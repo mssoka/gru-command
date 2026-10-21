@@ -29,7 +29,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
-import type { ReviewHostExitInput, ReviewHostExitResult } from '../runtime/review-host-exit.js';
+import { thisProcessIdentity, type ReviewHostExitInput, type ReviewHostExitResult } from '../runtime/review-host-exit.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
@@ -2605,6 +2605,14 @@ export class WaveRunner {
     return roundIds.length === 0 && operations === 0 && !unprovenFallback ? null : { roundIds, operations };
   }
 
+  /** #464: a graceful service shutdown, not a supersession, cut this round:
+   * the restart's clean abort (`service_restart`), re-armed after boot. A
+   * supersession wins, durable or in flight, as startup recovery rules. */
+  private shutdownCut(roundId: string, signal: AbortSignal): boolean {
+    return this.shuttingDown && !(signal.reason instanceof ReviewSupersededError) &&
+      this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') === null;
+  }
+
   /** True while a superseded round's stop is not PROVEN: no confirmation
    * newer than its supersession (or its last unconfirmed re-proof). A
    * restart that interrupted the pass leaves exactly this shape. */
@@ -2679,7 +2687,7 @@ export class WaveRunner {
     });
     if (!proof.ok) return { ids: left, detail: ` (dead-host proof refused: ${proof.problem})` };
     const still = await unproven();
-    return { ids: still, detail: still.length === 0 ? '' : ' (the dead-host proof is recorded, but the runtime does not accept it)' };
+    return { ids: still, detail: still.length === 0 ? '' : ` (the dead-host proof is recorded, but the runtime still refuses ${still.map((id) => id === '' ? 'the unregistered owner' : id).join(', ')}: its owner proof and its cessation check must read one ledger)` };
   }
 
   /** True when a MATERIAL amendment was accepted after `seq`: anything
@@ -3636,7 +3644,8 @@ export class WaveRunner {
       !validReviewOwnerGeneration(payload['generation'])) return null;
     return {
       roundId: round.id, runtimeId: payload['runtimeId'], pid: payload['pid'] as number,
-      generation: payload['generation'], recordedAt: event.ts,
+      generation: payload['generation'],
+      ...(typeof payload['hostIdentity'] === 'string' ? { hostIdentity: payload['hostIdentity'] } : {}),
     };
   }
 
@@ -5735,11 +5744,13 @@ export class WaveRunner {
       // Durable runtime provenance BEFORE any lead/child may spawn. The
       // generation binds same-process adapter cessation; a restarted Pi
       // service may instead prove its old in-process host PID has exited.
+      // The host's start identity tells a later process a reused pid (or
+      // this service restarted under it) from the live host (#464).
       if (runtime?.id === 'pi' || runtime?.id === 'claude-code') {
         this.opts.ledger.appendCustomEvent({
           kind: 'round.review-owner', jobId: job.id, roundId: round.id,
           payload: { roundId: round.id, targetSha, runtimeId: runtime.id,
-            pid: process.pid, generation: randomUUID() },
+            pid: process.pid, generation: randomUUID(), hostIdentity: thisProcessIdentity() },
         });
       }
       // ADMISSION PREFLIGHT (gh-169 Stage 4): validate the complete frozen
@@ -5845,8 +5856,10 @@ export class WaveRunner {
             : 'review setup interrupted by service shutdown; frozen proof is incomplete';
           this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
           // Only shutdown or supersession aborts a setup: a shutdown's cut is
-          // the restart's clean abort, re-armed after boot (#464).
-          const reason = superseded ? 'superseded' : 'service_restart';
+          // the restart's clean abort, re-armed after boot (#464). Anything
+          // else is named honestly and never re-armed.
+          const reason = this.shutdownCut(round.id, setupSignal) ? 'service_restart'
+            : superseded || this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null ? 'superseded' : 'cancelled';
           const artifacts = this.writeInterruptedArtifacts(round.id, reason, note);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.perkins-incomplete',
@@ -6251,12 +6264,20 @@ export class WaveRunner {
           payload: { error: String(error) },
         });
         // A shutdown that cut the wait for resident slots is the restart's
-        // clean abort too, re-armed after boot (#464).
-        if (this.shuttingDown && !(signal.reason instanceof ReviewSupersededError)) {
-          this.opts.ledger.appendCustomEvent({
-            kind: 'round.perkins-incomplete', jobId: job.id, roundId: round.id,
-            payload: { reason: 'service_restart', error: String(error).slice(0, 500) },
-          });
+        // clean abort too, re-armed after boot (#464). Its record never masks
+        // the cancellation being rethrown.
+        if (this.shutdownCut(round.id, signal)) {
+          try {
+            const note = 'review interrupted by service shutdown while waiting for resident slots; no reviewer spawned';
+            const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart', note);
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.perkins-incomplete', jobId: job.id, roundId: round.id,
+              payload: { reason: 'service_restart', error: String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500),
+                artifactDirectory: artifacts.directory, reportFile: artifacts.reportFile },
+            });
+          } catch (recordError) {
+            this.log('error', 'could not record the shutdown cut of a resident-slot wait', { round: round.id, error: String(recordError) });
+          }
         }
       }
       throw error;
@@ -6622,7 +6643,9 @@ export class WaveRunner {
           // abort (#464), which Silas re-arms on the unchanged head after
           // boot, exactly as startup recovery's own `service_restart`.
           reason: signal.reason instanceof ReviewSupersededError ? 'superseded'
-            : signal.aborted ? (this.shuttingDown ? 'service_restart' : 'cancelled') : 'workflow_error',
+            : signal.aborted ? (this.shutdownCut(round.id, signal) ? 'service_restart'
+              : this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null ? 'superseded' : 'cancelled')
+            : 'workflow_error',
           error: detail.slice(0, 500),
           reportFile,
           executionFacts,
@@ -7253,7 +7276,11 @@ export class WaveRunner {
           jobId: job.id,
           roundId: round.id,
           payload: {
-            reason: verdict === null ? 'review_incomplete' : deliveryFailureKind,
+            // A shutdown that cut delivery is the restart's clean abort
+            // (#464); the pending-publication guard still holds a re-arm
+            // until the in-flight post is reconciled.
+            reason: signal.aborted && this.shutdownCut(round.id, signal) ? 'service_restart'
+              : verdict === null ? 'review_incomplete' : deliveryFailureKind,
             reportFile,
             executionFacts: executionFactsLine,
             ...(hostReportWriteFailed !== null ? { hostReportWriteFailed } : {}),
@@ -7296,7 +7323,7 @@ export class WaveRunner {
         : {}),
     };
     } catch (error) {
-      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional, signal.aborted && this.shuttingDown);
+      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional, signal.aborted && this.shutdownCut(round.id, signal));
     }
   }
 

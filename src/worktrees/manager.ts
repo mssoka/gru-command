@@ -201,7 +201,13 @@ function treeProcesses(treePath: string, listed: readonly { readonly pid: number
   try {
     candidates.add(realpathSync(treePath));
   } catch {
-    /* the sweep's own guards handle a missing tree */
+    // A swept tree is resolved through its parent, so a process that
+    // outlived it is still matched by its resolved cwd (#464).
+    try {
+      candidates.add(join(realpathSync(dirname(treePath)), basename(treePath)));
+    } catch {
+      /* the sweep's own guards handle a missing tree */
+    }
   }
   const processes: TreeProcess[] = [];
   for (const { pid, command } of listed) {

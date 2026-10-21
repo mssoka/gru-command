@@ -242,16 +242,19 @@ degenerate into check-failed movement.
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
 - A round cut by a graceful service shutdown records its INCOMPLETE reason
-  as `service_restart` (#464). That is the same reason startup recovery
-  gives a round a crash interrupted, and it applies at every stage:
+  as `service_restart` (#464). Startup recovery uses the same reason for a
+  round that a crash interrupted. It applies at every stage:
   - during setup;
   - while waiting for resident slots;
   - mid-review;
-  - after the workflow returned, before finalization.
+  - after the workflow returned, before finalization;
+  - during report delivery.
 
-  Silas's `clean-abort-service-restart` row then re-arms the round on the
-  unchanged delivered head after boot. A refused re-arm keeps the row, and
-  each sweep tries again.
+  A supersession, recorded or in flight, still records `superseded`, as
+  startup recovery does. Silas's `clean-abort-service-restart` row then
+  re-arms the round on the unchanged delivered head after boot. A round cut
+  during delivery waits until its in-flight post is reconciled. A refused
+  re-arm keeps the row, and each sweep tries again.
 - A replacement round is admitted only once every earlier round's review
   owner is proven ceased. Ledger disposal state is not proof.
   - **Durable record.** When the owning process's adapter reports a review
@@ -261,8 +264,9 @@ degenerate into check-failed movement.
   - **Dead-host proof.** An owner hosted by another process that left no
     record (a crash, or a round older than the record) may instead be
     proven gone. Claude Code needs all of these:
-    - the host is gone: its pid is dead, reused by a process that started
-      after the marker, or this service restarted under that pid;
+    - the host is gone. Its pid is dead, or the process now holding it has
+      a different start identity from the one the marker recorded: a reused
+      pid, or this service restarted under that pid;
     - no live process is rooted (argv or cwd) in the round's review
       worktree;
     - no live process names one of the round's session ids;
@@ -273,9 +277,9 @@ degenerate into check-failed movement.
     refuses. A passing proof is recorded once (source `host-exit`), so it is
     never re-decided. The same proof clears a writer that is waiting on a
     supersession a restart interrupted.
-  - **Refusal.** A refused request answers 400. The refusal names the
-    process that may still run or the file to clear, and every later
-    request re-checks. See [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) ("A
+  - **Refusal.** A refused request answers 400. The refusal names a
+    process that may still run, or a file to clear, where there is one.
+    Every later request re-checks. See [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) ("A
     review owner from another process").
 - The base is changed source only when the locally resolved base ref no
   longer contains the frozen merge-base (rewritten past it) or no longer

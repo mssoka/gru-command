@@ -21,7 +21,7 @@ import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
 import { processTableAsync, type ProcessTable } from '../worktrees/manager.js';
 import {
-  hostedByThisProcess, pidStartedAt, pidState, proveReviewHostExit,
+  hostedByThisProcess, pidState, processIdentity, proveReviewHostExit,
   type ReviewHostExitEvidence, type ReviewHostExitInput, type ReviewHostExitResult,
 } from './review-host-exit.js';
 
@@ -86,10 +86,10 @@ export interface ReviewOwnerMarker {
   readonly runtimeId: string;
   readonly pid: number;
   readonly generation: string;
-  /** When the marker was written (its ledger event's time): a pid that now
-   * names a process started later, or this process restarted under it, is
-   * not the marker's host (#464). */
-  readonly recordedAt?: string;
+  /** The host process's start identity when it wrote the marker (#464): a
+   * live pid with another identity is a reused pid, or this service
+   * restarted under it. Absent on markers written before it existed. */
+  readonly hostIdentity?: string;
 }
 
 function validReviewOwnerMarker(marker: ReviewOwnerMarker | null): marker is ReviewOwnerMarker {
@@ -121,7 +121,7 @@ export function ledgerReviewOwnerCessation(
     },
     recordHostExit: (marker, evidence) => {
       ledger().recordReviewOwnerCessation({ source: 'host-exit', roundId: marker.roundId, generation: marker.generation,
-        pid: marker.pid, evidence: { ...evidence } });
+        pid: marker.pid, hostIdentity: marker.hostIdentity ?? null, evidence: { ...evidence } });
     },
     recorded: (agentId, marker) => ledger().reviewOwnerCessationRecorded(agentId, marker),
   };
@@ -148,6 +148,8 @@ export interface RuntimeRegistryOptions {
   readonly reviewOwnerCessation?: ReviewOwnerCessationLedger;
   /** Process-table override for the dead-host proof (tests only). */
   readonly processTable?: () => Promise<ProcessTable>;
+  /** Process start-identity override for the dead-host proof (tests only). */
+  readonly processIdentity?: (pid: number) => Promise<string | null>;
   /** Durable relay for reclaim-failure observations (one per handle per
    * drain epoch). The registry owns no ledger; the host wires this. */
   readonly reclaimFailureSink?: (observation: {
@@ -293,7 +295,7 @@ export class RuntimeRegistry {
     if (ledger === undefined) return { ok: false, problem: 'no durable cessation record is wired to keep a dead-host proof' };
     const result = await proveReviewHostExit(input, {
       pidState: this.opts.ownerProcessProbe ?? pidState,
-      pidStartedAt,
+      processIdentity: this.opts.processIdentity ?? processIdentity,
       processTable: this.opts.processTable ?? (() => processTableAsync({
         onCwdError: (error) => this.log('warn', 'dead-host proof could not list process working directories', { error: String(error) }),
       })),

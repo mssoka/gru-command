@@ -333,7 +333,7 @@ const PINS: Record<string, number> = {
   'review-runtime-swap.test.ts': 22,
   'review-source-preflight.test.ts': 13,
   'review-supersession.test.ts': 65,
-  'review-owner-cessation.test.ts': 13,
+  'review-owner-cessation.test.ts': 20,
   'review-path.test.ts': 26,
   'roles-definitions.test.ts': 18,
   'roles-installed-playbook.test.ts': 7,

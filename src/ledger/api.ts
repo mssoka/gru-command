@@ -1360,7 +1360,7 @@ export class LedgerApi {
   recordReviewOwnerCessation(input:
     | { readonly source: 'adapter'; readonly agentId: string; readonly generation: string }
     | { readonly source: 'host-exit'; readonly roundId: string; readonly generation: string; readonly pid: number;
-      readonly evidence: Readonly<Record<string, unknown>> }): EventRecord {
+      readonly hostIdentity: string | null; readonly evidence: Readonly<Record<string, unknown>> }): EventRecord {
     return this.transaction(() => {
       const candidates = input.source === 'adapter'
         ? this.db.prepare(
@@ -1370,9 +1370,10 @@ export class LedgerApi {
           "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-owner' ORDER BY seq ASC LIMIT 2",
         ).all(input.roundId) as Row[];
       const marker = candidates.length === 1 ? this.eventFromRow(candidates[0]!) : null;
-      const owner = marker?.payload as { generation?: unknown; pid?: unknown } | null | undefined;
+      const owner = marker?.payload as { generation?: unknown; pid?: unknown; hostIdentity?: unknown } | null | undefined;
       if (marker === null || marker.roundId === null || owner?.generation !== input.generation ||
-        (input.source === 'host-exit' && owner.pid !== input.pid) ||
+        // The proof judged exactly this marker's host: its pid and identity.
+        (input.source === 'host-exit' && (owner.pid !== input.pid || (owner.hostIdentity ?? null) !== input.hostIdentity)) ||
         (input.source === 'adapter' && input.agentId.trim() === '') ||
         this.uniqueRoundReviewOwnerMarker(marker.roundId)?.seq !== marker.seq) {
         throw new Error(`review-owner cessation (${input.source}) for generation ${input.generation} binds no unique round owner marker; nothing recorded`);

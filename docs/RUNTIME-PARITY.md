@@ -200,26 +200,38 @@ writes each runtime's own record shape during a resumed turn.
     tools run inside that host;
   - Claude Code never accepts PID death alone, because its CLI child can
     outlive the host. It needs the **dead-host proof** instead:
-    - the marker's host is gone. Its pid is dead, or the pid now belongs to
-      a process that started after the marker was written (a reused pid), or
-      this service restarted under the same pid;
+    - the marker's host is gone. Its pid is dead, or the process now
+      holding it has a different start identity from the one the marker
+      recorded. That covers a reused pid, and this service restarted under
+      the same pid. The identity is Linux's boot id plus the start ticks in
+      `/proc/<pid>/stat`; elsewhere it is `ps -o lstart` read in UTC. Both
+      are the kernel's own record, so clock and timezone changes never move
+      them. A marker written before the identity existed, under a live pid,
+      refuses;
     - no live process is rooted (argv or cwd) in the round's review
       worktree;
     - no live process names one of the round's session ids, registered or
       found as a session file in the round's session directory. Every
       session registers before its first turn, and a Claude CLI runs only
       during a turn with its session id in argv;
-    - no session lock of the round is held by a live pid. A lock the gone
-      host itself left is free, whatever hostname it recorded.
+    - no session lock of the round is held by a live pid, or by this
+      process. A lock the gone host itself left is free, whatever hostname
+      it recorded.
 
-  Evidence that cannot be read refuses: the process table, or the working
-  directories as a listing, cannot be read; an unreadable session directory;
-  an unreadable lock. A passing proof is recorded once as
-  `round.review-owner-ceased` (source `host-exit`, with the evidence it
-  checked), so it is never re-decided. A refusal names what is still alive or
-  what to clear, for example a lock file to remove once no process holds it.
-  Every later review request re-checks
-  (`test/review-owner-cessation.test.ts`).
+  Unreadable evidence refuses. That includes:
+  - a process table that cannot be listed;
+  - working directories that cannot be listed;
+  - a session directory that cannot be read;
+  - an unreadable lock, or one that names no pid.
+
+  A passing proof is recorded once as `round.review-owner-ceased` (source
+  `host-exit`). The record keeps the evidence it checked and how the host was
+  found gone (`dead`, `pid-reused` or `restarted`), so it is never
+  re-decided. The same proof clears a writer that is waiting on a
+  supersession a restart interrupted. A refusal names what is still alive
+  where there is a process, or the file to clear where there is one, for
+  example a lock file to remove once no process holds it. Every later review
+  request re-checks (`test/review-owner-cessation.test.ts`).
 
 ## Rollout of the default change
 

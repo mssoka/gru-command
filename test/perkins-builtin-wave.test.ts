@@ -1212,6 +1212,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
     expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(outcome.round.status).toBe('aborted');
+    // #464: a failure outside a shutdown is never the restart's clean abort.
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'finalization_error' });
     const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
     // Round-5 P1 ATOMIC finalization: the explosion inside the verdict
     // transaction leaves NOTHING committed — the settled lens keeps the
