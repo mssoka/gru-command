@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 
 /**
  * tools/prune-stale-dist.mjs contract. `tsc` never deletes outputs of a
- * removed source, and `gru-service roll` rebuilds the deploy clone in place
+ * removed source, and `gru roll` rebuilds the deploy clone in place
  * (no clean), so a deleted module's dist/*.js survived every roll until the
  * Perkins runtime fingerprint refused it as "an unproven executable path"
  * (owner incident 2026-10-07: dist/dispatch/perkins-review/hybrid.js). The
@@ -79,10 +79,11 @@ describe('prune-stale-dist', () => {
     // transaction (dist/worktrees/creation-intent.js); #446 the
     // default-branch CI alert (dist/repos/default-branch-ci.js); #455 the job
     // execution stop that proves (or refuses to claim) producer cessation
-    // (dist/dispatch/job-stop.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5221);
+    // (dist/dispatch/job-stop.js); #463 the `gru` operator subcommands
+    // (dist/cli/operator.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5222);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('40b15f489869e6fc05229011ae7ffa899ce25e3e8b0dcd852ce69fe46cad4587');
+      .toBe('def50b30d89a7f44c779d3113e2e9bf36dfbab4b6c4f83f036fae84a25a5fd26');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

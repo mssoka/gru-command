@@ -66,6 +66,8 @@ async function run(
         ...process.env,
         ...env,
         ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}),
+        // Likewise the `gru` launcher: never into a runner-set bin dir.
+        ...(env.HOME ? { GRU_COMMAND_BIN_DIR: join(env.HOME, '.local', 'bin') } : {}),
         npm_config_update_notifier: 'false',
         npm_config_progress: 'false',
       },
@@ -348,6 +350,7 @@ function writeLauncher(options: LauncherOptions): string {
   const exports: Record<string, string> = {
     HOME: options.home,
     XDG_CONFIG_HOME: join(options.home, '.config'),
+    GRU_COMMAND_BIN_DIR: join(options.home, '.local', 'bin'),
     GRU_COMMAND_HOME: options.instance,
     ...(options.seam === undefined
       ? {}
@@ -984,6 +987,18 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(seam.unit)).toBe(false);
   }, 400_000);
 
+  it.skipIf(!ptyCapable)('run the way gru runs it (from the checkout, the caller\'s directory handed over), the declined hint is still absolute (#463)', () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const elsewhere = tempDir('gru-command-hint-launch-pwd-');
+    const launcher = writeLauncher({
+      home, instance, seam, cwd: target, command: 'exec bash ./install.sh',
+      extraExports: { GRU_COMMAND_LAUNCH_PWD: elsewhere },
+    });
+    const output = ptyRun(launcher, 'n\\r');
+    expect(output).toMatch(/no service installed or running — \/\S+\/gru-command\/install\.sh --service registers it later/);
+    expect(output).not.toContain('— ./install.sh --service');
+  }, 400_000);
+
   it.skipIf(!ptyCapable)('prompt_register_service leaves a caller-held fd 3 intact (#36)', () => {
     const home = tempDir('gru-command-fd3-');
     const keep = join(home, 'fd3-keep.txt');
@@ -1090,7 +1105,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(outside, 'systemd'))).toBe(false);
   });
 
-  it('in-service restart delegates to gru-service roll and never unload/loads', async () => {
+  it('in-service restart delegates to gru roll --detach and never unload/loads', async () => {
     // Function-level pin for the delegation branch: the in-service process
     // group IS detected (fake manager reports our own pgid), the unit IS
     // owned, and the served restart must be the roll CLI — never the unit
@@ -1131,13 +1146,62 @@ describe('install.sh setup mode (one-line path)', () => {
       env: { ...process.env, HOME: home },
       encoding: 'utf-8',
     });
-    expect(stdout).toContain("delegating the restart to 'gru-service roll'");
-    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll\n');
+    expect(stdout).toContain("delegating the restart to 'gru roll --detach'");
+    expect(stdout).toContain('the service relaunches itself once its drain settles, unless the roll fails later; check it with gru status and gru logs');
+    // Through preflight only: the relaunch ends this shell with the service.
+    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --detach\n');
     const calls = existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '';
     expect(calls).not.toMatch(/^unload/m);
     expect(calls).not.toMatch(/^load/m);
     expect(calls).not.toContain('daemon-reload');
     expect(calls).not.toContain('restart gru-command');
+  });
+
+  it('an in-service roll the service refuses fails the update, named, and never claims a relaunch (#463)', async () => {
+    // Function-level pin for the delegation branch: the in-service process
+    // group IS detected (fake manager reports our own pgid), the unit IS
+    // owned, and the served restart must be the roll CLI — never the unit
+    // lifecycle calls. Ownership itself is covered by its own tests; this
+    // exercises the branch on every pty-less machine (Linux CI included).
+    const home = tempDir('gru-command-in-service-fn-');
+    const instance = join(home, '.gru-command');
+    const { manager, managerLog } = inServiceManagerSeam(home);
+    const rollLog = join(home, 'roll.log');
+    const repoRoot = tempDir('gru-command-in-service-repo-');
+    const installScript = join(import.meta.dirname, '..', 'install.sh');
+    mkdirSync(join(repoRoot, 'dist', 'cli'), { recursive: true });
+    writeFileSync(
+      join(repoRoot, 'dist', 'cli', 'service.js'),
+      [
+        '#!/usr/bin/env node',
+        "require('node:fs').appendFileSync(process.env.GRU_ROLL_LOG, `argv:${process.argv.slice(2).join(' ')}\n`);",
+        'process.exit(1);',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    const script = [
+      `REPO_ROOT=${shellQuote(repoRoot)}`,
+      'set -euo pipefail',
+      'err() { echo "install.sh: $*" >&2; }',
+      `OS=${process.platform === 'darwin' ? 'darwin' : 'linux'}`,
+      `LABEL=com.gru-command.service`,
+      `INSTANCE_DIR=${shellQuote(instance)}`,
+      `NODE_BIN=${shellQuote(process.execPath)}`,
+      `LAUNCHCTL_BIN=${shellQuote(manager)}`,
+      `SYSTEMCTL_BIN=${shellQuote(manager)}`,
+      `GRU_MANAGER_LOG=${shellQuote(managerLog)}`,
+      `GRU_ROLL_LOG=${shellQuote(rollLog)}`,
+      `export GRU_MANAGER_LOG GRU_ROLL_LOG`,
+      `eval "$(sed -n '/^managed_service_pid()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^inside_managed_service_pgroup()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_in_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^install_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service()/,/^}/p' ${shellQuote(installScript)})"`,
+      `restart_owned_service`,
+      '',
+    ].join('\n');
+    const result = spawnSync('bash', ['-c', script], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('the service refused the roll: the new build is on disk but the service still runs the old one');
+    expect(result.stdout).not.toContain('relaunches itself');
+    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --detach\n');
   });
 
   it.skipIf(!ptyCapable)('in-service pty update (absent unit): no prompt hang — auto-registers with a notice', () => {
@@ -1158,6 +1222,145 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(output).toContain('update complete; existing config preserved');
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   }, 340_000);
+
+  it('installs the gru launcher (#463): it runs the clone\'s CLI from any directory, refreshes on update, never replaces a foreign gru, and --uninstall removes only its own', async () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-launcher-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const target = join(home, 'gru-command');
+    const instance = join(home, '.gru-command');
+    const seam = serviceManagerSeam(home);
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+      ...seam.env,
+    };
+    const launcher = join(home, '.local', 'bin', 'gru');
+    const fresh = await run(join(bare, 'install.sh'), ['--answers', '{}'], env);
+    expect(fresh.status, fresh.stderr).toBe(0);
+    expect(fresh.stdout).toContain(`installed the 'gru' command: ${launcher}`);
+    // The sandbox PATH never holds the sandbox bin dir: the installer says how to add it.
+    expect(fresh.stdout).toContain(`export PATH="${join(home, '.local', 'bin')}:$PATH"`);
+    const launched = execFileSync(launcher, ['version', '--json'], { cwd: tmpdir(), encoding: 'utf-8', env: { ...process.env, HOME: home } });
+    expect(launched).toBe('FIXTURE-ROLL-RAN version --json\n');
+    expect(readFileSync(launcher, 'utf-8')).toContain('# gru-command launcher (managed by install.sh)');
+    // It pins this install's instance, as the unit does.
+    expect(readFileSync(launcher, 'utf-8')).toContain(`GRU_COMMAND_HOME='${instance}'`);
+
+    // Ours is refreshed by an update…
+    writeFileSync(launcher, '#!/bin/sh\n# gru-command launcher (managed by install.sh)\nexit 9\n', { mode: 0o755 });
+    const update = ['--update', '--no-interact'];
+    expect((await run(join(target, 'install.sh'), update, env)).status).toBe(0);
+    expect(readFileSync(launcher, 'utf-8')).toContain(`${target}/dist/cli/service.js`);
+    // …a foreign `gru` never is, and the install still succeeds…
+    writeFileSync(launcher, '#!/bin/sh\necho someone-elses-gru\n', { mode: 0o755 });
+    const foreign = await run(join(target, 'install.sh'), update, env);
+    expect(foreign.status).toBe(0);
+    expect(foreign.stdout).not.toContain("installed the 'gru' command");
+    expect(readFileSync(launcher, 'utf-8')).toBe('#!/bin/sh\necho someone-elses-gru\n');
+    // …and --uninstall removes only its own.
+    const keptForeign = await run(join(target, 'install.sh'), ['--uninstall'], env);
+    expect(keptForeign.status).toBe(0);
+    expect(keptForeign.stdout).toContain('this installer did not write it');
+    expect(existsSync(launcher)).toBe(true);
+    rmSync(launcher);
+    expect((await run(join(target, 'install.sh'), update, env)).status).toBe(0);
+    const removed = await run(join(target, 'install.sh'), ['--uninstall'], env);
+    expect(removed.status).toBe(0);
+    expect(removed.stdout).toContain(`removed the 'gru' command: ${launcher}`);
+    expect(existsSync(launcher)).toBe(false);
+  });
+
+  it('--stop/--start/--restart (#463) act on the owned unit only, with exact manager calls; inside the service, stop and an immediate restart refuse', async () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const instance = join(home, '.gru-command');
+    const unit = sandboxUnitPath(home);
+    const darwin = process.platform === 'darwin';
+    const label = 'com.gru-command.service';
+    const domain = `gui/${process.getuid?.() ?? 0}/${label}`;
+    const base = { HOME: home, GRU_COMMAND_HOME: instance };
+    const plain = serviceManagerSeam(home);
+    expect((await run(join(fixture, 'install.sh'), ['--answers', '{"smoke":false}'], { ...base, ...plain.env })).status).toBe(0);
+    const install = join(fixture, 'install.sh');
+    const calls = (seam: ManagerSeam): string[] => existsSync(seam.managerLog)
+      ? readFileSync(seam.managerLog, 'utf-8').split('\n').filter((line) => line !== '' && !line.startsWith('list') && !line.includes('show -p MainPID'))
+      : [];
+
+    // No unit: every mode names the registration command.
+    for (const mode of ['--stop', '--start', '--restart']) {
+      const absent = await run(install, [mode], { ...base, ...plain.env });
+      expect(absent.status).not.toBe(0);
+      expect(absent.stderr).toContain(`${fixture}/install.sh --service`);
+    }
+    expect(calls(plain)).toEqual([]);
+
+    const rendered = await run(install, ['--print'], { ...base, ...plain.env });
+    expect(rendered.status, rendered.stderr).toBe(0);
+    mkdirSync(dirname(unit), { recursive: true });
+    writeFileSync(unit, rendered.stdout);
+
+    // Owned, not loaded: a macOS stop says so (unloading it would be an
+    // error); start and restart load it. systemd's stop is idempotent.
+    const stopped = await run(install, ['--stop'], { ...base, ...plain.env });
+    expect(stopped.status).toBe(0);
+    if (darwin) expect(stopped.stdout).toContain('already stopped');
+    for (const mode of ['--start', '--restart']) {
+      expect((await run(install, [mode], { ...base, ...plain.env })).status).toBe(0);
+    }
+    expect(calls(plain)).toEqual(darwin
+      ? [`load ${unit}`, `load ${unit}`]
+      : ['--user stop gru-command.service', '--user start gru-command.service', '--user restart gru-command.service']);
+
+    // Loaded (macOS): stop unloads, start and restart go through kickstart.
+    const loaded = fakeManagerSeam(home, 'loaded-manager', [
+      'case "$*" in',
+      `  list*) printf -- "-\\t0\\t${label}\\n" ;;`,
+      'esac',
+    ]);
+    for (const mode of ['--stop', '--start', '--restart']) {
+      expect((await run(install, [mode], { ...base, ...loaded.env })).status).toBe(0);
+    }
+    expect(calls(loaded)).toEqual(darwin
+      ? [`unload ${unit}`, `kickstart ${domain}`, `kickstart -k ${domain}`]
+      : ['--user stop gru-command.service', '--user start gru-command.service', '--user restart gru-command.service']);
+
+    // Already running elsewhere: start is a no-op that says so.
+    const running = fakeManagerSeam(home, 'running-manager', [
+      'case "$*" in',
+      '  *"show -p MainPID"*) printf "4242" ;;',
+      `  list*) printf "4242\\t0\\t${label}\\n" ;;`,
+      'esac',
+    ]);
+    const already = await run(install, ['--start'], { ...base, ...running.env });
+    expect(already.status).toBe(0);
+    expect(already.stdout).toContain('already running (pid 4242)');
+    expect(calls(running)).toEqual([]);
+
+    // Inside the managed service: stop and an immediate restart refuse.
+    const inside = inServiceManagerSeam(home);
+    const insideStop = await run(install, ['--stop'], { ...base, ...inside.env });
+    expect(insideStop.status).not.toBe(0);
+    expect(insideStop.stderr).toContain("run 'gru stop' from a terminal outside the service");
+    const insideRestart = await run(install, ['--restart'], { ...base, ...inside.env });
+    expect(insideRestart.status).not.toBe(0);
+    expect(insideRestart.stderr).toContain("use 'gru restart --detach' instead");
+    expect(calls(inside)).toEqual([]);
+
+    // A foreign unit is never touched.
+    writeFileSync(unit, 'foreign-user-unit\n');
+    const foreignSeam = fakeManagerSeam(home, 'foreign-manager', []);
+    for (const mode of ['--stop', '--start', '--restart']) {
+      const refused = await run(install, [mode], { ...base, ...foreignSeam.env });
+      expect(refused.status).not.toBe(0);
+      expect(refused.stderr).toContain('refusing to touch unrelated service unit');
+    }
+    expect(calls(foreignSeam)).toEqual([]);
+    expect(readFileSync(unit, 'utf-8')).toBe('foreign-user-unit\n');
+  });
 
   it('direct --service/--uninstall also enforce exact unit ownership', async () => {
     const { fixture, home } = buildFixtureRepo();
@@ -1211,8 +1414,16 @@ describe('install.sh setup mode (one-line path)', () => {
     writeFileSync(unit, rendered.stdout);
     expect((await run(join(fixture, 'install.sh'), ['--uninstall'], env)).status).toBe(0);
     expect(existsSync(unit)).toBe(false);
+    // --service refreshes a stale launcher of ours with the unit (#463).
+    const launcher = join(home, '.local', 'bin', 'gru');
+    mkdirSync(dirname(launcher), { recursive: true });
+    writeFileSync(launcher, "#!/bin/sh\n# gru-command launcher (managed by install.sh)\nexec '/opt/previous-node/bin/node' '/elsewhere/dist/cli/service.js' \"$@\"\n", { mode: 0o755 });
     expect((await run(join(fixture, 'install.sh'), ['--service'], env)).status).toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe(rendered.stdout);
+    const refreshed = readFileSync(launcher, 'utf-8');
+    expect(refreshed).toContain(`GRU_COMMAND_HOME='${instance}'`);
+    expect(refreshed).toContain(`'${fixture}/dist/cli/service.js' "$@"`);
+    expect(refreshed).not.toContain('/opt/previous-node');
   });
 
   it('inside a clone: no flags clone the product — deps+build+wizard only', async () => {

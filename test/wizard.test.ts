@@ -859,7 +859,7 @@ describe('wizard CLI surface', () => {
       const text = `${res.stdout}\n${res.stderr}`;
       expect(res.status, text).toBe(1);
       expect(text).toContain(`port ${heldPort} on 127.0.0.1 is already in use`);
-      expect(text).toContain('--uninstall');
+      expect(text).toContain('stop it first (gru stop, or ./install.sh --stop)');
       // Failed BEFORE the write: no config, no half-install.
       expect(existsSync(join(instance, 'config.toml'))).toBe(false);
     } finally {

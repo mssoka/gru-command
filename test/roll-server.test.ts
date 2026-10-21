@@ -140,6 +140,28 @@ describe('POST /api/roll', () => {
     }
   });
 
+  it('forwards mode "restart" (#463) and refuses an unknown mode or a restart that asks to build', async () => {
+    const harness = await boot({});
+    try {
+      const post = (body: unknown) => fetch(`http://127.0.0.1:${harness.port}/api/roll`, {
+        method: 'POST',
+        headers: { ...AUTH, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      expect((await post({ mode: 'restart', requested_by: 'gru-service-cli' })).status).toBe(202);
+      expect(harness.invoked).toEqual([{ mode: 'restart', requestedBy: 'gru-service-cli' }]);
+      const unknown = await post({ mode: 'reload' });
+      expect(unknown.status).toBe(400);
+      expect(((await unknown.json()) as { detail: string }).detail).toContain('mode must be "update" or "restart"');
+      const building = await post({ mode: 'restart', force_build: true });
+      expect(building.status).toBe(400);
+      expect(((await building.json()) as { detail: string }).detail).toContain('a restart never builds');
+      expect(harness.invoked).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('answers 409 with the live record while a roll is already running', async () => {
     const live = rollState('drain', 'roll-live');
     const harness = await boot({

@@ -1367,8 +1367,10 @@ describe('gru-service reset (#427 PR 2b)', () => {
 
     expect(code).toBe(1);
     expect(at.err.join('\n')).toContain('the service is running: pid 4242 (node) listens on port');
-    expect(at.err.join('\n')).toContain('systemctl --user stop gru-command');
-    expect(at.err.join('\n')).toContain('launchctl bootout');
+    expect(at.err.join('\n')).toContain('Stop it first with gru stop');
+    expect(at.err.join('\n')).toContain('start the service afterwards with gru start');
+    // The raw manager stop stays as a fallback for an install without `gru`.
+    expect(at.err.join('\n')).toContain('systemctl --user stop gru-command on Linux');
     expect(laneTrees(at.app, at.lanesRoot)).toEqual(lanes);
     expect(existsSync(join(at.home, 'reviews'))).toBe(true);
 
@@ -1399,7 +1401,7 @@ describe('gru-service reset (#427 PR 2b)', () => {
     expect(readFileSync(join(at.home, 'config.toml'), 'utf-8')).toContain('managed_repos = ["app"]');
     expect(RESET_KEEPS).toContain('config.toml');
     const said = at.out.join('\n');
-    expect(said).toContain('gru-service reset will:');
+    expect(said).toContain('gru reset will:');
     expect(said).toContain('remove 2 GC lane(s)');
     expect(said).toContain('keep gru/* branches (--delete-branches deletes them)');
     expect(said).toMatch(/removed lane .*job-one from app/u);
@@ -1442,7 +1444,7 @@ describe('gru-service reset (#427 PR 2b)', () => {
     // (the roll parser gives 2 for an unknown command), and its output is seen.
     const usage: string[] = [];
     expect(await runServiceCli(['reset', '--help'], { stderr: (line) => { usage.push(line); } })).toBe(0);
-    expect(usage.join('\n')).toContain('usage: gru-service reset [--yes] [--delete-branches] [--delete-refs]');
+    expect(usage.join('\n')).toContain('usage: gru reset [--yes] [--delete-branches] [--delete-refs]');
     at.err.length = 0;
     expect(await runServiceCli(['reset'], { reset: at.deps() })).toBe(1);
     expect(at.err.join('\n')).toContain('Pass --yes');

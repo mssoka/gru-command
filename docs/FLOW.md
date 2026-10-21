@@ -1123,9 +1123,19 @@ The service rolls ITSELF — there is no shelf-stable restart path that a
 non-interactive shell can drive safely by hand. Two triggers, one state
 machine:
 
-- `gru-service roll` (CLI; `dist/cli/service.js`, also the `gru-service`
-  bin) — wait mode follows the roll to verified completion.
+- `gru roll` (CLI; `dist/cli/service.js`, also the `gru` / `gru-service`
+  bin) — wait mode follows the roll to verified completion; `--detach`
+  follows it through preflight only, for a caller inside the service.
 - `POST /api/roll` (operator-guarded, pairing token).
+
+A roll has a mode. `update` (the default) is the path below. `restart`
+(`gru restart`, `{"mode":"restart"}`, #463) relaunches the build already on
+disk: preflight keeps the foreign-listener refusal, skips the dirty-tree
+check, the pull and the build, and targets the on-disk build stamp
+(`dist/build-rev.json`; no stamp or a missing artifact fails loud). Swap
+re-checks that stamp instead of `HEAD`. Drain, swap and verify are
+unchanged, and the record carries `mode`. `force_build` with a restart is
+refused.
 
 Both write a disk record at `<data_dir>/roll-state.json` and drive four
 idempotent phases:
@@ -1185,9 +1195,12 @@ agent-owned pty.
 **install.sh --update is now a client of this path.** When the updater
 detects it is running inside the managed service's process group (the
 service main pid IS the group leader), it delegates the restart to
-`gru-service roll` and never calls `unload`/`load`; the register prompt is
-skipped with an announced default instead of reading `/dev/tty`. Run from
-a human terminal, the update path is unchanged.
+`gru roll --detach` and never calls `unload`/`load`. `--detach` follows the
+roll through preflight, so a refused roll fails the update, then returns:
+the relaunch ends that shell with the service, so it could never wait for
+verification. The register prompt is skipped with an announced default
+instead of reading `/dev/tty`. Run from a human terminal, the update path
+is unchanged.
 
 **Rollback safety (no auto-rollback v1).** If the new build fails to boot,
 launchd throttles (5 s `ThrottleInterval`) and systemd backs off
