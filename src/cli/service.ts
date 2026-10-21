@@ -291,6 +291,11 @@ export async function runServiceCli(
   }
   const deps: ServiceCliDeps = { ...defaultDeps(), ...overrides };
   const command = argv[0];
+  if ((isInstallerCommand(command) || command === 'status' || command === 'logs' || command === 'restart') &&
+      argv.slice(1).some((arg) => arg === '-h' || arg === '--help')) {
+    deps.stderr(USAGE.trimEnd());
+    return 0;
+  }
   if (isInstallerCommand(command)) return runInstallerCli(command, argv.slice(1), deps);
   if (command === 'restart' && argv.includes('--now')) return runRestartNowCli(argv.slice(1), deps);
   if (command === 'status') return runStatusCli(argv.slice(1), { ...deps, baseUrl: serviceBaseUrl });
@@ -344,8 +349,9 @@ export async function runServiceCli(
   } catch (error) {
     deps.stderr(
       `gru: service unreachable at ${base} (${String((error as Error).message)}) — ` +
-        'the self-roll requires the running OS service',
+        'the self-roll requires the running OS service; check it with gru status, start it with gru start',
     );
+    if (options.action === 'restart') configChangeHint(deps.stderr);
     return 1;
   }
   let body: RollApiBody;
@@ -374,6 +380,7 @@ export async function runServiceCli(
     deps.stderr(
       `gru: roll refused (HTTP ${res.status}): ${body.detail ?? body.error ?? 'unknown error'}`,
     );
+    if (options.action === 'restart' && res.status === 401) configChangeHint(deps.stderr);
     return 1;
   }
   if (!options.wait) return 0;
@@ -493,13 +500,22 @@ async function foreignHealthListener(
   return owners.find((owner) => owner.pid !== verifyPid) ?? null;
 }
 
+/** The CLI dials and authenticates with the config on disk: after an edit to
+ * [server] or [auth] the running service still listens with the old values. */
+function configChangeHint(stderr: (line: string) => void): void {
+  stderr(
+    'if config.toml changed [server] host/port or [auth] token, the running service still uses the old ' +
+      'values and cannot be reached this way: apply the edit with gru restart --now',
+  );
+}
+
 /** Rollback safety: no auto-rollback v1 — the old dist is git; name the bail. */
 function bailHint(stderr: (line: string) => void, state: RollState | null): void {
   const root = state?.repoRoot ?? '<deploy clone>';
   stderr(
     `bail: the swap marker is the only handoff state — to return the service, restore the ` +
       `checkout, rebuild (npm ci && npm run build && npm run build:web in ${root}), and ` +
-      'restart the unit (gru restart --now)',
+      'restart the unit (gru restart --now, or launchctl kickstart -k gui/$(id -u)/com.gru-command.service | systemctl --user restart gru-command)',
   );
 }
 

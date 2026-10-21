@@ -197,9 +197,24 @@ describe('gru roll follow loop', () => {
     const code = await runServiceCli(['restart', '--reason', 'config edit'], h.deps);
     expect(code).toBe(0);
     expect(h.bodies).toEqual([{ requested_by: 'gru-service-cli', reason: 'config edit', mode: 'restart' }]);
+    expect(h.stdout.join('\n')).toContain('preflight: checking the installed build (restart: no pull, no build)');
     expect(h.stdout.join('\n')).toContain(`restarted on build ${'b'.repeat(40)} (verified on /health)`);
     const parsed = parseServiceArgs(['restart', '--no-wait', '--json']);
     expect(parsed.ok && parsed.options.action).toBe('restart');
+  });
+
+  it('a restart that cannot reach or authenticate names gru start and the config-edit case', async () => {
+    const down = await harness({ post: 'unreachable' });
+    expect(await runServiceCli(['restart'], down.deps)).toBe(1);
+    expect(down.stderr.join('\n')).toContain('start it with gru start');
+    expect(down.stderr.join('\n')).toContain('apply the edit with gru restart --now');
+    const rejected = await harness({ post: jsonResponse(401, { error: 'unauthorized' }) });
+    expect(await runServiceCli(['restart'], rejected.deps)).toBe(1);
+    expect(rejected.stderr.join('\n')).toContain('[auth] token');
+    // A plain roll keeps its own refusal without the restart hint.
+    const roll = await harness({ post: jsonResponse(401, { error: 'unauthorized' }) });
+    expect(await runServiceCli(['roll'], roll.deps)).toBe(1);
+    expect(roll.stderr.join('\n')).not.toContain('gru restart --now');
   });
 
   it('gru restart refuses, non-zero, while another roll is in progress — it never attaches to it', async () => {

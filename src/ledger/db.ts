@@ -31,7 +31,7 @@ export interface Migration {
  * data directory (#427 PR 2b): the service does not start under a reset. */
 export class ResetRunningError extends Error {
   constructor(file: string, cause: unknown) {
-    super(`gru-service reset is running on this data directory (it holds ${file}): start the service once it has ended`, { cause });
+    super(`gru reset is running on this data directory (it holds ${file}): start the service once it has ended`, { cause });
     this.name = 'ResetRunningError';
   }
 }
@@ -49,7 +49,7 @@ function refuseUnderReset(dataDir: string): void {
     const code = (error as { readonly errcode?: unknown }).errcode;
     // SQLITE_BUSY and SQLITE_LOCKED: reset holds it.
     if (code === 5 || code === 6) throw new ResetRunningError(file, error);
-    throw new Error(`the reset lock ${file} cannot be read (${(error as Error).message}); if no gru-service reset is running, delete it and start the service again`, { cause: error });
+    throw new Error(`the reset lock ${file} cannot be read (${(error as Error).message}); if no gru reset is running, delete it and start the service again`, { cause: error });
   } finally {
     try { probe?.close(); } catch { /* the probe's own error is the one to report */ }
   }

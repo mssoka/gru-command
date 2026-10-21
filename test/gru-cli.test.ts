@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, type GruCommandConfig } from '../src/config.js';
 import type { BuildInfo } from '../src/build-info.js';
@@ -118,6 +118,28 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
     expect(h.stderr.join('\n')).toContain('restart --now takes no other options');
   });
 
+  it('runs the real install.sh with exactly those flags, on the pinned node, and returns its exit code', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-command-installer-'));
+    cleanupDirs.push(root);
+    const record = join(root, 'record.txt');
+    writeFileSync(join(root, 'install.sh'),
+      `printf '%s\\n' "$*" "$(command -v node)" > ${JSON.stringify(record)}\nexit 7\n`);
+    expect(installerRunnerFor(root)(['--stop'])).toBe(7);
+    const [args, node] = readFileSync(record, 'utf8').trimEnd().split('\n');
+    expect(args).toBe('--stop');
+    expect(dirname(node!)).toBe(dirname(process.execPath));
+  });
+
+  it('every subcommand answers --help with usage and exit 0, running nothing', async () => {
+    const h = harness();
+    for (const argv of [['update', '--help'], ['stop', '-h'], ['start', '--help'], ['status', '--help'], ['logs', '-h'], ['restart', '--now', '--help']]) {
+      expect(await runServiceCli(argv, h.deps)).toBe(0);
+    }
+    expect(h.installer).toEqual([]);
+    expect(h.tails).toEqual([]);
+    expect(h.stderr.filter((line) => line.startsWith('usage: gru <command>'))).toHaveLength(6);
+  });
+
   it('a package root without install.sh is a named refusal, not a crash', () => {
     const notACheckout = mkdtempSync(join(tmpdir(), 'gru-command-not-checkout-'));
     cleanupDirs.push(notACheckout);
@@ -180,7 +202,8 @@ describe('gru logs', () => {
     const h = harness({ config });
     expect(await runServiceCli(['logs'], h.deps)).toBe(0);
     expect(await runServiceCli(['logs', '-f', '-n', '20'], h.deps)).toBe(0);
-    expect(h.tails).toEqual([['-n', '100', file], ['-n', '20', '-f', file]]);
+    // -F: following survives the logger's rename-based rotation.
+    expect(h.tails).toEqual([['-n', '100', file], ['-n', '20', '-F', file]]);
     expect(await runServiceCli(['logs', '-n', '0'], h.deps)).toBe(2);
     expect(await runServiceCli(['logs', '--grep'], h.deps)).toBe(2);
     expect(h.tails).toHaveLength(2);

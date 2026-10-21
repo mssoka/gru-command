@@ -377,11 +377,12 @@ export class RollController {
 
   /** A restart (#463) relaunches the build already on disk: no dirty-tree
    * check, no pull, no build. Its target is that build's own stamp, which
-   * the relaunched service must report on /health. */
+   * the relaunched service must report on /health — read from disk with no
+   * fallback (readBuiltSha falls back to the running build's identity). */
   private async restartPreflight(state: RollState): Promise<RollState> {
     const started = this.now();
     await this.refuseForeignListener(state);
-    const built = this.opts.readBuiltSha();
+    const built = readBuildInfo(this.opts.repoRoot).rev;
     if (built === null) {
       throw new Error('the deploy clone has no build stamp (dist/build-rev.json) — run `gru update` to build it, then restart');
     }
@@ -434,7 +435,7 @@ export class RollController {
     if (toSha === null) throw new Error('swap without a preflight target sha');
     if (state.mode === 'restart') {
       // A restart never reads git: the relaunch runs whatever dist holds.
-      const built = this.opts.readBuiltSha();
+      const built = readBuildInfo(this.opts.repoRoot).rev;
       if (built !== toSha) {
         throw new Error(`the build changed during the restart drain: expected ${toSha}, found ${built ?? 'no build stamp'}`);
       }

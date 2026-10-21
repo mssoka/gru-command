@@ -302,13 +302,15 @@ describe('roll controller drain + swap', () => {
 
   it('restart mode fails loud without a build stamp or with an incomplete build, and when the build changes mid-drain', async () => {
     const unstamped = fixture();
-    const noStamp = makeController(unstamped, { runner: scriptedRunner({ heads: [SHA_A] }).run, readBuiltSha: () => null });
+    // readBuiltSha's production fallback (the running build) must not stand in for the stamp.
+    const noStamp = makeController(unstamped, { runner: scriptedRunner({ heads: [SHA_A] }).run, readBuiltSha: () => SHA_A });
     const failed = await noStamp.controller.roll({ mode: 'restart' });
     expect(failed.phase).toBe('failed');
     expect(failed.error?.detail).toContain('no build stamp');
     expect(readRollMarker(unstamped.dataDir)).toBeNull();
 
     const partial = fixture();
+    stampBuild(partial.repoRoot, SHA_C);
     rmSync(join(partial.repoRoot, 'dist', 'main.js'));
     const incomplete = makeController(partial, { runner: scriptedRunner({ heads: [SHA_A] }).run, readBuiltSha: () => SHA_C });
     const missing = await incomplete.controller.roll({ mode: 'restart' });
@@ -316,11 +318,11 @@ describe('roll controller drain + swap', () => {
     expect(missing.error?.detail).toContain('dist/main.js is missing');
 
     const moving = fixture();
-    let built = SHA_C;
+    stampBuild(moving.repoRoot, SHA_C);
     const rebuiltMidDrain = makeController(moving, {
       runner: scriptedRunner({ heads: [SHA_A] }).run,
-      readBuiltSha: () => built,
-      probeInFlight: async () => { built = SHA_B; return []; },
+      readBuiltSha: () => SHA_C,
+      probeInFlight: async () => { stampBuild(moving.repoRoot, SHA_B); return []; },
     });
     const changed = await rebuiltMidDrain.controller.roll({ mode: 'restart' });
     expect(changed.phase).toBe('failed');
@@ -331,6 +333,7 @@ describe('roll controller drain + swap', () => {
 
   it('restart mode still refuses a foreign listener on the instance port first', async () => {
     const fix = fixture();
+    stampBuild(fix.repoRoot, SHA_C);
     const escalated: number[] = [];
     const { controller } = makeController(fix, {
       runner: scriptedRunner({ heads: [SHA_A] }).run,

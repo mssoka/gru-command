@@ -1183,6 +1183,8 @@ describe('install.sh setup mode (one-line path)', () => {
     const launched = execFileSync(launcher, ['version', '--json'], { cwd: tmpdir(), encoding: 'utf-8', env: { ...process.env, HOME: home } });
     expect(launched).toBe('FIXTURE-ROLL-RAN version --json\n');
     expect(readFileSync(launcher, 'utf-8')).toContain('# gru-command launcher (managed by install.sh)');
+    // It pins this install's instance, as the unit does.
+    expect(readFileSync(launcher, 'utf-8')).toContain(`GRU_COMMAND_HOME='${instance}'`);
 
     // Ours is refreshed by an update…
     writeFileSync(launcher, '#!/bin/sh\n# gru-command launcher (managed by install.sh)\nexit 9\n', { mode: 0o755 });
@@ -1237,25 +1239,30 @@ describe('install.sh setup mode (one-line path)', () => {
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, rendered.stdout);
 
-    // Owned, not loaded/not running: stop unloads, start and restart load.
-    for (const mode of ['--stop', '--start', '--restart']) {
+    // Owned, not loaded: a macOS stop says so (unloading it would be an
+    // error); start and restart load it. systemd's stop is idempotent.
+    const stopped = await run(install, ['--stop'], { ...base, ...plain.env });
+    expect(stopped.status).toBe(0);
+    if (darwin) expect(stopped.stdout).toContain('already stopped');
+    for (const mode of ['--start', '--restart']) {
       expect((await run(install, [mode], { ...base, ...plain.env })).status).toBe(0);
     }
     expect(calls(plain)).toEqual(darwin
-      ? [`unload ${unit}`, `load ${unit}`, `load ${unit}`]
+      ? [`load ${unit}`, `load ${unit}`]
       : ['--user stop gru-command.service', '--user start gru-command.service', '--user restart gru-command.service']);
 
-    // Loaded but not running (macOS): start and restart go through kickstart.
+    // Loaded (macOS): stop unloads, start and restart go through kickstart.
     const loaded = fakeManagerSeam(home, 'loaded-manager', [
       'case "$*" in',
       `  list*) printf -- "-\\t0\\t${label}\\n" ;;`,
       'esac',
     ]);
-    expect((await run(install, ['--start'], { ...base, ...loaded.env })).status).toBe(0);
-    expect((await run(install, ['--restart'], { ...base, ...loaded.env })).status).toBe(0);
+    for (const mode of ['--stop', '--start', '--restart']) {
+      expect((await run(install, [mode], { ...base, ...loaded.env })).status).toBe(0);
+    }
     expect(calls(loaded)).toEqual(darwin
-      ? [`kickstart ${domain}`, `kickstart -k ${domain}`]
-      : ['--user start gru-command.service', '--user restart gru-command.service']);
+      ? [`unload ${unit}`, `kickstart ${domain}`, `kickstart -k ${domain}`]
+      : ['--user stop gru-command.service', '--user start gru-command.service', '--user restart gru-command.service']);
 
     // Already running elsewhere: start is a no-op that says so.
     const running = fakeManagerSeam(home, 'running-manager', [
@@ -1274,7 +1281,7 @@ describe('install.sh setup mode (one-line path)', () => {
     for (const mode of ['--stop', '--restart']) {
       const refused = await run(install, [mode], { ...base, ...inside.env });
       expect(refused.status).not.toBe(0);
-      expect(refused.stderr).toContain("use 'gru restart' instead");
+      expect(refused.stderr).toContain("use 'gru restart --no-wait' instead");
     }
     expect(calls(inside)).toEqual([]);
 

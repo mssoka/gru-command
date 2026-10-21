@@ -505,7 +505,7 @@ require_owned_unit() {
 refuse_inside_service() {
   if inside_managed_service_pgroup; then
     err "cannot $1 the service from inside it: the service manager would end this command with it"
-    err "use 'gru restart' instead: it drains in-flight work and the service relaunches itself"
+    err "use 'gru restart --no-wait' instead: the service drains in-flight work and relaunches itself (its drain counts this session's own turn, so waiting on it would only wait out the drain bound)"
     exit 1
   fi
 }
@@ -524,10 +524,18 @@ stop_service() {
   require_owned_unit
   refuse_inside_service stop
   case "$OS" in
-    darwin) "$LAUNCHCTL_BIN" unload "$(service_target)" ;;
+    darwin)
+      # unload of a job launchd does not hold is an error, not a stop.
+      if ! launchd_job_loaded; then
+        echo "the Gru Command service is already stopped"
+        return 0
+      fi
+      "$LAUNCHCTL_BIN" unload "$(service_target)"
+      ;;
+    # systemctl stop is a no-op on an inactive unit and ends a crash loop.
     linux) "$SYSTEMCTL_BIN" --user stop gru-command.service ;;
   esac
-  echo "stopped the Gru Command service; it stays down until 'gru start' or your next login"
+  echo "stopped the Gru Command service; it stays down until 'gru start' (a reboot or your next login starts it again)"
 }
 
 start_service() {
@@ -585,21 +593,41 @@ sh_single_quote() {
   printf "'%s'" "${1//$quote/$quote\\$quote$quote}"
 }
 
+# The launcher pins what the unit pins: this install's node, its checkout and
+# its instance directory (an explicit GRU_COMMAND_HOME still wins). If the
+# node or checkout is gone it says how to repair, instead of a bare error.
+write_launcher() {
+  local node cli setup
+  node="$(sh_single_quote "$NODE_BIN")"
+  cli="$(sh_single_quote "$REPO_ROOT/dist/cli/service.js")"
+  setup="$(sh_single_quote "$REPO_ROOT/install.sh")"
+  printf '#!/bin/sh\n%s\n' "$LAUNCHER_MARKER"
+  printf 'if [ -z "${GRU_COMMAND_HOME:-}" ]; then GRU_COMMAND_HOME=%s; export GRU_COMMAND_HOME; fi\n' "$(sh_single_quote "$INSTANCE_DIR")"
+  printf 'if [ ! -x %s ] || [ ! -f %s ]; then\n' "$node" "$cli"
+  printf '  printf %s %s %s %s >&2\n' "'gru: %s or %s is missing; re-run %s to repair this command\\n'" "$node" "$cli" "$setup"
+  printf '  exit 1\nfi\n'
+  printf 'exec %s %s "$@"\n' "$node" "$cli"
+}
+
 link_cli() {
-  local launcher found
+  local launcher found staged
   launcher="$(launcher_path)"
   if [[ -e "$launcher" || -L "$launcher" ]] && ! is_our_launcher "$launcher"; then
     err "not installing the 'gru' command: $launcher exists and was not written by this installer"
     err "rename or remove it, then re-run install.sh to get 'gru'"
     return 0
   fi
-  mkdir -p "$BIN_DIR"
-  {
-    printf '#!/bin/sh\n%s\n' "$LAUNCHER_MARKER"
-    printf 'exec %s %s "$@"\n' "$(sh_single_quote "$NODE_BIN")" "$(sh_single_quote "$REPO_ROOT/dist/cli/service.js")"
-  } > "$launcher.tmp"
-  chmod 755 "$launcher.tmp"
-  mv -f "$launcher.tmp" "$launcher"
+  # Best effort: a launcher that cannot be written never stops the install
+  # or update around it (the service reconciliation still has to run).
+  if ! mkdir -p "$BIN_DIR" 2>/dev/null || ! staged="$(mktemp "$BIN_DIR/.gru.XXXXXX" 2>/dev/null)"; then
+    err "could not install the 'gru' command in $BIN_DIR; continuing without it"
+    return 0
+  fi
+  if ! write_launcher > "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$launcher"; then
+    rm -f "$staged"
+    err "could not install the 'gru' command at $launcher; continuing without it"
+    return 0
+  fi
   echo "installed the 'gru' command: $launcher"
   case ":$PATH:" in
     *":$BIN_DIR:"*)

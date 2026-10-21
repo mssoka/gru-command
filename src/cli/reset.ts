@@ -198,7 +198,8 @@ interface PlanContext {
 }
 
 const STOP_HINT =
-  'Stop it first with gru stop (or end the npm start it runs in), then run gru reset again, and start the service afterwards with gru start.';
+  'Stop it first with gru stop (or launchctl bootout gui/$(id -u)/com.gru-command.service on macOS, systemctl --user stop gru-command on Linux, ' +
+  'or end the npm start it runs in), then run gru reset again, and start the service afterwards with gru start.';
 
 export async function runResetCli(argv: readonly string[], overrides: Partial<ResetCliDeps> = {}): Promise<number> {
   const deps: ResetCliDeps = { ...defaultDeps(), ...overrides };

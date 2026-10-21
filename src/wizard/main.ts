@@ -148,8 +148,8 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
 function portInUseGuidance(host: string, port: number, holder: string): string {
   return (
     `port ${port} on ${host} is already in use — if the previous\n` +
-    '  service still runs, stop it first (./install.sh --uninstall, or\n' +
-    '  systemctl --user stop gru-command / launchctl unload …), then re-run.\n' +
+    '  service still runs, stop it first (gru stop, or ./install.sh --stop),\n' +
+    '  then re-run.\n' +
     `  (listener detected${holder === 'unknown' ? '' : ` at ${holder}`})`
   );
 }

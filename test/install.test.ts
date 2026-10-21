@@ -355,3 +355,85 @@ describe('inside_checkout heuristic (W-B)', () => {
     expect((source.match(/grep -Eq/g) ?? [])).toHaveLength(0);
   });
 });
+
+describe('the gru launcher (#463)', () => {
+  /** Run install.sh's launcher functions against controlled values; no
+   * other installer code runs. Returns the shell's exit status and output. */
+  function launcherShell(vars: Readonly<Record<string, string>>, body: string, path?: string) {
+    const installScript = join(repoRoot, 'install.sh');
+    const script = [
+      'set -euo pipefail',
+      'err() { echo "install.sh: $*" >&2; }',
+      ...Object.entries(vars).map(([name, value]) => `${name}=${shellQuote(value)}`),
+      'LAUNCHER_MARKER="# gru-command launcher (managed by install.sh)"',
+      `eval "$(sed -n '/^launcher_path()/,/^}/p;/^is_our_launcher()/,/^}/p;/^sh_single_quote()/,/^}/p;/^write_launcher()/,/^}/p;/^link_cli()/,/^}/p' ${shellQuote(installScript)})"`,
+      body,
+    ].join('\n');
+    return spawnSync('bash', ['-c', script], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: path ?? process.env.PATH ?? '' },
+    });
+  }
+
+  function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, `'"'"'`)}'`;
+  }
+
+  function stage() {
+    const root = mkdtempSync(join(tmpdir(), 'gru-launcher-'));
+    cleanupDirs.push(root);
+    // A clone and an instance whose paths need quoting.
+    const clone = join(root, "clone it's");
+    mkdirSync(join(clone, 'dist', 'cli'), { recursive: true });
+    writeFileSync(join(clone, 'dist', 'cli', 'service.js'),
+      "console.log(`HOME=${process.env.GRU_COMMAND_HOME} ARGS=${process.argv.slice(2).join('|')}`);\n");
+    const bin = join(root, 'bin');
+    const instance = join(root, 'inst ance');
+    const node = realpathSync(process.execPath);
+    return { root, clone, bin, instance, node, vars: { BIN_DIR: bin, REPO_ROOT: clone, NODE_BIN: node, INSTANCE_DIR: instance } };
+  }
+
+  it('pins node, checkout and instance, quotes every path, and runs from any directory', () => {
+    const { bin, instance, vars } = stage();
+    const linked = launcherShell(vars, 'link_cli');
+    expect(linked.status, linked.stderr).toBe(0);
+    const launcher = join(bin, 'gru');
+    const run = (env: NodeJS.ProcessEnv) => spawnSync(launcher, ['status', 'a b'], { cwd: tmpdir(), encoding: 'utf8', env });
+    const { GRU_COMMAND_HOME: _ignored, ...withoutHome } = process.env;
+    expect(run(withoutHome).stdout).toBe(`HOME=${instance} ARGS=status|a b\n`);
+    // An explicit instance still wins over the pinned one.
+    expect(run({ ...withoutHome, GRU_COMMAND_HOME: '/explicit' }).stdout).toBe('HOME=/explicit ARGS=status|a b\n');
+  });
+
+  it('a vanished node or checkout names the repair instead of a bare exec error', () => {
+    const { bin, clone, vars } = stage();
+    expect(launcherShell({ ...vars, NODE_BIN: join(clone, 'gone', 'node') }, 'link_cli').status).toBe(0);
+    const broken = spawnSync(join(bin, 'gru'), ['version'], { encoding: 'utf8' });
+    expect(broken.status).toBe(1);
+    expect(broken.stderr).toContain(`re-run ${clone}/install.sh to repair this command`);
+  });
+
+  it('warns about a gru earlier on PATH, and stays quiet when ours is first', () => {
+    const { root, bin, vars } = stage();
+    const decoys = join(root, 'decoys');
+    mkdirSync(decoys);
+    writeFileSync(join(decoys, 'gru'), '#!/bin/sh\necho decoy\n', { mode: 0o755 });
+    const shadowed = launcherShell(vars, 'link_cli', `${decoys}:${bin}:${process.env.PATH ?? ''}`);
+    expect(shadowed.status).toBe(0);
+    expect(shadowed.stderr).toContain(`another 'gru' comes first on your PATH: ${decoys}/gru`);
+    const first = launcherShell(vars, 'link_cli', `${bin}:${decoys}:${process.env.PATH ?? ''}`);
+    expect(first.status).toBe(0);
+    expect(first.stderr).toBe('');
+    expect(first.stdout).not.toContain('not on your PATH');
+  });
+
+  it('a launcher that cannot be written never stops the install around it', () => {
+    const { root, vars } = stage();
+    const blocker = join(root, 'blocker');
+    writeFileSync(blocker, 'a file where the bin dir would go\n');
+    const blocked = launcherShell({ ...vars, BIN_DIR: join(blocker, 'bin') }, 'link_cli; echo "install continues"');
+    expect(blocked.status).toBe(0);
+    expect(blocked.stdout).toContain('install continues');
+    expect(blocked.stderr).toContain("could not install the 'gru' command");
+  });
+});

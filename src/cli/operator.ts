@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import type { GruCommandConfig } from '../config.js';
 import type { BuildInfo } from '../build-info.js';
 import type { DeployDriftView } from '../board/deploy-drift.js';
@@ -23,7 +23,10 @@ export function installerRunnerFor(packageRoot: string): InstallerRunner {
       process.stderr.write(`gru: ${packageRoot} is not a Gru Command checkout (no install.sh) — reinstall with the one-line installer\n`);
       return 1;
     }
-    const result = spawnSync('bash', [script, ...args], { stdio: 'inherit' });
+    // install.sh resolves `node` from PATH: hand it the node this command was
+    // pinned to, never whatever the caller's shell would find first.
+    const path = [dirname(process.execPath), process.env['PATH'] ?? ''].join(delimiter);
+    const result = spawnSync('bash', [script, ...args], { stdio: 'inherit', env: { ...process.env, PATH: path } });
     if (result.error !== undefined) {
       process.stderr.write(`gru: could not run ${script}: ${result.error.message}\n`);
       return 1;
@@ -125,7 +128,8 @@ export function runLogsCli(args: readonly string[], deps: LogsCliDeps): number {
     deps.stderr(`gru: no service log at ${file} — the service has not written one yet (start it with: gru start)`);
     return 1;
   }
-  return deps.runTail(['-n', String(lines), ...(follow ? ['-f'] : []), file]);
+  // -F follows the name, so following survives the logger's rotation.
+  return deps.runTail(['-n', String(lines), ...(follow ? ['-F'] : []), file]);
 }
 
 // ---------------------------------------------------------------------------

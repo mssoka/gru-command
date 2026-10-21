@@ -53,7 +53,7 @@ Node as the unit, from any directory, and the installer never replaces a
 
 ```bash
 gru update                # install.sh --update from anywhere
-gru restart [--now]       # graceful by default: drain, relaunch the same build, verify
+gru restart [--now]       # graceful by default: drain, relaunch the installed build, verify
 gru stop | gru start      # install.sh --stop / --start
 gru status [--json]       # running vs installed build, drift from main; exit 1 when down
 gru logs [-f] [-n N]      # the service log
@@ -70,7 +70,11 @@ the relaunch and the `/health` check. Use it to apply `config.toml` edits.
 recovery resumes the turns it cut. From inside the service (an agent's
 shell), `gru stop` and `gru restart --now` refuse, because the service
 manager would end them with the service; `gru restart` and `gru update`
-work there.
+work there. Pass `--no-wait` to `gru restart` from inside: the drain counts
+the calling session's own turn, so waiting would only sit out the drain
+bound. The CLI reads the instance's `config.toml` to reach the service, so
+after an edit to `[server]` host/port or `[auth]` token use
+`gru restart --now`.
 
 **Noticing a release.** The board's `deploy` check is the operator-facing
 update signal. Every 5 minutes the service reads `origin/main` and the
@@ -108,9 +112,9 @@ tail -f ~/.gru-command/logs/service.log    # the structured stream (or: gru logs
 Linux (systemd user unit):
 
 ```bash
-systemctl --user status gru-command
-systemctl --user restart gru-command
-journalctl --user -u gru-command -f        # systemd's capture mirror
+systemctl --user status gru-command      # (or: gru status)
+systemctl --user restart gru-command     # restart now (or: gru restart --now)
+journalctl --user -u gru-command -f        # systemd's capture mirror (or: gru logs -f)
 loginctl enable-linger $USER               # keep it running when logged out
 ```
 
@@ -165,8 +169,7 @@ min), `restart_window_ms` / `max_restarts` / `restart_backoff_ms`, and
 
 To talk to the Gru brain directly with a runtime CLI (pi or claude):
 
-1. **Stop the service first** (`./install.sh --uninstall`, or
-   `systemctl --user stop gru-command` / `launchctl unload …`). The stop
+1. **Stop the service first** (`gru stop`, or `./install.sh --stop`). The stop
    releases every session lock — single-writer is preserved BY the stop,
    never raced.
 2. Find the newest session file: `/health` declares the session path

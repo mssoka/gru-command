@@ -293,7 +293,7 @@ checkout's CLI from any directory:
 
 ```bash
 gru update              # pull main, rebuild, restart (same as ./install.sh --update)
-gru restart             # apply config.toml edits: drain in-flight turns, relaunch the same build
+gru restart             # apply config.toml edits: drain in-flight turns, relaunch the installed build
 gru restart --now       # restart at once; boot recovery resumes the turns it cut
 gru stop                # stop the service (down until gru start or your next login)
 gru start               # start it again
