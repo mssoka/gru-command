@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertClaudeDirectiveToolIntent, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint,
-  prepareClaudeDirectiveBinding, prepareDirectiveBinding, readDirectiveSessionHeader, type DirectiveTurnIdentity,
+  prepareClaudeDirectiveBinding, prepareDirectiveBinding, readDirectiveBinding, readDirectiveSessionHeader, type DirectiveTurnIdentity,
 } from '../src/runtime/directive-checkpoint.js';
 
 /**
@@ -421,5 +421,145 @@ describe('bounded reads (#469)', () => {
     piEntry(turn, 'receipt', null, prompt(text));
     grows(turn);
     expect(() => inspectDirectiveCheckpoint(turn, identity)).toThrow(/^native transcript changed during bounded inspection$/u);
+  });
+});
+
+describe('the pi tool fence reads its own admission and the whole live turn (#469)', () => {
+  const RECEIPT_CHANGED = /^actual native admission user receipt unavailable\/changed$/u;
+  const NOT_PERSISTED = /^native tool intent is not persisted before execution or its invocation\/results changed$/u;
+  it('refuses a receipt with another prompt or another parent', () => {
+    const prompted = sessionFile(piHeader);
+    preparePi(prompted);
+    piEntry(prompted, 'invocation', piEntry(prompted, 'receipt', null, prompt('a different prompt')), invocation);
+    expect(() => flushDirectiveToolIntent(prompted, invocation, toolCall, identity)).toThrow(RECEIPT_CHANGED);
+
+    const parented = sessionFile(piHeader);
+    piEntry(parented, 'h0', null, prompt('earlier'));
+    expect(preparePi(parented).baseline).toBe('h0');
+    piEntry(parented, 'invocation', piEntry(parented, 'receipt', null, prompt(text)), invocation);
+    expect(() => flushDirectiveToolIntent(parented, invocation, toolCall, identity)).toThrow(RECEIPT_CHANGED);
+  });
+
+  it('refuses a call whose result reuses a history id, or a torn live tail', () => {
+    const reused = sessionFile(piHeader);
+    piEntry(reused, 'h0', null, prompt('earlier'));
+    preparePi(reused);
+    const asked = piEntry(reused, 'invocation', piEntry(reused, 'receipt', 'h0', prompt(text)), invocation);
+    expect(() => flushDirectiveToolIntent(reused, invocation, toolCall, identity)).not.toThrow();
+    piEntry(reused, 'h0', asked, toolResult('call-1'));
+    expect(() => flushDirectiveToolIntent(reused, invocation, toolCall, identity)).toThrow(NOT_PERSISTED);
+
+    const torn = sessionFile(piHeader);
+    preparePi(torn);
+    piEntry(torn, 'invocation', piEntry(torn, 'receipt', null, prompt(text)), invocation);
+    appendFileSync(torn, '{"type":"message","id":"torn"');
+    expect(() => flushDirectiveToolIntent(torn, invocation, toolCall, identity)).toThrow(/^native transcript has a partial entry$/u);
+  });
+
+  it('allows the next call after many settled ones: the live turn is read to its end', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    let parent = piEntry(file, 'receipt', null, prompt(text));
+    for (let index = 0; index < 40; index += 1) {
+      const call = { ...toolCall, id: `call-${index}` };
+      parent = piEntry(file, `result-${index}`, piEntry(file, `use-${index}`, parent, { ...invocation, content: [call] }), toolResult(call.id));
+    }
+    const next = { ...toolCall, id: 'call-40' };
+    const asked = { ...invocation, content: [next] };
+    piEntry(file, 'use-40', parent, asked);
+    expect(() => flushDirectiveToolIntent(file, asked, next, identity)).not.toThrow();
+  });
+});
+
+describe('pinned identities and read refusals (#469)', () => {
+  it('refuses a receipt with an empty id or the header\'s own id', () => {
+    for (const id of ['', 'pi-session']) {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      piEntry(file, id, null, prompt(text));
+      expect(() => inspectDirectiveAdmission(file, identity), id).toThrow(/^malformed\/rebound native admission prefix$/u);
+      expect(inspectDirectiveCheckpoint(file, identity), id).toEqual({ state: 'unknown', reason: MALFORMED });
+      expect(readDirectiveBinding(file, identity.requestId)?.userEntryId, id).toBeNull();
+    }
+  });
+
+  it('a read refusal past a pi terminal propagates; a torn header refuses', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const final = piEntry(file, 'answer', piEntry(file, 'receipt', null, prompt(text)), answer);
+    appendFileSync(file, `${JSON.stringify({ type: 'model_change', id: 'model', parentId: final, provider: 'fixture', modelId: 'next' })}\n{"type":"message","id":"torn"`);
+    expect(() => inspectDirectiveCheckpoint(file, identity)).toThrow(/^native transcript has a partial entry$/u);
+
+    const header = sessionFile(piHeader);
+    preparePi(header);
+    writeFileSync(header, '{"type":"session","id":"pi-session"');
+    expect(() => inspectDirectiveCheckpoint(header, identity)).toThrow(/^native transcript has a partial entry$/u);
+  });
+
+  it('Claude Code: a torn live tail is no refusal, the checkpoint publishes admission, and the header bound holds at binding', () => {
+    const file = sessionFile(claudeHeader);
+    prepareClaude(file);
+    frames(file, init, echo(), use);
+    appendFileSync(file, '{"type":"assistant","uu');
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native directive turn has no result yet' });
+    expect(() => assertClaudeDirectiveToolIntent(file, identity, 't1', 'Read', { file_path: '/x' })).not.toThrow();
+
+    const published = sessionFile(claudeHeader);
+    prepareClaude(published);
+    frames(published, init, echo(), done());
+    expect(readDirectiveBinding(published, identity.requestId)?.userEntryId).toBeNull();
+    expect(inspectDirectiveCheckpoint(published, identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(readDirectiveBinding(published, identity.requestId)?.userEntryId).toBe('echo-1');
+
+    const header = sessionFile({ ...claudeHeader, cwd: `/${'x'.repeat(64 * 1024)}` });
+    expect(() => prepareClaude(header)).toThrow(/^native session header exceeds the 65536-byte inspection limit$/u);
+  });
+});
+
+describe('limits at their exact boundaries (#469)', () => {
+  /** A Claude turn (init, echo, `rows`, result) of exactly `bytes`, or `count` lines. */
+  function claudeTurn(rows: (file: string, start: number) => void): string {
+    const file = sessionFile(claudeHeader);
+    prepareClaude(file);
+    const start = statSync(file).size;
+    frames(file, init, echo());
+    rows(file, start);
+    frames(file, done());
+    return file;
+  }
+  const doneBytes = Buffer.byteLength(`${JSON.stringify(done())}\n`);
+  const turnOfBytes = (bytes: number) => claudeTurn((file, start) => {
+    const frame = (body: string) => `${JSON.stringify({ type: 'assistant', uuid: 'filler', message: { role: 'assistant', content: [{ type: 'text', text: body }] } })}\n`;
+    appendFileSync(file, frame('x'.repeat(bytes - (statSync(file).size - start) - doneBytes - Buffer.byteLength(frame('')))));
+  });
+  const turnOfLines = (lines: number) => claudeTurn((file) => appendRows(file, lines - 3, () => ({ type: 'stream_event', session_id: 'cli-session' })));
+
+  it('a turn of exactly 32 MiB or 250,000 entries is read; one byte or one entry more refuses', () => {
+    const exact = turnOfBytes(LIMIT);
+    expect(inspectDirectiveCheckpoint(exact, identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(() => inspectDirectiveCheckpoint(turnOfBytes(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
+    expect(inspectDirectiveCheckpoint(turnOfLines(250_000), identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(() => inspectDirectiveCheckpoint(turnOfLines(250_001), identity)).toThrow(/^native directive turn exceeds the entry inspection limit$/u);
+  });
+
+  it('a header line of exactly 64 KiB is read; one byte more refuses', () => {
+    const header = (bytes: number) => {
+      const line = (cwd: string) => JSON.stringify({ ...piHeader, cwd });
+      return sessionFile(JSON.parse(line(`/${'x'.repeat(bytes - Buffer.byteLength(line('/')))}`)) as Record<string, unknown>);
+    };
+    expect(readDirectiveSessionHeader(header(64 * 1024))).toMatchObject({ type: 'session', id: 'pi-session' });
+    expect(() => readDirectiveSessionHeader(header(64 * 1024 + 1))).toThrow(/^native session header exceeds the 65536-byte inspection limit$/u);
+  });
+
+  it('pi: a lookahead past a terminal has its own entry bound, never the earlier turn\'s', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const final = piEntry(file, 'answer-a', piEntry(file, 'receipt-a', null, prompt(text)), answer);
+    // The turn holds 2 entries; 249,999 controls and the next receipt make 250,000 more.
+    appendRows(file, 249_999, (index) => ({ type: 'thinking_level_change', id: `level-${index}`, parentId: index === 0 ? final : `level-${index - 1}`, thinkingLevel: 'low' }));
+    preparePi(file, laterIdentity, 'the next approved step');
+    piEntry(file, 'receipt-b', 'level-249998', prompt('the next approved step'));
+    expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final });
   });
 });
