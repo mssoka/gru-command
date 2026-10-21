@@ -3363,7 +3363,7 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     expect(measure(frames)).toBeNull();
   });
 
-  it('an errored turn measures nothing: the provider never measured its failing request (owner ruling 2026-10-21)', () => {
+  it('an errored turn measures nothing (owner ruling 2026-10-21)', () => {
     expect(measure(inBandErrorTurn())).toBeNull();
     expect(measure(withResult((result) => ({ ...result, is_error: true })))).toBeNull();
   });
@@ -3378,6 +3378,8 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
         usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } },
     };
     expect(measure([...frames, noResponse, result])).toEqual(MEASURED);
+    // A turn whose only reply is synthetic made no API call: nothing measures it.
+    expect(measure([noResponse, result])).toBeNull();
   });
 
   it('a native compaction inside the turn resets the measurement until a later call', () => {
@@ -3388,7 +3390,7 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     expect(measure([...frames, { type: 'compact_boundary', session_id: 'recorded-session' }, result])).toBeNull();
     const lastMain = frames[lastMainIndex(frames)]!;
     expect(measure([...frames, boundary, lastMain, result])).toEqual(MEASURED);
-    // A subagent's compaction is another context: the main measurement stands.
+    // A subagent's compaction (a synthesized shape) is another context: the main measurement stands.
     expect(measure([...frames, { ...boundary, parent_tool_use_id: 'toolu_subagent_context_461' }, result])).toEqual(MEASURED);
   });
 

@@ -181,15 +181,15 @@ is idle it shows the runtime's own `getContextUsage()` value as
   turn's last main-thread API call sent, so that call's own reply is not yet
   counted. The window is the one the result frame reports for that model.
   There is no estimate and no model-to-window table.
-  - Its pill reads "Context unavailable" until a turn ends measured.
-  - That covers a fresh spawn, a restart's resume, a New chat and a
-    compaction.
-  - It also covers a turn that ended in an error, such as a usage limit or a
-    too-long prompt, whose end state the provider never measured.
-  - So does a turn that made no API call, or whose result carries no usable
-    window.
+  Its pill reads "Context unavailable" until a turn ends measured, so it
+  is unavailable:
+  - after a fresh spawn, a restart's resume, a New chat or a compaction;
+  - after a turn that ended in an error, such as a usage limit or a
+    too-long prompt (owner ruling 2026-10-21);
+  - after a turn that made no API call, or whose result carries no window
+    that fits its prompt.
 
-The controls:
+Compact context and New chat are the row's controls:
 
 - **Compact context** invokes the active provider's native control in the
   same session. Pi uses its SDK compactor; Claude executes a dedicated

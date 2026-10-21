@@ -269,8 +269,8 @@ export class ClaudeTurnTranslator {
   /** Provider-reported context usage after this turn (#461): the latest
    * main-thread call's whole prompt over the result's window for that call's
    * model. Null until both halves are present and well formed — no window
-   * table, no estimate. Also null after an errored turn, whose end state
-   * the provider never measured (owner ruling 2026-10-21), and when the
+   * table, no estimate. Also null after a turn whose result is an error
+   * (owner ruling 2026-10-21: an errored turn leaves no measurement), and when the
    * prompt exceeds the window: a call that succeeded fit its window, so the
    * window cannot be that call's. */
   get contextUsage(): ContextUsage | null {

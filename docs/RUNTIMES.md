@@ -88,11 +88,13 @@ single-operation queue.
     `modelUsage[<that frame's model>].contextWindow`. That map's token
     counts are cumulative over the turn and are not used.
   - Usage is `null` when any of these holds:
+    - the turn made no API call, or its latest main-thread frame has
+      malformed usage or no model;
     - the window is missing;
     - the prompt exceeds the window (a call that succeeded fit its window,
       so that window cannot be the call's);
-    - the turn's result is an error, whose end state the provider never
-      measured (owner ruling 2026-10-21; pi keeps reporting);
+    - the turn's result is an error (owner ruling 2026-10-21: an errored
+      turn leaves no measurement);
     - a turn or compaction has started, until a turn ends with a measured
       result;
     - the handle is fresh or resumed and has not yet had such a turn.
