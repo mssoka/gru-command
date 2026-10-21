@@ -2635,3 +2635,148 @@ async function assertAuthenticatedRebriefClearance(revoke: boolean) {
 }
 it('authenticated HTTP rebrief gate refusal preserves the original accepted request until shared reconsideration positively clears it', () => assertAuthenticatedRebriefClearance(false));
 it('authenticated HTTP rebrief reconsideration rechecks owner authority after awaited clearance before native work', () => assertAuthenticatedRebriefClearance(true));
+
+describe('fresh-session successor and orphaned recovery debt (#470)', () => {
+  const recoverPath = (requestId: string): string => `/api/silas/directives/${encodeURIComponent(requestId)}/recover`;
+  const minionSpawns = (h: Harness) => h.spawns.filter((spawn) => spawn.role === 'minion');
+
+  it('rebrief-successor retires a stuck never-admitted request and admits a fresh-session rebrief on the same lane; the debt settles on that admission and a replay starts no second worker', async () => {
+    let blockers: readonly string[] = [];
+    const h = await boot({ pendingProducerBlockers: () => blockers }); const repo = makeFixtureRepo('rebrief-successor-http'); cleanupRepos.push(repo);
+    const jobId = 'fresh-session-job';
+    const { lane, row } = await seededLiveRequest(h, repo, jobId, 'stuck-continuation');
+    // The job's minion is resident on the session the stuck request would resume.
+    const resident = await h.registry.spawn('minion', { cwd: lane.path, agentId: 'resident-minion' });
+    h.ledger.registerAgent({ id: resident.id, role: 'minion', jobId, sessionFile: resident.sessionFile, parentage: 'top-level' });
+    h.ledger.setAgentState(resident.id, 'idle');
+    const debt = h.ledger.openDirectiveRecoveryDebt(row.requestId, 'accepted, never admitted');
+    const authority = h.ledger.directiveCurrentAuthority(jobId);
+    const body = { by: 'gru', expected_generation: debt.generation, expected_payload_hash: row.payloadHash, expected_head: laneHead(lane),
+      expected_epoch: h.ledger.directiveRecoveryEpoch(jobId), expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256,
+      reason: 'the stuck request can only be finished in a fresh session',
+      decision: { kind: 'rebrief-successor', request_id: 'fresh-session-rebrief', note: 'finish the approved scope from current artifacts' } };
+    const watermark = h.ledger.latestEventSeq();
+    // Native directive debt only; a missing note or current authority is malformed.
+    expect((await call(h.port, 'POST', `/api/silas/rebriefs/${row.requestId}/recover`, body, TOKEN)).status).toBe(400);
+    expect((await call(h.port, 'POST', recoverPath(row.requestId), { ...body, decision: { kind: 'rebrief-successor', request_id: 'fresh-session-rebrief' } }, TOKEN)).status).toBe(400);
+    expect((await call(h.port, 'POST', recoverPath(row.requestId), { ...body, expected_work_revision: undefined }, TOKEN)).status).toBe(400);
+    for (const stale of [{ expected_generation: debt.generation + 1 }, { expected_payload_hash: 'b'.repeat(64) }, { expected_head: 'c'.repeat(40) },
+      { expected_epoch: 99 }, { expected_work_revision: authority.workRevision + 1 }, { expected_contract_sha256: 'd'.repeat(64) }]) {
+      const refused = await call(h.port, 'POST', recoverPath(row.requestId), { ...body, ...stale }, TOKEN);
+      expect(refused.status, JSON.stringify(stale)).toBe(409);
+    }
+    blockers = ['supervised restart pending'];
+    const live = await call(h.port, 'POST', recoverPath(row.requestId), body, TOKEN);
+    expect(live.status).toBe(409); expect(live.json).toMatchObject({ error: 'recovery_refused', detail: expect.stringContaining('cessation is not proven') });
+    blockers = [];
+    expect(h.ledger.latestEventSeq()).toBe(watermark);
+    expect(h.ledger.getDirective(row.requestId)?.state).toBe('dispatching'); expect(h.ledger.getDirective('fresh-session-rebrief')).toBeNull();
+    const before = minionSpawns(h).length;
+    const accepted = await call(h.port, 'POST', recoverPath(row.requestId), body, TOKEN);
+    expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    expect(accepted.json).toMatchObject({ idempotent: false, successor_request_id: 'fresh-session-rebrief' });
+    expect(h.ledger.getDirective(row.requestId)?.state).toBe('retired');
+    await waitFor(() => h.ledger.getDirective('fresh-session-rebrief')?.state === 'settled', 'the fresh-session rebrief to settle');
+    const successor = h.ledger.getDirective('fresh-session-rebrief')!;
+    expect(successor.requestKind).toBe('rebrief'); expect(successor.nativeBinding).not.toBeNull();
+    // Fresh session on the same lane: the resident session was disposed and
+    // the successor's minion spawned without resuming any transcript.
+    expect(resident.cessationEvidence!()).toBe('ceased');
+    expect(minionSpawns(h)).toHaveLength(before + 1);
+    expect(minionSpawns(h).at(-1)?.options).toMatchObject({ cwd: lane.path }); expect(minionSpawns(h).at(-1)?.options.resumeFile).toBeUndefined();
+    expect(h.ledger.getObligation(debt.id)).toMatchObject({ state: 'settled',
+      settlement: { kind: 'executed-action', evidenceEventSeq: successor.admissionSeq, evidenceEventKind: 'silas.directive-sent' } });
+    const events = h.ledger.latestEventSeq();
+    const replay = await call(h.port, 'POST', recoverPath(row.requestId), body, TOKEN);
+    expect(replay.status).toBe(200); expect(replay.json).toMatchObject({ idempotent: true, successor_request_id: 'fresh-session-rebrief' });
+    expect(h.ledger.latestEventSeq()).toBe(events); expect(minionSpawns(h)).toHaveLength(before + 1);
+  });
+
+  /** The live case: `revision-continuation:rt-agencies-motion:3` accepted at
+   * revision 3, stuck in dispatching (never admitted), retired, then the
+   * work done by a separate fresh-session rebrief. */
+  async function orphanedRetirement(name: string) {
+    const h = await boot(); const repo = makeFixtureRepo(name); cleanupRepos.push(repo);
+    const jobId = 'rt-agencies-motion'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
+    const amendments = [1, 2, 3].map((version) => {
+      const added = h.ledger.addJobAmendment({ jobId, body: `Approved revision ${version} requirement.`, supersedes: [],
+        approval: { by: 'owner', reference: `PR #769 revision ${version}` }, effect: 'material', expectedContractSha256: h.ledger.directiveCurrentAuthority(jobId).contractSha256 });
+      if (added.status !== 'accepted') throw new Error(`fixture amendment ${version} was not accepted`);
+      return added.amendment;
+    });
+    // An earlier request that really ran, before the stuck one was accepted.
+    expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, directive: 'earlier approved slice', request_id: 'earlier-directive' }, TOKEN)).status).toBe(202);
+    await waitFor(() => h.ledger.getDirective('earlier-directive')?.state === 'settled', 'the earlier directive to settle');
+    const stuck = h.ledger.beginDirectiveIntent({ jobId, requestId: 'revision-continuation:rt-agencies-motion:3', directive: 'continue revision 3', holder: 'gru' }).record;
+    expect(stuck.workRevision).toBe(3);
+    const debt = h.ledger.openDirectiveRecoveryDebt(stuck.requestId, 'accepted, never admitted: no native target, binding or minion');
+    expect(debt.id).toBe('rt-agencies-motion:operation:directive-recovery:revision-continuation:rt-agencies-motion:3');
+    expect((await retire(h, stuck.requestId, laneHead(lane))).status).toBe(200);
+    const body = (admittedRequestId: string) => ({ by: 'gru', expected_generation: debt.generation, expected_payload_hash: stuck.payloadHash,
+      expected_head: laneHead(lane), expected_epoch: h.ledger.directiveRecoveryEpoch(jobId),
+      reason: 'the retired request\'s approved work was completed by a later fresh-session rebrief',
+      decision: { kind: 'reconcile-admitted', admitted_request_id: admittedRequestId } });
+    const rebrief = async (requestId: string) => {
+      expect((await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'finish revision 3 in a fresh session', request_id: requestId }, TOKEN)).status).toBe(202);
+      await waitFor(() => h.ledger.getDirective(requestId)?.state === 'settled', `rebrief ${requestId} to settle`);
+      return h.ledger.getDirective(requestId)!;
+    };
+    return { h, jobId, lane, amendments, stuck, debt, body, rebrief };
+  }
+
+  it('orphan settlement settles a retired request\'s open debt against the later fresh-session rebrief admission, and refuses without a later admission', async () => {
+    const { h, jobId, stuck, debt, body, rebrief } = await orphanedRetirement('orphan-settlement');
+    const refuse = async (requestId: string, pattern: RegExp) => {
+      const before = h.ledger.latestEventSeq();
+      const refused = await call(h.port, 'POST', recoverPath(stuck.requestId), body(requestId), TOKEN);
+      expect(refused.status, requestId).toBe(409); expect(field<string>(refused.json, 'detail'), requestId).toMatch(pattern);
+      expect(h.ledger.latestEventSeq(), requestId).toBe(before); expect(h.ledger.getObligation(debt.id)?.state, requestId).toBe('open');
+    };
+    // No later admission: an unknown request, the retired request itself, an admission before the retirement.
+    await refuse('rebrief:rt-agencies-motion:rev3-fresh-session', /not one/u);
+    await refuse(stuck.requestId, /not one/u);
+    await refuse('earlier-directive', /before the retirement/u);
+    const admitted = await rebrief('rebrief:rt-agencies-motion:rev3-fresh-session');
+    expect(admitted).toMatchObject({ requestKind: 'rebrief', workRevision: 3 });
+    // The defect: neither the retirement nor the later admission settled the debt.
+    expect(h.ledger.getObligation(debt.id)).toMatchObject({ state: 'open', settlement: null });
+    // Executing recovery is impossible on a retired request.
+    expect((await call(h.port, 'POST', recoverPath(stuck.requestId), { ...body(admitted.requestId), expected_work_revision: 3,
+      expected_contract_sha256: h.ledger.directiveCurrentAuthority(jobId).contractSha256,
+      decision: { kind: 'successor', request_id: 'too-late-successor', directive: 'redo revision 3' } }, TOKEN)).status).toBe(409);
+    expect((await call(h.port, 'POST', recoverPath(stuck.requestId), { ...body(admitted.requestId), expected_generation: debt.generation + 1 }, TOKEN)).status).toBe(409);
+    expect((await call(h.port, 'POST', recoverPath(stuck.requestId), { ...body(admitted.requestId), expected_head: 'c'.repeat(40) }, TOKEN)).status).toBe(409);
+    const spawns = h.spawns.length;
+    const settled = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);
+    expect(settled.status, JSON.stringify(settled.json)).toBe(200);
+    expect(settled.json).toMatchObject({ idempotent: false, successor_request_id: null });
+    expect(h.ledger.getObligation(debt.id)).toMatchObject({ state: 'settled',
+      settlement: { kind: 'executed-action', evidenceEventSeq: admitted.admissionSeq, evidenceEventKind: 'silas.directive-sent' } });
+    const decision = h.ledger.latestJobEvent(jobId, 'silas.directive-recovery-decided')!;
+    expect(decision.payload).toMatchObject({ request_id: stuck.requestId, generation: debt.generation,
+      decision: { kind: 'reconcile-admitted', admittedRequestId: admitted.requestId },
+      admission: { request_id: admitted.requestId, admission_seq: admitted.admissionSeq, work_revision: 3, retired_work_revision: 3, lane_id: jobId,
+        retirement_seq: h.ledger.latestJobEventByRequestId(jobId, 'silas.directive-retired', stuck.requestId)!.seq } });
+    expect(h.spawns).toHaveLength(spawns); // non-executing
+    const events = h.ledger.latestEventSeq();
+    const replay = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);
+    expect(replay.status).toBe(200); expect(replay.json).toMatchObject({ idempotent: true, successor_request_id: null });
+    expect(h.ledger.latestEventSeq()).toBe(events);
+    const readback = await call(h.port, 'GET', `/api/silas/directives/${encodeURIComponent(stuck.requestId)}`, undefined, TOKEN);
+    expect(readback.json).toMatchObject({ state: 'retired', recovery_decision: { successorId: null, eventSeq: decision.seq } });
+  });
+
+  it('orphan settlement refuses a later admission that carries a lower work revision', async () => {
+    const { h, jobId, amendments, stuck, debt, body, rebrief } = await orphanedRetirement('orphan-lower-revision');
+    // An administrative amendment withdraws revision 3: the next request carries revision 2.
+    expect(h.ledger.addJobAmendment({ jobId, body: 'Revision 3 requirement withdrawn.', supersedes: [`amendment:${amendments[2]!.id}`],
+      approval: { by: 'owner', reference: 'PR #769 withdrawal' }, effect: 'administrative',
+      expectedContractSha256: h.ledger.directiveCurrentAuthority(jobId).contractSha256 }).status).toBe('accepted');
+    const admitted = await rebrief('rebrief:rt-agencies-motion:rev2-fresh-session');
+    expect(admitted.workRevision).toBe(2);
+    const before = h.ledger.latestEventSeq();
+    const refused = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);
+    expect(refused.status).toBe(409); expect(field<string>(refused.json, 'detail')).toMatch(/work revision 2, lower than/u);
+    expect(h.ledger.latestEventSeq()).toBe(before); expect(h.ledger.getObligation(debt.id)?.state).toBe('open');
+  });
+});

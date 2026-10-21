@@ -359,6 +359,80 @@ debt. Generic Ops holds or notification prose cannot cover recovery debt.
 The existing bearer boundary authenticates the call; `by` remains audit
 attribution, not cryptographic role identity.
 
+### Fresh-session successor (#470)
+
+A `successor` is a directive, and every directive resumes the worker's
+existing session. When that session cannot be resumed (for example its
+transcript is over the inspection limit), name a **fresh-session**
+successor instead:
+
+```json
+"decision": {
+  "kind": "rebrief-successor",
+  "request_id": "<explicit fresh unused ID>",
+  "note": "<concrete approved follow-through>"
+}
+```
+
+The rest of the body is the same as for `successor`, including the
+current `expected_work_revision` and `expected_contract_sha256`. It takes
+the same fences in the same transaction: generation, payload hash, HEAD,
+epoch, current revision and contract, owner stops, and proven producer
+cessation (a live, queued or unproven producer refuses with 409). The
+stuck request is retired and the successor is accepted as a **rebrief**,
+the one request kind dispatched with a fresh session. It runs on the same
+job lane, branch and PR, and any resident session is disposed first. The
+debt settles on the successor's actual native admission, never on
+acceptance. An identical replay appends nothing and starts no second
+worker. Only `/api/silas/directives/{id}/recover` accepts this kind; a
+legacy marker's `/recover` refuses it with 400.
+
+### Settling an orphaned retired request (#470)
+
+A request retired outside `/recover` (for example by the standalone
+`/retire`) keeps its open recovery debt: retirement grants no authority
+and settles nothing. If its approved work was later completed by a
+separate request, Gru settles that debt with an explicit, non-executing
+judgment that names the later request:
+
+```json
+{
+  "by": "gru",
+  "expected_generation": 1,
+  "expected_payload_hash": "<the retired request's accepted hash>",
+  "expected_head": "<fresh checkout HEAD>",
+  "expected_epoch": 0,
+  "reason": "approved work completed by the later fresh-session rebrief",
+  "decision": { "kind": "reconcile-admitted", "admitted_request_id": "<later admitted request>" }
+}
+```
+
+The ledger checks, in one transaction, that:
+
+- the generation, payload hash, HEAD and epoch are current;
+- the subject request is `retired` (a live request takes a successor
+  decision instead) and its debt is open or waiting and unclaimed;
+- the retirement bound the job's current single live lane;
+- the named request is a different request of the same job with an
+  actual native admission (its correlated `silas.directive-sent`), and
+  that admission comes **after** the retirement;
+- its work revision is the same as or higher than the retired request's.
+
+A request that was only accepted, an admission that predates the
+retirement, a lower or unknown revision, and a request of another job
+are each refused with 409; nothing changes. Admission requires the job's
+single live lane, so an admission after the retirement on that same live
+lane ran on the lane the retirement bound.
+
+On success, `silas.directive-recovery-decided` records the decision and
+an `admission` block (the admitted request, its admission seq, minion,
+revision, the retired revision, the retirement seq and the lane). The
+debt settles as `executed-action`, citing that admission's
+`silas.directive-sent` event, and the action-required card resolves. No
+worker starts and no work revision or current authority is required. An
+identical replay returns `idempotent: true` and appends nothing. There
+is no age policy: an orphan settles only through this explicit call.
+
 Historical `pending_rebriefs` retain their original markers and audit.
 Their old blind replay/fresh-session boot pipeline is removed. Spent
 correlated evidence can settle, and terminal administrative retirement

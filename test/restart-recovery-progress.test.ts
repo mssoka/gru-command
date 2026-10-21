@@ -2147,6 +2147,55 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getDirective('fresh-successor')?.state).toBe('settled');
   });
 
+  it('a fresh-session rebrief successor takes every successor fence, runs on a fresh session, and only its actual admission settles the debt (#470)', async () => {
+    const f = await fixture(); surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'accepted, never admitted');
+    const debt = f.ledger.listObligations({ jobId: f.intent.jobId })[0]!;
+    const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+    const input = { ...f.deps, requestId: f.intent.requestId, generation: debt.generation, expectedPayloadHash: f.intent.payloadHash,
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId),
+      expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
+      reason: 'the original session cannot be resumed; finish the approved revision in a fresh session',
+      decision: { kind: 'rebrief-successor' as const, requestId: 'fresh-session-successor', note: 'finish the approved revision from current artifacts' } };
+    const queued = { view: () => ({ worker: { queued: [{ id: f.intent.jobId, label: 'queued job turn' }] } }) } as never;
+    const watermark = f.ledger.latestEventSeq();
+    const stale: readonly (readonly [string, Partial<typeof input> & { readonly workerGate?: never }])[] = [
+      ['generation', { generation: debt.generation + 1 }], ['hash', { expectedPayloadHash: 'b'.repeat(64) }], ['head', { expectedHead: 'c'.repeat(40) }],
+      ['epoch', { expectedEpoch: 99 }], ['revision', { expectedWorkRevision: authority.workRevision + 1 }], ['contract', { expectedContractSha256: 'd'.repeat(64) }],
+      ['queued producer', { workerGate: queued }]];
+    for (const [label, changed] of stale) {
+      expect(() => recoverInterruptedDirectiveFromRoute({ ...input, ...changed }), label).toThrow();
+      expect(f.ledger.latestEventSeq(), label).toBe(watermark);
+      expect(f.ledger.getDirective(f.intent.requestId)?.state, label).toBe('dispatching');
+      expect(f.ledger.getDirective('fresh-session-successor'), label).toBeNull();
+    }
+    f.supervised(['supervised restart pending']);
+    expect(() => recoverInterruptedDirectiveFromRoute(input)).toThrow(/cessation is not proven/u);
+    f.supervised([]);
+    expect(f.ledger.latestEventSeq()).toBe(watermark);
+    const accepted = recoverInterruptedDirectiveFromRoute(input);
+    expect(accepted).toMatchObject({ idempotent: false, successor: { requestId: 'fresh-session-successor', requestKind: 'rebrief', state: 'dispatching' } });
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('retired');
+    // Accepted is not admitted: the debt stays open until the successor's native admission.
+    expect(f.ledger.getObligation(debt.id)?.state).toBe('open');
+    const decided = f.ledger.latestEventSeq();
+    expect(recoverInterruptedDirectiveFromRoute(input)).toMatchObject({ idempotent: true, successor: { requestId: 'fresh-session-successor' } });
+    expect(f.ledger.latestEventSeq()).toBe(decided);
+    // The minion is resident on its existing session when the successor runs.
+    const resident = await f.registry.spawn('minion', { agentId: FIXTURE_MINION, cwd: f.lane.path, resumeFile: f.file });
+    await executeAcceptedDirective(f.deps, 'fresh-session-successor');
+    // Fresh session: the resident session is disposed, never prompted, and
+    // the successor's minion is spawned without resuming its transcript.
+    expect(resident.cessationEvidence!()).toBe('ceased');
+    expect(f.spawns).toHaveLength(2); expect(f.spawns[1]?.resumeFile).toBeUndefined();
+    expect(f.native.prompts).toHaveLength(1); expect(f.native.prompts[0]).toContain('finish the approved revision from current artifacts');
+    const successor = f.ledger.getDirective('fresh-session-successor')!;
+    expect(successor).toMatchObject({ requestKind: 'rebrief', state: 'settled' });
+    expect(f.ledger.getObligation(debt.id)).toMatchObject({ state: 'settled',
+      settlement: { kind: 'executed-action', evidenceEventSeq: successor.admissionSeq, evidenceEventKind: 'silas.directive-sent' } });
+    expect(recoverInterruptedDirectiveFromRoute(input).idempotent).toBe(true);
+    expect(f.spawns).toHaveLength(2);
+  });
+
   it('owner stops refuse a successor; a concrete reserved-owner obligation settles only Gru recovery debt', async () => {
     const f = await fixture(); surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'unknown');
     const debt = f.ledger.listObligations({ jobId: f.intent.jobId })[0]!;
