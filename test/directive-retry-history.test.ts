@@ -201,6 +201,14 @@ describe('Pi retry history (#483)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'unmatched/malformed native tool result' });
   });
 
+  it('a result naming a retried error row\'s never-run tool call after a retried answer that ends the turn is refused', () => {
+    const { file, producer, error } = retryScene([signedContent[1], partialCall]);
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    entry(file, 'answer', 'retry-error', answer);
+    entry(file, 'partial-result', 'answer', { ...result, toolCallId: partialCall.id });
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+  });
+
   it('a retry-start receipt cannot make an error row with unknown or malformed content retry history', () => {
     const refused = [
       { type: 'image', data: 'AAAA', mimeType: 'image/png' },
@@ -328,23 +336,82 @@ describe('Pi retry history (#483)', () => {
   });
 });
 
-describe('Pi rows whose tool calls the SDK never executes (#483)', () => {
+describe('Pi rows by what the SDK does with their tool calls (#483)', () => {
+  const GENERIC = 'native tool intent is not persisted before execution or its invocation/results changed';
   const cutOff = { type: 'toolCall', id: 'cut-off-call', name: 'bash', arguments: { command: 'printf trunc' } };
+  const truncated = { role: 'assistant', stopReason: 'length', content: [{ type: 'text', text: 'Running it now' }, cutOff] };
+  const notExecuted = (toolName = 'bash') => ({ role: 'toolResult', toolCallId: cutOff.id, toolName, isError: true,
+    content: [{ type: 'text', text: 'Tool call "bash" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.' }] });
+
   it('a length row\'s tool calls are pending until the SDK\'s own "not executed" results answer them, and the next tool runs', () => {
     const { file } = admittedScene();
-    entry(file, 'truncated', 'receipt', { role: 'assistant', stopReason: 'length', content: [{ type: 'text', text: 'Running it now' }, cutOff] });
+    entry(file, 'truncated', 'receipt', truncated);
+    // Lost before the SDK answered them: still incomplete.
     expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool effects/results are incomplete' });
-    entry(file, 'not-executed', 'truncated', { role: 'toolResult', toolCallId: cutOff.id, toolName: 'bash', isError: true,
-      content: [{ type: 'text', text: 'Tool call "bash" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.' }] });
-    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });
+    entry(file, 'not-executed', 'truncated', notExecuted());
     expect(() => flushRetried(file, 'not-executed')).not.toThrow();
     finishTurn(file);
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a turn lost right after the SDK\'s "not executed" results is resumable: nothing ran, so there is no tool error to judge', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', truncated);
+    entry(file, 'not-executed', 'truncated', notExecuted());
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'resumable', checkpointId: 'not-executed' });
+  });
+
+  it('a length row\'s calls left unanswered before the next assistant are refused', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', truncated);
+    entry(file, 'invocation', 'truncated', invocation);
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(new DirectiveCheckpointError(GENERIC));
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'assistant advanced without complete native tool results' });
+  });
+
+  it('a call-less length row followed by a tool is refused', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', { role: 'assistant', stopReason: 'length', content: [{ type: 'text', text: 'Running it now' }] });
+    expect(() => flushRetried(file, 'truncated')).toThrow(new DirectiveCheckpointError(GENERIC));
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+  });
+
+  it('a "not executed" result naming the wrong tool is refused', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', truncated);
+    entry(file, 'not-executed', 'truncated', notExecuted('read'));
+    expect(() => flushRetried(file, 'not-executed')).toThrow(new DirectiveCheckpointError(GENERIC));
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'unmatched/malformed native tool result' });
+  });
+
+  it('a stop row holding tool calls runs them: the fence admits its call and the turn completes past it', () => {
+    const { file } = admittedScene();
+    const stopWithCall = { ...invocation, stopReason: 'stop' };
+    entry(file, 'invocation', 'receipt', stopWithCall);
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool effects/results are incomplete' });
+    expect(() => flushDirectiveToolIntent(file, stopWithCall, call, identity)).not.toThrow();
+    finishTurn(file);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a stop row with no calls stays the terminal, and a tool after it is refused', () => {
+    const { file } = admittedScene();
+    entry(file, 'stopped', 'receipt', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'stopped' });
+    expect(() => flushRetried(file, 'stopped')).toThrow(new DirectiveCheckpointError(GENERIC));
   });
 
   it('an aborted row holding a tool call owes no result: it is the failed terminal', () => {
     const { file } = admittedScene();
     entry(file, 'aborted', 'receipt', { role: 'assistant', stopReason: 'aborted', errorMessage: 'Request was aborted', content: [cutOff] });
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: 'Request was aborted', checkpointId: 'aborted' });
+  });
+
+  it('a result after an aborted row holding a tool call is refused', () => {
+    const { file } = admittedScene();
+    entry(file, 'aborted', 'receipt', { role: 'assistant', stopReason: 'aborted', errorMessage: 'Request was aborted', content: [cutOff] });
+    entry(file, 'aborted-result', 'aborted', { ...result, toolCallId: cutOff.id });
+    expect(() => flushRetried(file, 'aborted-result')).toThrow(new DirectiveCheckpointError(GENERIC));
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
   });
 });

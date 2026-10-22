@@ -1994,7 +1994,10 @@ export class PiAgentHandle implements AgentHandle {
           });
         }
         if (msg !== undefined && msg['role'] === 'assistant') {
-          if (msg['stopReason'] === 'stop' && this.liveDirective !== undefined) {
+          // A stop row holding tool calls (openai-completions, mistral) is not
+          // completion: the SDK runs those calls next.
+          const holdsCalls = Array.isArray(msg['content']) && msg['content'].some((block) => (block as { type?: unknown } | null)?.type === 'toolCall');
+          if (msg['stopReason'] === 'stop' && !holdsCalls && this.liveDirective !== undefined) {
             const directive = this.liveDirective;
             // Completed original work may be historical after a park/hold or
             // material revision. Verify native authority, not today's candidacy.

@@ -187,7 +187,8 @@ class NativeTurn {
   constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
-   * nor refused as, this turn. A turn ends once. */
+   * nor refused as, this turn. Idempotent until resume(): a chained retry
+   * ends, resumes and ends again. */
   end(): void {
     if (this.ended !== null) return;
     this.ended = { start: this.start, count: this.count };
@@ -444,8 +445,10 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   let lastMessage = user.message;
   let terminal = false;
   // A tool error the turn went on to answer is ordinary work (a failing test,
-  // a grep with no match). One it never answered may be an interrupted effect.
+  // a grep with no match). One it never answered may be an interrupted effect,
+  // unless it is the SDK's own "not executed" result for a length row's call.
   let unanswered = false;
+  const notExecuted = new Set<string>();
   for (let index = 1; ; index += 1) {
     const entry = native(index);
     if (entry === undefined) break;
@@ -474,15 +477,13 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       // as lookahead, and charged to the turn only as that retried answer.
       if (isRetryHistoryRow(entry, () => { endTurn(); return native(index + 1); }, retries)) resumeTurn();
       else {
+        const calls = rowCalls(message.stopReason);
         for (const block of message.content as Record<string, unknown>[]) {
-          // An error row's calls never ran (owner ruling 2026-10-22, see
-          // validRetryErrorContent), nor did an aborted row's: the SDK returns
-          // on both. Ending the turn, such a row owes no results. A length
-          // row's calls are pending: the SDK answers each with its own
-          // "not executed" result and goes on.
-          if (block.type !== 'toolCall' || message.stopReason === 'error' || message.stopReason === 'aborted') continue;
-          if ((message.stopReason !== 'toolUse' && message.stopReason !== 'length') || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
+          // Ending the turn, an error or aborted row owes no results.
+          if (block.type !== 'toolCall' || calls === 'never-run') continue;
+          if (calls === null || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
           pending.set(block.id, block.name);
+          if (calls === 'not-executed') notExecuted.add(block.id);
         }
         if (pending.size === 0) {
           if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
@@ -495,7 +496,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
       pending.delete(message.toolCallId);
       if (!Array.isArray(message.content) || typeof message.toolName !== 'string') return unknown('malformed native tool result content/name');
-      if (message.isError) unanswered = true;
+      // Nothing ran for a "not executed" result: there is no effect to judge.
+      if (!notExecuted.delete(message.toolCallId) && message.isError) unanswered = true;
     } else return unknown('another user/custom message owns this session');
     lastMessage = message;
   }
@@ -900,6 +902,17 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 function nonBlank(value: unknown): value is string { return typeof value === 'string' && value.trim() !== ''; }
+/** What the pinned SDK's agent loop (pi-agent-core agent-loop.js) does with
+ * an assistant row's tool calls: it runs none of an error or aborted row's
+ * (owner ruling 2026-10-22, see validRetryErrorContent); it answers each of a
+ * length row's with its own failed "not executed" result and goes on; it
+ * runs a toolUse or stop row's (openai-completions and mistral end `stop`
+ * while holding calls). Null for any other stop: never trusted. */
+function rowCalls(stopReason: unknown): 'never-run' | 'not-executed' | 'executed' | null {
+  if (stopReason === 'error' || stopReason === 'aborted') return 'never-run';
+  if (stopReason === 'length') return 'not-executed';
+  return stopReason === 'toolUse' || stopReason === 'stop' ? 'executed' : null;
+}
 /** Text, thinking and tool calls only. Owner ruling 2026-10-22: an error
  * row's tool calls, partial ones included, never ran (the SDK executes none),
  * so they are inert retry history when the row is retried, and owe no
@@ -1058,7 +1071,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   while (index >= 0 && native[index]?.type === 'message' && native[index]?.message?.role === 'toolResult') index -= 1;
   const invocation = native[index];
   const content = invocation?.message?.content;
-  if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || invocation.message.stopReason !== 'toolUse' ||
+  if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || rowCalls(invocation.message.stopReason) !== 'executed' ||
       !isDeepStrictEqual(invocation.message, JSON.parse(JSON.stringify(assistantMessage))) || !Array.isArray(content)) refuse();
   const pending = new Map<string, Record<string, unknown>>();
   for (const block of content as Record<string, unknown>[]) {
@@ -1094,8 +1107,9 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
             : !isReceiptedErrorRow(entry.id, message!, retries) ? 'native receipted error row holds content that is not retry history'
               : 'native receipted error row has no retried answer after it');
         }
-        // A length row's calls get the SDK's own "not executed" results.
-        if (message!.stopReason !== 'toolUse' && message!.stopReason !== 'length') refuse();
+        // An executed row's calls, or a length row's, each get a result.
+        const calls = rowCalls(message!.stopReason);
+        if (calls !== 'executed' && calls !== 'not-executed') refuse();
         for (const block of message!.content as Record<string, unknown>[]) {
           if (block.type !== 'toolCall') continue;
           if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();

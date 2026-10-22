@@ -5207,6 +5207,50 @@ it('a real SDK tool call cut off by the output token limit is answered by the SD
   } finally { await f.cleanup(); }
 });
 
+it('a real SDK stop row holding a tool call (openai-completions, mistral) runs it once, and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-stop-call-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'stop-call', name: 'bash', args: { command: `printf ran >> ${JSON.stringify(effect)}` } }, stopReason: 'stop' },
+    { deltas: ['answered after the stop row\'s call'] },
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    expect(rows.find((entry) => entry.message?.role === 'assistant')?.message).toMatchObject({ stopReason: 'stop', content: [expect.objectContaining({ type: 'toolCall', id: 'stop-call' })] });
+    expect(toolResultsOf(rows)).toEqual([['stop-call', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(producerJournal(file).map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK row aborted while holding a tool call never runs it: the directive is a failed terminal (#483)', async () => {
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-aborted-call-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const fx = await fixture([{ deltas: [], toolCall: { id: 'aborted-call', name: 'bash', args: { command: `printf ran >> ${JSON.stringify(effect)}` } },
+    hold: new Promise<void>(() => {}), honorAbort: true }]);
+  const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+  const session = await actualDirectiveSdkSession(handle);
+  const identity = { requestId: 'aborted-call-directive', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'aborted-call-job', workRevision: 0, authorityEpoch: 0 };
+  try {
+    const turn = handle.promptWithVerdict!('call a tool, then be aborted', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+    await waitFor(() => fx.script.calls.length === 1, 'held native call');
+    await session.abort();
+    expect((await turn).ok).toBe(false);
+    const rows = nativeRows(handle.sessionFile!);
+    const aborted = rows.find((entry) => entry.message?.stopReason === 'aborted')!;
+    expect(aborted.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', id: 'aborted-call' }));
+    expect(toolResultsOf(rows)).toEqual([]);
+    expect(existsSync(effect)).toBe(false);
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: aborted.id });
+  } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+});
+
 const UNRECORDED_RETRY = 'native SDK retry evidence not recorded; retry-history tool effects remain refused';
 /** A directive minion on its own synthetic Responses model outside dispatch,
  * with a 1 ms retry base, its adapter log and its SDK retry starts captured. */
@@ -5308,7 +5352,8 @@ it('a real SDK retry whose producer journal cannot be read logs the error, and a
     const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
     expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
     expectUnreadableJournalWarn(m, request.identity.requestId);
-    expect(verdict.ok).toBe(false);
+    // The answer's completion receipt found no terminal proof, and that error is the verdict's.
+    expect(verdict).toEqual({ ok: false, error: 'DirectiveCheckpointError: native completion checkpoint/producer unavailable' });
     // The journal reads again; without a receipt the answer follows the error row's terminal.
     expect(inspectDirectiveCheckpoint(m.handle.sessionFile!, request.identity)).toEqual({ state: 'unknown',
       reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });

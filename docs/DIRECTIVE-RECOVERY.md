@@ -324,8 +324,10 @@ failing test or a `grep` with no match. The minion may go on calling tools,
 and a turn that reaches its own successful end completes, on both runtimes.
 A turn cut off right after a tool error the minion never answered never
 completes: it stays UNKNOWN, or reads as a failed turn when pi recorded the
-abort. On pi that may be an interrupted effect. On Claude Code, a success
-result straight after one means the CLI ended the turn by itself. A lane's
+abort. On pi that may be an interrupted effect, except the SDK's own "not
+executed" results for a `length` row's calls (below): nothing ran, so a turn
+cut off right after them is resumable. On Claude Code, a success result
+straight after one means the CLI ended the turn by itself. A lane's
 verification policy refusing a test command is ordinary too: the minion is
 told why and goes on. A tool the directive refused is never ordinary. That
 covers the authority fence's refusal and, on Claude Code, a request the
@@ -356,8 +358,11 @@ row as retry history only when all of these hold:
   it.
 
 Its calls never enter the pending set, so a result naming one is never a
-match: the turn reads UNKNOWN, as an unmatched result after the retried
-answer, or as an entry past the terminal when the row ended the turn.
+match, and the turn reads UNKNOWN. After a retried answer that calls tools
+the reason is `unmatched/malformed native tool result`. After a retried
+answer that ends the turn, or when the error row itself ended it, the
+reason is `native entries follow the correlated terminal checkpoint without
+a distinct bound request`.
 
 When a retry is cancelled during backoff, no retried answer follows, so the
 receipted row is the turn's terminal, a failed one. When attempts run out,
@@ -368,12 +373,21 @@ calls. At the tool fence any other error row still refuses the next tool,
 under a reason naming what it lacks: a matching receipt, history-only
 content, or the retried answer.
 
-Two other stops hold tool calls. The SDK runs none of an `aborted` row's
-calls either, so an aborted row likewise owes no results and is a failed
-terminal. A `length` row's calls were cut off by the output token limit:
-the SDK answers each with its own failed "not executed" result and goes on,
-so those calls are pending like a `toolUse` row's, and the minion may call
-tools after them.
+Every pi stop can hold tool calls, and the walks and the fence follow what
+the SDK's agent loop does with them:
+
+- `toolUse` and `stop`: the SDK runs them. openai-completions and Mistral
+  end `stop` while holding calls, so a `stop` row with calls is pending
+  work, not the turn's end; one without calls is the terminal.
+- `length`: the calls were cut off by the output token limit. The SDK runs
+  none and answers each with its own failed "not executed" result, then goes
+  on. Those calls are pending until those results arrive, and the minion
+  may call tools after them. Since nothing ran, a turn cut off right after
+  those results is resumable, not a tool error awaiting a recovery
+  judgment. A turn cut off before them stays UNKNOWN.
+- `error` and `aborted`: the SDK runs none (for an error row, the ruling
+  above). Such a row owes no results; ending the turn, it is a failed
+  terminal, and a result naming one of its calls is refused.
 
 When the adapter cannot record a receipt it logs `native SDK retry
 evidence not recorded; retry-history tool effects remain refused` at warn,
