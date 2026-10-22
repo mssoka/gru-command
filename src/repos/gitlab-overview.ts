@@ -149,10 +149,8 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     readonly limit: number;
   }): Promise<readonly GitLabPipelineRaw[]> {
     const label = `pipelines ${repoFullName(input.repo)}@${input.branch} on ${input.repo.host}`;
-    // `scope=branches` keeps a tag that shares the branch's name out.
     const query = new URLSearchParams({
       ref: input.branch,
-      scope: 'branches',
       order_by: 'id',
       sort: 'desc',
       per_page: String(input.limit),

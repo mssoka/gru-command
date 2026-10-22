@@ -427,7 +427,7 @@ describe('GitLab overview REST adapter', () => {
       'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject',
       'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/merge_requests?state=opened&scope=all&per_page=1',
       'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/issues?state=opened&scope=all&per_page=1',
-      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/pipelines?ref=main&scope=branches&order_by=id&sort=desc&per_page=20',
+      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/pipelines?ref=main&order_by=id&sort=desc&per_page=20',
     ]);
     for (const call of calls) {
       expect(call.headers['PRIVATE-TOKEN']).toBe(TOKEN);

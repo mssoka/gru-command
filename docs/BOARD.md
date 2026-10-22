@@ -262,10 +262,9 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   project's default branch, exact open merge-request and open-issue counts
   (the list endpoints' `X-Total`; GitLab omits it above 10,000 results,
   and the observation then fails as "count not exact" instead of
-  guessing), and the newest pipeline GitLab lists for the default branch
-  with `scope=branches` (so a tag sharing the branch's name never
-  counts), skipping merge-request and child (`parent_pipeline`)
-  pipelines. The row
+  guessing), and the newest default-branch pipeline by (created, id)
+  among the 20 newest, skipping merge-request and child
+  (`parent_pipeline`) pipelines. The row
   reads `OPEN MRs` / `excl. MRs`, links `on GitLab`, labels an unnamed
   pipeline `pipeline #N`, reads `NO RUNS` with no default-branch pipeline
   on that page (GitLab never claims no-workflow), `UNAVAILABLE` when the
