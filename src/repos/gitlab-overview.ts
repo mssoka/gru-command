@@ -1,4 +1,4 @@
-import { repoFullName, type RepoRef } from '../dispatch/github-poll.js';
+import { defaultGhRunner, repoFullName, type GhCommandRunner, type RepoRef } from '../dispatch/github-poll.js';
 import { isGitLabRemote } from '../dispatch/review-path.js';
 import {
   RepoProviderError,
@@ -11,50 +11,28 @@ import {
 } from './overview.js';
 
 /**
- * GitLab REST transport for the managed repository overview (#480). The
- * tracker owns budgets, freshness and abort scopes; this adapter only
- * reads one project through `/api/v4/projects/:path` and classifies each
- * failure by HTTP status (401 auth, 403 permission — auth when the token
- * lacks `read_api` — 404 not-found, 429 rate-limit; network, timeout, 5xx
- * and shape faults are other).
- *
- * The token (`GITLAB_TOKEN`, falling back to `GL_TOKEN` — the resolver
- * Perkins delivery uses) rides only the `PRIVATE-TOKEN` header, only over
- * https, and only to a host `isGitLabRemote` accepts. Redirects are
- * refused so the header can never follow one to another origin, and the
- * token never appears in a URL, a message or a log.
+ * GitLab transport for the managed repository overview (#480): the user's
+ * own `glab` CLI login, the way GitHub rows use `gh`. Each read is one
+ * `glab api --hostname <host> --include <path>` run (15 s, byte-bounded
+ * output) against `/api/v4/projects/:path`; GC never reads or handles a
+ * GitLab token — glab owns the credential. `--include` prints the HTTP
+ * status line and headers before the body, so counts come from `X-Total`
+ * and failures are classified by status (401 auth, 403 permission — auth
+ * when the login lacks `read_api`/`api` — 404 not-found, 429 rate-limit;
+ * 5xx, timeouts and shape faults are other). A missing glab, or a host
+ * glab has no login for, is auth and names the fix. The tracker owns
+ * budgets, freshness and abort scopes; glab is only ever run for a host
+ * `isGitLabRemote` accepts.
  */
 
-/** Per-request bound, the GitLab precedent's timeout. */
+/** Per-run bound for one `glab api` call. */
 export const GITLAB_OVERVIEW_TIMEOUT_MS = 15_000;
 
-/** GitLab's own `message` text is appended to a failure up to this length. */
+/** GitLab's or glab's own text is appended to a failure up to this length. */
 const GITLAB_MESSAGE_MAX_CHARS = 160;
 
-export interface GitLabFetchResponse {
-  readonly ok: boolean;
-  readonly status: number;
-  readonly headers: { get(name: string): string | null };
-  text(): Promise<string>;
-}
-
-export type GitLabFetch = (
-  url: string,
-  init: {
-    readonly headers: Record<string, string>;
-    readonly redirect: 'error';
-    readonly signal: AbortSignal;
-  },
-) => Promise<GitLabFetchResponse>;
-
-export interface GitLabRepoOverviewApiOptions {
-  readonly fetchImpl?: GitLabFetch;
-  readonly tokenResolver?: () => string | undefined;
-  readonly timeoutMs?: number;
-}
-
 /** The failure kind for an HTTP status. A 403 whose OAuth `error` is
- * `insufficient_scope` is the token itself (no `read_api`), so every
+ * `insufficient_scope` is the login itself (no `read_api`), so every
  * repository on the host would fail the same way: it reads as auth. */
 function kindOfStatus(status: number, oauthError: string | null): RepoFetchErrorKind {
   if (status === 401) return 'auth';
@@ -71,120 +49,97 @@ function flatText(value: unknown): string | null {
   return squashed === '' ? null : squashed.slice(0, GITLAB_MESSAGE_MAX_CHARS);
 }
 
-/** What to do about a token without the scope the overview reads with. */
-const MISSING_SCOPE_REMEDY =
-  'GitLab token lacks the read_api or api scope — replace GITLAB_TOKEN (GL_TOKEN is read only when GITLAB_TOKEN ' +
-  'is unset) with a read_api or api token, then gru restart';
+/** An ANSI CSI sequence (colour, cursor) as a CLI may print to stderr. */
+const ANSI_SEQUENCE = new RegExp(`${String.fromCharCode(0x1b)}\\[[0-?]*[ -/]*[@-~]`, 'gu');
+
+/** CLI output as display text: escape sequences and control characters
+ * removed, whitespace flattened, bounded; null when empty. */
+function cliText(value: string): string | null {
+  return flatText(value.replace(ANSI_SEQUENCE, '').replace(/\p{Cc}/gu, ' '));
+}
 
 /** GitLab's `scope` field is echoed only when it reads as a short list of
  * scope names, never as arbitrary server text inside Gru's advice. */
 const SCOPE_NAMES = /^[a-z_]+( [a-z_]+)*$/u;
 
+/** What to do when glab's login lacks the scope the overview reads with. */
+function missingScopeRemedy(host: string, accepted: string | null): string {
+  return (
+    `glab's login for ${host} lacks the read_api or api scope — run \`glab auth login --hostname ${host}\` ` +
+    `with a read_api or api token${accepted !== null ? `; GitLab accepts ${accepted}` : ''}`
+  );
+}
+
 /** GitLab's short error text — `{"message": "404 Project Not Found"}`, or
  * an OAuth-style `{"error": "invalid_token", "error_description": …}` —
- * and that OAuth `error` code; null where the body carries none. A
- * missing scope (`insufficient_scope`) instead yields a remedy, since
- * GitLab's own description never says what to do. */
+ * and that OAuth `error` code; null where the body carries none. For a
+ * missing scope (`insufficient_scope`) GitLab's own description never
+ * says what to do, so only the scopes it accepts are kept. */
 function gitLabErrorOf(text: string): {
   readonly detail: string | null;
   readonly oauthError: string | null;
-  readonly remedy: string | null;
+  readonly accepted: string | null;
 } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { detail: null, oauthError: null, remedy: null };
+    return { detail: null, oauthError: null, accepted: null };
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return { detail: null, oauthError: null, remedy: null };
+    return { detail: null, oauthError: null, accepted: null };
   }
   const body = parsed as Record<string, unknown>;
   const oauthError = flatText(body['error']);
   if (oauthError === 'insufficient_scope') {
     const scope = body['scope'];
     const accepted = typeof scope === 'string' && scope.length <= 40 && SCOPE_NAMES.test(scope) ? scope : null;
-    return {
-      detail: null,
-      oauthError,
-      remedy: `${MISSING_SCOPE_REMEDY}${accepted !== null ? `; GitLab accepts ${accepted}` : ''}`,
-    };
+    return { detail: null, oauthError, accepted };
   }
   return {
     detail: flatText(body['message']) ?? flatText(body['error_description']) ?? oauthError,
     oauthError,
-    remedy: null,
+    accepted: null,
   };
 }
 
-/** The project API URL, or null when the host cannot form a plain https
- * origin (a port, credentials or a host the URL parser rewrites). */
-function projectApiUrl(repo: RepoRef, suffix: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(`https://${repo.host}/api/v4/projects/${encodeURIComponent(repoFullName(repo))}${suffix}`);
-  } catch {
-    return null;
+interface IncludedResponse {
+  readonly status: number;
+  /** Header values by lowercased name. */
+  readonly headers: ReadonlyMap<string, string>;
+  readonly body: string;
+}
+
+/** Split `glab api --include` output — a status line (`HTTP/2.0 200 OK`),
+ * `Name: value` header lines, a blank line, then the body — tolerating
+ * CRLF and any header case; null when it carries no status line. */
+function parseIncluded(stdout: string): IncludedResponse | null {
+  const separator = /\r?\n\r?\n/u.exec(stdout);
+  const head = separator === null ? stdout : stdout.slice(0, separator.index);
+  const body = separator === null ? '' : stdout.slice(separator.index + separator[0].length);
+  const [statusLine = '', ...headerLines] = head.split(/\r?\n/u);
+  const status = /^HTTP\/\d+(?:\.\d+)? (\d{3})(?: |$)/u.exec(statusLine);
+  if (status === null) return null;
+  const headers = new Map<string, string>();
+  for (const line of headerLines) {
+    const colon = line.indexOf(':');
+    if (colon > 0) headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
   }
-  if (url.protocol !== 'https:') return null;
-  if (url.hostname.toLowerCase() !== repo.host.toLowerCase()) return null;
-  if (url.username !== '' || url.password !== '' || url.port !== '') return null;
-  return url.toString();
+  return { status: Number(status[1]), headers, body };
 }
 
-function redact(text: string, token: string): string {
-  return text.split(token).join('[redacted]');
-}
+/** A runner error that is one run's own bound (a slow or oversized
+ * response), never evidence that glab is missing. */
+const RUN_BOUND = /timed out|output exceeds|UTF-8/iu;
 
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** The text of a fetch failure's `cause`: its message, else (a
- * multi-address connect's `AggregateError`) the nested errors' messages.
- * A primitive cause is stringified; any other object is omitted, never
- * dumped onto the board (it could carry other credentials). */
-function causeTextOf(cause: unknown): string {
-  if (cause instanceof Error) {
-    if (cause.message.trim() !== '' || !(cause instanceof AggregateError)) return cause.message;
-    return (cause.errors as unknown[])
-      .map((nested) => (nested instanceof Error ? nested.message : ''))
-      .filter((message) => message.trim() !== '')
-      .join('; ');
-  }
-  return typeof cause === 'object' || typeof cause === 'function' ? '' : String(cause);
-}
-
-/** The error `code` of a cause, or of its first nested error. */
-function causeCodeOf(cause: unknown): string | null {
-  const code = typeof cause === 'object' && cause !== null ? (cause as { code?: unknown }).code : undefined;
-  if (typeof code === 'string' && code !== '') return code;
-  return cause instanceof AggregateError ? causeCodeOf((cause.errors as unknown[])[0]) : null;
-}
-
-/** A transport failure's detail. Node's fetch throws a bare
- * `TypeError('fetch failed')` and keeps the real reason (DNS, TLS, a
- * refused connection or redirect) in `cause`: its code goes first, so a
- * cut at the tracker's bound keeps it, then its redacted, flattened and
- * bounded text. */
-function transportDetailOf(error: unknown, token: string): string {
-  const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
-  if (cause === undefined || cause === null) return messageOf(error);
-  const code = flatText(redact(causeCodeOf(cause) ?? '', token))?.slice(0, 40) ?? null;
-  const text = flatText(redact(causeTextOf(cause), token));
-  return `${messageOf(error)}${code !== null ? ` [${code}]` : ''}${text !== null ? `: ${text}` : ''}`;
-}
+/** glab's verdict for a host it holds no login for. */
+const NOT_LOGGED_IN = /unauthenticated|not logged in|no token/iu;
 
 export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
-  private readonly fetchImpl: GitLabFetch;
-  private readonly tokenResolver: () => string | undefined;
-  private readonly timeoutMs: number;
-
-  constructor(options: GitLabRepoOverviewApiOptions = {}) {
-    this.fetchImpl = options.fetchImpl ?? (fetch as unknown as GitLabFetch);
-    this.tokenResolver = options.tokenResolver ?? (() => process.env['GITLAB_TOKEN'] ?? process.env['GL_TOKEN']);
-    this.timeoutMs = options.timeoutMs ?? GITLAB_OVERVIEW_TIMEOUT_MS;
-  }
+  constructor(
+    private readonly run: GhCommandRunner = defaultGhRunner('glab', { timeoutMs: GITLAB_OVERVIEW_TIMEOUT_MS }),
+    private readonly binary = 'glab',
+  ) {}
 
   async fetchProject(input: { readonly repo: RepoRef }): Promise<GitLabProjectMeta> {
     const label = `project ${repoFullName(input.repo)} on ${input.repo.host}`;
@@ -247,55 +202,51 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     suffix: string,
   ): Promise<{ readonly body: unknown; readonly total: string | null }> {
     const host = repo.host;
-    // The credential guard comes first: an unaccepted host never receives
-    // the token, whatever the caller classified.
-    if (!isGitLabRemote(host)) {
-      throw new RepoProviderError('other', `${label}: not a GitLab host — the GitLab token is never sent to it`);
+    // glab is only ever run for a host isGitLabRemote accepts, named as a
+    // plain hostname, whatever the caller classified.
+    if (!isGitLabRemote(host) || !/^[A-Za-z0-9.-]+$/u.test(host)) {
+      throw new RepoProviderError('other', `${label}: not a GitLab host — glab is never run for it`);
     }
-    const token = this.tokenResolver();
-    if (token === undefined || token.trim() === '') {
-      throw new RepoProviderError(
-        'auth',
-        `no GitLab token configured for ${host} — set GITLAB_TOKEN in the service environment to a read_api or api ` +
-          'token (GL_TOKEN is read only when GITLAB_TOKEN is unset)',
-      );
+    const login = `\`glab auth login --hostname ${host}\``;
+    const path = `projects/${encodeURIComponent(repoFullName(repo))}${suffix}`;
+    const result = await this.run(['api', '--hostname', host, '--include', path]);
+    if (result.error !== undefined && result.error !== '') {
+      const detail = cliText(result.error.replace(/\bgh api\b/gu, `${this.binary} api`)) ?? 'no detail';
+      if (RUN_BOUND.test(result.error)) throw new RepoProviderError('other', `${label}: ${detail}`);
+      throw new RepoProviderError('auth', `glab is unavailable (${detail}) — install the GitLab CLI and run ${login}`);
     }
-    const url = projectApiUrl(repo, suffix);
-    if (url === null) {
-      throw new RepoProviderError('other', `${label}: the host does not form a plain https API URL`);
-    }
-    let response: GitLabFetchResponse;
-    let text: string;
-    try {
-      response = await this.fetchImpl(url, {
-        headers: { 'PRIVATE-TOKEN': token, Accept: 'application/json' },
-        redirect: 'error',
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-      text = await response.text();
-    } catch (error) {
-      throw new RepoProviderError('other', redact(`${label}: request failed (${transportDetailOf(error, token)})`, token));
-    }
-    if (!response.ok) {
-      // Redact before GitLab's message is cut, so no token prefix survives.
-      const { detail, oauthError, remedy } = gitLabErrorOf(redact(text, token));
-      const kind = kindOfStatus(response.status, oauthError);
-      // A remedy leads the message, so the row bound (and the prefix an
-      // aborted row adds) can never cut it off behind a long project path.
-      if (remedy !== null) {
-        throw new RepoProviderError(kind, redact(`${remedy} (${label}: HTTP ${response.status})`, token));
+    const response = parseIncluded(result.stdout);
+    if (response === null) {
+      const stderr = cliText(result.stderr);
+      if (result.status !== 0 && stderr !== null && NOT_LOGGED_IN.test(stderr)) {
+        throw new RepoProviderError('auth', `glab is not logged in to ${host} — run ${login}`);
       }
       throw new RepoProviderError(
-        kind,
-        redact(`${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`, token),
+        'other',
+        result.status === 0
+          ? `${label}: ${this.binary} api printed no HTTP status line`
+          : `${label}: ${this.binary} exited ${result.status}${stderr !== null ? `: ${stderr}` : ''}`,
       );
+    }
+    if (response.status >= 400) {
+      const { detail, oauthError, accepted } = gitLabErrorOf(response.body);
+      const kind = kindOfStatus(response.status, oauthError);
+      // The remedy leads the message, so the row bound (and the prefix an
+      // aborted row adds) can never cut it off behind a long project path.
+      if (oauthError === 'insufficient_scope') {
+        throw new RepoProviderError(kind, `${missingScopeRemedy(host, accepted)} (${label}: HTTP ${response.status})`);
+      }
+      throw new RepoProviderError(kind, `${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`);
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw new RepoProviderError('other', `${label}: HTTP ${response.status}`);
     }
     let body: unknown;
     try {
-      body = JSON.parse(text);
+      body = JSON.parse(response.body);
     } catch {
       throw new RepoProviderError('other', `${label}: response is not valid JSON`);
     }
-    return { body, total: response.headers.get('x-total') };
+    return { body, total: response.headers.get('x-total') ?? null };
   }
 }

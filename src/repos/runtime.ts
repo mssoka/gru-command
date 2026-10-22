@@ -10,8 +10,8 @@ import {
 
 export interface ManagedRepoOverviewRuntimeOptions {
   readonly api: RepoOverviewApiPort;
-  /** The GitLab REST port for `gitlab` rows; required, so production can
-   * never construct the tracker without it. */
+  /** The GitLab (`glab` CLI) port for `gitlab` rows; required, so
+   * production can never construct the tracker without it. */
   readonly gitlabApi: GitLabRepoOverviewApiPort;
   readonly log?: (level: LogLevel, message: string, fields?: Record<string, unknown>) => void;
   readonly resolveRemote?: RemoteResolver;

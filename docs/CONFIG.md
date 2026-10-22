@@ -86,41 +86,21 @@ being replaced by another workspace child. Existing jobs and history are not
 removed when the overview list changes.
 
 The overview reads GitHub origins through the `gh` login and GitLab origins
-(`gitlab.com`, or a self-hosted host whose first label is `gitlab`) through
-`GITLAB_TOKEN`, falling back to `GL_TOKEN` — the same token Perkins GitLab
-delivery uses, sent only to those hosts. The overview needs the `read_api` or
-`api` scope; Perkins GitLab delivery posts notes and needs `api`, which covers
-the overview's reads too. `install.sh` writes no token into the service unit, so
-set `GITLAB_TOKEN` in the service's own environment. Paste it at the prompt
-(nothing is shown, and it stays out of shell history), then restart.
+(`gitlab.com`, or a self-hosted host whose first label is `gitlab`) through the
+`glab` login; GC never reads or handles a GitLab token. Run `glab auth login`
+(add `--hostname <host>` for a self-hosted host) with a token that has the
+`read_api` or `api` scope, and confirm with `glab auth status`. No environment
+variable and no `gru restart` are needed. A row on a host glab is not logged in
+to, or with glab not installed, reads unavailable and names `glab auth login
+--hostname <host>`; a login without `read_api` or `api` fails that host's rows
+as an auth failure. GitHub rows are unaffected either way. Origins on any other
+host read `Not linked (unsupported code host)`. See [BOARD.md](./BOARD.md) for
+what each row shows.
 
-macOS:
-
-```sh
-printf 'GitLab token: '; read -rs GITLAB_TOKEN; echo
-launchctl setenv GITLAB_TOKEN "$GITLAB_TOKEN"
-unset GITLAB_TOKEN
-gru restart
-```
-
-Linux:
-
-```sh
-printf 'GitLab token: '; read -rs GITLAB_TOKEN; echo
-export GITLAB_TOKEN; systemctl --user import-environment GITLAB_TOKEN
-unset GITLAB_TOKEN
-gru restart
-```
-
-To check what the service sees (prints `set` or `unset`, never the token):
-`[ -n "$(launchctl getenv GITLAB_TOKEN)" ] && echo set || echo unset` on macOS,
-`systemctl --user show-environment | grep -q '^GITLAB_TOKEN=.' && echo set || echo unset`
-on Linux. Neither setting survives a reboot: set it again after one.
-
-A GitLab row without a token reads unavailable and names the missing variable,
-and a token without `read_api` or `api` fails that host's rows as an auth
-failure; GitHub rows are unaffected. Origins on any other host read `Not linked
-(unsupported code host)`. See [BOARD.md](./BOARD.md) for what each row shows.
+Perkins GitLab delivery is separate and unchanged: it still uses `GITLAB_TOKEN`
+with the `api` scope ([FLOW.md](./FLOW.md)). glab itself prefers a
+`GITLAB_TOKEN` set in the service's environment over its stored login, so when
+that variable is set the overview reads with it too.
 
 ## Load & validation behavior
 

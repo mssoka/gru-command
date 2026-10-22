@@ -252,17 +252,16 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `gitlab.com`, or a self-hosted host whose first label is `gitlab` (the
   same `isGitLabRemote` rule Perkins delivery uses; no config key) — over
   SSH or HTTPS, nested groups included, is a linked GitLab row. The
-  tracker reads it through the GitLab REST API with `GITLAB_TOKEN`
-  (falling back to `GL_TOKEN`; the overview needs the `read_api` or `api`
-  scope, and Perkins GitLab delivery needs `api`) from the service's
-  environment — `install.sh` writes no token into the unit; see
-  [CONFIG.md](./CONFIG.md#managed-repositories) to set and check it.
-  It is sent only as the `PRIVATE-TOKEN` header over https to that host
-  (redirects refused, 15 s per request, never logged or rendered): the
-  project's default branch, exact open merge-request and open-issue counts
-  (the list endpoints' `X-Total`; GitLab omits it above 10,000 results,
-  and the observation then fails as "count not exact" instead of
-  guessing), and the newest default-branch pipeline by (created, id)
+  tracker reads it through the user's `glab` login, as GitHub rows use
+  `gh` (`glab api --hostname <host> --include`, 15 s and bounded output
+  per call; GC never reads or handles a GitLab token). The overview needs
+  a login with the `read_api` or `api` scope; Perkins GitLab delivery
+  still uses `GITLAB_TOKEN` with `api`, unchanged. See
+  [CONFIG.md](./CONFIG.md#managed-repositories) to log in and check it.
+  The tracker reads the project's default branch, exact open
+  merge-request and open-issue counts (the list endpoints' `X-Total`;
+  GitLab omits it above 10,000 results, and the observation then fails
+  as "count not exact" instead of guessing), and the newest default-branch pipeline by (created, id)
   among the 20 newest, skipping merge-request and child
   (`parent_pipeline`) pipelines. The row reads `OPEN MRs` / `excl. MRs`
   (an unlinked row, whatever its host, reads the neutral `OPEN PRs/MRs` /
@@ -271,11 +270,12 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   page (GitLab never claims no-workflow), `UNAVAILABLE` when the
   project turns CI/CD off, and no-branch for an empty repository; the
   module's sub-heading reads `CI = default-branch only · not deployment
-  health` for both hosts. Without a token the row is unavailable with
-  `no GitLab token configured for <host> — set GITLAB_TOKEN…`. A missing
-  token, a 401, a 403 `insufficient_scope` (no `read_api` or `api`) or a
-  429 aborts that GitLab host for the pass — its later rows read `refresh
-  aborted before this repository was checked` — while GitHub rows and
+  health` for both hosts. With glab not installed, or not logged in to
+  the host, the row is unavailable and names the fix (`glab auth login
+  --hostname <host>`). That, a 401, a 403 `insufficient_scope` (no
+  `read_api` or `api`) or a 429 aborts that GitLab host for the pass —
+  its later rows read `refresh aborted before this repository was
+  checked` — while GitHub rows and
   other GitLab hosts are still observed; a GitHub rate limit or `gh` auth
   failure likewise never stops GitLab rows. Other 403s, 404, 5xx and
   network failures are per-repository, and cached data renders

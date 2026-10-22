@@ -55,11 +55,11 @@ import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } fro
  * hook failure is logged without touching the row or the pass.
  *
  * GitLab origins (`isGitLabRemote` hosts, nested groups kept) are linked
- * `gitlab` rows observed through the GitLab REST port under the same
- * freshness, atomic-observation, budget and rotation rules: the project
- * gives the default branch, the list endpoints' `X-Total` the exact open
- * merge-request and issue counts, and the newest default-branch pipeline
- * the run. GitLab pipelines never feed the #446 alert. A fatal
+ * `gitlab` rows observed through the user's `glab` CLI login (as GitHub
+ * rows use `gh`) under the same freshness, atomic-observation, budget and
+ * rotation rules: the project gives the default branch, the list
+ * endpoints' `X-Total` the exact open merge-request and issue counts, and
+ * the newest default-branch pipeline the run. GitLab pipelines never feed the #446 alert. A fatal
  * auth/rate-limit condition aborts only its provider scope (`github`, or
  * `gitlab:<host>`): the other provider's rows are still observed.
  */
@@ -558,8 +558,8 @@ export function githubRepoLink(ref: RepoRef): string | null {
 
 /** Build the https project link from a parsed GitLab remote — nested
  * groups kept, every segment safe — or null (not-linked, never guessed).
- * The host rule is `isGitLabRemote`, the same guard that decides where
- * the GitLab token may be sent. */
+ * The host rule is `isGitLabRemote`, the same guard that decides which
+ * hosts `glab` is ever run for. */
 export function gitlabRepoLink(ref: RepoRef): string | null {
   if (!isGitLabRemote(ref.host)) return null;
   if (!isSafeLinkHost(ref.host)) return null;
@@ -1010,8 +1010,8 @@ export interface ManagedRepoOverviewOptions {
   /** Explicit config names only; an empty or absent list means no repos. */
   readonly managedRepos: readonly string[];
   readonly api: RepoOverviewApiPort;
-  /** The GitLab REST port; production always wires it. A GitLab row
-   * observed without it fails by name. */
+  /** The GitLab (`glab` CLI) port; production always wires it. A GitLab
+   * row observed without it fails by name. */
   readonly gitlabApi?: GitLabRepoOverviewApiPort;
   /** Test seams. Production membership is always `managedRepos`; no
    * directory discovery fallback exists. */

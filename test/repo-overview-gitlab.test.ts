@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
 import {
   repoCiView,
@@ -11,13 +11,15 @@ import {
   repoRowNote,
   repoRunContextTitle,
 } from '../web/src/lib/repo-overview.js';
-import { GhRateLimitedError, repoFullName, type RepoRef } from '../src/dispatch/github-poll.js';
-import { parseRepoRemote } from '../src/dispatch/review-path.js';
 import {
-  GITLAB_OVERVIEW_TIMEOUT_MS,
-  GitLabRepoOverviewApi,
-  type GitLabFetch,
-} from '../src/repos/gitlab-overview.js';
+  GhRateLimitedError,
+  repoFullName,
+  type GhCommandResult,
+  type GhCommandRunner,
+  type RepoRef,
+} from '../src/dispatch/github-poll.js';
+import { parseRepoRemote } from '../src/dispatch/review-path.js';
+import { GITLAB_OVERVIEW_TIMEOUT_MS, GitLabRepoOverviewApi } from '../src/repos/gitlab-overview.js';
 import {
   ManagedRepoOverviewTracker,
   REPO_OVERVIEW_RUNS_PER_FETCH,
@@ -44,7 +46,7 @@ import {
 // ------------------------------------------------------------------
 
 const T0 = Date.parse('2026-10-22T12:00:00.000Z');
-const TOKEN = 'glpat-test-secret-0123456789';
+const ESC = String.fromCharCode(0x1b);
 
 function githubRef(repo: string): RepoRef {
   return { host: 'github.com', owner: 'acme', repo };
@@ -265,32 +267,50 @@ function expectValidOnBoard(view: RepoOverviewView | null): void {
   expect(isValidSnapshot(snapshot), JSON.stringify(view)).toBe(true);
 }
 
-interface FetchCall {
-  readonly url: string;
-  readonly headers: Record<string, string>;
-  readonly redirect: string;
-  readonly signal: AbortSignal;
-}
-
-/** A fetch double answering each request from `answer` and recording it. */
-function fakeFetch(answer: (url: string) => Response | Promise<Response>): { fetchImpl: GitLabFetch; calls: FetchCall[] } {
-  const calls: FetchCall[] = [];
-  const fetchImpl: GitLabFetch = async (url, init) => {
-    calls.push({ url, headers: { ...init.headers }, redirect: init.redirect, signal: init.signal });
-    return answer(url);
+/** A glab runner double: records each argv and answers it. */
+function fakeGlab(answer: (args: readonly string[]) => GhCommandResult): { run: GhCommandRunner; calls: string[][] } {
+  const calls: string[][] = [];
+  return {
+    calls,
+    run: async (args) => {
+      calls.push([...args]);
+      return answer(args);
+    },
   };
-  return { fetchImpl, calls };
 }
 
-function json(body: unknown, init: { status?: number; total?: string | null } = {}): Response {
-  const headers = new Headers({ 'content-type': 'application/json' });
-  if (init.total !== undefined && init.total !== null) headers.set('x-total', init.total);
-  return new Response(JSON.stringify(body), { status: init.status ?? 200, headers });
-}
+const REASONS: Readonly<Record<number, string>> = {
+  200: 'OK',
+  304: 'Not Modified',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Not Found',
+  429: 'Too Many Requests',
+  500: 'Internal Server Error',
+  502: 'Bad Gateway',
+};
 
-afterEach(() => {
-  vi.unstubAllEnvs();
-});
+/** `glab api --include` output as glab 1.89 prints it: a status line,
+ * `Name: value` headers, a blank line, then the body. On an HTTP error
+ * glab exits 1 with the same stdout and `glab: … (HTTP n)` on stderr. */
+function included(
+  body: unknown,
+  init: { status?: number; total?: string; headers?: readonly string[]; eol?: string } = {},
+): GhCommandResult {
+  const status = init.status ?? 200;
+  const headers = [
+    'Content-Type: application/json',
+    ...(init.headers ?? []),
+    ...(init.total !== undefined ? [`X-Total: ${init.total}`] : []),
+  ];
+  return {
+    status: status >= 400 ? 1 : 0,
+    stdout: [`HTTP/2.0 ${status} ${REASONS[status] ?? ''}`, ...headers, '', typeof body === 'string' ? body : JSON.stringify(body)].join(
+      init.eol ?? '\n',
+    ),
+    stderr: status >= 400 ? `glab: ${REASONS[status] ?? 'error'} (HTTP ${status})` : '',
+  };
+}
 
 // ------------------------------------------------------------------
 // Classification, links and pure projections
@@ -312,8 +332,8 @@ describe('managed repo overview — GitLab classification', () => {
     expect(https).toEqual({ kind: 'linked', ref: { host: 'gitlab.com', owner: 'group', repo: 'project' }, provider: 'gitlab' });
     if (https.kind !== 'linked') throw new Error('expected linked');
     expect(gitlabRepoLink(https.ref)).toBe('https://gitlab.com/group/project');
-    // Hosts `isGitLabRemote` rejects never become GitLab rows: the token
-    // could never be sent to them.
+    // Hosts `isGitLabRemote` rejects never become GitLab rows: glab is
+    // never run for them.
     for (const url of [
       'git@bitbucket.org:a/b.git',
       'git@evil.gitlab.attacker.test:a/b.git',
@@ -378,18 +398,24 @@ describe('managed repo overview — GitLab classification', () => {
 });
 
 // ------------------------------------------------------------------
-// REST adapter
+// glab transport
 // ------------------------------------------------------------------
 
-describe('GitLab overview REST adapter', () => {
-  it('reads project, exact counts and pipelines over https with PRIVATE-TOKEN, no redirects and a bounded timeout', async () => {
-    const { fetchImpl, calls } = fakeFetch((url) => {
-      const path = new URL(url).pathname + new URL(url).search;
-      if (path === '/api/v4/projects/group%2Fsub%2Fproject') return json({ default_branch: 'main', empty_repo: false });
-      if (path.startsWith('/api/v4/projects/group%2Fsub%2Fproject/merge_requests?')) return json([{ iid: 1 }], { total: '7' });
-      if (path.startsWith('/api/v4/projects/group%2Fsub%2Fproject/issues?')) return json([], { total: '0' });
-      if (path.startsWith('/api/v4/projects/group%2Fsub%2Fproject/pipelines?')) {
-        return json([
+describe('GitLab overview glab transport', () => {
+  const label = 'project group/sub/project on gitlab.example.com';
+  const login = '`glab auth login --hostname gitlab.example.com`';
+  const failureOf = async (api: GitLabRepoOverviewApi): Promise<RepoProviderError> =>
+    (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+
+  it('runs glab api --include for each read and parses the status line, headers and body', async () => {
+    const { run, calls } = fakeGlab((args) => {
+      const path = args[4] ?? '';
+      if (path === 'projects/group%2Fsub%2Fproject') return included({ default_branch: 'main', empty_repo: false });
+      if (path.startsWith('projects/group%2Fsub%2Fproject/merge_requests?')) return included([{ iid: 1 }], { total: '7' });
+      // CRLF line ends and any header case parse the same.
+      if (path.startsWith('projects/group%2Fsub%2Fproject/issues?')) return included([], { headers: ['x-total: 0'], eol: '\r\n' });
+      if (path.startsWith('projects/group%2Fsub%2Fproject/pipelines?')) {
+        return included([
           {
             id: 9001,
             iid: 41,
@@ -402,9 +428,9 @@ describe('GitLab overview REST adapter', () => {
           },
         ]);
       }
-      return json({ message: '404 Not Found' }, { status: 404 });
+      return included({ message: '404 Not Found' }, { status: 404 });
     });
-    const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
+    const api = new GitLabRepoOverviewApi(run);
     const ref = gitlabRef('project');
     expect(await api.fetchProject({ repo: ref })).toEqual({ defaultBranch: 'main', ciEnabled: true });
     expect(await api.countOpenMergeRequests({ repo: ref })).toBe(7);
@@ -423,62 +449,47 @@ describe('GitLab overview REST adapter', () => {
         updatedAt: '2026-10-22T10:01:00.000Z',
       },
     ]);
-    expect(calls.map((call) => call.url)).toEqual([
-      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject',
-      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/merge_requests?state=opened&scope=all&per_page=1',
-      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/issues?state=opened&scope=all&per_page=1',
-      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/pipelines?ref=main&order_by=id&sort=desc&per_page=20',
+    const call = (path: string): string[] => ['api', '--hostname', 'gitlab.example.com', '--include', path];
+    expect(calls).toEqual([
+      call('projects/group%2Fsub%2Fproject'),
+      call('projects/group%2Fsub%2Fproject/merge_requests?state=opened&scope=all&per_page=1'),
+      call('projects/group%2Fsub%2Fproject/issues?state=opened&scope=all&per_page=1'),
+      call('projects/group%2Fsub%2Fproject/pipelines?ref=main&order_by=id&sort=desc&per_page=20'),
     ]);
-    for (const call of calls) {
-      expect(call.headers['PRIVATE-TOKEN']).toBe(TOKEN);
-      expect(call.redirect).toBe('error');
-      expect(call.signal).toBeInstanceOf(AbortSignal);
-      // The token rides the header only, never the URL.
-      expect(call.url).not.toContain(TOKEN);
-    }
     expect(GITLAB_OVERVIEW_TIMEOUT_MS).toBe(15_000);
-    // The per-request signal really bounds a stalled call.
-    const stalled = new GitLabRepoOverviewApi({
-      tokenResolver: () => TOKEN,
-      timeoutMs: 20,
-      fetchImpl: (_url, init) =>
-        new Promise((_resolve, reject) => {
-          init.signal.addEventListener('abort', () => reject(init.signal.reason as Error));
-        }),
-    });
-    const timedOut = await stalled.fetchProject({ repo: ref }).catch((error: unknown) => error);
-    expect(timedOut).toBeInstanceOf(RepoProviderError);
-    expect((timedOut as RepoProviderError).kind).toBe('other');
-    expect((timedOut as RepoProviderError).message).toContain('project group/sub/project on gitlab.example.com: request failed');
   });
 
-  it('fails a count loud when X-Total is missing or invalid, or the body is not an array', async () => {
-    const answers: Response[] = [
-      json([{ iid: 1 }]),
-      json([], { total: 'many' }),
-      json([], { total: '-1' }),
-      json([], { total: '1e3' }),
-      json({ not: 'a list' }, { total: '3' }),
+  it('fails a count loud when X-Total is missing or invalid, and a malformed body as other', async () => {
+    const answers: GhCommandResult[] = [
+      included([{ iid: 1 }]),
+      included([], { total: 'many' }),
+      included([], { total: '-1' }),
+      included([], { total: '1e3' }),
+      included({ not: 'a list' }, { total: '3' }),
+      included({ pipelines: [] }),
+      included([{ id: 1, ref: 'main' }, 'junk']),
+      included('<html>'),
     ];
-    const { fetchImpl } = fakeFetch(() => answers.shift() as Response);
-    const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
+    const api = new GitLabRepoOverviewApi(fakeGlab(() => answers.shift() as GhCommandResult).run);
+    const ref = gitlabRef('project');
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      const error = await api.countOpenMergeRequests({ repo: gitlabRef('project') }).catch((caught: unknown) => caught);
+      const error = await api.countOpenMergeRequests({ repo: ref }).catch((caught: unknown) => caught);
       expect(error).toBeInstanceOf(RepoProviderError);
-      expect((error as RepoProviderError).message).toContain('count not exact');
       expect((error as RepoProviderError).kind).toBe('other');
+      expect((error as RepoProviderError).message).toBe(
+        'open merge requests group/sub/project on gitlab.example.com: response carries no valid X-Total header (count not exact)',
+      );
     }
-    await expect(api.countOpenIssues({ repo: gitlabRef('project') })).rejects.toThrow(/not a JSON array/u);
+    await expect(api.countOpenIssues({ repo: ref })).rejects.toThrow(/not a JSON array/u);
     // A malformed pipeline page never shrinks into "no pipeline".
-    const pages: Response[] = [json({ pipelines: [] }), json([{ id: 1, ref: 'main' }, 'junk'])];
-    const listing = new GitLabRepoOverviewApi({ fetchImpl: fakeFetch(() => pages.shift() as Response).fetchImpl, tokenResolver: () => TOKEN });
-    await expect(listing.latestPipelines({ repo: gitlabRef('project'), branch: 'main', limit: 20 })).rejects.toThrow(/not a JSON array/u);
-    await expect(listing.latestPipelines({ repo: gitlabRef('project'), branch: 'main', limit: 20 })).rejects.toThrow(
-      /malformed pipeline entry/u,
-    );
+    await expect(api.latestPipelines({ repo: ref, branch: 'main', limit: 20 })).rejects.toThrow(/not a JSON array/u);
+    await expect(api.latestPipelines({ repo: ref, branch: 'main', limit: 20 })).rejects.toThrow(/malformed pipeline entry/u);
+    const garbled = await failureOf(api);
+    expect(garbled.kind).toBe('other');
+    expect(garbled.message).toBe(`${label}: response is not valid JSON`);
   });
 
-  it('maps HTTP status to error kinds, names host and label, and never echoes the token', async () => {
+  it('maps the HTTP status line to error kinds and names host and label', async () => {
     const cases: ReadonlyArray<readonly [number, string]> = [
       [401, 'auth'],
       [403, 'permission'],
@@ -488,170 +499,65 @@ describe('GitLab overview REST adapter', () => {
       [502, 'other'],
     ];
     for (const [status, kind] of cases) {
-      const { fetchImpl } = fakeFetch(() =>
-        json({ message: `${status} refused for token ${TOKEN} ${'x'.repeat(400)}` }, { status }),
-      );
-      const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
-      const error = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-      expect(error).toBeInstanceOf(RepoProviderError);
-      expect(error.kind).toBe(kind);
-      expect(error.message).toContain(`project group/sub/project on gitlab.example.com: HTTP ${status} (${status} refused`);
-      expect(error.message).not.toContain(TOKEN);
-      // GitLab's own message is bounded.
-      expect(error.message.length).toBeLessThan(80 + 160);
+      const answer = included({ message: `${status} refused ${'x'.repeat(400)}` }, { status });
+      const error = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => answer).run));
+      expect(error.kind, String(status)).toBe(kind);
+      // GitLab's own message is appended, bounded.
+      expect(error.message).toBe(`${label}: HTTP ${status} (${`${status} refused ${'x'.repeat(400)}`.slice(0, 160)})`);
     }
-    const network = new GitLabRepoOverviewApi({
-      tokenResolver: () => TOKEN,
-      fetchImpl: async () => {
-        throw new TypeError(`fetch failed: redirect refused (${TOKEN})`);
-      },
-    });
-    const failed = (await network.countOpenIssues({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(failed.kind).toBe('other');
-    expect(failed.message).toContain('open issues group/sub/project on gitlab.example.com: request failed');
-    expect(failed.message).not.toContain(TOKEN);
-    const garbled = new GitLabRepoOverviewApi({
-      tokenResolver: () => TOKEN,
-      fetchImpl: async () => new Response('<html>', { status: 200 }),
-    });
-    await expect(garbled.fetchProject({ repo: gitlabRef('project') })).rejects.toThrow(/not valid JSON/u);
-  });
-
-  it('names the real transport failure from fetch\'s cause and code, still redacted', async () => {
-    const failures: unknown[] = [
-      new TypeError('fetch failed', {
-        cause: Object.assign(new Error('getaddrinfo ENOTFOUND gitlab.example.com'), { code: 'ENOTFOUND' }),
-      }),
-      new TypeError('fetch failed', { cause: new Error(`redirect refused for ${TOKEN}`) }),
-      // A non-Error object cause is omitted (never dumped: it could carry
-      // credentials); a primitive cause is stringified; a code is
-      // flattened and bounded.
-      new TypeError('fetch failed', { cause: { reason: 'socket hang up', authorization: 'Bearer other-secret' } }),
-      new TypeError('fetch failed', { cause: 42n }),
-      new TypeError('fetch failed', {
-        cause: Object.assign(new Error('weird'), { code: `E_ODD\n  ${'X'.repeat(60)}` }),
-      }),
-      // Whitespace is flattened and the cause text bounded; the token
-      // straddles the 160-char cut and is redacted before it, so no
-      // prefix of it survives.
-      new TypeError('fetch failed', { cause: new Error(`tls\n\n  handshake   ${'x'.repeat(130)} ${TOKEN} ${'y'.repeat(200)}`) }),
-      // The same for a code: the token straddles its 40-char cut.
-      new TypeError('fetch failed', { cause: Object.assign(new Error('odd'), { code: `E_${'C'.repeat(30)}${TOKEN}` }) }),
-    ];
-    const api = new GitLabRepoOverviewApi({
-      tokenResolver: () => TOKEN,
-      fetchImpl: async () => {
-        throw failures.shift();
-      },
-    });
-    const dns = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(dns.kind).toBe('other');
-    expect(dns.message).toBe(
-      'project group/sub/project on gitlab.example.com: request failed (fetch failed [ENOTFOUND]: getaddrinfo ENOTFOUND gitlab.example.com)',
-    );
-    const redirect = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(redirect.message).toBe(
-      'project group/sub/project on gitlab.example.com: request failed (fetch failed: redirect refused for [redacted])',
-    );
-    const plain = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(plain.message).toBe('project group/sub/project on gitlab.example.com: request failed (fetch failed)');
-    const primitive = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(primitive.message).toBe('project group/sub/project on gitlab.example.com: request failed (fetch failed: 42)');
-    const odd = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(odd.message).toBe(
-      `project group/sub/project on gitlab.example.com: request failed (fetch failed [${`E_ODD ${'X'.repeat(60)}`.slice(0, 40)}]: weird)`,
-    );
-    const long = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    const text = /request failed \(fetch failed: (.*)\)$/u.exec(long.message)?.[1] ?? '';
-    expect(text).toBe(`tls handshake ${'x'.repeat(130)} [redacted] yyyy`);
-    expect(text).toHaveLength(160);
-    expect(long.message).not.toContain(TOKEN.slice(0, 8));
-    const coded = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(coded.message).toBe(
-      `project group/sub/project on gitlab.example.com: request failed (fetch failed [${`E_${'C'.repeat(30)}[redacted]`.slice(0, 40)}]: odd)`,
-    );
-    expect(coded.message).not.toContain(TOKEN.slice(0, 8));
-  });
-
-  it('names a multi-address connect failure from its AggregateError cause, code first', async () => {
-    const refused = (address: string): Error =>
-      Object.assign(new Error(`connect ECONNREFUSED ${address}`), { code: 'ECONNREFUSED' });
-    const failures: unknown[] = [
-      new TypeError('fetch failed', {
-        cause: Object.assign(new AggregateError([refused('10.0.0.1:443'), refused('[::1]:443')], ''), {
-          code: 'ECONNREFUSED',
-        }),
-      }),
-      // No code on the aggregate itself: the first nested error's code.
-      new TypeError('fetch failed', { cause: new AggregateError([refused('10.0.0.2:443')], '') }),
-      // Nothing readable at all: no empty text, no dangling separator.
-      new TypeError('fetch failed', { cause: new AggregateError([{}], '') }),
-    ];
-    const api = new GitLabRepoOverviewApi({
-      tokenResolver: () => TOKEN,
-      fetchImpl: async () => {
-        throw failures.shift();
-      },
-    });
-    const read = async (): Promise<RepoProviderError> =>
-      (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    const prefix = 'project group/sub/project on gitlab.example.com: request failed';
-    expect((await read()).message).toBe(
-      `${prefix} (fetch failed [ECONNREFUSED]: connect ECONNREFUSED 10.0.0.1:443; connect ECONNREFUSED [::1]:443)`,
-    );
-    expect((await read()).message).toBe(`${prefix} (fetch failed [ECONNREFUSED]: connect ECONNREFUSED 10.0.0.2:443)`);
-    const bare = await read();
-    expect(bare.kind).toBe('other');
-    expect(bare.message).toBe(`${prefix} (fetch failed)`);
+    // A non-2xx status below 400 is no success either.
+    const notModified = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => included('', { status: 304 })).run));
+    expect(notModified.kind).toBe('other');
+    expect(notModified.message).toBe(`${label}: HTTP 304`);
   });
 
   it('reads OAuth-style error bodies and aborts the host on a 403 insufficient_scope', async () => {
-    const remedy =
-      'GitLab token lacks the read_api or api scope — replace GITLAB_TOKEN (GL_TOKEN is read only when ' +
-      'GITLAB_TOKEN is unset) with a read_api or api token, then gru restart';
-    const label = 'project group/sub/project on gitlab.example.com';
+    const remedy = `glab's login for gitlab.example.com lacks the read_api or api scope — run ${login} with a read_api or api token`;
     const insufficient = {
       error: 'insufficient_scope',
       error_description: 'The request requires higher privileges than provided by the access token.',
       scope: 'api read_api',
     };
-    const cases: ReadonlyArray<readonly [Response, string, string]> = [
+    const cases: ReadonlyArray<readonly [GhCommandResult, string, string]> = [
       // A missing scope leads with what to do, never GitLab's generic text.
-      [json(insufficient, { status: 403 }), 'auth', `${remedy}; GitLab accepts api read_api (${label}: HTTP 403)`],
+      [included(insufficient, { status: 403 }), 'auth', `${remedy}; GitLab accepts api read_api (${label}: HTTP 403)`],
       [
-        json({ error: 'insufficient_scope', error_description: insufficient.error_description }, { status: 403 }),
+        included({ error: 'insufficient_scope', error_description: insufficient.error_description }, { status: 403 }),
         'auth',
         `${remedy} (${label}: HTTP 403)`,
       ],
       // A `scope` that is not a short list of scope names is never echoed.
-      [json({ ...insufficient, scope: `api ${TOKEN}` }, { status: 403 }), 'auth', `${remedy} (${label}: HTTP 403)`],
-      [json({ ...insufficient, scope: 'api, read_api' }, { status: 403 }), 'auth', `${remedy} (${label}: HTTP 403)`],
+      [included({ ...insufficient, scope: 'api <script>' }, { status: 403 }), 'auth', `${remedy} (${label}: HTTP 403)`],
+      [included({ ...insufficient, scope: 'api, read_api' }, { status: 403 }), 'auth', `${remedy} (${label}: HTTP 403)`],
       [
-        json({ ...insufficient, scope: 'api read_api read_repository write_repository' }, { status: 403 }),
+        included({ ...insufficient, scope: 'api read_api read_repository write_repository' }, { status: 403 }),
         'auth',
         `${remedy} (${label}: HTTP 403)`,
       ],
-      [json({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 }), 'auth', `${label}: HTTP 401 (Token was revoked.)`],
-      [json({ error: 'forbidden' }, { status: 403 }), 'permission', `${label}: HTTP 403 (forbidden)`],
-      [json({ message: '403 Forbidden', error: 'ignored' }, { status: 403 }), 'permission', `${label}: HTTP 403 (403 Forbidden)`],
+      [
+        included({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 }),
+        'auth',
+        `${label}: HTTP 401 (Token was revoked.)`,
+      ],
+      [included({ error: 'forbidden' }, { status: 403 }), 'permission', `${label}: HTTP 403 (forbidden)`],
+      [included({ message: '403 Forbidden', error: 'ignored' }, { status: 403 }), 'permission', `${label}: HTTP 403 (403 Forbidden)`],
     ];
-    for (const [response, kind, message] of cases) {
-      const api = new GitLabRepoOverviewApi({ fetchImpl: async () => response, tokenResolver: () => TOKEN });
-      const error = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    for (const [answer, kind, message] of cases) {
+      const error = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => answer).run));
       expect(error.kind, message).toBe(kind);
       expect(error.message).toBe(message);
     }
-    // A token without read_api fails every project alike: the first row
-    // aborts the host, and the rest spend no request. The remedy survives
+    // A login without read_api fails every project alike: the first row
+    // aborts the host, and the rest spend no glab run. The remedy survives
     // the row bound on the aborted row even behind a long nested path.
     const owner = 'platform-engineering/continuous-delivery-tooling/internal-services';
-    const { fetchImpl, calls } = fakeFetch(() => json(insufficient, { status: 403 }));
+    const { run, calls } = fakeGlab(() => included(insufficient, { status: 403 }));
     const h = harness({
       refs: new Map([
         ['gl-a', gitlabRef('gl-a-release-orchestration-service', 'gitlab.example.com', owner)],
         ['gl-b', gitlabRef('gl-b-release-orchestration-service', 'gitlab.example.com', owner)],
       ]),
-      gitlabApi: new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN }),
+      gitlabApi: new GitLabRepoOverviewApi(run),
     });
     const view = await h.tracker.refresh();
     expect(calls).toHaveLength(1);
@@ -661,34 +567,63 @@ describe('GitLab overview REST adapter', () => {
     expect(aborted.startsWith(`refresh aborted before this repository was checked: auth: ${remedy}; GitLab accepts api read_api`)).toBe(true);
   });
 
-  it('sends nothing without a token, to a host isGitLabRemote rejects, or to a non-default port', async () => {
-    const { fetchImpl, calls } = fakeFetch(() => json({}));
-    for (const token of [undefined, '', '   ']) {
-      const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => token });
-      const error = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-      expect(error).toBeInstanceOf(RepoProviderError);
-      expect(error.kind).toBe('auth');
-      expect(error.message).toMatch(/^no GitLab token configured for gitlab\.example\.com — set GITLAB_TOKEN/u);
-      expect(error.message).toBe(
-        'no GitLab token configured for gitlab.example.com — set GITLAB_TOKEN in the service environment to a ' +
-          'read_api or api token (GL_TOKEN is read only when GITLAB_TOKEN is unset)',
-      );
-    }
-    const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
+  it('never runs glab for a host isGitLabRemote rejects or one that is not a plain hostname', async () => {
+    const { run, calls } = fakeGlab(() => included({}));
+    const api = new GitLabRepoOverviewApi(run);
     for (const host of ['evil.example', 'evil.gitlab.attacker.test', 'gitlab.example.com:8443', 'gitlab.example.com@evil']) {
-      await expect(api.fetchProject({ repo: gitlabRef('project', host) }), host).rejects.toBeInstanceOf(RepoProviderError);
+      const error = (await api.fetchProject({ repo: gitlabRef('project', host) }).catch((caught: unknown) => caught)) as RepoProviderError;
+      expect(error, host).toBeInstanceOf(RepoProviderError);
+      expect(error.message).toContain('not a GitLab host — glab is never run for it');
     }
     expect(calls).toEqual([]);
   });
 
-  it('resolves the token from GITLAB_TOKEN, falling back to GL_TOKEN', async () => {
-    const { fetchImpl, calls } = fakeFetch(() => json({ default_branch: 'main' }));
-    vi.stubEnv('GITLAB_TOKEN', undefined);
-    vi.stubEnv('GL_TOKEN', 'gl-fallback-token');
-    await new GitLabRepoOverviewApi({ fetchImpl }).fetchProject({ repo: gitlabRef('project') });
-    vi.stubEnv('GITLAB_TOKEN', 'gitlab-primary-token');
-    await new GitLabRepoOverviewApi({ fetchImpl }).fetchProject({ repo: gitlabRef('project') });
-    expect(calls.map((call) => call.headers['PRIVATE-TOKEN'])).toEqual(['gl-fallback-token', 'gitlab-primary-token']);
+  it('reads a host glab holds no login for as auth, naming glab auth login', async () => {
+    const stderrs = [
+      // glab 1.89's boxed verdict, with colour and padding.
+      `\n ${ESC}[31m╭──────────────╮${ESC}[0m\n │ ERROR        │\n │ Unauthenticated.   │\n ╰──────────────╯\n\n`,
+      'You are not logged into any GitLab hosts. Run glab auth login to authenticate.',
+      'glab: no token found for gitlab.example.com',
+    ];
+    for (const stderr of stderrs) {
+      const error = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => ({ status: 1, stdout: '', stderr })).run));
+      expect(error.kind, stderr).toBe('auth');
+      expect(error.message).toBe(`glab is not logged in to gitlab.example.com — run ${login}`);
+    }
+  });
+
+  it('reads a missing glab as auth with the install fix, and a run past its bound as other', async () => {
+    const missing = await failureOf(
+      new GitLabRepoOverviewApi(fakeGlab(() => ({ status: -1, stdout: '', stderr: '', error: 'Error: spawn glab ENOENT' })).run),
+    );
+    expect(missing.kind).toBe('auth');
+    expect(missing.message).toBe(`glab is unavailable (Error: spawn glab ENOENT) — install the GitLab CLI and run ${login}`);
+    for (const [error, message] of [
+      ['gh api timed out after 15000 ms', 'glab api timed out after 15000 ms'],
+      ['gh api output exceeds 16777216 bytes', 'glab api output exceeds 16777216 bytes'],
+    ] as const) {
+      const bounded = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => ({ status: -1, stdout: '', stderr: '', error })).run));
+      // One slow or oversized response, never a host-wide condition.
+      expect(bounded.kind).toBe('other');
+      expect(bounded.message).toBe(`${label}: ${message}`);
+    }
+  });
+
+  it('reads any other failing glab run as other, with its stderr flattened, ANSI-stripped and bounded', async () => {
+    const answers: GhCommandResult[] = [
+      { status: 2, stdout: '', stderr: `${ESC}[33mglab:${ESC}[0m something\n\n   broke ${'z'.repeat(400)}` },
+      { status: 1, stdout: '', stderr: '' },
+      // Exit 0 without a status line is no response either.
+      { status: 0, stdout: '{"id":1}', stderr: '' },
+    ];
+    const api = new GitLabRepoOverviewApi(fakeGlab(() => answers.shift() as GhCommandResult).run);
+    const noisy = await failureOf(api);
+    expect(noisy.kind).toBe('other');
+    expect(noisy.message).toBe(`${label}: glab exited 2: ${`glab: something broke ${'z'.repeat(400)}`.slice(0, 160)}`);
+    expect((await failureOf(api)).message).toBe(`${label}: glab exited 1`);
+    const silent = await failureOf(api);
+    expect(silent.kind).toBe('other');
+    expect(silent.message).toBe(`${label}: glab api printed no HTTP status line`);
   });
 });
 
@@ -808,9 +743,8 @@ describe('managed repo overview tracker — GitLab rows', () => {
     expectValidOnBoard(view);
   });
 
-  it('with no GitLab token, GitHub rows stay fresh with today\'s calls and the GitLab rows name the missing token', async () => {
-    const { fetchImpl, calls: sent } = fakeFetch(() => json({}));
-    const gitlabApi = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => undefined });
+  it('with glab not logged in, GitHub rows stay fresh with today\'s calls and the GitLab rows name glab auth login', async () => {
+    const { run, calls } = fakeGlab(() => ({ status: 1, stdout: '', stderr: ' ERROR \n  Unauthenticated.  \n' }));
     const h = harness({
       refs: new Map<string, RepoRef>([
         ['alpha', githubRef('alpha')],
@@ -819,24 +753,32 @@ describe('managed repo overview tracker — GitLab rows', () => {
         ['gl-other', gitlabRef('gl-other', 'gitlab.other.test', 'team')],
         ['zeta', githubRef('zeta')],
       ]),
-      gitlabApi,
+      gitlabApi: new GitLabRepoOverviewApi(run),
     });
     const view = await h.tracker.refresh();
-    expect(sent).toEqual([]);
+    // One glab run per host: the first row's verdict aborts that host.
+    expect(calls.map((args) => args[2])).toEqual(['gitlab.example.com', 'gitlab.other.test']);
     // GitHub: exactly today's calls, fresh rows, the #446 hook fed.
     expect(h.github.calls).toEqual([...githubCalls('alpha'), ...githubCalls('zeta')]);
     for (const key of ['alpha', 'zeta']) {
       expect(row(view, key)).toMatchObject({ provider: 'github', freshness: 'fresh', error: null, openPrs: 2 });
     }
     expect(h.alerts.map((alert) => alert.repo.repo)).toEqual(['alpha', 'zeta']);
-    // The first GitLab row on the host names the missing token…
+    // The first GitLab row on the host names the fix…
     expect(row(view, 'gl-a').freshness).toBe('unavailable');
-    expect(row(view, 'gl-a').error).toMatch(/^no GitLab token configured for gitlab\.example\.com — set GITLAB_TOKEN/u);
-    // …later rows on that host are disclosed aborted with no call, and a
+    expect(row(view, 'gl-a').error).toBe(
+      'glab is not logged in to gitlab.example.com — run `glab auth login --hostname gitlab.example.com`',
+    );
+    // …later rows on that host are disclosed aborted with no run, and a
     // different GitLab host is its own scope.
     expect(row(view, 'gl-b').freshness).toBe('unavailable');
-    expect(row(view, 'gl-b').error).toContain('refresh aborted before this repository was checked: auth: no GitLab token');
-    expect(row(view, 'gl-other').error).toMatch(/^no GitLab token configured for gitlab\.other\.test/u);
+    expect(row(view, 'gl-b').error).toBe(
+      'refresh aborted before this repository was checked: auth: glab is not logged in to gitlab.example.com — run ' +
+        '`glab auth login --hostname gitlab.example.com`',
+    );
+    expect(row(view, 'gl-other').error).toBe(
+      'glab is not logged in to gitlab.other.test — run `glab auth login --hostname gitlab.other.test`',
+    );
     // Unknown data stays unknown: no zero counts, no run.
     expect(row(view, 'gl-b')).toMatchObject({ openPrs: null, openIssues: null, run: null, checkedAt: null });
     expectValidOnBoard(view);
