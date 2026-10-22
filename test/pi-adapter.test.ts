@@ -4407,7 +4407,7 @@ it('automatic SDK compaction completes before the same admitted native authority
   const summaryHold = new Promise<void>((resolveSummary) => { releaseSummary = resolveSummary; });
   let handle: AgentHandle | null = null;
   let supervisor: InstanceType<typeof Supervisor> | null = null;
-  let sample: (() => {
+  type CompactionObservation = {
     readonly view: ReturnType<InstanceType<typeof Supervisor>['viewFor']>;
     readonly adapterCompacting: boolean;
     readonly sdkCompacting: boolean;
@@ -4419,10 +4419,11 @@ it('automatic SDK compaction completes before the same admitted native authority
     readonly exactBlockers: readonly string[];
     readonly unownedBlockers: readonly string[];
     readonly mismatchedBlockers: Readonly<Record<string, readonly string[]>>;
-  } | null) | null = null;
+  };
+  let sample: (() => CompactionObservation | null) | null = null;
   const rawCompaction: { readonly type: string; readonly sdkCompacting: boolean }[] = [];
-  const preparations: { readonly before: ReturnType<NonNullable<typeof sample>>; readonly after: ReturnType<NonNullable<typeof sample>> }[] = [];
-  const afterCompactionTurnStarts: NonNullable<ReturnType<NonNullable<typeof sample>>>[] = [];
+  const preparations: { readonly before: CompactionObservation; readonly after: CompactionObservation }[] = [];
+  const afterCompactionTurnStarts: CompactionObservation[] = [];
   let rawTerminalObserved = false;
   const f = await sdkDirectiveExecutionFixture([
     { deltas: [history], toolCall: { id: 'compact-once', name: 'bash', args: { command: "printf 'once\\n' > compacted-native-effect.txt" } }, usageTokens: 90_000 },
