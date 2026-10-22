@@ -1466,6 +1466,35 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     ).toHaveLength(1);
   });
 
+  it('an explicit compaction Pi cancelled keeps Pi\'s own cancel terminal when its call then throws', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    const internal = handle as unknown as { session: { compact(): Promise<unknown> }; onPiEvent(event: unknown): void };
+    const nativeSession = internal.session;
+    // As Pi's compact() does when cancelled: it emits its own aborted terminal, then rethrows.
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'compact') {
+          return async () => {
+            internal.onPiEvent({ type: 'compaction_start' });
+            internal.onPiEvent({ type: 'compaction_end', aborted: true, willRetry: false });
+            throw new Error('Compaction cancelled');
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    try {
+      await handle.prompt('prime');
+      await expect(handle.compact!()).rejects.toThrow(/^compaction aborted$/u);
+      expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: false, error: 'compaction aborted' }]);
+    } finally {
+      internal.session = nativeSession;
+      await handle.dispose();
+    }
+  });
+
   it('never aborts a pending explicit compaction when time crosses the former #137 deadline', async () => {
     const fx = await fixture([{ deltas: ['first answer'] }]);
     const handle = await fx.runtime.spawn('gru');
@@ -4871,10 +4900,12 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose' | 'deadline
     expect(f.store.isHeld(handle.sessionFile!)).toBe(false);
   } finally { clock?.mockRestore(); held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
 }
-/** A pre-prompt compaction whose terminal Pi's gate still withholds at the
- * directive's admission (preflight), or whose reconcile bound disposed the
- * handle first: the directive is refused there, before Pi writes a receipt. */
-async function assertPreflightRefused(by: 'withheld' | 'disposed') {
+/** At the directive's admission (preflight), before Pi writes a receipt, the
+ * directive is refused when the pre-prompt compaction terminal is still
+ * withheld by Pi's gate, when the reconcile bound disposed the handle (before
+ * preflight, or in admission's own flush), or when a compaction is still
+ * running with no terminal yet. */
+async function assertPreflightRefused(by: 'withheld' | 'disposed' | 'disposed-at-admission' | 'running') {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
   const { DirectiveCheckpointError, readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
   let summaries = 0; let replies = 0;
@@ -4886,6 +4917,7 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed') {
   const scene = await directiveRecoveryLedgerFixture(`preflight-${by}`);
   const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: `preflight-${by}-minion` });
   const session = await actualDirectiveSdkSession(handle);
+  const internal = handle as unknown as { onPiEvent(event: unknown): void };
   scene.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: scene.request.jobId, sessionFile: handle.sessionFile });
   scene.ledger.setAgentState(handle.id, 'idle');
   scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
@@ -4895,7 +4927,7 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed') {
   let clock: { mockRestore(): void } | null = null;
   Object.defineProperty(session, 'isCompacting', { configurable: true, get: () => held || nativeCompacting.call(session) });
   session.subscribe((event) => {
-    if (!armed || event.type !== 'compaction_end') return;
+    if (!armed || event.type !== 'compaction_end' || by === 'running') return;
     held = true;
     if (by === 'disposed') {
       // Past the reconcile bound by the next re-check: it publishes a failed terminal and disposes.
@@ -4903,9 +4935,26 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed') {
       clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
     }
   });
+  if (by === 'disposed-at-admission' || by === 'running') {
+    // Act as Pi calls preflightResult: the bound is crossed there, so admission's
+    // own flush is the first re-check past it; or a compaction starts there.
+    const nativePrompt = session.prompt.bind(session);
+    (session as unknown as { prompt: (text: string, options?: Record<string, unknown>) => Promise<void> }).prompt = (text, options) => {
+      const preflight = options?.['preflightResult'] as ((accepted: boolean) => void) | undefined;
+      if (preflight === undefined) return nativePrompt(text, options as never);
+      return nativePrompt(text, { ...options, preflightResult: (accepted: boolean) => {
+        if (accepted && armed && by === 'running') internal.onPiEvent({ type: 'compaction_start' });
+        if (accepted && armed && by === 'disposed-at-admission') {
+          const now = Date.now.bind(Date);
+          clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
+        }
+        preflight(accepted);
+      } } as never);
+    };
+  }
   const events = collect(handle);
   // Once the bound published its failed terminal the gate opens, so disposal can prove quiescence.
-  if (by === 'disposed') handle.subscribe((event) => { if (event.type === 'compaction_end') held = false; });
+  if (by === 'disposed' || by === 'disposed-at-admission') handle.subscribe((event) => { if (event.type === 'compaction_end') held = false; });
   try {
     await handle.prompt('earlier ordinary work');
     await waitFor(() => handle.isCompacting?.() === false, 'failed post-run compaction terminal');
@@ -4915,7 +4964,7 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed') {
       beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
       onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
     await expect(turn).rejects.toThrow(new DirectiveCheckpointError(by === 'withheld' ? 'native compaction terminal still withheld at directive admission'
-      : 'native directive owner disposed during prompt preparation'));
+      : by === 'running' ? 'native compaction still running at directive admission' : 'native directive owner disposed during prompt preparation'));
     (clock as { mockRestore(): void } | null)?.mockRestore(); clock = null;
     // Not admitted: no receipt, no directive model request.
     const rows = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly message?: { readonly role: string } });
@@ -4928,6 +4977,12 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed') {
       await waitFor(() => events.some((event) => event.type === 'compaction_end'), 'the withheld terminal once Pi\'s gate clears');
       expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: true }]);
       expect(handle.health().state).not.toBe('disposed');
+    } else if (by === 'running') {
+      // The pre-prompt terminal published; the running one ends later and publishes too.
+      internal.onPiEvent({ type: 'compaction_end' });
+      await waitFor(() => events.filter((event) => event.type === 'compaction_end').length === 2, 'the running compaction\'s terminal');
+      expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: true }, { type: 'compaction_end', success: true }]);
+      expect(handle.health().state).not.toBe('disposed');
     } else {
       expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: false, error: 'native compaction state did not settle after its terminal event' }]);
       await handle.dispose();
@@ -4937,6 +4992,8 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed') {
 }
 it('a directive is refused at admission while Pi\'s gate still withholds its pre-prompt compaction terminal, before any receipt', () => assertPreflightRefused('withheld'));
 it('a directive is refused at admission when the reconcile bound disposed its owner during prompt preparation, before any receipt', () => assertPreflightRefused('disposed'));
+it('a directive is refused when admission\'s own flush crosses the reconcile bound and disposes its owner, before any receipt', () => assertPreflightRefused('disposed-at-admission'));
+it('a directive is refused at admission while a compaction is still running with no terminal, before any receipt', () => assertPreflightRefused('running'));
 it('a directive abort during the compaction terminal wait refuses at once, without another model request', () => assertCompactionWaitCancelled('abort'));
 it('disposal during the compaction terminal wait refuses at once and releases native ownership', () => assertCompactionWaitCancelled('dispose'));
 it('a compaction terminal that never settles ends the waiting preparation at the reconcile deadline with a refusal', () => assertCompactionWaitCancelled('deadline'));
@@ -5021,8 +5078,12 @@ it('a joined compaction running past the first terminal\'s reconcile bound publi
 
 /** Pi's own compaction events into one open episode, its terminal held back
  * by Pi's gate: the joined episode publishes one terminal once the gate opens. */
-async function assertJoinedTerminal(outcomes: readonly ('success' | 'failure' | 'aborted')[], expected: Extract<RuntimeEvent, { type: 'compaction_end' }>) {
-  const f = await fixture([{ deltas: ['primed'] }]);
+async function assertJoinedTerminal(outcomes: readonly ('success' | 'failure' | 'aborted')[], expected: Extract<RuntimeEvent, { type: 'compaction_end' }>,
+  droppedFailures: readonly string[] = []) {
+  const dropped: unknown[] = [];
+  const f = await fixture([{ deltas: ['primed'] }], ['text'], { log: (level, msg, fields) => {
+    if (level === 'warn' && msg === 'joined native compaction failure not published') dropped.push(fields?.['error']);
+  } });
   const handle = await f.runtime.spawn('gru');
   const session = await actualDirectiveSdkSession(handle);
   const internal = handle as unknown as { onPiEvent(event: unknown): void };
@@ -5043,14 +5104,24 @@ async function assertJoinedTerminal(outcomes: readonly ('success' | 'failure' | 
     held = false;
     await waitFor(() => events.some((event) => event.type === 'compaction_end'), 'the joined terminal once Pi\'s gate opens');
     expect(events.filter((event) => event.type === 'compaction_end')).toEqual([expected]);
+    // A failure the join did not publish is still logged.
+    expect(dropped).toEqual(droppedFailures);
   } finally { held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
 }
 it('a joined compaction episode publishes one terminal: a later written summary wins over an earlier failure', () =>
   assertJoinedTerminal(['failure', 'success'], { type: 'compaction_end', success: true }));
 it('a joined compaction episode publishes one terminal: an earlier written summary wins over a later failure', () =>
-  assertJoinedTerminal(['success', 'failure'], { type: 'compaction_end', success: true }));
+  assertJoinedTerminal(['success', 'failure'], { type: 'compaction_end', success: true }, ['Auto-compaction failed: summary 1 failed']));
 it('a joined compaction episode with no summary publishes a failure\'s own error, never a later cancel\'s', () =>
   assertJoinedTerminal(['failure', 'aborted'], { type: 'compaction_end', success: false, error: 'Auto-compaction failed: summary 0 failed' }));
+it('a joined compaction episode with no summary publishes the first failure, the root cause, and logs the later one', () =>
+  assertJoinedTerminal(['failure', 'failure'], { type: 'compaction_end', success: false, error: 'Auto-compaction failed: summary 0 failed' }, ['Auto-compaction failed: summary 1 failed']));
+it('a joined compaction episode keeps a written summary over a later cancel', () =>
+  assertJoinedTerminal(['success', 'aborted'], { type: 'compaction_end', success: true }));
+it('a compaction cancelled with no later attempt publishes compaction aborted', () =>
+  assertJoinedTerminal(['aborted'], { type: 'compaction_end', success: false, error: 'compaction aborted' }));
+it('a joined compaction episode publishes a later failure over an earlier cancel', () =>
+  assertJoinedTerminal(['aborted', 'failure'], { type: 'compaction_end', success: false, error: 'Auto-compaction failed: summary 1 failed' }));
 
 it('restart recovery continues a directive the host lost right after Pi\'s mid-run compaction: one model call, the earlier effect never re-run', async () => {
   const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');

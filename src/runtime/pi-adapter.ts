@@ -16,7 +16,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
-import { resolveModelRefreshPolicy, resolveSpawnPolicy } from '../config.js';
+import { PI_THINKING_LEVELS, resolveModelRefreshPolicy, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
@@ -745,15 +745,6 @@ export class PiRuntime implements AgentRuntime {
     await this.prepareReviewModel(role);
   }
 
-  /** Thinking levels pi's session API accepts (fail-loud on typos: pi CAN set it). */
-  private static readonly PI_THINKING_LEVELS: readonly ThinkingLevel[] = [
-    'minimal',
-    'low',
-    'medium',
-    'high',
-    'xhigh',
-    'max',
-  ];
 
   private resolveThinkingLevel(role: Role, override?: string): ThinkingLevel | undefined {
     const ref =
@@ -761,9 +752,10 @@ export class PiRuntime implements AgentRuntime {
         ? override
         : resolveSpawnPolicy(this.config, 'pi', role).thinkingLevel;
     if (ref === '' || ref === 'default') return undefined;
-    if (!PiRuntime.PI_THINKING_LEVELS.includes(ref as ThinkingLevel)) {
+    // Thinking levels pi's session API accepts (fail-loud on typos: pi CAN set it).
+    if (!PI_THINKING_LEVELS.includes(ref as ThinkingLevel)) {
       throw new Error(
-        `unknown thinking level "${ref}" for pi (valid: default, ${PiRuntime.PI_THINKING_LEVELS.join(', ')})`,
+        `unknown thinking level "${ref}" for pi (valid: default, ${PI_THINKING_LEVELS.join(', ')})`,
       );
     }
     return ref as ThinkingLevel;
@@ -1532,7 +1524,9 @@ export class PiAgentHandle implements AgentHandle {
       if (this.compactionWork === work) this.compactionWork = null;
       this.compacting = false;
       if (!this.disposed) {
-        if (failed || this.pendingCompactionEnd === null) {
+        // Pi's own terminal, a cancel's included, stands when it emitted one
+        // before the call threw; a failure is synthesized only without one.
+        if (this.pendingCompactionEnd === null) {
           this.pendingCompactionEnd = { aborted: false, event: {
             type: 'compaction_end',
             success: false,
@@ -1797,7 +1791,8 @@ export class PiAgentHandle implements AgentHandle {
       // disposes), the directive is not admitted.
       if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
       if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
-      if (this.nativeCompactionOpen || this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
+      if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
+      if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
       directive.beforeAdmission();
       if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
         throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
@@ -2124,11 +2119,14 @@ export class PiAgentHandle implements AgentHandle {
               }),
         } };
         // A joined episode publishes one terminal: success when any compaction
-        // in it wrote its summary, else a failure's own error; a cancelled
-        // cycle stands only when nothing else ended the episode.
+        // in it wrote its summary, else the first failure's own error (the root
+        // cause); a cancelled cycle stands only when nothing else ended it.
         const rank = ({ event, aborted: cancelled }: typeof terminal): number => event.success ? 2 : cancelled ? 0 : 1;
         const prior = this.pendingCompactionEnd;
-        if (prior === null || rank(terminal) >= rank(prior)) this.pendingCompactionEnd = terminal;
+        if (prior === null || rank(terminal) > rank(prior)) this.pendingCompactionEnd = terminal;
+        else if (rank(terminal) === 1) {
+          this.log('warn', 'joined native compaction failure not published', { role: this.role, session: this.id, error: terminal.event.error });
+        }
         this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
         // Pi dispatches this event before AgentSession clears isCompacting.
         // Publish only after the native gate is really open, or queued prompts

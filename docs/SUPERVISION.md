@@ -80,11 +80,14 @@ compaction.
 **A Pi directive's own automatic compaction is not a foreign control.**
 Pi compacts a long session on its own; each compaction appends a summary
 entry that runs no tool and sends no message. While a directive runs, the
-adapter publishes that compaction's terminal as soon as Pi's gate clears,
-admission publishes one still withheld once the gate has cleared (and
-otherwise refuses the directive before Pi writes its receipt), and
-next-turn preparation waits for it before the authority check, so
-supervision never holds the directive's own compaction against it.
+adapter publishes that compaction's terminal as soon as Pi's compaction
+flag clears, admission publishes one still withheld once the flag has
+cleared (and otherwise refuses the directive before Pi writes its
+receipt), and next-turn preparation waits for it before the authority
+check, so supervision never holds the directive's own compaction against
+it. A terminal stays withheld past Pi's settle point, and a later start
+joins its episode, only while another holder (a manual compaction or a
+branch summary) keeps Pi's flag set.
 Directive proof (admission, the tool fence before every effect, and the
 checkpoint read for completion or recovery) walks past a compaction only
 when it is a Pi-authored summary, with a timestamp, a summary and a token
@@ -105,10 +108,9 @@ of four places:
   history: tool calls in it never ran. A turn lost between that compaction
   and the continued reply reads as the failed reply's terminal (not ok) and
   is never resumed: the run ended on that error, and only Pi's compaction
-  ran after it. That holds when the failed reply has no tool calls; one
-  that holds calls makes the lost turn read UNKNOWN ('malformed native tool
-  identity') until #483's retry-history reading, which reads those calls as
-  never run, lands.
+  ran after it. That holds when the failed reply has no tool calls: an error
+  reply holding tool calls reads UNKNOWN ('malformed native tool
+  identity').
 
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the
