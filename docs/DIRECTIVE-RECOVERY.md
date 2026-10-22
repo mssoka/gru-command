@@ -288,7 +288,11 @@ continuations and `/recover` successors.
   session's later growth never pushes an earlier directive past its limits.
   A pi checkpoint's lookahead past its terminal (the next request and its
   model/thinking controls) has its own 32 MiB / 250,000-entry bound and is
-  refused under its own name, as the lookahead, never as the turn.
+  refused under its own name, as the lookahead, never as the turn. The
+  entry after a receipted retry error row (#483, below) is read as that
+  lookahead, and charged back to the turn when it is the SDK's retried
+  answer. One too large to read at all is refused as the lookahead before
+  its role is known; it is past both bounds.
 
 What is still refused by name, wherever a walk reads it:
 
@@ -334,30 +338,44 @@ A provider error the pi SDK retries is not the turn's end either (#483).
 After a retryable error, such as a truncated stream, the SDK keeps the
 assistant error row in the transcript and retries from it. When the SDK
 emits its live `auto_retry_start`, the adapter writes a `retry-start`
-receipt to the producer journal (below), through the directive's own started
-physical producer. The receipt names the error row's entry id and its error
-message. It is written only from that live event, never from transcript
-history, so a retry the adapter never saw has no receipt. The tool fence,
-the checkpoint and settlement read the row as history only when all of
-these hold:
+receipt to the producer journal (below), through the directive's own
+started physical producer. The receipt names the error row's entry id and
+its error message. It is written only from that live event, never from
+transcript history, so a retry the adapter never saw has no receipt.
+
+Owner ruling 2026-10-22: an error row's tool calls, partial ones included,
+never ran, because the SDK executes no call of an error row. They are inert
+retry history when the row is retried, and owe no results when the row
+ends the turn. The tool fence, the checkpoint and settlement read an error
+row as retry history only when all of these hold:
 
 - a receipt from a producer of this exact directive identity names the row
   and its exact error;
-- the row holds only text, thinking and tool calls (owner ruling
-  2026-10-22). The SDK executes no tool call of an error row, so its calls,
-  partial ones included, never enter the pending set, and a result naming
-  one is refused as unmatched;
+- the row holds only text, thinking and tool calls;
 - the SDK's retried answer, an assistant entry parented on the row, follows
   it.
 
+Its calls never enter the pending set, so a result naming one is never a
+match: the turn reads UNKNOWN, as an unmatched result after the retried
+answer, or as an entry past the terminal when the row ended the turn.
+
 When a retry is cancelled during backoff, no retried answer follows, so the
 receipted row is the turn's terminal, a failed one. When attempts run out,
-the SDK starts no retry for the last error: the receipted rows before it are
-history, and that unreceipted last row is the failed terminal. An error row
-that ends the turn reads as that failed terminal even when it holds tool
-calls, because they never ran. At the tool fence any other error row still
-refuses the next tool, under a reason naming what it lacks: a matching
-receipt, history-only content, or the retried answer. When the adapter cannot record a receipt it logs `native SDK retry
+the SDK starts no retry for the last error: the receipted rows before it
+are history, and that unreceipted last row is the failed terminal. An error
+row that ends the turn is that failed terminal even when it holds tool
+calls. At the tool fence any other error row still refuses the next tool,
+under a reason naming what it lacks: a matching receipt, history-only
+content, or the retried answer.
+
+Two other stops hold tool calls. The SDK runs none of an `aborted` row's
+calls either, so an aborted row likewise owes no results and is a failed
+terminal. A `length` row's calls were cut off by the output token limit:
+the SDK answers each with its own failed "not executed" result and goes on,
+so those calls are pending like a `toolUse` row's, and the minion may call
+tools after them.
+
+When the adapter cannot record a receipt it logs `native SDK retry
 evidence not recorded; retry-history tool effects remain refused` at warn,
 with the reason or the error, and the directive stays fail-closed. A
 malformed `retry-start` receipt, or two that give one row different errors,

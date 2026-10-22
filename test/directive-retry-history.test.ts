@@ -56,6 +56,12 @@ function producerFor(file: string, who: DirectiveTurnIdentity): DirectiveProduce
 /** A Pi directive whose first request failed at `retry-error`, admitted
  * (read back) unless `admit` is false. */
 function retryScene(content: readonly unknown[] = signedContent, admit = true) {
+  const { file, producer } = admittedScene(admit);
+  const error = entry(file, 'retry-error', 'receipt', errorMessage(content));
+  return { file, producer, error };
+}
+/** A Pi directive at its user receipt, admitted (read back) unless `admit` is false. */
+function admittedScene(admit = true) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-retry-history-'));
   dirs.push(dir);
   const file = join(dir, 'session.jsonl');
@@ -64,8 +70,7 @@ function retryScene(content: readonly unknown[] = signedContent, admit = true) {
   const producer = producerFor(file, identity);
   entry(file, 'receipt', null, { role: 'user', content: [{ type: 'text', text }] });
   if (admit) inspectDirectiveAdmission(file, identity);
-  const error = entry(file, 'retry-error', 'receipt', errorMessage(content));
-  return { file, producer, error };
+  return { file, producer };
 }
 /** The retried request calls a tool: the guard must admit it before it runs. */
 function flushRetried(file: string, parent = 'retry-error'): void {
@@ -320,5 +325,26 @@ describe('Pi retry history (#483)', () => {
     const { file, producer } = retryScene();
     appendReceipt(file, { state: 'retry-start', producer: { ...producer, incarnation: 'never-started' }, entryId: 'retry-error', errorMessage: ERROR });
     expect(() => inspectDirectiveCheckpoint(file, identity)).toThrow(new DirectiveCheckpointError('native cessation does not bind its physical incarnation'));
+  });
+});
+
+describe('Pi rows whose tool calls the SDK never executes (#483)', () => {
+  const cutOff = { type: 'toolCall', id: 'cut-off-call', name: 'bash', arguments: { command: 'printf trunc' } };
+  it('a length row\'s tool calls are pending until the SDK\'s own "not executed" results answer them, and the next tool runs', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', { role: 'assistant', stopReason: 'length', content: [{ type: 'text', text: 'Running it now' }, cutOff] });
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool effects/results are incomplete' });
+    entry(file, 'not-executed', 'truncated', { role: 'toolResult', toolCallId: cutOff.id, toolName: 'bash', isError: true,
+      content: [{ type: 'text', text: 'Tool call "bash" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.' }] });
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });
+    expect(() => flushRetried(file, 'not-executed')).not.toThrow();
+    finishTurn(file);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('an aborted row holding a tool call owes no result: it is the failed terminal', () => {
+    const { file } = admittedScene();
+    entry(file, 'aborted', 'receipt', { role: 'assistant', stopReason: 'aborted', errorMessage: 'Request was aborted', content: [cutOff] });
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: 'Request was aborted', checkpointId: 'aborted' });
   });
 });

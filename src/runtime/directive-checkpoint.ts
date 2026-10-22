@@ -194,9 +194,11 @@ class NativeTurn {
     this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn';
   }
   /** Takes back end(): what was read since belongs to the turn after all,
-   * and is charged to it under the turn's own bound and name. */
+   * and is charged to it under the turn's own bound and name. A line too
+   * large to read at all was refused before its role was known, under the
+   * lookahead's name: it is past both bounds. */
   resume(): void {
-    if (this.ended === null) return;
+    if (this.ended === null) throw new DirectiveCheckpointError('native directive turn resumed without having ended');
     this.start = this.ended.start; this.count += this.ended.count; this.ended = null; this.scope = 'native directive turn';
     if (this.lines.end - this.start > MAX_NATIVE_TRANSCRIPT_BYTES) throw new DirectiveCheckpointError(`${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
     if (this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError(`${this.scope} exceeds the entry inspection limit`);
@@ -473,9 +475,13 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (isRetryHistoryRow(entry, () => { endTurn(); return native(index + 1); }, retries)) resumeTurn();
       else {
         for (const block of message.content as Record<string, unknown>[]) {
-          // An error row's calls never ran (owner ruling 2026-10-22): it ends the turn, it owes no results.
-          if (block.type !== 'toolCall' || message.stopReason === 'error') continue;
-          if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
+          // An error row's calls never ran (owner ruling 2026-10-22, see
+          // validRetryErrorContent), nor did an aborted row's: the SDK returns
+          // on both. Ending the turn, such a row owes no results. A length
+          // row's calls are pending: the SDK answers each with its own
+          // "not executed" result and goes on.
+          if (block.type !== 'toolCall' || message.stopReason === 'error' || message.stopReason === 'aborted') continue;
+          if ((message.stopReason !== 'toolUse' && message.stopReason !== 'length') || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
           pending.set(block.id, block.name);
         }
         if (pending.size === 0) {
@@ -894,10 +900,11 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 function nonBlank(value: unknown): value is string { return typeof value === 'string' && value.trim() !== ''; }
-/** Text, thinking and tool calls only. The SDK executes no tool call of an
- * error row (owner ruling 2026-10-22), so its calls, partial ones included,
- * are inert history. Unknown blocks, and text or thinking with other keys,
- * are never history. */
+/** Text, thinking and tool calls only. Owner ruling 2026-10-22: an error
+ * row's tool calls, partial ones included, never ran (the SDK executes none),
+ * so they are inert retry history when the row is retried, and owe no
+ * results when it ends the turn. Unknown blocks, and text or thinking with
+ * other keys, are never history. */
 function validRetryErrorContent(content: unknown): boolean {
   if (!Array.isArray(content)) return false;
   return content.every((value: unknown) => {
@@ -1087,7 +1094,8 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
             : !isReceiptedErrorRow(entry.id, message!, retries) ? 'native receipted error row holds content that is not retry history'
               : 'native receipted error row has no retried answer after it');
         }
-        if (message!.stopReason !== 'toolUse') refuse();
+        // A length row's calls get the SDK's own "not executed" results.
+        if (message!.stopReason !== 'toolUse' && message!.stopReason !== 'length') refuse();
         for (const block of message!.content as Record<string, unknown>[]) {
           if (block.type !== 'toolCall') continue;
           if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();

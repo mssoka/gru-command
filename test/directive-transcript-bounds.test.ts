@@ -363,29 +363,21 @@ describe('an earlier directive on a session that kept working (#469)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
   });
 
-  it('pi: a turn just under the limit ending on an abandoned receipted retry row stays inspectable once a later request follows; a retried answer is charged to the turn (#483)', () => {
-    const turn = () => {
-      const file = sessionFile(piHeader);
-      preparePi(file);
-      const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
-      const error = (body: string) => ({ type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError(body) });
-      // The whole turn, receipt and receipted error row, is 10 bytes under the limit.
-      const row = error('x'.repeat(LIMIT - 10 - Buffer.byteLength(receipt) - Buffer.byteLength(`${JSON.stringify(error('x'))}\n`) + 1));
-      appendFileSync(file, `${receipt}${JSON.stringify(row)}\n`);
-      inspectDirectiveAdmission(file, identity);
-      recordRetry(file, row);
-      return file;
-    };
-    const file = turn();
+  it('pi: a turn just under the limit ending on an abandoned receipted retry row stays inspectable once a later request follows (#483)', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+    const error = (body: string) => ({ type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError(body) });
+    // The whole turn, receipt and receipted error row, is 10 bytes under the limit.
+    const row = error('x'.repeat(LIMIT - 10 - Buffer.byteLength(receipt) - Buffer.byteLength(`${JSON.stringify(error('x'))}\n`) + 1));
+    appendFileSync(file, `${receipt}${JSON.stringify(row)}\n`);
+    inspectDirectiveAdmission(file, identity);
+    recordRetry(file, row);
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: RETRY_ERROR, checkpointId: 'retry-error' });
     preparePi(file, laterIdentity, 'the next approved step');
     piEntry(file, 'receipt-b', 'retry-error', prompt('the next approved step'));
     expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: RETRY_ERROR, checkpointId: 'retry-error' });
-    // The SDK's retried answer is the turn's own: it is charged to the turn, here past its limit.
-    const retried = turn();
-    piEntry(retried, 'retried-answer', 'retry-error', answer);
-    expect(() => inspectDirectiveCheckpoint(retried, identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
   });
 
   it('Claude Code: stays inspectable after a later directive turn past the limit, reading only through its own turn', () => {
@@ -595,6 +587,25 @@ describe('limits at their exact boundaries (#469)', () => {
     expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
   });
 
+  it('pi: a turn of exactly 32 MiB ending on its retried answer is read; one byte more refuses as the turn (#483)', () => {
+    const turn = (bytes: number) => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+      const error = (body: string) => ({ type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError(body) });
+      // The retried answer is read as lookahead, then charged back to the turn.
+      const retried = `${JSON.stringify({ type: 'message', id: 'retried-answer', parentId: 'retry-error', message: answer })}\n`;
+      const row = error('x'.repeat(bytes - Buffer.byteLength(receipt) - Buffer.byteLength(retried) - Buffer.byteLength(`${JSON.stringify(error('x'))}\n`) + 1));
+      appendFileSync(file, `${receipt}${JSON.stringify(row)}\n`);
+      inspectDirectiveAdmission(file, identity);
+      recordRetry(file, row);
+      appendFileSync(file, retried);
+      return file;
+    };
+    expect(inspectDirectiveCheckpoint(turn(LIMIT), identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'retried-answer' });
+    expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
+  });
+
   it('a header line of exactly 64 KiB is read; one byte more refuses', () => {
     const header = (bytes: number) => {
       const line = (cwd: string) => JSON.stringify({ ...piHeader, cwd });
@@ -627,6 +638,28 @@ describe('limits at their exact boundaries (#469)', () => {
     const final = piEntry(bytes, 'answer-a', piEntry(bytes, 'receipt-a', null, prompt(text)), answer);
     piEntry(bytes, 'huge', final, prompt('x'.repeat(LIMIT)));
     expect(() => inspectDirectiveCheckpoint(bytes, identity)).toThrow(/^native lookahead after the directive turn exceeds the 33554432-byte inspection limit$/u);
+  });
+
+  it('pi: the lookahead past an abandoned receipted retry row has its own entry bound, the entry read after the row counted once (#483)', () => {
+    /** An abandoned receipted retry row ends a 2-entry turn; then `controls` controls and the next directive's receipt. */
+    const lookahead = (controls: number) => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      piEntry(file, 'receipt-a', null, prompt(text));
+      inspectDirectiveAdmission(file, identity);
+      const row = { type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError() };
+      piEntry(file, row.id, row.parentId, row.message);
+      recordRetry(file, row);
+      appendRows(file, controls, (index) => ({ type: 'thinking_level_change', id: `level-${index}`, parentId: index === 0 ? 'retry-error' : `level-${index - 1}`, thinkingLevel: 'low' }));
+      preparePi(file, laterIdentity, 'the next approved step');
+      piEntry(file, 'receipt-b', `level-${controls - 1}`, prompt('the next approved step'));
+      expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
+      return file;
+    };
+    // 249,999 controls and the receipt are 250,000 lookahead entries: within their own bound.
+    expect(inspectDirectiveCheckpoint(lookahead(249_999), identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'retry-error' });
+    // One more is past it: the turn ends once, so the control read after the row stays counted.
+    expect(() => inspectDirectiveCheckpoint(lookahead(250_000), identity)).toThrow(/^native lookahead after the directive turn exceeds the entry inspection limit$/u);
   });
 
   it('pi: the entry after an abandoned receipted retry row is lookahead, refused under its own name, never the turn\'s (#483)', () => {

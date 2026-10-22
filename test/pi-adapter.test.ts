@@ -5184,6 +5184,29 @@ it('a real SDK retry of a truncated stream holding a partial tool call continues
   } finally { await f.cleanup(); }
 });
 
+it('a real SDK tool call cut off by the output token limit is answered by the SDK, and the next tool call runs once and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-length-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'cut-off', name: 'bash', args: { command: `printf cut >> ${JSON.stringify(effect)}` } }, stopReason: 'length' },
+    { deltas: [], toolCall: { id: 'after-cut-off', name: 'bash', args: { command: `printf ran >> ${JSON.stringify(effect)}` } } },
+    { deltas: ['answered after the output token limit'] },
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    expect(rows.find((entry) => entry.message?.stopReason === 'length')?.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', id: 'cut-off' }));
+    // The SDK's own "not executed" result answers the cut-off call; only the next one ran.
+    expect(toolResultsOf(rows)).toEqual([['cut-off', true], ['after-cut-off', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(producerJournal(file).map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
 const UNRECORDED_RETRY = 'native SDK retry evidence not recorded; retry-history tool effects remain refused';
 /** A directive minion on its own synthetic Responses model outside dispatch,
  * with a 1 ms retry base, its adapter log and its SDK retry starts captured. */
@@ -5232,17 +5255,14 @@ it('a real SDK retry of an error row holding an unknown block records no evidenc
   } finally { await m.dispose(); }
 });
 
-it('a real SDK retry whose producer journal cannot be read logs the error, and the directive stays fail-closed at its next tool (#483)', async () => {
-  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
-  const effect = join(effects, 'ran.log');
-  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-torn-journal', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
-  const request = m.directive('unreadable-journal-retry');
+/** Tears `m`'s producer journal from the provider error row's end through
+ * the SDK's auto_retry_start, which the adapter sees first, and heals it
+ * before the retried request. `heal` removes only the torn fragment, never a
+ * line appended after it. */
+function tearJournalThroughRetryStart(m: Awaited<ReturnType<typeof retryMinion>>): () => void {
   const journalPath = () => `${m.handle.sessionFile!}.producers.jsonl`;
   const torn = '{"state":"torn-by-this-test"';
-  /** Removes only the torn fragment, never a line appended after it. */
   const heal = () => { if (existsSync(journalPath())) writeFileSync(journalPath(), readFileSync(journalPath(), 'utf8').replace(torn, '')); };
-  // Torn from the provider error row's end through the SDK's auto_retry_start,
-  // which the adapter sees first; healed before the retried request.
   let tore = false;
   m.session.subscribe((event) => {
     if (!tore && event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') {
@@ -5251,17 +5271,48 @@ it('a real SDK retry whose producer journal cannot be read logs the error, and t
     }
     if (event.type === 'auto_retry_start') heal();
   });
+  return heal;
+}
+const expectUnreadableJournalWarn = (m: Awaited<ReturnType<typeof retryMinion>>, requestId: string) =>
+  expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY, fields: { requestId, error: expect.stringContaining('native producer journal has a partial write') } });
+
+it('a real SDK retry whose producer journal cannot be read logs the error, and the directive stays fail-closed at its next tool (#483)', async () => {
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-torn-journal', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
+  const request = m.directive('unreadable-journal-retry');
+  const heal = tearJournalThroughRetryStart(m);
   try {
     const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
     expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
-    expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY,
-      fields: { requestId: request.identity.requestId, error: expect.stringContaining('native producer journal has a partial write') } });
+    expectUnreadableJournalWarn(m, request.identity.requestId);
     // Fail-closed: no receipt, so the guard refused the retried call, by name.
     expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('native error row has no matching live SDK retry-start receipt') });
     expect(existsSync(effect)).toBe(false);
     const journal = producerJournal(m.handle.sessionFile!);
     expect(journal.map((receipt) => receipt['state'])).not.toContain('retry-start');
     expect(journal).toContainEqual(expect.objectContaining({ state: 'guard-refused', reason: expect.stringContaining('native error row has no matching live SDK retry-start receipt') }));
+    expect(m.requests()).toBe(2);
+  } finally {
+    heal(); // disposal records cessation in a readable journal
+    await m.dispose();
+  }
+});
+
+it('a real SDK retry whose producer journal cannot be read logs the error, and a plain retried answer still leaves the directive not ok (#483)', async () => {
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const m = await retryMinion([responsesTruncated, responsesAnswer('answered after the retry')]);
+  const request = m.directive('unreadable-journal-plain-retry');
+  const heal = tearJournalThroughRetryStart(m);
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expectUnreadableJournalWarn(m, request.identity.requestId);
+    expect(verdict.ok).toBe(false);
+    // The journal reads again; without a receipt the answer follows the error row's terminal.
+    expect(inspectDirectiveCheckpoint(m.handle.sessionFile!, request.identity)).toEqual({ state: 'unknown',
+      reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+    expect(producerJournal(m.handle.sessionFile!).map((receipt) => receipt['state'])).not.toContain('retry-start');
     expect(m.requests()).toBe(2);
   } finally {
     heal(); // disposal records cessation in a readable journal
