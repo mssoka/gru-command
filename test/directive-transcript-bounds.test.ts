@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertClaudeDirectiveToolIntent, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint,
-  prepareClaudeDirectiveBinding, prepareDirectiveBinding, readDirectiveBinding, readDirectiveSessionHeader, type DirectiveTurnIdentity,
+  prepareClaudeDirectiveBinding, prepareDirectiveBinding, readDirectiveBinding, readDirectiveSessionHeader,
+  recordDirectiveRetryStart, clearDirectiveRetryEvidence, type DirectiveTurnIdentity,
 } from '../src/runtime/directive-checkpoint.js';
 
 /**
@@ -160,6 +161,40 @@ describe('a pi session past the transcript limit (#469)', () => {
     const settled = piEntry(file, 'result', asked, toolResult('call-1'));
     const final = piEntry(file, 'answer', settled, answer);
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final });
+
+    const refusedRetryHistoryControls = [
+      { name: 'nonretryable error without SDK retry-start evidence', message: { role: 'assistant', stopReason: 'error',
+        errorMessage: 'HTTP 400 invalid request', content: [{ type: 'text', text: 'invalid request' }] },
+        event: { type: 'agent_end', willRetry: false, errorMessage: 'HTTP 400 invalid request' } },
+      { name: 'aborted error despite a retry-shaped event', message: { role: 'assistant', stopReason: 'aborted',
+        errorMessage: 'Aborted', content: [{ type: 'text', text: 'stopped' }] },
+        event: { type: 'auto_retry_start', attempt: 1, maxAttempts: 1, delayMs: 0, errorMessage: 'Aborted' } },
+      { name: 'malformed partial tool-call error despite retry-shaped event', message: { role: 'assistant', stopReason: 'error',
+        errorMessage: 'OpenAI Responses stream ended before a terminal response event',
+        content: [{ type: 'toolCall', id: '', name: '', arguments: { partial: true } }] },
+        event: { type: 'auto_retry_start', attempt: 1, maxAttempts: 1, delayMs: 0,
+          errorMessage: 'OpenAI Responses stream ended before a terminal response event' } },
+    ] as const;
+    for (const [index, control] of refusedRetryHistoryControls.entries()) {
+      const controlIdentity = { ...identity, requestId: `bounded-retry-negative-${index}` };
+      const controlFile = sessionFile(piHeader);
+      preparePi(controlFile, controlIdentity);
+      const controlReceipt = piEntry(controlFile, `retry-receipt-${index}`, null, prompt(text));
+      inspectDirectiveAdmission(controlFile, controlIdentity);
+      const errorEntry = { type: 'message', id: `retry-error-${index}`, parentId: controlReceipt, message: control.message };
+      piEntry(controlFile, errorEntry.id, errorEntry.parentId, control.message);
+      // Only an actual auto_retry_start event for a well-formed effect-free
+      // error row can enter transient evidence. These synthetic controls either
+      // lack that lifecycle event or carry an ineligible row shape.
+      recordDirectiveRetryStart(controlFile, controlIdentity, control.event, errorEntry);
+      const call = { ...toolCall, id: `retry-call-${index}` };
+      const followup = { ...invocation, content: [call] };
+      piEntry(controlFile, `retry-followup-${index}`, errorEntry.id, followup);
+      try {
+        expect(() => flushDirectiveToolIntent(controlFile, followup, call, controlIdentity))
+          .toThrow(/^native tool intent is not persisted before execution or its invocation\/results changed$/u);
+      } finally { clearDirectiveRetryEvidence(controlFile, controlIdentity.requestId); }
+    }
   });
 
   it('takes a directive after more history entries than the turn entry limit, and across a character split by a read', () => {

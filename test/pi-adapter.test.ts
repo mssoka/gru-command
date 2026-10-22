@@ -4965,9 +4965,157 @@ const followingCommand = { id: 'following-command', name: 'bash', args: { comman
 it('a real SDK bash command that fails is ordinary work once the model answers it: the directive settles', () => assertSdkFailedCommandIsOrdinary([
   { deltas: [], toolCalls: [failingCommand] }, { deltas: ['the command failed, so the minion reported it'] },
 ], [['failing-command', true]]));
-it('a real SDK minion may go on calling tools after a failed command, and the directive settles #contract:directive-tool-error:pi', () => assertSdkFailedCommandIsOrdinary([
-  { deltas: [], toolCalls: [failingCommand] }, { deltas: [], toolCalls: [followingCommand] }, { deltas: ['fixed it after the failure'] },
-], [['failing-command', true], ['following-command', false]]));
+it('a real SDK minion may go on calling tools after a failed command, and the directive settles #contract:directive-tool-error:pi', async () => {
+  await assertSdkFailedCommandIsOrdinary([
+    { deltas: [], toolCalls: [failingCommand] }, { deltas: [], toolCalls: [followingCommand] }, { deltas: ['fixed it after the failure'] },
+  ], [['failing-command', true], ['following-command', false]]);
+  await assertRealOpenAIResponsesTruncatedRetry('effect-free-error');
+  await assertRealOpenAIResponsesTruncatedRetry('partial-tool-call-error');
+});
+
+async function assertRealOpenAIResponsesTruncatedRetry(retryHistory: 'effect-free-error' | 'partial-tool-call-error'): Promise<void> {
+  const { stream: streamOpenAIResponses } = await import('@earendil-works/pi-ai/api/openai-responses');
+  const fx = await fixture([]);
+  const providerId = 'gru-synthetic-truncated-responses';
+  const modelId = 'synthetic-responses-model';
+  const model = {
+    id: modelId, name: 'Synthetic Responses Model', api: 'openai-responses' as const, provider: providerId,
+    baseUrl: 'http://synthetic.invalid/v1', reasoning: false, input: ['text'] as ('text' | 'image')[],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_000, maxTokens: 1_024,
+  };
+  let requests = 0;
+  const functionCallResponse = (ordinal: number, name: string, callId: string, args: string) => {
+    const item = { id: `item-${ordinal}`, type: 'function_call', call_id: callId, name, arguments: args, status: 'completed' };
+    return [
+      { type: 'response.created', response: { id: `response-${ordinal}`, status: 'in_progress' } },
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } },
+      { type: 'response.function_call_arguments.delta', output_index: 0, delta: args },
+      { type: 'response.function_call_arguments.done', output_index: 0, arguments: args },
+      { type: 'response.output_item.done', output_index: 0, item },
+      { type: 'response.completed', response: {
+        id: `response-${ordinal}`, object: 'response', status: 'completed', output: [item],
+        usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
+          output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 },
+      } },
+    ];
+  };
+  const finalResponse = () => {
+    const item = { id: 'final-item', type: 'message', role: 'assistant', status: 'completed', phase: 'final_answer',
+      content: [{ type: 'output_text', text: 'synthetic retry completed' }] };
+    return [
+      { type: 'response.created', response: { id: 'response-final', status: 'in_progress' } },
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+      { type: 'response.output_text.delta', output_index: 0, delta: 'synthetic retry completed' },
+      { type: 'response.output_item.done', output_index: 0, item },
+      { type: 'response.completed', response: {
+        id: 'response-final', object: 'response', status: 'completed', output: [item],
+        usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
+          output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 },
+      } },
+    ];
+  };
+  const fakeFetch: typeof fetch = async () => {
+    requests += 1;
+    // The second response is either a true no-effect truncated stream or a
+    // truncated stream with a partial function call; both reach the real
+    // Responses parser's terminal-event EOF path.
+    const truncatedEvents = retryHistory === 'effect-free-error'
+      ? [{ type: 'response.created', response: { id: 'truncated-response', status: 'in_progress' } }]
+      : [
+          { type: 'response.created', response: { id: 'truncated-response', status: 'in_progress' } },
+          { type: 'response.output_item.added', output_index: 0, item: { id: 'partial-item', type: 'function_call',
+            call_id: 'partial-call', name: 'synthetic_followup', arguments: '', status: 'in_progress' } },
+          { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"partial":' },
+        ];
+    const events = requests === 2 ? truncatedEvents : requests === 1
+      ? functionCallResponse(1, 'synthetic_fail', 'call-first', '{}')
+      : requests === 3
+        ? functionCallResponse(3, 'synthetic_followup', 'call-followup', '{"value":"exact-argument"}')
+        : finalResponse();
+    const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+  fx.modelRuntime.registerNativeProvider({
+    id: providerId, name: 'Synthetic offline Responses',
+    auth: { apiKey: { name: 'synthetic key', resolve: async () => ({ auth: { apiKey: 'offline-only' }, source: 'test' }) } },
+    getModels: () => [model],
+    stream: (selectedModel, context, options) => streamOpenAIResponses(selectedModel as Parameters<typeof streamOpenAIResponses>[0], context,
+      { ...options, apiKey: 'offline-only', fetch: fakeFetch } as Parameters<typeof streamOpenAIResponses>[2]),
+    streamSimple: (selectedModel, context, options) => streamOpenAIResponses(selectedModel as Parameters<typeof streamOpenAIResponses>[0], context,
+      { ...options, apiKey: 'offline-only', fetch: fakeFetch } as Parameters<typeof streamOpenAIResponses>[2]),
+  });
+  await fx.modelRuntime.refresh({ allowNetwork: false, providers: [providerId] });
+  let failedToolCalls = 0;
+  const executedFollowups: unknown[] = [];
+  const nativeTools = [
+    { name: 'synthetic_fail', description: 'Return a deterministic ordinary tool error.', authorityManifest: 'synthetic-fail-v1',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      async execute() { failedToolCalls += 1; throw new Error('synthetic ordinary tool error'); } },
+    { name: 'synthetic_followup', description: 'Record a deterministic synthetic retry effect.', authorityManifest: 'synthetic-followup-v1',
+      inputSchema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+      async execute(args: unknown) { executedFollowups.push(structuredClone(args)); return { text: 'synthetic follow-up tool completed' }; } },
+  ] as const;
+  const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: `${providerId}/${modelId}`, nativeTools });
+  const session = await actualDirectiveSdkSession(handle);
+  const sdkEvents: { readonly type: string; readonly willRetry?: boolean; readonly errorMessage?: string }[] = [];
+  session.subscribe((event) => sdkEvents.push({ type: event.type, ...('willRetry' in event ? { willRetry: event.willRetry } : {}),
+    ...('errorMessage' in event ? { errorMessage: event.errorMessage } : {}) }));
+  const identity = { requestId: 'synthetic-truncated-stream-retry', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+    jobId: 'synthetic-stream-retry-job', workRevision: 0, authorityEpoch: 0 };
+  try {
+    expect(session.autoRetryEnabled).toBe(true);
+    const verdict = await handle.promptWithVerdict!('synthetic native retry investigation', {
+      directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} },
+    });
+    const rows = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as {
+      id: string; parentId: string | null; message?: { role?: string; stopReason?: string; errorMessage?: string; toolCallId?: string;
+        toolName?: string; isError?: boolean; content?: unknown[] };
+    });
+    const toolUses = rows.filter((row) => row.message?.role === 'assistant' && row.message.stopReason === 'toolUse');
+    const providerError = rows.find((row) => row.message?.role === 'assistant' && row.message.stopReason === 'error');
+    const retryToolUse = toolUses.find((row) => (row.message?.content ?? []).some((block) =>
+      (block as { name?: string }).name === 'synthetic_followup'));
+    const ordinaryErrorResult = rows.find((row) => row.message?.role === 'toolResult' && row.message.toolName === 'synthetic_fail');
+    const retryResult = rows.find((row) => row.message?.role === 'toolResult' && row.message.toolName === 'synthetic_followup');
+    expect(providerError?.message?.errorMessage).toContain('OpenAI Responses stream ended before a terminal response event');
+    expect(ordinaryErrorResult?.message).toMatchObject({ role: 'toolResult', toolName: 'synthetic_fail', isError: true });
+    expect(providerError!.parentId).toBe(ordinaryErrorResult!.id);
+    expect(retryToolUse).toBeDefined();
+    expect(retryToolUse!.parentId).toBe(providerError!.id);
+    expect(sdkEvents).toContainEqual(expect.objectContaining({ type: 'agent_end', willRetry: true }));
+    expect(sdkEvents).toContainEqual(expect.objectContaining({ type: 'auto_retry_start', errorMessage: providerError!.message!.errorMessage }));
+    expect(failedToolCalls).toBe(1);
+    if (retryHistory === 'partial-tool-call-error') {
+      // Parser result: the persisted EOF error itself contains an unfinished
+      // function call. Retry admission happened, but ambiguous error content
+      // is not effect-free retry history and the follow-up executor stays shut.
+      expect((providerError!.message?.content ?? []).find((block) => (block as { type?: string }).type === 'toolCall')).toMatchObject({
+        type: 'toolCall', name: 'synthetic_followup',
+      });
+      expect(verdict.ok).toBe(false);
+      expect(executedFollowups).toEqual([]);
+      expect(requests).toBeGreaterThanOrEqual(3);
+      expect(retryResult?.parentId).toBe(retryToolUse!.id);
+      expect(retryResult?.message).toMatchObject({ role: 'toolResult', toolName: 'synthetic_followup', isError: true });
+      expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8')).toContain('native tool intent is not persisted before execution');
+    } else {
+      expect(verdict, readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8')).toMatchObject({ ok: true, error: null });
+      expect(retryResult?.parentId).toBe(retryToolUse!.id);
+      expect(retryResult?.message).toMatchObject({ role: 'toolResult', toolName: 'synthetic_followup', isError: false });
+      expect(retryResult?.message?.toolCallId).toBe('call-followup|item-3');
+      expect((retryToolUse!.message?.content ?? []).find((block) => (block as { type?: string }).type === 'toolCall')).toMatchObject({
+        type: 'toolCall', id: 'call-followup|item-3', name: 'synthetic_followup', arguments: { value: 'exact-argument' },
+      });
+      expect(requests).toBe(4);
+      expect(executedFollowups).toEqual([{ value: 'exact-argument' }]);
+      expect(retryResult?.message?.content).toContainEqual({ type: 'text', text: 'synthetic follow-up tool completed' });
+      const completedAssistant = rows.filter((row) => row.message?.role === 'assistant' && row.message.stopReason === 'stop').at(-1);
+      expect(completedAssistant).toBeDefined();
+      const { readDirectiveCompletion } = await import('../src/runtime/directive-checkpoint.js');
+      expect(readDirectiveCompletion(handle.sessionFile!, identity, completedAssistant!.id)).toMatchObject({ checkpointId: completedAssistant!.id });
+    }
+  } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+}
 it('a later call in the same sequential batch still runs after a failed one, and the directive settles', () => assertSdkFailedCommandIsOrdinary([
   { deltas: [], toolCalls: [failingCommand, followingCommand] }, { deltas: ['both calls settled'] },
 ], [['failing-command', true], ['following-command', false]]));
