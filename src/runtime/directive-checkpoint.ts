@@ -32,54 +32,6 @@ export type DirectiveCheckpoint =
 export class DirectiveCheckpointError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveCheckpointError'; }
 }
-/** Transient evidence from the actual Pi auto_retry_start callback. It is scoped
- * to the live directive and intentionally is not a durable/history receipt. */
-const directiveRetryEvidence = new Map<string, Map<string, string>>();
-function directiveRetryEvidenceKey(file: string, requestId: string): string { return `${file}\0${requestId}`; }
-function validRetryErrorContent(content: unknown): content is readonly Record<string, unknown>[] {
-  if (!Array.isArray(content)) return false;
-  return content.every((value: unknown) => {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-    const block = value as Record<string, unknown>;
-    if (block['type'] === 'text') return typeof block['text'] === 'string' && Object.keys(block).every((key) => key === 'type' || key === 'text');
-    if (block['type'] === 'thinking') return typeof block['thinking'] === 'string' &&
-      (block['thinkingSignature'] === undefined || typeof block['thinkingSignature'] === 'string') &&
-      (block['redacted'] === undefined || typeof block['redacted'] === 'boolean') &&
-      Object.keys(block).every((key) => ['type', 'thinking', 'thinkingSignature', 'redacted'].includes(key));
-    // Tool calls (including unfinished/malformed calls) and all unknown blocks
-    // remain effectful/ambiguous and cannot be retry-history nodes.
-    return false;
-  });
-}
-/** Called only for a live Pi `auto_retry_start` event. Pi emits that event from
- * `_prepareRetry` after its retry classifier and budget checks, and before it
- * removes the error from in-memory context. Bind it to the exact current native
- * branch tail; the ancestry guard later verifies the complete chain and row. */
-export function recordDirectiveRetryStart(file: string, identity: DirectiveTurnIdentity, event: unknown, latestEntry: unknown): void {
-  validateDirectiveIdentity(identity);
-  if (typeof event !== 'object' || event === null || Array.isArray(event) ||
-      typeof latestEntry !== 'object' || latestEntry === null || Array.isArray(latestEntry)) return;
-  const sdkEvent = event as Record<string, unknown>;
-  const entry = latestEntry as NativeEntry;
-  const message = entry.message;
-  if (sdkEvent['type'] !== 'auto_retry_start' || !Number.isSafeInteger(sdkEvent['attempt']) || (sdkEvent['attempt'] as number) < 1 ||
-      !Number.isSafeInteger(sdkEvent['maxAttempts']) || (sdkEvent['maxAttempts'] as number) < (sdkEvent['attempt'] as number) ||
-      !Number.isSafeInteger(sdkEvent['delayMs']) || (sdkEvent['delayMs'] as number) < 0 ||
-      typeof sdkEvent['errorMessage'] !== 'string' || sdkEvent['errorMessage'].trim() === '' ||
-      entry.type !== 'message' || typeof entry.id !== 'string' || entry.id === '' || !message || message['role'] !== 'assistant' ||
-      message['stopReason'] !== 'error' || message['errorMessage'] !== sdkEvent['errorMessage'] || !validRetryErrorContent(message['content'])) return;
-  const binding = readDirectiveBinding(file, identity.requestId);
-  if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, identity) || binding.userEntryId === null) return;
-  const key = directiveRetryEvidenceKey(file, identity.requestId);
-  const entries = directiveRetryEvidence.get(key) ?? new Map<string, string>();
-  entries.set(entry.id, sdkEvent['errorMessage']);
-  directiveRetryEvidence.set(key, entries);
-}
-/** Retry lifecycle evidence expires with its one live directive; it is never
- * replayed to reconstruct a missing historical SDK callback. */
-export function clearDirectiveRetryEvidence(file: string, requestId: string): void {
-  directiveRetryEvidence.delete(directiveRetryEvidenceKey(file, requestId));
-}
 /** Bounds a directive's own turn (#469), never the session before it. */
 const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 const MAX_NATIVE_TRANSCRIPT_ENTRIES = 250_000;
@@ -467,9 +419,10 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   syncFile(file);
   const admitted = { ...binding, userEntryId: user.id };
   if (binding.userEntryId === null) appendBinding(admitted);
-  if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
+  const receipts = producerReceipts(file);
+  if (receipts.some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
+  const retries = retryEvidence(receipts, identity);
   let parent = user.id;
-  const retryErrors = directiveRetryEvidence.get(directiveRetryEvidenceKey(file, identity.requestId)) ?? new Map<string, string>();
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
@@ -499,9 +452,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
-      const retryHistory = message.stopReason === 'error' && typeof message.errorMessage === 'string' &&
-        retryErrors.get(entry.id) === message.errorMessage && validRetryErrorContent(message.content);
-      if (!retryHistory) {
+      // A retried error row is history the turn went past, never its terminal.
+      if (!isRetryHistoryRow(entry.id, message, retries)) {
         for (const block of message.content as Record<string, unknown>[]) {
           if (block.type !== 'toolCall') continue;
           if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
@@ -828,7 +780,7 @@ export interface DirectiveProducer {
   readonly sessionId: string;
   readonly sessionFile: string;
 }
-interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly boundary?: 'authority'; readonly reason?: string }
+interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused' | 'retry-start'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly boundary?: 'authority'; readonly reason?: string; readonly entryId?: string; readonly errorMessage?: string }
 export interface DirectiveCompletion { readonly producer: DirectiveProducer; readonly checkpointId: string; readonly head: string | null }
 function appendProducer(receipt: ProducerReceipt): void {
   const fd = openSync(`${receipt.producer.sessionFile}.producers.jsonl`, 'a', 0o600);
@@ -860,7 +812,10 @@ function producerReceipts(file: string): readonly ProducerReceipt[] {
         !(typeof receipt.toolCallId === 'string' && receipt.toolCallId.length > 0 || receipt.boundary === 'authority' && receipt.toolCallId === undefined))) {
       throw new DirectiveCheckpointError('malformed native guard refusal receipt');
     }
-    if (!['started', 'ceased', 'independent', 'completed', 'guard-refused'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
+    if (state === 'retry-start' && (typeof receipt.entryId !== 'string' || !receipt.entryId || !nonBlank(receipt.errorMessage))) {
+      throw new DirectiveCheckpointError('malformed native retry-start receipt');
+    }
+    if (!['started', 'ceased', 'independent', 'completed', 'guard-refused', 'retry-start'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
         !producer.host || !producer.agentId || !producer.sessionId || producer.sessionFile !== file ||
         producer.lockOwner !== undefined && (producer.lockOwner.host !== producer.host || producer.lockOwner.pid !== producer.pid || !producer.lockOwner.bootId)) throw new DirectiveCheckpointError('malformed native producer journal');
     const start = starts.get(producer.incarnation);
@@ -914,6 +869,75 @@ export function recordDirectiveAuthorityRefusal(producer: DirectiveProducer, rea
   if (!reason || !rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) throw new DirectiveCheckpointError('native authority refusal requires exact original physical start');
   if (!rows.some((row) => row.state === 'guard-refused' && row.boundary === 'authority' && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'guard-refused', producer, boundary: 'authority', reason });
   else syncFile(`${producer.sessionFile}.producers.jsonl`);
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+function nonBlank(value: unknown): value is string { return typeof value === 'string' && value.trim() !== ''; }
+/** Text and thinking only. Tool calls (unfinished or malformed ones too) and
+ * unknown blocks may be effects, so they are never retry history. */
+function validRetryErrorContent(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.every((value: unknown) => {
+    const block = objectRecord(value);
+    if (block?.['type'] === 'text') return typeof block['text'] === 'string' &&
+      (block['textSignature'] === undefined || typeof block['textSignature'] === 'string') &&
+      Object.keys(block).every((key) => ['type', 'text', 'textSignature'].includes(key));
+    if (block?.['type'] === 'thinking') return typeof block['thinking'] === 'string' &&
+      (block['thinkingSignature'] === undefined || typeof block['thinkingSignature'] === 'string') &&
+      (block['redacted'] === undefined || typeof block['redacted'] === 'boolean') &&
+      Object.keys(block).every((key) => ['type', 'thinking', 'thinkingSignature', 'redacted'].includes(key));
+    return false;
+  });
+}
+/** The one retry-history predicate both walks use: an effect-free assistant
+ * error row whose exact entry and error a live SDK retry-start receipt names.
+ * Error text alone proves nothing. */
+function isRetryHistoryRow(entryId: string, message: Record<string, unknown>, evidence: ReadonlyMap<string, string>): boolean {
+  return message['role'] === 'assistant' && message['stopReason'] === 'error' && typeof message['errorMessage'] === 'string' &&
+    evidence.get(entryId) === message['errorMessage'] && validRetryErrorContent(message['content']);
+}
+/** entryId → errorMessage from this exact directive's retry-start receipts,
+ * whichever of its physical producers recorded them. */
+function retryEvidence(receipts: readonly ProducerReceipt[], identity: DirectiveTurnIdentity): ReadonlyMap<string, string> {
+  const evidence = new Map<string, string>();
+  for (const row of receipts) {
+    if (row.state !== 'retry-start' || !isDeepStrictEqual(row.producer.identity, identity)) continue;
+    const prior = evidence.get(row.entryId!);
+    if (prior !== undefined && prior !== row.errorMessage) throw new DirectiveCheckpointError('conflicting native retry-start receipts for one error row');
+    evidence.set(row.entryId!, row.errorMessage!);
+  }
+  return evidence;
+}
+/** Called only for a live Pi `auto_retry_start` event, never synthesized from
+ * history. Pi emits it from `_prepareRetry` after its retry classifier and
+ * budget checks, once the error row is persisted and before that row leaves
+ * the in-memory context. The durable receipt binds the exact physical
+ * producer to that branch tail; the ancestry walks later prove the chain and
+ * the row. Null once recorded, else why nothing was. */
+export function recordDirectiveRetryStart(producer: DirectiveProducer, event: unknown, latestEntry: unknown): string | null {
+  validateDirectiveIdentity(producer.identity);
+  const sdkEvent = objectRecord(event);
+  if (sdkEvent?.['type'] !== 'auto_retry_start') return 'not an SDK auto_retry_start event';
+  const { attempt, maxAttempts, delayMs, errorMessage } = sdkEvent;
+  // SDK delayMs is baseDelayMs·2^(attempt-1), and the configured base may be fractional.
+  if (!Number.isSafeInteger(attempt) || (attempt as number) < 1 || !Number.isSafeInteger(maxAttempts) || (maxAttempts as number) < (attempt as number) ||
+      typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 0 || !nonBlank(errorMessage)) return 'malformed SDK auto_retry_start event';
+  const entry = objectRecord(latestEntry);
+  const message = objectRecord(entry?.['message']);
+  const entryId = entry?.['id'];
+  if (entry?.['type'] !== 'message' || typeof entryId !== 'string' || !entryId || message === null ||
+      !isRetryHistoryRow(entryId, message, new Map([[entryId, errorMessage]]))) return 'native branch tail is not the effect-free error row this retry names';
+  const binding = readDirectiveBinding(producer.sessionFile, producer.identity.requestId);
+  if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, producer.identity)) return 'exact pi directive association unavailable';
+  const rows = producerReceipts(producer.sessionFile);
+  if (!rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) return 'exact original physical producer start missing';
+  const prior = rows.filter((row) => row.state === 'retry-start' && row.entryId === entryId && isDeepStrictEqual(row.producer.identity, producer.identity));
+  if (prior.some((row) => row.errorMessage !== errorMessage)) return 'conflicting retry-start receipt for this error row';
+  if (!prior.some((row) => isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'retry-start', producer, entryId, errorMessage });
+  else syncFile(`${producer.sessionFile}.producers.jsonl`);
+  return null;
 }
 
 export function recordDirectiveCompletion(producer: DirectiveProducer, checkpointId: string, head: string | null): void {
@@ -996,7 +1020,6 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || invocation.message.stopReason !== 'toolUse' ||
       !isDeepStrictEqual(invocation.message, JSON.parse(JSON.stringify(assistantMessage))) || !Array.isArray(content)) refuse();
   const pending = new Map<string, Record<string, unknown>>();
-  const retryErrors = directiveRetryEvidence.get(directiveRetryEvidenceKey(file, identity.requestId)) ?? new Map<string, string>();
   for (const block of content as Record<string, unknown>[]) {
     if (block.type !== 'toolCall') continue;
     if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name ||
@@ -1016,19 +1039,15 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   if (native[0]?.id !== binding.userEntryId || index < 1) refuse();
   let ancestor = binding.userEntryId;
   const chainPending = new Map<string, string>();
+  const retries = retryEvidence(producerReceipts(file), identity);
   for (const entry of native.slice(1)) {
     const message = entry.message;
     if (entry.type !== 'message' || entry.parentId !== ancestor || !message) refuse();
     ancestor = entry.id;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
-      if (message!.stopReason === 'error') {
-        // This is admissible only when the current Pi adapter observed the SDK's
-        // actual retry-start event for this exact persisted error row. It must be
-        // effect-free and structurally complete; error text alone proves nothing.
-        if (retryErrors.get(entry.id) !== message!['errorMessage'] || typeof message!['errorMessage'] !== 'string' ||
-            !validRetryErrorContent(message!.content)) refuse();
-      } else {
+      // An error row the live SDK retried is history, not a tool invocation.
+      if (!isRetryHistoryRow(entry.id, message!, retries)) {
         if (message!.stopReason !== 'toolUse') refuse();
         for (const block of message!.content as Record<string, unknown>[]) {
           if (block.type !== 'toolCall') continue;

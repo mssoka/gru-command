@@ -238,6 +238,7 @@ const PINS: Record<string, number> = {
   'docs-contracts.test.ts': 3,
   'directive-producer-inspection.test.ts': 2,
   'directive-retirement.test.ts': 85,
+  'directive-retry-history.test.ts': 12,
   'directive-transcript-bounds.test.ts': 25,
   'fix-directive.test.ts': 46,
   'github-poll.test.ts': 43,
