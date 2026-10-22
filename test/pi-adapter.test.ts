@@ -4402,7 +4402,7 @@ it('automatic SDK compaction completes before the same admitted native authority
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const { inspectDirectiveAdmission, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const { Supervisor } = await import('../src/supervision/supervisor.js');
-  const history = 'history '.repeat(10_500);
+  const history = 'history '.repeat(100);
   let releaseSummary!: () => void;
   const summaryHold = new Promise<void>((resolveSummary) => { releaseSummary = resolveSummary; });
   let handle: AgentHandle | null = null;
@@ -4455,6 +4455,7 @@ it('automatic SDK compaction completes before the same admitted native authority
       }
     });
   });
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
   supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 600000, restartWindowMs: 600000, maxRestarts: 3, restartBackoffMs: 10 }, registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60000 });
   supervisor.start();
   const currentOwner = () => {
