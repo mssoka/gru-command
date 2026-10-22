@@ -4564,10 +4564,11 @@ it('automatic SDK compaction completes before the same admitted native authority
     expect(checkpoint).toMatchObject({ state: 'terminal', ok: true, binding: row.nativeBinding });
     if (checkpoint.state !== 'terminal') throw new Error('original native completion must have a successful terminal checkpoint');
     const events = f.scene.ledger.listJobEvents(row.jobId, { limit: 100 });
-    const producerStarts = events.filter((event) => event.kind === 'silas.directive-producer-started' && event.payload?.['request_id'] === row.requestId);
+    const producerStarts = events.filter((event) => event.kind === 'silas.directive-producer-started' &&
+      (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId);
     expect(producerStarts).toHaveLength(1);
     const deliveries = f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
-      .filter((event) => event.payload?.['request_id'] === row.requestId);
+      .filter((event) => (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId);
     expect(deliveries).toHaveLength(1);
     const producerRecords = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8').trimEnd().split('\n')
       .map((line) => JSON.parse(line) as { readonly state: string; readonly producer?: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null });
