@@ -5,10 +5,12 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
+import type { DirectiveProducer } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, applyThinkingFallback, ledgerReviewOwnerCessation, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
@@ -4394,6 +4396,176 @@ it('PR334 runtime causal real supervisor permits its exact current native tool o
     expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.state).toBe('settled');
     expect(readFileSync(join(f.scene.lane.path, 'guarded-effects.txt'), 'utf8')).toBe('first\nsecond\n');
   } finally { supervisor.dispose(); await f.cleanup(); }
+});
+
+it('automatic SDK compaction completes before the same admitted native authority check resumes', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveAdmission, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const { Supervisor } = await import('../src/supervision/supervisor.js');
+  const history = 'history '.repeat(12_000);
+  let releaseSummary!: () => void;
+  const summaryHold = new Promise<void>((resolveSummary) => { releaseSummary = resolveSummary; });
+  let handle: AgentHandle | null = null;
+  let supervisor: InstanceType<typeof Supervisor> | null = null;
+  let sample: (() => {
+    readonly view: ReturnType<InstanceType<typeof Supervisor>['viewFor']>;
+    readonly adapterCompacting: boolean;
+    readonly sdkCompacting: boolean;
+    readonly openControl: boolean | undefined;
+    readonly openTurn: boolean;
+    readonly openToolCalls: number;
+    readonly ownNative: boolean;
+    readonly identityMatches: Readonly<Record<string, boolean>>;
+    readonly exactBlockers: readonly string[];
+    readonly unownedBlockers: readonly string[];
+    readonly mismatchedBlockers: Readonly<Record<string, readonly string[]>>;
+  } | null) = null;
+  const rawCompaction: { readonly type: string; readonly sdkCompacting: boolean }[] = [];
+  const preparations: { readonly before: ReturnType<NonNullable<typeof sample>>; readonly after: ReturnType<NonNullable<typeof sample>> }[] = [];
+  const afterCompactionTurnStarts: NonNullable<ReturnType<NonNullable<typeof sample>>>[] = [];
+  let rawTerminalObserved = false;
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [history], toolCall: { id: 'compact-once', name: 'bash', args: { command: "printf 'once\\n' > compacted-native-effect.txt" } }, usageTokens: 90_000 },
+    { deltas: ['automatic compaction summary'], hold: summaryHold },
+    { deltas: ['completed after automatic compaction'] },
+  ], (session, spawned) => {
+    handle = spawned;
+    const sdk = session as unknown as { subscribe(listener: (event: unknown) => void): () => void; readonly isCompacting: boolean };
+    sdk.subscribe((event) => {
+      const type = (event as { readonly type?: unknown }).type;
+      if (type === 'compaction_start' || type === 'compaction_end') {
+        rawCompaction.push({ type, sdkCompacting: sdk.isCompacting });
+        if (type === 'compaction_end') rawTerminalObserved = true;
+      }
+    });
+    const prepare = session.agent.prepareNextTurnWithContext!.bind(session.agent);
+    session.agent.prepareNextTurnWithContext = async (turn, signal) => {
+      const before = sample?.() ?? null;
+      try { return await prepare(turn, signal); }
+      finally {
+        const after = sample?.() ?? null;
+        if (before !== null && after !== null) preparations.push({ before, after });
+      }
+    };
+    spawned.subscribe((event) => {
+      if (event.type === 'turn_start' && rawTerminalObserved) {
+        const observation = sample?.();
+        if (observation !== null && observation !== undefined) afterCompactionTurnStarts.push(observation);
+      }
+    });
+  });
+  supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 600000, restartWindowMs: 600000, maxRestarts: 3, restartBackoffMs: 10 }, registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60000 });
+  supervisor.start();
+  const currentOwner = () => {
+    if (handle === null) return null;
+    const started = f.scene.ledger.latestJobEventByRequestId(f.scene.request.jobId, 'silas.directive-producer-started', f.scene.request.requestId);
+    const producer = (started?.payload as { readonly native_producer?: DirectiveProducer } | undefined)?.native_producer;
+    return producer === undefined ? null : { handle, producer, started };
+  };
+  sample = () => {
+    if (handle === null || supervisor === null) return null;
+    const view = supervisor.viewFor(handle.id);
+    const owner = currentOwner();
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId);
+    const pendingIdentity = handle.pendingTurn?.()?.directive?.identity;
+    const nativeBinding = row?.nativeBinding;
+    const nativeTarget = row?.nativeTarget;
+    const startedProducer = (owner?.started.payload as { readonly native_producer?: unknown } | undefined)?.native_producer;
+    const identityMatches = {
+      sameRegisteredHandle: f.registry.getHandle(handle.id) === handle,
+      producerAgent: owner !== null && owner.producer.agentId === handle.id,
+      producerJob: owner !== null && owner.producer.identity.jobId === f.scene.request.jobId,
+      acceptedIdentity: owner !== null && isDeepStrictEqual(owner.producer.identity, f.scene.identity),
+      nativeTarget: nativeTarget?.agentId === handle.id && nativeTarget.sessionFile === handle.sessionFile,
+      producerSessionFile: owner !== null && owner.producer.sessionFile === handle.sessionFile,
+      bindingSession: owner !== null && nativeBinding?.sessionId === owner.producer.sessionId,
+      pendingTurnIdentity: owner !== null && isDeepStrictEqual(pendingIdentity, owner.producer.identity),
+      startedProducerReceipt: owner !== null && isDeepStrictEqual(startedProducer, owner.producer),
+    };
+    const ownNative = Object.values(identityMatches).every(Boolean);
+    const exactBlockers = owner === null ? [] : supervisor.pendingProducerBlockers(f.scene.request.jobId, owner);
+    const mismatchedBlockers = owner === null ? {} : {
+      incarnation: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, incarnation: `${owner.producer.incarnation}-foreign` } }),
+      session: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, sessionId: `${owner.producer.sessionId}-foreign` } }),
+      identity: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, identity: { ...owner.producer.identity, requestId: `${owner.producer.identity.requestId}-foreign` } } }),
+    };
+    const sdk = (f.sessions.at(-1) as unknown as { readonly isCompacting: boolean } | undefined);
+    return {
+      view,
+      adapterCompacting: handle.isCompacting?.() === true,
+      sdkCompacting: sdk?.isCompacting === true,
+      openControl: view?.openControl,
+      openTurn: view?.openTurn ?? false,
+      openToolCalls: view?.openToolCalls ?? -1,
+      ownNative,
+      identityMatches,
+      exactBlockers,
+      unownedBlockers: supervisor.pendingProducerBlockers(f.scene.request.jobId),
+      mismatchedBlockers,
+    };
+  };
+  let runError: unknown = null;
+  try {
+    const running = executeAcceptedDirective({ ...f.deps, pendingProducerBlockers: supervisor.pendingProducerBlockers.bind(supervisor) }, f.scene.request.requestId);
+    await waitFor(() => rawCompaction.some((event) => event.type === 'compaction_start') && f.fx.script.calls.some((call) => call.prompt.startsWith('<conversation>')), 'held automatic compaction summary');
+    const active = sample();
+    expect(active).not.toBeNull();
+    expect(active).toMatchObject({ openControl: true, openTurn: false, openToolCalls: 0, adapterCompacting: true, sdkCompacting: true, ownNative: true });
+    expect(active?.exactBlockers.some((blocker) => blocker.includes('open turn/control/tool'))).toBe(true);
+    expect(f.fx.script.calls.filter((call) => !call.prompt.startsWith('<conversation>'))).toHaveLength(1);
+    releaseSummary();
+    try { await running; } catch (error) { runError = error; }
+
+    const afterPreparation = preparations.at(-1)?.after;
+    expect(afterPreparation, JSON.stringify({ rawCompaction, preparations, runError: String(runError) })).toMatchObject({
+      openControl: false,
+      openTurn: false,
+      openToolCalls: 0,
+      adapterCompacting: false,
+      sdkCompacting: false,
+      ownNative: true,
+      exactBlockers: [],
+      identityMatches: {
+        sameRegisteredHandle: true,
+        producerAgent: true,
+        producerJob: true,
+        acceptedIdentity: true,
+        nativeTarget: true,
+        producerSessionFile: true,
+        bindingSession: true,
+        pendingTurnIdentity: true,
+        startedProducerReceipt: true,
+      },
+    });
+    expect(preparations).toHaveLength(1);
+    expect(rawCompaction).toEqual([
+      { type: 'compaction_start', sdkCompacting: false },
+      { type: 'compaction_end', sdkCompacting: true },
+    ]);
+    expect(runError).toBeNull();
+
+    expect(afterCompactionTurnStarts).toHaveLength(1);
+    const continued = afterCompactionTurnStarts[0]!;
+    expect(continued).toMatchObject({ openControl: false, openTurn: true, openToolCalls: 0, ownNative: true, exactBlockers: [] });
+    expect(continued.unownedBlockers.some((blocker) => blocker.includes('open turn/control/tool'))).toBe(true);
+    expect(Object.values(continued.mismatchedBlockers).every((blockers) => blockers.some((blocker) => blocker.includes('open turn/control/tool')))).toBe(true);
+
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row).toMatchObject({ state: 'settled', payloadHash: f.scene.identity.payloadHash, workRevision: f.scene.identity.workRevision,
+      contractSha256: f.scene.identity.contractSha256, authorityEpoch: f.scene.identity.authorityEpoch });
+    expect(row.nativeBinding?.sessionId).toBe(currentOwner()?.producer.sessionId);
+    expect(inspectDirectiveAdmission(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ identity: f.scene.identity, agentId: row.nativeTarget!.agentId });
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, binding: row.nativeBinding });
+    expect(f.scene.ledger.listJobEvents(row.jobId, { limit: 100 }).filter((event) => event.kind === 'silas.directive-producer-started')).toHaveLength(1);
+    expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).not.toBeNull();
+    expect(readFileSync(join(f.scene.lane.path, 'compacted-native-effect.txt'), 'utf8')).toBe('once\n');
+    expect(f.fx.script.calls).toHaveLength(3);
+    expect(f.sessions).toHaveLength(1);
+  } finally {
+    releaseSummary();
+    supervisor.dispose();
+    await f.cleanup();
+  }
 });
 
 async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
