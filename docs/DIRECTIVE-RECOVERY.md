@@ -350,10 +350,14 @@ these hold:
 - the SDK's retried answer, an assistant entry parented on the row, follows
   it.
 
-Without that retried answer (a retry cancelled during backoff, or attempts
-exhausted on an unreceipted final error) the row is the turn's terminal, a
-failed one. Any other error row still refuses the next tool, under its own
-reason. When the adapter cannot record a receipt it logs `native SDK retry
+When a retry is cancelled during backoff, no retried answer follows, so the
+receipted row is the turn's terminal, a failed one. When attempts run out,
+the SDK starts no retry for the last error: the receipted rows before it are
+history, and that unreceipted last row is the failed terminal. An error row
+that ends the turn reads as that failed terminal even when it holds tool
+calls, because they never ran. At the tool fence any other error row still
+refuses the next tool, under a reason naming what it lacks: a matching
+receipt, history-only content, or the retried answer. When the adapter cannot record a receipt it logs `native SDK retry
 evidence not recorded; retry-history tool effects remain refused` at warn,
 with the reason or the error, and the directive stays fail-closed. A
 malformed `retry-start` receipt, or two that give one row different errors,

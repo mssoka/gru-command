@@ -3,7 +3,7 @@ import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -5221,7 +5221,7 @@ it('a real SDK retry of an error row holding an unknown block records no evidenc
     expect(rows.find((entry) => entry.message?.stopReason === 'error')?.message?.content).toContainEqual(expect.objectContaining({ type: 'image' }));
     expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
     expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY,
-      fields: { requestId: request.identity.requestId, reason: 'native branch tail is not the effect-free error row this retry names' } });
+      fields: { requestId: request.identity.requestId, reason: 'native branch tail is not an error row of retry-history content carrying this retry\'s error' } });
     expect(toolResultsOf(rows)).toEqual([['refused-call|item-2', true]]);
     expect(existsSync(effect)).toBe(false);
     expect(verdict.ok).toBe(false);
@@ -5232,27 +5232,39 @@ it('a real SDK retry of an error row holding an unknown block records no evidenc
   } finally { await m.dispose(); }
 });
 
-it('a real SDK retry whose producer journal cannot be read logs the error and the directive verdict resolves not ok (#483)', async () => {
-  const m = await retryMinion([responsesTruncated, responsesAnswer('answered after the retry')]);
+it('a real SDK retry whose producer journal cannot be read logs the error, and the directive stays fail-closed at its next tool (#483)', async () => {
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-torn-journal', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
   const request = m.directive('unreadable-journal-retry');
-  let journalPath = ''; let intact = '';
-  // Tear the journal once the error row ends, before the SDK's auto_retry_start.
+  const journalPath = () => `${m.handle.sessionFile!}.producers.jsonl`;
+  const torn = '{"state":"torn-by-this-test"';
+  /** Removes only the torn fragment, never a line appended after it. */
+  const heal = () => { if (existsSync(journalPath())) writeFileSync(journalPath(), readFileSync(journalPath(), 'utf8').replace(torn, '')); };
+  // Torn from the provider error row's end through the SDK's auto_retry_start,
+  // which the adapter sees first; healed before the retried request.
+  let tore = false;
   m.session.subscribe((event) => {
-    if (event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') {
-      journalPath = `${m.handle.sessionFile!}.producers.jsonl`;
-      intact = readFileSync(journalPath, 'utf8');
-      writeFileSync(journalPath, `${intact}{"state":"retry-start"`);
+    if (!tore && event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') {
+      tore = true;
+      appendFileSync(journalPath(), torn);
     }
+    if (event.type === 'auto_retry_start') heal();
   });
   try {
     const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
-    expect(verdict.ok).toBe(false);
     expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
     expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY,
       fields: { requestId: request.identity.requestId, error: expect.stringContaining('native producer journal has a partial write') } });
+    // Fail-closed: no receipt, so the guard refused the retried call, by name.
+    expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('native error row has no matching live SDK retry-start receipt') });
+    expect(existsSync(effect)).toBe(false);
+    const journal = producerJournal(m.handle.sessionFile!);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('retry-start');
+    expect(journal).toContainEqual(expect.objectContaining({ state: 'guard-refused', reason: expect.stringContaining('native error row has no matching live SDK retry-start receipt') }));
     expect(m.requests()).toBe(2);
   } finally {
-    if (journalPath !== '') writeFileSync(journalPath, intact); // disposal records cessation in a readable journal
+    heal(); // disposal records cessation in a readable journal
     await m.dispose();
   }
 });

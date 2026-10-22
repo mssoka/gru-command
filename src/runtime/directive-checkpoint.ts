@@ -183,11 +183,24 @@ class NativeTurn {
   private readonly lines: NativeLines;
   private count = 0;
   private scope = 'native directive turn';
+  private ended: { readonly start: number; readonly count: number } | null = null;
   constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
-   * nor refused as, this turn. */
-  end(): void { this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn'; }
+   * nor refused as, this turn. A turn ends once. */
+  end(): void {
+    if (this.ended !== null) return;
+    this.ended = { start: this.start, count: this.count };
+    this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn';
+  }
+  /** Takes back end(): what was read since belongs to the turn after all,
+   * and is charged to it under the turn's own bound and name. */
+  resume(): void {
+    if (this.ended === null) return;
+    this.start = this.ended.start; this.count += this.ended.count; this.ended = null; this.scope = 'native directive turn';
+    if (this.lines.end - this.start > MAX_NATIVE_TRANSCRIPT_BYTES) throw new DirectiveCheckpointError(`${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
+    if (this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError(`${this.scope} exceeds the entry inspection limit`);
+  }
   /** The turn's next line, or undefined at its end. */
   next(): string | undefined {
     const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, `${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
@@ -214,6 +227,8 @@ interface PiTranscript {
   readonly turn: PiTurn | null;
   /** The turn ended at the last entry read (see NativeTurn.end). */
   readonly endTurn: () => void;
+  /** Takes back endTurn (see NativeTurn.resume). */
+  readonly resumeTurn: () => void;
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
@@ -236,7 +251,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, ids, malformed, turn: null, endTurn: () => {} });
+      return inspect({ header, ids, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {} });
     }
     const after = new NativeTurn(fd, lines.end, tail);
     const seen = new Set<string>();
@@ -250,7 +265,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       }
       return entries[index];
     };
-    return inspect({ header, ids, malformed, turn, endTurn: () => after.end() });
+    return inspect({ header, ids, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume() });
   });
 }
 /** Header facts come from the first line alone. They identify a session/cwd,
@@ -403,7 +418,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
 }
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
-function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
+function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native, endTurn, resumeTurn }: PiTranscript): DirectiveCheckpoint {
   const { identity } = binding;
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
   const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
@@ -453,10 +468,13 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
       // A receipted error row is history only when the SDK's retried answer
-      // follows it; otherwise (an abandoned retry) it is the turn's terminal.
-      if (!isRetryHistoryRow(entry, () => native(index + 1), retries)) {
+      // follows it; otherwise it is the turn's terminal. Its successor is read
+      // as lookahead, and charged to the turn only as that retried answer.
+      if (isRetryHistoryRow(entry, () => { endTurn(); return native(index + 1); }, retries)) resumeTurn();
+      else {
         for (const block of message.content as Record<string, unknown>[]) {
-          if (block.type !== 'toolCall') continue;
+          // An error row's calls never ran (owner ruling 2026-10-22): it ends the turn, it owes no results.
+          if (block.type !== 'toolCall' || message.stopReason === 'error') continue;
           if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
           pending.set(block.id, block.name);
         }
@@ -943,8 +961,8 @@ export function recordDirectiveRetryStart(producer: DirectiveProducer, event: un
   const entry = objectRecord(latestEntry);
   const message = objectRecord(entry?.['message']);
   const entryId = entry?.['id'];
-  if (entry?.['type'] !== 'message' || typeof entryId !== 'string' || !entryId || message === null ||
-      !isReceiptedErrorRow(entryId, message, new Map([[entryId, errorMessage]]))) return 'native branch tail is not the effect-free error row this retry names';
+  if (entry?.['type'] !== 'message' || !nonBlank(entryId) || message === null ||
+      !isReceiptedErrorRow(entryId, message, new Map([[entryId, errorMessage]]))) return 'native branch tail is not an error row of retry-history content carrying this retry\'s error';
   const binding = readDirectiveBinding(producer.sessionFile, producer.identity.requestId);
   if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, producer.identity)) return 'exact pi directive association unavailable';
   const rows = producerReceipts(producer.sessionFile);
@@ -1065,8 +1083,9 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
       // An error row the live SDK retried past is history, not a tool invocation.
       if (!isRetryHistoryRow(entry, () => native[native.indexOf(entry) + 1], retries)) {
         if (message!.stopReason === 'error') {
-          refuse(retries.get(entry.id) === message!['errorMessage'] ? 'native retry-start receipted error row is not retry history: unknown content or no retried answer'
-            : 'native error row has no matching live SDK retry-start receipt');
+          refuse(!retries.has(entry.id) || retries.get(entry.id) !== message!['errorMessage'] ? 'native error row has no matching live SDK retry-start receipt'
+            : !isReceiptedErrorRow(entry.id, message!, retries) ? 'native receipted error row holds content that is not retry history'
+              : 'native receipted error row has no retried answer after it');
         }
         if (message!.stopReason !== 'toolUse') refuse();
         for (const block of message!.content as Record<string, unknown>[]) {

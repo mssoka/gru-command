@@ -25,8 +25,9 @@ const identity: DirectiveTurnIdentity = { requestId: 'retry-request', payloadHas
 const text = 'follow the approved correction';
 const ERROR = 'OpenAI Responses stream ended before a terminal response event';
 const UNRECEIPTED = 'native error row has no matching live SDK retry-start receipt';
-const NOT_HISTORY = 'native retry-start receipted error row is not retry history: unknown content or no retried answer';
-const TAIL = 'native branch tail is not the effect-free error row this retry names';
+const NOT_HISTORY_CONTENT = 'native receipted error row holds content that is not retry history';
+const NO_RETRIED_ANSWER = 'native receipted error row has no retried answer after it';
+const TAIL = 'native branch tail is not an error row of retry-history content carrying this retry\'s error';
 /** What the Responses and Google parsers persist before a stream breaks. */
 const signedContent = [
   { type: 'thinking', thinking: 'reading the lane first', thinkingSignature: 'opaque-reasoning', redacted: false },
@@ -76,6 +77,13 @@ function finishTurn(file: string): void {
   entry(file, 'result', 'invocation', result);
   entry(file, 'answer', 'result', answer);
 }
+const later: DirectiveTurnIdentity = { ...identity, requestId: 'later-request', payloadHash: 'b'.repeat(64) };
+/** A later directive admitted directly after `baseline`. */
+function laterBoundRequest(file: string, baseline: string): void {
+  prepareDirectiveBinding({ identity: later, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text: 'a later directive', authorityManifest: 'manifest' });
+  entry(file, 'later-receipt', baseline, { role: 'user', content: [{ type: 'text', text: 'a later directive' }] });
+  expect(inspectDirectiveAdmission(file, later).userEntryId).toBe('later-receipt');
+}
 /** Refused at the guard by `reason`, and the checkpoint never reads the turn as finished. */
 function expectRetryHistoryRefused(file: string, reason = UNRECEIPTED): void {
   expect(() => flushRetried(file)).toThrow(new DirectiveCheckpointError(reason));
@@ -117,7 +125,7 @@ describe('Pi retry history (#483)', () => {
     expect(() => flushRetried(file)).not.toThrow();
   });
 
-  it('retry evidence is recorded only from an auto_retry_start naming an effect-free error tail, once per producer and row', () => {
+  it('retry evidence is recorded only from an auto_retry_start naming a history-only error tail, once per producer and row', () => {
     const { file, producer, error } = retryScene();
     const before = journal(file);
     const refused = [
@@ -131,6 +139,7 @@ describe('Pi retry history (#483)', () => {
       [retryEvent(), { ...error, message: { ...error.message, stopReason: 'aborted' } }, TAIL],
       [retryEvent(), { ...error, message: errorMessage([...signedContent, { type: 'image', data: 'AAAA', mimeType: 'image/png' }]) }, TAIL],
       [retryEvent(), { ...error, type: 'custom' }, TAIL],
+      [retryEvent(), { ...error, id: ' ' }, TAIL],
     ] as const;
     for (const [event, tail, reason] of refused) expect(recordDirectiveRetryStart(producer, event, tail), reason).toBe(reason);
     expect(journal(file)).toBe(before);
@@ -197,7 +206,7 @@ describe('Pi retry history (#483)', () => {
       const { file, producer, error } = retryScene([signedContent[0], block]);
       expect(recordDirectiveRetryStart(producer, retryEvent(), error), JSON.stringify(block)).toBe(TAIL);
       appendReceipt(file, { state: 'retry-start', producer, entryId: 'retry-error', errorMessage: ERROR });
-      expectRetryHistoryRefused(file, NOT_HISTORY);
+      expectRetryHistoryRefused(file, NOT_HISTORY_CONTENT);
     }
   });
 
@@ -222,8 +231,15 @@ describe('Pi retry history (#483)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: last, checkpointId: 'final-error' });
   });
 
+  it('a retry whose attempts ran out on an error row holding a tool call ends the turn there: terminal, not ok', () => {
+    const { file, producer, error } = retryScene();
+    const last = 'HTTP 503 service unavailable';
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    entry(file, 'final-error', 'retry-error', errorMessage([signedContent[1], partialCall], last));
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: last, checkpointId: 'final-error' });
+  });
+
   it('an abandoned receipted retry row followed by a later bound request or control is the earlier turn\'s terminal, not ok', () => {
-    const later: DirectiveTurnIdentity = { ...identity, requestId: 'later-request', payloadHash: 'b'.repeat(64) };
     for (const control of [false, true]) {
       const { file, producer, error } = retryScene();
       expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
@@ -232,11 +248,47 @@ describe('Pi retry history (#483)', () => {
         appendFileSync(file, `${JSON.stringify({ type: 'model_change', id: 'switch-model', parentId: baseline, provider: 'openai', modelId: 'gpt-next' })}\n`);
         baseline = 'switch-model';
       }
-      prepareDirectiveBinding({ identity: later, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text: 'a later directive', authorityManifest: 'manifest' });
-      entry(file, 'later-receipt', baseline, { role: 'user', content: [{ type: 'text', text: 'a later directive' }] });
-      expect(inspectDirectiveAdmission(file, later).userEntryId).toBe('later-receipt');
+      laterBoundRequest(file, baseline);
       expect(inspectDirectiveCheckpoint(file, identity), `control: ${String(control)}`).toMatchObject({ state: 'terminal', ok: false, error: ERROR, checkpointId: 'retry-error' });
     }
+  });
+
+  it('an abandoned receipted retry row holding a partial tool call is the failed terminal, with or without a later bound request', () => {
+    for (const followed of [false, true]) {
+      const { file, producer, error } = retryScene([signedContent[1], partialCall]);
+      expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+      if (followed) laterBoundRequest(file, 'retry-error');
+      expect(inspectDirectiveCheckpoint(file, identity), `followed: ${String(followed)}`).toMatchObject({ state: 'terminal', ok: false, error: ERROR, checkpointId: 'retry-error' });
+    }
+  });
+
+  it('a receipted error row with no retried answer after it refuses the next tool by that reason', () => {
+    const { file, producer, error } = retryScene();
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    entry(file, 'steer', 'retry-error', { role: 'user', content: [{ type: 'text', text: 'a steer, not the retried answer' }] });
+    entry(file, 'invocation', 'steer', invocation);
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(new DirectiveCheckpointError(NO_RETRIED_ANSWER));
+  });
+
+  it('a retried call that reuses the error row\'s call id runs once and is accepted', () => {
+    const reused = { ...call, id: partialCall.id };
+    const retried = { ...invocation, content: [reused] };
+    const { file, producer, error } = retryScene([signedContent[1], partialCall]);
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    entry(file, 'invocation', 'retry-error', retried);
+    expect(() => flushDirectiveToolIntent(file, retried, reused, identity)).not.toThrow();
+    entry(file, 'result', 'invocation', { ...result, toolCallId: reused.id });
+    // Its result is persisted: the same call never runs again.
+    expect(() => flushDirectiveToolIntent(file, retried, reused, identity)).toThrow(
+      new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'));
+    entry(file, 'answer', 'result', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('an unreceipted error row followed by a plain answer leaves the turn unknown', () => {
+    const { file } = retryScene();
+    entry(file, 'answer', 'retry-error', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
   });
 
   it('conflicting retry-start receipts for one error row are never trusted', () => {
