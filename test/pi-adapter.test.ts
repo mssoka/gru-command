@@ -3961,8 +3961,8 @@ it('routes a real local native authority refusal away from provider authenticati
     const refusal = events.find((event) => event.type === 'error');
     expect(refusal?.type).toBe('error');
     expect(refusal?.type === 'error' ? refusal.error : '').toContain('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized');
+    expect(refusal, `real runtime error event: ${JSON.stringify(refusal)}`).toMatchObject({ nativeControl: 'directive-refusal' });
     expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
-    expect(refusal).toMatchObject({ nativeControl: 'directive-refusal' });
     expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
     expect(scene.ledger.listProviderWaits()).toEqual([]);
     expect(spawn).toHaveBeenCalledTimes(1);
