@@ -202,6 +202,40 @@ describe('fresh fix worker association', () => {
     }
   });
 
+  it('a message for a minion still working tells its turn to skip the wait at its reply (#471 follow-up)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-background-working-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Working lane' });
+      ledger.setJobStatus('job-1', 'working');
+      ledger.registerAgent({ id: 'working-implementer', role: 'minion', jobId: 'job-1' });
+      const order: string[] = [];
+      const handle = {
+        id: 'working-implementer', role: 'minion', sessionFile: null,
+        async prompt() { order.push('prompt'); },
+        // Still working: nothing is answered yet, so nothing is stopped now.
+        turnAnswered: () => false,
+        endBackgroundWait: async () => { order.push('skip the wait'); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const routed = await routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'also update the docs', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      });
+      expect(routed.delivered).toBe(true);
+      expect(order).toEqual(['skip the wait', 'prompt']);
+    } finally {
+      db.close();
+    }
+  });
+
   it('a re-brief ends the prior minion\'s answered wait before its fences and its cleanup (#471 follow-up)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-background-rebrief-'));
     cleanupDirs.push(dir);

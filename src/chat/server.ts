@@ -760,15 +760,15 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }
   }
 
-  /** Start a coalesced awareness turn when the lane is idle. A request that
-   * arrives mid-turn or mid-wake waits for a trailing turn instead of
-   * steering into a live conversation; settle hooks call back here. */
   /** A Gru turn that has replied and only waits on background work ends that
    * wait for a held wake, which then runs at the turn's end. */
   function endLiveWaitForWake(): void {
     void handle?.endBackgroundWait?.().catch(() => undefined);
   }
 
+  /** Start a coalesced awareness turn when the lane is idle. A request that
+   * arrives mid-turn or mid-wake waits for a trailing turn instead of
+   * steering into a live conversation; settle hooks call back here. */
   function maybeWake(): void {
     if (disposed || !wakeRequested || options.awareness === undefined) return;
     if (wakeRunning) {

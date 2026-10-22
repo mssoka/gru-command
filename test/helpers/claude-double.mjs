@@ -55,6 +55,7 @@
  *   CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS=<ms> the follow-up turn works this long before answering
  *   CLAUDE_DOUBLE_BACKGROUND_ERROR=1 that reply is an in-band error result
  *   CLAUDE_DOUBLE_BACKGROUND_UNLISTED=1 never list the task (no background_tasks_changed frames)
+ *   CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY=1 exit 2 right after that reply, the task still listed
  *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
  *   CLAUDE_DOUBLE_COMPACT_STATUS_FAIL=1 report native failure with a successful command result
  *   CLAUDE_DOUBLE_COMPACT_EXIT_ERROR=1 report native success, then exit non-zero
@@ -471,6 +472,7 @@ async function emitBackgroundTurn(ms) {
   }
   await emitTextTurn('started it');
   out(resultFrame('started it', process.env['CLAUDE_DOUBLE_BACKGROUND_ERROR'] === '1'));
+  if (process.env['CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY'] === '1') process.exit(2);
   await delay(ms);
   out({ type: 'system', subtype: 'task_notification', task_id: task.task_id, status: 'completed', session_id: sessionId });
   tasksChanged([]);

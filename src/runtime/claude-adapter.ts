@@ -660,14 +660,14 @@ function syncTranscript(path: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-/** One directive turn in flight (#424). */
 /** An ordinary turn's wait on the background tasks its CLI still runs after
  * the reply (see DEFAULT_CLAUDE_BACKGROUND_WAIT_MS). */
 interface BackgroundWait {
   /** The prompted turn has replied successfully: its prompt is answered. An
    * in-band error result is no answer (the rate-limit retry re-sends it). */
   answered(): boolean;
-  /** Replied, and no follow-up turn of the CLI's own is running. */
+  /** Replied, and the idle clock is running: no follow-up turn of the CLI's
+   * own pauses it (see `paused` in spawnTurn). */
   waiting(): boolean;
   /** A message is waiting: stop now if waiting, else skip the next wait. */
   end(): Promise<void>;
@@ -718,6 +718,7 @@ export function backgroundStopNotice(tasks: readonly string[], reason: Backgroun
     'your turn. If you need a result, run the command again and wait for it before you reply.';
 }
 
+/** One directive turn in flight (#424). */
 interface DirectiveTurn {
   readonly directive: NonNullable<PromptOptions['directive']>;
   readonly producer: DirectiveProducer;
@@ -2159,13 +2160,14 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
       };
       const stopBackground = (reason: BackgroundStopReason): void => {
-        if (stopping || settled) return;
+        if (stopping || settled || ended) return;
         stopping = true;
+        // A CLI that already ended by itself was stopped by nothing.
+        if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
         if (tasks.length > 0) this.backgroundNotice = backgroundStopNotice(tasks, reason, waitMs);
         this.log('info', 'stopping a claude turn that has replied and only waits on background work', {
           session_id: params.sessionId, reason, tasks,
         });
-        if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
         try { child.stdin?.end(); } catch { /* already closed */ }
         try { child.kill('SIGTERM'); } catch { /* already gone */ }
         // A CLI that ignores SIGTERM is killed after the grace period. A killed
@@ -2195,14 +2197,16 @@ export class ClaudeCodeHandle implements AgentHandle {
       // A reply (`fresh`) restarts the clock; anything else only brings the
       // stop closer, so further messages never push it back.
       const arm = (fresh: boolean): void => {
-        if (!replied || paused() || stopping || settled) {
+        if (!replied || paused() || stopping || settled || ended) {
           if (waitTimer !== null) clearTimeout(waitTimer);
           waitTimer = null;
           return;
         }
         const reason: BackgroundStopReason = errored ? 'error' : messageWaiting ? 'message' : 'limit';
         const delay = reason === 'limit' ? waitMs : tasks.length > 0 ? 0 : stopGraceMs;
-        const deadline = Date.now() + delay;
+        // Node's timers run on the monotonic clock, which stops while the
+        // machine sleeps; the deadlines compare on the same clock.
+        const deadline = performance.now() + delay;
         if (delay > 0 && !fresh && waitTimer !== null && waitDeadline <= deadline) return;
         if (waitTimer !== null) clearTimeout(waitTimer);
         waitTimer = null;
@@ -2218,7 +2222,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         answered: () => answered,
         waiting: () => replied && !paused() && !settled,
         end: () => {
-          if (settled) return Promise.resolve();
+          if (settled || ended) return Promise.resolve();
           messageWaiting = true;
           if (!replied || paused()) return Promise.resolve();
           arm(false);

@@ -72,6 +72,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS',
   'CLAUDE_DOUBLE_BACKGROUND_ERROR',
   'CLAUDE_DOUBLE_BACKGROUND_UNLISTED',
+  'CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY',
   'CLAUDE_DOUBLE_TASK_NOTIFICATION',
   'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
   'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
@@ -4874,7 +4875,7 @@ describe('a replied Claude turn waiting on background work (#471 follow-up)', ()
   it('the verdict is the prompted turn\'s own first result: a later follow-up success never makes an error reply an answer', async () => {
     // An unlisted task (CLI drift) leaves the error reply to the grace; the
     // task ends inside it, and the CLI's own follow-up turn then succeeds.
-    const fx = fixture({ backgroundStopGraceMs: 5_000 });
+    const fx = fixture({ killGraceMs: 50, backgroundStopGraceMs: 5_000 });
     process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] = '1';
     process.env['CLAUDE_DOUBLE_BACKGROUND_ERROR'] = '1';
     const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
@@ -4888,8 +4889,24 @@ describe('a replied Claude turn waiting on background work (#471 follow-up)', ()
     }
   });
 
+  it('a CLI that ends by itself with a task still listed was stopped by nothing: a message at its end leaves no notice', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    try {
+      // The double exits 2 right after its reply, the task still listed.
+      process.env['CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY'] = '1';
+      handle.subscribe((event) => { if (event.type === 'turn_end') void handle.endBackgroundWait!(); });
+      await handle.prompt('background:60000 start the server');
+      delete process.env['CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY'];
+      await handle.prompt('answer plainly');
+      expect(doubleInvocations(fx).at(-1)!.prompt).toBe('answer plainly');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('an error reply\'s stop does not wait for the CLI\'s follow-up turn either', async () => {
-    const fx = fixture({ backgroundStopGraceMs: 1_500 });
+    const fx = fixture({ killGraceMs: 50, backgroundStopGraceMs: 1_500 });
     process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] = '1';
     process.env['CLAUDE_DOUBLE_BACKGROUND_ERROR'] = '1';
     process.env['CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS'] = '20000';
@@ -4909,7 +4926,7 @@ describe('a replied Claude turn waiting on background work (#471 follow-up)', ()
   it('a stop the messages ask for is never pushed back by further messages', async () => {
     // Nothing listed: the first message gives the CLI the grace to end; each
     // further one must not restart it.
-    const fx = fixture({ backgroundStopGraceMs: 600 });
+    const fx = fixture({ killGraceMs: 50, backgroundStopGraceMs: 600 });
     process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] = '1';
     const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
     try {
@@ -4931,7 +4948,7 @@ describe('a replied Claude turn waiting on background work (#471 follow-up)', ()
 
   it('in a worker-verification lane a waiting message also ends the CLI\'s follow-up turn, which nothing can host', async () => {
     const lane = verificationLane(); cleanupDirs.push(lane.root);
-    const fx = fixture({ backgroundStopGraceMs: 300 });
+    const fx = fixture({ killGraceMs: 50, backgroundStopGraceMs: 300 });
     process.env['CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS'] = '20000';
     const handle = await withFallbacks(fx.runtime).spawn('minion', lane.session);
     const events = collect(handle);
