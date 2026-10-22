@@ -616,7 +616,10 @@ describe('GitLab overview glab transport', () => {
     const rejected = included({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 });
     const error = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => rejected).run));
     expect(error.kind).toBe('auth');
-    expect(error.message).toBe(`${remedy} (${label}: HTTP 401)`);
+    // GitLab's own reason follows the status.
+    expect(error.message).toBe(`${remedy} (${label}: HTTP 401 — Token was revoked.)`);
+    const bare = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => included({}, { status: 401 })).run));
+    expect(bare.message).toBe(`${remedy} (${label}: HTTP 401)`);
     // The remedy survives the row bound on an aborted row behind a long path.
     const owner = 'platform-engineering/continuous-delivery-tooling/internal-services';
     const { run, calls } = fakeGlab(() => rejected);
@@ -629,6 +632,9 @@ describe('GitLab overview glab transport', () => {
     });
     const view = await h.tracker.refresh();
     expect(calls).toHaveLength(1);
+    // The row that got the 401 leads with the remedy too.
+    expect(row(view, 'gl-a')).toMatchObject({ freshness: 'unavailable' });
+    expect(row(view, 'gl-a').error?.startsWith(`${remedy} (project ${owner}/gl-a-release-orchestration-service`)).toBe(true);
     const aborted = row(view, 'gl-b').error ?? '';
     expect(aborted).toHaveLength(300);
     expect(aborted.startsWith(`refresh aborted before this repository was checked: auth: ${remedy}`)).toBe(true);
@@ -647,12 +653,12 @@ describe('GitLab overview glab transport', () => {
 
   it('reads a host glab holds no login for as auth, naming glab auth login', async () => {
     const stderrs = [
-      // glab 1.89's boxed verdict, with colour and padding.
-      `\n ${ESC}[31m╭──────────────╮${ESC}[0m\n │ ERROR        │\n │ Unauthenticated.   │\n ╰──────────────╯\n\n`,
+      // glab 1.89's verdict block, coloured, its line padded.
+      `          \n   ${ESC}[41m ERROR ${ESC}[0m  \n          \n  Unauthenticated.${' '.repeat(100)}\r\n\n`,
       'You are not logged into any GitLab hosts. Run glab auth login to authenticate.',
       'glab: no token found for gitlab.example.com',
-      // The verdict after a preamble longer than the display bound.
-      `${'warning: a newer glab release is available. '.repeat(8)}\nERROR Unauthenticated.`,
+      // The verdict line after a preamble longer than the display bound.
+      `${'warning: a newer glab release is available. '.repeat(8)}\n  ERROR\n  Unauthenticated.\n`,
     ];
     for (const stderr of stderrs) {
       const error = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => ({ status: 1, stdout: '', stderr })).run));
@@ -674,19 +680,31 @@ describe('GitLab overview glab transport', () => {
       new GitLabRepoOverviewApi(fakeGlab(() => ({ status: -1, stdout: '', stderr: '', error: 'Error: spawn glab ENOENT' })).run),
     );
     expect(missing.kind).toBe('auth');
-    expect(missing.message).toBe(`glab is unavailable (Error: spawn glab ENOENT) — install the GitLab CLI and run ${login}`);
+    const unavailable = (detail: string): string =>
+      `glab is unavailable (${detail}) — install the GitLab CLI (or make it executable) and run ${login}`;
+    expect(missing.message).toBe(unavailable('Error: spawn glab ENOENT'));
     const denied = await failureOf(
       new GitLabRepoOverviewApi(fakeGlab(() => ({ status: -1, stdout: '', stderr: '', error: 'Error: spawn glab EACCES' })).run),
     );
     expect(denied.kind).toBe('auth');
-    expect(denied.message).toBe(`glab is unavailable (Error: spawn glab EACCES) — install the GitLab CLI and run ${login}`);
+    expect(denied.message).toBe(unavailable('Error: spawn glab EACCES'));
+    // Node throws some spawn errnos synchronously, so the run rejects
+    // instead of resolving with `error`: classified the same way.
+    const rejecting = (error: Error): GitLabRepoOverviewApi =>
+      new GitLabRepoOverviewApi(async () => {
+        throw error;
+      });
+    const gone = await failureOf(rejecting(Object.assign(new Error('spawn glab ENOENT'), { code: 'ENOENT' })));
+    expect(gone.kind).toBe('auth');
+    expect(gone.message).toBe(unavailable('Error: spawn glab ENOENT'));
+    const starved = await failureOf(rejecting(Object.assign(new Error('spawn ENOMEM'), { code: 'ENOMEM' })));
+    expect(starved.kind).toBe('other');
+    expect(starved.message).toBe(`${label}: Error: spawn ENOMEM`);
     for (const [error, message] of [
       ['gh api timed out after 15000 ms', 'glab api timed out after 15000 ms'],
       ['gh api output exceeds 16777216 bytes', 'glab api output exceeds 16777216 bytes'],
       // A transient spawn failure is one failed read, never "install glab".
-      ['Error: spawn EMFILE', 'Error: spawn EMFILE'],
       ['Error: spawn glab EAGAIN', 'Error: spawn glab EAGAIN'],
-      ['Error: spawn ENOMEM', 'Error: spawn ENOMEM'],
     ] as const) {
       const failed = await failureOf(new GitLabRepoOverviewApi(fakeGlab(() => ({ status: -1, stdout: '', stderr: '', error })).run));
       expect(failed.kind, error).toBe('other');
@@ -701,7 +719,16 @@ describe('GitLab overview glab transport', () => {
       // Exit 0 without a status line is no response either.
       { status: 0, stdout: '{"id":1}', stderr: '' },
       // A failing run is never a success, whatever status line it printed.
-      { ...included({ default_branch: 'main' }), status: 1 },
+      { ...included({ default_branch: 'main' }), status: 1, stderr: 'glab: write /dev/stdout: broken pipe\n' },
+      // A project path that merely contains "unauthenticated" is no login
+      // verdict: a DNS failure reads as other, never as "log in".
+      {
+        status: 1,
+        stdout: '',
+        stderr:
+          'glab: Get "https://gitlab.example.com/api/v4/projects/group%2Funauthenticated-api%2Fproject": ' +
+          'dial tcp: lookup gitlab.example.com: no such host\n',
+      },
     ];
     const api = new GitLabRepoOverviewApi(fakeGlab(() => answers.shift() as GhCommandResult).run);
     const noisy = await failureOf(api);
@@ -713,7 +740,13 @@ describe('GitLab overview glab transport', () => {
     expect(silent.message).toBe(`${label}: glab api printed no HTTP status line`);
     const contradicted = await failureOf(api);
     expect(contradicted.kind).toBe('other');
-    expect(contradicted.message).toBe(`${label}: glab exited 1`);
+    expect(contradicted.message).toBe(`${label}: glab exited 1: glab: write /dev/stdout: broken pipe`);
+    const dns = await failureOf(api);
+    expect(dns.kind).toBe('other');
+    expect(dns.message).toBe(
+      `${label}: glab exited 1: glab: Get "https://gitlab.example.com/api/v4/projects/group%2Funauthenticated-api%2Fproject": ` +
+        'dial tcp: lookup gitlab.example.com: no such host',
+    );
   });
 });
 

@@ -1,4 +1,10 @@
-import { defaultGhRunner, repoFullName, type GhCommandRunner, type RepoRef } from '../dispatch/github-poll.js';
+import {
+  defaultGhRunner,
+  repoFullName,
+  type GhCommandResult,
+  type GhCommandRunner,
+  type RepoRef,
+} from '../dispatch/github-poll.js';
 import { isGitLabRemote } from '../dispatch/review-path.js';
 import {
   RepoProviderError,
@@ -129,12 +135,29 @@ function parseIncluded(stdout: string): IncludedResponse | null {
 }
 
 /** A runner error that proves glab is missing or not executable. Any
- * other (a run's own time or size bound, a transient EMFILE/EAGAIN/ENOMEM
- * spawn failure) is one failed read, never a reason to reinstall. */
+ * other (a run's own time or size bound, or a transient spawn failure) is
+ * one failed read, never a reason to reinstall. */
 const GLAB_MISSING = /\b(?:ENOENT|EACCES)\b/u;
 
-/** glab's verdict for a host it holds no login for. */
-const NOT_LOGGED_IN = /unauthenticated|not logged in|no token/iu;
+/** glab's verdict for a host it holds no login for: its own
+ * `Unauthenticated.` line, or a "not logged in" / "no token" phrase. Never
+ * a bare word anywhere — a project path in a DNS or TLS failure can
+ * contain `unauthenticated`, and names are never provider semantics. */
+const NOT_LOGGED_IN = /^\s*unauthenticated\.?\s*$|not logged in|no token/imu;
+
+/** A rejected run as the runner reports a spawn failure: Node throws some
+ * errnos synchronously from `spawn`, so the run rejects instead of
+ * resolving with `error`. */
+function rejectedRun(error: unknown): GhCommandResult {
+  const text = String(error);
+  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+  return {
+    status: -1,
+    stdout: '',
+    stderr: '',
+    error: typeof code === 'string' && code !== '' && !text.includes(code) ? `${text} (${code})` : text,
+  };
+}
 
 export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
   constructor(
@@ -212,11 +235,19 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     const host = repo.host.toLowerCase();
     const login = `\`glab auth login --hostname ${host}\``;
     const path = `projects/${encodeURIComponent(repoFullName(repo))}${suffix}`;
-    const result = await this.run(['api', '--hostname', host, '--include', path]);
+    let result: GhCommandResult;
+    try {
+      result = await this.run(['api', '--hostname', host, '--include', path]);
+    } catch (error) {
+      result = rejectedRun(error);
+    }
     if (result.error !== undefined && result.error !== '') {
       const detail = cliText(result.error.replace(/\bgh api\b/gu, `${this.binary} api`)) ?? 'no detail';
       if (GLAB_MISSING.test(result.error)) {
-        throw new RepoProviderError('auth', `glab is unavailable (${detail}) — install the GitLab CLI and run ${login}`);
+        throw new RepoProviderError(
+          'auth',
+          `glab is unavailable (${detail}) — install the GitLab CLI (or make it executable) and run ${login}`,
+        );
       }
       throw new RepoProviderError('other', `${label}: ${detail}`);
     }
@@ -247,7 +278,7 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
         throw new RepoProviderError(
           kind,
           `glab's login for ${host} was rejected — run ${login} (a GITLAB_TOKEN in the service environment ` +
-            `overrides glab's login) (${label}: HTTP 401)`,
+            `overrides glab's login) (${label}: HTTP 401${detail !== null ? ` — ${detail}` : ''})`,
         );
       }
       throw new RepoProviderError(kind, `${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`);
@@ -256,7 +287,10 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
       throw new RepoProviderError('other', `${label}: HTTP ${response.status}`);
     }
     // A failing glab run is never a success, whatever status line it printed.
-    if (result.status !== 0) throw new RepoProviderError('other', `${label}: ${this.binary} exited ${result.status}`);
+    if (result.status !== 0) {
+      const stderr = cliText(result.stderr);
+      throw new RepoProviderError('other', `${label}: ${this.binary} exited ${result.status}${stderr !== null ? `: ${stderr}` : ''}`);
+    }
     let body: unknown;
     try {
       body = JSON.parse(response.body);

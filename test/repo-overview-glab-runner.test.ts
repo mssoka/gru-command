@@ -9,11 +9,18 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...actual, spawn: vi.fn(() => { throw new Error('test refuses unmocked child spawn; no live glab calls'); }) };
 });
 
-/** The production GitLab adapter's default runner (#480): its own module
- * mock keeps the tracker tests in repo-overview-gitlab.test.ts on real
- * child processes. */
+/** The production GitLab adapter's default runner (#480). It lives in its
+ * own file so this child_process mock stays away from
+ * repo-overview-gitlab.test.ts, whose real-git origin test spawns git. */
 describe('GitLab overview default glab runner', () => {
-  afterEach(() => { vi.useRealTimers(); vi.mocked(spawn).mockClear(); });
+  afterEach(() => {
+    vi.useRealTimers();
+    // Reset drops any unconsumed mockReturnValueOnce; the refusal default
+    // is re-established so a stray spawn can never reach a real glab.
+    vi.mocked(spawn).mockReset().mockImplementation(() => {
+      throw new Error('test refuses unmocked child spawn; no live glab calls');
+    });
+  });
 
   it('spawns glab api --include for the host and kills the run at its 15 s bound', async () => {
     vi.useFakeTimers();

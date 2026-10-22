@@ -273,15 +273,17 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   not deployment health` for both hosts. With glab not installed, or not
   logged in to the host, the row is unavailable and names the fix (`glab
   auth login --hostname <host>`); a rejected login (HTTP 401) names the
-  same fix. A missing glab, a missing or rejected glab login, a 403
-  `insufficient_scope` (no `read_api` or `api`) or a 429 aborts that
-  GitLab host for the pass — its later rows read `refresh aborted before
-  this repository was checked` — while GitHub rows and other GitLab hosts
-  are still observed; a GitHub rate limit or `gh` auth failure likewise
-  never stops GitLab rows. Other 403s, 404, 5xx and network failures are per-repository,
-  and cached data renders `STALE · last …` like any other row. GitLab
-  pipelines never feed the default-branch CI alert below: a red GitLab
-  pipeline shows on its row without waking Gru.
+  same fix and notes that a `GITLAB_TOKEN` in the service environment
+  overrides the glab login. A missing glab, a missing or rejected glab
+  login, a 403 `insufficient_scope` (no `read_api` or `api`) or a 429
+  aborts that GitLab host for the pass — its later rows read `refresh
+  aborted before this repository was checked` — while GitHub rows and
+  other GitLab hosts are still observed; a GitHub rate limit or `gh` auth
+  failure likewise never stops GitLab rows. Other 403s, 404, 5xx, network
+  failures, timeouts, oversized output and transient spawn failures are
+  per-repository, and cached data renders `STALE · last …` like any other
+  row. GitLab pipelines never feed the default-branch CI alert below: a
+  red GitLab pipeline shows on its row without waking Gru.
   **Default-branch CI alert (#446):** the one runs call reads the 20
   newest default-branch runs; the chip shows the newest of them that tested
   the branch itself — `pull_request*` and fork runs that merely share its
