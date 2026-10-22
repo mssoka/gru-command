@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname } from 'node:path';
+import { PI_THINKING_LEVELS } from '../config.js';
 import { withSessionLockCoordination } from '../sessions/lock-coordination.js';
 
 /** Accepted authority, not a prompt or a claim lease. */
@@ -193,7 +194,8 @@ class NativeTurn {
   constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
-   * nor refused as, this turn. A turn ends once. */
+   * nor refused as, this turn. Idempotent until resume(): a chained retry
+   * ends, resumes and ends again. */
   end(): void {
     if (this.ended !== null) return;
     this.ended = { start: this.start, count: this.count };
@@ -354,6 +356,8 @@ function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) =>
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
   return compaction;
 }
+/** Every level a Pi thinking_level_change can record: GC's own, and off. */
+const PI_THINKING_CONTROL_LEVELS: readonly string[] = ['off', ...PI_THINKING_LEVELS];
 /** Why `control`, after a completed checkpoint, is not one Pi links on `tip`:
  * a model or thinking-level change, or an automatic compaction that does not
  * follow another. Null when it is. */
@@ -363,7 +367,7 @@ function controlRefusal(control: NativeEntry, tip: NativeEntry, ancestry: PiAnce
   if (control.type === 'model_change' &&
       (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim())) return 'native model control is malformed';
   if (control.type === 'thinking_level_change' &&
-      (typeof control.thinkingLevel !== 'string' || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return 'native thinking-level control is malformed';
+      (typeof control.thinkingLevel !== 'string' || !PI_THINKING_CONTROL_LEVELS.includes(control.thinkingLevel))) return 'native thinking-level control is malformed';
   return null;
 }
 /** Where a directive's user receipt is: directly after its baseline, or after

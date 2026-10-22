@@ -1128,7 +1128,8 @@ export class PiAgentHandle implements AgentHandle {
   private compacting = false;
   /** Adapter-owned cessation evidence state (once-only transition). */
   private cessationState: 'live' | 'ceased' | 'unknown' = 'live';
-  private pendingCompactionEnd: RuntimeEvent | null = null;
+  /** The withheld terminal; `aborted` is Pi's own flag for a cancelled cycle. */
+  private pendingCompactionEnd: { readonly event: Extract<RuntimeEvent, { type: 'compaction_end' }>; readonly aborted: boolean } | null = null;
   private nativeCompactionOpen = false;
   private readonly compactionTerminalWaiters = new Set<() => void>();
   private compactionEndDeadline = 0;
@@ -1532,7 +1533,7 @@ export class PiAgentHandle implements AgentHandle {
       this.compacting = false;
       if (!this.disposed) {
         if (failed || this.pendingCompactionEnd === null) {
-          this.pendingCompactionEnd = {
+          this.pendingCompactionEnd = { aborted: false, event: {
             type: 'compaction_end',
             success: false,
             error:
@@ -1541,7 +1542,7 @@ export class PiAgentHandle implements AgentHandle {
                   ? failure.message
                   : String(failure)
                 : 'native compaction settled without a terminal event',
-          };
+          } };
           this.nativeCompactionOpen = true;
           this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
         }
@@ -1789,10 +1790,14 @@ export class PiAgentHandle implements AgentHandle {
     if (mapped !== undefined) promptOptions['images'] = mapped;
     if (directive !== undefined) promptOptions['preflightResult'] = (accepted: boolean) => {
       if (!accepted) return;
-      // Pi calls this synchronously, after any pre-prompt compaction it awaited
-      // has cleared its gate; a terminal still withheld (a failed compaction
-      // awaits its failure hook first) is published before the fences run.
+      // Pi calls this synchronously before it runs the prompt and writes the
+      // receipt; a throw here rejects the prompt with no receipt. A withheld
+      // compaction terminal is published if Pi's gate has cleared. If one is
+      // still withheld, or the handle was disposed (the reconcile bound
+      // disposes), the directive is not admitted.
       if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
+      if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
+      if (this.nativeCompactionOpen || this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
       directive.beforeAdmission();
       if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
         throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
@@ -1960,11 +1965,11 @@ export class PiAgentHandle implements AgentHandle {
     }
     if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
     this.compactionEndTimer = null;
-    const terminal = this.pendingCompactionEnd;
+    const terminal = this.pendingCompactionEnd.event;
     this.pendingCompactionEnd = null;
     this.nativeCompactionOpen = false;
     this.compactionEndDeadline = 0;
-    this.publishCompactionEnd(terminal as Extract<RuntimeEvent, { type: 'compaction_end' }>);
+    this.publishCompactionEnd(terminal);
   }
 
   private publishCompactionEnd(
@@ -2104,25 +2109,26 @@ export class PiAgentHandle implements AgentHandle {
           (this.explicitCompactionTerminal === null ||
             this.explicitCompactionTerminal.settled)
         ) return;
-        const success = e['aborted'] !== true && typeof e['errorMessage'] !== 'string';
-        // A joined episode publishes one terminal. A failed compaction in it
-        // wins, with its own error; a cancelled one is superseded by what Pi
-        // runs next (the broad-cancellation boundary pins that).
+        const aborted = e['aborted'] === true;
+        const success = !aborted && typeof e['errorMessage'] !== 'string';
+        const terminal = { aborted, event: {
+          type: 'compaction_end' as const,
+          success,
+          ...(success
+            ? {}
+            : {
+                error:
+                  typeof e['errorMessage'] === 'string'
+                    ? e['errorMessage']
+                    : 'compaction aborted',
+              }),
+        } };
+        // A joined episode publishes one terminal: success when any compaction
+        // in it wrote its summary, else a failure's own error; a cancelled
+        // cycle stands only when nothing else ended the episode.
+        const rank = ({ event, aborted: cancelled }: typeof terminal): number => event.success ? 2 : cancelled ? 0 : 1;
         const prior = this.pendingCompactionEnd;
-        if (!(prior?.type === 'compaction_end' && !prior.success && prior.error !== 'compaction aborted')) {
-          this.pendingCompactionEnd = {
-            type: 'compaction_end',
-            success,
-            ...(success
-              ? {}
-              : {
-                  error:
-                    typeof e['errorMessage'] === 'string'
-                      ? e['errorMessage']
-                      : 'compaction aborted',
-                }),
-          };
-        }
+        if (prior === null || rank(terminal) >= rank(prior)) this.pendingCompactionEnd = terminal;
         this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
         // Pi dispatches this event before AgentSession clears isCompacting.
         // Publish only after the native gate is really open, or queued prompts

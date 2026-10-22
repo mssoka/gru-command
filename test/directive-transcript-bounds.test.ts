@@ -612,6 +612,29 @@ describe('limits at their exact boundaries (#469)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'failed-a', error: overflow });
   });
 
+  it('pi: a turn of exactly 32 MiB through a compact-and-retry is read; one byte more refuses as the turn (#481)', () => {
+    /** The receipt, a failed reply, Pi's compaction on it and the reply continued from it: `bytes` in all, padded in `padded`. */
+    const turn = (bytes: number, padded: 'failed' | 'continued') => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      const line = (row: Record<string, unknown>) => `${JSON.stringify(row)}\n`;
+      const receipt = line({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) });
+      const failed = (body: string) => line({ type: 'message', id: 'failed-a', parentId: 'receipt-a',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: [{ type: 'text', text: body }] } });
+      const compaction = line({ type: 'compaction', id: 'retry-compaction', parentId: 'failed-a', timestamp: '2026-10-22T00:00:00.000Z',
+        summary: 'Pi automatic compaction summary', firstKeptEntryId: 'receipt-a', tokensBefore: 90_000, fromHook: false });
+      const continued = (body: string) => line({ type: 'message', id: 'answer-a', parentId: 'retry-compaction', message: { ...answer, content: [{ type: 'text', text: body }] } });
+      const pad = 'x'.repeat(bytes - Buffer.byteLength(receipt + failed('') + compaction + continued('')));
+      appendFileSync(file, receipt + failed(padded === 'failed' ? pad : '') + compaction + continued(padded === 'continued' ? pad : ''));
+      return file;
+    };
+    // The entries read to see whether Pi continued the failed reply are the turn's own once it did.
+    for (const padded of ['failed', 'continued'] as const) {
+      expect(inspectDirectiveCheckpoint(turn(LIMIT, padded), identity), padded).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
+      expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1, padded), identity), padded).toThrow(new DirectiveCheckpointError('native directive turn exceeds the 33554432-byte inspection limit'));
+    }
+  });
+
   it('a header line of exactly 64 KiB is read; one byte more refuses', () => {
     const header = (bytes: number) => {
       const line = (cwd: string) => JSON.stringify({ ...piHeader, cwd });

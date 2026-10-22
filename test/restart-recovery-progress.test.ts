@@ -850,14 +850,15 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   /** The original's controls tail, then a later prompt bound on it. The
    * original stays unsettled until the tail is read: only a linked tail lets
    * it settle. */
-  async function assertBoundControlTail(mode: 'linked' | 'wrong-parent' | 'malformed-compaction' | 'malformed-model' | 'malformed-thinking') {
+  async function assertBoundControlTail(mode: 'linked' | 'max-thinking' | 'wrong-parent' | 'malformed-compaction' | 'malformed-model' | 'malformed-thinking') {
     const f = await fixture(); f.seed(); f.native.finish();
     const original = inspectDirectiveCheckpoint(f.file, f.identity);
     if (original.state !== 'terminal') throw new Error('original fixture must genuinely complete');
     const model = { type: 'model_change', id: 'later-model-control',
       parentId: mode === 'wrong-parent' ? 'unbound-parent' : original.checkpointId,
       provider: mode === 'malformed-model' ? undefined : 'fixture', modelId: 'later-model' };
-    const thinking = { type: 'thinking_level_change', id: 'later-thinking-control', parentId: model.id, thinkingLevel: mode === 'malformed-thinking' ? 'turbo' : 'high' };
+    const thinking = { type: 'thinking_level_change', id: 'later-thinking-control', parentId: model.id,
+      thinkingLevel: mode === 'malformed-thinking' ? 'turbo' : mode === 'max-thinking' ? 'max' : 'high' };
     // Pi's own compaction shape, but with a blank summary.
     const control = mode === 'malformed-compaction' ? piCompaction(model.id, original.checkpointId, original.checkpointId, { summary: ' ' }) : JSON.stringify(model);
     appendFileSync(f.file, `${control}\n${JSON.stringify(thinking)}\n`);
@@ -867,12 +868,14 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const observed = inspectDirectiveCheckpoint(f.file, f.identity);
     const reasons = { 'wrong-parent': 'native control is not linked to the completed checkpoint', 'malformed-compaction': 'native compaction lacks a summary',
       'malformed-model': 'native model control is malformed', 'malformed-thinking': 'native thinking-level control is malformed' };
-    if (mode === 'linked') expect(observed).toEqual(original);
+    const linked = mode === 'linked' || mode === 'max-thinking';
+    if (linked) expect(observed).toEqual(original);
     else expect(observed).toEqual({ state: 'unknown', reason: reasons[mode] });
     expect(readFileSync(f.file, 'utf8')).toBe(bytes);
-    expectSettlement(f, mode === 'linked', mode);
+    expectSettlement(f, linked, mode);
   }
   it('P46 preserves original completion through linked model and thinking controls into a later bound request', () => assertBoundControlTail('linked'));
+  it('P46 preserves original completion through Pi\'s max thinking level into a later bound request, and settles once', () => assertBoundControlTail('max-thinking'));
   it('P46 refuses later bound controls whose ancestry does not descend from the original checkpoint', () => assertBoundControlTail('wrong-parent'));
   it('P46 refuses a malformed compaction control even when a later request is independently bound', () => assertBoundControlTail('malformed-compaction'));
   it('P46 refuses malformed model controls before an independently bound later request', () => assertBoundControlTail('malformed-model'));
@@ -1007,8 +1010,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     f.native.append(bashCall('first')); f.native.append(bashResult('first', false));
     const overflow = 'prompt is too long: 150000 tokens > 100000 maximum';
     const failed = f.native.append({ role: 'assistant', stopReason: 'error', errorMessage: overflow, content: [] });
-    // The run ended on that error and nothing ran after it: Pi's continue()
-    // would reject the assistant tip, so this is the failed reply's terminal.
+    // The run ended on that error: only Pi's compaction ran after it, and
+    // continue() would reject the assistant tip, so this is the failed
+    // reply's terminal. Pinned without tool calls: a failed reply holding
+    // calls reads UNKNOWN ('malformed native tool identity') on this branch.
     appendLine(f.file, piCompaction('compaction', failed, user));
     expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: failed, error: overflow });
     expectSettlement(f, false, 'lost-continued-reply');

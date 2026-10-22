@@ -71,18 +71,25 @@ single-operation queue.
   the result authority (missing/failed terminals reject), and the adapter
   verifies the session id/file did not change.
   Pi also compacts automatically: before a prompt, between a completed tool
-  round and the next model call, after a run's final reply, and on an error
-  or length reply before continuing from it. The adapter publishes an
+  round and the next model call, and after a run's final reply; after a
+  context overflow or a truncated reply, Pi compacts and continues. GC checks
+  the linked shape (an error or length reply, a compaction linked on it, a
+  reply continued from it), not the reason. The adapter publishes an
   automatic compaction's terminal as soon as Pi's compaction gate clears,
-  ahead of the next turn or the continued reply, and a directive's admission
-  publishes one still withheld before its fences run. A start that arrives
-  while an episode is open joins it, and the joined episode publishes one
-  terminal: a failed compaction in it wins, with its own error, and a
-  cancelled one is superseded by what Pi ran next. A directive's next-turn
-  preparation also waits for every open episode's terminal before its
-  authority check; the run's abort, disposal, or the 5 s reconcile bound
-  (which disposes) ends that wait with a refusal. Which automatic compactions
-  directive proof walks past is in [SUPERVISION.md](./SUPERVISION.md).
+  ahead of the next turn or the continued reply. A directive's admission
+  publishes one still withheld once Pi's gate has cleared, and refuses the
+  directive while a terminal is still withheld or after its handle was
+  disposed. A start that arrives while an episode is open joins it, and the
+  joined episode publishes one terminal: success when any compaction in it
+  wrote its summary, otherwise a failure's own error; a cancelled cycle
+  publishes `compaction aborted` only when nothing else ended the episode. A
+  directive's next-turn preparation also waits for every open episode's
+  terminal before its authority check. A compaction still running (a joined
+  one included) holds that wait as it holds Pi, until the run's abort or
+  disposal; once Pi has emitted a terminal, the 5 s reconcile bound applies
+  and disposes. Each ends the wait with a refusal. Which automatic
+  compactions directive proof walks past is in
+  [SUPERVISION.md](./SUPERVISION.md).
 - **Claude Code:** usage is measured live from each turn's stream-json and
   never seeded from transcripts (#461).
   - `tokens` is `input_tokens + cache_creation_input_tokens +

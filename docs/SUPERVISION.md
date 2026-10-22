@@ -81,7 +81,8 @@ compaction.
 Pi compacts a long session on its own; each compaction appends a summary
 entry that runs no tool and sends no message. While a directive runs, the
 adapter publishes that compaction's terminal as soon as Pi's gate clears,
-admission publishes one still withheld before its fences run, and
+admission publishes one still withheld once the gate has cleared (and
+otherwise refuses the directive before Pi writes its receipt), and
 next-turn preparation waits for it before the authority check, so
 supervision never holds the directive's own compaction against it.
 Directive proof (admission, the tool fence before every effect, and the
@@ -103,7 +104,11 @@ of four places:
   it, and a reply continued from that compaction. The failed reply is
   history: tool calls in it never ran. A turn lost between that compaction
   and the continued reply reads as the failed reply's terminal (not ok) and
-  is never resumed: the run ended on that error and nothing ran after it.
+  is never resumed: the run ended on that error, and only Pi's compaction
+  ran after it. That holds when the failed reply has no tool calls; one
+  that holds calls makes the lost turn read UNKNOWN ('malformed native tool
+  identity') until #483's retry-history reading, which reads those calls as
+  never run, lands.
 
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the
