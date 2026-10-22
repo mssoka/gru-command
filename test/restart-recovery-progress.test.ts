@@ -873,6 +873,21 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('P46 refuses later bound controls whose ancestry does not descend from the original checkpoint', () => assertBoundControlTail('wrong-parent'));
   it('P46 refuses compaction controls even when a later request is independently bound', () => assertBoundControlTail('unsupported'));
   it('P46 refuses malformed model controls before an independently bound later request', () => assertBoundControlTail('malformed-model'));
+  it('P46 reads only an exact linked native compaction inside the active directive checkpoint', async () => {
+    for (const mode of ['linked', 'wrong-parent', 'unknown-first-kept', 'hook-authored'] as const) {
+      const f = await fixture(); f.seed();
+      const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
+      f.native.append(bashCall(`before-${mode}`)); f.native.append(bashResult(`before-${mode}`, false));
+      const parent = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
+      appendFileSync(f.file, `${JSON.stringify({ type: 'compaction', id: `compact-${mode}`, parentId: mode === 'wrong-parent' ? 'foreign-parent' : parent.id,
+        timestamp: new Date().toISOString(), summary: 'genuine linked automatic compaction summary', firstKeptEntryId: mode === 'unknown-first-kept' ? 'foreign-entry' : user.id,
+        tokensBefore: 90_000, ...(mode === 'hook-authored' ? { fromHook: true } : {}) })}\n`);
+      f.native.finish();
+      const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+      if (mode === 'linked') expect(proof).toMatchObject({ state: 'terminal', ok: true });
+      else expect(proof).toEqual({ state: 'unknown', reason: 'native branch/control/partial checkpoint' });
+    }
+  });
 
   it('keeps an exact completed checkpoint readable after a later distinct request is durably admitted on the same session', async () => {
     const f = await fixture(); f.seed(); f.native.finish();

@@ -4551,9 +4551,7 @@ it('automatic SDK compaction completes before the same admitted native authority
     expect(Object.values(continued.mismatchedBlockers).every((blockers) => blockers.some((blocker) => blocker.includes('open turn/control/tool')))).toBe(true);
 
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
-    expect(row, JSON.stringify({ rowState: row.state, finalSupervision: sample(), calls: f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>') ? 'compaction-summary' : call.prompt.slice(0, 100)),
-      relevantEvents: f.scene.ledger.listJobEvents(row.jobId, { limit: 100 }).filter((event) => event.kind.startsWith('silas.directive') || event.kind === 'job.delivered').map((event) => ({ kind: event.kind, payload: event.payload })),
-      checkpoint: inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity) })).toMatchObject({ state: 'settled', payloadHash: f.scene.identity.payloadHash, workRevision: f.scene.identity.workRevision,
+    expect(row).toMatchObject({ state: 'settled', payloadHash: f.scene.identity.payloadHash, workRevision: f.scene.identity.workRevision,
       contractSha256: f.scene.identity.contractSha256, authorityEpoch: f.scene.identity.authorityEpoch });
     expect(row.nativeBinding?.sessionId).toBe(currentOwner()?.producer.sessionId);
     expect(inspectDirectiveAdmission(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ identity: f.scene.identity, agentId: row.nativeTarget!.agentId });
