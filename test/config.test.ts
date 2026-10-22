@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   configPathFor,
+  DEFAULT_CLAUDE_BACKGROUND_WAIT_MS,
   ConfigError,
   expandTilde,
   instanceDirFromEnv,
@@ -659,13 +660,34 @@ thinking_level = "high"
     const home = tmpHome();
     writeConfig(home, '[runtimes.claude-code]\nmodel_refresh = false\n');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
-      /unknown key `model_refresh` in \[runtimes\.claude-code\] \(valid keys: model, thinking_level, mcp, roles\)/,
+      /unknown key `model_refresh` in \[runtimes\.claude-code\] \(valid keys: model, thinking_level, mcp, background_wait_ms, roles\)/,
     );
     const home2 = tmpHome();
     writeConfig(home2, '[runtimes.claude-code]\nmodel_refresh_timeout_ms = 2500\n');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
       /unknown key `model_refresh_timeout_ms` in \[runtimes\.claude-code\]/,
     );
+  });
+
+  it('[runtimes.claude-code] background_wait_ms: 15 minutes unless set, a positive timer-safe integer, and claude-code only', () => {
+    const home = tmpHome();
+    const defaults = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(defaults.runtimes.policies['claude-code']?.backgroundWaitMs).toBeUndefined();
+    expect(DEFAULT_CLAUDE_BACKGROUND_WAIT_MS).toBe(900_000);
+    writeConfig(home, '[runtimes.claude-code]\nbackground_wait_ms = 60000\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').runtimes.policies['claude-code']).toMatchObject({ backgroundWaitMs: 60_000 });
+    for (const [value, message] of [
+      ['0', /runtimes\.claude-code\.background_wait_ms must be a positive integer, got: 0/],
+      ['"15m"', /runtimes\.claude-code\.background_wait_ms must be a positive integer/],
+      ['2147483648', /runtimes\.claude-code\.background_wait_ms must be at most 2147483647 \(about 24\.8 days\), got: 2147483648/],
+    ] as const) {
+      const bad = tmpHome();
+      writeConfig(bad, `[runtimes.claude-code]\nbackground_wait_ms = ${value}\n`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: bad }, '/home/tester'), value).toThrow(message);
+    }
+    const pi = tmpHome();
+    writeConfig(pi, '[runtimes.pi]\nbackground_wait_ms = 60000\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: pi }, '/home/tester')).toThrow(/unknown key `background_wait_ms` in \[runtimes\.pi\]/);
   });
 });
 

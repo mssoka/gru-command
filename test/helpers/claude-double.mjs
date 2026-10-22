@@ -28,6 +28,9 @@
  *   "think"            — thinking deltas + thinking block before text
  *   "tool:<name>"      — a tool_use/tool_result loop before the answer
  *   "tool-error:<name>" — the same loop whose tool_result is an error
+ *   "background:<ms>"  — a Bash call left running in the background, the
+ *                        reply, then the CLI's wait on that task: a follow-up
+ *                        turn after <ms>, or exit 143 on SIGTERM
  *
  * With --replay-user-messages (a directive turn, #424) the double echoes the
  * prompt after init (`isReplay: true`, a uuid) — unless its text holds markup
@@ -47,6 +50,12 @@
  *   CLAUDE_DOUBLE_MCP_SERVER_ERRORS=<json> init frame's mcp_server_errors
  *   CLAUDE_DOUBLE_MCP_SERVERS=<json> init frame's mcp_servers
  *   CLAUDE_DOUBLE_IGNORE_TERM=1 ignore SIGTERM (SIGKILL-path tests)
+ *   CLAUDE_DOUBLE_BACKGROUND_DESCRIPTION=<text> the background task's description
+ *   CLAUDE_DOUBLE_BACKGROUND_STOPPED=<file> append that description when SIGTERM stops it
+ *   CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS=<ms> the follow-up turn works this long before answering
+ *   CLAUDE_DOUBLE_BACKGROUND_ERROR=1 that reply is an in-band error result
+ *   CLAUDE_DOUBLE_BACKGROUND_UNLISTED=1 never list the task (no background_tasks_changed frames)
+ *   CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY=1 exit 2 right after that reply, the task still listed
  *   CLAUDE_DOUBLE_PERMISSION_REPEAT=1 ask the host twice for one tool use
  *   CLAUDE_DOUBLE_TOOL_AFTER_ERROR=1 "tool-error:" goes on to a second tool
  *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
@@ -446,6 +455,41 @@ async function writeChunked(obj) {
   }
 }
 
+/** A Bash call left running in the background, then the reply. Like Claude
+ * Code 2.1.307 the double then waits on that task: after `ms` it answers its
+ * completion in a follow-up turn of its own; a SIGTERM first stops it and
+ * exits 143 (CLAUDE_DOUBLE_BACKGROUND_STOPPED=<file> records that). */
+async function emitBackgroundTurn(ms) {
+  const description = process.env['CLAUDE_DOUBLE_BACKGROUND_DESCRIPTION'] ?? 'npm run dev';
+  const task = { task_id: 'bdouble1', run_id: 'run-double', task_type: 'local_bash', description };
+  const tasksChanged = (tasks) => {
+    if (process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] !== '1') out({ type: 'system', subtype: 'background_tasks_changed', tasks, session_id: sessionId, uuid: randomUUID() });
+  };
+  out(assistantFrame([{ type: 'tool_use', id: 'toolu_background', name: 'Bash', input: { command: description, run_in_background: true } }]));
+  tasksChanged([task]);
+  out({ type: 'user', session_id: sessionId, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_background',
+    content: `Command running in background with ID: ${task.task_id}.` }] } });
+  if (process.env['CLAUDE_DOUBLE_IGNORE_TERM'] !== '1') {
+    process.on('SIGTERM', () => {
+      const marker = process.env['CLAUDE_DOUBLE_BACKGROUND_STOPPED'];
+      if (marker) appendFileSync(marker, `${description}\n`, 'utf8');
+      out({ type: 'system', subtype: 'task_updated', task_id: task.task_id, patch: { status: 'killed' }, session_id: sessionId });
+      tasksChanged([]);
+      process.exit(143);
+    });
+  }
+  await emitTextTurn('started it');
+  out(resultFrame('started it', process.env['CLAUDE_DOUBLE_BACKGROUND_ERROR'] === '1'));
+  if (process.env['CLAUDE_DOUBLE_BACKGROUND_DIE_AFTER_REPLY'] === '1') process.exit(2);
+  await delay(ms);
+  out({ type: 'system', subtype: 'task_notification', task_id: task.task_id, status: 'completed', session_id: sessionId });
+  tasksChanged([]);
+  out(initFrame());
+  await delay(Number(process.env['CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS'] ?? '0'));
+  await emitTextTurn('background done');
+  out({ ...resultFrame('background done', false), origin: { kind: 'task-notification' } });
+}
+
 async function run() {
   const { prompt, images } = promptFromStdin();
   // A test-only fail-closed stand-in for Claude's review settings resolution.
@@ -805,6 +849,11 @@ async function run() {
     return;
   }
 
+  const background = /background:(\d+)/u.exec(prompt);
+  if (background !== null) {
+    await emitBackgroundTurn(Number(background[1]));
+    return;
+  }
   if (prompt.includes('think')) {
     await emitThinkingTurn('thought about it');
     out(resultFrame('thought about it', false));

@@ -348,6 +348,13 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(withSupervision({ state: 'flying', restarts: 0, breakerOpen: false }))).toBe(false);
     expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: -1, breakerOpen: false }))).toBe(false);
     expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: Number.NaN, breakerOpen: false }))).toBe(false);
+    // The background work a replied Claude turn waits on (#471 follow-up):
+    // absent on older servers, otherwise a list of strings the board joins.
+    const watching = { state: 'watching', restarts: 0, breakerOpen: false };
+    expect(isValidSnapshot(withSupervision({ ...watching, backgroundTasks: ['npm run dev'] }))).toBe(true);
+    expect(isValidSnapshot(withSupervision({ ...watching, backgroundTasks: [] }))).toBe(true);
+    expect(isValidSnapshot(withSupervision({ ...watching, backgroundTasks: 'npm run dev' }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ ...watching, backgroundTasks: [7] }))).toBe(false);
   });
 
   it('#171 agent classification fields validate strictly at the parse boundary (unknown class/status/lastEventAt reject)', () => {

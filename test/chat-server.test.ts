@@ -81,6 +81,9 @@ class StubGruHandle implements AgentHandle {
   toolName: string | null = null;
   /** Hold the NEXT prompt's turn open until this resolves. */
   nextHold: Promise<void> | null = null;
+  /** Times a held message or wake asked the live turn to end its background wait. */
+  endBackgroundWaitCalls = 0;
+  endBackgroundWait = async (): Promise<void> => { this.endBackgroundWaitCalls += 1; };
   /** The NEXT prompt rejects with this error before any event. */
   nextPromptError: string | null = null;
   /** The NEXT prompt emits a fatal runtime error mid-turn (no turn end). */
@@ -3586,6 +3589,74 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
       expect(outcomes).toEqual([{ ok: true }]);
     } finally {
       await harness.close();
+    }
+  });
+
+  it('a wake held behind a live turn ends that turn\'s wait on background work, then runs (#471 follow-up)', async () => {
+    const injection = sampleInjection();
+    const harness = await makeHarness({ awareness: { prepare: () => injection, commit: () => {} } });
+    try {
+      const client = await authedClient(harness.port, TOKEN, undefined, true);
+      let release!: () => void;
+      harness.handle.nextHold = new Promise<void>((resolve) => { release = resolve; });
+      client.send('start the dev server', 'background-wait-1');
+      await pollUntil(() => harness.handle.calls.length === 1, 'held chat turn');
+      harness.chat.wakeAwareness();
+      expect(harness.handle.endBackgroundWaitCalls).toBe(1);
+      release();
+      await pollUntil(() => harness.handle.calls.length === 2, 'the wake turn after it');
+      expect(harness.handle.calls[1]?.text).toContain(AWARENESS_WAKE_INSTRUCTION);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a wake held behind a running wake turn ends that turn\'s wait on background work (#471 follow-up)', async () => {
+    const injection = sampleInjection();
+    const harness = await makeHarness({ awareness: { prepare: () => injection, commit: () => {} } });
+    try {
+      let release!: () => void;
+      harness.handle.nextHold = new Promise<void>((resolve) => { release = resolve; });
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 1, 'held wake turn');
+      harness.chat.wakeAwareness();
+      expect(harness.handle.endBackgroundWaitCalls).toBe(1);
+      release();
+      await pollUntil(() => harness.handle.calls.length === 2, 'the trailing wake turn');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a wake held while Gru is still being started ends the wait of the turn that then starts (#471 follow-up)', async () => {
+    const injection = sampleInjection();
+    let releaseSpawn!: () => void;
+    const spawnHold = new Promise<void>((resolve) => { releaseSpawn = resolve; });
+    let spawning = false;
+    const sessionDir = mkdtempSync(join(tmpdir(), 'gru-command-chat-wake-spawn-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'held-spawn-gru.jsonl');
+    writeFileSync(sessionFile, '');
+    const gru = new StubGruHandle(sessionFile, 'held-spawn-gru');
+    const harness = await makeHarness({
+      awareness: { prepare: () => injection, commit: () => {} },
+      spawnGru: async () => { spawning = true; await spawnHold; return gru; },
+    });
+    try {
+      const client = await authedClient(harness.port, TOKEN, undefined, true);
+      client.send('start the dev server', 'background-wait-spawn');
+      await pollUntil(() => spawning, 'Gru spawn held');
+      harness.chat.wakeAwareness();
+      expect(gru.endBackgroundWaitCalls).toBe(0);
+      releaseSpawn();
+      await pollUntil(() => gru.calls.length >= 1, 'the chat turn');
+      expect(gru.endBackgroundWaitCalls).toBe(1);
+      await client.close();
+    } finally {
+      releaseSpawn();
+      await harness.close();
+      await gru.dispose();
     }
   });
 

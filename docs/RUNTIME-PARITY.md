@@ -90,8 +90,8 @@ that proves it on each adapter.
 
 Every top-level block in the two adapter test files is placed here. A block maps
 to the contract it proves (`umbrella` for the long round-trip block, which holds
-tests for many contracts), or is `adapter-internal`: a pure parser or a pin with
-no counterpart on the other runtime.
+tests for many contracts), or is `adapter-internal`: a pure parser, a pin, or a
+runtime's own behaviour with no counterpart on the other runtime.
 
 <!-- adapter-blocks:start -->
 | File | Top-level block | Contract or kind |
@@ -117,6 +117,7 @@ no counterpart on the other runtime.
 | `test/claude-adapter.test.ts` | isolated-review confinement guards | isolated-review-tools |
 | `test/claude-adapter.test.ts` | ReviewMcpBridge fail-closed guards | review-native-tools |
 | `test/claude-adapter.test.ts` | scheduled verification ordinary Claude Bash | scheduled-verification |
+| `test/claude-adapter.test.ts` | a replied Claude turn waiting on background work (#471 follow-up) | adapter-internal |
 <!-- adapter-blocks:end -->
 
 ## Above the adapter layer
@@ -213,6 +214,38 @@ writes each runtime's own record shape during a resumed turn.
   The reason: the CLI waits for a running task after the turn's result, then
   answers its completion in an unprompted turn of its own, after the directive
   is over and with no host left to decide its tools.
+- **Background work after a reply (#471 follow-up).** pi's bash tool has
+  no background tasks. In an ordinary Claude Code turn an agent (a minion,
+  or Gru, Silas or Bob on Claude Code) may leave work running in the
+  background: a dev server, or a test run the CLI moved there at its
+  timeout. Each turn is its own CLI process, and after the reply that CLI
+  waits on such work, then answers its completion in a follow-up turn of
+  its own.
+  - GC allows that for `[runtimes.claude-code] background_wait_ms` (default
+    15 min) of idle time after each reply, the CLI's own follow-up replies
+    included. A follow-up turn pauses the clock, except in a
+    worker-verification lane, where the host can no longer answer that
+    turn's tool requests, and after the turn's own reply (its first result)
+    was an in-band error.
+  - A waiting message (chat, a Gru wake, a dispatch or a Silas directive
+    once it is admissible), or an own reply that was an in-band error, ends
+    the wait at once; a turn still working when the message arrives skips the
+    wait at its reply. Work the CLI does not list gets 10 s to end by
+    itself first, and further messages never push that stop back. The
+    turn's verdict is its own first result, as before: a later follow-up
+    success never turns an error reply into an answer.
+  - Then GC stops the CLI, which stops the work. A CLI that ignores SIGTERM
+    is killed 10 s later, and its work may survive; GC logs that.
+  - The agent's next ordinary turn begins with a note naming the work it
+    stopped and why, and how to keep a result: run it again and wait for it
+    before replying. A directive's text and a prompt that starts with "/"
+    never carry the note; it waits for the next ordinary prompt. It lives
+    only as long as the session's handle.
+  - While it waits, the turn stays open: the board shows "waiting on: …",
+    the watchdog counts the wait as live work, and a restart neither sends
+    the answered prompt again nor reports a lost turn.
+
+  A directive turn starts no background work.
 - **A review owner from another process (#464).** A replacement Perkins round
   starts only once every earlier round's review owner is proven ceased. On
   both runtimes the proof is either this process's adapter evidence or the
