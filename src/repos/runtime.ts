@@ -10,8 +10,9 @@ import {
 
 export interface ManagedRepoOverviewRuntimeOptions {
   readonly api: RepoOverviewApiPort;
-  /** The GitLab REST port for `gitlab` rows (production always wires it). */
-  readonly gitlabApi?: GitLabRepoOverviewApiPort;
+  /** The GitLab REST port for `gitlab` rows; required, so production can
+   * never construct the tracker without it. */
+  readonly gitlabApi: GitLabRepoOverviewApiPort;
   readonly log?: (level: LogLevel, message: string, fields?: Record<string, unknown>) => void;
   readonly resolveRemote?: RemoteResolver;
   /** The default-branch CI alert (#446) fed by each committed observation. */
@@ -32,7 +33,7 @@ export function createManagedRepoOverviewTracker(
     workspaceRoot: config.workspaceRoot,
     managedRepos: config.managedRepos,
     api: options.api,
-    ...(options.gitlabApi !== undefined ? { gitlabApi: options.gitlabApi } : {}),
+    gitlabApi: options.gitlabApi,
     ...(options.log !== undefined ? { log: options.log } : {}),
     ...(options.resolveRemote !== undefined ? { resolveRemote: options.resolveRemote } : {}),
     ...(options.onDefaultBranchRuns !== undefined ? { onDefaultBranchRuns: options.onDefaultBranchRuns } : {}),

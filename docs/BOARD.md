@@ -256,9 +256,12 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (falling back to `GL_TOKEN`; the overview needs the `read_api` or `api`
   scope, and Perkins GitLab delivery needs `api`) from the service's
   environment — `install.sh` writes no token into the unit, so set it
-  there with `launchctl setenv GITLAB_TOKEN <token>` on macOS or
-  `systemctl --user set-environment GITLAB_TOKEN=<token>` on Linux, then
-  run `gru restart`; neither survives a reboot, so set it again after one.
+  there without echoing it: `read -rs GITLAB_TOKEN`, then `launchctl
+  setenv GITLAB_TOKEN "$GITLAB_TOKEN"` (macOS) or `systemctl --user
+  set-environment GITLAB_TOKEN="$GITLAB_TOKEN"` (Linux), then `gru
+  restart`; neither survives a reboot. Check it without printing it:
+  `[ -n "$(launchctl getenv GITLAB_TOKEN)" ] && echo set` or `systemctl
+  --user show-environment | grep -q '^GITLAB_TOKEN=' && echo set`.
   It is sent only as the `PRIVATE-TOKEN` header over https to that host
   (redirects refused, 15 s per request, never logged or rendered): the
   project's default branch, exact open merge-request and open-issue counts

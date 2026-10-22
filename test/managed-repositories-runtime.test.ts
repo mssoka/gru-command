@@ -81,6 +81,22 @@ class ProviderSpy implements RepoOverviewApiPort {
   }
 }
 
+/** The required GitLab port for GitHub-only registries: never called. */
+const unusedGitLab: GitLabRepoOverviewApiPort = {
+  fetchProject: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+  countOpenMergeRequests: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+  countOpenIssues: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+  latestPipelines: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+};
+
 function configFor(instance: string, workspace: string, selected: readonly string[]) {
   const answers = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: selected }));
   const text = generateConfigToml({ answers, instanceDir: instance });
@@ -109,6 +125,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const defaultBranchPages: string[] = [];
     const tracker = createManagedRepoOverviewTracker(config, {
       api,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       now: () => Date.parse('2026-10-10T12:00:00.000Z'),
       sleep: async () => {},
@@ -142,6 +159,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const changedPaths: string[] = [];
     const changedTracker = createManagedRepoOverviewTracker(changed, {
       api: changedApi,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       sleep: async () => {},
       resolveRemote: async (path) => {
@@ -229,6 +247,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const oldPaths: string[] = [];
     const oldTracker = createManagedRepoOverviewTracker(oldConfig, {
       api: oldApi,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       sleep: async () => {},
       resolveRemote: async (path) => {
@@ -248,6 +267,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const emptyPaths: string[] = [];
     const emptyTracker = createManagedRepoOverviewTracker(emptyConfig, {
       api: emptyApi,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       sleep: async () => {},
       resolveRemote: async (path) => {
@@ -294,6 +314,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const resolvedPaths: string[] = [];
     const tracker = createManagedRepoOverviewTracker(config, {
       api,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       now: () => Date.parse('2026-10-10T12:00:00.000Z'),
       sleep: async () => {},

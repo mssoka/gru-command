@@ -71,31 +71,50 @@ function flatText(value: unknown): string | null {
   return squashed === '' ? null : squashed.slice(0, GITLAB_MESSAGE_MAX_CHARS);
 }
 
+/** What to do about a token without the scope the overview reads with. */
+const MISSING_SCOPE_REMEDY =
+  'GitLab token lacks the read_api or api scope — replace GITLAB_TOKEN (GL_TOKEN is read only when GITLAB_TOKEN ' +
+  'is unset) with a read_api or api token, then gru restart';
+
+/** GitLab's `scope` field is echoed only when it reads as a short list of
+ * scope names, never as arbitrary server text inside Gru's advice. */
+const SCOPE_NAMES = /^[a-z_]+( [a-z_]+)*$/u;
+
 /** GitLab's short error text — `{"message": "404 Project Not Found"}`, or
- * an OAuth-style `{"error": "insufficient_scope", "error_description": …}`
- * — and that OAuth `error` code; null where the body carries none. A
- * missing scope is reworded into what to do, naming the scopes GitLab
- * reports, since its own description never says which one is missing. */
-function gitLabErrorOf(text: string): { readonly detail: string | null; readonly oauthError: string | null } {
+ * an OAuth-style `{"error": "invalid_token", "error_description": …}` —
+ * and that OAuth `error` code; null where the body carries none. A
+ * missing scope (`insufficient_scope`) instead yields a remedy, since
+ * GitLab's own description never says what to do. */
+function gitLabErrorOf(text: string): {
+  readonly detail: string | null;
+  readonly oauthError: string | null;
+  readonly remedy: string | null;
+} {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { detail: null, oauthError: null };
+    return { detail: null, oauthError: null, remedy: null };
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { detail: null, oauthError: null };
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { detail: null, oauthError: null, remedy: null };
+  }
   const body = parsed as Record<string, unknown>;
   const oauthError = flatText(body['error']);
   if (oauthError === 'insufficient_scope') {
-    const accepted = flatText(body['scope']);
+    const scope = body['scope'];
+    const accepted = typeof scope === 'string' && scope.length <= 40 && SCOPE_NAMES.test(scope) ? scope : null;
     return {
-      detail:
-        `the GitLab token lacks the read_api scope${accepted !== null ? `; GitLab accepts ${accepted}` : ''}` +
-        ' — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api',
+      detail: null,
       oauthError,
+      remedy: `${MISSING_SCOPE_REMEDY}${accepted !== null ? `; GitLab accepts ${accepted}` : ''}`,
     };
   }
-  return { detail: flatText(body['message']) ?? flatText(body['error_description']) ?? oauthError, oauthError };
+  return {
+    detail: flatText(body['message']) ?? flatText(body['error_description']) ?? oauthError,
+    oauthError,
+    remedy: null,
+  };
 }
 
 /** The project API URL, or null when the host cannot form a plain https
@@ -122,8 +141,9 @@ function messageOf(error: unknown): string {
 }
 
 /** The text of a fetch failure's `cause`: its message, else (a
- * multi-address connect's `AggregateError`) the nested errors' messages;
- * a non-Error cause is stringified without `[object Object]`. */
+ * multi-address connect's `AggregateError`) the nested errors' messages.
+ * A primitive cause is stringified; any other object is omitted, never
+ * dumped onto the board (it could carry other credentials). */
 function causeTextOf(cause: unknown): string {
   if (cause instanceof Error) {
     if (cause.message.trim() !== '' || !(cause instanceof AggregateError)) return cause.message;
@@ -132,12 +152,7 @@ function causeTextOf(cause: unknown): string {
       .filter((message) => message.trim() !== '')
       .join('; ');
   }
-  if (typeof cause === 'string' || typeof cause === 'number' || typeof cause === 'boolean') return String(cause);
-  try {
-    return JSON.stringify(cause) ?? '';
-  } catch {
-    return '';
-  }
+  return typeof cause === 'object' || typeof cause === 'function' ? '' : String(cause);
 }
 
 /** The error `code` of a cause, or of its first nested error. */
@@ -155,7 +170,7 @@ function causeCodeOf(cause: unknown): string | null {
 function transportDetailOf(error: unknown, token: string): string {
   const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
   if (cause === undefined || cause === null) return messageOf(error);
-  const code = causeCodeOf(cause);
+  const code = flatText(causeCodeOf(cause))?.slice(0, 40) ?? null;
   const text = flatText(redact(causeTextOf(cause), token));
   return `${messageOf(error)}${code !== null ? ` [${code}]` : ''}${text !== null ? `: ${text}` : ''}`;
 }
@@ -241,7 +256,8 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     if (token === undefined || token.trim() === '') {
       throw new RepoProviderError(
         'auth',
-        `no GitLab token configured for ${host} — set GITLAB_TOKEN (or GL_TOKEN) in the service environment to a token with the read_api (or api) scope that can read ${repoFullName(repo)}`,
+        `no GitLab token configured for ${host} — set GITLAB_TOKEN in the service environment to a read_api or api ` +
+          'token (GL_TOKEN is read only when GITLAB_TOKEN is unset)',
       );
     }
     const url = projectApiUrl(repo, suffix);
@@ -262,9 +278,13 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     }
     if (!response.ok) {
       // Redact before GitLab's message is cut, so no token prefix survives.
-      const { detail, oauthError } = gitLabErrorOf(redact(text, token));
+      const { detail, oauthError, remedy } = gitLabErrorOf(redact(text, token));
+      const kind = kindOfStatus(response.status, oauthError);
+      // A remedy leads the message, so the row bound (and the prefix an
+      // aborted row adds) can never cut it off behind a long project path.
+      if (remedy !== null) throw new RepoProviderError(kind, `${remedy} (${label}: HTTP ${response.status})`);
       throw new RepoProviderError(
-        kindOfStatus(response.status, oauthError),
+        kind,
         redact(`${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`, token),
       );
     }

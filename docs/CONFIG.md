@@ -91,14 +91,24 @@ The overview reads GitHub origins through the `gh` login and GitLab origins
 delivery uses, sent only to those hosts. The overview needs the `read_api` or
 `api` scope; Perkins GitLab delivery posts notes and needs `api`, which covers
 the overview's reads too. `install.sh` writes no token into the service unit, so
-set `GITLAB_TOKEN` in the service's own environment — `launchctl setenv
-GITLAB_TOKEN <token>` on macOS or `systemctl --user set-environment
-GITLAB_TOKEN=<token>` on Linux — then run `gru restart`. Neither survives a
-reboot: set it again after one. A GitLab row without a token reads unavailable
-and names the missing variable, and a token without `read_api` or `api` fails
-that host's rows as an auth failure; GitHub rows are unaffected. Origins on any
-other host read `Not linked (unsupported code host)`. See [BOARD.md](./BOARD.md)
-for what each row shows.
+set `GITLAB_TOKEN` in the service's own environment, reading it without echo so
+it stays out of shell history, then restart:
+
+```sh
+read -rs GITLAB_TOKEN                                          # paste; nothing is shown
+launchctl setenv GITLAB_TOKEN "$GITLAB_TOKEN"                  # macOS
+systemctl --user set-environment GITLAB_TOKEN="$GITLAB_TOKEN"  # Linux
+gru restart
+# check what the service sees, without printing the token:
+[ -n "$(launchctl getenv GITLAB_TOKEN)" ] && echo set                     # macOS
+systemctl --user show-environment | grep -q '^GITLAB_TOKEN=' && echo set  # Linux
+```
+
+Neither setting survives a reboot: set it again after one. A GitLab row without
+a token reads unavailable and names the missing variable, and a token without
+`read_api` or `api` fails that host's rows as an auth failure; GitHub rows are
+unaffected. Origins on any other host read `Not linked (unsupported code
+host)`. See [BOARD.md](./BOARD.md) for what each row shows.
 
 ## Load & validation behavior
 

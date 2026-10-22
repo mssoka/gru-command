@@ -523,8 +523,14 @@ describe('GitLab overview REST adapter', () => {
         cause: Object.assign(new Error('getaddrinfo ENOTFOUND gitlab.example.com'), { code: 'ENOTFOUND' }),
       }),
       new TypeError('fetch failed', { cause: new Error(`redirect refused for ${TOKEN}`) }),
-      // A non-Error cause never renders as `[object Object]`.
-      new TypeError('fetch failed', { cause: { reason: 'socket hang up' } }),
+      // A non-Error object cause is omitted (never dumped: it could carry
+      // credentials); a primitive cause is stringified; a code is
+      // flattened and bounded.
+      new TypeError('fetch failed', { cause: { reason: 'socket hang up', authorization: 'Bearer other-secret' } }),
+      new TypeError('fetch failed', { cause: 42n }),
+      new TypeError('fetch failed', {
+        cause: Object.assign(new Error('weird'), { code: `E_ODD\n  ${'X'.repeat(60)}` }),
+      }),
       // Whitespace is flattened and the cause text bounded; the token
       // straddles the 160-char cut and is redacted before it, so no
       // prefix of it survives.
@@ -546,8 +552,12 @@ describe('GitLab overview REST adapter', () => {
       'project group/sub/project on gitlab.example.com: request failed (fetch failed: redirect refused for [redacted])',
     );
     const plain = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-    expect(plain.message).toBe(
-      'project group/sub/project on gitlab.example.com: request failed (fetch failed: {"reason":"socket hang up"})',
+    expect(plain.message).toBe('project group/sub/project on gitlab.example.com: request failed (fetch failed)');
+    const primitive = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    expect(primitive.message).toBe('project group/sub/project on gitlab.example.com: request failed (fetch failed: 42)');
+    const odd = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    expect(odd.message).toBe(
+      `project group/sub/project on gitlab.example.com: request failed (fetch failed [${`E_ODD ${'X'.repeat(60)}`.slice(0, 40)}]: weird)`,
     );
     const long = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
     const text = /request failed \(fetch failed: (.*)\)$/u.exec(long.message)?.[1] ?? '';
@@ -589,50 +599,59 @@ describe('GitLab overview REST adapter', () => {
   });
 
   it('reads OAuth-style error bodies and aborts the host on a 403 insufficient_scope', async () => {
+    const remedy =
+      'GitLab token lacks the read_api or api scope — replace GITLAB_TOKEN (GL_TOKEN is read only when ' +
+      'GITLAB_TOKEN is unset) with a read_api or api token, then gru restart';
+    const label = 'project group/sub/project on gitlab.example.com';
     const insufficient = {
       error: 'insufficient_scope',
       error_description: 'The request requires higher privileges than provided by the access token.',
       scope: 'api read_api',
     };
-    const missingScope =
-      'HTTP 403 (the GitLab token lacks the read_api scope; GitLab accepts api read_api — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api)';
     const cases: ReadonlyArray<readonly [Response, string, string]> = [
-      // A missing scope says what to do, never GitLab's generic description.
-      [json(insufficient, { status: 403 }), 'auth', missingScope],
+      // A missing scope leads with what to do, never GitLab's generic text.
+      [json(insufficient, { status: 403 }), 'auth', `${remedy}; GitLab accepts api read_api (${label}: HTTP 403)`],
       [
         json({ error: 'insufficient_scope', error_description: insufficient.error_description }, { status: 403 }),
         'auth',
-        'HTTP 403 (the GitLab token lacks the read_api scope — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api)',
+        `${remedy} (${label}: HTTP 403)`,
       ],
+      // A `scope` that is not a short list of scope names is never echoed.
+      [json({ ...insufficient, scope: `api ${TOKEN}` }, { status: 403 }), 'auth', `${remedy} (${label}: HTTP 403)`],
+      [json({ ...insufficient, scope: 'api, read_api' }, { status: 403 }), 'auth', `${remedy} (${label}: HTTP 403)`],
       [
-        json({ ...insufficient, scope: `api ${TOKEN} ${'s'.repeat(400)}` }, { status: 403 }),
+        json({ ...insufficient, scope: 'api read_api read_repository write_repository' }, { status: 403 }),
         'auth',
-        `HTTP 403 (the GitLab token lacks the read_api scope; GitLab accepts ${`api [redacted] ${'s'.repeat(400)}`.slice(0, 160)} — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api)`,
+        `${remedy} (${label}: HTTP 403)`,
       ],
-      [json({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 }), 'auth', 'HTTP 401 (Token was revoked.)'],
-      [json({ error: 'forbidden' }, { status: 403 }), 'permission', 'HTTP 403 (forbidden)'],
-      [json({ message: '403 Forbidden', error: 'ignored' }, { status: 403 }), 'permission', 'HTTP 403 (403 Forbidden)'],
+      [json({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 }), 'auth', `${label}: HTTP 401 (Token was revoked.)`],
+      [json({ error: 'forbidden' }, { status: 403 }), 'permission', `${label}: HTTP 403 (forbidden)`],
+      [json({ message: '403 Forbidden', error: 'ignored' }, { status: 403 }), 'permission', `${label}: HTTP 403 (403 Forbidden)`],
     ];
-    for (const [response, kind, detail] of cases) {
+    for (const [response, kind, message] of cases) {
       const api = new GitLabRepoOverviewApi({ fetchImpl: async () => response, tokenResolver: () => TOKEN });
       const error = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
-      expect(error.kind, detail).toBe(kind);
-      expect(error.message).toBe(`project group/sub/project on gitlab.example.com: ${detail}`);
+      expect(error.kind, message).toBe(kind);
+      expect(error.message).toBe(message);
     }
     // A token without read_api fails every project alike: the first row
-    // aborts the host, and the rest spend no request.
+    // aborts the host, and the rest spend no request. The remedy survives
+    // the row bound on the aborted row even behind a long nested path.
+    const owner = 'platform-engineering/continuous-delivery-tooling/internal-services';
     const { fetchImpl, calls } = fakeFetch(() => json(insufficient, { status: 403 }));
     const h = harness({
       refs: new Map([
-        ['gl-a', gitlabRef('gl-a')],
-        ['gl-b', gitlabRef('gl-b')],
+        ['gl-a', gitlabRef('gl-a-release-orchestration-service', 'gitlab.example.com', owner)],
+        ['gl-b', gitlabRef('gl-b-release-orchestration-service', 'gitlab.example.com', owner)],
       ]),
       gitlabApi: new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN }),
     });
     const view = await h.tracker.refresh();
     expect(calls).toHaveLength(1);
-    expect(row(view, 'gl-a').error).toContain('HTTP 403 (the GitLab token lacks the read_api scope; GitLab accepts api read_api');
-    expect(row(view, 'gl-b').error).toContain('refresh aborted before this repository was checked: auth:');
+    expect(row(view, 'gl-a').error?.startsWith(`${remedy}; GitLab accepts api read_api (project ${owner}/`)).toBe(true);
+    const aborted = row(view, 'gl-b').error ?? '';
+    expect(aborted).toHaveLength(300);
+    expect(aborted.startsWith(`refresh aborted before this repository was checked: auth: ${remedy}; GitLab accepts api read_api`)).toBe(true);
   });
 
   it('sends nothing without a token, to a host isGitLabRemote rejects, or to a non-default port', async () => {
@@ -643,7 +662,10 @@ describe('GitLab overview REST adapter', () => {
       expect(error).toBeInstanceOf(RepoProviderError);
       expect(error.kind).toBe('auth');
       expect(error.message).toMatch(/^no GitLab token configured for gitlab\.example\.com — set GITLAB_TOKEN/u);
-      expect(error.message).toContain('a token with the read_api (or api) scope');
+      expect(error.message).toBe(
+        'no GitLab token configured for gitlab.example.com — set GITLAB_TOKEN in the service environment to a ' +
+          'read_api or api token (GL_TOKEN is read only when GITLAB_TOKEN is unset)',
+      );
     }
     const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
     for (const host of ['evil.example', 'evil.gitlab.attacker.test', 'gitlab.example.com:8443', 'gitlab.example.com@evil']) {
