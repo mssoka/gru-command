@@ -5207,7 +5207,9 @@ it('a real SDK tool call cut off by the output token limit is answered by the SD
   } finally { await f.cleanup(); }
 });
 
-it('a real SDK stop row holding a tool call (openai-completions, mistral) runs it once, and the directive settles (#483)', async () => {
+// Providers that report `stop` with tool calls (e.g. OpenAI-compatible chat
+// completions): the stub drives the same SDK agent loop, not a real transport.
+it('a real SDK stop row holding a tool call (providers that report stop with tool calls) runs it once, and the directive settles (#483)', async () => {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const effects = mkdtempSync(join(tmpdir(), 'gru-stop-call-effect-')); cleanupDirs.push(effects);
   const effect = join(effects, 'ran.log');
@@ -5226,6 +5228,23 @@ it('a real SDK stop row holding a tool call (openai-completions, mistral) runs i
     expect(producerJournal(file).map((receipt) => receipt['state'])).not.toContain('guard-refused');
     expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
   } finally { await f.cleanup(); }
+});
+
+it('an ordinary turn whose last row is a stop row holding a tool call is no successful completion, like a toolUse row (#483)', async () => {
+  for (const stopReason of ['stop', 'toolUse'] as const) {
+    let finished = 0;
+    const fx = await fixture([{ deltas: [], toolCall: { id: 'finish-call', name: 'finish_now', args: {} }, stopReason }]);
+    // Every call in the batch terminates, so the SDK ends the run on that row.
+    const nativeTools = [{ name: 'finish_now', description: 'End the run now.', inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      async execute() { finished += 1; return { text: 'finished', terminate: true }; } }];
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, nativeTools });
+    try {
+      const verdict = await handle.promptWithVerdict!('finish through the tool');
+      expect(finished, stopReason).toBe(1);
+      expect(verdict, stopReason).toEqual({ ok: false,
+        error: `turn settled without a successful completion (stopReason: ${stopReason === 'stop' ? 'stop holding tool calls' : 'toolUse'})` });
+    } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+  }
 });
 
 it('a real SDK row aborted while holding a tool call never runs it: the directive is a failed terminal (#483)', async () => {

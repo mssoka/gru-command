@@ -481,7 +481,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
         for (const block of message.content as Record<string, unknown>[]) {
           // Ending the turn, an error or aborted row owes no results.
           if (block.type !== 'toolCall' || calls === 'never-run') continue;
-          if (calls === null || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
+          if (calls === null) return unknown('native assistant stop reason holding tool calls is unsupported');
+          if (typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
           pending.set(block.id, block.name);
           if (calls === 'not-executed') notExecuted.add(block.id);
         }
@@ -496,8 +497,10 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
       pending.delete(message.toolCallId);
       if (!Array.isArray(message.content) || typeof message.toolName !== 'string') return unknown('malformed native tool result content/name');
-      // Nothing ran for a "not executed" result: there is no effect to judge.
-      if (!notExecuted.delete(message.toolCallId) && message.isError) unanswered = true;
+      // Nothing ran for the SDK's own "not executed" result (always isError):
+      // there is no effect to judge. A success result is an ordinary answer.
+      const notRun = notExecuted.delete(message.toolCallId) && message.isError === true;
+      if (message.isError && !notRun) unanswered = true;
     } else return unknown('another user/custom message owns this session');
     lastMessage = message;
   }
@@ -906,8 +909,9 @@ function nonBlank(value: unknown): value is string { return typeof value === 'st
  * an assistant row's tool calls: it runs none of an error or aborted row's
  * (owner ruling 2026-10-22, see validRetryErrorContent); it answers each of a
  * length row's with its own failed "not executed" result and goes on; it
- * runs a toolUse or stop row's (openai-completions and mistral end `stop`
- * while holding calls). Null for any other stop: never trusted. */
+ * runs a toolUse or stop row's (providers that report `stop` with tool calls,
+ * e.g. OpenAI-compatible chat completions). Null for any other stop, such as
+ * pi-ai's `pending` or `deferred`: unsupported, never trusted. */
 function rowCalls(stopReason: unknown): 'never-run' | 'not-executed' | 'executed' | null {
   if (stopReason === 'error' || stopReason === 'aborted') return 'never-run';
   if (stopReason === 'length') return 'not-executed';

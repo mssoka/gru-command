@@ -361,6 +361,37 @@ describe('Pi rows by what the SDK does with their tool calls (#483)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'resumable', checkpointId: 'not-executed' });
   });
 
+  it('a success result for a length row\'s call is an ordinary answer', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', truncated);
+    entry(file, 'answered', 'truncated', { ...notExecuted(), isError: false });
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'resumable', checkpointId: 'answered' });
+  });
+
+  it('a length row with only some "not executed" results written is incomplete', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', { ...truncated, content: [cutOff, { ...cutOff, id: 'second-cut-off-call' }] });
+    entry(file, 'not-executed', 'truncated', notExecuted());
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool effects/results are incomplete' });
+  });
+
+  it('a call re-issued under the id of a "not executed" one is ordinary work: its tool error needs a recovery judgment', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', truncated);
+    entry(file, 'not-executed', 'truncated', notExecuted());
+    entry(file, 'reissued', 'not-executed', { role: 'assistant', stopReason: 'toolUse', content: [cutOff] });
+    entry(file, 'reissued-result', 'reissued', { ...result, toolCallId: cutOff.id, isError: true });
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });
+  });
+
+  it('a row holding tool calls under an unsupported stop reason is refused by name, and at the fence', () => {
+    const { file } = admittedScene();
+    const deferred = { ...invocation, stopReason: 'deferred' };
+    entry(file, 'deferred', 'receipt', deferred);
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native assistant stop reason holding tool calls is unsupported' });
+    expect(() => flushDirectiveToolIntent(file, deferred, call, identity)).toThrow(new DirectiveCheckpointError(GENERIC));
+  });
+
   it('a length row\'s calls left unanswered before the next assistant are refused', () => {
     const { file } = admittedScene();
     entry(file, 'truncated', 'receipt', truncated);

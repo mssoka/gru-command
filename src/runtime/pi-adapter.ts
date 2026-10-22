@@ -1117,9 +1117,10 @@ export class PiAgentHandle implements AgentHandle {
   private directiveAdmissionError: unknown = null;
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
-   * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
-   * settle capture reads it before `drain()` starts a successor. */
-  private liveTurnStop: { stopReason: string | null; error: string | null } | null = null;
+   * positive completion proof (`stopReason: 'stop'` holding no tool calls).
+   * Reset per turn; the settle capture reads it before `drain()` starts a
+   * successor. */
+  private liveTurnStop: { stopReason: string | null; error: string | null; holdsCalls: boolean } | null = null;
   /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
   private readonly toolHeartbeat: ToolHeartbeat;
   private readonly queue: QueuedMessage[] = [];
@@ -1772,7 +1773,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveOwner = owner;
     this.livePromptText = text;
     this.livePromptImages = images;
-    this.liveTurnStop = { stopReason: null, error: null };
+    this.liveTurnStop = { stopReason: null, error: null, holdsCalls: false };
     this.liveDirective = directive;
     this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
@@ -1825,7 +1826,7 @@ export class PiAgentHandle implements AgentHandle {
           captured =
             this.state === 'error'
               ? { ok: false, error: this.stateError ?? terminal?.error ?? 'runtime settled the turn with an in-band error' }
-              : terminal?.stopReason === 'stop'
+              : terminal?.stopReason === 'stop' && !terminal.holdsCalls
                 ? { ok: true, error: null }
                 : {
                     ok: false,
@@ -1835,7 +1836,7 @@ export class PiAgentHandle implements AgentHandle {
                         ? this.disposed
                           ? 'session disposed before a terminal assistant message'
                           : 'no terminal assistant message'
-                        : `stopReason: ${terminal.stopReason}`) +
+                        : `stopReason: ${terminal.stopReason}${terminal.stopReason === 'stop' && terminal.holdsCalls ? ' holding tool calls' : ''}`) +
                       (terminal?.error == null ? ')' : `: ${terminal.error})`),
                   };
           if (directive !== undefined) {
@@ -1994,7 +1995,8 @@ export class PiAgentHandle implements AgentHandle {
           });
         }
         if (msg !== undefined && msg['role'] === 'assistant') {
-          // A stop row holding tool calls (openai-completions, mistral) is not
+          // A stop row holding tool calls (providers that report `stop` with
+          // tool calls, e.g. OpenAI-compatible chat completions) is not
           // completion: the SDK runs those calls next.
           const holdsCalls = Array.isArray(msg['content']) && msg['content'].some((block) => (block as { type?: unknown } | null)?.type === 'toolCall');
           if (msg['stopReason'] === 'stop' && !holdsCalls && this.liveDirective !== undefined) {
@@ -2025,6 +2027,7 @@ export class PiAgentHandle implements AgentHandle {
             this.liveTurnStop = {
               stopReason: typeof msg['stopReason'] === 'string' ? msg['stopReason'] : null,
               error: typeof msg['errorMessage'] === 'string' ? msg['errorMessage'] : null,
+              holdsCalls,
             };
           }
           // pi reports in-band model errors as an assistant message with

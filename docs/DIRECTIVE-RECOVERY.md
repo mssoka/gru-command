@@ -308,9 +308,11 @@ before #469.
 
 Boot and bounded deterministic reconsideration inspect correlated ledger
 completion, then exact native completion, **before** considering execution.
-A proven native user or complete successful tool-results checkpoint can
-continue once through the adapter-owned operation on the same logical
-minion/session, job lane, branch and PR. The original user prompt is never
+A proven native user checkpoint, or a complete tool-results checkpoint that
+leaves no tool error unanswered, can continue once through the
+adapter-owned operation on the same logical minion/session, job lane,
+branch and PR. The SDK's own "not executed" results for a `length` row's
+calls (below) are no such error: nothing ran. The original user prompt is never
 replayed. Every producer/permission fence is rechecked around asynchronous
 pacing/spawn/continuation boundaries. A durable checkpoint claim cannot be
 reissued by age or lease expiry. A turn that ended in its own native error
@@ -358,11 +360,11 @@ row as retry history only when all of these hold:
   it.
 
 Its calls never enter the pending set, so a result naming one is never a
-match, and the turn reads UNKNOWN. After a retried answer that calls tools
-the reason is `unmatched/malformed native tool result`. After a retried
-answer that ends the turn, or when the error row itself ended it, the
-reason is `native entries follow the correlated terminal checkpoint without
-a distinct bound request`.
+match, and the turn reads UNKNOWN. After a retried answer that leaves
+calls pending, the reason is `unmatched/malformed native tool result`.
+After one that ends the turn (an aborted answer holding calls ends it too),
+or when the error row itself ended it, the reason is `native entries follow
+the correlated terminal checkpoint without a distinct bound request`.
 
 When a retry is cancelled during backoff, no retried answer follows, so the
 receipted row is the turn's terminal, a failed one. When attempts run out,
@@ -376,9 +378,10 @@ content, or the retried answer.
 Every pi stop can hold tool calls, and the walks and the fence follow what
 the SDK's agent loop does with them:
 
-- `toolUse` and `stop`: the SDK runs them. openai-completions and Mistral
-  end `stop` while holding calls, so a `stop` row with calls is pending
-  work, not the turn's end; one without calls is the terminal.
+- `toolUse` and `stop`: the SDK runs them. Providers that report `stop`
+  with tool calls (e.g. OpenAI-compatible chat completions) leave a `stop`
+  row holding calls, so such a row is pending work, not the turn's end, and
+  never a successful turn verdict; one without calls is the terminal.
 - `length`: the calls were cut off by the output token limit. The SDK runs
   none and answers each with its own failed "not executed" result, then goes
   on. Those calls are pending until those results arrive, and the minion
@@ -388,6 +391,9 @@ the SDK's agent loop does with them:
 - `error` and `aborted`: the SDK runs none (for an error row, the ruling
   above). Such a row owes no results; ending the turn, it is a failed
   terminal, and a result naming one of its calls is refused.
+- Any other stop (pi-ai also has `pending` and `deferred`): a row holding
+  calls under it is refused, by the checkpoint as `native assistant stop
+  reason holding tool calls is unsupported` and by the fence.
 
 When the adapter cannot record a receipt it logs `native SDK retry
 evidence not recorded; retry-history tool effects remain refused` at warn,
