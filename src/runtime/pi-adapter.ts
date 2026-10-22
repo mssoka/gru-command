@@ -1241,7 +1241,7 @@ export class PiAgentHandle implements AgentHandle {
             // preparation await. Its terminal is deliberately withheld until
             // the native gate clears; publish that exact episode before the
             // after-preparation authority check so supervision sees closure.
-            await this.waitForCompactionTerminalAfter(compactionGeneration);
+            await this.waitForCompactionTerminalAfter(compactionGeneration, signal);
             this.assertDirectiveExecutionAuthority(directive, signal);
             const context = update?.context ?? turn.context;
             if ((update?.model !== undefined && !isDeepStrictEqual(update.model, session.model)) ||
@@ -1591,6 +1591,7 @@ export class PiAgentHandle implements AgentHandle {
     this.pendingCompactionEnd = null;
     this.nativeCompactionOpen = false;
     this.compactionEndDeadline = 0;
+    this.wakeCompactionTerminalWaiters(); // each sees disposal and refuses
     if (abortCompaction) {
       // Resolve the explicit waiter before clearing lifecycle state. compact()
       // may still be awaiting the SDK call, but once it settles it observes
@@ -1902,14 +1903,25 @@ export class PiAgentHandle implements AgentHandle {
     }
   }
 
-  private async waitForCompactionTerminalAfter(generation: number): Promise<void> {
+  /** Resolves once every compaction episode begun after `generation` has
+   * published its terminal. Disposal or the run's abort ends the wait with a
+   * refusal: the terminal may never be published. */
+  private async waitForCompactionTerminalAfter(generation: number, signal?: AbortSignal): Promise<void> {
+    const cancelled = (): boolean => this.disposed || signal?.aborted === true;
     while (this.nativeCompactionGeneration > generation && this.publishedCompactionGeneration < this.nativeCompactionGeneration) {
-      await new Promise<void>((resolve) => {
-        const wake = (): void => { this.compactionTerminalWaiters.delete(wake); resolve(); };
-        this.compactionTerminalWaiters.add(wake);
-        if (this.publishedCompactionGeneration >= this.nativeCompactionGeneration) wake();
-      });
+      if (!cancelled()) {
+        await new Promise<void>((resolve) => {
+          const wake = (): void => { this.compactionTerminalWaiters.delete(wake); signal?.removeEventListener('abort', wake); resolve(); };
+          this.compactionTerminalWaiters.add(wake);
+          signal?.addEventListener('abort', wake, { once: true });
+        });
+      }
+      if (cancelled()) throw new DirectiveCheckpointError('native directive ownership cancelled while its compaction terminal was pending');
     }
+  }
+
+  private wakeCompactionTerminalWaiters(): void {
+    for (const wake of [...this.compactionTerminalWaiters]) wake();
   }
 
   private flushCompactionEndWhenSettled(): void {
@@ -1946,10 +1958,12 @@ export class PiAgentHandle implements AgentHandle {
   private publishCompactionEnd(
     terminal: Extract<RuntimeEvent, { type: 'compaction_end' }>,
   ): void {
+    // Every episode begun so far has ended, even when an explicit compaction
+    // already settled and this terminal is not published again.
+    this.publishedCompactionGeneration = this.nativeCompactionGeneration;
+    this.wakeCompactionTerminalWaiters();
     const waiter = this.explicitCompactionTerminal;
     if (waiter?.settled === true) return;
-    this.publishedCompactionGeneration = Math.max(this.publishedCompactionGeneration, this.nativeCompactionGeneration);
-    for (const wake of [...this.compactionTerminalWaiters]) wake();
     this.emit(terminal);
     if (waiter !== null) {
       waiter.settled = true;

@@ -4666,6 +4666,66 @@ it('Pi pre-prompt compaction before a directive receipt is admitted and the dire
   } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
 });
 
+/** Preparation waits for a compaction terminal the adapter withholds while
+ * Pi's compaction state does not settle; the run's abort or disposal ends
+ * that wait at once, with its own refusal and no further model request. */
+async function assertCompactionWaitCancelled(by: 'abort' | 'dispose') {
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const { AgentSession } = await import('@earendil-works/pi-coding-agent');
+  const f = await fixture([
+    { deltas: ['history '.repeat(100)], toolCall: { id: 'before-wait', name: 'bash', args: { command: "printf 'once\\n' >> wait-effect.txt" } }, usageTokens: 90_000 },
+    { deltas: ['automatic compaction summary'] },
+    { deltas: ['never requested'] },
+  ]);
+  writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  const scene = await directiveRecoveryLedgerFixture(`compaction-wait-${by}`);
+  const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: `compaction-wait-${by}-minion` });
+  const session = await actualDirectiveSdkSession(handle); session.agent.toolExecution = 'sequential';
+  scene.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: scene.request.jobId, sessionFile: handle.sessionFile });
+  scene.ledger.setAgentState(handle.id, 'idle');
+  scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+  // After its terminal event, Pi's compaction state stays set: a native gate that does not settle.
+  const nativeCompacting = Object.getOwnPropertyDescriptor(AgentSession.prototype, 'isCompacting')!.get!;
+  let held = false;
+  Object.defineProperty(session, 'isCompacting', { configurable: true, get: () => held || nativeCompacting.call(session) });
+  session.subscribe((event) => { if (event.type === 'compaction_end') held = true; });
+  const events = collect(handle);
+  // Synchronization only: preparation has registered its wait for the withheld terminal.
+  const waiters = (handle as unknown as { readonly compactionTerminalWaiters: ReadonlySet<unknown> }).compactionTerminalWaiters;
+  try {
+    const turn = handle.promptWithVerdict!('approved directive', { directive: { identity: scene.identity,
+      beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+      onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    await waitFor(() => waiters.size === 1, 'next-turn preparation waiting for the withheld compaction terminal');
+    let disposing: Promise<void> | null = null;
+    if (by === 'abort') session.agent.abort();
+    else { disposing = handle.dispose(); held = false; }
+    const verdict = await turn;
+    expect(verdict.ok).toBe(false);
+    expect(verdict.error).toContain('native directive ownership cancelled while its compaction terminal was pending');
+    expect(waiters.size).toBe(0);
+    // Abort: the turn settled while the terminal was still withheld. Dispose publishes it as failed.
+    expect(events.filter((event) => event.type === 'compaction_end')).toEqual(by === 'abort' ? [] :
+      [{ type: 'compaction_end', success: false, error: 'agent session disposed during native compaction' }]);
+    expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
+    expect(readFileSync(join(scene.lane.path, 'wait-effect.txt'), 'utf8')).toBe('once\n');
+    const refusals = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trimEnd().split('\n')
+      .map((line) => JSON.parse(line) as { readonly state: string; readonly boundary?: string; readonly reason?: string }).filter((record) => record.state === 'guard-refused');
+    expect(refusals).toEqual([expect.objectContaining({ boundary: 'authority', reason: expect.stringContaining('cancelled while its compaction terminal was pending') })]);
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
+    held = false;
+    if (by === 'abort') {
+      await waitFor(() => events.some((event) => event.type === 'compaction_end'), 'compaction terminal once the native gate settles');
+      expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: true }]);
+    }
+    await (disposing ?? handle.dispose());
+    expect(handle.cessationEvidence!()).toBe('ceased');
+    expect(f.store.isHeld(handle.sessionFile!)).toBe(false);
+  } finally { held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
+}
+it('a directive abort during the compaction terminal wait refuses at once, without another model request', () => assertCompactionWaitCancelled('abort'));
+it('disposal during the compaction terminal wait refuses at once and releases native ownership', () => assertCompactionWaitCancelled('dispose'));
+
 async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
   const { prepareDirectiveBinding, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const original = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'guarded-original-minion' });
