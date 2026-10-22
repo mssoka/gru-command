@@ -1130,6 +1130,9 @@ export class PiAgentHandle implements AgentHandle {
   private cessationState: 'live' | 'ceased' | 'unknown' = 'live';
   private pendingCompactionEnd: RuntimeEvent | null = null;
   private nativeCompactionOpen = false;
+  private nativeCompactionGeneration = 0;
+  private publishedCompactionGeneration = 0;
+  private readonly compactionTerminalWaiters = new Set<() => void>();
   private compactionEndDeadline = 0;
   private compactionEndTimer: ReturnType<typeof setTimeout> | null = null;
   private explicitCompactionTerminal: {
@@ -1231,8 +1234,14 @@ export class PiAgentHandle implements AgentHandle {
         const directive = this.liveDirective;
         try {
           if (directive !== undefined) this.assertDirectiveExecutionAuthority(directive, signal);
+          const compactionGeneration = this.nativeCompactionGeneration;
           const update = await beforeNextTurn?.(turn, signal);
           if (directive !== undefined) {
+            // Automatic compaction may begin and finish inside the SDK's
+            // preparation await. Its terminal is deliberately withheld until
+            // the native gate clears; publish that exact episode before the
+            // after-preparation authority check so supervision sees closure.
+            await this.waitForCompactionTerminalAfter(compactionGeneration);
             this.assertDirectiveExecutionAuthority(directive, signal);
             const context = update?.context ?? turn.context;
             if ((update?.model !== undefined && !isDeepStrictEqual(update.model, session.model)) ||
@@ -1893,6 +1902,16 @@ export class PiAgentHandle implements AgentHandle {
     }
   }
 
+  private async waitForCompactionTerminalAfter(generation: number): Promise<void> {
+    while (this.nativeCompactionGeneration > generation && this.publishedCompactionGeneration < this.nativeCompactionGeneration) {
+      await new Promise<void>((resolve) => {
+        const wake = (): void => { this.compactionTerminalWaiters.delete(wake); resolve(); };
+        this.compactionTerminalWaiters.add(wake);
+        if (this.publishedCompactionGeneration >= this.nativeCompactionGeneration) wake();
+      });
+    }
+  }
+
   private flushCompactionEndWhenSettled(): void {
     if (this.disposed || this.pendingCompactionEnd === null) return;
     if (this.compacting || this.session.isCompacting) {
@@ -1929,6 +1948,8 @@ export class PiAgentHandle implements AgentHandle {
   ): void {
     const waiter = this.explicitCompactionTerminal;
     if (waiter?.settled === true) return;
+    this.publishedCompactionGeneration = Math.max(this.publishedCompactionGeneration, this.nativeCompactionGeneration);
+    for (const wake of [...this.compactionTerminalWaiters]) wake();
     this.emit(terminal);
     if (waiter !== null) {
       waiter.settled = true;
@@ -2045,6 +2066,7 @@ export class PiAgentHandle implements AgentHandle {
       case 'compaction_start':
         if (this.nativeCompactionOpen) return;
         this.nativeCompactionOpen = true;
+        this.nativeCompactionGeneration += 1;
         this.emit({ type: 'compaction_start' });
         return;
       case 'compaction_end': {

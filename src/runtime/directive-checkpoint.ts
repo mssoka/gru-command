@@ -107,6 +107,11 @@ interface NativeEntry {
   readonly provider?: unknown;
   readonly modelId?: unknown;
   readonly thinkingLevel?: unknown;
+  readonly summary?: unknown;
+  readonly firstKeptEntryId?: unknown;
+  readonly tokensBefore?: unknown;
+  readonly fromHook?: unknown;
+  readonly timestamp?: unknown;
 }
 /*
  * Native transcripts grow for a session's whole life (#469), so inspection
@@ -403,7 +408,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
 }
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
-function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
+function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, ids, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
   const { identity } = binding;
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
   const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
@@ -421,6 +426,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   if (binding.userEntryId === null) appendBinding(admitted);
   if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
   let parent = user.id;
+  const knownIds = new Set(ids);
+  knownIds.add(user.id);
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
@@ -443,8 +450,27 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       }
       return unknown('native entries follow the correlated terminal checkpoint without a distinct bound request');
     }
+    if (entry.type === 'compaction') {
+      // Pi writes a linked compaction control into the same session ancestry
+      // while an admitted native turn is still running. It has no tool or
+      // message effect, but it must be accounted for in the parent chain so
+      // the original turn's later terminal can still be read back. A branch,
+      // hook-authored summary, malformed pointer, or wrong-parent control is
+      // not equivalent evidence and remains UNKNOWN.
+      if (entry.parentId !== parent || typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '' ||
+          typeof entry.summary !== 'string' || entry.summary.trim() === '' || typeof entry.firstKeptEntryId !== 'string' ||
+          !knownIds.has(entry.firstKeptEntryId) || entry.firstKeptEntryId === entry.id ||
+          typeof entry.tokensBefore !== 'number' || !Number.isFinite(entry.tokensBefore) || entry.tokensBefore < 0 ||
+          entry.fromHook === true || entry.fromHook !== undefined && typeof entry.fromHook !== 'boolean') {
+        return unknown('native branch/control/partial checkpoint');
+      }
+      parent = entry.id;
+      knownIds.add(entry.id);
+      continue;
+    }
     if (entry.type !== 'message' || entry.parentId !== parent || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
     parent = entry.id;
+    knownIds.add(entry.id);
     const message = entry.message;
     if (message.role === 'assistant') {
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
