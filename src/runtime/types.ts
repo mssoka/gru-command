@@ -294,7 +294,7 @@ export type RuntimeEvent =
       readonly type: 'error';
       readonly error: string;
       readonly fatal: boolean;
-      /** In-process native control provenance, set only by an adapter's typed directive refusal boundary; never inferred from error text. */
+      /** In-process native-control provenance correlated with a typed refusal captured at the directive guard boundary; message text alone is insufficient. */
       readonly nativeControl?: 'directive-refusal';
       readonly provider?: string;
       readonly model?: string;

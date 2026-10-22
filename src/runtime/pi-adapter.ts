@@ -1115,8 +1115,8 @@ export class PiAgentHandle implements AgentHandle {
   private livePromptImages: PromptOptions['images'] | undefined;
   private liveDirective: PromptOptions['directive'] | undefined;
   private directiveAdmissionError: unknown = null;
-  /** Exact local directive guard provenance; deliberately not derived from the error text. */
-  private nativeDirectiveRefusal = false;
+  /** Exact local guard error object; later event text alone can never establish this provenance. */
+  private nativeDirectiveRefusal: DirectiveCheckpointError | null = null;
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
@@ -1300,7 +1300,7 @@ export class PiAgentHandle implements AgentHandle {
   private refuseDirectiveGuard(directive: PromptOptions['directive'], toolCallId: string | undefined, error: unknown): never {
     if (directive !== undefined) {
       this.directiveAdmissionError ??= error;
-      if (error instanceof DirectiveCheckpointError) this.nativeDirectiveRefusal = true;
+      if (error instanceof DirectiveCheckpointError) this.nativeDirectiveRefusal ??= error;
       const producer = this.directiveProducers.get(directive.identity.requestId);
       if (producer !== undefined) {
         const key = `${producer.incarnation}:${toolCallId === undefined ? 'authority' : `tool:${toolCallId}`}`;
@@ -1314,6 +1314,11 @@ export class PiAgentHandle implements AgentHandle {
       }
     }
     throw error;
+  }
+
+  private isNativeDirectiveRefusal(detail: string, directive: PromptOptions['directive']): boolean {
+    const refusal = this.nativeDirectiveRefusal;
+    return directive !== undefined && refusal !== null && (detail.includes(refusal.message) || detail.includes(String(refusal)));
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -1779,7 +1784,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveDirective = directive;
     this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
-    this.nativeDirectiveRefusal = false;
+    this.nativeDirectiveRefusal = null;
     this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
@@ -1803,11 +1808,12 @@ export class PiAgentHandle implements AgentHandle {
           // Arbitrary exceptions stay anonymous — the sensor can never
           // mistake them for provider rejections.
           const typed = typedFromSdkError(error);
+          const errorText = String(error);
           this.emit({
             type: 'error',
-            error: String(error),
+            error: errorText,
             fatal: false,
-            ...(directive !== undefined && this.nativeDirectiveRefusal ? { nativeControl: 'directive-refusal' as const } : {}),
+            ...(typed === null && this.isNativeDirectiveRefusal(errorText, directive) ? { nativeControl: 'directive-refusal' as const } : {}),
             ...(typed !== null && this.session.model !== undefined
               ? { provider: this.session.model.provider, model: this.session.model.id }
               : {}),
@@ -2024,6 +2030,7 @@ export class PiAgentHandle implements AgentHandle {
               type: 'error',
               error: detail,
               fatal: false,
+              ...(typed === null && this.isNativeDirectiveRefusal(detail, this.liveDirective) ? { nativeControl: 'directive-refusal' as const } : {}),
               ...(typeof msg['provider'] === 'string'
                 ? { provider: msg['provider'] }
                 : this.session.model !== undefined
