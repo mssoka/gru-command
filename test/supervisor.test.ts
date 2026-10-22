@@ -3234,6 +3234,30 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
+  it('provider auth and unproven local-looking errors retain deterministic wall protections', async () => {
+    const localLooking = 'HTTP 401 provider rejection: DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+    for (const { id, typed, localControl } of [
+      { id: 'provider-auth-local-words', typed: true, localControl: false },
+      { id: 'provider-auth-local-words-conflicting-origin', typed: true, localControl: true },
+      { id: 'untyped-local-words', typed: false, localControl: false },
+    ] as const) {
+      const h = boot();
+      const handle = new FakeHandle('minion', id, null);
+      h.registry.adopt(handle);
+      const spawns = h.registry.spawnCalls.length;
+      handle.emit({ type: 'error', error: localLooking, fatal: false,
+        ...(localControl ? { nativeControl: 'directive-refusal' as const } : {}), ...(typed ? {
+          provider: 'synthetic-provider', model: 'synthetic-model', typed: { origin: 'provider-message' as const, status: 401 },
+        } : {}) });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.supervisor.viewFor(id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall', restarts: 0 });
+      expect(h.registry.spawnCalls).toHaveLength(spawns);
+      expect(h.notificationsOfKind(`supervision.provider-wall.${id}.authentication_wall`)).toHaveLength(1);
+      expect(h.api.listProviderWaits()).toEqual([]);
+      h.dispose();
+    }
+  });
+
   it('a legacy machine-routed provider-wall row dedupes the new machine stop: one row, Gru disposition re-arms', async () => {
     const h = boot({ decide: vi.fn(async () => { throw new Error('decision service down'); }) } as unknown as DecisionService);
     const handle = new FakeHandle('minion', 'minion-legacy-wall', null);

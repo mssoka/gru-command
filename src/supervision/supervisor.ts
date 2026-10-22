@@ -1006,6 +1006,17 @@ export class Supervisor {
             });
             break;
           }
+          if (!event.fatal && event.nativeControl === 'directive-refusal' && event.typed === undefined) {
+            // A locally proven native directive fence is already fail-closed
+            // and belongs to the directive's guarded recovery path. It is not
+            // a provider response: do not pace, classify, stop as a wall, or
+            // hand its accepted prompt to restart/replay recovery here.
+            this.log('info', 'native directive control refusal retained for native recovery; provider failure routing skipped', {
+              agent_id: agent.agentId,
+              error: event.error,
+            });
+            break;
+          }
           // Publication can replay a startup error while its owner is still
           // settling the rung. Defer that exact error, never another spawn.
           const flight = [...this.restartingAgents.values()].find((item) => item.handle === agent.handle);

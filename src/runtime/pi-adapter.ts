@@ -1115,6 +1115,8 @@ export class PiAgentHandle implements AgentHandle {
   private livePromptImages: PromptOptions['images'] | undefined;
   private liveDirective: PromptOptions['directive'] | undefined;
   private directiveAdmissionError: unknown = null;
+  /** Exact local directive guard provenance; deliberately not derived from the error text. */
+  private nativeDirectiveRefusal = false;
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
@@ -1298,6 +1300,7 @@ export class PiAgentHandle implements AgentHandle {
   private refuseDirectiveGuard(directive: PromptOptions['directive'], toolCallId: string | undefined, error: unknown): never {
     if (directive !== undefined) {
       this.directiveAdmissionError ??= error;
+      if (error instanceof DirectiveCheckpointError) this.nativeDirectiveRefusal = true;
       const producer = this.directiveProducers.get(directive.identity.requestId);
       if (producer !== undefined) {
         const key = `${producer.incarnation}:${toolCallId === undefined ? 'authority' : `tool:${toolCallId}`}`;
@@ -1776,6 +1779,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveDirective = directive;
     this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
+    this.nativeDirectiveRefusal = false;
     this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
@@ -1803,6 +1807,7 @@ export class PiAgentHandle implements AgentHandle {
             type: 'error',
             error: String(error),
             fatal: false,
+            ...(directive !== undefined && this.nativeDirectiveRefusal ? { nativeControl: 'directive-refusal' as const } : {}),
             ...(typed !== null && this.session.model !== undefined
               ? { provider: this.session.model.provider, model: this.session.model.id }
               : {}),

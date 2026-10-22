@@ -39,7 +39,7 @@ import {
   type StreamFrame,
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
@@ -2596,6 +2596,28 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           delete process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'];
           await handle.dispose();
         }
+      }
+    });
+
+    it('marks only a typed local directive authority refusal as native-control provenance, never a message lookalike', async () => {
+      const message = 'directive authority is terminal, held or superseded — no work is authorized';
+      for (const typed of [true, false]) {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const events: RuntimeEvent[] = [];
+        handle.subscribe((event) => events.push(event));
+        let checks = 0;
+        const refusal = typed ? new DirectiveCheckpointError(message) : new Error(message);
+        try {
+          await expect(handle.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor(`claude-local-control-${String(typed)}`),
+            beforeAdmission: () => { if (++checks > 1) throw refusal; }, onAdmitted: () => {} } }))
+            .rejects.toThrow(/directive refused/u);
+          const runtimeError = events.find((event) => event.type === 'error');
+          expect(runtimeError?.type === 'error' ? runtimeError.error : '').toContain(message);
+          if (typed) expect(runtimeError).toMatchObject({ type: 'error', nativeControl: 'directive-refusal' });
+          else expect(runtimeError).not.toHaveProperty('nativeControl');
+          expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+        } finally { await handle.dispose(); }
       }
     });
 

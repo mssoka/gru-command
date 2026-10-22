@@ -2257,7 +2257,8 @@ export class ClaudeCodeHandle implements AgentHandle {
         failed = true;
         failure = detail;
         if (!this.disposed) {
-          this.emit({ type: 'error', error: detail, fatal: false });
+          this.emit({ type: 'error', error: detail, fatal: false,
+            ...(turn?.failure instanceof DirectiveCheckpointError ? { nativeControl: 'directive-refusal' as const } : {}) });
           this.setState('error', detail);
         }
       };

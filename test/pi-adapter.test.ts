@@ -3962,19 +3962,20 @@ it('routes a real local native authority refusal away from provider authenticati
     expect(refusal?.type).toBe('error');
     expect(refusal?.type === 'error' ? refusal.error : '').toContain('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized');
     expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
-    expect(refusal).toMatchObject({ origin: 'native-control' });
+    expect(refusal).toMatchObject({ nativeControl: 'directive-refusal' });
     expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
     expect(scene.ledger.listProviderWaits()).toEqual([]);
     expect(spawn).toHaveBeenCalledTimes(1);
-    expect(fx.script.calls).toHaveLength(1);
     expect(readFileSync(handle.sessionFile!, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; content?: readonly { text?: string }[] } })
       .filter((row) => row.message?.role === 'user' && row.message.content?.some((part) => part.text === 'original accepted synthetic directive'))).toHaveLength(1);
     expect(existsSync(join(scene.lane.path, 'local-authority-effect.txt'))).toBe(false);
     expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'failed', nativeBinding: { identity: scene.identity } });
+    expect(scene.ledger.directiveCurrentAuthority(scene.request.jobId).contractSha256).not.toBe(scene.identity.contractSha256);
     const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string });
     expect(receipts).toContainEqual(expect.objectContaining({ state: 'guard-refused', toolCallId: 'refused-local-effect' }));
     expect(receipts.some((receipt) => receipt.state === 'ceased')).toBe(false);
-    const { inspectDirectiveProducers } = await import('../src/runtime/directive-checkpoint.js');
+    const { inspectDirectiveCheckpoint, inspectDirectiveProducers } = await import('../src/runtime/directive-checkpoint.js');
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity).state).toBe('unknown');
     expect(inspectDirectiveProducers(handle.sessionFile!, scene.identity)).toEqual([{ producer, evidence: 'unknown' }]);
   } finally {
     supervisor.dispose();
