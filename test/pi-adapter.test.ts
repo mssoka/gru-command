@@ -4419,7 +4419,7 @@ it('automatic SDK compaction completes before the same admitted native authority
     readonly exactBlockers: readonly string[];
     readonly unownedBlockers: readonly string[];
     readonly mismatchedBlockers: Readonly<Record<string, readonly string[]>>;
-  } | null) = null;
+  } | null) | null = null;
   const rawCompaction: { readonly type: string; readonly sdkCompacting: boolean }[] = [];
   const preparations: { readonly before: ReturnType<NonNullable<typeof sample>>; readonly after: ReturnType<NonNullable<typeof sample>> }[] = [];
   const afterCompactionTurnStarts: NonNullable<ReturnType<NonNullable<typeof sample>>>[] = [];
@@ -4459,7 +4459,8 @@ it('automatic SDK compaction completes before the same admitted native authority
   const currentOwner = () => {
     if (handle === null) return null;
     const started = f.scene.ledger.latestJobEventByRequestId(f.scene.request.jobId, 'silas.directive-producer-started', f.scene.request.requestId);
-    const producer = (started?.payload as { readonly native_producer?: DirectiveProducer } | undefined)?.native_producer;
+    if (started === null) return null;
+    const producer = (started.payload as { readonly native_producer?: DirectiveProducer } | undefined)?.native_producer;
     return producer === undefined ? null : { handle, producer, started };
   };
   sample = () => {
@@ -4484,7 +4485,7 @@ it('automatic SDK compaction completes before the same admitted native authority
     };
     const ownNative = Object.values(identityMatches).every(Boolean);
     const exactBlockers = owner === null ? [] : supervisor.pendingProducerBlockers(f.scene.request.jobId, owner);
-    const mismatchedBlockers = owner === null ? {} : {
+    const mismatchedBlockers: Readonly<Record<string, readonly string[]>> = owner === null ? {} : {
       incarnation: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, incarnation: `${owner.producer.incarnation}-foreign` } }),
       session: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, sessionId: `${owner.producer.sessionId}-foreign` } }),
       identity: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, identity: { ...owner.producer.identity, requestId: `${owner.producer.identity.requestId}-foreign` } } }),
