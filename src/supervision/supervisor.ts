@@ -132,6 +132,9 @@ export interface AgentSupervisionView {
   readonly openControl?: boolean;
   /** Tool calls currently open (a live process here is activity, not a hang). */
   readonly openToolCalls: number;
+  /** Background work a replied turn still waits on (claude-code), as the
+   * runtime describes it; empty when none. */
+  readonly backgroundTasks?: readonly string[];
   readonly lastEventAt: string | null;
   readonly lastFileBytes: number | null;
 }
@@ -159,6 +162,8 @@ interface SupervisedAgent {
   compactionWarned: boolean;
   /** callId → tool name for tool calls currently executing. */
   openToolCalls: Map<string, string>;
+  /** The open turn's latest `background_wait` tasks (read only while open). */
+  backgroundTasks: readonly string[];
   /** An interrupted turn awaiting resume on the next live handle. Survives
    * failed rungs and breaker re-arms — the lane must never be forgotten. */
   pendingRecovery: InterruptedTurn | null;
@@ -965,6 +970,10 @@ export class Supervisor {
         case 'turn_end':
           agent.openTurn = false;
           agent.openToolCalls.clear();
+          agent.backgroundTasks = [];
+          break;
+        case 'background_wait':
+          agent.backgroundTasks = [...event.tasks];
           break;
         case 'compaction_start':
           agent.openControl = true;
@@ -1124,6 +1133,7 @@ export class Supervisor {
       openControl: false,
       compactionWarned: false,
       openToolCalls: new Map(),
+      backgroundTasks: [],
       pendingRecovery: null,
       lastEventAt: this.now(),
       lastFileBytes: this.fileSize(sessionFile),
@@ -2734,6 +2744,9 @@ export class Supervisor {
       }
     }
     if (pending === null && !hadOpenTurn) return null;
+    // A turn that already replied and only waited on background work was
+    // not interrupted: there is no prompt to send again and no lost turn.
+    if (pending === null && handle.turnAnswered?.() === true) return null;
     const jobId = this.ledger.getAgent(agent.agentId)?.jobId ?? null;
     return { pending, hadOpenTurn, originAgentId: agent.agentId, ...this.captureJobAuthority(jobId, agent.agentId) };
   }
@@ -3656,6 +3669,7 @@ export class Supervisor {
         openTurn: agent.openTurn,
         openControl: agent.openControl,
         openToolCalls: agent.openToolCalls.size,
+        backgroundTasks: agent.openTurn ? [...agent.backgroundTasks] : [],
         lastEventAt:
           agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
         lastFileBytes: agent.lastFileBytes,
@@ -3904,6 +3918,7 @@ export class Supervisor {
       openTurn: agent.openTurn,
       openControl: agent.openControl,
       openToolCalls: agent.openToolCalls.size,
+      backgroundTasks: agent.openTurn ? [...agent.backgroundTasks] : [],
       lastEventAt:
         agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
       lastFileBytes: agent.lastFileBytes,

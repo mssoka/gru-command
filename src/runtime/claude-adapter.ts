@@ -20,7 +20,7 @@ import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
 import { repositoryGitEnv } from '../git-env.js';
-import { CLAUDE_CODE_THINKING_LEVELS as CLAUDE_EFFORT_LEVELS, DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
+import { CLAUDE_CODE_THINKING_LEVELS as CLAUDE_EFFORT_LEVELS, DEFAULT_CLAUDE_BACKGROUND_WAIT_MS, DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { managedSkillsPromptNote } from './managed-skills.js';
@@ -128,6 +128,10 @@ export function mapRoleTools(role: Role, tools: readonly string[]): string[] {
 
 /** Default grace between SIGTERM and SIGKILL when disposing a live turn. */
 const DEFAULT_KILL_GRACE_MS = 2_000;
+/** Grace before SIGKILL for a CLI stopped while it only waits on background
+ * tasks: on SIGTERM it stops them itself (probed on Claude Code 2.1.307), but
+ * a SIGKILL would leave them running. */
+const DEFAULT_BACKGROUND_STOP_GRACE_MS = 10_000;
 /** Cap on the stderr tail kept for turn-failure error messages. */
 const STDERR_TAIL_BYTES = 8_192;
 /** Timeout for the one-shot binary availability probe at spawn. */
@@ -168,6 +172,9 @@ export interface ClaudeCodeRuntimeOptions {
   readonly spawnProcess?: typeof spawn;
   /** Test seam: grace before SIGKILL on dispose. Default 2000ms. */
   readonly killGraceMs?: number;
+  /** Test seam: grace before SIGKILL for a CLI stopped while it only waits
+   * on background tasks. Default 10 000ms. */
+  readonly backgroundStopGraceMs?: number;
   /** Test seam: override the long-tool heartbeat cadence. */
   readonly toolHeartbeatMs?: number;
   /** Test seam for the user Claude settings source (never the review repo). */
@@ -206,6 +213,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   private readonly binary: string;
   private readonly spawnProcess: typeof spawn;
   private readonly killGraceMs: number;
+  private readonly backgroundStopGraceMs: number;
   private readonly log: Log;
   private readonly reviewSettingsFile: string;
   /** Long-tool heartbeat cadence override; derived from the supervision
@@ -224,6 +232,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     this.binary = opts.binary ?? 'claude';
     this.spawnProcess = opts.spawnProcess ?? spawn;
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+    this.backgroundStopGraceMs = opts.backgroundStopGraceMs ?? DEFAULT_BACKGROUND_STOP_GRACE_MS;
     this.log = opts.log ?? (() => {});
     this.reviewSettingsFile = opts.reviewSettingsFile ?? userClaudeSettingsFile();
     this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
@@ -570,6 +579,8 @@ export class ClaudeCodeRuntime implements AgentRuntime {
               reviewTools: reviewBridge.toolNames,
             } : {}),
           killGraceMs: this.killGraceMs,
+          backgroundWaitMs: this.config.runtimes.policies['claude-code']?.backgroundWaitMs ?? DEFAULT_CLAUDE_BACKGROUND_WAIT_MS,
+          backgroundStopGraceMs: this.backgroundStopGraceMs,
           resume: established,
           nativeDirectives,
           ...(model !== undefined ? { model } : {}),
@@ -649,6 +660,65 @@ function syncTranscript(path: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+/** An ordinary turn's wait on the background tasks its CLI still runs after
+ * the reply (see DEFAULT_CLAUDE_BACKGROUND_WAIT_MS). */
+interface BackgroundWait {
+  /** The prompted turn has replied successfully: its prompt is answered. An
+   * in-band error result is no answer (the rate-limit retry re-sends it). */
+  answered(): boolean;
+  /** Replied, and not paused by a follow-up turn of the CLI's own (see
+   * `paused` in spawnTurn), until the turn settles: the watchdog counts this,
+   * a stop's grace included, as live work. */
+  waiting(): boolean;
+  /** A message is waiting: stop now if waiting, else skip the next wait. */
+  end(): Promise<void>;
+}
+
+/** Why GC stopped background work: the idle limit, a waiting message, or a
+ * turn that ended in an error (its follow-up would only meet that error). */
+type BackgroundStopReason = 'limit' | 'message' | 'error';
+
+/** The longest task description a notice or the board repeats. */
+const BACKGROUND_TASK_TEXT_MAX = 200;
+/** How a listed task with no description is named. */
+const UNNAMED_BACKGROUND_TASK = 'an unnamed background task';
+
+/** Running background tasks as a `background_tasks_changed` frame lists them
+ * (Claude Code 2.1.307): `tasks: [{ task_id, description, … }]`, one entry
+ * per task. Null when the frame has no such list. */
+function backgroundTaskDescriptions(tasks: unknown): string[] | null {
+  if (!Array.isArray(tasks)) return null;
+  return tasks.map((task): string => {
+    const description = (task as Record<string, unknown> | null)?.['description'];
+    const line = typeof description === 'string' ? description.replace(/\s+/gu, ' ').trim() : '';
+    if (line === '') return UNNAMED_BACKGROUND_TASK;
+    return line.length > BACKGROUND_TASK_TEXT_MAX ? `${line.slice(0, BACKGROUND_TASK_TEXT_MAX - 1)}…` : line;
+  });
+}
+
+/** A wait limit as the minion reads it. */
+function waitText(ms: number): string {
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.max(1, Math.round(ms / 1_000))} s`;
+}
+
+/** What the minion is told at the start of its next ordinary turn. It may
+ * come turns later (a directive's text is never changed), so it says
+ * "earlier". `forced`: the CLI ignored the stop and was killed, so the work
+ * may still be running. */
+export function backgroundStopNotice(tasks: readonly string[], reason: BackgroundStopReason, waitMs: number, forced = false): string {
+  const limit = waitText(waitMs);
+  const list = tasks.map((task) => `\`${task.replaceAll('`', "'")}\``).join(', ');
+  const why = reason === 'limit' ? `It was still running ${limit} after that reply.`
+    : reason === 'message' ? 'A new message had arrived for you.' : 'That turn had ended in an error.';
+  const what = forced
+    ? `Earlier, after one of your replies, Gru Command had to force-stop the Claude Code process running background work you had left running: ${list}. ${why} ` +
+      'That work may still be running: check before you start it again.'
+    : `Earlier, after one of your replies, Gru Command stopped background work you had left running: ${list}. ${why}`;
+  return `[Gru Command] ${what} Each of your turns runs in its own Claude Code process, so work still running after ` +
+    `you reply is stopped ${limit} later, or as soon as a new message arrives; a server or a watcher cannot outlive ` +
+    'your turn. If you need a result, run the command again and wait for it before you reply.';
+}
+
 /** One directive turn in flight (#424). */
 interface DirectiveTurn {
   readonly directive: NonNullable<PromptOptions['directive']>;
@@ -691,6 +761,10 @@ interface HandleParams {
   readonly ambientMcp?: { readonly mode: 'none' } | { readonly mode: 'user' } | { readonly mode: 'project'; readonly file?: string };
   readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
+  /** How long an ordinary turn that has replied waits on its CLI's
+   * background tasks ([runtimes.claude-code] background_wait_ms). */
+  readonly backgroundWaitMs?: number;
+  readonly backgroundStopGraceMs?: number;
   readonly resume: boolean;
   /** The session can host native directives (#424): GC header, no ambient MCP. */
   readonly nativeDirectives?: boolean;
@@ -1059,6 +1133,13 @@ export class ClaudeCodeHandle implements AgentHandle {
   private settleLiveOnDispose: (() => void) | null = null;
   /** The prompt behind the live CLI turn — supervision's resume snapshot. */
   private livePrompt: PendingTurn | null = null;
+  /** The live ordinary turn's background wait (null when no such turn). */
+  private backgroundWait: BackgroundWait | null = null;
+  /** Background work GC stopped after a reply, told to the minion at the
+   * start of its next ordinary turn (null when none). */
+  private backgroundNotice: string | null = null;
+  /** A message arrived while the next turn was still being prepared. */
+  private messageAwaitsTurn = false;
   /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
   private readonly toolHeartbeat: ToolHeartbeat;
   private compacting = false;
@@ -1172,10 +1253,22 @@ export class ClaudeCodeHandle implements AgentHandle {
    * and at least one tool call is still open — activity, not a hang.
    */
   hasLiveProcess = (): boolean =>
-    !this.disposed && this.live !== null && this.toolHeartbeat.openCalls > 0;
+    !this.disposed && this.live !== null && (this.toolHeartbeat.openCalls > 0 || this.backgroundWait?.waiting() === true);
 
-  /** The live turn's prompt — snapshotted by supervision before a restart. */
-  pendingTurn = (): PendingTurn | null => this.livePrompt;
+  /** The live turn's prompt — snapshotted by supervision before a restart.
+   * Once the minion has replied it is answered: a restart must not send it
+   * again. */
+  pendingTurn = (): PendingTurn | null => (this.backgroundWait?.answered() === true ? null : this.livePrompt);
+
+  endBackgroundWait = (): Promise<void> => {
+    if (this.backgroundWait !== null) return this.backgroundWait.end();
+    // A turn still being prepared (the project-MCP check) has no wait yet:
+    // it skips the wait when it replies.
+    if (this.preparingTurn) this.messageAwaitsTurn = true;
+    return Promise.resolve();
+  };
+
+  turnAnswered = (): boolean => this.backgroundWait?.answered() === true;
 
   subscribe(listener: RuntimeEventListener): () => void {
     this.listeners.add(listener);
@@ -1642,6 +1735,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       },
       (error: unknown) => {
         this.preparingTurn = false;
+        this.messageAwaitsTurn = false;
         if (this.disposed) {
           this.cleanupProjectMcpCopy();
           onNotSpawned?.(null);
@@ -1663,6 +1757,9 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private spawnCompaction(params: HandleParams): Promise<void> {
     const translator = new ClaudeControlTranslator();
+    // A message held while the compaction was being prepared waits behind
+    // the compaction, not behind a turn: no turn skips its wait for it.
+    this.messageAwaitsTurn = false;
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -2014,6 +2111,13 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (livePrompt === null) throw new Error('claude turn spawned without its accepted prompt');
     const { text } = livePrompt;
     const images = livePrompt.images;
+    // Background work stopped after a reply is told to the minion once, ahead
+    // of its next ordinary prompt. A directive's text is exact, and a prompt
+    // that starts with "/" is a command to the CLI: both leave it for later.
+    const notice = turn === null && !text.startsWith('/') ? this.backgroundNotice : null;
+    if (notice !== null) this.backgroundNotice = null;
+    const sent = notice === null ? text : `${notice}\n\n${text}`;
+    const keepNotice = (): void => { if (notice !== null) this.backgroundNotice ??= notice; };
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -2022,9 +2126,118 @@ export class ClaudeCodeHandle implements AgentHandle {
       let child: ChildProcess;
       let stderrTail = '';
 
+      // An ordinary turn's background wait: after the reply the CLI waits on
+      // the background tasks it still runs, then answers their completion in
+      // a follow-up turn of its own. GC allows that for backgroundWaitMs of
+      // idle time after each reply, and no longer once a message is waiting;
+      // then it stops the CLI, which stops its tasks.
+      const waitMs = params.backgroundWaitMs ?? DEFAULT_CLAUDE_BACKGROUND_WAIT_MS;
+      const stopGraceMs = Math.max(params.killGraceMs, params.backgroundStopGraceMs ?? DEFAULT_BACKGROUND_STOP_GRACE_MS);
+      let replied = false;
+      let answered = false;
+      // The prompted turn's own reply (its first result) was an in-band error.
+      let errored = false;
+      let followUp = false;
+      // A message that arrived while this turn was being prepared.
+      let messageWaiting = turn === null && this.messageAwaitsTurn;
+      this.messageAwaitsTurn = false;
+      let stopping = false;
+      let tasks: readonly string[] = [];
+      let unlistedTasksLogged = false;
+      let announced = false;
+      // The CLI has closed: its terminal events follow, after the board label.
+      let ended = false;
+      let waitTimer: ReturnType<typeof setTimeout> | null = null;
+      let resolveTurnSettled: () => void = () => {};
+      const turnSettled = new Promise<void>((resolveSettled) => { resolveTurnSettled = resolveSettled; });
+      // The board shows what a replied turn still waits on.
+      const announce = (): void => {
+        if (replied && !followUp && !ended && !settled && tasks.length > 0) {
+          this.emit({ type: 'background_wait', tasks });
+          announced = true;
+        } else if (announced) {
+          this.emit({ type: 'background_wait', tasks: [] });
+          announced = false;
+        }
+      };
+      const stopBackground = (reason: BackgroundStopReason): void => {
+        if (stopping || settled || ended) return;
+        stopping = true;
+        // A CLI that already ended by itself was stopped by nothing.
+        if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+        if (tasks.length > 0) this.backgroundNotice = backgroundStopNotice(tasks, reason, waitMs);
+        this.log('info', 'stopping a claude turn that has replied and only waits on background work', {
+          session_id: params.sessionId, reason, tasks,
+        });
+        try { child.stdin?.end(); } catch { /* already closed */ }
+        try { child.kill('SIGTERM'); } catch { /* already gone */ }
+        // A CLI that ignores SIGTERM is killed after the grace period. A killed
+        // CLI cannot stop its tasks, so the minion is told they may run on.
+        const target = child;
+        const stoppedTasks = tasks;
+        const escalation = setTimeout(() => {
+          this.log('warn', 'a claude CLI waiting on background work ignored SIGTERM and was killed; that work may still be running', {
+            session_id: params.sessionId, reason, tasks: stoppedTasks,
+          });
+          if (stoppedTasks.length > 0) this.backgroundNotice = backgroundStopNotice(stoppedTasks, reason, waitMs, true);
+          try { target.kill('SIGKILL'); } catch { /* already gone */ }
+        }, stopGraceMs);
+        escalation.unref();
+        target.once('close', () => clearTimeout(escalation));
+      };
+      // The clock runs only while the replied turn is idle. A waiting message,
+      // or a reply that was an in-band error, stops listed tasks at once; with
+      // none listed the CLI is ending by itself, and is stopped only if it
+      // has not after the grace period.
+      // A follow-up turn of the CLI's own pauses the clock, except in a
+      // worker-verification lane (the host's permission input is already
+      // closed there, so that turn cannot be hosted) and after an error
+      // reply (whose stop must not wait for it).
+      const paused = (): boolean => followUp && permissions === undefined && !errored;
+      let waitDeadline = 0;
+      // A reply (`fresh`) restarts the clock; anything else only brings the
+      // stop closer, so further messages never push it back.
+      const arm = (fresh: boolean): void => {
+        if (!replied || paused() || stopping || settled || ended) {
+          if (waitTimer !== null) clearTimeout(waitTimer);
+          waitTimer = null;
+          return;
+        }
+        const reason: BackgroundStopReason = errored ? 'error' : messageWaiting ? 'message' : 'limit';
+        const delay = reason === 'limit' ? waitMs : tasks.length > 0 ? 0 : stopGraceMs;
+        // Deadlines compare on the clock Node's timers run on, so a wall-clock
+        // change (NTP, a manual reset) cannot reorder a stop and the limit.
+        const deadline = performance.now() + delay;
+        if (delay > 0 && !fresh && waitTimer !== null && waitDeadline <= deadline) return;
+        if (waitTimer !== null) clearTimeout(waitTimer);
+        waitTimer = null;
+        if (delay === 0) {
+          stopBackground(reason);
+          return;
+        }
+        waitDeadline = deadline;
+        waitTimer = setTimeout(() => stopBackground(reason), delay);
+        waitTimer.unref();
+      };
+      const wait: BackgroundWait = {
+        answered: () => answered,
+        waiting: () => replied && !paused() && !settled,
+        end: () => {
+          if (settled || ended) return Promise.resolve();
+          messageWaiting = true;
+          if (!replied || paused()) return Promise.resolve();
+          arm(false);
+          return turnSettled;
+        },
+      };
+
       const settle = (error: Error | null): void => {
         if (settled) return;
         settled = true;
+        if (waitTimer !== null) clearTimeout(waitTimer);
+        announce();
+        if (this.backgroundWait === wait) this.backgroundWait = null;
+        resolveTurnSettled();
         this.live = null;
         this.liveTranscript = null;
         this.settleLiveOnDispose = null;
@@ -2057,6 +2270,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.liveTranscript = transcript;
       } catch (error) {
         failTurn(String(error));
+        keepNotice();
         settle(new Error(failure));
         return;
       }
@@ -2126,6 +2340,34 @@ export class ClaudeCodeHandle implements AgentHandle {
           permissions?.ingest(frame);
           if (permissions !== undefined && frame['type'] === 'result') child?.stdin?.end();
           transcript.write(`${JSON.stringify(frame)}\n`);
+          if (frame['type'] === 'system' && frame['subtype'] === 'background_tasks_changed') {
+            const listed = backgroundTaskDescriptions(frame['tasks']);
+            if (listed !== null) tasks = listed;
+            else if (!unlistedTasksLogged) {
+              unlistedTasksLogged = true;
+              this.log('warn', 'claude background_tasks_changed frame carries no task list; the board and the stop notice cannot name that work', {
+                session_id: params.sessionId,
+              });
+            }
+            announce();
+            if (messageWaiting) arm(false);
+          } else if (frame['type'] === 'system' && frame['subtype'] === 'init' && replied) {
+            // The CLI's own follow-up turn: the minion is working again.
+            followUp = true;
+            arm(false);
+            announce();
+          } else if (frame['type'] === 'result') {
+            // The prompted turn's verdict is its first result, read as the
+            // translator reads it; a later result is a follow-up turn's own.
+            if (!replied) {
+              errored = frame['is_error'] === true;
+              answered = !errored;
+            }
+            replied = true;
+            followUp = false;
+            arm(true);
+            announce();
+          }
         }
         for (const event of translator.ingest(frame)) {
           if (event.type === 'tool_start') this.toolHeartbeat.started(event.callId, event.tool);
@@ -2164,7 +2406,7 @@ export class ClaudeCodeHandle implements AgentHandle {
           // A directive turn's record is the CLI's own echo (#424).
           if (turn === null) {
             transcript.write(`${JSON.stringify({
-              ...claudePromptFrame(text, images),
+              ...claudePromptFrame(sent, images),
               session_id: params.sessionId,
               timestamp: new Date().toISOString(),
               gc_prompt: true,
@@ -2201,11 +2443,13 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.onInfraError(error);
         failTurn(`claude process failed to spawn: ${String(error)}`);
         turn?.settings.dispose();
+        keepNotice();
         transcript.end(() => settle(new Error(failure)));
         return;
       }
       this.trackVerificationChild(child);
       this.live = child;
+      if (turn === null) this.backgroundWait = wait;
 
       child.stdout?.on('data', (chunk: Buffer) => parser.push(chunk));
       child.stderr?.on('data', (chunk: Buffer) => {
@@ -2240,6 +2484,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         parser.end();
         // A child that never started can never read its settings.
         turn?.settings.dispose();
+        keepNotice();
         transcript.end(() => settle(new Error(failure)));
       });
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
@@ -2252,6 +2497,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         });
       });
       const finishTurn = (code: number | null, signal: NodeJS.Signals | null): void => {
+        // The board label clears before the turn's terminal events: an event
+        // after them would read as new activity to supervision.
+        ended = true;
+        announce();
         if (this.disposed) {
           settle(new Error('agent session disposed'));
           return;
@@ -2294,13 +2543,15 @@ export class ClaudeCodeHandle implements AgentHandle {
               (stderrTail.trim() !== '' ? `: ${stderrTail.trim()}` : ''),
           );
         }
+        // A CLI that failed before it started never showed the minion the notice.
+        if (!turnStarted) keepNotice();
         settle(new Error(failure));
       };
 
       // Policy and directive children keep stdin open for native permission
       // responses; other turns retain the existing single-frame/EOF transport.
       const send = (): void => {
-        const prompt = turn === null ? claudePromptFrame(text, images) : { type: 'user', message: { role: 'user', content: turn.content } };
+        const prompt = turn === null ? claudePromptFrame(sent, images) : { type: 'user', message: { role: 'user', content: turn.content } };
         child.stdin?.write(`${JSON.stringify(prompt)}\n`, (error?: Error | null) => {
           if (error != null) this.log('error', 'failed to write prompt frame to claude stdin', { error: String(error) });
           if (permissions === undefined && directivePermissions === undefined) child.stdin?.end();

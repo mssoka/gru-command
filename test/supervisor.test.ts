@@ -93,6 +93,8 @@ class FakeHandle implements AgentHandle {
   liveProcess = false;
   /** pendingTurn snapshot; null = the runtime cannot name the live prompt. */
   pendingTurnSnapshot: PendingTurn | null = null;
+  /** The open turn already replied (claude-code background wait); absent = unknown. */
+  turnAnswered: (() => boolean) | undefined = undefined;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
   constructor(role: Role, id: string, sessionFile: string | null, reviewIsolation = false) {
@@ -4194,6 +4196,39 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     await sleep(60);
     expect(handle.disposed).toBe(true);
     expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
+    h.dispose();
+  });
+
+  it('a restart while a replied turn only waits on background work interrupts nothing: no lost-turn incident (#471 follow-up)', async () => {
+    for (const answered of [false, true]) {
+      const h = boot();
+      const id = `minion-answered-${answered}`;
+      const handle = new FakeHandle('minion', id, null);
+      handle.turnAnswered = () => answered;
+      h.registry.adopt(handle);
+      hang(handle);
+      h.advance(60);
+      await sleep(60);
+      expect(handle.disposed, String(answered)).toBe(true);
+      expect(h.notificationsOfKind(`supervision.turn-orphaned.${id}`), String(answered)).toHaveLength(answered ? 0 : 1);
+      h.dispose();
+    }
+  });
+
+  it('names the background work a replied turn still waits on, only while that turn is open (#471 follow-up)', () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-background-wait', null);
+    h.registry.adopt(handle);
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual([]);
+    hang(handle);
+    handle.emit({ type: 'background_wait', tasks: ['npm run dev', 'tsc --watch'] });
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual(['npm run dev', 'tsc --watch']);
+    // The CLI's own follow-up turn, or the end of the wait, clears it.
+    handle.emit({ type: 'background_wait', tasks: [] });
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual([]);
+    handle.emit({ type: 'background_wait', tasks: ['npm run dev'] });
+    handle.emit({ type: 'turn_end' });
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual([]);
     h.dispose();
   });
 

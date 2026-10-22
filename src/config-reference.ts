@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { decisionsConfigFor } from './decisions/config-template.js';
 import {
   CLAUDE_CODE_THINKING_LEVELS,
+  DEFAULT_CLAUDE_BACKGROUND_WAIT_MS,
   DEFAULT_CLAUDE_MCP_MODE,
   DEFAULT_DISPATCH_CONFIG,
   DEFAULT_LESSONS_CONFIG,
@@ -216,6 +217,16 @@ function runtimePolicyLines(
       mcp === undefined
         ? `${c}# mcp = ${tomlString(DEFAULT_CLAUDE_MCP_MODE)}`
         : `${c}mcp = ${tomlString(mcp)}`,
+    );
+    const backgroundWait = policy?.backgroundWaitMs;
+    lines.push(
+      `${c}# After an agent replies, how long its turn may wait on background work`,
+      `${c}# it left running (a test run, a dev server). Each turn is its own CLI;`,
+      `${c}# past this, or once a message arrives, GC stops that work and tells`,
+      `${c}# the agent in its next ordinary turn.`,
+      backgroundWait === undefined
+        ? `${c}# background_wait_ms = ${DEFAULT_CLAUDE_BACKGROUND_WAIT_MS}`
+        : `${c}background_wait_ms = ${backgroundWait}`,
     );
   }
   lines.push('', `${c}[runtimes.${runtime}.roles]`);

@@ -2311,6 +2311,36 @@ describe('board agent rail — truthful runtime status (#171)', () => {
     expect(age).toMatch(/^\d+s quiet$/);
   });
 
+  it('a replied Claude minion still waiting on background work says what it waits on (#471 follow-up)', () => {
+    const view = new BoardView(() => {});
+    const waitingOn = (backgroundTasks?: readonly string[]) => {
+      view.render(
+        snapshot({
+          agents: [
+            agent('minion-waiting', {
+              role: 'minion',
+              state: 'streaming',
+              status: 'streaming',
+              runtime: 'current',
+              supervision: {
+                state: 'watching', restarts: 0, breakerOpen: false, openTurn: true,
+                lastEventAt: new Date().toISOString(),
+                ...(backgroundTasks === undefined ? {} : { backgroundTasks }),
+              },
+            }),
+          ],
+        }),
+      );
+      return document.querySelector<HTMLElement>('#board-agents .board-agent .board-agent__background');
+    };
+    const chip = waitingOn(['npm run dev', 'tsc --watch']);
+    expect(chip?.textContent).toBe('⏳ waiting on: npm run dev +1');
+    expect(chip?.title).toBe('replied; still waiting on background work: npm run dev; tsc --watch');
+    // No chip without such work, or from a server that predates the field.
+    expect(waitingOn([])).toBeNull();
+    expect(waitingOn()).toBeNull();
+  });
+
   it('ambiguous ownership stays visible and marked, but only confirmed current owners count as crew', () => {
     const view = new BoardView(() => {});
     view.render(

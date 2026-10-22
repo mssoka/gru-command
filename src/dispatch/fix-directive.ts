@@ -219,10 +219,27 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
+  // A message for a minion whose turn has replied and only waits on
+  // background work ends that wait (the producer fences refuse a session
+  // with an open turn, and the waiting turn still holds its worker slot until
+  // its CLI is gone); a turn still working skips that wait when it replies.
+  // Only an admissible message does either. The check here never throws: a
+  // refusal is still raised, and classified, by the guards that follow.
+  const endWaitForMessage = async (handle: AgentHandle): Promise<void> => {
+    if (handle.endBackgroundWait === undefined) return;
+    try {
+      input.beforeWriterSideEffect?.();
+      assertDirectiveJobActive(input.ledger, input.jobId);
+    } catch {
+      return;
+    }
+    await handle.endBackgroundWait();
+  };
   if (input.freshSession === true) {
     for (const minion of minions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
+      await endWaitForMessage(prior);
       guard();
       priorCleanupPending = true;
       await disposeAndRecord(prior, true);
@@ -245,6 +262,7 @@ export async function routeFixDirectiveToMinion(
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      await endWaitForMessage(handle);
       guard(); // before even the owned prior retry/pacing awaits
       // Active-incident attribution (B1): if an automatic retry is already
       // covering this handle, wait for its settlement BEFORE prompting.
