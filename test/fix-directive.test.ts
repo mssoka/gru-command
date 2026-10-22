@@ -148,6 +148,47 @@ describe('fresh fix worker association', () => {
     }
   });
 
+  it('a resident minion that has replied and only waits on background work ends that wait before the message takes a worker slot (#471 follow-up)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-background-wait-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    // The replied turn still holds the only worker slot until its CLI is gone.
+    let waitingTurn: Awaited<ReturnType<typeof gate.acquireWorkerTurn>> | null = await gate.acquireWorkerTurn({ id: 'job-1', label: 'replied, waiting on npm run dev' });
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Waiting lane' });
+      ledger.setJobStatus('job-1', 'working');
+      ledger.registerAgent({ id: 'waiting-implementer', role: 'minion', jobId: 'job-1' });
+      const order: string[] = [];
+      const handle = {
+        id: 'waiting-implementer', role: 'minion', sessionFile: null,
+        async prompt() { order.push('prompt'); },
+        endBackgroundWait: async () => {
+          order.push('end wait');
+          waitingTurn?.release();
+          waitingTurn = null;
+        },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const routed = await routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'rebase on main', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        workerGate: gate,
+      });
+      expect(routed.delivered).toBe(true);
+      expect(order).toEqual(['end wait', 'prompt']);
+    } finally {
+      waitingTurn?.release();
+      db.close();
+    }
+  });
+
   it('refuses a freshly binned lane after asynchronous spawn, disposing before prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-bin-race-'));
     cleanupDirs.push(dir);

@@ -212,6 +212,19 @@ writes each runtime's own record shape during a resumed turn.
   The reason: the CLI waits for a running task after the turn's result, then
   answers its completion in an unprompted turn of its own, after the directive
   is over and with no host left to decide its tools.
+- **Background work after a reply (#471 follow-up).** pi's bash tool has
+  no background tasks. In an ordinary Claude Code turn a minion may leave
+  work running in the background: a dev server, or a test run the CLI moved
+  there at its timeout. Each turn is its own CLI process, and after the
+  reply that CLI waits on such work, then answers its completion in a
+  follow-up turn of its own. GC allows that for `[runtimes.claude-code]
+  background_wait_ms` (default 15 min) of idle time after each reply, and
+  no longer once a message for the minion is waiting. Then it stops the
+  CLI, which stops the work, and the minion's next ordinary turn begins with
+  a note naming what was stopped and why.
+  While it waits, the turn stays open: the board shows "waiting on: …", the
+  watchdog counts the wait as live work, and a restart never sends the
+  answered prompt again. A directive turn starts no background work.
 - **A review owner from another process (#464).** A replacement Perkins round
   starts only once every earlier round's review owner is proven ceased. On
   both runtimes the proof is either this process's adapter evidence or the

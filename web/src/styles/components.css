@@ -3137,6 +3137,15 @@ body {
   white-space: nowrap;
 }
 
+/* A replied Claude minion still waiting on background work it left running. */
+.board-agent__background {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
 /* Disposed collapse: a dashed toggle row and dimmed disclosed rows. */
 .board-agent-toggle {
   border: 2px dashed var(--line);

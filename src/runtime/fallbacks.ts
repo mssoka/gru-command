@@ -77,6 +77,7 @@ class FallbackHandle implements AgentHandle {
   readonly isCompacting?: () => boolean;
   readonly hasLiveProcess?: () => boolean;
   readonly pendingTurn?: () => PendingTurn | null;
+  readonly endBackgroundWait?: () => Promise<void>;
   readonly prepareDirectiveProducer?: AgentHandle['prepareDirectiveProducer'];
   readonly inspectDirective?: AgentHandle['inspectDirective'];
   readonly resumeDirective?: AgentHandle['resumeDirective'];
@@ -113,6 +114,9 @@ class FallbackHandle implements AgentHandle {
     }
     if (inner.pendingTurn !== undefined) {
       this.pendingTurn = () => inner.pendingTurn!();
+    }
+    if (inner.endBackgroundWait !== undefined) {
+      this.endBackgroundWait = () => inner.endBackgroundWait!();
     }
     if (inner.prepareDirectiveProducer !== undefined) this.prepareDirectiveProducer = (identity) => {
       this.assertLive();
@@ -266,6 +270,11 @@ class FallbackHandle implements AgentHandle {
     if (this.busy || this.queue.length > 0) {
       const owner = options.owner ?? 'default';
       this.emit({ type: 'queued', reason, owner });
+      // A turn that has replied and only waits on background work stops it
+      // for this message (it settles; the pump then delivers in order).
+      try {
+        void this.inner.endBackgroundWait?.().catch(() => { /* the turn's own outcome is reported by it */ });
+      } catch { /* a faulty probe never blocks queueing */ }
       return new Promise<PromptTurnVerdict>((resolve, reject) => {
         const item: QueuedTurn = {
           text,

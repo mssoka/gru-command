@@ -216,6 +216,11 @@ default = "default"
 # # for roles with a shell; "user" = your own Claude MCP configuration,
 # # connectors included, without prompts.
 # # mcp = "none"
+# # After a minion replies, how long its turn may wait on background work
+# # it left running (a test run, a dev server). Each turn is its own CLI;
+# # past this, or once a message arrives, GC stops that work and tells
+# # the minion in its next turn.
+# # background_wait_ms = 900000
 
 # [runtimes.claude-code.roles]
 # # Optional per-role inline tables (at least one field when uncommented).
@@ -698,6 +703,7 @@ example.
 | Unknown runtime policy key | `unknown key \`x\` in [runtimes.pi] (valid keys: model, thinking_level, model_refresh, model_refresh_timeout_ms, roles)` |
 | Empty runtime role entry | `[runtimes.pi.roles.gru] must set at least one of model, thinking_level` |
 | Bad claude-code MCP mode | `runtimes.claude-code.mcp must be one of "none", "project", "user", got "x"` |
+| Bad claude-code background wait | `runtimes.claude-code.background_wait_ms must be a positive integer, got: 0` (at most 2147483647) |
 | Unknown runtime id as a table | `unknown key \`x\` in [runtimes] (valid keys: default, roles, or a runtime id: pi, claude-code)` |
 | Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` (an empty value is rejected the same way) |
 | Path not absolute after expansion | `workspace_root must resolve to an absolute path` |

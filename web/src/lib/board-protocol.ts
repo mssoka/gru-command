@@ -147,6 +147,9 @@ export interface AgentView {
     readonly openTurn?: boolean;
     readonly openControl?: boolean;
     readonly openToolCalls?: number;
+    /** Background work a replied Claude turn still waits on (absent on
+     * servers that predate it). */
+    readonly backgroundTasks?: readonly string[];
     readonly lastEventAt?: string | null;
   } | null;
 }

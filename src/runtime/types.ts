@@ -262,6 +262,13 @@ export type RuntimeEvent =
   | { readonly type: 'tool_end'; readonly callId: string; readonly isError: boolean }
   | { readonly type: 'turn_start' }
   | { readonly type: 'turn_end' }
+  | {
+      /** The turn has replied and its CLI only waits on background tasks it
+       * still runs (claude-code): their descriptions, or none once that wait
+       * is over. The turn stays open until the CLI ends. */
+      readonly type: 'background_wait';
+      readonly tasks: readonly string[];
+    }
   | { readonly type: 'cessation_evidence'; readonly evidence: 'ceased' | 'unknown' }
 | { readonly type: 'compaction_start' }
   | {
@@ -420,6 +427,13 @@ export interface AgentHandle {
    * posts a durable recoverable-lane note instead of resuming.
    */
   readonly pendingTurn?: () => PendingTurn | null;
+  /**
+   * A message is waiting for this session. A turn that has replied and only
+   * waits on its background tasks stops them now; the promise settles once
+   * that turn has. A turn still working skips that wait when it replies, and
+   * the promise settles at once. Runtimes without such a wait omit it.
+   */
+  readonly endBackgroundWait?: () => Promise<void>;
   /** Current native/provider context usage, or null when unavailable/stale. */
   readonly getContextUsage?: () => ContextUsage | null;
   /** Run the runtime's native context compaction on this same session. */

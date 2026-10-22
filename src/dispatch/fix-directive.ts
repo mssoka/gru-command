@@ -246,6 +246,12 @@ export async function routeFixDirectiveToMinion(
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
       guard(); // before even the owned prior retry/pacing awaits
+      // A turn that has replied and only waits on background work ends that
+      // wait for this message, before a worker slot is taken for it: a
+      // directive needs the session idle, and the waiting turn still holds
+      // its own slot until its CLI is gone.
+      await handle.endBackgroundWait?.();
+      guard();
       // Active-incident attribution (B1): if an automatic retry is already
       // covering this handle, wait for its settlement BEFORE prompting.
       // Otherwise the new directive and the retry would deliver overlapping

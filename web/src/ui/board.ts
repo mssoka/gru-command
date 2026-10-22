@@ -2408,6 +2408,15 @@ export class BoardView {
     if (status === 'streaming') {
       subline.append(this.ageNode('board-agent__age lbl', agentActivityOf(agent), '', ' quiet'));
     }
+    // A Claude minion that has replied and still waits on background work it
+    // left running: busy for that reason only, until GC's wait limit.
+    const waitingOn = agent.supervision?.backgroundTasks ?? [];
+    if (status === 'streaming' && waitingOn.length > 0) {
+      const more = waitingOn.length > 1 ? ` +${waitingOn.length - 1}` : '';
+      const chip = el('span', 'board-agent__background lbl', `⏳ waiting on: ${waitingOn[0]}${more}`);
+      chip.title = `replied; still waiting on background work: ${waitingOn.join('; ')}`;
+      subline.append(chip);
+    }
     // Issue #171: ambiguous ownership is explicit — an unverified row is
     // visible, marked, and never claimed active or dead by the board (on
     // a pre-upgrade server no row is marked: the whole board is legacy).

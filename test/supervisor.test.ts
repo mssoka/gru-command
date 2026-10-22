@@ -4197,6 +4197,23 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.dispose();
   });
 
+  it('names the background work a replied turn still waits on, only while that turn is open (#471 follow-up)', () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-background-wait', null);
+    h.registry.adopt(handle);
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual([]);
+    hang(handle);
+    handle.emit({ type: 'background_wait', tasks: ['npm run dev', 'tsc --watch'] });
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual(['npm run dev', 'tsc --watch']);
+    // The CLI's own follow-up turn, or the end of the wait, clears it.
+    handle.emit({ type: 'background_wait', tasks: [] });
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual([]);
+    handle.emit({ type: 'background_wait', tasks: ['npm run dev'] });
+    handle.emit({ type: 'turn_end' });
+    expect(h.supervisor.viewFor('minion-background-wait')?.backgroundTasks).toEqual([]);
+    h.dispose();
+  });
+
   it('tool heartbeats keep a long silent run alive without any transcript growth', async () => {
     const h = boot();
     const handle = new FakeHandle('minion', 'minion-heartbeat', null);

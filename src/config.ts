@@ -59,6 +59,9 @@ export interface RuntimeModelPolicy {
   /** claude-code only: which MCP servers non-review sessions may load
    * (default "none" — exactly the role's mapped tools, like pi). */
   readonly mcp?: ClaudeMcpMode;
+  /** claude-code only: how long a turn that has replied may wait on the
+   * background tasks it left running, in milliseconds (default 900 000). */
+  readonly backgroundWaitMs?: number;
   readonly roles: Readonly<Partial<Record<Role, RuntimeRolePolicyEntry>>>;
 }
 
@@ -76,6 +79,16 @@ export const CLAUDE_MCP_MODES = ['none', 'project', 'user'] as const;
 export type ClaudeMcpMode = (typeof CLAUDE_MCP_MODES)[number];
 /** Default for [runtimes.claude-code] mcp. */
 export const DEFAULT_CLAUDE_MCP_MODE: ClaudeMcpMode = 'none';
+
+/**
+ * [runtimes.claude-code] background_wait_ms — each Claude Code turn is its
+ * own CLI process, and after the minion replies that CLI waits on every
+ * background task it still runs, then answers their completion in a
+ * follow-up turn. GC waits for that up to this long after each reply, and no
+ * longer once a message is waiting for the minion; then it stops the CLI,
+ * which stops its tasks, and tells the minion in its next turn.
+ */
+export const DEFAULT_CLAUDE_BACKGROUND_WAIT_MS = 900_000;
 
 /** Default for [runtimes.pi] model_refresh (network catalog refresh ON). */
 export const DEFAULT_MODEL_REFRESH = true;
@@ -2390,7 +2403,7 @@ function readDecisionsConfig(
 /** Keys accepted per [runtimes.<id>]; the catalog-refresh knobs are pi-only. */
 const RUNTIME_POLICY_KEYS: Readonly<Record<RuntimeId, readonly string[]>> = {
   pi: ['model', 'thinking_level', 'model_refresh', 'model_refresh_timeout_ms', 'roles'],
-  'claude-code': ['model', 'thinking_level', 'mcp', 'roles'],
+  'claude-code': ['model', 'thinking_level', 'mcp', 'background_wait_ms', 'roles'],
 };
 
 /**
@@ -2421,6 +2434,7 @@ function readRuntimePolicy(
   let modelRefresh: boolean | undefined;
   let modelRefreshTimeoutMs: number | undefined;
   let mcp: ClaudeMcpMode | undefined;
+  let backgroundWaitMs: number | undefined;
   const roles: Partial<Record<Role, RuntimeRolePolicyEntry>> = {};
   if (table['model'] !== undefined) {
     model = requireString(table['model'], file, `${field}.model`);
@@ -2448,6 +2462,17 @@ function readRuntimePolicy(
       );
     }
     mcp = value as ClaudeMcpMode;
+  }
+  if (runtimeId === 'claude-code' && table['background_wait_ms'] !== undefined) {
+    backgroundWaitMs = requirePositiveInt(table['background_wait_ms'], file, `${field}.background_wait_ms`);
+    // A Node timer longer than this fires at once.
+    if (backgroundWaitMs > 2_147_483_647) {
+      throw new ConfigError(
+        `${field}.background_wait_ms must be at most 2147483647 (about 24.8 days), got: ${backgroundWaitMs}`,
+        file,
+        `${field}.background_wait_ms`,
+      );
+    }
   }
   if (table['roles'] !== undefined) {
     const rolesTable = requireTable(table['roles'], file, `${field}.roles`);
@@ -2500,6 +2525,7 @@ function readRuntimePolicy(
     ...(modelRefresh !== undefined ? { modelRefresh } : {}),
     ...(modelRefreshTimeoutMs !== undefined ? { modelRefreshTimeoutMs } : {}),
     ...(mcp !== undefined ? { mcp } : {}),
+    ...(backgroundWaitMs !== undefined ? { backgroundWaitMs } : {}),
     roles,
   };
 }
