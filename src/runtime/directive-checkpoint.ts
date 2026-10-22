@@ -4,6 +4,7 @@ import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, writeFi
 import { isDeepStrictEqual } from 'node:util';
 import { dirname } from 'node:path';
 import type { ModelThinkingLevel } from '@earendil-works/pi-ai';
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { PI_THINKING_LEVELS } from '../config.js';
 import { withSessionLockCoordination } from '../sessions/lock-coordination.js';
 
@@ -357,13 +358,17 @@ function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) =>
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
   return compaction;
 }
+/** The level Pi's session records in a thinking_level_change: what
+ * setThinkingLevel was given, or clamped to (through Pi's own nested copies). */
+type PiRecordedThinkingLevel = Parameters<AgentSession['setThinkingLevel']>[0];
 /** Every level a Pi thinking_level_change can record: GC's own, and off.
- * Typecheck proves it is pi-ai's ModelThinkingLevel both ways, so a Pi
- * upgrade that adds a level fails the build instead of stranding directives
- * UNKNOWN: `satisfies` refuses a level Pi lacks, and the declared type below
- * turns to never while Pi has one the list lacks. */
-const PI_THINKING_CONTROL_LEVEL_LIST = ['off', ...PI_THINKING_LEVELS] as const satisfies readonly ModelThinkingLevel[];
-const PI_THINKING_CONTROL_LEVELS: [Exclude<ModelThinkingLevel, (typeof PI_THINKING_CONTROL_LEVEL_LIST)[number]>] extends [never]
+ * Typecheck proves it is both pi-ai's ModelThinkingLevel and the level Pi
+ * records, each both ways, so a Pi upgrade that adds a level fails the build
+ * instead of stranding directives UNKNOWN: `satisfies` refuses a level
+ * either lacks, and the declared type below turns to never while either has
+ * one the list lacks. */
+const PI_THINKING_CONTROL_LEVEL_LIST = ['off', ...PI_THINKING_LEVELS] as const satisfies readonly (ModelThinkingLevel & PiRecordedThinkingLevel)[];
+const PI_THINKING_CONTROL_LEVELS: [Exclude<ModelThinkingLevel | PiRecordedThinkingLevel, (typeof PI_THINKING_CONTROL_LEVEL_LIST)[number]>] extends [never]
   ? readonly string[] : never = PI_THINKING_CONTROL_LEVEL_LIST;
 /** Why `control`, after a completed checkpoint, is not one Pi links on `tip`:
  * a model or thinking-level change, or an automatic compaction that does not

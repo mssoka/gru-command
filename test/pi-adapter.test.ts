@@ -1495,6 +1495,57 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('a failed explicit compaction whose handlers outlast the reconcile bound with Pi\'s flag clear keeps the handle and publishes once', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }, { deltas: ['still usable'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    const internal = handle as unknown as { session: { compact(): Promise<unknown> }; onPiEvent(event: unknown): void; flushCompactionEndWhenSettled(): void };
+    const nativeSession = internal.session;
+    let release!: () => void;
+    let reachedHandlers = false;
+    // As Pi's compact() fails: its flag clears, its terminal is emitted, then it
+    // awaits slow session_compact_failed handlers before it rethrows.
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'compact') {
+          return async () => {
+            internal.onPiEvent({ type: 'compaction_start' });
+            internal.onPiEvent({ type: 'compaction_end', aborted: false, willRetry: false, errorMessage: 'Compaction failed: summary provider failed' });
+            reachedHandlers = true;
+            await new Promise<void>((resolveHandlers) => { release = resolveHandlers; });
+            throw new Error('summary provider failed');
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    let clock: { mockRestore(): void } | null = null;
+    try {
+      await handle.prompt('prime');
+      const compacting = handle.compact!().then(() => null, (error: Error) => error);
+      await waitFor(() => reachedHandlers, 'Pi awaiting its failure handlers');
+      const polls = vi.spyOn(internal, 'flushCompactionEndWhenSettled');
+      const now = Date.now.bind(Date);
+      clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
+      await waitFor(() => polls.mock.calls.length >= 2, 'withheld-terminal polls past the reconcile bound');
+      // Only the adapter's own flag holds: no failed terminal, no disposal.
+      expect(events.filter((event) => event.type === 'compaction_end')).toEqual([]);
+      expect(handle.health().state).not.toBe('disposed');
+      clock.mockRestore(); clock = null; polls.mockRestore();
+      release();
+      expect(String(await compacting)).toContain('Compaction failed: summary provider failed');
+      expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: false, error: 'Compaction failed: summary provider failed' }]);
+      internal.session = nativeSession;
+      await handle.prompt('still usable');
+      expect(fx.script.calls.map((call) => call.prompt)).toContain('still usable');
+    } finally {
+      clock?.mockRestore();
+      release?.();
+      internal.session = nativeSession;
+      await handle.dispose();
+    }
+  });
+
   it('never aborts a pending explicit compaction when time crosses the former #137 deadline', async () => {
     const fx = await fixture([{ deltas: ['first answer'] }]);
     const handle = await fx.runtime.spawn('gru');
@@ -5109,7 +5160,7 @@ async function assertJoinedTerminal(outcomes: readonly ('success' | 'failure' | 
   } finally { held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
 }
 it('a joined compaction episode publishes one terminal: a later written summary wins over an earlier failure', () =>
-  assertJoinedTerminal(['failure', 'success'], { type: 'compaction_end', success: true }));
+  assertJoinedTerminal(['failure', 'success'], { type: 'compaction_end', success: true }, ['Auto-compaction failed: summary 0 failed']));
 it('a joined compaction episode publishes one terminal: an earlier written summary wins over a later failure', () =>
   assertJoinedTerminal(['success', 'failure'], { type: 'compaction_end', success: true }, ['Auto-compaction failed: summary 1 failed']));
 it('a joined compaction episode with no summary publishes a failure\'s own error, never a later cancel\'s', () =>

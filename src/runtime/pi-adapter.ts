@@ -1929,7 +1929,10 @@ export class PiAgentHandle implements AgentHandle {
   private flushCompactionEndWhenSettled(): void {
     if (this.disposed || this.pendingCompactionEnd === null) return;
     if (this.compacting || this.session.isCompacting) {
-      if (this.compactionEndDeadline > 0 && Date.now() >= this.compactionEndDeadline) {
+      // Only Pi's own flag can stall past the bound. The adapter's `compacting`
+      // defers publication to compact()'s finally, however long Pi awaits its
+      // failure handlers first.
+      if (this.session.isCompacting && this.compactionEndDeadline > 0 && Date.now() >= this.compactionEndDeadline) {
         this.pendingCompactionEnd = null;
         this.nativeCompactionOpen = false;
         this.compactionEndDeadline = 0;
@@ -2123,9 +2126,12 @@ export class PiAgentHandle implements AgentHandle {
         // cause); a cancelled cycle stands only when nothing else ended it.
         const rank = ({ event, aborted: cancelled }: typeof terminal): number => event.success ? 2 : cancelled ? 0 : 1;
         const prior = this.pendingCompactionEnd;
-        if (prior === null || rank(terminal) > rank(prior)) this.pendingCompactionEnd = terminal;
-        else if (rank(terminal) === 1) {
-          this.log('warn', 'joined native compaction failure not published', { role: this.role, session: this.id, error: terminal.event.error });
+        const replaces = prior === null || rank(terminal) > rank(prior);
+        const unpublished = replaces ? prior : terminal;
+        if (replaces) this.pendingCompactionEnd = terminal;
+        // A failure the join does not publish, replaced or held back, is still logged.
+        if (unpublished !== null && rank(unpublished) === 1) {
+          this.log('warn', 'joined native compaction failure not published', { role: this.role, session: this.id, error: unpublished.event.error });
         }
         this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
         // Pi dispatches this event before AgentSession clears isCompacting.
