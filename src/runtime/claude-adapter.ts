@@ -666,8 +666,9 @@ interface BackgroundWait {
   /** The prompted turn has replied successfully: its prompt is answered. An
    * in-band error result is no answer (the rate-limit retry re-sends it). */
   answered(): boolean;
-  /** Replied, and the idle clock is running: no follow-up turn of the CLI's
-   * own pauses it (see `paused` in spawnTurn). */
+  /** Replied, and not paused by a follow-up turn of the CLI's own (see
+   * `paused` in spawnTurn), until the turn settles: the watchdog counts this,
+   * a stop's grace included, as live work. */
   waiting(): boolean;
   /** A message is waiting: stop now if waiting, else skip the next wait. */
   end(): Promise<void>;
@@ -2134,7 +2135,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       const stopGraceMs = Math.max(params.killGraceMs, params.backgroundStopGraceMs ?? DEFAULT_BACKGROUND_STOP_GRACE_MS);
       let replied = false;
       let answered = false;
-      // The latest result was an in-band error.
+      // The prompted turn's own reply (its first result) was an in-band error.
       let errored = false;
       let followUp = false;
       // A message that arrived while this turn was being prepared.
@@ -2204,8 +2205,8 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
         const reason: BackgroundStopReason = errored ? 'error' : messageWaiting ? 'message' : 'limit';
         const delay = reason === 'limit' ? waitMs : tasks.length > 0 ? 0 : stopGraceMs;
-        // Node's timers run on the monotonic clock, which stops while the
-        // machine sleeps; the deadlines compare on the same clock.
+        // Deadlines compare on the clock Node's timers run on, so a wall-clock
+        // change (NTP, a manual reset) cannot reorder a stop and the limit.
         const deadline = performance.now() + delay;
         if (delay > 0 && !fresh && waitTimer !== null && waitDeadline <= deadline) return;
         if (waitTimer !== null) clearTimeout(waitTimer);
