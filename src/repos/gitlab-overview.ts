@@ -64,9 +64,18 @@ function kindOfStatus(status: number, oauthError: string | null): RepoFetchError
   return 'other';
 }
 
+/** Whitespace-flattened and bounded display text; null when empty. */
+function flatText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const squashed = value.replace(/\s+/gu, ' ').trim();
+  return squashed === '' ? null : squashed.slice(0, GITLAB_MESSAGE_MAX_CHARS);
+}
+
 /** GitLab's short error text — `{"message": "404 Project Not Found"}`, or
  * an OAuth-style `{"error": "insufficient_scope", "error_description": …}`
- * — and that OAuth `error` code; null where the body carries none. */
+ * — and that OAuth `error` code; null where the body carries none. A
+ * missing scope is reworded into what to do, naming the scopes GitLab
+ * reports, since its own description never says which one is missing. */
 function gitLabErrorOf(text: string): { readonly detail: string | null; readonly oauthError: string | null } {
   let parsed: unknown;
   try {
@@ -76,13 +85,17 @@ function gitLabErrorOf(text: string): { readonly detail: string | null; readonly
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { detail: null, oauthError: null };
   const body = parsed as Record<string, unknown>;
-  const flat = (value: unknown): string | null => {
-    if (typeof value !== 'string') return null;
-    const squashed = value.replace(/\s+/gu, ' ').trim();
-    return squashed === '' ? null : squashed.slice(0, GITLAB_MESSAGE_MAX_CHARS);
-  };
-  const oauthError = flat(body['error']);
-  return { detail: flat(body['message']) ?? flat(body['error_description']) ?? oauthError, oauthError };
+  const oauthError = flatText(body['error']);
+  if (oauthError === 'insufficient_scope') {
+    const accepted = flatText(body['scope']);
+    return {
+      detail:
+        `the GitLab token lacks the read_api scope${accepted !== null ? `; GitLab accepts ${accepted}` : ''}` +
+        ' — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api',
+      oauthError,
+    };
+  }
+  return { detail: flatText(body['message']) ?? flatText(body['error_description']) ?? oauthError, oauthError };
 }
 
 /** The project API URL, or null when the host cannot form a plain https
@@ -108,14 +121,43 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The text of a fetch failure's `cause`: its message, else (a
+ * multi-address connect's `AggregateError`) the nested errors' messages;
+ * a non-Error cause is stringified without `[object Object]`. */
+function causeTextOf(cause: unknown): string {
+  if (cause instanceof Error) {
+    if (cause.message.trim() !== '' || !(cause instanceof AggregateError)) return cause.message;
+    return (cause.errors as unknown[])
+      .map((nested) => (nested instanceof Error ? nested.message : ''))
+      .filter((message) => message.trim() !== '')
+      .join('; ');
+  }
+  if (typeof cause === 'string' || typeof cause === 'number' || typeof cause === 'boolean') return String(cause);
+  try {
+    return JSON.stringify(cause) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** The error `code` of a cause, or of its first nested error. */
+function causeCodeOf(cause: unknown): string | null {
+  const code = typeof cause === 'object' && cause !== null ? (cause as { code?: unknown }).code : undefined;
+  if (typeof code === 'string' && code !== '') return code;
+  return cause instanceof AggregateError ? causeCodeOf((cause.errors as unknown[])[0]) : null;
+}
+
 /** A transport failure's detail. Node's fetch throws a bare
  * `TypeError('fetch failed')` and keeps the real reason (DNS, TLS, a
- * refused connection or redirect) in `cause`, with its `code`. */
-function transportDetailOf(error: unknown): string {
+ * refused connection or redirect) in `cause`: its code goes first, so a
+ * cut at the tracker's bound keeps it, then its redacted, flattened and
+ * bounded text. */
+function transportDetailOf(error: unknown, token: string): string {
   const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
   if (cause === undefined || cause === null) return messageOf(error);
-  const code = (cause as { code?: unknown }).code;
-  return `${messageOf(error)}: ${messageOf(cause)}${typeof code === 'string' && code !== '' ? ` [${code}]` : ''}`;
+  const code = causeCodeOf(cause);
+  const text = flatText(redact(causeTextOf(cause), token));
+  return `${messageOf(error)}${code !== null ? ` [${code}]` : ''}${text !== null ? `: ${text}` : ''}`;
 }
 
 export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
@@ -199,7 +241,7 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     if (token === undefined || token.trim() === '') {
       throw new RepoProviderError(
         'auth',
-        `no GitLab token configured for ${host} — set GITLAB_TOKEN (or GL_TOKEN) in the service environment to a token with the read_api scope that can read ${repoFullName(repo)}`,
+        `no GitLab token configured for ${host} — set GITLAB_TOKEN (or GL_TOKEN) in the service environment to a token with the read_api (or api) scope that can read ${repoFullName(repo)}`,
       );
     }
     const url = projectApiUrl(repo, suffix);
@@ -216,7 +258,7 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
       });
       text = await response.text();
     } catch (error) {
-      throw new RepoProviderError('other', redact(`${label}: request failed (${transportDetailOf(error)})`, token));
+      throw new RepoProviderError('other', redact(`${label}: request failed (${transportDetailOf(error, token)})`, token));
     }
     if (!response.ok) {
       // Redact before GitLab's message is cut, so no token prefix survives.

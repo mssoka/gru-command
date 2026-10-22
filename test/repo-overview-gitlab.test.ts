@@ -523,6 +523,12 @@ describe('GitLab overview REST adapter', () => {
         cause: Object.assign(new Error('getaddrinfo ENOTFOUND gitlab.example.com'), { code: 'ENOTFOUND' }),
       }),
       new TypeError('fetch failed', { cause: new Error(`redirect refused for ${TOKEN}`) }),
+      // A non-Error cause never renders as `[object Object]`.
+      new TypeError('fetch failed', { cause: { reason: 'socket hang up' } }),
+      // Whitespace is flattened and the cause text bounded; the token
+      // straddles the 160-char cut and is redacted before it, so no
+      // prefix of it survives.
+      new TypeError('fetch failed', { cause: new Error(`tls\n\n  handshake   ${'x'.repeat(130)} ${TOKEN} ${'y'.repeat(200)}`) }),
     ];
     const api = new GitLabRepoOverviewApi({
       tokenResolver: () => TOKEN,
@@ -533,12 +539,53 @@ describe('GitLab overview REST adapter', () => {
     const dns = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
     expect(dns.kind).toBe('other');
     expect(dns.message).toBe(
-      'project group/sub/project on gitlab.example.com: request failed (fetch failed: getaddrinfo ENOTFOUND gitlab.example.com [ENOTFOUND])',
+      'project group/sub/project on gitlab.example.com: request failed (fetch failed [ENOTFOUND]: getaddrinfo ENOTFOUND gitlab.example.com)',
     );
     const redirect = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
     expect(redirect.message).toBe(
       'project group/sub/project on gitlab.example.com: request failed (fetch failed: redirect refused for [redacted])',
     );
+    const plain = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    expect(plain.message).toBe(
+      'project group/sub/project on gitlab.example.com: request failed (fetch failed: {"reason":"socket hang up"})',
+    );
+    const long = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    const text = /request failed \(fetch failed: (.*)\)$/u.exec(long.message)?.[1] ?? '';
+    expect(text).toBe(`tls handshake ${'x'.repeat(130)} [redacted] yyyy`);
+    expect(text).toHaveLength(160);
+    expect(long.message).not.toContain(TOKEN.slice(0, 8));
+  });
+
+  it('names a multi-address connect failure from its AggregateError cause, code first', async () => {
+    const refused = (address: string): Error =>
+      Object.assign(new Error(`connect ECONNREFUSED ${address}`), { code: 'ECONNREFUSED' });
+    const failures: unknown[] = [
+      new TypeError('fetch failed', {
+        cause: Object.assign(new AggregateError([refused('10.0.0.1:443'), refused('[::1]:443')], ''), {
+          code: 'ECONNREFUSED',
+        }),
+      }),
+      // No code on the aggregate itself: the first nested error's code.
+      new TypeError('fetch failed', { cause: new AggregateError([refused('10.0.0.2:443')], '') }),
+      // Nothing readable at all: no empty text, no dangling separator.
+      new TypeError('fetch failed', { cause: new AggregateError([{}], '') }),
+    ];
+    const api = new GitLabRepoOverviewApi({
+      tokenResolver: () => TOKEN,
+      fetchImpl: async () => {
+        throw failures.shift();
+      },
+    });
+    const read = async (): Promise<RepoProviderError> =>
+      (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    const prefix = 'project group/sub/project on gitlab.example.com: request failed';
+    expect((await read()).message).toBe(
+      `${prefix} (fetch failed [ECONNREFUSED]: connect ECONNREFUSED 10.0.0.1:443; connect ECONNREFUSED [::1]:443)`,
+    );
+    expect((await read()).message).toBe(`${prefix} (fetch failed [ECONNREFUSED]: connect ECONNREFUSED 10.0.0.2:443)`);
+    const bare = await read();
+    expect(bare.kind).toBe('other');
+    expect(bare.message).toBe(`${prefix} (fetch failed)`);
   });
 
   it('reads OAuth-style error bodies and aborts the host on a 403 insufficient_scope', async () => {
@@ -547,8 +594,21 @@ describe('GitLab overview REST adapter', () => {
       error_description: 'The request requires higher privileges than provided by the access token.',
       scope: 'api read_api',
     };
+    const missingScope =
+      'HTTP 403 (the GitLab token lacks the read_api scope; GitLab accepts api read_api — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api)';
     const cases: ReadonlyArray<readonly [Response, string, string]> = [
-      [json(insufficient, { status: 403 }), 'auth', `HTTP 403 (${insufficient.error_description})`],
+      // A missing scope says what to do, never GitLab's generic description.
+      [json(insufficient, { status: 403 }), 'auth', missingScope],
+      [
+        json({ error: 'insufficient_scope', error_description: insufficient.error_description }, { status: 403 }),
+        'auth',
+        'HTTP 403 (the GitLab token lacks the read_api scope — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api)',
+      ],
+      [
+        json({ ...insufficient, scope: `api ${TOKEN} ${'s'.repeat(400)}` }, { status: 403 }),
+        'auth',
+        `HTTP 403 (the GitLab token lacks the read_api scope; GitLab accepts ${`api [redacted] ${'s'.repeat(400)}`.slice(0, 160)} — set GITLAB_TOKEN (or GL_TOKEN) to a token with read_api or api)`,
+      ],
       [json({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 }), 'auth', 'HTTP 401 (Token was revoked.)'],
       [json({ error: 'forbidden' }, { status: 403 }), 'permission', 'HTTP 403 (forbidden)'],
       [json({ message: '403 Forbidden', error: 'ignored' }, { status: 403 }), 'permission', 'HTTP 403 (403 Forbidden)'],
@@ -571,7 +631,7 @@ describe('GitLab overview REST adapter', () => {
     });
     const view = await h.tracker.refresh();
     expect(calls).toHaveLength(1);
-    expect(row(view, 'gl-a').error).toContain('HTTP 403 (The request requires higher privileges');
+    expect(row(view, 'gl-a').error).toContain('HTTP 403 (the GitLab token lacks the read_api scope; GitLab accepts api read_api');
     expect(row(view, 'gl-b').error).toContain('refresh aborted before this repository was checked: auth:');
   });
 
@@ -583,7 +643,7 @@ describe('GitLab overview REST adapter', () => {
       expect(error).toBeInstanceOf(RepoProviderError);
       expect(error.kind).toBe('auth');
       expect(error.message).toMatch(/^no GitLab token configured for gitlab\.example\.com — set GITLAB_TOKEN/u);
-      expect(error.message).toContain('the read_api scope');
+      expect(error.message).toContain('a token with the read_api (or api) scope');
     }
     const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
     for (const host of ['evil.example', 'evil.gitlab.attacker.test', 'gitlab.example.com:8443', 'gitlab.example.com@evil']) {
@@ -779,7 +839,13 @@ describe('managed repo overview tracker — GitLab rows', () => {
     expect(h.github.calls).toEqual([...githubCalls('alpha'), ...githubCalls('zeta')]);
     expect(row(view, 'zeta').freshness).toBe('fresh');
     const abort = h.logs.find((line) => line.msg.includes('refresh aborted (provider/rate-limit condition)'));
-    expect(abort?.fields).toEqual({ scopes: ['gitlab:gitlab.example.com', 'gitlab:gitlab.other.test'] });
+    expect(abort?.fields).toEqual({
+      scopes: ['gitlab:gitlab.example.com', 'gitlab:gitlab.other.test'],
+      details: {
+        'gitlab:gitlab.example.com': 'rate-limit: open merge requests group/sub/gl-a on gitlab.example.com: HTTP 429',
+        'gitlab:gitlab.other.test': 'auth: project team/gl-c on gitlab.other.test: HTTP 401',
+      },
+    });
     expectValidOnBoard(view);
   });
 
@@ -995,7 +1061,7 @@ describe('managed repo overview tracker — GitLab rows', () => {
     expect(row(view, 'gl-b').error).toBeNull();
     expect(row(view, 'gl-c').error).toBeNull();
     const abort = h.logs.find((line) => line.msg.includes('refresh aborted (provider/rate-limit condition)'));
-    expect(abort?.fields).toEqual({ scopes: ['github'] });
+    expect(abort?.fields).toEqual({ scopes: ['github'], details: { github: 'rate-limit: alpha: GitHub rate limit' } });
     expect(h.logs.some((line) => line.msg.includes('call budget exhausted'))).toBe(true);
     github.errors.clear();
     order.length = 0;

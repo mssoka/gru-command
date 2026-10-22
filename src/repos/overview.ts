@@ -1466,6 +1466,7 @@ export class ManagedRepoOverviewTracker {
     if (abortedScopes.size > 0) {
       this.log('warn', 'repo overview refresh aborted (provider/rate-limit condition) — next cadence re-observes', {
         scopes: [...abortedScopes.keys()],
+        details: Object.fromEntries(abortedScopes),
       });
     }
     if (stopped === 'budget') {

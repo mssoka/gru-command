@@ -291,8 +291,27 @@ describe('managed repository overview — GitLab wording', () => {
   it('words a GitLab row in merge requests and pipelines', () => {
     expect(repoTerms(gitlabRow())).toEqual({ host: 'GitLab', requests: 'MRs', requestsLong: 'merge requests', run: 'pipeline' });
     expect(repoTerms(row())).toEqual({ host: 'GitHub', requests: 'PRs', requestsLong: 'pull requests', run: 'run' });
+    // An unnamed pipeline links under its project-scoped number.
+    expect(repoCiView(gitlabRow())).toEqual({
+      label: 'pipeline #41',
+      workflow: null,
+      url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
+      branch: 'main',
+    });
+    expect(repoCiView(gitlabRow({ run: { ...gitlabRow().run!, runNumber: null } })).label).toBe('pipeline');
+    expect(repoRunContextTitle(gitlabRow())).toBe(
+      `provider status: success · pipeline #41 · created ${CHECKED} · updated ${CHECKED}`,
+    );
+    expect(repoBadgeTitle(gitlabRow())).toBe('success');
+    const badge = repoRowBadge(gitlabRow());
+    expect(repoRowAriaLabel(gitlabRow(), badge)).toBe(
+      'alpha — PASSED — 2 open merge requests, 3 open issues excluding merge requests',
+    );
+  });
+
+  it('words an unlinked row in neutral terms, never one host\'s', () => {
     // An unlinked row has no provider (a GitLab host on a custom port reads
-    // "unrecognized remote"): neutral terms, never GitHub's.
+    // "unrecognized remote"): neutral terms, never one host's.
     const unlinked = row({
       linked: false,
       provider: null,
@@ -315,22 +334,6 @@ describe('managed repository overview — GitLab wording', () => {
     });
     expect(repoRowAriaLabel(unlinked, repoRowBadge(unlinked))).toBe(
       'alpha — NOT LINKED — unknown open pull or merge requests, unknown open issues excluding pull or merge requests',
-    );
-    // An unnamed pipeline links under its project-scoped number.
-    expect(repoCiView(gitlabRow())).toEqual({
-      label: 'pipeline #41',
-      workflow: null,
-      url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
-      branch: 'main',
-    });
-    expect(repoCiView(gitlabRow({ run: { ...gitlabRow().run!, runNumber: null } })).label).toBe('pipeline');
-    expect(repoRunContextTitle(gitlabRow())).toBe(
-      `provider status: success · pipeline #41 · created ${CHECKED} · updated ${CHECKED}`,
-    );
-    expect(repoBadgeTitle(gitlabRow())).toBe('success');
-    const badge = repoRowBadge(gitlabRow());
-    expect(repoRowAriaLabel(gitlabRow(), badge)).toBe(
-      'alpha — PASSED — 2 open merge requests, 3 open issues excluding merge requests',
     );
   });
 
