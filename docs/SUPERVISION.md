@@ -81,22 +81,29 @@ compaction.
 Pi compacts a long session on its own; each compaction appends a summary
 entry that runs no tool and sends no message. While a directive runs, the
 adapter publishes that compaction's terminal as soon as Pi's gate clears,
-and next-turn preparation waits for it before the authority check, so
+admission publishes one still withheld before its fences run, and
+next-turn preparation waits for it before the authority check, so
 supervision never holds the directive's own compaction against it.
 Directive proof (admission, the tool fence before every effect, and the
 checkpoint read for completion or recovery) walks past a compaction only
-when it is Pi's own automatic summary (`fromHook: false`, a timestamp, a
-summary and a token count) linked directly on the active chain, with its
-kept entry on that chain, in one of four places:
+when it is a Pi-authored summary, with a timestamp, a summary and a token
+count, linked directly on the active chain, with its kept entry on that
+chain. `fromHook: false` marks a Pi-authored summary: an automatic one, or
+a manual compact, which GC runs only on an idle session and so never inside
+a live turn. The SDK GC ships (^0.85.1) always writes `fromHook`; a
+compaction without it is refused. Such a compaction is walked past in one
+of four places:
 
 - **pre-prompt:** between the directive's baseline and its user receipt;
 - **mid-run:** after a completed tool round, before the next model call. A
   turn lost right there is resumable at the compaction;
 - **post-run:** directly after the final reply, which stays the turn's
   checkpoint;
-- **overflow retry:** on a reply that failed with a context overflow (or a
-  recoverable `length` stop), followed by the retried reply. The failed
-  reply is history: tool calls in it never ran.
+- **compact-and-retry:** an error or length reply, a compaction linked on
+  it, and a reply continued from that compaction. The failed reply is
+  history: tool calls in it never ran. A turn lost between that compaction
+  and the continued reply reads as the failed reply's terminal (not ok) and
+  is never resumed: the run ended on that error and nothing ran after it.
 
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the

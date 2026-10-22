@@ -136,7 +136,7 @@ function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinit
   });
 }
 
-const COMPACTION_END_RECONCILE_MS = 5_000;
+export const COMPACTION_END_RECONCILE_MS = 5_000;
 
 /**
  * Bound on the pi adapter's native-settlement proof (abort + waitForIdle) before
@@ -1789,6 +1789,10 @@ export class PiAgentHandle implements AgentHandle {
     if (mapped !== undefined) promptOptions['images'] = mapped;
     if (directive !== undefined) promptOptions['preflightResult'] = (accepted: boolean) => {
       if (!accepted) return;
+      // Pi calls this synchronously, after any pre-prompt compaction it awaited
+      // has cleared its gate; a terminal still withheld (a failed compaction
+      // awaits its failure hook first) is published before the fences run.
+      if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
       directive.beforeAdmission();
       if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
         throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
@@ -1945,10 +1949,11 @@ export class PiAgentHandle implements AgentHandle {
           this.flushCompactionEndWhenSettled();
         }, 10);
         this.compactionEndTimer.unref();
-        // Pi clears its gate synchronously after emitting the terminal, before
-        // any caller awaiting the compaction resumes: a microtask re-check
-        // publishes it ahead of a prompt's admission, an overflow retry or the
-        // next turn. The timer polls a gate that stays closed.
+        // After a successful compaction Pi clears its gate synchronously, before
+        // any caller awaiting it resumes: a microtask re-check publishes the
+        // terminal ahead of the next turn or the continued reply. A failed one
+        // awaits its failure hook first; admission then publishes it (see
+        // preflightResult). The timer polls a gate that stays closed.
         queueMicrotask(() => this.flushCompactionEndWhenSettled());
       }
       return;
@@ -2084,7 +2089,11 @@ export class PiAgentHandle implements AgentHandle {
         this.emit({ type: 'turn_end' });
         return;
       case 'compaction_start':
-        if (this.nativeCompactionOpen) return;
+        if (this.nativeCompactionOpen) {
+          // Joins the open episode; its own compaction_end re-arms the deadline.
+          this.compactionEndDeadline = 0;
+          return;
+        }
         this.nativeCompactionOpen = true;
         this.emit({ type: 'compaction_start' });
         return;
@@ -2096,18 +2105,24 @@ export class PiAgentHandle implements AgentHandle {
             this.explicitCompactionTerminal.settled)
         ) return;
         const success = e['aborted'] !== true && typeof e['errorMessage'] !== 'string';
-        this.pendingCompactionEnd = {
-          type: 'compaction_end',
-          success,
-          ...(success
-            ? {}
-            : {
-                error:
-                  typeof e['errorMessage'] === 'string'
-                    ? e['errorMessage']
-                    : 'compaction aborted',
-              }),
-        };
+        // A joined episode publishes one terminal. A failed compaction in it
+        // wins, with its own error; a cancelled one is superseded by what Pi
+        // runs next (the broad-cancellation boundary pins that).
+        const prior = this.pendingCompactionEnd;
+        if (!(prior?.type === 'compaction_end' && !prior.success && prior.error !== 'compaction aborted')) {
+          this.pendingCompactionEnd = {
+            type: 'compaction_end',
+            success,
+            ...(success
+              ? {}
+              : {
+                  error:
+                    typeof e['errorMessage'] === 'string'
+                      ? e['errorMessage']
+                      : 'compaction aborted',
+                }),
+          };
+        }
         this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
         // Pi dispatches this event before AgentSession clears isCompacting.
         // Publish only after the native gate is really open, or queued prompts

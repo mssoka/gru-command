@@ -189,11 +189,26 @@ class NativeTurn {
   private readonly lines: NativeLines;
   private count = 0;
   private scope = 'native directive turn';
+  private ended: { readonly start: number; readonly count: number } | null = null;
   constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
-   * nor refused as, this turn. */
-  end(): void { this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn'; }
+   * nor refused as, this turn. A turn ends once. */
+  end(): void {
+    if (this.ended !== null) return;
+    this.ended = { start: this.start, count: this.count };
+    this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn';
+  }
+  /** Takes back end(): what was read since belongs to the turn after all,
+   * and is charged to it under the turn's own bound and name. A line too
+   * large to read at all was refused before its role was known, under the
+   * lookahead's name: it is past both bounds. */
+  resume(): void {
+    if (this.ended === null) throw new DirectiveCheckpointError('native directive turn resumed without having ended');
+    this.start = this.ended.start; this.count += this.ended.count; this.ended = null; this.scope = 'native directive turn';
+    if (this.lines.end - this.start > MAX_NATIVE_TRANSCRIPT_BYTES) throw new DirectiveCheckpointError(`${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
+    if (this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError(`${this.scope} exceeds the entry inspection limit`);
+  }
   /** The turn's next line, or undefined at its end. */
   next(): string | undefined {
     const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, `${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
@@ -220,6 +235,8 @@ interface PiTranscript {
   readonly turn: PiTurn | null;
   /** The turn ended at the last entry read (see NativeTurn.end). */
   readonly endTurn: () => void;
+  /** Takes back endTurn (see NativeTurn.resume). */
+  readonly resumeTurn: () => void;
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
@@ -242,7 +259,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {} });
+      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {} });
     }
     const after = new NativeTurn(fd, lines.end, tail);
     const seen = new Set<string>();
@@ -256,7 +273,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       }
       return entries[index];
     };
-    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end() });
+    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume() });
   });
 }
 /** One inspection's parent links: the turn entries it has walked, over the
@@ -294,18 +311,22 @@ class PiAncestry {
  * so one linked directly on the active chain is walked past, not refused as a
  * branch. Its kept entry may lie after the directive's own user entry: the
  * directive text then leaves the model's context but stays in the transcript,
- * and GC correlates effects, never model context. Returns why `entry` is not
- * such a compaction, or null when it is.
+ * and GC correlates effects, never model context. `fromHook: false` marks a
+ * Pi-authored summary: automatic, or a manual compact, which GC runs only on
+ * an idle session and so never inside a live turn; it does not by itself
+ * prove "automatic". Returns why `entry` is not such a compaction, or null
+ * when it is.
  */
 function linkedCompactionRefusal(entry: NativeEntry, parentId: string | null, ancestry: PiAncestry): string | null {
   if (parentId === null || entry.parentId !== parentId) return 'native compaction is not linked to the active checkpoint';
-  // The pinned SDK's appendCompaction always writes the boolean.
+  // The SDK GC ships (^0.85.1) always writes fromHook; without it, refused.
   if (entry.fromHook === true) return 'native compaction summary was authored by an extension hook';
   if (entry.fromHook !== false) return 'native compaction hook marker is malformed';
   if (typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '') return 'native compaction lacks a timestamp';
   if (typeof entry.summary !== 'string' || entry.summary.trim() === '') return 'native compaction lacks a summary';
   if (typeof entry.tokensBefore !== 'number' || !Number.isFinite(entry.tokensBefore) || entry.tokensBefore < 0) return 'native compaction token count is malformed';
   if (typeof entry.firstKeptEntryId !== 'string' || !ancestry.isActiveAncestor(entry.firstKeptEntryId, parentId)) return 'native compaction keeps an entry off the active chain';
+  // Only the compactions this inspection linked are known: the prefix keeps no entry types.
   if (ancestry.isCompaction(entry.firstKeptEntryId)) return 'native compaction keeps another compaction, not a message';
   return null;
 }
@@ -316,16 +337,19 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
   if (previous.type !== 'message' || previous.message?.role !== 'toolResult') return 'native compaction does not follow a completed tool round';
   return linkedCompactionRefusal(entry, previous.id, ancestry);
 }
-/** Pi's context-overflow recovery: an `error` or `length` reply, a compaction
- * linked on it, then the retried reply on that compaction (`agent.continue()`,
- * no prompt). The failed reply ran no tool: tool calls in it never executed
- * and are inert history, never pending. `after(1)` and `after(2)` are the
- * entries that follow `reply`, read only for such a reply. Returns that
- * compaction, or null when `reply` is not one Pi retried. */
-function overflowRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | null {
+/** Pi's compact-and-retry: an `error` or `length` reply, a compaction linked
+ * on it, and a reply continued from that compaction (`agent.continue()`, no
+ * prompt). The failed reply ran no tool: tool calls in it never executed and
+ * are inert history, never pending. `after(1)` and `after(2)` are the entries
+ * that follow `reply`, read only for such a reply. Returns that compaction;
+ * the named refusal when the compaction on such a reply is not Pi's; null
+ * when nothing continued `reply`. */
+function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
   if (reply.message?.role !== 'assistant' || !['error', 'length'].includes(String(reply.message.stopReason))) return null;
   const compaction = after(1);
-  if (typeof compaction !== 'object' || compaction.type !== 'compaction' || linkedCompactionRefusal(compaction, reply.id, ancestry) !== null) return null;
+  if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
+  const refusal = linkedCompactionRefusal(compaction, reply.id, ancestry);
+  if (refusal !== null) return refusal;
   const retried = after(2);
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
   return compaction;
@@ -517,7 +541,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
 function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, transcript: PiTranscript): DirectiveCheckpoint {
-  const { header, malformed, turn: native, endTurn } = transcript;
+  const { header, malformed, turn: native, endTurn, resumeTurn } = transcript;
   const { identity } = binding;
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
   const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
@@ -586,8 +610,12 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
-      const retry = overflowRetryCompaction(entry, (offset) => native(index + offset), ancestry);
+      // Unless Pi continued it, an error or length reply is the terminal: what
+      // follows is read as lookahead, and taken back into the turn if it is.
+      const retry = compactAndRetryCompaction(entry, (offset) => { endTurn(); return native(index + offset); }, ancestry);
+      if (typeof retry === 'string') return unknown(retry);
       if (retry !== null) {
+        resumeTurn();
         // The failed reply is history; the turn continues on the compaction.
         ancestry.link(retry);
         previous = retry;
@@ -1120,8 +1148,9 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     previous = entry;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
-      const retry = overflowRetryCompaction(entry, (offset) => native[at + offset], ancestry);
-      if (retry !== null) {
+      const retry = compactAndRetryCompaction(entry, (offset) => native[at + offset], ancestry);
+      if (typeof retry === 'string') refuse(retry);
+      else if (retry !== null) {
         ancestry.link(retry);
         previous = retry;
         at += 1;

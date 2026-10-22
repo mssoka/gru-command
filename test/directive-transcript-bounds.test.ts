@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  assertClaudeDirectiveToolIntent, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint,
+  DirectiveCheckpointError, assertClaudeDirectiveToolIntent, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint,
   prepareClaudeDirectiveBinding, prepareDirectiveBinding, readDirectiveBinding, readDirectiveSessionHeader, type DirectiveTurnIdentity,
 } from '../src/runtime/directive-checkpoint.js';
 
@@ -486,8 +486,10 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
     const asked = { ...invocation, content: [next] };
     const sibling = { ...toolCall, id: 'call-x' };
     const OPEN_ROUND = 'native compaction interrupts an open tool round';
-    for (const [mode, refusal] of [['after-round', null], ['pre-prompt', null], ['overflow-retry', null], ['inside-round', OPEN_ROUND], ['inside-batch', OPEN_ROUND],
-      ['hook-authored', 'native compaction summary was authored by an extension hook']] as const) {
+    const HOOK_AUTHORED = 'native compaction summary was authored by an extension hook';
+    for (const [mode, refusal] of [['after-round', null], ['pre-prompt', null], ['overflow-retry', null], ['overflow-retry-kept-failed', null],
+      ['inside-round', OPEN_ROUND], ['inside-batch', OPEN_ROUND], ['hook-authored', HOOK_AUTHORED],
+      ['overflow-retry-hook', HOOK_AUTHORED], ['overflow-retry-no-summary', 'native compaction lacks a summary']] as const) {
       const file = sessionFile(piHeader);
       const earlier = piEntry(file, 'h1', piEntry(file, 'h0', null, prompt('earlier')), answer);
       preparePi(file);
@@ -496,13 +498,17 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
       let settled = piEntry(file, 'result-1', mode === 'inside-round' ? compaction(file, 'compaction', first, receipt) : first, toolResult('call-1'));
       // Between two results of one batch: the round is still open.
       if (mode === 'inside-batch') settled = piEntry(file, 'result-x', compaction(file, 'compaction', settled, receipt), toolResult('call-x'));
-      // Pi's overflow recovery: a failed reply (its tool call never ran), a compaction on it, then the retried call.
-      if (mode === 'overflow-retry') settled = compaction(file, 'compaction', piEntry(file, 'overflowed', settled, { role: 'assistant', stopReason: 'error',
-        errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: [{ ...toolCall, id: 'never-run' }] }), receipt);
+      // Pi's compact-and-retry: a failed reply (its tool call never ran), a compaction on it, then the continued call.
+      if (mode.startsWith('overflow-retry')) {
+        const failed = piEntry(file, 'overflowed', settled, { role: 'assistant', stopReason: 'error',
+          errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: [{ ...toolCall, id: 'never-run' }] });
+        settled = compaction(file, 'compaction', failed, mode === 'overflow-retry-kept-failed' ? failed : receipt,
+          mode === 'overflow-retry-hook' ? { fromHook: true } : mode === 'overflow-retry-no-summary' ? { summary: undefined } : {});
+      }
       const tip = mode === 'after-round' || mode === 'hook-authored'
         ? compaction(file, 'compaction', settled, receipt, mode === 'hook-authored' ? { fromHook: true } : {}) : settled;
       piEntry(file, 'use-2', tip, asked);
-      if (refusal !== null) expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).toThrow(new RegExp(`^${refusal}$`, 'u'));
+      if (refusal !== null) expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).toThrow(new DirectiveCheckpointError(refusal));
       else expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).not.toThrow();
     }
   });
@@ -590,6 +596,20 @@ describe('limits at their exact boundaries (#469)', () => {
     };
     expect(inspectDirectiveCheckpoint(turn(LIMIT), identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
     expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
+  });
+
+  it('pi: a turn of exactly 32 MiB ending on an error reply nothing continued leaves Pi\'s compaction on it to the lookahead (#481)', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const overflow = 'prompt is too long: 150000 tokens > 100000 maximum';
+    const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+    const failed = (body: string) => `${JSON.stringify({ type: 'message', id: 'failed-a', parentId: 'receipt-a',
+      message: { role: 'assistant', stopReason: 'error', errorMessage: overflow, content: [{ type: 'text', text: body }] } })}\n`;
+    appendFileSync(file, receipt + failed('x'.repeat(LIMIT - Buffer.byteLength(receipt) - Buffer.byteLength(failed('')))));
+    // Read to see whether Pi continued the failed reply, the compaction is lookahead: no reply follows it.
+    appendFileSync(file, `${JSON.stringify({ type: 'compaction', id: 'post-run', parentId: 'failed-a', timestamp: '2026-10-22T00:00:00.000Z',
+      summary: 'Pi automatic compaction summary', firstKeptEntryId: 'receipt-a', tokensBefore: 90_000, fromHook: false })}\n`);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'failed-a', error: overflow });
   });
 
   it('a header line of exactly 64 KiB is read; one byte more refuses', () => {

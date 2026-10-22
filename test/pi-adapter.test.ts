@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
-import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
+import { COMPACTION_END_RECONCILE_MS, PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import type { DirectiveProducer } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, applyThinkingFallback, ledgerReviewOwnerCessation, serviceRegistryOptions } from '../src/runtime/registry.js';
@@ -4647,6 +4647,7 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const effect = (line: string) => `printf '${line}\\n' >> overflow-effect.txt`;
+  const published: string[] = [];
   const f = await sdkDirectiveExecutionFixture([
     { deltas: ['history '.repeat(100)], toolCall: { id: 'before-overflow', name: 'bash', args: { command: effect('before') } } },
     // The provider rejects the next request as too long; the tool call in that failed reply never runs.
@@ -4654,7 +4655,13 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
     { deltas: ['overflow recovery summary'] },
     { deltas: [], toolCall: { id: 'after-retry', name: 'bash', args: { command: effect('after') } } },
     { deltas: ['completed after overflow recovery'] },
-  ]);
+  ], (_session, spawned) => {
+    spawned.subscribe((event) => {
+      if (event.type === 'compaction_start') published.push(event.type);
+      if (event.type === 'compaction_end') published.push(`compaction_end:${event.success ? 'success' : event.error ?? 'failed'}`);
+      if (event.type === 'tool_start') published.push(`tool_start:${event.callId}`);
+    });
+  });
   writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
   const { supervisor, deps } = await superviseDirectiveFixture(f);
   try {
@@ -4665,6 +4672,8 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
     expect(rows[failed + 1]).toMatchObject({ type: 'compaction', parentId: rows[failed]!.id });
     expect(rows[failed + 2]).toMatchObject({ type: 'message', parentId: rows[failed + 1]!.id, message: { role: 'assistant', stopReason: 'toolUse' } });
     expect(readFileSync(join(f.scene.lane.path, 'overflow-effect.txt'), 'utf8')).toBe('before\nafter\n');
+    // The compaction's terminal is published before the continued reply's tool starts.
+    expect(published).toEqual(['tool_start:before-overflow', 'compaction_start', 'compaction_end:success', 'tool_start:after-retry']);
     expect(rows.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message!.toolCallId, entry.message!.isError]))
       .toEqual([['before-overflow', false], ['after-retry', false]]);
     const final = rows.at(-1)!;
@@ -4711,6 +4720,44 @@ it('Pi pre-prompt compaction publishes its terminal before the supervised direct
     expect(rows[user - 1]).toMatchObject({ type: 'compaction', parentId: row.nativeBinding!.baseline });
     expect(published).toEqual(['compaction_start', 'compaction_end:success', 'tool_start']);
     expect(readFileSync(join(f.scene.lane.path, 'pre-prompt-effect.txt'), 'utf8')).toBe('once\n');
+    expect(inspectDirectiveCheckpoint(minion.sessionFile!, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(row.state).toBe('settled');
+    expect(readFileSync(`${minion.sessionFile!}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
+  } finally { supervisor.dispose(); await f.cleanup(); }
+});
+
+it('a failed Pi pre-prompt compaction publishes its terminal before the supervised directive\'s admission fences run', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  // Both summaries fail: after the earlier reply, and again before the
+  // directive's prompt. Pi awaits its failure hook before its gate clears.
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: ['history '.repeat(100)], usageTokens: 90_000 },
+    { deltas: [], error: 'summary provider failed' },
+    { deltas: [], error: 'pre-prompt summary provider failed' },
+    { deltas: [], toolCall: { id: 'after-failed-compaction', name: 'bash', args: { command: "printf 'once\\n' >> failed-compaction-effect.txt" } } },
+    { deltas: ['completed after a failed pre-prompt compaction'] },
+  ]);
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  const { supervisor, deps } = await superviseDirectiveFixture(f);
+  const published: string[] = [];
+  try {
+    const minion = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'failed-pre-prompt-minion' });
+    minion.subscribe((event) => {
+      if (event.type === 'compaction_start' || event.type === 'tool_start') published.push(event.type);
+      if (event.type === 'compaction_end') published.push(`compaction_end:${event.success ? 'success' : event.error ?? 'failed'}`);
+    });
+    await minion.prompt('earlier ordinary work');
+    await waitFor(() => minion.isCompacting?.() === false, 'failed post-run compaction terminal');
+    published.length = 0; // only the directive's own episode
+    await executeAcceptedDirective(deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(published).toEqual(['compaction_start', expect.stringMatching(/^compaction_end:.*pre-prompt summary provider failed/u), 'tool_start']);
+    expect(row.nativeTarget?.agentId).toBe(minion.id);
+    // The failed compaction wrote no entry: the receipt follows the baseline.
+    const rows = nativeEntries(minion.sessionFile!);
+    expect(rows.find((entry) => entry.id === row.nativeBinding?.userEntryId)).toMatchObject({ parentId: row.nativeBinding!.baseline });
+    expect(readFileSync(join(f.scene.lane.path, 'failed-compaction-effect.txt'), 'utf8')).toBe('once\n');
     expect(inspectDirectiveCheckpoint(minion.sessionFile!, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true });
     expect(row.state).toBe('settled');
     expect(readFileSync(`${minion.sessionFile!}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
@@ -4784,22 +4831,22 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose' | 'deadline
   if (by === 'deadline') handle.subscribe((event) => { if (event.type === 'compaction_end') held = false; });
   // Synchronization only: preparation has registered its wait for the withheld terminal.
   const waiters = (handle as unknown as { readonly compactionTerminalWaiters: ReadonlySet<unknown> }).compactionTerminalWaiters;
+  let clock: { mockRestore(): void } | null = null;
   try {
     const turn = handle.promptWithVerdict!('approved directive', { directive: { identity: scene.identity,
       beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
       onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
     await waitFor(() => waiters.size === 1, 'next-turn preparation waiting for the withheld compaction terminal');
     let disposing: Promise<void> | null = null;
-    let clock: { mockRestore(): void } | null = null;
     if (by === 'abort') session.agent.abort();
     else if (by === 'dispose') { disposing = handle.dispose(); held = false; }
     else {
-      // The gate stays closed past COMPACTION_END_RECONCILE_MS: the next poll publishes a failed terminal and disposes.
+      // The gate stays closed past the reconcile bound: the next poll publishes a failed terminal and disposes.
       const now = Date.now.bind(Date);
-      clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + 10_000);
+      clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
     }
     const verdict = await turn;
-    clock?.mockRestore();
+    clock?.mockRestore(); clock = null;
     expect(verdict.ok).toBe(false);
     expect(verdict.error).toContain('native directive ownership cancelled while its compaction terminal was pending');
     expect(waiters.size).toBe(0);
@@ -4820,19 +4867,31 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose' | 'deadline
     await (disposing ?? handle.dispose());
     expect(handle.cessationEvidence!()).toBe('ceased');
     expect(f.store.isHeld(handle.sessionFile!)).toBe(false);
-  } finally { held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
+  } finally { clock?.mockRestore(); held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
 }
 it('a directive abort during the compaction terminal wait refuses at once, without another model request', () => assertCompactionWaitCancelled('abort'));
 it('disposal during the compaction terminal wait refuses at once and releases native ownership', () => assertCompactionWaitCancelled('dispose'));
 it('a compaction terminal that never settles ends the waiting preparation at the reconcile deadline with a refusal', () => assertCompactionWaitCancelled('deadline'));
 
-it('a compaction Pi starts while an earlier terminal is still withheld holds next-turn preparation until it publishes', async () => {
+/** A directive whose pre-prompt compaction terminal is still withheld (Pi's
+ * gate held) when Pi starts its mid-run compaction: the adapter folds that
+ * start into the open episode and publishes one terminal for both. */
+async function assertJoinedCompaction(scenario: 'success-success' | 'failure-success' | 'success-failure' | 'past-deadline') {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
+  let releaseJoinedSummary!: () => void;
+  const joinedSummaryHold = new Promise<void>((resolveHold) => { releaseJoinedSummary = resolveHold; });
   // Summary requests answer apart from replies: the first fails, so Pi
   // compacts again before the directive's prompt.
-  let summaries = 0; let replies = 0;
+  let summaries = 0; let replies = 0; let joinedSummaryStarted = false;
   const f = await fixture((prompt) => {
-    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['automatic summary'] };
+    if (prompt.startsWith('<conversation>')) {
+      const index = summaries++;
+      if (index === 0) return { deltas: [], error: 'summary provider failed' };
+      if (index === 1 && scenario === 'failure-success') return { deltas: [], error: 'pre-prompt summary provider failed' };
+      if (index === 2 && scenario === 'success-failure') return { deltas: [], error: 'mid-run summary provider failed' };
+      if (index === 2 && scenario === 'past-deadline') { joinedSummaryStarted = true; return { deltas: ['automatic summary'], hold: joinedSummaryHold }; }
+      return { deltas: ['automatic summary'] };
+    }
     return [
       { deltas: ['history '.repeat(100)], usageTokens: 90_000 },
       { deltas: ['history '.repeat(100)], toolCall: { id: 'during-hold', name: 'bash', args: { command: "printf 'once\\n' >> held-effect.txt" } }, usageTokens: 90_000 },
@@ -4840,8 +4899,8 @@ it('a compaction Pi starts while an earlier terminal is still withheld holds nex
     ][replies++] ?? { deltas: ['unexpected extra reply'] };
   });
   writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
-  const scene = await directiveRecoveryLedgerFixture('swallowed-compaction-start');
-  const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: 'swallowed-start-minion' });
+  const scene = await directiveRecoveryLedgerFixture(`joined-compaction-${scenario}`);
+  const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: `joined-compaction-${scenario}-minion` });
   const session = await actualDirectiveSdkSession(handle); session.agent.toolExecution = 'sequential';
   scene.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: scene.request.jobId, sessionFile: handle.sessionFile });
   scene.ledger.setAgentState(handle.id, 'idle');
@@ -4850,8 +4909,14 @@ it('a compaction Pi starts while an earlier terminal is still withheld holds nex
   // terminal, so the adapter still withholds it when Pi starts the mid-run one.
   const nativeCompacting = Object.getOwnPropertyDescriptor(AgentSession.prototype, 'isCompacting')!.get!;
   let armed = false; let held = false; let nativeEnds = 0;
+  const nativeErrors: string[] = [];
   Object.defineProperty(session, 'isCompacting', { configurable: true, get: () => held || nativeCompacting.call(session) });
-  session.subscribe((event) => { if (armed && event.type === 'compaction_end') { held = true; nativeEnds += 1; } });
+  session.subscribe((event) => {
+    if (!armed || event.type !== 'compaction_end') return;
+    held = true; nativeEnds += 1;
+    const error = (event as { readonly errorMessage?: unknown }).errorMessage;
+    if (typeof error === 'string') nativeErrors.push(error);
+  });
   // Outside the adapter's wrapper: whether the adapter still reported compaction when preparation returned.
   let compactingAfterPreparation: boolean | null = null;
   const prepare = session.agent.prepareNextTurnWithContext!.bind(session.agent);
@@ -4863,6 +4928,7 @@ it('a compaction Pi starts while an earlier terminal is still withheld holds nex
   const events = collect(handle);
   // Synchronization only: preparation has registered its wait for the withheld terminal.
   const waiters = (handle as unknown as { readonly compactionTerminalWaiters: ReadonlySet<unknown> }).compactionTerminalWaiters;
+  let clock: { mockRestore(): void } | null = null;
   try {
     await handle.prompt('earlier ordinary work');
     await waitFor(() => handle.isCompacting?.() === false, 'failed post-run compaction terminal');
@@ -4871,6 +4937,18 @@ it('a compaction Pi starts while an earlier terminal is still withheld holds nex
     const turn = handle.promptWithVerdict!('approved directive', { directive: { identity: scene.identity,
       beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
       onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    if (scenario === 'past-deadline') {
+      // The joined summary outlasts the first terminal's reconcile bound: the
+      // joined start disarmed it, so the polls publish nothing and keep the session.
+      await waitFor(() => joinedSummaryStarted, 'the joined compaction summary in flight');
+      const polls = vi.spyOn(handle as unknown as { flushCompactionEndWhenSettled(): void }, 'flushCompactionEndWhenSettled');
+      const now = Date.now.bind(Date);
+      clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
+      await waitFor(() => polls.mock.calls.length >= 2, 'withheld-terminal polls past the first episode\'s reconcile bound');
+      expect(events.filter((event) => event.type === 'compaction_end')).toEqual([]);
+      clock.mockRestore(); clock = null; polls.mockRestore();
+      releaseJoinedSummary();
+    }
     await waitFor(() => nativeEnds === 2 && waiters.size === 1, 'next-turn preparation waiting after both native compactions');
     expect(compactingAfterPreparation).toBeNull();
     // The second native start joined the open episode: one start, nothing published yet.
@@ -4878,11 +4956,20 @@ it('a compaction Pi starts while an earlier terminal is still withheld holds nex
     held = false;
     expect(await turn).toEqual({ ok: true, error: null });
     expect(compactingAfterPreparation).toBe(false);
-    expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: true }]);
+    // One terminal for the joined episode; any failure in it wins, with its own error.
+    const failed = scenario === 'failure-success' || scenario === 'success-failure';
+    expect(nativeErrors).toHaveLength(failed ? 1 : 0);
+    if (failed) expect(nativeErrors[0]).toContain(scenario === 'failure-success' ? 'pre-prompt summary provider failed' : 'mid-run summary provider failed');
+    expect(events.filter((event) => event.type === 'compaction_end')).toEqual([failed ? { type: 'compaction_end', success: false, error: nativeErrors[0] } : { type: 'compaction_end', success: true }]);
+    expect(handle.health().state).not.toBe('disposed');
     expect(readFileSync(join(scene.lane.path, 'held-effect.txt'), 'utf8')).toBe('once\n');
     expect(replies).toBe(3);
-  } finally { held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
-});
+  } finally { clock?.mockRestore(); releaseJoinedSummary(); held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
+}
+it('a compaction Pi starts while an earlier terminal is still withheld holds next-turn preparation until it publishes', () => assertJoinedCompaction('success-success'));
+it('a joined compaction episode publishes one terminal: an earlier failure wins over a later success', () => assertJoinedCompaction('failure-success'));
+it('a joined compaction episode publishes one terminal: a later failure wins over an earlier success', () => assertJoinedCompaction('success-failure'));
+it('a joined compaction running past the first terminal\'s reconcile bound publishes its real terminal and the session lives', () => assertJoinedCompaction('past-deadline'));
 
 it('restart recovery continues a directive the host lost right after Pi\'s mid-run compaction: one model call, the earlier effect never re-run', async () => {
   const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
