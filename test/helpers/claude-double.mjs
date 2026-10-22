@@ -300,7 +300,7 @@ async function askHost(toolName, callId, input) {
   return decision;
 }
 
-async function emitToolTurn(toolName, toolError = false, callId = 'toolu_double_1') {
+async function emitToolTurn(toolName, toolError = false, callId = 'toolu_double_1', answer = true) {
   if (partials) {
     streamEvent({
       type: 'content_block_start',
@@ -341,7 +341,7 @@ async function emitToolTurn(toolName, toolError = false, callId = 'toolu_double_
       content: [{ type: 'tool_result', tool_use_id: callId, content: denied ? (decision?.message ?? 'denied') : toolError ? 'tool failed' : 'ok', is_error: denied || toolError }],
     },
   });
-  await emitTextTurn(denied ? 'tool refused' : 'tool done');
+  if (answer) await emitTextTurn(denied ? 'tool refused' : 'tool done');
 }
 
 /** Claude Code 2.1.306's replay filter (#472): a user message whose text holds
@@ -812,9 +812,10 @@ async function run() {
   }
   if (prompt.includes('tool-error:')) {
     const name = prompt.split('tool-error:')[1].split(/\s/)[0] || 'Bash';
-    await emitToolTurn(name, true);
-    // The minion goes on after the failure with another tool of its own.
-    if (process.env.CLAUDE_DOUBLE_TOOL_AFTER_ERROR === '1') await emitToolTurn(name, false, 'toolu_double_2');
+    // The minion may go straight on to another tool after the failure, with no text between.
+    const after = process.env.CLAUDE_DOUBLE_TOOL_AFTER_ERROR === '1';
+    await emitToolTurn(name, true, 'toolu_double_1', !after);
+    if (after) await emitToolTurn(name, false, 'toolu_double_2');
     out(resultFrame('tool failed', false));
     return;
   }

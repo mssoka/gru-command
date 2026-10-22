@@ -107,8 +107,9 @@ export class ClaudeDirectivePermissionChannel {
       typeof toolUse === 'string' && toolUse !== '' && !this.toolUses.has(toolUse) &&
       input !== null && typeof input === 'object' && !Array.isArray(input);
     if (!valid) {
-      if (typeof id === 'string' && id !== '' && !this.closed) {
-        this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' });
+      // Only a deny the CLI was actually sent is a refusal.
+      if (typeof id === 'string' && id !== '' && !this.closed &&
+          this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' })) {
         this.deps.refused(undefined, 'malformed or foreign directive permission request');
       }
       this.deps.fail('malformed or foreign directive permission request');
@@ -127,29 +128,33 @@ export class ClaudeDirectivePermissionChannel {
       (decision) => this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message }),
       (error: unknown) => {
         const reason = `directive tool fence failed: ${error instanceof Error ? error.message : String(error)}`;
-        this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' });
-        this.deps.refused(tool.toolUseId, reason);
+        if (!this.closed && this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' })) {
+          this.deps.refused(tool.toolUseId, reason);
+        }
         this.deps.fail(reason);
       },
     );
   }
 
-  private respond(requestId: string, response: Record<string, unknown>): void {
-    this.write({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } }, true);
+  /** Whether the response was handed to the CLI. */
+  private respond(requestId: string, response: Record<string, unknown>): boolean {
+    return this.write({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } }, true);
   }
 
-  private write(frame: StreamFrame, echoed: boolean): void {
+  private write(frame: StreamFrame, echoed: boolean): boolean {
     if (this.closed || this.child.stdin == null || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
       this.deps.fail('directive permission transport is unavailable');
-      return;
+      return false;
     }
     if (echoed) this.echoes.push(frame);
     try {
       this.child.stdin.write(`${JSON.stringify(frame)}\n`, (error) => {
         if (error != null) this.deps.fail('directive permission transport failed');
       });
+      return true;
     } catch {
       this.deps.fail('directive permission transport failed');
+      return false;
     }
   }
 }

@@ -4835,8 +4835,8 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
     const handle = f.registry.getHandle(row.nativeTarget!.agentId)!;
     f.sessions[0]!.agent.state.systemPrompt = 'unapproved current role authority'; release(); await run;
     expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(1);
-    // Its refused tools' errors never read as ordinary work while their receipts are owed.
-    expect(checkpoint.inspectDirectiveCheckpoint(file, f.scene.identity)).not.toMatchObject({ state: 'terminal', ok: true });
+    // While its tool refusals' receipts are owed, the refusal at the next model request is durable: never ordinary work.
+    expect(checkpoint.inspectDirectiveCheckpoint(file, f.scene.identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
     expect(handle.cessationEvidence!()).toBe('unknown'); expect(f.fx.store.isHeld(file)).toBe(true); expect(existsSync(`${file}.lock`)).toBe(true);
     expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
     failing = false; await f.registry.disposeHandle(handle);
@@ -5207,7 +5207,7 @@ describe('scheduled verification ordinary Pi Bash', () => {
   it('scheduled verification guard refuses the exact web incident before any producer', async () => refuses(WEB_INCIDENT));
   it('scheduled verification guard refuses the exact npm test incident before any producer', async () => refuses(FULL_INCIDENT));
   it('scheduled verification guard refuses the entire exact build compound before its first producer', async () => refuses(BUILD_INCIDENT));
-  it('a directive whose minion is refused a test command is ordinary work: the minion goes on and the directive completes', async () => {
+  it('a directive whose minion is refused a test command is ordinary work: the minion goes on and the directive completes #contract:directive-tool-error:pi', async () => {
     const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
     const lane = verificationLane(); cleanupDirs.push(lane.root);
     const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;

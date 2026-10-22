@@ -2591,7 +2591,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
 
     it('a refused tool\'s deny is written before the turn ends, and a CLI that ignores SIGTERM is killed after the grace period', async () => {
-      const fx = fixture({ killGraceMs: 300 });
+      const fx = fixture({ killGraceMs: 1500 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const identity = identityFor('claude-stubborn');
       process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'] = '1';
@@ -2612,8 +2612,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
-    it('a CLI that asks twice for one tool use gets a durable refusal: the turn never completes, even if it reports success', async () => {
-      const fx = fixture({ killGraceMs: 300 });
+    it('a CLI that asks twice for one tool use gets a durable refusal: the turn never completes, even if it reports success #contract:directive-tool-error:claude-code', async () => {
+      const fx = fixture({ killGraceMs: 1500 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const identity = identityFor('claude-asked-twice');
       process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
@@ -3091,6 +3091,31 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
+    it('a CLI that asks twice records no completion even while its refusal receipt is still owed', async () => {
+      const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+      const journal = vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal').mockImplementationOnce(() => { throw new Error('refusal journal unavailable'); });
+      const fx = fixture({ killGraceMs: 1500 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-asked-twice-owed');
+      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/malformed or foreign directive permission request/u);
+        expect(journal).toHaveBeenCalled();
+        const result = frames(handle.sessionFile!).find((frame) => frame['type'] === 'result' && frame['subtype'] === 'success')!;
+        // The CLI reported success while the receipt was owed: the failed directive still recorded no completion.
+        expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).toBeNull();
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        journal.mockRestore();
+        await handle.dispose();
+      }
+      // The owed receipt is written with the producer's cessation.
+      expect(checkpoint.inspectDirectiveCheckpoint(handle.sessionFile!, identity))
+        .toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
+    });
+
     it('a minion that goes on to another tool after a failed one is allowed it, and the turn completes', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
@@ -3101,6 +3126,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const results = transcript.flatMap((frame) => frame['type'] === 'user' && frame['isReplay'] !== true ? (frame['message'] as { content: Record<string, unknown>[] }).content : [])
         .filter((block) => block['type'] === 'tool_result').map((block) => [block['tool_use_id'], block['is_error']]);
       expect(results).toEqual([['toolu_double_1', true], ['toolu_double_2', false]]);
+      // The second tool_use is the minion's first frame after the failure.
+      const failedAt = transcript.findIndex((frame) => JSON.stringify(frame['message'] ?? null).includes('"is_error":true'));
+      expect(transcript.slice(failedAt + 1).find((frame) => frame['type'] === 'assistant')?.['message']).toMatchObject({ content: [{ type: 'tool_use', id: 'toolu_double_2' }] });
       expect(transcript.filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toHaveLength(2);
       const result = transcript.find((frame) => frame['type'] === 'result')!;
       expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });

@@ -933,7 +933,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
     expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
   });
-  it('a pi turn that stopped at a tool error it never answered stays UNKNOWN: it may be an interrupted effect', async () => {
+  it('a pi turn that stopped at a tool error it never answered stays UNKNOWN: it may be an interrupted effect #contract:directive-tool-error:pi', async () => {
     const f = await fixture(); f.seed();
     f.native.append(bashCall('first')); f.native.append(bashResult('first', true));
     expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });

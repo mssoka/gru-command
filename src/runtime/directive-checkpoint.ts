@@ -687,7 +687,8 @@ function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNative
       const message = frame['message'] as { content?: unknown } | undefined;
       const blocks = Array.isArray(message?.content) ? message.content as Record<string, unknown>[] : [];
       if (type === 'assistant') {
-        unanswered = false;
+        // Only the main agent's own frame answers it, never a sub-agent's.
+        if (frame['parent_tool_use_id'] == null) unanswered = false;
         for (const block of blocks) {
           if (block['type'] !== 'tool_use') continue;
           if (typeof block['id'] !== 'string' || block['id'] === '' || typeof block['name'] !== 'string' || block['name'] === '' ||
