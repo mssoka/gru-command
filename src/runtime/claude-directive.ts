@@ -63,7 +63,8 @@ export class ClaudeDirectivePermissionChannel {
     private readonly deps: {
       readonly fail: (message: string) => void;
       /** A tool request this channel denied itself (malformed or foreign, or a
-       * fence that failed): the host keeps a durable refusal of it. */
+       * fence that failed), once the deny is handed to the CLI's stdin: the
+       * host keeps a durable refusal of it. */
       readonly refused: (toolUseId: string | undefined, reason: string) => void;
       /** Called once per tool request, after the request frame is durable. */
       readonly decide: (request: ClaudeToolRequest, durable: Promise<void>) => Promise<ClaudeToolDecision>;
@@ -107,7 +108,7 @@ export class ClaudeDirectivePermissionChannel {
       typeof toolUse === 'string' && toolUse !== '' && !this.toolUses.has(toolUse) &&
       input !== null && typeof input === 'object' && !Array.isArray(input);
     if (!valid) {
-      // Only a deny the CLI was actually sent is a refusal.
+      // Only a deny handed to the CLI's stdin is a refusal.
       if (typeof id === 'string' && id !== '' && !this.closed &&
           this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' })) {
         this.deps.refused(undefined, 'malformed or foreign directive permission request');

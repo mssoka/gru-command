@@ -4858,7 +4858,7 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
     expect(f.scene.ledger.workRevisionState(row.jobId).delivered).toBe(0);
   } finally { release(); failing = false; journal.mockRestore(); await f.cleanup(); }
 }
-it('actual SDK pre-commit refusal journal failure retains lock and retries refusal before cessation or restart settlement', () => assertSdkRefusalJournalRetry(false));
+it('actual SDK pre-commit refusal journal failure retains lock and retries refusal before cessation or restart settlement #contract:directive-tool-error:pi', () => assertSdkRefusalJournalRetry(false));
 it('actual SDK post-commit refusal journal failure fsync-retries exact receipts without duplicate refusals or delivery', () => assertSdkRefusalJournalRetry(true));
 
 it('real SDK system mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-role'));

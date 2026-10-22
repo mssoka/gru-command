@@ -3094,6 +3094,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     it('a CLI that asks twice records no completion even while its refusal receipt is still owed', async () => {
       const checkpoint = await import('../src/runtime/directive-checkpoint.js');
       const journal = vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal').mockImplementationOnce(() => { throw new Error('refusal journal unavailable'); });
+      onTestFinished(() => journal.mockRestore());
       const fx = fixture({ killGraceMs: 1500 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const identity = identityFor('claude-asked-twice-owed');
@@ -3108,7 +3109,6 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).toBeNull();
       } finally {
         delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
-        journal.mockRestore();
         await handle.dispose();
       }
       // The owed receipt is written with the producer's cessation.
