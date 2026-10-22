@@ -1291,6 +1291,13 @@ export class PiAgentHandle implements AgentHandle {
     if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
     if (this.directiveAdmissionError !== null) throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`);
     if (this.publishedDirectiveAdmission !== directive) throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
+    // Pi reports compaction_end before clearing its native isCompacting gate.
+    // The adapter normally publishes that terminal from a short poll, but a
+    // completed automatic compaction can reach this authority boundary first.
+    // Reconcile synchronously here so supervision observes the genuine closed
+    // control before its current-native producer check; an active SDK gate is
+    // still retained by flushCompactionEndWhenSettled().
+    this.flushCompactionEndWhenSettled();
     if (recheckCurrentAdmission) directive.beforeAdmission();
     if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect or completion');
   }
