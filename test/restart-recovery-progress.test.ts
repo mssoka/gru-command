@@ -921,6 +921,28 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
     expect(inspectDirectiveCheckpoint(f.file, f.identity).state).toBe('resumable');
   });
+  const bashCall = (id: string) => ({ role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id, name: 'bash', arguments: { command: 'npm test' } }] });
+  const bashResult = (id: string, isError: boolean) => ({ role: 'toolResult', toolCallId: id, toolName: 'bash', isError,
+    content: [{ type: 'text', text: isError ? 'Command exited with code 1' : 'ok' }] });
+  it('a pi tool error the minion went on to answer is ordinary work: its own stop settles the directive', async () => {
+    const f = await fixture(); f.seed();
+    f.native.append(bashCall('failing')); f.native.append(bashResult('failing', true));
+    f.native.finish();
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+  });
+  it('a pi turn that stopped at a tool error it never answered stays UNKNOWN: it may be an interrupted effect', async () => {
+    const f = await fixture(); f.seed();
+    f.native.append(bashCall('first')); f.native.append(bashResult('first', true));
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+    // Once answered, the error is history: a later successful batch is an ordinary resumable checkpoint.
+    f.native.append(bashCall('second')); f.native.append(bashResult('second', false));
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'resumable' });
+  });
   it('rejects a stale terminal before an unbound later user tail', () => assertStaleTerminalTail('user'));
   it('rejects a stale terminal before a later branch tail', () => assertStaleTerminalTail('branch'));
   it('rejects a stale terminal before a later assistant tail', () => assertStaleTerminalTail('assistant'));

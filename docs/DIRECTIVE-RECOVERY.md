@@ -314,6 +314,17 @@ results/effects, changed native authority and unsupported runtimes refuse
 loudly. Claude CLI currently cannot attest this exact checkpoint protocol;
 its capability refusal stays visible rather than inventing admission.
 
+A failed tool call the minion went on to answer is ordinary work, such as a
+failing test or a `grep` with no match. A turn that reaches its own
+successful end completes, on both runtimes, whatever failed along the way. A
+pi turn that stopped at a tool error it never answered stays UNKNOWN: GC
+cannot tell an ordinary failure from an interrupted effect, so that is a
+recovery judgment. A lane's verification policy refusing a test command is
+ordinary too: the minion is told why and goes on. A tool the directive's
+authority fence refused is never ordinary. Its `guard-refused` receipt
+leaves the turn UNKNOWN. On pi the refusal also blocks the next model
+request, and on Claude Code it ends the turn.
+
 Physical ownership is recorded separately in `<session.jsonl>.producers.jsonl`:
 request/hash/revision/epoch, logical minion, native session/file, physical UUID,
 host and PID. Dispatch reservation is not native admission or producer start.

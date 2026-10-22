@@ -3053,14 +3053,34 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await moved.dispose();
     });
 
-    it('a tool error leaves the checkpoint UNKNOWN (a recovery judgment, as on pi) and records no completion', async () => {
+    it('a tool error the minion went on to answer is ordinary work: the turn completes and its completion is recorded', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const identity = identityFor('claude-tool-error');
-      await expect(handle.prompt('tool-error:Read try it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
-        .rejects.toThrow(/native tool error requires a recovery judgment/u);
-      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'native tool error requires a recovery judgment' });
+      await handle.prompt('tool-error:Read try it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      const transcript = frames(handle.sessionFile!);
+      expect(transcript.some((frame) => frame['type'] === 'user' && JSON.stringify(frame['message']).includes('"is_error":true'))).toBe(true);
+      const result = transcript.find((frame) => frame['type'] === 'result')!;
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });
+      expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).not.toBeNull();
       await handle.dispose();
+    });
+
+    it('a lane\'s verification policy refusing the minion\'s test command is ordinary work: the directive still completes', async () => {
+      const lane = verificationLane(); cleanupDirs.push(lane.root);
+      const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+      try {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', lane.session);
+        const identity = identityFor('claude-verification-refused');
+        await handle.prompt(`verification-bash:${FULL_INCIDENT}`, { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+        expect(existsSync(lane.starts)).toBe(false);
+        expect(readFileSync(handle.sessionFile!, 'utf8')).toContain('no receipt was created');
+        const result = frames(handle.sessionFile!).find((frame) => frame['type'] === 'result')!;
+        expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });
+        expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).not.toBeNull();
+        await handle.dispose();
+      } finally { process.env['PATH'] = oldPath; }
     });
 
     it('a session that cannot attest admission exposes no directive capability and refuses a directive by name before any CLI run', async () => {

@@ -4944,6 +4944,21 @@ it('P30 default pinned SDK parallel-safe read batch preserves exact accepted anc
   } finally { release(); await f.cleanup(); }
 });
 
+it('a real SDK bash command that fails is ordinary work once the model answers it: the directive settles', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCalls: [{ id: 'failing-command', name: 'bash', args: { command: 'exit 3' } }] },
+    { deltas: ['the command failed, so the minion reported it'] },
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const native = readFileSync(row.nativeTarget!.sessionFile, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; toolCallId?: string; isError?: boolean } });
+    expect(native.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([['failing-command', true]]);
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
 async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing' | 'missing-head' | 'parked-missing-head') {
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
   let release!: () => void; const hold = new Promise<void>((resolve) => { release = resolve; });

@@ -142,12 +142,23 @@ describe('the Claude directive checkpoint (#424)', () => {
       .toEqual({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
   });
 
-  it('is unknown, never resumable, for a turn without a result, a second prompt, a repeated tool id, or a tool error', () => {
+  it('a tool error the model went on to answer is ordinary work: terminal at the turn\'s own result, and only that result decides', () => {
+    const failed = (id: string) => ({ type: 'user', uuid: `r-${id}`, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'Exit code 1', is_error: true }] } });
+    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), use('t2'), result('t2'), done]), identity))
+      .toMatchObject({ state: 'terminal', ok: true, checkpointId: 'result-1' });
+    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), done]), identity)).toMatchObject({ state: 'terminal', ok: true });
+    // Interrupted after the error: no result, so no completion.
+    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1')]), identity))
+      .toEqual({ state: 'unknown', reason: 'native directive turn has no result yet' });
+    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), { ...done, subtype: 'error_during_execution', is_error: true }]), identity))
+      .toMatchObject({ state: 'terminal', ok: false });
+  });
+
+  it('is unknown, never resumable, for a turn without a result, a second prompt or a repeated tool id', () => {
     const reasons = [
       [init, echo, use('t1')],
       [init, echo, { ...echo, uuid: 'echo-2' }, done],
       [init, echo, use('t1'), use('t1'), done],
-      [init, echo, use('t1'), { ...result('t1'), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'no', is_error: true }] } }, done],
       [init, { ...echo, message: { role: 'user', content: [{ type: 'text', text: 'something else' }] } }, done],
       // A line that is no JSON object, read anywhere the walk reads (#469).
       [init, echo, use('t1'), 'not json', result('t1'), done],
@@ -159,7 +170,6 @@ describe('the Claude directive checkpoint (#424)', () => {
       'native directive turn has no result yet',
       'another prompt entered the directive turn',
       'malformed native tool identity',
-      'native tool error requires a recovery judgment',
       'actual native admission user receipt unavailable/changed',
       'malformed native frame after the directive prefix',
       'malformed native frame after the directive prefix',

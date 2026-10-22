@@ -172,6 +172,11 @@ writes each runtime's own record shape during a resumed turn.
   decision (`test/restart-recovery-progress.test.ts`, "an interrupted Claude
   directive is never resumed or replayed …" and "a service that died
   mid-directive …").
+- **A failed tool call in a directive turn.** On both runtimes it is
+  ordinary work once the minion answers it, so a turn that reaches its own
+  successful end completes. A pi turn that stopped at an unanswered tool
+  error stays UNKNOWN, because it may be an interrupted effect. A Claude turn
+  that stops without a result is never complete anyway.
 - **Directive sessions.** A Claude Code transcript starts with a GC session
   header (session id and cwd), which directive admission binds. A directive
   and a re-brief both run in the minion's recorded session, so two kinds of
