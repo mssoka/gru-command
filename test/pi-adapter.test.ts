@@ -5220,7 +5220,7 @@ describe('scheduled verification ordinary Pi Bash', () => {
       await handle.prompt('attempt ordinary Bash');
       expect(existsSync(lane.starts)).toBe(false);
       const transcriptPath = handle.sessionFile;
-      if (transcriptPath === undefined) throw new Error('refusal case did not create an ordinary Pi transcript');
+      if (transcriptPath === null) throw new Error('refusal case did not create an ordinary Pi transcript');
       const transcript = readFileSync(transcriptPath, 'utf8');
       expect(transcript).toContain('capture-cli.js');
       expect(transcript).toContain('focused, full');
