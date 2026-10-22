@@ -457,6 +457,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     switch (event.type) {
       case 'turn_start':
         turnLive = true;
+        // A wake held before this turn started must not wait out its
+        // background work either.
+        if (wakeRequested) void source.endBackgroundWait?.().catch(() => undefined);
         emitLogged({ type: 'turn', state: 'start' });
         if (acceptAwarenessTurn?.source === source) {
           const { accept } = acceptAwarenessTurn;
@@ -760,8 +763,18 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   /** Start a coalesced awareness turn when the lane is idle. A request that
    * arrives mid-turn or mid-wake waits for a trailing turn instead of
    * steering into a live conversation; settle hooks call back here. */
+  /** A Gru turn that has replied and only waits on background work ends that
+   * wait for a held wake, which then runs at the turn's end. */
+  function endLiveWaitForWake(): void {
+    void handle?.endBackgroundWait?.().catch(() => undefined);
+  }
+
   function maybeWake(): void {
-    if (disposed || !wakeRequested || wakeRunning || options.awareness === undefined) return;
+    if (disposed || !wakeRequested || options.awareness === undefined) return;
+    if (wakeRunning) {
+      endLiveWaitForWake();
+      return;
+    }
     if (recoveryBlockedReason !== null || options.canWakeGru?.() === false) {
       wakeRequested = false;
       options.awareness.noteWakeBlocked?.(recoveryBlockedReason ?? 'Gru breaker is open; authorized re-arm required');
@@ -775,9 +788,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       controlBarrier !== null ||
       runtimeCompactionBarrier !== null
     ) {
-      // A Gru turn that has replied and only waits on background work ends
-      // that wait for the wake, which then runs at the turn's end.
-      if (turnLive || frameLog.hasOpenTurn) void handle?.endBackgroundWait?.().catch(() => undefined);
+      if (turnLive || frameLog.hasOpenTurn) endLiveWaitForWake();
       options.awareness.noteWakeDeferred?.('busy');
       return;
     }
@@ -929,7 +940,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               // A turn that has replied and only waits on background work
               // ends that wait for it.
               wakeRequested = true;
-              void gru.endBackgroundWait?.().catch(() => undefined);
+              endLiveWaitForWake();
               return;
             }
             midTurn = true;

@@ -71,6 +71,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_BACKGROUND_STOPPED',
   'CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS',
   'CLAUDE_DOUBLE_BACKGROUND_ERROR',
+  'CLAUDE_DOUBLE_BACKGROUND_UNLISTED',
   'CLAUDE_DOUBLE_TASK_NOTIFICATION',
   'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
   'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
@@ -4865,6 +4866,104 @@ describe('a replied Claude turn waiting on background work (#471 follow-up)', ()
     try {
       await handle.prompt('usage-limit right now');
       expect(pendingAtError).toEqual([expect.objectContaining({ text: 'usage-limit right now' })]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('the verdict is the prompted turn\'s own first result: a later follow-up success never makes an error reply an answer', async () => {
+    // An unlisted task (CLI drift) leaves the error reply to the grace; the
+    // task ends inside it, and the CLI's own follow-up turn then succeeds.
+    const fx = fixture({ backgroundStopGraceMs: 5_000 });
+    process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] = '1';
+    process.env['CLAUDE_DOUBLE_BACKGROUND_ERROR'] = '1';
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    const pendingAtError: unknown[] = [];
+    handle.subscribe((event) => { if (event.type === 'error') pendingAtError.push(handle.pendingTurn!()); });
+    try {
+      await handle.prompt('background:200 start the server');
+      expect(pendingAtError).toEqual([expect.objectContaining({ text: 'background:200 start the server' })]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('an error reply\'s stop does not wait for the CLI\'s follow-up turn either', async () => {
+    const fx = fixture({ backgroundStopGraceMs: 1_500 });
+    process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] = '1';
+    process.env['CLAUDE_DOUBLE_BACKGROUND_ERROR'] = '1';
+    process.env['CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS'] = '20000';
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    const events = collect(handle);
+    try {
+      const started = Date.now();
+      await handle.prompt('background:200 start the server');
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(deltas(events, 'text_delta').join('')).not.toContain('background done');
+      expect(events.some((event) => event.type === 'error')).toBe(true);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a stop the messages ask for is never pushed back by further messages', async () => {
+    // Nothing listed: the first message gives the CLI the grace to end; each
+    // further one must not restart it.
+    const fx = fixture({ backgroundStopGraceMs: 600 });
+    process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] = '1';
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    try {
+      let settled = false;
+      const turn = handle.prompt('background:60000 start the server').finally(() => { settled = true; });
+      await waitFor(() => handle.turnAnswered!());
+      const started = Date.now();
+      while (!settled && Date.now() - started < 4_000) {
+        void handle.endBackgroundWait!();
+        await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      }
+      expect(settled).toBe(true);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      await turn;
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('in a worker-verification lane a waiting message also ends the CLI\'s follow-up turn, which nothing can host', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const fx = fixture({ backgroundStopGraceMs: 300 });
+    process.env['CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS'] = '20000';
+    const handle = await withFallbacks(fx.runtime).spawn('minion', lane.session);
+    const events = collect(handle);
+    try {
+      const first = handle.prompt('background:100 run the suite');
+      // The task ended and the follow-up turn began (its list emptied).
+      await waitFor(() => waits(events).length === 2);
+      const started = Date.now();
+      await handle.prompt('what is the status');
+      await first;
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(deltas(events, 'text_delta').join('')).not.toContain('background done');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a message held while a compaction is prepared waits behind the compaction: the next turn keeps its own wait', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const stopped = join(fx.home, 'stopped.txt');
+    process.env['CLAUDE_DOUBLE_BACKGROUND_STOPPED'] = stopped;
+    const handle = await withFallbacks(fx.runtime).spawn('minion', { cwd: fx.workspace });
+    const events = collect(handle);
+    try {
+      await handle.prompt('answer plainly');
+      // The compaction is still checking the project's MCP file when the message is held.
+      const compacting = handle.compact!();
+      const turn = handle.prompt('background:600 build it');
+      await compacting;
+      await turn;
+      expect(deltas(events, 'text_delta').join('')).toContain('background done');
+      expect(existsSync(stopped)).toBe(false);
     } finally {
       await handle.dispose();
     }

@@ -3612,6 +3612,54 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('a wake held behind a running wake turn ends that turn\'s wait on background work (#471 follow-up)', async () => {
+    const injection = sampleInjection();
+    const harness = await makeHarness({ awareness: { prepare: () => injection, commit: () => {} } });
+    try {
+      let release!: () => void;
+      harness.handle.nextHold = new Promise<void>((resolve) => { release = resolve; });
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 1, 'held wake turn');
+      harness.chat.wakeAwareness();
+      expect(harness.handle.endBackgroundWaitCalls).toBe(1);
+      release();
+      await pollUntil(() => harness.handle.calls.length === 2, 'the trailing wake turn');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a wake held while Gru is still being started ends the wait of the turn that then starts (#471 follow-up)', async () => {
+    const injection = sampleInjection();
+    let releaseSpawn!: () => void;
+    const spawnHold = new Promise<void>((resolve) => { releaseSpawn = resolve; });
+    let spawning = false;
+    const sessionDir = mkdtempSync(join(tmpdir(), 'gru-command-chat-wake-spawn-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'held-spawn-gru.jsonl');
+    writeFileSync(sessionFile, '');
+    const gru = new StubGruHandle(sessionFile, 'held-spawn-gru');
+    const harness = await makeHarness({
+      awareness: { prepare: () => injection, commit: () => {} },
+      spawnGru: async () => { spawning = true; await spawnHold; return gru; },
+    });
+    try {
+      const client = await authedClient(harness.port, TOKEN, undefined, true);
+      client.send('start the dev server', 'background-wait-spawn');
+      await pollUntil(() => spawning, 'Gru spawn held');
+      harness.chat.wakeAwareness();
+      expect(gru.endBackgroundWaitCalls).toBe(0);
+      releaseSpawn();
+      await pollUntil(() => gru.calls.length >= 1, 'the chat turn');
+      expect(gru.endBackgroundWaitCalls).toBe(1);
+      await client.close();
+    } finally {
+      releaseSpawn();
+      await harness.close();
+      await gru.dispose();
+    }
+  });
+
   it('logs the accepted wake context as a replayable service notice, never the instruction (GH-114)', async () => {
     const injection = sampleInjection();
     const harness = await makeHarness({

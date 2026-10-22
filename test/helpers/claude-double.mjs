@@ -54,6 +54,7 @@
  *   CLAUDE_DOUBLE_BACKGROUND_STOPPED=<file> append that description when SIGTERM stops it
  *   CLAUDE_DOUBLE_BACKGROUND_FOLLOW_UP_MS=<ms> the follow-up turn works this long before answering
  *   CLAUDE_DOUBLE_BACKGROUND_ERROR=1 that reply is an in-band error result
+ *   CLAUDE_DOUBLE_BACKGROUND_UNLISTED=1 never list the task (no background_tasks_changed frames)
  *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
  *   CLAUDE_DOUBLE_COMPACT_STATUS_FAIL=1 report native failure with a successful command result
  *   CLAUDE_DOUBLE_COMPACT_EXIT_ERROR=1 report native success, then exit non-zero
@@ -452,7 +453,9 @@ async function writeChunked(obj) {
 async function emitBackgroundTurn(ms) {
   const description = process.env['CLAUDE_DOUBLE_BACKGROUND_DESCRIPTION'] ?? 'npm run dev';
   const task = { task_id: 'bdouble1', run_id: 'run-double', task_type: 'local_bash', description };
-  const tasksChanged = (tasks) => out({ type: 'system', subtype: 'background_tasks_changed', tasks, session_id: sessionId, uuid: randomUUID() });
+  const tasksChanged = (tasks) => {
+    if (process.env['CLAUDE_DOUBLE_BACKGROUND_UNLISTED'] !== '1') out({ type: 'system', subtype: 'background_tasks_changed', tasks, session_id: sessionId, uuid: randomUUID() });
+  };
   out(assistantFrame([{ type: 'tool_use', id: 'toolu_background', name: 'Bash', input: { command: description, run_in_background: true } }]));
   tasksChanged([task]);
   out({ type: 'user', session_id: sessionId, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_background',

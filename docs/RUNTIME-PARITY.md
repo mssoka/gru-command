@@ -224,10 +224,14 @@ writes each runtime's own record shape during a resumed turn.
     15 min) of idle time after each reply, the CLI's own follow-up replies
     included. A follow-up turn pauses the clock, except in a
     worker-verification lane, where the host can no longer answer that
-    turn's tool requests.
+    turn's tool requests, and after a reply that was an in-band error.
   - A waiting message (chat, a Gru wake, a dispatch or a Silas directive
     once it is admissible), or a reply that was an in-band error, ends the
-    wait at once.
+    wait at once; a turn still working when the message arrives skips the
+    wait at its reply. Work the CLI does not list gets 10 s to end by
+    itself first, and further messages never push that stop back. The
+    turn's verdict is its own first result, as before: a later follow-up
+    success never turns an error reply into an answer.
   - Then GC stops the CLI, which stops the work. A CLI that ignores SIGTERM
     is killed 10 s later, and its work may survive; GC logs that.
   - The agent's next ordinary turn begins with a note naming the work it

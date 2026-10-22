@@ -189,14 +189,60 @@ describe('fresh fix worker association', () => {
           beforeWriterSideEffect: () => { if (refuse) throw new Error('coverage identity changed'); },
         });
       };
-      // A message refused anyway never costs the minion its background work.
-      await expect(route(true)).rejects.toThrow(/coverage identity changed/u);
+      // A message refused anyway never costs the minion its background work,
+      // and its refusal is still the fences' own.
+      await expect(route(true)).rejects.toThrow(/directive producer fences: open turn/u);
       expect(order).toEqual([]);
       const routed = await route(false);
       expect(routed.delivered).toBe(true);
       expect(order).toEqual(['end wait', 'prompt']);
     } finally {
       waitingTurn?.release();
+      db.close();
+    }
+  });
+
+  it('a re-brief ends the prior minion\'s answered wait before its fences and its cleanup (#471 follow-up)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-background-rebrief-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Re-briefed lane' });
+      ledger.setJobStatus('job-1', 'working');
+      ledger.registerAgent({ id: 'waiting-prior', role: 'minion', jobId: 'job-1' });
+      const order: string[] = [];
+      let waiting = true;
+      const base = {
+        role: 'minion', sessionFile: null,
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } as const;
+      const prior = {
+        ...base, id: 'waiting-prior',
+        async prompt() { order.push('prior prompt'); },
+        turnAnswered: () => waiting,
+        endBackgroundWait: async () => { order.push('end wait'); waiting = false; },
+        cessationEvidence: () => 'ceased' as const,
+      } satisfies AgentHandle;
+      const fresh = { ...base, id: 'fresh-minion', async prompt() { order.push('fresh prompt'); } } satisfies AgentHandle;
+      const routed = await routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'start over from the contract', signal: new AbortController().signal, freshSession: true,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: (id: string) => (id === 'waiting-prior' ? prior : null),
+          spawn: async () => fresh,
+          disposeHandle: async (handle: AgentHandle) => { order.push(`dispose ${handle.id}`); },
+        },
+        // The producer fences refuse a session whose turn is still open.
+        beforeTurnSideEffect: () => { if (waiting) throw new Error('directive producer fences: open turn'); },
+      });
+      expect(routed.delivered).toBe(true);
+      expect(order).toEqual(['end wait', 'dispose waiting-prior', 'fresh prompt']);
+    } finally {
       db.close();
     }
   });

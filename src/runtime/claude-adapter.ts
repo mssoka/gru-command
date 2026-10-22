@@ -1755,6 +1755,9 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private spawnCompaction(params: HandleParams): Promise<void> {
     const translator = new ClaudeControlTranslator();
+    // A message held while the compaction was being prepared waits behind
+    // the compaction, not behind a turn: no turn skips its wait for it.
+    this.messageAwaitsTurn = false;
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -2183,27 +2186,42 @@ export class ClaudeCodeHandle implements AgentHandle {
       // or a reply that was an in-band error, stops listed tasks at once; with
       // none listed the CLI is ending by itself, and is stopped only if it
       // has not after the grace period.
-      const arm = (): void => {
-        if (waitTimer !== null) clearTimeout(waitTimer);
-        waitTimer = null;
-        if (!replied || followUp || stopping || settled) return;
+      // A follow-up turn of the CLI's own pauses the clock, except in a
+      // worker-verification lane (the host's permission input is already
+      // closed there, so that turn cannot be hosted) and after an error
+      // reply (whose stop must not wait for it).
+      const paused = (): boolean => followUp && permissions === undefined && !errored;
+      let waitDeadline = 0;
+      // A reply (`fresh`) restarts the clock; anything else only brings the
+      // stop closer, so further messages never push it back.
+      const arm = (fresh: boolean): void => {
+        if (!replied || paused() || stopping || settled) {
+          if (waitTimer !== null) clearTimeout(waitTimer);
+          waitTimer = null;
+          return;
+        }
         const reason: BackgroundStopReason = errored ? 'error' : messageWaiting ? 'message' : 'limit';
         const delay = reason === 'limit' ? waitMs : tasks.length > 0 ? 0 : stopGraceMs;
+        const deadline = Date.now() + delay;
+        if (delay > 0 && !fresh && waitTimer !== null && waitDeadline <= deadline) return;
+        if (waitTimer !== null) clearTimeout(waitTimer);
+        waitTimer = null;
         if (delay === 0) {
           stopBackground(reason);
           return;
         }
+        waitDeadline = deadline;
         waitTimer = setTimeout(() => stopBackground(reason), delay);
         waitTimer.unref();
       };
       const wait: BackgroundWait = {
         answered: () => answered,
-        waiting: () => replied && !followUp && !settled,
+        waiting: () => replied && !paused() && !settled,
         end: () => {
           if (settled) return Promise.resolve();
           messageWaiting = true;
-          if (!replied || followUp) return Promise.resolve();
-          arm();
+          if (!replied || paused()) return Promise.resolve();
+          arm(false);
           return turnSettled;
         },
       };
@@ -2327,21 +2345,22 @@ export class ClaudeCodeHandle implements AgentHandle {
               });
             }
             announce();
-            if (messageWaiting) arm();
+            if (messageWaiting) arm(false);
           } else if (frame['type'] === 'system' && frame['subtype'] === 'init' && replied) {
-            // The CLI's own follow-up turn: the minion is working again, and
-            // the idle clock pauses. In a worker-verification lane the host's
-            // permission input is already closed, so that turn cannot be
-            // hosted: there the clock keeps running.
+            // The CLI's own follow-up turn: the minion is working again.
             followUp = true;
-            if (permissions === undefined) arm();
+            arm(false);
             announce();
           } else if (frame['type'] === 'result') {
+            // The prompted turn's verdict is its first result, read as the
+            // translator reads it; a later result is a follow-up turn's own.
+            if (!replied) {
+              errored = frame['is_error'] === true;
+              answered = !errored;
+            }
             replied = true;
-            errored = frame['is_error'] !== false;
-            if (!errored) answered = true;
             followUp = false;
-            arm();
+            arm(true);
             announce();
           }
         }
