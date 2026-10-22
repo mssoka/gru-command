@@ -79,6 +79,7 @@ that proves it on each adapter.
 | `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
 | `native-directive-admission` | A Silas directive's native admission and producer ownership are attested before any effect, and the directive settles with its delivery. pi: an accepted directive runs as its exact SDK producer. Claude Code (#424): the binding is durable before the CLI starts, admission is the CLI's own echo of the prompt (`--replay-user-messages`; the opening tags the CLI reserves for its own frames, such as `<task-notification>`, whose echo it withholds, are sent as entities; a keepalive ping may precede the echo, but a turn that answers before it ends at once, #472), every tool asks the host through the stdio permission prompt and is allowed only once its intent is durable and the directive's authority still holds, and completion is the turn's own result | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
+| `directive-tool-error` | A failed tool call in a directive turn is ordinary work: the minion may go on calling tools, and a turn that reaches its own successful end completes. A turn cut off at a tool error the minion never answered never completes, and one with a tool the directive refused stays UNKNOWN on its durable `guard-refused` receipt | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `rate-limit-retry` | An in-band 429 keeps the delivery pending until the supervisor's automatic retry recovers; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `supervisor-restart-ladder` | A hung agent climbs the restart ladder and is restored by resume; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `provider-recovery-continuation` | A provider-recovery claim resumes the interrupted session and re-delivers its continuation prompt; driven through `AgentHandle` | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
@@ -172,11 +173,6 @@ writes each runtime's own record shape during a resumed turn.
   decision (`test/restart-recovery-progress.test.ts`, "an interrupted Claude
   directive is never resumed or replayed …" and "a service that died
   mid-directive …").
-- **A failed tool call in a directive turn.** On both runtimes it is
-  ordinary work once the minion answers it, so a turn that reaches its own
-  successful end completes. A pi turn that stopped at an unanswered tool
-  error stays UNKNOWN, because it may be an interrupted effect. A Claude turn
-  that stops without a result is never complete anyway.
 - **Directive sessions.** A Claude Code transcript starts with a GC session
   header (session id and cwd), which directive admission binds. A directive
   and a re-brief both run in the minion's recorded session, so two kinds of

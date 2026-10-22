@@ -4835,6 +4835,8 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
     const handle = f.registry.getHandle(row.nativeTarget!.agentId)!;
     f.sessions[0]!.agent.state.systemPrompt = 'unapproved current role authority'; release(); await run;
     expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(1);
+    // Its refused tools' errors never read as ordinary work while their receipts are owed.
+    expect(checkpoint.inspectDirectiveCheckpoint(file, f.scene.identity)).not.toMatchObject({ state: 'terminal', ok: true });
     expect(handle.cessationEvidence!()).toBe('unknown'); expect(f.fx.store.isHeld(file)).toBe(true); expect(existsSync(`${file}.lock`)).toBe(true);
     expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
     failing = false; await f.registry.disposeHandle(handle);
@@ -4944,20 +4946,31 @@ it('P30 default pinned SDK parallel-safe read batch preserves exact accepted anc
   } finally { release(); await f.cleanup(); }
 });
 
-it('a real SDK bash command that fails is ordinary work once the model answers it: the directive settles', async () => {
+/** A real SDK directive whose bash command fails (`exit 3`) settles like any
+ * other: the failure is ordinary work, whatever the minion does next. */
+async function assertSdkFailedCommandIsOrdinary(turns: readonly StubTurn[], results: readonly (readonly [string, boolean])[]) {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
-  const f = await sdkDirectiveExecutionFixture([
-    { deltas: [], toolCalls: [{ id: 'failing-command', name: 'bash', args: { command: 'exit 3' } }] },
-    { deltas: ['the command failed, so the minion reported it'] },
-  ]);
+  const f = await sdkDirectiveExecutionFixture(turns);
   try {
     await executeAcceptedDirective(f.deps, f.scene.request.requestId);
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
     const native = readFileSync(row.nativeTarget!.sessionFile, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; toolCallId?: string; isError?: boolean } });
-    expect(native.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([['failing-command', true]]);
+    expect(native.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual(results);
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
     expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
   } finally { await f.cleanup(); }
-});
+}
+const failingCommand = { id: 'failing-command', name: 'bash', args: { command: 'exit 3' } };
+const followingCommand = { id: 'following-command', name: 'bash', args: { command: 'true' } };
+it('a real SDK bash command that fails is ordinary work once the model answers it: the directive settles', () => assertSdkFailedCommandIsOrdinary([
+  { deltas: [], toolCalls: [failingCommand] }, { deltas: ['the command failed, so the minion reported it'] },
+], [['failing-command', true]]));
+it('a real SDK minion may go on calling tools after a failed command, and the directive settles #contract:directive-tool-error:pi', () => assertSdkFailedCommandIsOrdinary([
+  { deltas: [], toolCalls: [failingCommand] }, { deltas: [], toolCalls: [followingCommand] }, { deltas: ['fixed it after the failure'] },
+], [['failing-command', true], ['following-command', false]]));
+it('a later call in the same sequential batch still runs after a failed one, and the directive settles', () => assertSdkFailedCommandIsOrdinary([
+  { deltas: [], toolCalls: [failingCommand, followingCommand] }, { deltas: ['both calls settled'] },
+], [['failing-command', true], ['following-command', false]]));
 
 async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing' | 'missing-head' | 'parked-missing-head') {
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
@@ -5194,6 +5207,31 @@ describe('scheduled verification ordinary Pi Bash', () => {
   it('scheduled verification guard refuses the exact web incident before any producer', async () => refuses(WEB_INCIDENT));
   it('scheduled verification guard refuses the exact npm test incident before any producer', async () => refuses(FULL_INCIDENT));
   it('scheduled verification guard refuses the entire exact build compound before its first producer', async () => refuses(BUILD_INCIDENT));
+  it('a directive whose minion is refused a test command is ordinary work: the minion goes on and the directive completes', async () => {
+    const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = await fixture([
+      { deltas: [], toolCall: { id: 'verification-call', name: 'bash', args: { command: FULL_INCIDENT } } },
+      { deltas: [], toolCall: { id: 'after-refusal', name: 'bash', args: { command: 'true' } } },
+      { deltas: ['scheduled the scope instead'] },
+    ]);
+    const identity = { requestId: 'verification-refused-directive', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+      jobId: 'verification-refused-job', workRevision: 0, authorityEpoch: 0 };
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      const verdict = await handle.promptWithVerdict!('a directive in a verification lane', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      expect(existsSync(lane.starts)).toBe(false);
+      const transcript = readFileSync(handle.sessionFile!, 'utf8');
+      expect(transcript).toContain('no receipt was created');
+      const results = transcript.trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; toolCallId?: string; isError?: boolean } })
+        .filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message?.toolCallId, entry.message?.isError]);
+      expect(results).toEqual([['verification-call', true], ['after-refusal', false]]);
+      expect(verdict).toMatchObject({ ok: true });
+      expect(inspectDirectiveCheckpoint(handle.sessionFile!, identity)).toMatchObject({ state: 'terminal', ok: true });
+      await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
 
 
   it('review-1 standalone lint refuses before any producer #contract:scheduled-verification:pi', async () => refuses('npm run lint'));

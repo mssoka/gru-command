@@ -943,6 +943,22 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     f.native.append(bashCall('second')); f.native.append(bashResult('second', false));
     expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'resumable' });
   });
+  it('a pi turn aborted right after a tool error never completes: the recorded abort is a failed turn', async () => {
+    const f = await fixture(); f.seed();
+    f.native.append(bashCall('interrupted')); f.native.append(bashResult('interrupted', true));
+    f.native.finish('aborted');
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: false });
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+  });
+  it('a pi batch cut off with one failed and one successful result, in either order, stays UNKNOWN', async () => {
+    for (const order of [[true, false], [false, true]] as const) {
+      const f = await fixture(); f.seed();
+      f.native.append({ role: 'assistant', stopReason: 'toolUse', content: ['a', 'b'].map((id) => ({ type: 'toolCall', id, name: 'bash', arguments: { command: 'npm test' } })) });
+      f.native.append(bashResult('a', order[0])); f.native.append(bashResult('b', order[1]));
+      expect(inspectDirectiveCheckpoint(f.file, f.identity), String(order)).toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });
+    }
+  });
   it('rejects a stale terminal before an unbound later user tail', () => assertStaleTerminalTail('user'));
   it('rejects a stale terminal before a later branch tail', () => assertStaleTerminalTail('branch'));
   it('rejects a stale terminal before a later assistant tail', () => assertStaleTerminalTail('assistant'));

@@ -67,6 +67,8 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_TOOL_BACKGROUND',
   'CLAUDE_DOUBLE_TASK_NOTIFICATION',
   'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
+  'CLAUDE_DOUBLE_PERMISSION_REPEAT',
+  'CLAUDE_DOUBLE_TOOL_AFTER_ERROR',
   'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
   'CLAUDE_DOUBLE_COMPACT_VERIFICATION',
   'CLAUDE_DOUBLE_LOG',
@@ -2600,8 +2602,31 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           .rejects.toThrow(/directive refused: native tool intent is not persisted/u);
         // The CLI read the deny (it echoes what the host wrote) before it was killed.
         expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"deny"'))).toBe(true);
+        // It even answered and reported success; the durable refusal still keeps the turn unproven.
+        expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'result' && frame['subtype'] === 'success')).toBe(true);
+        expect(handle.inspectDirective!(identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
       } finally {
         delete process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        await handle.dispose();
+      }
+    });
+
+    it('a CLI that asks twice for one tool use gets a durable refusal: the turn never completes, even if it reports success', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-asked-twice');
+      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/malformed or foreign directive permission request/u);
+        expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'result' && frame['subtype'] === 'success')).toBe(true);
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"reason":"malformed or foreign directive permission request"');
+        expect(handle.inspectDirective!(identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
+        const result = frames(handle.sessionFile!).find((frame) => frame['type'] === 'result')!;
+        expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).toBeNull();
+      } finally {
         delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
         await handle.dispose();
       }
@@ -3053,7 +3078,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await moved.dispose();
     });
 
-    it('a tool error the minion went on to answer is ordinary work: the turn completes and its completion is recorded', async () => {
+    it('a tool error the minion went on to answer is ordinary work: the turn completes and its completion is recorded #contract:directive-tool-error:claude-code', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const identity = identityFor('claude-tool-error');
@@ -3066,21 +3091,39 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
+    it('a minion that goes on to another tool after a failed one is allowed it, and the turn completes', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-tool-after-error');
+      process.env['CLAUDE_DOUBLE_TOOL_AFTER_ERROR'] = '1';
+      await handle.prompt('tool-error:Read try it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      const transcript = frames(handle.sessionFile!);
+      const results = transcript.flatMap((frame) => frame['type'] === 'user' && frame['isReplay'] !== true ? (frame['message'] as { content: Record<string, unknown>[] }).content : [])
+        .filter((block) => block['type'] === 'tool_result').map((block) => [block['tool_use_id'], block['is_error']]);
+      expect(results).toEqual([['toolu_double_1', true], ['toolu_double_2', false]]);
+      expect(transcript.filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toHaveLength(2);
+      const result = transcript.find((frame) => frame['type'] === 'result')!;
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });
+      expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).not.toBeNull();
+      await handle.dispose();
+    });
+
     it('a lane\'s verification policy refusing the minion\'s test command is ordinary work: the directive still completes', async () => {
       const lane = verificationLane(); cleanupDirs.push(lane.root);
       const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+      const fx = fixture();
       try {
-        const fx = fixture();
         const handle = await fx.runtime.spawn('minion', lane.session);
         const identity = identityFor('claude-verification-refused');
         await handle.prompt(`verification-bash:${FULL_INCIDENT}`, { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
         expect(existsSync(lane.starts)).toBe(false);
-        expect(readFileSync(handle.sessionFile!, 'utf8')).toContain('no receipt was created');
+        const refusal = frames(handle.sessionFile!).flatMap((frame) => frame['type'] === 'user' ? (frame['message'] as { content: Record<string, unknown>[] }).content : [])
+          .find((block) => block['type'] === 'tool_result');
+        expect(refusal).toMatchObject({ is_error: true, content: expect.stringContaining('no receipt was created') });
         const result = frames(handle.sessionFile!).find((frame) => frame['type'] === 'result')!;
         expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });
         expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).not.toBeNull();
-        await handle.dispose();
-      } finally { process.env['PATH'] = oldPath; }
+      } finally { process.env['PATH'] = oldPath; await fx.runtime.dispose(); }
     });
 
     it('a session that cannot attest admission exposes no directive capability and refuses a directive by name before any CLI run', async () => {

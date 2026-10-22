@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { claudeDirectiveContent } from '../src/runtime/claude-adapter.js';
 import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from '../src/runtime/claude-directive.js';
-import { assertClaudeDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint, isClaudeTaskNotification, prepareClaudeDirectiveBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { assertClaudeDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint, isClaudeTaskNotification, prepareClaudeDirectiveBinding, prepareDirectiveProducer, recordDirectiveToolRefusal, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import { workerVerificationRefusal, type WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 
 /**
@@ -36,16 +36,18 @@ const request = (id: string, toolUseId: string, extra: Record<string, unknown> =
 function channel(decide: (request: ClaudeToolRequest) => ClaudeToolDecision = () => ({ allow: true }), verification?: WorkerVerificationPolicy) {
   const { child, written } = fakeChild();
   const failures: string[] = [];
+  const refusals: [string | undefined, string][] = [];
   const decided: ClaudeToolRequest[] = [];
   const permissions = new ClaudeDirectivePermissionChannel(child, {
     fail: (message) => failures.push(message),
+    refused: (toolUseId, reason) => refusals.push([toolUseId, reason]),
     decide: async (tool, durable) => { await durable; decided.push(tool); return decide(tool); },
     ...(verification === undefined ? {} : { verification }),
   });
   permissions.start();
   const init = written()[0]!;
   const initialize = (): void => permissions.ingest({ type: 'control_response', response: { subtype: 'success', request_id: init['request_id'], response: {} } }, Promise.resolve());
-  return { permissions, written, failures, decided, initialize };
+  return { permissions, written, failures, refusals, decided, initialize };
 }
 
 describe('the Claude directive permission channel (#424)', () => {
@@ -87,7 +89,10 @@ describe('the Claude directive permission channel (#424)', () => {
       drive(c);
       await tick();
       expect(c.failures.length, label).toBeGreaterThan(0);
+      // A request it denied is a durable refusal; a stray response denies nothing.
+      expect(c.refusals, label).toEqual(label === 'foreign response' ? [] : [[undefined, 'malformed or foreign directive permission request']]);
     }
+    expect(early.refusals).toEqual([]);
   });
 
   it('denies a lane\'s verification producer before any fence, with the verification refusal', async () => {
@@ -100,12 +105,13 @@ describe('the Claude directive permission channel (#424)', () => {
     expect(c.written().at(-1)).toMatchObject({ response: { request_id: 'r1', response: { behavior: 'deny', message: workerVerificationRefusal(policy) } } });
   });
 
-  it('a fence that throws denies the tool and fails the turn', async () => {
+  it('a fence that throws denies the tool, keeps a durable refusal of it and fails the turn', async () => {
     const c = channel(() => { throw new Error('fence broke'); });
     c.initialize();
     c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
     await tick(); await tick();
     expect(c.written().at(-1)).toMatchObject({ response: { request_id: 'r1', response: { behavior: 'deny' } } });
+    expect(c.refusals).toEqual([['toolu_1', 'directive tool fence failed: fence broke']]);
     expect(c.failures).toEqual(['directive tool fence failed: fence broke']);
   });
 });
@@ -142,16 +148,27 @@ describe('the Claude directive checkpoint (#424)', () => {
       .toEqual({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
   });
 
-  it('a tool error the model went on to answer is ordinary work: terminal at the turn\'s own result, and only that result decides', () => {
+  it('a tool error the model went on to answer is ordinary work: terminal at the turn\'s own result; one it never answered is unknown', () => {
     const failed = (id: string) => ({ type: 'user', uuid: `r-${id}`, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'Exit code 1', is_error: true }] } });
     expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), use('t2'), result('t2'), done]), identity))
       .toMatchObject({ state: 'terminal', ok: true, checkpointId: 'result-1' });
-    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), done]), identity)).toMatchObject({ state: 'terminal', ok: true });
+    const answer = { type: 'assistant', uuid: 'a-answer', message: { role: 'assistant', content: [{ type: 'text', text: 'it failed; reported' }] } };
+    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), answer, done]), identity)).toMatchObject({ state: 'terminal', ok: true });
+    // A success result straight after the error: the CLI ended the turn by itself.
+    expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), done]), identity))
+      .toEqual({ state: 'unknown', reason: 'native tool error the turn never answered requires a recovery judgment' });
     // Interrupted after the error: no result, so no completion.
     expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1')]), identity))
       .toEqual({ state: 'unknown', reason: 'native directive turn has no result yet' });
     expect(inspectDirectiveCheckpoint(turn([init, echo, use('t1'), failed('t1'), { ...done, subtype: 'error_during_execution', is_error: true }]), identity))
       .toMatchObject({ state: 'terminal', ok: false });
+  });
+
+  it('a refused tool keeps even a turn that answered and reported success unknown', () => {
+    const file = turn([init, echo, use('t1'), result('t1'), done]);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true });
+    recordDirectiveToolRefusal(prepareDirectiveProducer({ identity, agentId: 'minion', sessionId: 'cli-session', sessionFile: file }), 't1', 'refused by the fence');
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
   });
 
   it('is unknown, never resumable, for a turn without a result, a second prompt or a repeated tool id', () => {

@@ -2310,6 +2310,11 @@ export class ClaudeCodeHandle implements AgentHandle {
         // Every tool asks the host (#424); the lane's verification policy rides along.
         directivePermissions = new ClaudeDirectivePermissionChannel(child, {
           fail: (message) => abortTurn(message),
+          // A deny the channel wrote itself is a refusal like the fence's (#424).
+          refused: (toolUseId, reason) => {
+            this.recordGuardRefusal(turn.producer, toolUseId, reason);
+            turn.failure ??= new DirectiveCheckpointError(reason);
+          },
           decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
           ...(params.workerVerification !== undefined ? { verification: params.workerVerification } : {}),
         });
