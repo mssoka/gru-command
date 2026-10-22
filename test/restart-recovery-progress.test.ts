@@ -874,19 +874,74 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('P46 refuses compaction controls even when a later request is independently bound', () => assertBoundControlTail('unsupported'));
   it('P46 refuses malformed model controls before an independently bound later request', () => assertBoundControlTail('malformed-model'));
   it('P46 reads only an exact linked native compaction inside the active directive checkpoint', async () => {
-    for (const mode of ['linked', 'wrong-parent', 'unknown-first-kept', 'hook-authored'] as const) {
-      const f = await fixture(); f.seed();
+    for (const mode of ['linked', 'wrong-parent', 'unknown-first-kept', 'known-sibling-first-kept', 'session-header-first-kept', 'hook-authored', 'branch-control'] as const) {
+      const f = await fixture();
+      let firstKeptEntryId = '';
+      if (mode === 'known-sibling-first-kept' || mode === 'session-header-first-kept') {
+        const rows = readFileSync(f.file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { id: string });
+        const headerId = rows[0]!.id;
+        const prefixParent = { type: 'message', id: 'prefix-parent', parentId: headerId,
+          message: { role: 'assistant', stopReason: 'stop', content: [] } };
+        const activeAncestor = { type: 'message', id: 'active-ancestor', parentId: prefixParent.id,
+          message: { role: 'assistant', stopReason: 'stop', content: [] } };
+        const sibling = { type: 'message', id: 'sibling-first-kept', parentId: prefixParent.id,
+          message: { role: 'assistant', stopReason: 'stop', content: [] } };
+        const baseline = { type: 'model_change', id: 'active-baseline', parentId: activeAncestor.id, provider: 'fixture', modelId: 'model' };
+        appendFileSync(f.file, `${[prefixParent, activeAncestor, sibling, baseline].map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+        firstKeptEntryId = mode === 'known-sibling-first-kept' ? sibling.id : headerId;
+      }
+      f.seed();
       const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
       f.native.append(bashCall(`before-${mode}`)); f.native.append(bashResult(`before-${mode}`, false));
       const parent = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
-      appendFileSync(f.file, `${JSON.stringify({ type: 'compaction', id: `compact-${mode}`, parentId: mode === 'wrong-parent' ? 'foreign-parent' : parent.id,
-        timestamp: new Date().toISOString(), summary: 'genuine linked automatic compaction summary', firstKeptEntryId: mode === 'unknown-first-kept' ? 'foreign-entry' : user.id,
-        tokensBefore: 90_000, ...(mode === 'hook-authored' ? { fromHook: true } : {}) })}\n`);
+      if (mode === 'branch-control') {
+        appendFileSync(f.file, `${JSON.stringify({ type: 'branch', id: `branch-${mode}`, parentId: parent.id })}\n`);
+      } else {
+        appendFileSync(f.file, `${JSON.stringify({ type: 'compaction', id: `compact-${mode}`, parentId: mode === 'wrong-parent' ? 'foreign-parent' : parent.id,
+          timestamp: new Date().toISOString(), summary: 'genuine linked automatic compaction summary',
+          firstKeptEntryId: mode === 'unknown-first-kept' ? 'foreign-entry' : firstKeptEntryId || user.id,
+          tokensBefore: 90_000, ...(mode === 'hook-authored' ? { fromHook: true } : {}) })}\n`);
+      }
       f.native.finish();
       const proof = inspectDirectiveCheckpoint(f.file, f.identity);
       if (mode === 'linked') expect(proof).toMatchObject({ state: 'terminal', ok: true });
       else expect(proof).toEqual({ state: 'unknown', reason: 'native branch/control/partial checkpoint' });
+      if (mode === 'known-sibling-first-kept' || mode === 'session-header-first-kept' || mode === 'branch-control') {
+        expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
+        expect(f.ledger.getDirective(f.identity.requestId)?.state).not.toBe('settled');
+        expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)).toBeNull();
+      }
     }
+  });
+
+  it('P46 preserves the original terminal checkpoint across a linked SDK compaction appended after assistant stop', async () => {
+    const f = await fixture(); f.seed();
+    const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
+    f.native.finish();
+    const terminal = inspectDirectiveCheckpoint(f.file, f.identity);
+    expect(terminal).toMatchObject({ state: 'terminal', ok: true });
+    if (terminal.state !== 'terminal') throw new Error('fixture must contain a real terminal assistant result');
+    appendFileSync(f.file, `${JSON.stringify({ type: 'compaction', id: 'post-terminal-compaction', parentId: terminal.checkpointId,
+      timestamp: new Date().toISOString(), summary: 'SDK automatic post-run compaction', firstKeptEntryId: user.id, tokensBefore: 90_000, fromHook: false })}\n`);
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(terminal);
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.identity.requestId)?.state).toBe('settled');
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+  });
+
+  it('P46 refuses an unbound user turn after a valid post-terminal compaction', async () => {
+    const f = await fixture(); f.seed(); f.native.finish();
+    const terminal = inspectDirectiveCheckpoint(f.file, f.identity);
+    expect(terminal.state).toBe('terminal');
+    if (terminal.state !== 'terminal') throw new Error('fixture must contain a real terminal assistant result');
+    const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n')[1]!) as { id: string };
+    appendFileSync(f.file, `${JSON.stringify({ type: 'compaction', id: 'post-terminal-compaction', parentId: terminal.checkpointId,
+      timestamp: new Date().toISOString(), summary: 'SDK automatic post-run compaction', firstKeptEntryId: user.id, tokensBefore: 90_000 })}\n`);
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'unbound later prompt' }] });
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
+    expect(f.ledger.getDirective(f.identity.requestId)?.state).not.toBe('settled');
+    expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)).toBeNull();
   });
 
   it('keeps an exact completed checkpoint readable after a later distinct request is durably admitted on the same session', async () => {
