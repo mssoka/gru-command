@@ -216,10 +216,10 @@ default = "default"
 # # for roles with a shell; "user" = your own Claude MCP configuration,
 # # connectors included, without prompts.
 # # mcp = "none"
-# # After a minion replies, how long its turn may wait on background work
+# # After an agent replies, how long its turn may wait on background work
 # # it left running (a test run, a dev server). Each turn is its own CLI;
 # # past this, or once a message arrives, GC stops that work and tells
-# # the minion in its next turn.
+# # the agent in its next ordinary turn.
 # # background_wait_ms = 900000
 
 # [runtimes.claude-code.roles]

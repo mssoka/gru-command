@@ -78,6 +78,7 @@ class FallbackHandle implements AgentHandle {
   readonly hasLiveProcess?: () => boolean;
   readonly pendingTurn?: () => PendingTurn | null;
   readonly endBackgroundWait?: () => Promise<void>;
+  readonly turnAnswered?: () => boolean;
   readonly prepareDirectiveProducer?: AgentHandle['prepareDirectiveProducer'];
   readonly inspectDirective?: AgentHandle['inspectDirective'];
   readonly resumeDirective?: AgentHandle['resumeDirective'];
@@ -117,6 +118,9 @@ class FallbackHandle implements AgentHandle {
     }
     if (inner.endBackgroundWait !== undefined) {
       this.endBackgroundWait = () => inner.endBackgroundWait!();
+    }
+    if (inner.turnAnswered !== undefined) {
+      this.turnAnswered = () => inner.turnAnswered!();
     }
     if (inner.prepareDirectiveProducer !== undefined) this.prepareDirectiveProducer = (identity) => {
       this.assertLive();
@@ -270,11 +274,7 @@ class FallbackHandle implements AgentHandle {
     if (this.busy || this.queue.length > 0) {
       const owner = options.owner ?? 'default';
       this.emit({ type: 'queued', reason, owner });
-      // A turn that has replied and only waits on background work stops it
-      // for this message (it settles; the pump then delivers in order).
-      try {
-        void this.inner.endBackgroundWait?.().catch(() => { /* the turn's own outcome is reported by it */ });
-      } catch { /* a faulty probe never blocks queueing */ }
+      this.messageWaiting();
       return new Promise<PromptTurnVerdict>((resolve, reject) => {
         const item: QueuedTurn = {
           text,
@@ -306,6 +306,15 @@ class FallbackHandle implements AgentHandle {
     return this.deliver(text, options);
   }
 
+  /** A message is held: a turn that has replied and only waits on background
+   * work stops it (it settles; the pump then delivers in order), and one
+   * still working or being prepared skips that wait at its reply. */
+  private messageWaiting(): void {
+    // It never rejects; the catch only keeps a broken adapter from crashing
+    // the service through an unhandled rejection.
+    void this.inner.endBackgroundWait?.().catch(() => undefined);
+  }
+
   private async deliver(text: string, options: PromptOptions): Promise<PromptTurnVerdict> {
     this.inFlight = true;
     let captured: PromptTurnVerdict = { ok: true, error: null };
@@ -313,7 +322,10 @@ class FallbackHandle implements AgentHandle {
       // Capture the settled turn's verdict BEFORE the finally pumps the
       // queue: a synchronously started successor's state must never be
       // read as this turn's outcome (r5 blocker 1).
-      captured = await promptWithTerminalVerdict(this.inner, text, options);
+      const delivering = promptWithTerminalVerdict(this.inner, text, options);
+      // Messages still held behind this one: its turn must not wait either.
+      if (this.queue.length > 0) this.messageWaiting();
+      captured = await delivering;
     } finally {
       this.inFlight = false;
       void this.pump();

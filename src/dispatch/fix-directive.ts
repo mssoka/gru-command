@@ -219,10 +219,21 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
+  // A minion whose turn has replied and only waits on background work ends
+  // that wait for this message once the message is admissible: the producer
+  // fences refuse a session with an open turn, and the waiting turn still
+  // holds its worker slot until its CLI is gone.
+  const endAnsweredWait = async (handle: AgentHandle): Promise<void> => {
+    if (handle.turnAnswered?.() !== true || handle.endBackgroundWait === undefined) return;
+    input.beforeWriterSideEffect?.();
+    assertDirectiveJobActive(input.ledger, input.jobId);
+    await handle.endBackgroundWait();
+  };
   if (input.freshSession === true) {
     for (const minion of minions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
+      await endAnsweredWait(prior);
       guard();
       priorCleanupPending = true;
       await disposeAndRecord(prior, true);
@@ -245,13 +256,8 @@ export async function routeFixDirectiveToMinion(
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      await endAnsweredWait(handle);
       guard(); // before even the owned prior retry/pacing awaits
-      // A turn that has replied and only waits on background work ends that
-      // wait for this message, before a worker slot is taken for it: a
-      // directive needs the session idle, and the waiting turn still holds
-      // its own slot until its CLI is gone.
-      await handle.endBackgroundWait?.();
-      guard();
       // Active-incident attribution (B1): if an automatic retry is already
       // covering this handle, wait for its settlement BEFORE prompting.
       // Otherwise the new directive and the retry would deliver overlapping

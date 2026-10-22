@@ -430,10 +430,17 @@ export interface AgentHandle {
   /**
    * A message is waiting for this session. A turn that has replied and only
    * waits on its background tasks stops them now; the promise settles once
-   * that turn has. A turn still working skips that wait when it replies, and
-   * the promise settles at once. Runtimes without such a wait omit it.
+   * that turn has. A turn still working, or still being prepared, skips that
+   * wait when it replies, and the promise settles at once. It never rejects.
+   * Runtimes without such a wait omit it.
    */
   readonly endBackgroundWait?: () => Promise<void>;
+  /**
+   * The open turn has already replied successfully and only waits on
+   * background work: a restart interrupts nothing and has no prompt to send
+   * again. Runtimes without such a wait omit it.
+   */
+  readonly turnAnswered?: () => boolean;
   /** Current native/provider context usage, or null when unavailable/stale. */
   readonly getContextUsage?: () => ContextUsage | null;
   /** Run the runtime's native context compaction on this same session. */

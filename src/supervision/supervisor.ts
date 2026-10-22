@@ -2744,6 +2744,9 @@ export class Supervisor {
       }
     }
     if (pending === null && !hadOpenTurn) return null;
+    // A turn that already replied and only waited on background work was
+    // not interrupted: there is no prompt to send again and no lost turn.
+    if (pending === null && handle.turnAnswered?.() === true) return null;
     const jobId = this.ledger.getAgent(agent.agentId)?.jobId ?? null;
     return { pending, hadOpenTurn, originAgentId: agent.agentId, ...this.captureJobAuthority(jobId, agent.agentId) };
   }

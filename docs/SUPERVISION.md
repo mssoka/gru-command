@@ -45,8 +45,9 @@ After a Claude Code minion replies, its CLI keeps running while background
 work it left running goes on (see RUNTIME-PARITY.md, "Background work
 after a reply"). The live-process probe reports that wait as live, and the
 adapter itself ends it at `[runtimes.claude-code] background_wait_ms`. Its
-prompt is already answered, so a restart in that window never sends it
-again.
+prompt is already answered, so a restart in that window neither sends it
+again nor posts a lost-turn note. A turn whose reply was an in-band error
+is no answer: its prompt stays pending for the rate-limit retry.
 
 **An open native compaction is waited for, never silence-restarted.**
 Provider compaction (`compaction_start` … `compaction_end`) can run

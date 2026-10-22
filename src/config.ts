@@ -82,11 +82,12 @@ export const DEFAULT_CLAUDE_MCP_MODE: ClaudeMcpMode = 'none';
 
 /**
  * [runtimes.claude-code] background_wait_ms — each Claude Code turn is its
- * own CLI process, and after the minion replies that CLI waits on every
+ * own CLI process, and after the agent replies that CLI waits on every
  * background task it still runs, then answers their completion in a
- * follow-up turn. GC waits for that up to this long after each reply, and no
- * longer once a message is waiting for the minion; then it stops the CLI,
- * which stops its tasks, and tells the minion in its next turn.
+ * follow-up turn. GC waits for that up to this long of idle time after each
+ * reply, and no longer once a message is waiting for the agent; then it
+ * stops the CLI, which stops its tasks, and tells the agent in its next
+ * ordinary turn.
  */
 export const DEFAULT_CLAUDE_BACKGROUND_WAIT_MS = 900_000;
 

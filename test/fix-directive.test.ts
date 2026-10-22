@@ -161,11 +161,14 @@ describe('fresh fix worker association', () => {
       ledger.setJobStatus('job-1', 'working');
       ledger.registerAgent({ id: 'waiting-implementer', role: 'minion', jobId: 'job-1' });
       const order: string[] = [];
+      let waiting = true;
       const handle = {
         id: 'waiting-implementer', role: 'minion', sessionFile: null,
         async prompt() { order.push('prompt'); },
+        turnAnswered: () => waiting,
         endBackgroundWait: async () => {
           order.push('end wait');
+          waiting = false;
           waitingTurn?.release();
           waitingTurn = null;
         },
@@ -175,12 +178,21 @@ describe('fresh fix worker association', () => {
         health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
         async dispose() {},
       } satisfies AgentHandle;
-      const routed = await routeFixDirectiveToMinion({
-        jobId: 'job-1', directive: 'rebase on main', signal: new AbortController().signal,
-        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
-        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
-        workerGate: gate,
-      });
+      const route = (refuse: boolean) => {
+        return routeFixDirectiveToMinion({
+          jobId: 'job-1', directive: 'rebase on main', signal: new AbortController().signal,
+          ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+          registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+          workerGate: gate,
+          // The producer fences refuse a session whose turn is still open.
+          beforeTurnSideEffect: () => { if (waiting) throw new Error('directive producer fences: open turn'); },
+          beforeWriterSideEffect: () => { if (refuse) throw new Error('coverage identity changed'); },
+        });
+      };
+      // A message refused anyway never costs the minion its background work.
+      await expect(route(true)).rejects.toThrow(/coverage identity changed/u);
+      expect(order).toEqual([]);
+      const routed = await route(false);
       expect(routed.delivered).toBe(true);
       expect(order).toEqual(['end wait', 'prompt']);
     } finally {

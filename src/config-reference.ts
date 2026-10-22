@@ -220,10 +220,10 @@ function runtimePolicyLines(
     );
     const backgroundWait = policy?.backgroundWaitMs;
     lines.push(
-      `${c}# After a minion replies, how long its turn may wait on background work`,
+      `${c}# After an agent replies, how long its turn may wait on background work`,
       `${c}# it left running (a test run, a dev server). Each turn is its own CLI;`,
       `${c}# past this, or once a message arrives, GC stops that work and tells`,
-      `${c}# the minion in its next turn.`,
+      `${c}# the agent in its next ordinary turn.`,
       backgroundWait === undefined
         ? `${c}# background_wait_ms = ${DEFAULT_CLAUDE_BACKGROUND_WAIT_MS}`
         : `${c}background_wait_ms = ${backgroundWait}`,

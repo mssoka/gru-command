@@ -81,6 +81,9 @@ class StubGruHandle implements AgentHandle {
   toolName: string | null = null;
   /** Hold the NEXT prompt's turn open until this resolves. */
   nextHold: Promise<void> | null = null;
+  /** Times a held message or wake asked the live turn to end its background wait. */
+  endBackgroundWaitCalls = 0;
+  endBackgroundWait = async (): Promise<void> => { this.endBackgroundWaitCalls += 1; };
   /** The NEXT prompt rejects with this error before any event. */
   nextPromptError: string | null = null;
   /** The NEXT prompt emits a fatal runtime error mid-turn (no turn end). */
@@ -3584,6 +3587,26 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
         harness.frameLog.history.some((frame) => frame.type === 'turn' && frame.state === 'start'),
       ).toBe(true);
       expect(outcomes).toEqual([{ ok: true }]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a wake held behind a live turn ends that turn\'s wait on background work, then runs (#471 follow-up)', async () => {
+    const injection = sampleInjection();
+    const harness = await makeHarness({ awareness: { prepare: () => injection, commit: () => {} } });
+    try {
+      const client = await authedClient(harness.port, TOKEN, undefined, true);
+      let release!: () => void;
+      harness.handle.nextHold = new Promise<void>((resolve) => { release = resolve; });
+      client.send('start the dev server', 'background-wait-1');
+      await pollUntil(() => harness.handle.calls.length === 1, 'held chat turn');
+      harness.chat.wakeAwareness();
+      expect(harness.handle.endBackgroundWaitCalls).toBe(1);
+      release();
+      await pollUntil(() => harness.handle.calls.length === 2, 'the wake turn after it');
+      expect(harness.handle.calls[1]?.text).toContain(AWARENESS_WAKE_INSTRUCTION);
+      await client.close();
     } finally {
       await harness.close();
     }

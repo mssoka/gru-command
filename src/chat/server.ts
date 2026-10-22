@@ -775,6 +775,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       controlBarrier !== null ||
       runtimeCompactionBarrier !== null
     ) {
+      // A Gru turn that has replied and only waits on background work ends
+      // that wait for the wake, which then runs at the turn's end.
+      if (turnLive || frameLog.hasOpenTurn) void handle?.endBackgroundWait?.().catch(() => undefined);
       options.awareness.noteWakeDeferred?.('busy');
       return;
     }
@@ -923,7 +926,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             if (wake) {
               // Lost the idle race to a user turn: requeue the wake for the
               // next idle point instead of steering into the conversation.
+              // A turn that has replied and only waits on background work
+              // ends that wait for it.
               wakeRequested = true;
+              void gru.endBackgroundWait?.().catch(() => undefined);
               return;
             }
             midTurn = true;

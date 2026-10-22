@@ -1520,6 +1520,9 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           (agent.supervision.openControl === undefined ||
             typeof agent.supervision.openControl === 'boolean') &&
           (agent.supervision.openToolCalls === undefined || isRestartCount(agent.supervision.openToolCalls)) &&
+          (agent.supervision.backgroundTasks === undefined ||
+            (Array.isArray(agent.supervision.backgroundTasks) &&
+              agent.supervision.backgroundTasks.every((task) => typeof task === 'string'))) &&
           (agent.supervision.lastEventAt === undefined ||
             agent.supervision.lastEventAt === null ||
             (typeof agent.supervision.lastEventAt === 'string' &&
