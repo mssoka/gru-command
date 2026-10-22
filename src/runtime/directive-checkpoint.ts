@@ -32,54 +32,6 @@ export type DirectiveCheckpoint =
 export class DirectiveCheckpointError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveCheckpointError'; }
 }
-/** Transient evidence from the actual Pi auto_retry_start callback. It is scoped
- * to the live directive and intentionally is not a durable/history receipt. */
-const directiveRetryEvidence = new Map<string, Map<string, string>>();
-function directiveRetryEvidenceKey(file: string, requestId: string): string { return `${file}\0${requestId}`; }
-function validRetryErrorContent(content: unknown): content is readonly Record<string, unknown>[] {
-  if (!Array.isArray(content)) return false;
-  return content.every((value: unknown) => {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-    const block = value as Record<string, unknown>;
-    if (block['type'] === 'text') return typeof block['text'] === 'string' && Object.keys(block).every((key) => key === 'type' || key === 'text');
-    if (block['type'] === 'thinking') return typeof block['thinking'] === 'string' &&
-      (block['thinkingSignature'] === undefined || typeof block['thinkingSignature'] === 'string') &&
-      (block['redacted'] === undefined || typeof block['redacted'] === 'boolean') &&
-      Object.keys(block).every((key) => ['type', 'thinking', 'thinkingSignature', 'redacted'].includes(key));
-    // Tool calls (including unfinished/malformed calls) and all unknown blocks
-    // remain effectful/ambiguous and cannot be retry-history nodes.
-    return false;
-  });
-}
-/** Called only for a live Pi `auto_retry_start` event. Pi emits that event from
- * `_prepareRetry` after its retry classifier and budget checks, and before it
- * removes the error from in-memory context. Bind it to the exact current native
- * branch tail; the ancestry guard later verifies the complete chain and row. */
-export function recordDirectiveRetryStart(file: string, identity: DirectiveTurnIdentity, event: unknown, latestEntry: unknown): void {
-  validateDirectiveIdentity(identity);
-  if (typeof event !== 'object' || event === null || Array.isArray(event) ||
-      typeof latestEntry !== 'object' || latestEntry === null || Array.isArray(latestEntry)) return;
-  const sdkEvent = event as Record<string, unknown>;
-  const entry = latestEntry as NativeEntry;
-  const message = entry.message;
-  if (sdkEvent['type'] !== 'auto_retry_start' || !Number.isSafeInteger(sdkEvent['attempt']) || (sdkEvent['attempt'] as number) < 1 ||
-      !Number.isSafeInteger(sdkEvent['maxAttempts']) || (sdkEvent['maxAttempts'] as number) < (sdkEvent['attempt'] as number) ||
-      !Number.isSafeInteger(sdkEvent['delayMs']) || (sdkEvent['delayMs'] as number) < 0 ||
-      typeof sdkEvent['errorMessage'] !== 'string' || sdkEvent['errorMessage'].trim() === '' ||
-      entry.type !== 'message' || typeof entry.id !== 'string' || entry.id === '' || !message || message['role'] !== 'assistant' ||
-      message['stopReason'] !== 'error' || message['errorMessage'] !== sdkEvent['errorMessage'] || !validRetryErrorContent(message['content'])) return;
-  const binding = readDirectiveBinding(file, identity.requestId);
-  if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, identity) || binding.userEntryId === null) return;
-  const key = directiveRetryEvidenceKey(file, identity.requestId);
-  const entries = directiveRetryEvidence.get(key) ?? new Map<string, string>();
-  entries.set(entry.id, sdkEvent['errorMessage']);
-  directiveRetryEvidence.set(key, entries);
-}
-/** Retry lifecycle evidence expires with its one live directive; it is never
- * replayed to reconstruct a missing historical SDK callback. */
-export function clearDirectiveRetryEvidence(file: string, requestId: string): void {
-  directiveRetryEvidence.delete(directiveRetryEvidenceKey(file, requestId));
-}
 /** Bounds a directive's own turn (#469), never the session before it. */
 const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 const MAX_NATIVE_TRANSCRIPT_ENTRIES = 250_000;
@@ -469,7 +421,6 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   if (binding.userEntryId === null) appendBinding(admitted);
   if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
   let parent = user.id;
-  const retryErrors = directiveRetryEvidence.get(directiveRetryEvidenceKey(file, identity.requestId)) ?? new Map<string, string>();
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
@@ -499,20 +450,16 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
-      const retryHistory = message.stopReason === 'error' && typeof message.errorMessage === 'string' &&
-        retryErrors.get(entry.id) === message.errorMessage && validRetryErrorContent(message.content);
-      if (!retryHistory) {
-        for (const block of message.content as Record<string, unknown>[]) {
-          if (block.type !== 'toolCall') continue;
-          if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
-          pending.set(block.id, block.name);
-        }
-        if (pending.size === 0) {
-          if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
-          terminal = true;
-          // Whatever follows (a later request, its controls) is lookahead.
-          endTurn();
-        }
+      for (const block of message.content as Record<string, unknown>[]) {
+        if (block.type !== 'toolCall') continue;
+        if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
+        pending.set(block.id, block.name);
+      }
+      if (pending.size === 0) {
+        if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
+        terminal = true;
+        // Whatever follows (a later request, its controls) is lookahead.
+        endTurn();
       }
     } else if (message.role === 'toolResult') {
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
@@ -996,7 +943,6 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || invocation.message.stopReason !== 'toolUse' ||
       !isDeepStrictEqual(invocation.message, JSON.parse(JSON.stringify(assistantMessage))) || !Array.isArray(content)) refuse();
   const pending = new Map<string, Record<string, unknown>>();
-  const retryErrors = directiveRetryEvidence.get(directiveRetryEvidenceKey(file, identity.requestId)) ?? new Map<string, string>();
   for (const block of content as Record<string, unknown>[]) {
     if (block.type !== 'toolCall') continue;
     if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name ||
@@ -1021,22 +967,13 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     if (entry.type !== 'message' || entry.parentId !== ancestor || !message) refuse();
     ancestor = entry.id;
     if (message!.role === 'assistant') {
-      if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
-      if (message!.stopReason === 'error') {
-        // This is admissible only when the current Pi adapter observed the SDK's
-        // actual retry-start event for this exact persisted error row. It must be
-        // effect-free and structurally complete; error text alone proves nothing.
-        if (retryErrors.get(entry.id) !== message!['errorMessage'] || typeof message!['errorMessage'] !== 'string' ||
-            !validRetryErrorContent(message!.content)) refuse();
-      } else {
-        if (message!.stopReason !== 'toolUse') refuse();
-        for (const block of message!.content as Record<string, unknown>[]) {
-          if (block.type !== 'toolCall') continue;
-          if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();
-          chainPending.set(block.id as string, block.name as string);
-        }
-        if (chainPending.size === 0) refuse();
+      if (chainPending.size > 0 || message!.stopReason !== 'toolUse' || !Array.isArray(message!.content)) refuse();
+      for (const block of message!.content as Record<string, unknown>[]) {
+        if (block.type !== 'toolCall') continue;
+        if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();
+        chainPending.set(block.id as string, block.name as string);
       }
+      if (chainPending.size === 0) refuse();
     } else if (message!.role === 'toolResult') {
       // An earlier failed call is ordinary work; the minion may go on.
       if (typeof message!.toolCallId !== 'string' || chainPending.get(message!.toolCallId) !== message!.toolName || typeof message!.isError !== 'boolean' || !Array.isArray(message!.content)) refuse();

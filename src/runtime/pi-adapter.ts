@@ -50,7 +50,7 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { isPublicModelToken } from './review-model-identity.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveRetryStart, clearDirectiveRetryEvidence, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -1774,7 +1774,6 @@ export class PiAgentHandle implements AgentHandle {
     this.livePromptImages = images;
     this.liveTurnStop = { stopReason: null, error: null };
     this.liveDirective = directive;
-    if (directive !== undefined) clearDirectiveRetryEvidence(this.sessionFile, directive.identity.requestId);
     this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
     this.publishedDirectiveAdmission = undefined;
@@ -1849,7 +1848,6 @@ export class PiAgentHandle implements AgentHandle {
             if (this.directiveAdmissionError !== null) captured = { ok: false, error: String(this.directiveAdmissionError) };
           }
           this.preparedDirectiveEffects.clear();
-          if (directive !== undefined) clearDirectiveRetryEvidence(this.sessionFile, directive.identity.requestId);
           this.liveDirective = undefined;
           this.liveTurn = null;
           this.liveOwner = null;
@@ -1946,21 +1944,6 @@ export class PiAgentHandle implements AgentHandle {
       case 'agent_start':
         this.setState('streaming');
         return;
-      case 'auto_retry_start': {
-        const directive = this.liveDirective;
-        if (directive !== undefined && this.session instanceof AgentSession) {
-          try {
-            const latestEntry = this.session.sessionManager.getBranch().at(-1);
-            recordDirectiveRetryStart(this.sessionFile, directive.identity, e, latestEntry);
-          } catch (error) {
-            // Missing lifecycle evidence is fail-closed at the native tool guard.
-            this.log('warn', 'native SDK retry evidence unavailable; retry-history tool effects remain refused', {
-              requestId: directive.identity.requestId, error: String(error),
-            });
-          }
-        }
-        return;
-      }
       case 'agent_end':
         if (e['willRetry'] === true) return; // retry keeps the turn live
         // All tool executions are done by now; forget any call whose
