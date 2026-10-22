@@ -472,6 +472,7 @@ describe('board server-frame validator', () => {
       key: 'demo',
       displayName: 'demo',
       linked: true,
+      provider: 'github',
       host: 'github.com',
       link: 'https://github.com/example/demo',
       linkReason: null,
@@ -500,9 +501,10 @@ describe('board server-frame validator', () => {
     const unlinked = {
       ...row,
       linked: false,
+      provider: null,
       host: null,
       link: null,
-      linkReason: 'non-GitHub remote',
+      linkReason: 'unsupported code host',
       fullName: null,
       openPrs: null,
       openIssues: null,
@@ -512,6 +514,25 @@ describe('board server-frame validator', () => {
       lastAttemptAt: null,
     };
     expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [unlinked] } } as unknown)).toBe(true);
+    // A GitLab row: nested groups in the full name, a pipeline run with no
+    // conclusion, links on the GitLab host.
+    const gitlab = {
+      ...row,
+      provider: 'gitlab',
+      host: 'gitlab.example.com',
+      link: 'https://gitlab.example.com/group/sub/project',
+      fullName: 'group/sub/project',
+      run: {
+        ...run,
+        status: 'success',
+        conclusion: null,
+        workflow: null,
+        runNumber: 41,
+        url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
+        runStartedAt: null,
+      },
+    };
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [gitlab] } } as unknown)).toBe(true);
     // Positive shapes the server emits that a fixture-light suite can
     // miss: a linked but never-observed row (first pass / rotation
     // window) and an aged stale row with no failure marker.
@@ -613,6 +634,12 @@ describe('board server-frame validator', () => {
       { ...row, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null, run: null, error: null, openPrs: 2 },
       // An unlinked row is always never-observed.
       { ...unlinked, freshness: 'unavailable', error: 'HTTP 500', lastAttemptAt: '2026-01-01T00:06:00.000Z' },
+      // Provider coherence: a linked row names a known provider, an
+      // unlinked row none.
+      { ...row, provider: null },
+      { ...row, provider: undefined },
+      { ...row, provider: 'bitbucket' },
+      { ...unlinked, provider: 'gitlab' },
     ]) {
       expect(
         isValidSnapshot({ ...snapshot(), repoOverview: { rows: [broken] } } as unknown),

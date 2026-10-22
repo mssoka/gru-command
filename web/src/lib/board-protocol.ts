@@ -553,9 +553,9 @@ export interface PipelineView {
  * row per configured managed repository. Server-computed and additive —
  * absent/null on pre-upgrade servers and until the tracker's first
  * refresh pass, in which case the board hides the section entirely.
- * Counts are repo-wide exact totals (issues excluding PRs); the run is
- * the newest Actions run on the repository's discovered default branch,
- * never deployment health. */
+ * Counts are repo-wide exact totals (issues excluding PRs/MRs); the run
+ * is the newest Actions run or GitLab pipeline on the repository's
+ * discovered default branch, never deployment health. */
 export const REPO_OVERVIEW_RUN_STATES = [
   'passed',
   'failed',
@@ -581,6 +581,12 @@ export const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavaila
 
 export type RepoOverviewFreshness = (typeof REPO_OVERVIEW_FRESHNESS)[number];
 
+/** The code host a linked row is observed through; the row's wording
+ * (PRs/Actions vs MRs/pipelines) follows it. */
+export const REPO_PROVIDERS = ['github', 'gitlab'] as const;
+
+export type RepoProvider = (typeof REPO_PROVIDERS)[number];
+
 /** One observed run. `status`/`conclusion` are raw provider strings
  * (untrusted display text); `url` is https on the repository host only. */
 export interface RepoOverviewRunView {
@@ -603,7 +609,9 @@ export interface RepoOverviewRowView {
   readonly key: string;
   readonly displayName: string;
   readonly linked: boolean;
-  /** The GitHub host the identity was read from (null when not linked). */
+  /** The code host the row is observed through (null when not linked). */
+  readonly provider: RepoProvider | null;
+  /** The code host the identity was read from (null when not linked). */
   readonly host: string | null;
   readonly link: string | null;
   readonly linkReason: string | null;
@@ -1230,6 +1238,10 @@ function isRepoOverviewFreshness(value: unknown): value is RepoOverviewFreshness
   return typeof value === 'string' && (REPO_OVERVIEW_FRESHNESS as readonly string[]).includes(value);
 }
 
+function isRepoProvider(value: unknown): value is RepoProvider {
+  return typeof value === 'string' && (REPO_PROVIDERS as readonly string[]).includes(value);
+}
+
 function isNullableIso(value: unknown): value is string | null {
   return value === null || (typeof value === 'string' && Number.isFinite(Date.parse(value)));
 }
@@ -1284,6 +1296,7 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
     typeof value.displayName !== 'string' ||
     !hasVisibleCharacters(value.displayName) ||
     typeof value.linked !== 'boolean' ||
+    !(value.provider === null || isRepoProvider(value.provider)) ||
     !(value.host === null || isSafeHost(value.host)) ||
     !isHttpsUrlOrNull(value.link) ||
     (value.linkReason !== null && typeof value.linkReason !== 'string') ||
@@ -1324,14 +1337,15 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
     if (value.openPrs !== null || value.openIssues !== null || value.run !== null) return false;
     if (value.error === null) return false;
   }
-  // Coherence: a linked row has a link and no reason; an unlinked row has
-  // a reason and no link. A linked row must also carry a safe full name
-  // that the link path actually addresses — a row can never validate as a
-  // guessed or mismatched identity.
+  // Coherence: a linked row has a provider, a link and no reason; an
+  // unlinked row has a reason and no provider or link. A linked row must
+  // also carry a safe full name that the link path actually addresses — a
+  // row can never validate as a guessed or mismatched identity.
   if (!value.linked) {
     return (
       value.link === null &&
       value.linkReason !== null &&
+      value.provider === null &&
       value.host === null &&
       value.openPrs === null &&
       value.openIssues === null &&
@@ -1340,7 +1354,7 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
       value.freshness === 'unchecked'
     );
   }
-  if (value.link === null || value.linkReason !== null || value.host === null) return false;
+  if (value.link === null || value.linkReason !== null || value.host === null || value.provider === null) return false;
   if (typeof value.fullName !== 'string' || value.fullName === '') return false;
   const segments = value.fullName.split('/');
   if (

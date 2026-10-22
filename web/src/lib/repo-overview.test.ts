@@ -9,6 +9,7 @@ import {
   repoRowNote,
   repoRunBadge,
   repoRunContextTitle,
+  repoTerms,
 } from './repo-overview.js';
 
 const CHECKED = '2026-10-07T12:00:00.000Z';
@@ -18,6 +19,7 @@ function row(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
     key: 'alpha',
     displayName: 'alpha',
     linked: true,
+    provider: 'github',
     host: 'github.com',
     link: 'https://github.com/acme/alpha',
     linkReason: null,
@@ -90,6 +92,7 @@ describe('managed repository overview — badge model', () => {
       repoRowBadge(
         row({
           linked: false,
+          provider: null,
           host: null,
           link: null,
           linkReason: 'no usable origin remote',
@@ -170,9 +173,10 @@ describe('managed repository overview — meta and notes', () => {
       repoCiView(
         row({
           linked: false,
+          provider: null,
           host: null,
           link: null,
-          linkReason: 'non-GitHub remote',
+          linkReason: 'unsupported code host',
           fullName: null,
           openPrs: null,
           openIssues: null,
@@ -217,9 +221,10 @@ describe('managed repository overview — meta and notes', () => {
     );
     const unlinked = row({
       linked: false,
+      provider: null,
       host: null,
       link: null,
-      linkReason: 'non-GitHub remote',
+      linkReason: 'unsupported code host',
       fullName: null,
       openPrs: null,
       openIssues: null,
@@ -228,7 +233,9 @@ describe('managed repository overview — meta and notes', () => {
       checkedAt: null,
       lastAttemptAt: null,
     });
-    expect(repoRowNote(unlinked)).toContain('non-GitHub remote');
+    // The unlinked note is neutral: it never blames a missing GitHub link.
+    expect(repoRowNote(unlinked)).toBe('Not linked (unsupported code host) — no repository data is fetched.');
+    expect(repoRowNote({ ...unlinked, linkReason: null })).toBe('Not linked — no repository data is fetched.');
   });
 
   it('names unknown counts in the accessible summary instead of guessing zero', () => {
@@ -255,5 +262,75 @@ describe('managed repository overview — meta and notes', () => {
     expect(repoRunContextTitle(queued)).not.toContain('started ');
     expect(repoRunContextTitle(row({ run: { ...row().run!, status: null } }))).toBeNull();
     expect(repoRunContextTitle(row({ run: null }))).toBeNull();
+  });
+});
+
+describe('managed repository overview — GitLab wording', () => {
+  function gitlabRow(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
+    return row({
+      provider: 'gitlab',
+      host: 'gitlab.example.com',
+      link: 'https://gitlab.example.com/group/sub/project',
+      fullName: 'group/sub/project',
+      run: {
+        state: 'passed',
+        status: 'success',
+        conclusion: null,
+        workflow: null,
+        branch: 'main',
+        runNumber: 41,
+        url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
+        runCreatedAt: CHECKED,
+        runStartedAt: null,
+        runUpdatedAt: CHECKED,
+      },
+      ...over,
+    });
+  }
+
+  it('words a GitLab row in merge requests and pipelines', () => {
+    expect(repoTerms(gitlabRow())).toEqual({ host: 'GitLab', requests: 'MRs', requestsLong: 'merge requests', run: 'pipeline' });
+    expect(repoTerms(row())).toEqual({ host: 'GitHub', requests: 'PRs', requestsLong: 'pull requests', run: 'run' });
+    // An unnamed pipeline links under its project-scoped number.
+    expect(repoCiView(gitlabRow())).toEqual({
+      label: 'pipeline #41',
+      workflow: null,
+      url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
+      branch: 'main',
+    });
+    expect(repoCiView(gitlabRow({ run: { ...gitlabRow().run!, runNumber: null } })).label).toBe('pipeline');
+    expect(repoRunContextTitle(gitlabRow())).toBe(
+      `provider status: success · pipeline #41 · created ${CHECKED} · updated ${CHECKED}`,
+    );
+    expect(repoBadgeTitle(gitlabRow())).toBe('success');
+    const badge = repoRowBadge(gitlabRow());
+    expect(repoRowAriaLabel(gitlabRow(), badge)).toBe(
+      'alpha — PASSED — 2 open merge requests, 3 open issues excluding merge requests',
+    );
+  });
+
+  it('gives GitLab notes their own CI vocabulary and never says GitHub, Actions or PRs', () => {
+    const at = (state: RepoOverviewRunState): RepoOverviewRowView =>
+      gitlabRow({ run: { ...gitlabRow().run!, state, workflow: null, url: null } });
+    expect(repoRowNote(at('never-run'))).toBe('No pipeline on main yet.');
+    expect(repoRowNote(at('unavailable'))).toBe('GitLab CI/CD is unavailable for this repository.');
+    expect(repoRowNote(at('running'))).toBe('Newest pipeline in progress — older results are not shown as current.');
+    expect(repoRowNote(at('queued'))).toBe('Newest pipeline queued — an older result is not shown as current.');
+    expect(repoRowNote(at('cancelled'))).toBe('Pipeline cancelled — neither pass nor failure.');
+    expect(repoRowNote(at('unknown'))).toBe('The provider returned a pipeline state that could not be classified.');
+    const texts: string[] = [];
+    for (const state of [
+      'passed', 'failed', 'cancelled', 'skipped', 'running', 'queued', 'action-required',
+      'never-run', 'no-branch', 'unavailable', 'unknown',
+    ] as const) {
+      const entry = at(state);
+      const badge = repoRowBadge(entry);
+      texts.push(badge.text, repoRowAriaLabel(entry, badge), repoRowNote(entry) ?? '', repoCiView(entry).label);
+    }
+    const stale = gitlabRow({ freshness: 'stale', error: 'open issues group/sub/project on gitlab.example.com: HTTP 500' });
+    texts.push(repoRowBadge(stale).text, repoRowNote(stale) ?? '', repoRunContextTitle(stale) ?? '');
+    for (const text of texts) {
+      expect(text).not.toMatch(/GitHub|Actions|PRs|pull request/u);
+    }
   });
 });

@@ -65,7 +65,7 @@ a fallback for relocated deployments — see
 
 `workspace_root` is a shared project directory and may contain unrelated
 repositories. `managed_repos` is the explicit subset Gru Command treats as
-managed (including GitHub overview membership and intake root validation);
+managed (including overview membership and intake root validation);
 names are exact direct-child directory names relative to `workspace_root`,
 for example:
 
@@ -84,6 +84,14 @@ inferred or written for you, and there is no hot reload. A selected but
 unavailable directory stays selected and is shown as unavailable rather than
 being replaced by another workspace child. Existing jobs and history are not
 removed when the overview list changes.
+
+The overview reads GitHub origins through the `gh` login and GitLab origins
+(`gitlab.com`, or a self-hosted host whose first label is `gitlab`) through
+`GITLAB_TOKEN`, falling back to `GL_TOKEN`, in the service environment — the
+same token Perkins GitLab delivery uses, sent only to those hosts. A GitLab row
+without a token reads unavailable and names the missing variable; GitHub rows
+are unaffected. Origins on any other host read `Not linked (unsupported code
+host)`. See [BOARD.md](./BOARD.md) for what each row shows.
 
 ## Load & validation behavior
 

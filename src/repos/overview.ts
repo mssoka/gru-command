@@ -10,7 +10,7 @@ import {
   type GhCommandRunner,
   type RepoRef,
 } from '../dispatch/github-poll.js';
-import { isGitHubRemote, parseRepoRemote } from '../dispatch/review-path.js';
+import { isGitHubRemote, isGitLabRemote, parseRepoRemote } from '../dispatch/review-path.js';
 import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } from './managed-names.js';
 
 /**
@@ -53,6 +53,15 @@ import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } fro
  * optional `onDefaultBranchRuns` hook, called once per complete
  * observation after the row is committed — no extra GitHub call, and a
  * hook failure is logged without touching the row or the pass.
+ *
+ * GitLab origins (`isGitLabRemote` hosts, nested groups kept) are linked
+ * `gitlab` rows observed through the GitLab REST port under the same
+ * freshness, atomic-observation, budget and rotation rules: the project
+ * gives the default branch, the list endpoints' `X-Total` the exact open
+ * merge-request and issue counts, and the newest default-branch pipeline
+ * the run. GitLab pipelines never feed the #446 alert. A fatal
+ * auth/rate-limit condition aborts only its provider scope (`github`, or
+ * `gitlab:<host>`): the other provider's rows are still observed.
  */
 
 // ------------------------------------------------------------------
@@ -88,6 +97,11 @@ export const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavaila
 
 export type RepoOverviewFreshness = (typeof REPO_OVERVIEW_FRESHNESS)[number];
 
+/** The code host a linked row is observed through; its wording follows it. */
+export const REPO_PROVIDERS = ['github', 'gitlab'] as const;
+
+export type RepoProvider = (typeof REPO_PROVIDERS)[number];
+
 export interface RepoOverviewRunView {
   readonly state: RepoOverviewRunState;
   /** Raw provider status/conclusion strings — untrusted text, display only. */
@@ -111,7 +125,9 @@ export interface RepoOverviewRowView {
   readonly key: string;
   readonly displayName: string;
   readonly linked: boolean;
-  /** The GitHub host the identity was read from (null when not linked) —
+  /** The code host the row is observed through (null when not linked). */
+  readonly provider: RepoProvider | null;
+  /** The code host the identity was read from (null when not linked) —
    * lets the web validator pin the link and run URLs to that host. */
   readonly host: string | null;
   /** Validated https repository URL (null when not linked). */
@@ -146,7 +162,7 @@ export const REPO_OVERVIEW_REFRESH_MS = 300_000;
 /** Freshness window: data older than this (3 cadences) reads stale even
  * without a recorded failure, so an old green never looks current. */
 export const REPO_OVERVIEW_STALE_AFTER_MS = REPO_OVERVIEW_REFRESH_MS * 3;
-/** `gh` calls allowed per refresh (≈20 repos at ≤5 calls). */
+/** Provider calls allowed per refresh (≈20 repos at ≤5 calls). */
 export const REPO_OVERVIEW_MAX_CALLS_PER_REFRESH = 100;
 /** Runs read per repository (one call): enough that the newest is
  * selectable robustly and each workflow's latest finished run is usually
@@ -244,6 +260,48 @@ export interface RepoOverviewApiPort {
   }): Promise<ActionsAvailability<readonly RepoOverviewRunRaw[]>>;
 }
 
+export interface GitLabProjectMeta {
+  /** The project's default branch; null for an empty repository
+   * (`empty_repo`, whose reported branch is only the instance default) or
+   * a project that reports none. */
+  readonly defaultBranch: string | null;
+  /** False only on an explicit `builds_access_level: 'disabled'` or
+   * `jobs_enabled: false`; anything else reads as CI available. */
+  readonly ciEnabled: boolean;
+}
+
+/** One pipeline from the project pipelines list. */
+export interface GitLabPipelineRaw {
+  readonly id: number | null;
+  /** The project-scoped pipeline number shown as `pipeline #iid`. */
+  readonly iid: number | null;
+  /** The pipeline's `workflow:name`, when the project sets one. */
+  readonly name: string | null;
+  readonly status: string | null;
+  /** What triggered the pipeline: a `merge_request_event` or child
+   * (`parent_pipeline`) pipeline does not test the branch itself. */
+  readonly source: string | null;
+  readonly ref: string | null;
+  readonly url: string | null;
+  /** Actual creation time — the selection key, as for GitHub runs. */
+  readonly createdAt: string | null;
+  readonly startedAt: string | null;
+  readonly updatedAt: string | null;
+}
+
+export interface GitLabRepoOverviewApiPort {
+  fetchProject(input: { readonly repo: RepoRef }): Promise<GitLabProjectMeta>;
+  /** Exact count of open merge requests (`X-Total`). */
+  countOpenMergeRequests(input: { readonly repo: RepoRef }): Promise<number>;
+  /** Exact count of open issues (`X-Total`); merge requests are never issues on GitLab. */
+  countOpenIssues(input: { readonly repo: RepoRef }): Promise<number>;
+  latestPipelines(input: {
+    readonly repo: RepoRef;
+    readonly branch: string;
+    readonly limit: number;
+  }): Promise<readonly GitLabPipelineRaw[]>;
+}
+
 // ------------------------------------------------------------------
 // Pure projections
 // ------------------------------------------------------------------
@@ -332,6 +390,43 @@ export function runStateOf(status: string | null, conclusion: string | null): Re
   }
 }
 
+/** Map a GitLab pipeline status to the fixed display state list; anything
+ * unrecognized is `unknown`. GitLab carries no separate conclusion. */
+export function gitLabPipelineStateOf(status: string | null): RepoOverviewRunState {
+  switch ((status ?? '').toLowerCase()) {
+    case 'success':
+      return 'passed';
+    case 'failed':
+      return 'failed';
+    case 'canceled':
+    case 'canceling':
+      return 'cancelled';
+    case 'skipped':
+      return 'skipped';
+    case 'running':
+      return 'running';
+    case 'created':
+    case 'waiting_for_resource':
+    case 'preparing':
+    case 'pending':
+    case 'scheduled':
+      return 'queued';
+    case 'manual':
+      return 'action-required';
+    default:
+      return 'unknown';
+  }
+}
+
+/** Pipeline sources that can share the default branch's ref without
+ * testing the branch itself. */
+const GITLAB_NON_BRANCH_SOURCES: ReadonlySet<string> = new Set(['merge_request_event', 'parent_pipeline']);
+
+/** A pipeline that tested the default branch itself. */
+export function isDefaultBranchPipeline(pipeline: Pick<GitLabPipelineRaw, 'ref' | 'source'>, branch: string): boolean {
+  return pipeline.ref === branch && !GITLAB_NON_BRANCH_SOURCES.has(pipeline.source ?? '');
+}
+
 /** The newest-run order: true when `run` is newer than `than` by the
  * ACTUAL CREATION time (createdAt), then id. A run without a parseable
  * creation time is newer only than another unparseable one with a
@@ -354,10 +449,10 @@ export function isNewerRun(
 /** Newest run wins by {@link isNewerRun} — provider list order is never
  * trusted alone, and a delayed `run_started_at` can never promote an older
  * run over a newer queued one. */
-export function selectLatestRun(
-  runs: readonly RepoOverviewRunRaw[],
-): RepoOverviewRunRaw | null {
-  let best: RepoOverviewRunRaw | null = null;
+export function selectLatestRun<T extends Pick<RepoOverviewRunRaw, 'createdAt' | 'id'>>(
+  runs: readonly T[],
+): T | null {
+  let best: T | null = null;
   for (const run of runs) {
     if (best === null || isNewerRun(run, best)) best = run;
   }
@@ -436,13 +531,17 @@ export function safeDisplayName(name: string): string {
   return escaped === '' ? 'unnamed repository' : escaped;
 }
 
+function isSafeLinkHost(host: string): boolean {
+  if (!SAFE_HOST.test(host) || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host)) return false;
+  // No empty label, anywhere: `foo..github` must stay unlinked.
+  return !host.includes('..');
+}
+
 /** Build the https repository link from a parsed remote, or null when the
  * host/segments cannot form a safe link (not-linked, never guessed). */
 export function githubRepoLink(ref: RepoRef): string | null {
   if (!isGitHubRemote(ref.host)) return null;
-  if (!SAFE_HOST.test(ref.host) || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(ref.host)) return null;
-  // No empty label, anywhere: `foo..github` must stay unlinked.
-  if (ref.host.includes('..')) return null;
+  if (!isSafeLinkHost(ref.host)) return null;
   if (!SAFE_REMOTE_SEGMENT.test(ref.owner) || !SAFE_REMOTE_SEGMENT.test(ref.repo)) return null;
   if (ref.owner === '.' || ref.owner === '..' || ref.repo === '.' || ref.repo === '..') return null;
   let url: URL;
@@ -455,6 +554,34 @@ export function githubRepoLink(ref: RepoRef): string | null {
   if (url.hostname.toLowerCase() !== ref.host.toLowerCase()) return null;
   if (url.pathname !== `/${ref.owner}/${ref.repo}`) return null;
   return url.toString();
+}
+
+/** Build the https project link from a parsed GitLab remote — nested
+ * groups kept, every segment safe — or null (not-linked, never guessed).
+ * The host rule is `isGitLabRemote`, the same guard that decides where
+ * the GitLab token may be sent. */
+export function gitlabRepoLink(ref: RepoRef): string | null {
+  if (!isGitLabRemote(ref.host)) return null;
+  if (!isSafeLinkHost(ref.host)) return null;
+  const segments = [...ref.owner.split('/'), ref.repo];
+  if (segments.some((segment) => !SAFE_REMOTE_SEGMENT.test(segment) || segment === '.' || segment === '..')) {
+    return null;
+  }
+  const path = `/${segments.join('/')}`;
+  let url: URL;
+  try {
+    url = new URL(`https://${ref.host}${path}`);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:') return null;
+  if (url.hostname.toLowerCase() !== ref.host.toLowerCase()) return null;
+  if (url.pathname !== path) return null;
+  return url.toString();
+}
+
+function repoLinkOf(ref: RepoRef, provider: RepoProvider | null): string | null {
+  return provider === 'gitlab' ? gitlabRepoLink(ref) : githubRepoLink(ref);
 }
 
 /** A provider run URL is linkable only when it is https on the SAME host
@@ -477,6 +604,20 @@ export function safeRunUrl(raw: string | null, host: string): string | null {
 
 export type RepoFetchErrorKind = 'rate-limit' | 'auth' | 'permission' | 'not-found' | 'other';
 
+/** A provider failure whose kind the adapter already knows (an HTTP
+ * status, a missing credential): classification reads the kind, never the
+ * message, so a project or host name can never read as a provider
+ * condition. */
+export class RepoProviderError extends Error {
+  readonly kind: RepoFetchErrorKind;
+
+  constructor(kind: RepoFetchErrorKind, message: string) {
+    super(message);
+    this.name = 'RepoProviderError';
+    this.kind = kind;
+  }
+}
+
 /** The structured failure detail when the error carries one. Classifying
  * against the annotated label instead would read repository/owner names
  * (e.g. `authentication-service`) as provider semantics. */
@@ -497,11 +638,12 @@ function classifyFailureText(text: string): RepoFetchErrorKind {
   return 'other';
 }
 
-/** Classify a failed observation. `rate-limit` and `auth` are global
- * conditions: the refresh aborts instead of hammering every repository. A
- * structured `GhApiError` without a cause is an adapter/shape failure —
- * per-repository, never global. */
+/** Classify a failed observation. `rate-limit` and `auth` are scope-wide
+ * conditions: the refresh stops observing that provider scope instead of
+ * hammering every repository in it. A structured `GhApiError` without a
+ * cause is an adapter/shape failure — per-repository, never scope-wide. */
 export function classifyGhError(error: unknown): RepoFetchErrorKind {
+  if (error instanceof RepoProviderError) return error.kind;
   if (error instanceof GhRateLimitedError) return 'rate-limit';
   if (error instanceof GhApiError && error.causeText === null) return 'other';
   return classifyFailureText(failureText(error));
@@ -532,9 +674,26 @@ function runViewOf(raw: RepoOverviewRunRaw, host: string, branch: string): RepoO
   };
 }
 
-function runUnavailableView(branch: string | null): RepoOverviewRunView {
+function gitLabRunViewOf(raw: GitLabPipelineRaw, host: string, branch: string): RepoOverviewRunView {
   return {
-    state: 'unavailable',
+    state: gitLabPipelineStateOf(raw.status),
+    status: raw.status,
+    conclusion: null,
+    workflow: raw.name,
+    branch,
+    runNumber: raw.iid,
+    url: safeRunUrl(raw.url, host),
+    runCreatedAt: raw.createdAt,
+    runStartedAt: raw.startedAt,
+    runUpdatedAt: raw.updatedAt,
+  };
+}
+
+/** A run state with no provider run behind it (no branch, no workflow,
+ * never run, CI unavailable): no provider strings at all. */
+function absentRunView(state: RepoOverviewRunState, branch: string | null): RepoOverviewRunView {
+  return {
+    state,
     status: null,
     conclusion: null,
     workflow: null,
@@ -684,11 +843,54 @@ export class GhRepoOverviewApi implements RepoOverviewApiPort {
 }
 
 // ------------------------------------------------------------------
+// GitLab payload projections (the transport is ./gitlab-overview.ts)
+// ------------------------------------------------------------------
+
+/** The project fields the overview reads. An empty repository reads as no
+ * branch whatever branch GitLab reports for it; a null/absent branch is
+ * the same state, and any other non-string fails loud. */
+export function gitLabProjectMetaOf(label: string, value: unknown): GitLabProjectMeta {
+  const raw = record(value);
+  if (raw === null) {
+    throw new RepoProviderError('other', `${label}: response is not a JSON object`);
+  }
+  const ciEnabled = !(raw['builds_access_level'] === 'disabled' || raw['jobs_enabled'] === false);
+  if (raw['empty_repo'] === true) return { defaultBranch: null, ciEnabled };
+  const branch = raw['default_branch'];
+  if (branch === undefined || branch === null) return { defaultBranch: null, ciEnabled };
+  if (typeof branch !== 'string' || branch === '') {
+    throw new RepoProviderError(
+      'other',
+      `${label}: default_branch must be a non-empty string (got ${JSON.stringify(branch).slice(0, 80)})`,
+    );
+  }
+  return { defaultBranch: branch, ciEnabled };
+}
+
+/** One pipeline list entry; null when the entry is not an object. */
+export function gitLabPipelineOf(value: unknown): GitLabPipelineRaw | null {
+  const raw = record(value);
+  if (raw === null) return null;
+  return {
+    id: countOrNull(raw['id']),
+    iid: countOrNull(raw['iid']),
+    name: strOrNull(raw['name']),
+    status: strOrNull(raw['status']),
+    source: strOrNull(raw['source']),
+    ref: strOrNull(raw['ref']),
+    url: strOrNull(raw['web_url']),
+    createdAt: isoOrNull(raw['created_at']),
+    startedAt: isoOrNull(raw['started_at']),
+    updatedAt: isoOrNull(raw['updated_at']),
+  };
+}
+
+// ------------------------------------------------------------------
 // Remote classification
 // ------------------------------------------------------------------
 
 export type RemoteClassification =
-  | { readonly kind: 'linked'; readonly ref: RepoRef }
+  | { readonly kind: 'linked'; readonly ref: RepoRef; readonly provider: RepoProvider }
   | { readonly kind: 'unlinked'; readonly reason: string };
 
 export type RemoteResolver = (repoPath: string) => RepoRef | null | Promise<RepoRef | null>;
@@ -738,9 +940,15 @@ export async function defaultRemoteResolver(repoPath: string): Promise<RepoRef |
 
 function classifyRemoteValue(ref: RepoRef | null): RemoteClassification {
   if (ref === null) return { kind: 'unlinked', reason: 'no usable origin remote' };
-  if (!isGitHubRemote(ref.host)) return { kind: 'unlinked', reason: 'non-GitHub remote' };
-  if (githubRepoLink(ref) === null) return { kind: 'unlinked', reason: 'unrecognized remote' };
-  return { kind: 'linked', ref };
+  if (isGitHubRemote(ref.host)) {
+    if (githubRepoLink(ref) === null) return { kind: 'unlinked', reason: 'unrecognized remote' };
+    return { kind: 'linked', ref, provider: 'github' };
+  }
+  if (isGitLabRemote(ref.host)) {
+    if (gitlabRepoLink(ref) === null) return { kind: 'unlinked', reason: 'unrecognized remote' };
+    return { kind: 'linked', ref, provider: 'gitlab' };
+  }
+  return { kind: 'unlinked', reason: 'unsupported code host' };
 }
 
 export function classifyRemote(repoPath: string, resolveRemote: (path: string) => RepoRef | null): RemoteClassification {
@@ -753,6 +961,8 @@ export function classifyRemote(repoPath: string, resolveRemote: (path: string) =
 
 interface RepoSourceState {
   ref: RepoRef | null;
+  /** Set with `ref`: the code host the identity is observed through. */
+  provider: RepoProvider | null;
   linkReason: string | null;
   counts: { readonly openPrs: number; readonly openIssues: number } | null;
   run: RepoOverviewRunView | null;
@@ -764,6 +974,7 @@ interface RepoSourceState {
 function emptySourceState(): RepoSourceState {
   return {
     ref: null,
+    provider: null,
     linkReason: null,
     counts: null,
     run: null,
@@ -799,6 +1010,9 @@ export interface ManagedRepoOverviewOptions {
   /** Explicit config names only; an empty or absent list means no repos. */
   readonly managedRepos: readonly string[];
   readonly api: RepoOverviewApiPort;
+  /** The GitLab REST port; production always wires it. A GitLab row
+   * observed without it fails by name. */
+  readonly gitlabApi?: GitLabRepoOverviewApiPort;
   /** Test seams. Production membership is always `managedRepos`; no
    * directory discovery fallback exists. */
   readonly scanRepos?: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
@@ -808,7 +1022,7 @@ export interface ManagedRepoOverviewOptions {
   readonly intervalMs?: number;
   /** Freshness window; default {@link REPO_OVERVIEW_STALE_AFTER_MS}. */
   readonly staleAfterMs?: number;
-  /** `gh` calls per refresh; default {@link REPO_OVERVIEW_MAX_CALLS_PER_REFRESH}. */
+  /** Provider calls per refresh; default {@link REPO_OVERVIEW_MAX_CALLS_PER_REFRESH}. */
   readonly maxCallsPerRefresh?: number;
   /** Sleep seam for search pacing; default a real timer (tests advance a
    * fake clock instead of waiting). */
@@ -822,7 +1036,8 @@ export interface ManagedRepoOverviewOptions {
 }
 
 interface ObserveOutcome {
-  /** Fatal global condition (rate limit/auth) — stop the refresh. */
+  /** Fatal scope condition (rate limit/auth) — stop observing the
+   * repository's provider scope for the rest of the refresh. */
   readonly aborted: boolean;
   /** Budget (call count or wall clock) ran out before a complete
    * observation — nothing was recorded and rotation advances past this
@@ -832,6 +1047,20 @@ interface ObserveOutcome {
    * aborts fatally, the exhausted budget's own message on `retry`, and
    * null otherwise. */
   readonly detail: string | null;
+}
+
+/** One complete provider observation, committed atomically by `observe`. */
+interface ProviderObservation {
+  readonly counts: { readonly openPrs: number; readonly openIssues: number };
+  readonly run: RepoOverviewRunView;
+  /** GitHub only: the run page for the default-branch CI alert (#446). */
+  readonly defaultBranchRuns: DefaultBranchRunsObservation | null;
+}
+
+/** The fatal-abort scope a linked row belongs to: every GitHub host shares
+ * the `gh` credential, while each GitLab host is its own scope. */
+function providerScopeOf(state: RepoSourceState): string {
+  return state.provider === 'gitlab' && state.ref !== null ? `gitlab:${state.ref.host.toLowerCase()}` : 'github';
 }
 
 export class ManagedRepoOverviewTracker {
@@ -920,8 +1149,9 @@ export class ManagedRepoOverviewTracker {
         key: name,
         displayName: safeDisplayName(name),
         linked,
+        provider: state.ref !== null ? state.provider : null,
         host: state.ref !== null ? state.ref.host : null,
-        link: state.ref !== null ? githubRepoLink(state.ref) : null,
+        link: state.ref !== null ? repoLinkOf(state.ref, state.provider) : null,
         linkReason: state.ref !== null ? null : state.linkReason,
         fullName: state.ref !== null ? repoFullName(state.ref) : null,
         openPrs: linked ? state.counts?.openPrs ?? null : null,
@@ -936,7 +1166,7 @@ export class ManagedRepoOverviewTracker {
     return { rows };
   }
 
-  /** Re-scan the registry and observe GitHub state (coalesced). */
+  /** Re-scan the registry and observe provider state (coalesced). */
   refresh(): Promise<RepoOverviewView | null> {
     if (this.inFlight !== null) return this.inFlight;
     this.inFlight = this.runRefresh()
@@ -957,8 +1187,8 @@ export class ManagedRepoOverviewTracker {
     // Classification is built into a LOCAL map and published only once
     // every remote has been resolved: `view()` (called by board pushes and
     // heartbeats DURING this refresh) must never observe a half-classified
-    // entry as `linked:false` without a reason. A changed identity (or a
-    // remote that stopped being a safe GitHub link) drops the old
+    // entry as `linked:false` without a reason. A changed identity or
+    // provider (or a remote that stopped being a safe link) drops the old
     // repository's cached observation — stale data must never attach to a
     // different identity. A resolver ERROR keeps the previous
     // classification and cached observation (a transient git failure is
@@ -1110,6 +1340,7 @@ export class ManagedRepoOverviewTracker {
       } else {
         const sameIdentity =
           base.ref !== null &&
+          base.provider === classification.provider &&
           base.ref.host === classification.ref.host &&
           repoFullName(base.ref) === repoFullName(classification.ref);
         if (sameIdentity) {
@@ -1118,6 +1349,7 @@ export class ManagedRepoOverviewTracker {
         } else {
           const reset = emptySourceState();
           reset.ref = classification.ref;
+          reset.provider = classification.provider;
           nextStates.set(name, reset);
         }
       }
@@ -1147,48 +1379,62 @@ export class ManagedRepoOverviewTracker {
       deadlineMs: this.now() + REPO_OVERVIEW_FETCH_BUDGET_MS,
     };
     let nextIndex = 0;
+    let stopIndex = fetchable.length;
     let discarded: string | null = null;
     let failures = 0;
-    let aborted: string | null = null;
-    let abortDetail: string | null = null;
+    let stopped: 'budget' | 'deadline' | null = null;
+    // Fatal auth/rate-limit conditions, per provider scope: an aborted
+    // scope spends no further call this pass, and every other scope keeps
+    // being observed.
+    const abortedScopes = new Map<string, string>();
+    const skipped: string[] = [];
     for (let index = 0; index < fetchable.length; index += 1) {
+      const name = fetchable[index] as string;
+      const scope = providerScopeOf(this.states.get(name) as RepoSourceState);
+      if (abortedScopes.has(scope)) {
+        skipped.push(name);
+        continue;
+      }
       if (budget.used >= budget.limit) {
-        aborted = 'budget';
+        stopped = 'budget';
         nextIndex = index;
+        stopIndex = index;
         break;
       }
       if (this.now() > budget.deadlineMs) {
-        aborted = 'deadline';
+        stopped = 'deadline';
         nextIndex = index;
+        stopIndex = index;
         break;
       }
-      const outcome = await this.observe(fetchable[index] as string, budget);
+      const outcome = await this.observe(name, budget);
       if (outcome.retry) {
         // The partial observation is discarded, and its repository is
         // prioritized on the next pass (never silently skipped past): a
         // budget or wall-clock truncation must not starve the tail behind
         // a repeated prefix.
-        aborted = outcome.detail !== null && outcome.detail.includes('wall-clock') ? 'deadline' : 'budget';
-        discarded = fetchable[index] as string;
+        stopped = outcome.detail !== null && outcome.detail.includes('wall-clock') ? 'deadline' : 'budget';
+        discarded = name;
         nextIndex = index;
+        stopIndex = index;
         break;
       }
       nextIndex = index + 1;
       if (outcome.aborted) {
-        aborted = 'fatal';
-        abortDetail = outcome.detail;
-        break;
+        abortedScopes.set(scope, outcome.detail ?? 'provider condition');
+        continue;
       }
-      if (this.states.get(fetchable[index] as string)?.error !== null) failures += 1;
+      if (this.states.get(name)?.error !== null) failures += 1;
     }
-    if (aborted === 'fatal' && abortDetail !== null) {
-      // A global outage (auth/rate limit) aborted the pass: every
-      // unattempted linked repository is disclosed as unchecked-for-this-
-      // pass rather than silently keeping a fresh-looking age.
-      const rest = fetchable.slice(nextIndex);
-      for (const name of rest) {
+    if (abortedScopes.size > 0) {
+      // A scope-wide outage (auth/rate limit) aborted that scope: every
+      // unattempted linked repository in it is disclosed as unchecked-for-
+      // this-pass rather than silently keeping a fresh-looking age.
+      for (const name of [...skipped, ...fetchable.slice(stopIndex)]) {
         const state = this.states.get(name);
         if (state === undefined || state.ref === null) continue;
+        const abortDetail = abortedScopes.get(providerScopeOf(state));
+        if (abortDetail === undefined) continue;
         state.lastAttemptAt = new Date(this.now()).toISOString();
         state.error = `refresh aborted before this repository was checked: ${abortDetail}`.slice(0, 300);
       }
@@ -1212,19 +1458,23 @@ export class ManagedRepoOverviewTracker {
         ? classificationResumeIndex
         : Math.max(0, repos.indexOf(resumeName));
     }
-    if (aborted === 'budget') {
+    // An aborted scope's first skipped repository resumes the next pass, so
+    // what this pass never checked goes first (a discarded observation
+    // still keeps its priority).
+    if (skipped.length > 0) this.cursor = Math.max(0, repos.indexOf(skipped[0] as string));
+    if (stopped === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {
         budget: this.maxCallsPerRefresh,
         calls: budget.used,
         repos: repos.length,
       });
-    } else if (aborted === 'deadline') {
+    } else if (stopped === 'deadline') {
       this.log('warn', 'repo overview refresh: fetch wall-clock budget spent — remaining repositories defer', {
         budgetMs: REPO_OVERVIEW_FETCH_BUDGET_MS,
         calls: budget.used,
         repos: repos.length,
       });
-    } else if (aborted === 'fatal') {
+    } else if (abortedScopes.size > 0) {
       this.log('warn', 'repo overview refresh aborted (provider/rate-limit condition) — next cadence re-observes', {});
     } else if (failures > 0) {
       this.log('warn', 'repo overview refresh completed with repository failures', { repos: repos.length, failures });
@@ -1246,80 +1496,15 @@ export class ManagedRepoOverviewTracker {
     const state = this.states.get(name) as RepoSourceState;
     const ref = state.ref as RepoRef;
     try {
-      let observed: DefaultBranchRunsObservation | null = null;
-      const meta = await this.spend(budget, () => this.opts.api.fetchRepo({ repo: ref }));
-      const openPrs = await this.spendSearch(budget, () => this.opts.api.countOpenPulls({ repo: ref }));
-      const openIssues = await this.spendSearch(budget, () => this.opts.api.countOpenIssues({ repo: ref }));
-      let run: RepoOverviewRunView;
-      if (meta.defaultBranch === null) {
-        // An empty repository has no default branch: the exact counts are
-        // still real observations and the run context is honestly absent
-        // instead of degrading the whole row into a fetch failure.
-        run = {
-          state: 'no-branch',
-          status: null,
-          conclusion: null,
-          workflow: null,
-          branch: null,
-          runNumber: null,
-          url: null,
-          runCreatedAt: null,
-          runStartedAt: null,
-          runUpdatedAt: null,
-        };
-      } else {
-        const branch = meta.defaultBranch;
-        const workflows = await this.spend(budget, () => this.opts.api.countWorkflows({ repo: ref }));
-        if (workflows.kind === 'actions-unavailable') {
-          run = runUnavailableView(branch);
-        } else if (workflows.value === 0) {
-          run = {
-            state: 'no-workflow',
-            status: null,
-            conclusion: null,
-            workflow: null,
-            branch,
-            runNumber: null,
-            url: null,
-            runCreatedAt: null,
-            runStartedAt: null,
-            runUpdatedAt: null,
-          };
-        } else {
-          const runs = await this.spend(budget, () =>
-            this.opts.api.latestRuns({ repo: ref, branch, limit: REPO_OVERVIEW_RUNS_PER_FETCH }),
-          );
-          if (runs.kind === 'actions-unavailable') {
-            run = runUnavailableView(branch);
-          } else {
-            observed = { repo: ref, branch, runs: runs.value };
-            // The chip shows the branch's own newest run; the hook gets the full page.
-            const latest = selectLatestRun(runs.value.filter(isDefaultBranchRun));
-            run =
-              latest === null
-                ? {
-                    state: 'never-run',
-                    status: null,
-                    conclusion: null,
-                    workflow: null,
-                    branch,
-                    runNumber: null,
-                    url: null,
-                    runCreatedAt: null,
-                    runStartedAt: null,
-                    runUpdatedAt: null,
-                  }
-                : runViewOf(latest, ref.host, branch);
-          }
-        }
-      }
-      state.counts = { openPrs, openIssues };
-      state.run = run;
+      const observation =
+        state.provider === 'gitlab' ? await this.observeGitLab(ref, budget) : await this.observeGitHub(ref, budget);
+      state.counts = observation.counts;
+      state.run = observation.run;
       const completedAt = new Date(this.now()).toISOString();
       state.checkedAt = completedAt;
       state.lastAttemptAt = completedAt;
       state.error = null;
-      if (observed !== null) this.reportDefaultBranchRuns(name, observed);
+      if (observation.defaultBranchRuns !== null) this.reportDefaultBranchRuns(name, observation.defaultBranchRuns);
       return { aborted: false, retry: false, detail: null };
     } catch (error) {
       if (error instanceof GhBudgetExceededError) {
@@ -1340,6 +1525,78 @@ export class ManagedRepoOverviewTracker {
       const fatal = kind === 'rate-limit' || kind === 'auth';
       return { aborted: fatal, retry: false, detail: fatal ? `${kind}: ${state.error}` : null };
     }
+  }
+
+  private async observeGitHub(
+    ref: RepoRef,
+    budget: { used: number; limit: number; deadlineMs: number },
+  ): Promise<ProviderObservation> {
+    let observed: DefaultBranchRunsObservation | null = null;
+    const meta = await this.spend(budget, () => this.opts.api.fetchRepo({ repo: ref }));
+    const openPrs = await this.spendSearch(budget, () => this.opts.api.countOpenPulls({ repo: ref }));
+    const openIssues = await this.spendSearch(budget, () => this.opts.api.countOpenIssues({ repo: ref }));
+    let run: RepoOverviewRunView;
+    if (meta.defaultBranch === null) {
+      // An empty repository has no default branch: the exact counts are
+      // still real observations and the run context is honestly absent
+      // instead of degrading the whole row into a fetch failure.
+      run = absentRunView('no-branch', null);
+    } else {
+      const branch = meta.defaultBranch;
+      const workflows = await this.spend(budget, () => this.opts.api.countWorkflows({ repo: ref }));
+      if (workflows.kind === 'actions-unavailable') {
+        run = absentRunView('unavailable', branch);
+      } else if (workflows.value === 0) {
+        run = absentRunView('no-workflow', branch);
+      } else {
+        const runs = await this.spend(budget, () =>
+          this.opts.api.latestRuns({ repo: ref, branch, limit: REPO_OVERVIEW_RUNS_PER_FETCH }),
+        );
+        if (runs.kind === 'actions-unavailable') {
+          run = absentRunView('unavailable', branch);
+        } else {
+          observed = { repo: ref, branch, runs: runs.value };
+          // The chip shows the branch's own newest run; the hook gets the full page.
+          const latest = selectLatestRun(runs.value.filter(isDefaultBranchRun));
+          run = latest === null ? absentRunView('never-run', branch) : runViewOf(latest, ref.host, branch);
+        }
+      }
+    }
+    return { counts: { openPrs, openIssues }, run, defaultBranchRuns: observed };
+  }
+
+  /** The GitLab observation: project, open MR and issue counts, then the
+   * newest default-branch pipeline. Pipelines never feed the #446 alert;
+   * `no-workflow` is never claimed (a missing CI config is not cheaply
+   * provable), so an empty pipeline page reads `never-run`. */
+  private async observeGitLab(
+    ref: RepoRef,
+    budget: { used: number; limit: number; deadlineMs: number },
+  ): Promise<ProviderObservation> {
+    const api = this.opts.gitlabApi;
+    if (api === undefined) {
+      throw new RepoProviderError(
+        'other',
+        `GitLab overview adapter is not wired — ${repoFullName(ref)} on ${ref.host} cannot be observed`,
+      );
+    }
+    const project = await this.spend(budget, () => api.fetchProject({ repo: ref }));
+    const openPrs = await this.spend(budget, () => api.countOpenMergeRequests({ repo: ref }));
+    const openIssues = await this.spend(budget, () => api.countOpenIssues({ repo: ref }));
+    let run: RepoOverviewRunView;
+    if (project.defaultBranch === null) {
+      run = absentRunView('no-branch', null);
+    } else if (!project.ciEnabled) {
+      run = absentRunView('unavailable', project.defaultBranch);
+    } else {
+      const branch = project.defaultBranch;
+      const pipelines = await this.spend(budget, () =>
+        api.latestPipelines({ repo: ref, branch, limit: REPO_OVERVIEW_RUNS_PER_FETCH }),
+      );
+      const latest = selectLatestRun(pipelines.filter((pipeline) => isDefaultBranchPipeline(pipeline, branch)));
+      run = latest === null ? absentRunView('never-run', branch) : gitLabRunViewOf(latest, ref.host, branch);
+    }
+    return { counts: { openPrs, openIssues }, run, defaultBranchRuns: null };
   }
 
   /** Hand a committed observation's run page to the default-branch CI

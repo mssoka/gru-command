@@ -81,10 +81,11 @@ describe('prune-stale-dist', () => {
     // execution stop that proves (or refuses to claim) producer cessation
     // (dist/dispatch/job-stop.js); #463 the `gru` operator subcommands
     // (dist/cli/operator.js); #464 the review-owner dead-host proof
-    // (dist/runtime/review-host-exit.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5223);
+    // (dist/runtime/review-host-exit.js); #480 the GitLab overview transport
+    // (dist/repos/gitlab-overview.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5224);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('6df0c455c38e87a3128e460a0a92ea4310720cb988e06796c6ccc5a760a816d4');
+      .toBe('5830633d0cab9d870320a5d678dc425e0411c1f610bbcdbf78acb32c13c07ea0');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

@@ -317,6 +317,7 @@ const PINS: Record<string, number> = {
   'restart-recovery-schema.test.ts': 4,
   'rebrief-recovery.test.ts': 99,
   'repo-overview.test.ts': 97,
+  'repo-overview-gitlab.test.ts': 21,
   'rehearsal.test.ts': 4,
   'release-version.test.ts': 10,
   'resident-budget.test.ts': 7,

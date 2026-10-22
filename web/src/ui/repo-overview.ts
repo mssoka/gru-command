@@ -1,9 +1,9 @@
 /**
  * Managed repository overview — the compact-row panel rendered inside the
  * crew rail, below the crew list (owner-approved Option A). Read-only:
- * rows disclose GitHub state and link out; nothing here ACKs, executes or
- * changes GitHub state. One list, shared border; status always carries
- * visible text + glyph as well as colour.
+ * rows disclose GitHub/GitLab state and link out; nothing here ACKs,
+ * executes or changes code-host state. One list, shared border; status
+ * always carries visible text + glyph as well as colour.
  */
 import type { RepoOverviewRowView, RepoOverviewView } from '../lib/board-protocol.js';
 import {
@@ -14,6 +14,7 @@ import {
   repoRowBadge,
   repoRowNote,
   repoRunContextTitle,
+  repoTerms,
 } from '../lib/repo-overview.js';
 import { el } from './dom.js';
 
@@ -102,7 +103,7 @@ export class RepoOverviewPanel {
       el(
         'p',
         'repo-overview__sub',
-        'Actions = default-branch CI only · not deployment health',
+        'CI = default-branch only · not deployment health',
       ),
     );
     if (view.rows.length === 0) {
@@ -168,7 +169,8 @@ export class RepoOverviewPanel {
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     link.dataset.focusKey = `repo:${row.key}`;
-    link.title = row.fullName !== null ? `${row.fullName} on GitHub` : 'open repository on GitHub';
+    const host = repoTerms(row).host;
+    link.title = row.fullName !== null ? `${row.fullName} on ${host}` : `open repository on ${host}`;
     return link;
   }
 
@@ -187,9 +189,15 @@ export class RepoOverviewPanel {
 
   private metrics(row: RepoOverviewRowView): HTMLElement {
     const metrics = el('div', 'repo-row__metrics');
+    const terms = repoTerms(row);
     metrics.append(
-      this.metric(row.openPrs, 'OPEN PRs', 'open pull requests'),
-      this.metric(row.openIssues, 'OPEN issues', 'open issues excluding pull requests', 'excl. PRs'),
+      this.metric(row.openPrs, `OPEN ${terms.requests}`, `open ${terms.requestsLong}`),
+      this.metric(
+        row.openIssues,
+        'OPEN issues',
+        `open issues excluding ${terms.requestsLong}`,
+        `excl. ${terms.requests}`,
+      ),
     );
     return metrics;
   }

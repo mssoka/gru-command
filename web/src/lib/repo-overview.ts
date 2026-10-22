@@ -5,7 +5,8 @@
  * its tests read the same rules: colour is never the only cue (every
  * badge carries text and a glyph), a cached result never reads as current
  * health, and nothing here claims deployment/health semantics. Provider
- * strings are display text only; hrefs stay https-or-nothing.
+ * strings are display text only; hrefs stay https-or-nothing. A GitLab
+ * row speaks merge requests and pipelines — never GitHub, Actions or PRs.
  */
 import type { RepoOverviewRowView, RepoOverviewRunState } from './board-protocol.js';
 
@@ -38,6 +39,26 @@ const RUN_BADGES: Readonly<Record<RepoOverviewRunState, RepoBadge>> = {
 
 export function repoRunBadge(state: RepoOverviewRunState): RepoBadge {
   return RUN_BADGES[state];
+}
+
+/** The provider vocabulary a row is worded in. Unlinked rows carry no
+ * provider and keep the GitHub defaults. */
+export interface RepoTerms {
+  /** The host's product name, for link titles. */
+  readonly host: string;
+  /** Short change-request noun for the count labels ("PRs" / "MRs"). */
+  readonly requests: string;
+  /** Long change-request noun for titles and the aria summary. */
+  readonly requestsLong: string;
+  /** What one CI execution is called ("run" / "pipeline"). */
+  readonly run: string;
+}
+
+const GITHUB_TERMS: RepoTerms = { host: 'GitHub', requests: 'PRs', requestsLong: 'pull requests', run: 'run' };
+const GITLAB_TERMS: RepoTerms = { host: 'GitLab', requests: 'MRs', requestsLong: 'merge requests', run: 'pipeline' };
+
+export function repoTerms(row: RepoOverviewRowView): RepoTerms {
+  return row.provider === 'gitlab' ? GITLAB_TERMS : GITHUB_TERMS;
 }
 
 /** Row-level badge: freshness/not-linked overlays replace the run badge so
@@ -98,12 +119,13 @@ export function repoCiView(row: RepoOverviewRowView): RepoCiView {
   if (!row.linked || run === null) return { label: '—', workflow: null, url: null, branch: null };
   const noWorkflow = run.state === 'no-workflow';
   const hasUrl = run.url !== null && !noWorkflow;
+  const noun = repoTerms(row).run;
   return {
     // A missing workflow name is never fabricated; when a validated run
     // URL exists the link is still offered under a run-number label.
     label: noWorkflow
       ? 'none'
-      : (run.workflow ?? (hasUrl ? (run.runNumber !== null ? `run #${run.runNumber}` : 'run') : '—')),
+      : (run.workflow ?? (hasUrl ? (run.runNumber !== null ? `${noun} #${run.runNumber}` : noun) : '—')),
     workflow: noWorkflow ? null : run.workflow,
     url: hasUrl ? run.url : null,
     branch: run.branch,
@@ -114,8 +136,8 @@ export function repoCiView(row: RepoOverviewRowView): RepoCiView {
 export function repoRowNote(row: RepoOverviewRowView): string | null {
   if (!row.linked) {
     return row.linkReason !== null
-      ? `No GitHub link (${row.linkReason}) — no repository data is fetched.`
-      : 'No GitHub link — no repository data is fetched.';
+      ? `Not linked (${row.linkReason}) — no repository data is fetched.`
+      : 'Not linked — no repository data is fetched.';
   }
   if (row.freshness === 'unavailable') {
     return row.error !== null
@@ -129,21 +151,25 @@ export function repoRowNote(row: RepoOverviewRowView): string | null {
   }
   const run = row.run;
   if (run === null) return null;
+  const gitlab = row.provider === 'gitlab';
+  const noun = repoTerms(row).run;
   switch (run.state) {
     case 'running':
-      return 'Newest run in progress — older results are not shown as current.';
+      return `Newest ${noun} in progress — older results are not shown as current.`;
     case 'queued':
-      return 'Newest run queued — an older result is not shown as current.';
+      return `Newest ${noun} queued — an older result is not shown as current.`;
     case 'cancelled':
-      return 'Run cancelled — neither pass nor failure.';
+      return `${gitlab ? 'Pipeline' : 'Run'} cancelled — neither pass nor failure.`;
     case 'never-run':
-      return `No workflow run on ${run.branch ?? 'the default branch'} yet.`;
+      return gitlab
+        ? `No pipeline on ${run.branch ?? 'the default branch'} yet.`
+        : `No workflow run on ${run.branch ?? 'the default branch'} yet.`;
     case 'no-branch':
       return 'No default branch exists on this repository yet.';
     case 'unknown':
-      return 'The provider returned a run state that could not be classified.';
+      return `The provider returned a ${noun} state that could not be classified.`;
     case 'unavailable':
-      return 'Actions is unavailable for this repository.';
+      return gitlab ? 'GitLab CI/CD is unavailable for this repository.' : 'Actions is unavailable for this repository.';
     default:
       return null;
   }
@@ -157,7 +183,7 @@ export function repoRunContextTitle(row: RepoOverviewRowView): string | null {
   if (run === null || run.status === null) return null;
   const parts = [`provider status: ${run.status}`];
   if (run.conclusion !== null) parts.push(`conclusion: ${run.conclusion}`);
-  if (run.runNumber !== null) parts.push(`run #${run.runNumber}`);
+  if (run.runNumber !== null) parts.push(`${repoTerms(row).run} #${run.runNumber}`);
   // Creation and start are distinct semantics; both are disclosed.
   if (run.runCreatedAt !== null) parts.push(`created ${run.runCreatedAt}`);
   if (run.runStartedAt !== null) parts.push(`started ${run.runStartedAt}`);
@@ -178,5 +204,6 @@ export function repoBadgeTitle(row: RepoOverviewRowView): string | null {
 export function repoRowAriaLabel(row: RepoOverviewRowView, badge: RepoBadge): string {
   const prs = row.openPrs === null ? 'unknown' : String(row.openPrs);
   const issues = row.openIssues === null ? 'unknown' : String(row.openIssues);
-  return `${row.displayName} — ${badge.text} — ${prs} open pull requests, ${issues} open issues excluding pull requests`;
+  const requests = repoTerms(row).requestsLong;
+  return `${row.displayName} — ${badge.text} — ${prs} open ${requests}, ${issues} open issues excluding ${requests}`;
 }
