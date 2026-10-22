@@ -3959,8 +3959,10 @@ it('routes a real local native authority refusal away from provider authenticati
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
 
     const refusal = events.find((event) => event.type === 'error');
-    expect(refusal).toMatchObject({ type: 'error', error: 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized' });
+    expect(refusal?.type).toBe('error');
+    expect(refusal?.type === 'error' ? refusal.error : '').toContain('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized');
     expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    expect(refusal).toMatchObject({ origin: 'native-control' });
     expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
     expect(scene.ledger.listProviderWaits()).toEqual([]);
     expect(spawn).toHaveBeenCalledTimes(1);
