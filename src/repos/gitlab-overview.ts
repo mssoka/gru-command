@@ -170,7 +170,7 @@ function causeCodeOf(cause: unknown): string | null {
 function transportDetailOf(error: unknown, token: string): string {
   const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
   if (cause === undefined || cause === null) return messageOf(error);
-  const code = flatText(causeCodeOf(cause))?.slice(0, 40) ?? null;
+  const code = flatText(redact(causeCodeOf(cause) ?? '', token))?.slice(0, 40) ?? null;
   const text = flatText(redact(causeTextOf(cause), token));
   return `${messageOf(error)}${code !== null ? ` [${code}]` : ''}${text !== null ? `: ${text}` : ''}`;
 }
@@ -282,7 +282,9 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
       const kind = kindOfStatus(response.status, oauthError);
       // A remedy leads the message, so the row bound (and the prefix an
       // aborted row adds) can never cut it off behind a long project path.
-      if (remedy !== null) throw new RepoProviderError(kind, `${remedy} (${label}: HTTP ${response.status})`);
+      if (remedy !== null) {
+        throw new RepoProviderError(kind, redact(`${remedy} (${label}: HTTP ${response.status})`, token));
+      }
       throw new RepoProviderError(
         kind,
         redact(`${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`, token),

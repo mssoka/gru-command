@@ -535,6 +535,8 @@ describe('GitLab overview REST adapter', () => {
       // straddles the 160-char cut and is redacted before it, so no
       // prefix of it survives.
       new TypeError('fetch failed', { cause: new Error(`tls\n\n  handshake   ${'x'.repeat(130)} ${TOKEN} ${'y'.repeat(200)}`) }),
+      // The same for a code: the token straddles its 40-char cut.
+      new TypeError('fetch failed', { cause: Object.assign(new Error('odd'), { code: `E_${'C'.repeat(30)}${TOKEN}` }) }),
     ];
     const api = new GitLabRepoOverviewApi({
       tokenResolver: () => TOKEN,
@@ -564,6 +566,11 @@ describe('GitLab overview REST adapter', () => {
     expect(text).toBe(`tls handshake ${'x'.repeat(130)} [redacted] yyyy`);
     expect(text).toHaveLength(160);
     expect(long.message).not.toContain(TOKEN.slice(0, 8));
+    const coded = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    expect(coded.message).toBe(
+      `project group/sub/project on gitlab.example.com: request failed (fetch failed [${`E_${'C'.repeat(30)}[redacted]`.slice(0, 40)}]: odd)`,
+    );
+    expect(coded.message).not.toContain(TOKEN.slice(0, 8));
   });
 
   it('names a multi-address connect failure from its AggregateError cause, code first', async () => {

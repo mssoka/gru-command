@@ -255,13 +255,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   tracker reads it through the GitLab REST API with `GITLAB_TOKEN`
   (falling back to `GL_TOKEN`; the overview needs the `read_api` or `api`
   scope, and Perkins GitLab delivery needs `api`) from the service's
-  environment — `install.sh` writes no token into the unit, so set it
-  there without echoing it: `read -rs GITLAB_TOKEN`, then `launchctl
-  setenv GITLAB_TOKEN "$GITLAB_TOKEN"` (macOS) or `systemctl --user
-  set-environment GITLAB_TOKEN="$GITLAB_TOKEN"` (Linux), then `gru
-  restart`; neither survives a reboot. Check it without printing it:
-  `[ -n "$(launchctl getenv GITLAB_TOKEN)" ] && echo set` or `systemctl
-  --user show-environment | grep -q '^GITLAB_TOKEN=' && echo set`.
+  environment — `install.sh` writes no token into the unit; see
+  [CONFIG.md](./CONFIG.md#managed-repositories) to set and check it.
   It is sent only as the `PRIVATE-TOKEN` header over https to that host
   (redirects refused, 15 s per request, never logged or rendered): the
   project's default branch, exact open merge-request and open-issue counts
