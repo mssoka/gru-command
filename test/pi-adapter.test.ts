@@ -2,6 +2,7 @@ import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -5185,8 +5186,29 @@ it('P40 original native completion writer rejects intermediate Git ID lengths an
 it('P40 durable native completion reader rejects intermediate Git ID lengths and preserves exact SHA1 SHA256 null', () => assertNativeCompletionHeadLengths('reader'));
 
 describe('scheduled verification ordinary Pi Bash', () => {
-  async function refuses(input: string | ((cwd: string) => string), quality = false) {
-    const lane = verificationLane(quality); cleanupDirs.push(lane.root);
+  interface RefusalCaseFixtureIdentity {
+    readonly laneRoot: string;
+    readonly lanePath: string;
+    readonly laneId: string;
+    readonly branch: string | null;
+    readonly producerStarts: string;
+    readonly laneFixtureSetupMs: number;
+    readonly home: string;
+    readonly dataDir: string;
+    readonly transcript: string;
+    readonly modelScript: StubScript;
+    readonly workerSession: ReturnType<typeof verificationLane>['session'];
+  }
+
+  async function refuses(
+    input: string | ((cwd: string) => string),
+    quality = false,
+    template?: Parameters<typeof verificationLane>[1],
+  ): Promise<RefusalCaseFixtureIdentity> {
+    const laneSetupStarted = performance.now();
+    const lane = verificationLane(quality, template);
+    const laneFixtureSetupMs = performance.now() - laneSetupStarted;
+    cleanupDirs.push(lane.root);
     const command = typeof input === 'string' ? input : input(lane.lane.path);
     const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
     const f = await fixture([
@@ -5197,11 +5219,18 @@ describe('scheduled verification ordinary Pi Bash', () => {
       const handle = await f.runtime.spawn('minion', lane.session);
       await handle.prompt('attempt ordinary Bash');
       expect(existsSync(lane.starts)).toBe(false);
-      const transcript = readFileSync(handle.sessionFile!, 'utf8');
+      const transcriptPath = handle.sessionFile;
+      if (transcriptPath === null) throw new Error('refusal case did not create an ordinary Pi transcript');
+      const transcript = readFileSync(transcriptPath, 'utf8');
       expect(transcript).toContain('capture-cli.js');
       expect(transcript).toContain('focused, full');
       expect(transcript).toContain('no receipt was created');
       await handle.dispose();
+      return {
+        laneRoot: lane.root, lanePath: lane.lane.path, laneId: lane.lane.id, branch: lane.lane.branch,
+        producerStarts: lane.starts, laneFixtureSetupMs, home: f.home, dataDir: f.config.dataDir, transcript: transcriptPath,
+        modelScript: f.script, workerSession: lane.session,
+      };
     } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
   }
   it('scheduled verification guard refuses the exact web incident before any producer', async () => refuses(WEB_INCIDENT));
@@ -5329,7 +5358,30 @@ describe('scheduled verification ordinary Pi Bash', () => {
   });
   it('strict repair every retained producing raw case refuses through ordinary Pi with zero starts', async () => {
     const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
-    for (const row of nativeCorpus.filter((row) => row.refused)) await refuses(row.raw, true);
+    const refusedRows = nativeCorpus.filter((row) => row.refused);
+    expect(refusedRows).toHaveLength(54);
+    const seedSetupStarted = performance.now();
+    const template = makeWorkflowLane();
+    const seedFixtureSetupMs = performance.now() - seedSetupStarted;
+    cleanupDirs.push(template.root);
+    const identities: RefusalCaseFixtureIdentity[] = [];
+    for (const row of refusedRows) identities.push(await refuses(row.raw, true, template.lane));
+    const expectIndependent = <T>(select: (identity: RefusalCaseFixtureIdentity) => T) => {
+      expect(new Set(identities.map(select)).size).toBe(54);
+    };
+    expect(identities).toHaveLength(54);
+    expectIndependent((identity) => identity.laneRoot);
+    expectIndependent((identity) => identity.lanePath);
+    expectIndependent((identity) => identity.laneId);
+    expectIndependent((identity) => identity.branch);
+    expectIndependent((identity) => identity.producerStarts);
+    expectIndependent((identity) => identity.home);
+    expectIndependent((identity) => identity.dataDir);
+    expectIndependent((identity) => identity.transcript);
+    expectIndependent((identity) => identity.modelScript);
+    expectIndependent((identity) => identity.workerSession);
+    const caseLaneFixtureSetupMs = identities.reduce((total, identity) => total + identity.laneFixtureSetupMs, 0);
+    console.info(`[raw-refusal-fixture] cases=${identities.length} seed-setup-ms=${seedFixtureSetupMs.toFixed(1)} independent-lane-setup-ms=${caseLaneFixtureSetupMs.toFixed(1)}`);
   });
   it('strict repair reopened real-SDK Pi preserves identity cwd workflow and refuses all incidents', async () => {
     const lane = verificationLane(); cleanupDirs.push(lane.root);
