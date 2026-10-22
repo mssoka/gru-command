@@ -116,11 +116,11 @@ interface NativeEntry {
 /*
  * Native transcripts grow for a session's whole life (#469), so inspection
  * never holds one whole. The header is its first line. The session before a
- * directive's baseline is streamed past: pi keeps only its entry ids, Claude
- * re-hashes its exact bytes. The directive's own turn after the baseline is
- * read only as far as an inspection walks, and only the lines read count
- * against the transcript byte and entry limits, so a session's later work
- * never refuses an earlier directive.
+ * directive's baseline is streamed past: pi retains only bounded id/parent
+ * links for ancestry checks, Claude re-hashes its exact bytes. The directive's
+ * own turn after the baseline is read only as far as an inspection walks, and
+ * only the lines read count against transcript byte and entry limits, so a
+ * session's later work never refuses an earlier directive.
  */
 const HEADER_OVERSIZED = `native session header exceeds the ${MAX_NATIVE_HEADER_BYTES}-byte inspection limit`;
 const ENTRY_OVERSIZED = `native transcript entry exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`;
@@ -208,11 +208,11 @@ class NativeTurn {
  * id; undefined past the turn's end. */
 type PiTurn = (index: number) => NativeEntry | 'malformed' | undefined;
 /** A pi transcript split after its `baseline` entry (after the header when
- * null). Entries through the split are kept only as their ids. */
+ * null). Entries through the split retain only ancestry links and identity state. */
 interface PiTranscript {
   readonly header: NativeEntry | null;
-  /** Every id through the baseline, the header's included. */
-  readonly ids: ReadonlySet<string>;
+  /** Parent links through the baseline prove which known entries are active ancestors. */
+  readonly parentIds: ReadonlyMap<string, string | null>;
   /** An entry through the baseline has no unique, non-empty id. */
   readonly malformed: boolean;
   /** Null without the baseline. */
@@ -226,7 +226,11 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
     const first = lines.nextEntry();
     const header = first === null ? null : JSON.parse(first) as NativeEntry | null;
     const ids = new Set<string>();
-    if (typeof header?.id === 'string') ids.add(header.id);
+    const parentIds = new Map<string, string | null>();
+    if (typeof header?.id === 'string') {
+      ids.add(header.id);
+      parentIds.set(header.id, null);
+    }
     const fresh = (entry: NativeEntry | null, seen?: ReadonlySet<string>): entry is NativeEntry =>
       !!entry && typeof entry.id === 'string' && entry.id !== '' && !ids.has(entry.id) && !seen?.has(entry.id);
     let malformed = false;
@@ -237,11 +241,12 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       const entry = JSON.parse(line) as NativeEntry | null;
       if (!fresh(entry)) { malformed = true; continue; }
       ids.add(entry.id);
+      parentIds.set(entry.id, entry.parentId ?? null);
       found = entry.id === baseline;
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, ids, malformed, turn: null, endTurn: () => {} });
+      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {} });
     }
     const after = new NativeTurn(fd, lines.end, tail);
     const seen = new Set<string>();
@@ -255,7 +260,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       }
       return entries[index];
     };
-    return inspect({ header, ids, malformed, turn, endTurn: () => after.end() });
+    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end() });
   });
 }
 /** Header facts come from the first line alone. They identify a session/cwd,
@@ -406,9 +411,23 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   if (binding.runtime !== 'pi') return unknown('exact native request association unavailable');
   return withPiTranscript(file, binding.baseline, 'whole', (transcript) => piDirectiveCheckpoint(file, binding, transcript));
 }
+/** True only when the pointer is on the parent chain active at `parentId`.
+ * Known sibling entries and the session header are not checkpoint ancestry. */
+function isActiveParentAncestor(candidateId: string, parentId: string, parentIds: ReadonlyMap<string, string | null>, headerId: string | undefined): boolean {
+  if (candidateId === headerId) return false;
+  let current: string | null | undefined = parentId;
+  const visited = new Set<string>();
+  while (current !== null && current !== undefined && !visited.has(current)) {
+    if (current === candidateId) return true;
+    visited.add(current);
+    current = parentIds.get(current);
+    if (current === undefined) return false;
+  }
+  return false;
+}
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
-function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, ids, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
+function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, parentIds: prefixParentIds, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
   const { identity } = binding;
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
   const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
@@ -426,8 +445,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   if (binding.userEntryId === null) appendBinding(admitted);
   if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
   let parent = user.id;
-  const knownIds = new Set(ids);
-  knownIds.add(user.id);
+  const parentIds = new Map(prefixParentIds);
+  parentIds.set(user.id, user.parentId ?? null);
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
@@ -459,18 +478,18 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       // not equivalent evidence and remains UNKNOWN.
       if (entry.parentId !== parent || typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '' ||
           typeof entry.summary !== 'string' || entry.summary.trim() === '' || typeof entry.firstKeptEntryId !== 'string' ||
-          !knownIds.has(entry.firstKeptEntryId) || entry.firstKeptEntryId === entry.id ||
+          !isActiveParentAncestor(entry.firstKeptEntryId, parent, parentIds, header?.id) || entry.firstKeptEntryId === entry.id ||
           typeof entry.tokensBefore !== 'number' || !Number.isFinite(entry.tokensBefore) || entry.tokensBefore < 0 ||
           entry.fromHook === true || entry.fromHook !== undefined && typeof entry.fromHook !== 'boolean') {
         return unknown('native branch/control/partial checkpoint');
       }
       parent = entry.id;
-      knownIds.add(entry.id);
+      parentIds.set(entry.id, entry.parentId ?? null);
       continue;
     }
     if (entry.type !== 'message' || entry.parentId !== parent || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
     parent = entry.id;
-    knownIds.add(entry.id);
+    parentIds.set(entry.id, entry.parentId ?? null);
     const message = entry.message;
     if (message.role === 'assistant') {
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');

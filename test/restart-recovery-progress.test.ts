@@ -874,10 +874,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('P46 refuses compaction controls even when a later request is independently bound', () => assertBoundControlTail('unsupported'));
   it('P46 refuses malformed model controls before an independently bound later request', () => assertBoundControlTail('malformed-model'));
   it('P46 reads only an exact linked native compaction inside the active directive checkpoint', async () => {
-    for (const mode of ['linked', 'wrong-parent', 'unknown-first-kept', 'known-sibling-first-kept', 'session-header-first-kept', 'hook-authored', 'branch-control'] as const) {
+    for (const mode of ['linked', 'active-ancestor-first-kept', 'wrong-parent', 'unknown-first-kept', 'known-sibling-first-kept', 'session-header-first-kept', 'hook-authored', 'branch-control'] as const) {
       const f = await fixture();
       let firstKeptEntryId = '';
-      if (mode === 'known-sibling-first-kept' || mode === 'session-header-first-kept') {
+      if (mode === 'active-ancestor-first-kept' || mode === 'known-sibling-first-kept' || mode === 'session-header-first-kept') {
         const rows = readFileSync(f.file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { id: string });
         const headerId = rows[0]!.id;
         const prefixParent = { type: 'message', id: 'prefix-parent', parentId: headerId,
@@ -888,7 +888,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
           message: { role: 'assistant', stopReason: 'stop', content: [] } };
         const baseline = { type: 'model_change', id: 'active-baseline', parentId: activeAncestor.id, provider: 'fixture', modelId: 'model' };
         appendFileSync(f.file, `${[prefixParent, activeAncestor, sibling, baseline].map((entry) => JSON.stringify(entry)).join('\n')}\n`);
-        firstKeptEntryId = mode === 'known-sibling-first-kept' ? sibling.id : headerId;
+        firstKeptEntryId = mode === 'active-ancestor-first-kept' ? activeAncestor.id :
+          mode === 'known-sibling-first-kept' ? sibling.id : headerId;
       }
       f.seed();
       const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
@@ -904,7 +905,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       }
       f.native.finish();
       const proof = inspectDirectiveCheckpoint(f.file, f.identity);
-      if (mode === 'linked') expect(proof).toMatchObject({ state: 'terminal', ok: true });
+      if (mode === 'linked' || mode === 'active-ancestor-first-kept') expect(proof).toMatchObject({ state: 'terminal', ok: true });
       else expect(proof).toEqual({ state: 'unknown', reason: 'native branch/control/partial checkpoint' });
       if (mode === 'known-sibling-first-kept' || mode === 'session-header-first-kept' || mode === 'branch-control') {
         expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
@@ -914,7 +915,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     }
   });
 
-  it('P46 preserves the original terminal checkpoint across a linked SDK compaction appended after assistant stop', async () => {
+  it('P46 retains UNKNOWN semantics for a linked SDK compaction appended after assistant stop', async () => {
     const f = await fixture(); f.seed();
     const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
     f.native.finish();
@@ -923,10 +924,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     if (terminal.state !== 'terminal') throw new Error('fixture must contain a real terminal assistant result');
     appendFileSync(f.file, `${JSON.stringify({ type: 'compaction', id: 'post-terminal-compaction', parentId: terminal.checkpointId,
       timestamp: new Date().toISOString(), summary: 'SDK automatic post-run compaction', firstKeptEntryId: user.id, tokensBefore: 90_000, fromHook: false })}\n`);
-    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(terminal);
-    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
-    expect(f.ledger.getDirective(f.identity.requestId)?.state).toBe('settled');
-    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
+    expect(f.ledger.getDirective(f.identity.requestId)?.state).not.toBe('settled');
+    expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)).toBeNull();
   });
 
   it('P46 refuses an unbound user turn after a valid post-terminal compaction', async () => {

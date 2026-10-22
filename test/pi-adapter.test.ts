@@ -4557,18 +4557,33 @@ it('automatic SDK compaction completes before the same admitted native authority
     expect(row).toMatchObject({ state: 'settled', payloadHash: f.scene.identity.payloadHash, workRevision: f.scene.identity.workRevision,
       contractSha256: f.scene.identity.contractSha256, authorityEpoch: f.scene.identity.authorityEpoch });
     expect(row.nativeBinding?.sessionId).toBe(currentOwner()?.producer.sessionId);
-    expect(inspectDirectiveAdmission(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ identity: f.scene.identity, agentId: row.nativeTarget!.agentId });
-    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, binding: row.nativeBinding });
-    expect(f.scene.ledger.listJobEvents(row.jobId, { limit: 100 }).filter((event) => event.kind === 'silas.directive-producer-started')).toHaveLength(1);
+    const nativeSession = f.sessions[0]!;
+    const admission = inspectDirectiveAdmission(row.nativeTarget!.sessionFile, f.scene.identity);
+    expect(admission).toMatchObject({ identity: f.scene.identity, agentId: row.nativeTarget!.agentId, sessionId: nativeSession.sessionId });
+    const checkpoint = inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity);
+    expect(checkpoint).toMatchObject({ state: 'terminal', ok: true, binding: row.nativeBinding });
+    if (checkpoint.state !== 'terminal') throw new Error('original native completion must have a successful terminal checkpoint');
+    const events = f.scene.ledger.listJobEvents(row.jobId, { limit: 100 });
+    const producerStarts = events.filter((event) => event.kind === 'silas.directive-producer-started' && event.payload?.['request_id'] === row.requestId);
+    expect(producerStarts).toHaveLength(1);
     const deliveries = f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
       .filter((event) => event.payload?.['request_id'] === row.requestId);
     expect(deliveries).toHaveLength(1);
     const producerRecords = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8').trimEnd().split('\n')
-      .map((line) => JSON.parse(line) as { readonly state: string; readonly producer?: DirectiveProducer });
+      .map((line) => JSON.parse(line) as { readonly state: string; readonly producer?: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null });
+    const originalProducer = currentOwner()?.producer;
+    expect(originalProducer).toBeDefined();
+    const starts = producerRecords.filter((record) => record.state === 'started' && isDeepStrictEqual(record.producer?.identity, f.scene.identity));
+    expect(starts).toHaveLength(1);
     const completions = producerRecords.filter((record) => record.state === 'completed' && isDeepStrictEqual(record.producer?.identity, f.scene.identity));
     expect(completions).toHaveLength(1);
-    expect(readFileSync(join(f.scene.lane.path, 'compacted-native-effect.txt'), 'utf8')).toBe('once\n');
-    expect(f.sessions.at(-1)!.prompt).toHaveBeenCalledTimes(1);
+    expect(completions[0]).toMatchObject({ producer: originalProducer, checkpointId: checkpoint.checkpointId,
+      head: execFileSync('git', ['-C', f.scene.lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() });
+    const effect = readFileSync(join(f.scene.lane.path, 'compacted-native-effect.txt'), 'utf8');
+    const effectOccurrences = effect.split('\n').filter((line) => line === 'once');
+    expect(effectOccurrences).toHaveLength(1);
+    expect(effect).toBe('once\n');
+    expect(nativeSession.prompt).toHaveBeenCalledTimes(1);
     expect(f.fx.script.calls).toHaveLength(3);
     expect(f.sessions).toHaveLength(1);
   } finally {
