@@ -59,9 +59,10 @@ import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } fro
  * rows use `gh`) under the same freshness, atomic-observation, budget and
  * rotation rules: the project gives the default branch, the list
  * endpoints' `X-Total` the exact open merge-request and issue counts, and
- * the newest default-branch pipeline the run. GitLab pipelines never feed the #446 alert. A fatal
- * auth/rate-limit condition aborts only its provider scope (`github`, or
- * `gitlab:<host>`): the other provider's rows are still observed.
+ * the newest default-branch pipeline the run. GitLab pipelines never feed
+ * the #446 alert. A fatal auth/rate-limit condition aborts only its
+ * provider scope (`github`, or `gitlab:<host>`): the other provider's rows
+ * are still observed.
  */
 
 // ------------------------------------------------------------------

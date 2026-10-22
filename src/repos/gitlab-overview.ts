@@ -128,9 +128,10 @@ function parseIncluded(stdout: string): IncludedResponse | null {
   return { status: Number(status[1]), headers, body };
 }
 
-/** A runner error that is one run's own bound (a slow or oversized
- * response), never evidence that glab is missing. */
-const RUN_BOUND = /timed out|output exceeds|UTF-8/iu;
+/** A runner error that proves glab is missing or not executable. Any
+ * other (a run's own time or size bound, a transient EMFILE/EAGAIN/ENOMEM
+ * spawn failure) is one failed read, never a reason to reinstall. */
+const GLAB_MISSING = /\b(?:ENOENT|EACCES)\b/u;
 
 /** glab's verdict for a host it holds no login for. */
 const NOT_LOGGED_IN = /unauthenticated|not logged in|no token/iu;
@@ -201,26 +202,32 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     label: string,
     suffix: string,
   ): Promise<{ readonly body: unknown; readonly total: string | null }> {
-    const host = repo.host;
     // glab is only ever run for a host isGitLabRemote accepts, named as a
     // plain hostname, whatever the caller classified.
-    if (!isGitLabRemote(host) || !/^[A-Za-z0-9.-]+$/u.test(host)) {
+    if (!isGitLabRemote(repo.host) || !/^[A-Za-z0-9.-]+$/u.test(repo.host)) {
       throw new RepoProviderError('other', `${label}: not a GitLab host — glab is never run for it`);
     }
+    // glab looks logins up by exact hostname, and hostnames are
+    // case-insensitive: `GitLab.Example.com` must find the same login.
+    const host = repo.host.toLowerCase();
     const login = `\`glab auth login --hostname ${host}\``;
     const path = `projects/${encodeURIComponent(repoFullName(repo))}${suffix}`;
     const result = await this.run(['api', '--hostname', host, '--include', path]);
     if (result.error !== undefined && result.error !== '') {
       const detail = cliText(result.error.replace(/\bgh api\b/gu, `${this.binary} api`)) ?? 'no detail';
-      if (RUN_BOUND.test(result.error)) throw new RepoProviderError('other', `${label}: ${detail}`);
-      throw new RepoProviderError('auth', `glab is unavailable (${detail}) — install the GitLab CLI and run ${login}`);
+      if (GLAB_MISSING.test(result.error)) {
+        throw new RepoProviderError('auth', `glab is unavailable (${detail}) — install the GitLab CLI and run ${login}`);
+      }
+      throw new RepoProviderError('other', `${label}: ${detail}`);
     }
     const response = parseIncluded(result.stdout);
     if (response === null) {
-      const stderr = cliText(result.stderr);
-      if (result.status !== 0 && stderr !== null && NOT_LOGGED_IN.test(stderr)) {
+      // The verdict is read from the whole stderr; the bounded text is for
+      // display only, so a long preamble cannot hide it.
+      if (result.status !== 0 && NOT_LOGGED_IN.test(result.stderr.replace(ANSI_SEQUENCE, ''))) {
         throw new RepoProviderError('auth', `glab is not logged in to ${host} — run ${login}`);
       }
+      const stderr = cliText(result.stderr);
       throw new RepoProviderError(
         'other',
         result.status === 0
@@ -236,11 +243,20 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
       if (oauthError === 'insufficient_scope') {
         throw new RepoProviderError(kind, `${missingScopeRemedy(host, accepted)} (${label}: HTTP ${response.status})`);
       }
+      if (response.status === 401) {
+        throw new RepoProviderError(
+          kind,
+          `glab's login for ${host} was rejected — run ${login} (a GITLAB_TOKEN in the service environment ` +
+            `overrides glab's login) (${label}: HTTP 401)`,
+        );
+      }
       throw new RepoProviderError(kind, `${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`);
     }
     if (response.status < 200 || response.status >= 300) {
       throw new RepoProviderError('other', `${label}: HTTP ${response.status}`);
     }
+    // A failing glab run is never a success, whatever status line it printed.
+    if (result.status !== 0) throw new RepoProviderError('other', `${label}: ${this.binary} exited ${result.status}`);
     let body: unknown;
     try {
       body = JSON.parse(response.body);

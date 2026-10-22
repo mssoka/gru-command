@@ -261,27 +261,27 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   The tracker reads the project's default branch, exact open
   merge-request and open-issue counts (the list endpoints' `X-Total`;
   GitLab omits it above 10,000 results, and the observation then fails
-  as "count not exact" instead of guessing), and the newest default-branch pipeline by (created, id)
-  among the 20 newest, skipping merge-request and child
-  (`parent_pipeline`) pipelines. The row reads `OPEN MRs` / `excl. MRs`
-  (an unlinked row, whatever its host, reads the neutral `OPEN PRs/MRs` /
-  `excl. PRs/MRs`), links `on GitLab`, labels an unnamed pipeline
-  `pipeline #N`, reads `NO RUNS` with no default-branch pipeline on that
-  page (GitLab never claims no-workflow), `UNAVAILABLE` when the
-  project turns CI/CD off, and no-branch for an empty repository; the
-  module's sub-heading reads `CI = default-branch only · not deployment
-  health` for both hosts. With glab not installed, or not logged in to
-  the host, the row is unavailable and names the fix (`glab auth login
-  --hostname <host>`). That, a 401, a 403 `insufficient_scope` (no
-  `read_api` or `api`) or a 429 aborts that GitLab host for the pass —
-  its later rows read `refresh aborted before this repository was
-  checked` — while GitHub rows and
-  other GitLab hosts are still observed; a GitHub rate limit or `gh` auth
-  failure likewise never stops GitLab rows. Other 403s, 404, 5xx and
-  network failures are per-repository, and cached data renders
-  `STALE · last …` like any other row. GitLab pipelines never feed the
-  default-branch CI alert below: a red GitLab pipeline shows on its row
-  without waking Gru.
+  as "count not exact" instead of guessing), and the newest
+  default-branch pipeline by (created, id) among the 20 newest, skipping
+  merge-request and child (`parent_pipeline`) pipelines. The row reads
+  `OPEN MRs` / `excl. MRs` (an unlinked row, whatever its host, reads the
+  neutral `OPEN PRs/MRs` / `excl. PRs/MRs`), links `on GitLab`, labels an
+  unnamed pipeline `pipeline #N`, reads `NO RUNS` with no default-branch
+  pipeline on that page (GitLab never claims no-workflow), `UNAVAILABLE`
+  when the project turns CI/CD off, and no-branch for an empty
+  repository; the module's sub-heading reads `CI = default-branch only ·
+  not deployment health` for both hosts. With glab not installed, or not
+  logged in to the host, the row is unavailable and names the fix (`glab
+  auth login --hostname <host>`); a rejected login (HTTP 401) names the
+  same fix. A missing glab, a missing or rejected glab login, a 403
+  `insufficient_scope` (no `read_api` or `api`) or a 429 aborts that
+  GitLab host for the pass — its later rows read `refresh aborted before
+  this repository was checked` — while GitHub rows and other GitLab hosts
+  are still observed; a GitHub rate limit or `gh` auth failure likewise
+  never stops GitLab rows. Other 403s, 404, 5xx and network failures are per-repository,
+  and cached data renders `STALE · last …` like any other row. GitLab
+  pipelines never feed the default-branch CI alert below: a red GitLab
+  pipeline shows on its row without waking Gru.
   **Default-branch CI alert (#446):** the one runs call reads the 20
   newest default-branch runs; the chip shows the newest of them that tested
   the branch itself — `pull_request*` and fork runs that merely share its
