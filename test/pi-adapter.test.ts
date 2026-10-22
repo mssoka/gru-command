@@ -4402,7 +4402,7 @@ it('automatic SDK compaction completes before the same admitted native authority
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const { inspectDirectiveAdmission, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const { Supervisor } = await import('../src/supervision/supervisor.js');
-  const history = 'history '.repeat(12_000);
+  const history = 'history '.repeat(10_500);
   let releaseSummary!: () => void;
   const summaryHold = new Promise<void>((resolveSummary) => { releaseSummary = resolveSummary; });
   let handle: AgentHandle | null = null;
