@@ -69,6 +69,7 @@ import {
   DirectiveCheckpointError,
   inspectDirectiveAdmission,
   inspectDirectiveCheckpoint,
+  isClaudeTaskNotification,
   prepareClaudeDirectiveBinding,
   prepareDirectiveProducer as prepareNativeDirectiveProducer,
   readDirectiveBinding,
@@ -1926,6 +1927,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string) => void): void {
     const { directive, producer } = turn;
     if (frame['type'] === 'user' && frame['isReplay'] === true) {
+      // The CLI's own task notification is neither the echo nor a second prompt (#471).
+      if (isClaudeTaskNotification(frame, this.params.sessionId)) return;
       if (turn.admission !== null) {
         this.failDirective(turn, new DirectiveCheckpointError('a second prompt entered the directive turn'), abortTurn);
         return;
@@ -1979,6 +1982,13 @@ export class ClaudeCodeHandle implements AgentHandle {
       await turn.admission;
       if (turn.failure !== null || turn.admitted === null) {
         throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
+      }
+      // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by
+      // name. The CLI reads the strings "true"/"false" as booleans; anything else that is not plainly
+      // a foreground call is refused too.
+      const background = request.input['run_in_background'];
+      if (background !== undefined && background !== false && background !== 'false') {
+        throw new DirectiveCheckpointError('a directive turn cannot start a background task: its completion would outlive the turn');
       }
       turn.directive.beforeAdmission();
       if (readDirectiveBinding(this.sessionFile, turn.directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest()) {

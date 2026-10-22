@@ -20,8 +20,10 @@ export function privateClaudeVerificationSettings(policy: WorkerVerificationPoli
 /** Private settings whose native `ask` rule routes each listed tool to the
  * stdio host, even under bypassPermissions. A worker-verification policy
  * adds its Bash hook (the explanation). Shared by verification lanes and
- * directive turns (#424). */
-export function privateClaudeAskSettings(ask: readonly string[], policy: WorkerVerificationPolicy | undefined, prefix: string): {
+ * directive turns (#424); `env` is the CLI's settings env, which outranks
+ * every user, project and local settings source. */
+export function privateClaudeAskSettings(ask: readonly string[], policy: WorkerVerificationPolicy | undefined, prefix: string,
+  env?: Readonly<Record<string, string>>): {
   readonly file: string;
   dispose(): void;
 } {
@@ -36,7 +38,8 @@ export function privateClaudeAskSettings(ask: readonly string[], policy: WorkerV
       const command = [process.execPath, hook, policyFile].map(verificationShellQuote).join(' ');
       hooks = { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] };
     }
-    writeFileSync(file, JSON.stringify({ permissions: { ask: [...ask] }, ...(hooks === undefined ? {} : { hooks }) }), { mode: 0o600, flag: 'wx' });
+    writeFileSync(file, JSON.stringify({ permissions: { ask: [...ask] }, ...(hooks === undefined ? {} : { hooks }), ...(env === undefined ? {} : { env: { ...env } }) }),
+      { mode: 0o600, flag: 'wx' });
     return { file, dispose: () => rmSync(dir, { recursive: true, force: true }) };
   } catch (error) {
     rmSync(dir, { recursive: true, force: true });

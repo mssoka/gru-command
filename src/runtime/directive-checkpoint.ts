@@ -559,6 +559,22 @@ export function prepareClaudeDirectiveBinding(input: {
 }
 
 type ClaudeFrame = Record<string, unknown>;
+
+/** The CLI's own background-task completion (#471). Under
+ * --replay-user-messages Claude Code replays it as an `isReplay` user frame
+ * that it tags `origin.kind: 'task-notification'`, its content a string that
+ * is exactly one `<task-notification>` block (Claude Code 2.1.306, recorded
+ * in test/fixtures/claude-stream/task-notifications.jsonl). It is a runtime
+ * event, not a prompt: it never admits a directive and never counts as
+ * another prompt in its turn. Any other replayed user frame still does. */
+export function isClaudeTaskNotification(frame: ClaudeFrame, sessionId: string): boolean {
+  const origin = frame['origin'];
+  const content = (frame['message'] as { content?: unknown } | undefined)?.content;
+  return frame['type'] === 'user' && frame['isReplay'] === true && frame['session_id'] === sessionId && frame['parent_tool_use_id'] == null &&
+    typeof origin === 'object' && origin !== null && (origin as Record<string, unknown>)['kind'] === 'task-notification' &&
+    typeof content === 'string' && /^<task-notification>(?:(?!<\/?task-notification>)[\s\S])*<\/task-notification>$/u.test(content.trim());
+}
+
 /** The bound turn after its exact recorded prefix, frame by frame and read
  * only as far as an inspection walks (#469): `malformed` for a line that is
  * no JSON object, undefined past the turn's end. `echo` indexes its
@@ -609,6 +625,8 @@ function withClaudeTurn<T>(file: string, binding: DirectiveNativeBinding, inspec
         continue;
       }
       if (type === 'user') {
+        // A resumed session may replay a dead turn's task notifications first.
+        if (init && isClaudeTaskNotification(current, binding.sessionId)) continue;
         const message = current['message'] as { content?: unknown } | undefined;
         if (!init || current['isReplay'] !== true || current['session_id'] !== binding.sessionId || current['parent_tool_use_id'] != null ||
             typeof current['uuid'] !== 'string' || current['uuid'] === '' || !Array.isArray(message?.content) ||
@@ -668,7 +686,10 @@ function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNative
           pending.set(block['id'], block['name']);
         }
       } else if (type === 'user') {
-        if (frame['isReplay'] === true) return unknown('another prompt entered the directive turn');
+        if (frame['isReplay'] === true) {
+          if (isClaudeTaskNotification(frame, binding.sessionId)) continue;
+          return unknown('another prompt entered the directive turn');
+        }
         for (const block of blocks) {
           if (block['type'] !== 'tool_result') continue;
           if (typeof block['tool_use_id'] !== 'string' || !pending.has(block['tool_use_id'])) return unknown('unmatched/malformed native tool result');

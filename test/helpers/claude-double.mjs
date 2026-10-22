@@ -67,6 +67,20 @@
  *   CLAUDE_DOUBLE_INIT_DELAY_MS=<ms> wait this long after taking the prompt before init
  *   CLAUDE_DOUBLE_PRE_ECHO=1    a request status and a keepalive ping between init and the echo
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
+ *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string|string-false  the tool_use carries
+ *                               run_in_background: true, or the string "true" or
+ *                               "false" the real CLI coerces
+ *   CLAUDE_DOUBLE_TASK_NOTIFICATION=after-echo|before-echo|before-echo-tool|foreign
+ *                               a background task's notification replay right
+ *                               after the echo; two before it (a resumed
+ *                               session's unanswered tail); one before it and
+ *                               then a tool that asks the host before the echo;
+ *                               or, after the echo, a replayed prompt that is
+ *                               no notification
+ * The invocation record's `backgroundTasks` is CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+ * as the real CLI resolves it (probed on 2.1.306): the --settings env, then the
+ * cwd's .claude/settings.local.json and .claude/settings.json env, then the
+ * process environment (user and managed settings are not modelled).
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
@@ -160,12 +174,21 @@ function promptFromStdin() {
   return { prompt, images };
 }
 
+/** CLAUDE_CODE_DISABLE_BACKGROUND_TASKS as the CLI resolves it (#471): each
+ * settings env outranks the inherited environment, and --settings outranks
+ * the local and project settings. */
+function resolvedBackgroundSwitch() {
+  const envOf = (file) => (file !== undefined && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')).env : undefined);
+  const layers = [flagValue('--settings'), `${process.cwd()}/.claude/settings.local.json`, `${process.cwd()}/.claude/settings.json`].map(envOf);
+  return [...layers, process.env].map((env) => env?.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).find((value) => value !== undefined) ?? null;
+}
+
 function recordInvocation(prompt, images) {
   const logFile = process.env['CLAUDE_DOUBLE_LOG'];
   if (!logFile) return;
   appendFileSync(
     logFile,
-    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText })}\n`,
+    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: resolvedBackgroundSwitch() })}\n`,
     'utf8',
   );
 }
@@ -288,14 +311,16 @@ async function emitToolTurn(toolName, toolError = false) {
     });
     streamEvent({ type: 'content_block_stop', index: 0 });
   }
+  const background = { '1': true, string: 'true', 'string-false': 'false' }[process.env.CLAUDE_DOUBLE_TOOL_BACKGROUND ?? ''];
+  const input = background === undefined ? { command: 'ls' } : { command: 'ls', run_in_background: background };
   // The COMPLETE assistant frame still arrives — the adapter must not
   // double-announce this tool call.
   out(
     assistantFrame([
-      { type: 'tool_use', id: callId, name: toolName, input: { command: 'ls' } },
+      { type: 'tool_use', id: callId, name: toolName, input },
     ]),
   );
-  const decision = await askHost(toolName, callId, { command: 'ls' });
+  const decision = await askHost(toolName, callId, input);
   const holdMs = Number(process.env['CLAUDE_DOUBLE_TOOL_HOLD_MS'] ?? '0');
   if (Number.isFinite(holdMs) && holdMs > 0) await delay(holdMs);
   const denied = decision?.behavior !== 'allow';
@@ -329,6 +354,19 @@ function echoPrompt() {
     ? { ...frame.message, content: [{ type: 'text', text: 'not what the host sent' }] }
     : frame.message;
   out({ type: 'user', message, session_id: sessionId, parent_tool_use_id: null, uuid: randomUUID(), timestamp: new Date().toISOString(), isReplay: true });
+}
+
+/** A background task's completion as the real CLI replays it (#471, Claude
+ * Code 2.1.306): a system task_notification, then an isReplay user frame
+ * tagged origin.kind task-notification whose content is one string block. */
+function taskNotification(taskId) {
+  const runId = `run-${taskId}`;
+  const summary = `Background command "${taskId}" completed (exit code 0)`;
+  out({ type: 'system', subtype: 'task_notification', task_id: taskId, run_id: runId, tool_use_id: `toolu_${taskId}`, status: 'completed',
+    output_file: `/tmp/${taskId}.output`, summary, uuid: randomUUID(), session_id: sessionId });
+  out({ type: 'user', message: { role: 'user', content: `<task-notification>\n<task-id>${taskId}</task-id>\n<tool-use-id>toolu_${taskId}</tool-use-id>\n<output-file>/tmp/${taskId}.output</output-file>\n<status>completed</status>\n<summary>${summary}</summary>\n</task-notification>` },
+    session_id: sessionId, parent_tool_use_id: null, uuid: randomUUID(), timestamp: new Date().toISOString(), isReplay: true,
+    origin: { kind: 'task-notification', producer: 'session-task', runId } });
 }
 
 /** Minimal MCP stdio client: newline-delimited JSON-RPC to the bridge
@@ -460,7 +498,20 @@ async function run() {
       out({ type: 'system', subtype: 'status', status: 'requesting', session_id: sessionId, uuid: randomUUID() });
       streamEvent({ type: 'ping' });
     }
+    const notified = process.env.CLAUDE_DOUBLE_TASK_NOTIFICATION;
+    // Hypothetical orderings: CLI 2.1.306 was not seen replaying a dead turn's
+    // notifications on --resume (its resumed turn echoed nothing at all, #472).
+    if (notified === 'before-echo') { taskNotification('bgdouble1'); taskNotification('bgdouble2'); }
+    if (notified === 'before-echo-tool') {
+      taskNotification('bgdouble1');
+      out(assistantFrame([{ type: 'tool_use', id: 'toolu_early', name: 'Read', input: { file_path: '/early' } }]));
+      await askHost('Read', 'toolu_early', { file_path: '/early' });
+    }
     echoPrompt();
+    if (notified === 'after-echo') taskNotification('bgdouble1');
+    if (notified === 'foreign') {
+      out({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'do something else' }] }, session_id: sessionId, parent_tool_use_id: null, uuid: randomUUID(), timestamp: new Date().toISOString(), isReplay: true });
+    }
   }
 
   if (prompt.includes('die-after-echo')) {
