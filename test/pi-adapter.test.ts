@@ -17,6 +17,7 @@ import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
+import { Supervisor } from '../src/supervision/supervisor.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
@@ -3921,6 +3922,64 @@ async function assertSdkToolAuthority(boundary: 'model-await' | 'prior-hook-awai
 it('real sequential SDK tools recheck revoked directive authority after model-await', () => assertSdkToolAuthority('model-await'));
 it('real sequential SDK tools recheck revoked directive authority after prior-hook-await', () => assertSdkToolAuthority('prior-hook-await'));
 
+it('routes a real local native authority refusal away from provider authentication recovery', async () => {
+  let applyAcceptedClarification: (() => void) | null = null;
+  const f = await sdkDirectiveExecutionFixture((_prompt, index) => {
+    if (index === 0) applyAcceptedClarification?.();
+    return index === 0
+      ? { deltas: [], toolCall: { id: 'refused-local-effect', name: 'bash', args: { command: 'printf forbidden > local-authority-effect.txt' } } }
+      : { deltas: ['native refusal remains final'] };
+  });
+  const { scene, registry, fx } = f;
+  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
+    restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+    registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
+  const spawn = vi.spyOn(registry, 'spawn');
+  try {
+    expect(scene.ledger.claimDirectiveDispatch(scene.request.requestId)).toBe(true);
+    const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: 'logical-minion' });
+    scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+    if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
+    const producer = handle.prepareDirectiveProducer(scene.identity);
+    const producerStartSeq = scene.ledger.startDirectiveProducer(scene.identity, producer);
+    expect(producerStartSeq).toBeGreaterThan(0);
+    applyAcceptedClarification = () => {
+      expect(scene.ledger.addJobAmendment({ jobId: scene.request.jobId, body: 'Synthetic accepted administrative contract clarification.',
+        supersedes: [], approval: { by: 'owner', reference: 'synthetic accepted clarification' }, effect: 'material',
+        expectedContractSha256: scene.identity.contractSha256 }).status).toBe('accepted');
+      scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'accepted contract clarification superseded the original continuation' });
+    };
+    const events: RuntimeEvent[] = [];
+    handle.subscribe((event) => events.push(event));
+    const verdict = await handle.promptWithVerdict('original accepted synthetic directive', { owner: `silas-directive:${scene.request.requestId}`,
+      directive: { identity: scene.identity, beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+        onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    expect(verdict.ok).toBe(false);
+    await waitFor(() => events.some((event) => event.type === 'error'), 'real native refusal error event');
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+
+    const refusal = events.find((event) => event.type === 'error');
+    expect(refusal).toMatchObject({ type: 'error', error: 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized' });
+    expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
+    expect(scene.ledger.listProviderWaits()).toEqual([]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(fx.script.calls).toHaveLength(1);
+    expect(readFileSync(handle.sessionFile!, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; content?: readonly { text?: string }[] } })
+      .filter((row) => row.message?.role === 'user' && row.message.content?.some((part) => part.text === 'original accepted synthetic directive'))).toHaveLength(1);
+    expect(existsSync(join(scene.lane.path, 'local-authority-effect.txt'))).toBe(false);
+    expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'failed', nativeBinding: { identity: scene.identity } });
+    const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string });
+    expect(receipts).toContainEqual(expect.objectContaining({ state: 'guard-refused', toolCallId: 'refused-local-effect' }));
+    expect(receipts.some((receipt) => receipt.state === 'ceased')).toBe(false);
+    const { inspectDirectiveProducers } = await import('../src/runtime/directive-checkpoint.js');
+    expect(inspectDirectiveProducers(handle.sessionFile!, scene.identity)).toEqual([{ producer, evidence: 'unknown' }]);
+  } finally {
+    supervisor.dispose();
+    await f.cleanup();
+  }
+});
+
 it('cessation journal failure retains native lock and physical owner until an exact receipt retry succeeds', async () => {
   const f = await fixture([{ deltas: ['done'] }]);
   const handle = await f.runtime.spawn('minion', { cwd: f.workspace });
@@ -4159,7 +4218,7 @@ async function directiveRecoveryLedgerFixture(label: string, materialRevision = 
     identity: ledger.directiveTurnIdentity(request.requestId) };
 }
 
-async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false, useDefaultToolExecution = false, rebrief = false) {
+async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[] | StubResponder, configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false, useDefaultToolExecution = false, rebrief = false) {
   const fx = await fixture(turns);
   const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools', materialRevision, rebrief);
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
