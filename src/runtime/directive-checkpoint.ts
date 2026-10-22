@@ -424,6 +424,9 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
+  // A tool error the turn went on to answer is ordinary work (a failing test,
+  // a grep with no match). One it never answered may be an interrupted effect.
+  let unanswered = false;
   for (let index = 1; ; index += 1) {
     const entry = native(index);
     if (entry === undefined) break;
@@ -445,6 +448,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
     const message = entry.message;
     if (message.role === 'assistant') {
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
+      unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
       for (const block of message.content as Record<string, unknown>[]) {
         if (block.type !== 'toolCall') continue;
@@ -461,7 +465,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
       pending.delete(message.toolCallId);
       if (!Array.isArray(message.content) || typeof message.toolName !== 'string') return unknown('malformed native tool result content/name');
-      if (message.isError) return unknown('native tool error requires a recovery judgment');
+      if (message.isError) unanswered = true;
     } else return unknown('another user/custom message owns this session');
     lastMessage = message;
   }
@@ -471,6 +475,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
     return { state: 'terminal', binding: admitted, checkpointId: parent, ok,
       error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
   }
+  if (unanswered) return unknown('native tool error the turn never answered requires a recovery judgment');
   return { state: 'resumable', binding: admitted, checkpointId: parent };
 }
 
@@ -671,6 +676,9 @@ function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNative
       return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
     }
     const pending = new Map<string, string>();
+    // As on pi: a tool error the model went on to answer is ordinary work; a
+    // result straight after one means the CLI ended the turn by itself.
+    let unanswered = false;
     for (let index = turn.echo + 1; ; index += 1) {
       const frame = turn.frame(index);
       if (frame === undefined) break;
@@ -679,6 +687,8 @@ function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNative
       const message = frame['message'] as { content?: unknown } | undefined;
       const blocks = Array.isArray(message?.content) ? message.content as Record<string, unknown>[] : [];
       if (type === 'assistant') {
+        // Only the main agent's own frame answers it, never a sub-agent's.
+        if (frame['parent_tool_use_id'] == null) unanswered = false;
         for (const block of blocks) {
           if (block['type'] !== 'tool_use') continue;
           if (typeof block['id'] !== 'string' || block['id'] === '' || typeof block['name'] !== 'string' || block['name'] === '' ||
@@ -693,7 +703,7 @@ function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNative
         for (const block of blocks) {
           if (block['type'] !== 'tool_result') continue;
           if (typeof block['tool_use_id'] !== 'string' || !pending.has(block['tool_use_id'])) return unknown('unmatched/malformed native tool result');
-          if (block['is_error'] === true) return unknown('native tool error requires a recovery judgment');
+          if (block['is_error'] === true) unanswered = true;
           pending.delete(block['tool_use_id']);
         }
       } else if (type === 'control_request') {
@@ -707,6 +717,7 @@ function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNative
         if (frame['session_id'] !== binding.sessionId || typeof frame['uuid'] !== 'string' || frame['uuid'] === '') return unknown('malformed native result');
         const ok = frame['subtype'] === 'success' && frame['is_error'] === false;
         if (ok && pending.size > 0) return unknown('native tool effects/results are incomplete');
+        if (ok && unanswered) return unknown('native tool error the turn never answered requires a recovery judgment');
         return { state: 'terminal', binding: admitted, checkpointId: frame['uuid'], ok,
           error: ok ? null : String(typeof frame['result'] === 'string' && frame['result'] !== '' ? frame['result'] : `native result: ${String(frame['subtype'])}`) };
       }
@@ -964,7 +975,8 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
       }
       if (chainPending.size === 0) refuse();
     } else if (message!.role === 'toolResult') {
-      if (typeof message!.toolCallId !== 'string' || chainPending.get(message!.toolCallId) !== message!.toolName || message!.isError !== false || !Array.isArray(message!.content)) refuse();
+      // An earlier failed call is ordinary work; the minion may go on.
+      if (typeof message!.toolCallId !== 'string' || chainPending.get(message!.toolCallId) !== message!.toolName || typeof message!.isError !== 'boolean' || !Array.isArray(message!.content)) refuse();
       chainPending.delete(message!.toolCallId as string);
     } else refuse();
   }

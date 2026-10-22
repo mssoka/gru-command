@@ -62,6 +62,10 @@ export class ClaudeDirectivePermissionChannel {
     private readonly child: ChildProcess,
     private readonly deps: {
       readonly fail: (message: string) => void;
+      /** A tool request this channel denied itself (malformed or foreign, or a
+       * fence that failed), once the deny is handed to the CLI's stdin: the
+       * host keeps a durable refusal of it. */
+      readonly refused: (toolUseId: string | undefined, reason: string) => void;
       /** Called once per tool request, after the request frame is durable. */
       readonly decide: (request: ClaudeToolRequest, durable: Promise<void>) => Promise<ClaudeToolDecision>;
       readonly verification?: WorkerVerificationPolicy;
@@ -104,7 +108,11 @@ export class ClaudeDirectivePermissionChannel {
       typeof toolUse === 'string' && toolUse !== '' && !this.toolUses.has(toolUse) &&
       input !== null && typeof input === 'object' && !Array.isArray(input);
     if (!valid) {
-      if (typeof id === 'string' && id !== '' && !this.closed) this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' });
+      // Only a deny handed to the CLI's stdin is a refusal.
+      if (typeof id === 'string' && id !== '' && !this.closed &&
+          this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' })) {
+        this.deps.refused(undefined, 'malformed or foreign directive permission request');
+      }
       this.deps.fail('malformed or foreign directive permission request');
       return;
     }
@@ -120,28 +128,34 @@ export class ClaudeDirectivePermissionChannel {
     this.deps.decide(tool, durable).then(
       (decision) => this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message }),
       (error: unknown) => {
-        this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' });
-        this.deps.fail(`directive tool fence failed: ${error instanceof Error ? error.message : String(error)}`);
+        const reason = `directive tool fence failed: ${error instanceof Error ? error.message : String(error)}`;
+        if (!this.closed && this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' })) {
+          this.deps.refused(tool.toolUseId, reason);
+        }
+        this.deps.fail(reason);
       },
     );
   }
 
-  private respond(requestId: string, response: Record<string, unknown>): void {
-    this.write({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } }, true);
+  /** Whether the response was handed to the CLI. */
+  private respond(requestId: string, response: Record<string, unknown>): boolean {
+    return this.write({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } }, true);
   }
 
-  private write(frame: StreamFrame, echoed: boolean): void {
+  private write(frame: StreamFrame, echoed: boolean): boolean {
     if (this.closed || this.child.stdin == null || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
       this.deps.fail('directive permission transport is unavailable');
-      return;
+      return false;
     }
     if (echoed) this.echoes.push(frame);
     try {
       this.child.stdin.write(`${JSON.stringify(frame)}\n`, (error) => {
         if (error != null) this.deps.fail('directive permission transport failed');
       });
+      return true;
     } catch {
       this.deps.fail('directive permission transport failed');
+      return false;
     }
   }
 }

@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { reviewPythonExecutable } from '../src/runtime/review-directory-entries.js';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -357,6 +357,13 @@ describe('inside_checkout heuristic (W-B)', () => {
 });
 
 describe('the gru launcher (#463)', () => {
+  /** The host's PATH without any directory that holds a `gru`: link_cli
+   * reports every other `gru` the shell would run, so a developer's own
+   * install on PATH would leak into what these tests expect. Bash expands a
+   * leading `~` in an entry, so the check does too. */
+  const hostPath = (process.env.PATH ?? '').split(':')
+    .filter((dir) => dir !== '' && !existsSync(join(dir.replace(/^~(?=\/|$)/u, homedir()), 'gru'))).join(':');
+
   /** Run install.sh's launcher functions against controlled values; no
    * other installer code runs. Returns the shell's exit status and output. */
   function launcherShell(vars: Readonly<Record<string, string>>, body: string, path?: string) {
@@ -370,7 +377,7 @@ describe('the gru launcher (#463)', () => {
     ].join('\n');
     return spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
-      env: { ...process.env, PATH: path ?? process.env.PATH ?? '' },
+      env: { ...process.env, PATH: path ?? hostPath },
     });
   }
 
@@ -438,18 +445,18 @@ describe('the gru launcher (#463)', () => {
     const decoys = join(root, 'decoys');
     mkdirSync(decoys);
     writeFileSync(join(decoys, 'gru'), '#!/bin/sh\necho decoy\n', { mode: 0o755 });
-    const first = launcherShell(vars, 'link_cli', `${bin}:${decoys}:${process.env.PATH ?? ''}`);
+    const first = launcherShell(vars, 'link_cli', `${bin}:${decoys}:${hostPath}`);
     expect(first.status).toBe(0);
     expect(first.stdout).toContain("installed the 'gru' command");
     expect(first.stdout).not.toContain('not on your PATH');
     expect(first.stderr).toBe('');
     // Unchanged launcher, a gru that appeared ahead of it since: still reported.
-    const shadowed = launcherShell(vars, 'link_cli', `${decoys}:${bin}:${process.env.PATH ?? ''}`);
+    const shadowed = launcherShell(vars, 'link_cli', `${decoys}:${bin}:${hostPath}`);
     expect(shadowed.status).toBe(0);
     expect(shadowed.stdout).toBe('');
     expect(shadowed.stderr).toContain(`your shell runs another 'gru': ${decoys}/gru`);
     // Ours off PATH entirely while another gru is on it: typing gru runs that one, so say so.
-    const offPath = launcherShell(vars, 'link_cli', `${decoys}:${process.env.PATH ?? ''}`);
+    const offPath = launcherShell(vars, 'link_cli', `${decoys}:${hostPath}`);
     expect(offPath.stderr).toContain(`your shell runs another 'gru': ${decoys}/gru`);
   });
 
