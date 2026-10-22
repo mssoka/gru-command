@@ -493,10 +493,11 @@ async function main(): Promise<number> {
   // read-only GitHub/GitLab projection of the configured managed-repo
   // registry. Own bounded cadence (never per-render, never per-tab),
   // coalesced, server-side through the existing gh auth seam and the
-  // GitLab token (#480); the snapshot carries the cached view. Rows are absent (null) until the first pass runs.
-  // Each committed observation also feeds the default-branch CI alert
-  // (#446), built once the notification center exists below — the tracker
-  // starts only after that, so no first pass is lost.
+  // GitLab token (#480); the snapshot carries the cached view. Rows are
+  // absent (null) until the first pass runs. Each committed GitHub
+  // observation also feeds the default-branch CI alert (#446), built once
+  // the notification center exists below — the tracker starts only after
+  // that, so no first pass is lost.
   const repoOverview = createManagedRepoOverviewTracker(config, {
     api: new GhRepoOverviewApi(),
     gitlabApi: new GitLabRepoOverviewApi(),

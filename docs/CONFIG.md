@@ -87,11 +87,16 @@ removed when the overview list changes.
 
 The overview reads GitHub origins through the `gh` login and GitLab origins
 (`gitlab.com`, or a self-hosted host whose first label is `gitlab`) through
-`GITLAB_TOKEN`, falling back to `GL_TOKEN`, in the service environment — the
-same token Perkins GitLab delivery uses, sent only to those hosts. A GitLab row
-without a token reads unavailable and names the missing variable; GitHub rows
-are unaffected. Origins on any other host read `Not linked (unsupported code
-host)`. See [BOARD.md](./BOARD.md) for what each row shows.
+`GITLAB_TOKEN`, falling back to `GL_TOKEN` — the same token Perkins GitLab
+delivery uses, sent only to those hosts. The token needs the `read_api` scope.
+`install.sh` writes no token into the service unit, so set `GITLAB_TOKEN` in
+the service's own environment (check what it sees with `launchctl getenv
+GITLAB_TOKEN` on macOS or `systemctl --user show-environment` on Linux), then
+run `gru restart`. A GitLab row without a token reads unavailable and names the
+missing variable, and a token without `read_api` fails that host's rows as an
+auth failure; GitHub rows are unaffected. Origins on any other host read `Not
+linked (unsupported code host)`. See [BOARD.md](./BOARD.md) for what each row
+shows.
 
 ## Load & validation behavior
 

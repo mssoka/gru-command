@@ -42,7 +42,8 @@ export function repoRunBadge(state: RepoOverviewRunState): RepoBadge {
 }
 
 /** The provider vocabulary a row is worded in. Unlinked rows carry no
- * provider and keep the GitHub defaults. */
+ * provider (the host may be GitLab, GitHub or neither) and read neutral
+ * terms. */
 export interface RepoTerms {
   /** The host's product name, for link titles. */
   readonly host: string;
@@ -56,9 +57,16 @@ export interface RepoTerms {
 
 const GITHUB_TERMS: RepoTerms = { host: 'GitHub', requests: 'PRs', requestsLong: 'pull requests', run: 'run' };
 const GITLAB_TERMS: RepoTerms = { host: 'GitLab', requests: 'MRs', requestsLong: 'merge requests', run: 'pipeline' };
+const NEUTRAL_TERMS: RepoTerms = {
+  host: 'the code host',
+  requests: 'PRs/MRs',
+  requestsLong: 'pull or merge requests',
+  run: 'run',
+};
 
 export function repoTerms(row: RepoOverviewRowView): RepoTerms {
-  return row.provider === 'gitlab' ? GITLAB_TERMS : GITHUB_TERMS;
+  if (row.provider === 'gitlab') return GITLAB_TERMS;
+  return row.provider === 'github' ? GITHUB_TERMS : NEUTRAL_TERMS;
 }
 
 /** Row-level badge: freshness/not-linked overlays replace the run badge so

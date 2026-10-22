@@ -14,8 +14,9 @@ import {
  * GitLab REST transport for the managed repository overview (#480). The
  * tracker owns budgets, freshness and abort scopes; this adapter only
  * reads one project through `/api/v4/projects/:path` and classifies each
- * failure by HTTP status (401 auth, 403 permission, 404 not-found, 429
- * rate-limit; network, timeout, 5xx and shape faults are other).
+ * failure by HTTP status (401 auth, 403 permission — auth when the token
+ * lacks `read_api` — 404 not-found, 429 rate-limit; network, timeout, 5xx
+ * and shape faults are other).
  *
  * The token (`GITLAB_TOKEN`, falling back to `GL_TOKEN` — the resolver
  * Perkins delivery uses) rides only the `PRIVATE-TOKEN` header, only over
@@ -52,28 +53,36 @@ export interface GitLabRepoOverviewApiOptions {
   readonly timeoutMs?: number;
 }
 
-function kindOfStatus(status: number): RepoFetchErrorKind {
+/** The failure kind for an HTTP status. A 403 whose OAuth `error` is
+ * `insufficient_scope` is the token itself (no `read_api`), so every
+ * repository on the host would fail the same way: it reads as auth. */
+function kindOfStatus(status: number, oauthError: string | null): RepoFetchErrorKind {
   if (status === 401) return 'auth';
-  if (status === 403) return 'permission';
+  if (status === 403) return oauthError === 'insufficient_scope' ? 'auth' : 'permission';
   if (status === 404) return 'not-found';
   if (status === 429) return 'rate-limit';
   return 'other';
 }
 
-/** GitLab's short error text (`{"message": "404 Project Not Found"}`);
- * null when the body carries no string message. */
-function gitLabMessageOf(text: string): string | null {
+/** GitLab's short error text — `{"message": "404 Project Not Found"}`, or
+ * an OAuth-style `{"error": "insufficient_scope", "error_description": …}`
+ * — and that OAuth `error` code; null where the body carries none. */
+function gitLabErrorOf(text: string): { readonly detail: string | null; readonly oauthError: string | null } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return null;
+    return { detail: null, oauthError: null };
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-  const message = (parsed as Record<string, unknown>)['message'];
-  if (typeof message !== 'string') return null;
-  const flat = message.replace(/\s+/gu, ' ').trim();
-  return flat === '' ? null : flat.slice(0, GITLAB_MESSAGE_MAX_CHARS);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { detail: null, oauthError: null };
+  const body = parsed as Record<string, unknown>;
+  const flat = (value: unknown): string | null => {
+    if (typeof value !== 'string') return null;
+    const squashed = value.replace(/\s+/gu, ' ').trim();
+    return squashed === '' ? null : squashed.slice(0, GITLAB_MESSAGE_MAX_CHARS);
+  };
+  const oauthError = flat(body['error']);
+  return { detail: flat(body['message']) ?? flat(body['error_description']) ?? oauthError, oauthError };
 }
 
 /** The project API URL, or null when the host cannot form a plain https
@@ -97,6 +106,16 @@ function redact(text: string, token: string): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A transport failure's detail. Node's fetch throws a bare
+ * `TypeError('fetch failed')` and keeps the real reason (DNS, TLS, a
+ * refused connection or redirect) in `cause`, with its `code`. */
+function transportDetailOf(error: unknown): string {
+  const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+  if (cause === undefined || cause === null) return messageOf(error);
+  const code = (cause as { code?: unknown }).code;
+  return `${messageOf(error)}: ${messageOf(cause)}${typeof code === 'string' && code !== '' ? ` [${code}]` : ''}`;
 }
 
 export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
@@ -130,8 +149,10 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     readonly limit: number;
   }): Promise<readonly GitLabPipelineRaw[]> {
     const label = `pipelines ${repoFullName(input.repo)}@${input.branch} on ${input.repo.host}`;
+    // `scope=branches` keeps a tag that shares the branch's name out.
     const query = new URLSearchParams({
       ref: input.branch,
+      scope: 'branches',
       order_by: 'id',
       sort: 'desc',
       per_page: String(input.limit),
@@ -180,7 +201,7 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
     if (token === undefined || token.trim() === '') {
       throw new RepoProviderError(
         'auth',
-        `no GitLab token configured for ${host} — set GITLAB_TOKEN (or GL_TOKEN) to a token that can read ${repoFullName(repo)}`,
+        `no GitLab token configured for ${host} — set GITLAB_TOKEN (or GL_TOKEN) in the service environment to a token with the read_api scope that can read ${repoFullName(repo)}`,
       );
     }
     const url = projectApiUrl(repo, suffix);
@@ -197,13 +218,13 @@ export class GitLabRepoOverviewApi implements GitLabRepoOverviewApiPort {
       });
       text = await response.text();
     } catch (error) {
-      throw new RepoProviderError('other', redact(`${label}: request failed (${messageOf(error)})`, token));
+      throw new RepoProviderError('other', redact(`${label}: request failed (${transportDetailOf(error)})`, token));
     }
     if (!response.ok) {
       // Redact before GitLab's message is cut, so no token prefix survives.
-      const detail = gitLabMessageOf(redact(text, token));
+      const { detail, oauthError } = gitLabErrorOf(redact(text, token));
       throw new RepoProviderError(
-        kindOfStatus(response.status),
+        kindOfStatus(response.status, oauthError),
         redact(`${label}: HTTP ${response.status}${detail !== null ? ` (${detail})` : ''}`, token),
       );
     }

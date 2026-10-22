@@ -1057,8 +1057,9 @@ interface ProviderObservation {
   readonly defaultBranchRuns: DefaultBranchRunsObservation | null;
 }
 
-/** The fatal-abort scope a linked row belongs to: every GitHub host shares
- * the `gh` credential, while each GitLab host is its own scope. */
+/** The fatal-abort scope a linked row belongs to. GitHub keeps today's
+ * single scope (one GitHub abort stops every GitHub host's rows, as before
+ * #480); each GitLab host is its own scope. */
 function providerScopeOf(state: RepoSourceState): string {
   return state.provider === 'gitlab' && state.ref !== null ? `gitlab:${state.ref.host.toLowerCase()}` : 'github';
 }
@@ -1459,9 +1460,14 @@ export class ManagedRepoOverviewTracker {
         : Math.max(0, repos.indexOf(resumeName));
     }
     // An aborted scope's first skipped repository resumes the next pass, so
-    // what this pass never checked goes first (a discarded observation
-    // still keeps its priority).
-    if (skipped.length > 0) this.cursor = Math.max(0, repos.indexOf(skipped[0] as string));
+    // what this pass never checked goes first — unless the pass was
+    // truncated, whose resume point (or discarded priority) stands.
+    if (stopped === null && skipped.length > 0) this.cursor = Math.max(0, repos.indexOf(skipped[0] as string));
+    if (abortedScopes.size > 0) {
+      this.log('warn', 'repo overview refresh aborted (provider/rate-limit condition) — next cadence re-observes', {
+        scopes: [...abortedScopes.keys()],
+      });
+    }
     if (stopped === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {
         budget: this.maxCallsPerRefresh,
@@ -1474,9 +1480,7 @@ export class ManagedRepoOverviewTracker {
         calls: budget.used,
         repos: repos.length,
       });
-    } else if (abortedScopes.size > 0) {
-      this.log('warn', 'repo overview refresh aborted (provider/rate-limit condition) — next cadence re-observes', {});
-    } else if (failures > 0) {
+    } else if (abortedScopes.size === 0 && failures > 0) {
       this.log('warn', 'repo overview refresh completed with repository failures', { repos: repos.length, failures });
     }
     return this.view();

@@ -148,6 +148,11 @@ describe('managed repository overview panel', () => {
     expect(article.querySelector('.repo-row__badge-text')?.textContent).toBe('NOT LINKED');
     expect(article.querySelector('.repo-row__note')?.textContent).toContain('no usable origin remote');
     expect(article.dataset.runState).toBe('unlinked');
+    // No provider, so no host's vocabulary is claimed.
+    expect([...article.querySelectorAll('.repo-row__metric-label')].map((node) => node.textContent)).toEqual([
+      'OPEN PRs/MRs',
+      'OPEN issues excl. PRs/MRs',
+    ]);
   });
 
   it('renders the stale overlay and the no-health-claim note for cached data', () => {

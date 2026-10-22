@@ -64,7 +64,8 @@ function pipeline(over: Partial<GitLabPipelineRaw> = {}): GitLabPipelineRaw {
     ref: 'main',
     url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
     createdAt: '2026-10-22T10:00:00.000Z',
-    startedAt: '2026-10-22T10:00:05.000Z',
+    // The list-pipelines entity carries no start time.
+    startedAt: null,
     updatedAt: '2026-10-22T10:05:00.000Z',
     ...over,
   };
@@ -80,10 +81,12 @@ interface GitLabFacts {
   readonly errors?: Partial<Record<GitLabCall, unknown>>;
 }
 
-/** Deterministic GitLab port: every call is recorded as `call:host/path`. */
+/** Deterministic GitLab port: every call is recorded as `call:host/path`
+ * (pass one array to both fakes to read the cross-provider order). */
 class FakeGitLab implements GitLabRepoOverviewApiPort {
-  readonly calls: string[] = [];
   readonly facts = new Map<string, GitLabFacts>();
+
+  constructor(readonly calls: string[] = []) {}
 
   set(repo: string, facts: GitLabFacts): this {
     this.facts.set(repo, facts);
@@ -123,8 +126,9 @@ class FakeGitLab implements GitLabRepoOverviewApiPort {
 
 /** The GitHub port, answering every repository with one passing run. */
 class FakeGitHub implements RepoOverviewApiPort {
-  readonly calls: string[] = [];
   readonly errors = new Map<string, unknown>();
+
+  constructor(readonly calls: string[] = []) {}
 
   private record(name: string, repo: RepoRef): void {
     this.calls.push(`${name}:${repoFullName(repo)}`);
@@ -201,6 +205,7 @@ function harness(options: {
   refs: ReadonlyMap<string, RepoRef | null>;
   gitlabApi?: GitLabRepoOverviewApiPort | null;
   github?: FakeGitHub;
+  maxCallsPerRefresh?: number;
 }): Harness {
   const github = options.github ?? new FakeGitHub();
   const refs = new Map(options.refs);
@@ -217,6 +222,7 @@ function harness(options: {
     resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
     resolveRemote: (repoPath) => refs.get(repoPath.split('/').pop() as string) ?? null,
     intervalMs: 300_000,
+    ...(options.maxCallsPerRefresh !== undefined ? { maxCallsPerRefresh: options.maxCallsPerRefresh } : {}),
     now: () => clock.ms,
     sleep: async (ms) => {
       clock.ms += ms;
@@ -421,7 +427,7 @@ describe('GitLab overview REST adapter', () => {
       'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject',
       'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/merge_requests?state=opened&scope=all&per_page=1',
       'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/issues?state=opened&scope=all&per_page=1',
-      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/pipelines?ref=main&order_by=id&sort=desc&per_page=20',
+      'https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject/pipelines?ref=main&scope=branches&order_by=id&sort=desc&per_page=20',
     ]);
     for (const call of calls) {
       expect(call.headers['PRIVATE-TOKEN']).toBe(TOKEN);
@@ -511,6 +517,64 @@ describe('GitLab overview REST adapter', () => {
     await expect(garbled.fetchProject({ repo: gitlabRef('project') })).rejects.toThrow(/not valid JSON/u);
   });
 
+  it('names the real transport failure from fetch\'s cause and code, still redacted', async () => {
+    const failures: unknown[] = [
+      new TypeError('fetch failed', {
+        cause: Object.assign(new Error('getaddrinfo ENOTFOUND gitlab.example.com'), { code: 'ENOTFOUND' }),
+      }),
+      new TypeError('fetch failed', { cause: new Error(`redirect refused for ${TOKEN}`) }),
+    ];
+    const api = new GitLabRepoOverviewApi({
+      tokenResolver: () => TOKEN,
+      fetchImpl: async () => {
+        throw failures.shift();
+      },
+    });
+    const dns = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    expect(dns.kind).toBe('other');
+    expect(dns.message).toBe(
+      'project group/sub/project on gitlab.example.com: request failed (fetch failed: getaddrinfo ENOTFOUND gitlab.example.com [ENOTFOUND])',
+    );
+    const redirect = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+    expect(redirect.message).toBe(
+      'project group/sub/project on gitlab.example.com: request failed (fetch failed: redirect refused for [redacted])',
+    );
+  });
+
+  it('reads OAuth-style error bodies and aborts the host on a 403 insufficient_scope', async () => {
+    const insufficient = {
+      error: 'insufficient_scope',
+      error_description: 'The request requires higher privileges than provided by the access token.',
+      scope: 'api read_api',
+    };
+    const cases: ReadonlyArray<readonly [Response, string, string]> = [
+      [json(insufficient, { status: 403 }), 'auth', `HTTP 403 (${insufficient.error_description})`],
+      [json({ error: 'invalid_token', error_description: 'Token was revoked.' }, { status: 401 }), 'auth', 'HTTP 401 (Token was revoked.)'],
+      [json({ error: 'forbidden' }, { status: 403 }), 'permission', 'HTTP 403 (forbidden)'],
+      [json({ message: '403 Forbidden', error: 'ignored' }, { status: 403 }), 'permission', 'HTTP 403 (403 Forbidden)'],
+    ];
+    for (const [response, kind, detail] of cases) {
+      const api = new GitLabRepoOverviewApi({ fetchImpl: async () => response, tokenResolver: () => TOKEN });
+      const error = (await api.fetchProject({ repo: gitlabRef('project') }).catch((caught: unknown) => caught)) as RepoProviderError;
+      expect(error.kind, detail).toBe(kind);
+      expect(error.message).toBe(`project group/sub/project on gitlab.example.com: ${detail}`);
+    }
+    // A token without read_api fails every project alike: the first row
+    // aborts the host, and the rest spend no request.
+    const { fetchImpl, calls } = fakeFetch(() => json(insufficient, { status: 403 }));
+    const h = harness({
+      refs: new Map([
+        ['gl-a', gitlabRef('gl-a')],
+        ['gl-b', gitlabRef('gl-b')],
+      ]),
+      gitlabApi: new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN }),
+    });
+    const view = await h.tracker.refresh();
+    expect(calls).toHaveLength(1);
+    expect(row(view, 'gl-a').error).toContain('HTTP 403 (The request requires higher privileges');
+    expect(row(view, 'gl-b').error).toContain('refresh aborted before this repository was checked: auth:');
+  });
+
   it('sends nothing without a token, to a host isGitLabRemote rejects, or to a non-default port', async () => {
     const { fetchImpl, calls } = fakeFetch(() => json({}));
     for (const token of [undefined, '', '   ']) {
@@ -519,6 +583,7 @@ describe('GitLab overview REST adapter', () => {
       expect(error).toBeInstanceOf(RepoProviderError);
       expect(error.kind).toBe('auth');
       expect(error.message).toMatch(/^no GitLab token configured for gitlab\.example\.com — set GITLAB_TOKEN/u);
+      expect(error.message).toContain('the read_api scope');
     }
     const api = new GitLabRepoOverviewApi({ fetchImpl, tokenResolver: () => TOKEN });
     for (const host of ['evil.example', 'evil.gitlab.attacker.test', 'gitlab.example.com:8443', 'gitlab.example.com@evil']) {
@@ -581,7 +646,7 @@ describe('managed repo overview tracker — GitLab rows', () => {
       runNumber: 6,
       url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
       runCreatedAt: '2026-10-22T10:00:00.000Z',
-      runStartedAt: '2026-10-22T10:00:05.000Z',
+      runStartedAt: null,
       runUpdatedAt: '2026-10-22T10:05:00.000Z',
     });
     expect(gitlab.calls).toEqual([
@@ -713,7 +778,8 @@ describe('managed repo overview tracker — GitLab rows', () => {
     expect(row(view, 'gl-d')).toMatchObject({ freshness: 'fresh', openPrs: 4 });
     expect(h.github.calls).toEqual([...githubCalls('alpha'), ...githubCalls('zeta')]);
     expect(row(view, 'zeta').freshness).toBe('fresh');
-    expect(h.logs.some((line) => line.msg.includes('refresh aborted (provider/rate-limit condition)'))).toBe(true);
+    const abort = h.logs.find((line) => line.msg.includes('refresh aborted (provider/rate-limit condition)'));
+    expect(abort?.fields).toEqual({ scopes: ['gitlab:gitlab.example.com', 'gitlab:gitlab.other.test'] });
     expectValidOnBoard(view);
   });
 
@@ -858,6 +924,111 @@ describe('managed repo overview tracker — GitLab rows', () => {
       ].join('\n');
       expect(words, name).not.toMatch(/GitHub|Actions|PRs|pull request/u);
     }
+  });
+
+  it('spends GitLab calls from the per-pass budget and discards a cut-off observation', async () => {
+    const gitlab = new FakeGitLab().set('gl-a', { openMrs: 1 }).set('gl-b', { openMrs: 2, openIssues: 3 });
+    const h = harness({
+      refs: new Map([
+        ['gl-a', gitlabRef('gl-a')],
+        ['gl-b', gitlabRef('gl-b')],
+      ]),
+      gitlabApi: gitlab,
+      maxCallsPerRefresh: 6,
+    });
+    const first = await h.tracker.refresh();
+    expect(row(first, 'gl-a')).toMatchObject({ freshness: 'fresh', openPrs: 1 });
+    // gl-b's project and MR count fit (calls 5 and 6); its issue count does
+    // not, so nothing partial is committed and nothing is recorded as failed.
+    expect(gitlab.calls.filter((call) => call.endsWith('/gl-b'))).toEqual([
+      'fetchProject:gitlab.example.com/group/sub/gl-b',
+      'countOpenMergeRequests:gitlab.example.com/group/sub/gl-b',
+    ]);
+    expect(row(first, 'gl-b')).toMatchObject({
+      freshness: 'unchecked',
+      openPrs: null,
+      openIssues: null,
+      run: null,
+      error: null,
+      lastAttemptAt: null,
+    });
+    const budget = h.logs.find((line) => line.msg.includes('call budget exhausted'));
+    expect(budget?.fields).toMatchObject({ budget: 6, calls: 6 });
+    gitlab.calls.length = 0;
+    const second = await h.tracker.refresh();
+    // The discarded repository goes first on the next pass.
+    expect(gitlab.calls[0]).toBe('fetchProject:gitlab.example.com/group/sub/gl-b');
+    expect(row(second, 'gl-b')).toMatchObject({ freshness: 'fresh', openPrs: 2, openIssues: 3 });
+  });
+
+  it('discloses an aborted scope past a budget stop and resumes at the discarded repository', async () => {
+    const order: string[] = [];
+    const github = new FakeGitHub(order);
+    github.errors.set('fetchRepo:alpha', new GhRateLimitedError('alpha: GitHub rate limit', 'HTTP 403: API rate limit exceeded'));
+    const gitlab = new FakeGitLab(order);
+    const h = harness({
+      refs: new Map<string, RepoRef>([
+        ['alpha', githubRef('alpha')],
+        ['gl-a', gitlabRef('gl-a')],
+        ['gl-b', gitlabRef('gl-b')],
+        ['gl-c', gitlabRef('gl-c')],
+        ['zeta', githubRef('zeta')],
+      ]),
+      github,
+      gitlabApi: gitlab,
+      maxCallsPerRefresh: 7,
+    });
+    const view = await h.tracker.refresh();
+    // alpha (1 call) aborts GitHub; gl-a spends 4; gl-b is cut at its third.
+    expect(order).toEqual([
+      'fetchRepo:acme/alpha',
+      'fetchProject:gitlab.example.com/group/sub/gl-a',
+      'countOpenMergeRequests:gitlab.example.com/group/sub/gl-a',
+      'countOpenIssues:gitlab.example.com/group/sub/gl-a',
+      'latestPipelines:gitlab.example.com/group/sub/gl-a',
+      'fetchProject:gitlab.example.com/group/sub/gl-b',
+      'countOpenMergeRequests:gitlab.example.com/group/sub/gl-b',
+    ]);
+    // zeta sits past the stop, in the aborted GitHub scope: disclosed.
+    expect(row(view, 'zeta').error).toContain('refresh aborted before this repository was checked: rate-limit:');
+    // gl-b was discarded and gl-c deferred: neither carries an error.
+    expect(row(view, 'gl-b').error).toBeNull();
+    expect(row(view, 'gl-c').error).toBeNull();
+    const abort = h.logs.find((line) => line.msg.includes('refresh aborted (provider/rate-limit condition)'));
+    expect(abort?.fields).toEqual({ scopes: ['github'] });
+    expect(h.logs.some((line) => line.msg.includes('call budget exhausted'))).toBe(true);
+    github.errors.clear();
+    order.length = 0;
+    await h.tracker.refresh();
+    expect(order[0]).toBe('fetchProject:gitlab.example.com/group/sub/gl-b');
+  });
+
+  it('resumes at the budget stop, not at an earlier skipped repository', async () => {
+    const order: string[] = [];
+    const github = new FakeGitHub(order);
+    github.errors.set('fetchRepo:alpha', new GhRateLimitedError('alpha: GitHub rate limit', 'HTTP 403: API rate limit exceeded'));
+    const gitlab = new FakeGitLab(order);
+    const h = harness({
+      refs: new Map<string, RepoRef>([
+        ['alpha', githubRef('alpha')],
+        ['beta', githubRef('beta')],
+        ['gl-a', gitlabRef('gl-a')],
+        ['gl-b', gitlabRef('gl-b')],
+      ]),
+      github,
+      gitlabApi: gitlab,
+      maxCallsPerRefresh: 5,
+    });
+    const view = await h.tracker.refresh();
+    // alpha aborts GitHub (beta skipped), gl-a spends the rest, and the pass
+    // stops before gl-b.
+    expect(row(view, 'beta').error).toContain('refresh aborted before this repository was checked: rate-limit:');
+    expect(row(view, 'gl-b')).toMatchObject({ freshness: 'unchecked', error: null });
+    github.errors.clear();
+    order.length = 0;
+    await h.tracker.refresh();
+    // The tail behind the stop goes first; rewinding to beta would starve it.
+    expect(order[0]).toBe('fetchProject:gitlab.example.com/group/sub/gl-b');
   });
 
   it('links a real nested GitLab SSH origin through the default resolver', async () => {

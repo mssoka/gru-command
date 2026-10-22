@@ -253,14 +253,19 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   same `isGitLabRemote` rule Perkins delivery uses; no config key) — over
   SSH or HTTPS, nested groups included, is a linked GitLab row. The
   tracker reads it through the GitLab REST API with `GITLAB_TOKEN`
-  (falling back to `GL_TOKEN`) from the service environment, sent only as
-  the `PRIVATE-TOKEN` header over https to that host (redirects refused,
-  15 s per request, never logged or rendered): the project's default
-  branch, exact open merge-request and open-issue counts (the list
-  endpoints' `X-Total`; GitLab omits it above 10,000 results, and the
-  observation then fails as "count not exact" instead of guessing), and
-  the newest default-branch pipeline by (created, id) among the 20 newest,
-  skipping merge-request and child (`parent_pipeline`) pipelines. The row
+  (falling back to `GL_TOKEN`; the token needs the `read_api` scope) from
+  the service's environment — `install.sh` writes no token into the unit,
+  so set it there (check with `launchctl getenv GITLAB_TOKEN` on macOS or
+  `systemctl --user show-environment` on Linux) and run `gru restart`. It
+  is sent only as the `PRIVATE-TOKEN` header over https to that host
+  (redirects refused, 15 s per request, never logged or rendered): the
+  project's default branch, exact open merge-request and open-issue counts
+  (the list endpoints' `X-Total`; GitLab omits it above 10,000 results,
+  and the observation then fails as "count not exact" instead of
+  guessing), and the newest pipeline GitLab lists for the default branch
+  with `scope=branches` (so a tag sharing the branch's name never
+  counts), skipping merge-request and child (`parent_pipeline`)
+  pipelines. The row
   reads `OPEN MRs` / `excl. MRs`, links `on GitLab`, labels an unnamed
   pipeline `pipeline #N`, reads `NO RUNS` with no default-branch pipeline
   on that page (GitLab never claims no-workflow), `UNAVAILABLE` when the
@@ -268,9 +273,10 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   module's sub-heading reads `CI = default-branch only · not deployment
   health` for both hosts. Without a token the row is unavailable with
   `no GitLab token configured for <host> — set GITLAB_TOKEN…`. A missing
-  token, a 401 or a 429 aborts that GitLab host for the pass — its later
-  rows read `refresh aborted before this repository was checked` — while
-  GitHub rows and other GitLab hosts are still observed; a GitHub rate
+  token, a 401, a 403 `insufficient_scope` (no `read_api`) or a 429 aborts
+  that GitLab host for the pass — its later rows read `refresh aborted
+  before this repository was checked` — while GitHub rows and other
+  GitLab hosts are still observed; a GitHub rate
   limit or `gh` auth failure likewise never stops GitLab rows. 403, 404,
   5xx and network failures are per-repository, and cached data renders
   `STALE · last …` like any other row. GitLab pipelines never feed the
