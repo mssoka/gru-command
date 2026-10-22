@@ -12,8 +12,9 @@ import {
  * the error assistant row in the transcript and retries from it. Only a
  * durable `retry-start` receipt, written from the live SDK `auto_retry_start`
  * event through the directive's exact physical producer, lets the native tool
- * guard and the checkpoint walk past that row. Every control below differs
- * from the admitted case in exactly one fact, so each refusal is that fact's.
+ * guard and the checkpoint walk past that row, and only when the SDK's
+ * retried answer follows it. Every control below differs from the admitted
+ * case in exactly one fact, so each refusal is that fact's.
  */
 
 const dirs: string[] = [];
@@ -23,7 +24,9 @@ const identity: DirectiveTurnIdentity = { requestId: 'retry-request', payloadHas
   jobId: 'retry-job', workRevision: 0, authorityEpoch: 0 };
 const text = 'follow the approved correction';
 const ERROR = 'OpenAI Responses stream ended before a terminal response event';
-const REFUSED = /^native tool intent is not persisted before execution or its invocation\/results changed$/u;
+const UNRECEIPTED = 'native error row has no matching live SDK retry-start receipt';
+const NOT_HISTORY = 'native retry-start receipted error row is not retry history: unknown content or no retried answer';
+const TAIL = 'native branch tail is not the effect-free error row this retry names';
 /** What the Responses and Google parsers persist before a stream breaks. */
 const signedContent = [
   { type: 'thinking', thinking: 'reading the lane first', thinkingSignature: 'opaque-reasoning', redacted: false },
@@ -31,6 +34,8 @@ const signedContent = [
 ];
 const errorMessage = (content: readonly unknown[] = signedContent, error = ERROR) => ({ role: 'assistant', stopReason: 'error', errorMessage: error, content });
 const call = { type: 'toolCall', id: 'call-after-retry', name: 'bash', arguments: { command: 'true' } };
+/** A call the stream cut off mid-arguments: the SDK never runs it. */
+const partialCall = { type: 'toolCall', id: 'partial-call|partial-item', name: 'bash', arguments: {} };
 const invocation = { role: 'assistant', stopReason: 'toolUse', content: [call] };
 const result = { role: 'toolResult', toolCallId: call.id, toolName: 'bash', isError: false, content: [{ type: 'text', text: 'ok' }] };
 const answer = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'done' }] };
@@ -62,8 +67,8 @@ function retryScene(content: readonly unknown[] = signedContent, admit = true) {
   return { file, producer, error };
 }
 /** The retried request calls a tool: the guard must admit it before it runs. */
-function flushRetried(file: string): void {
-  entry(file, 'invocation', 'retry-error', invocation);
+function flushRetried(file: string, parent = 'retry-error'): void {
+  entry(file, 'invocation', parent, invocation);
   flushDirectiveToolIntent(file, invocation, call, identity);
 }
 /** The tool ran and the turn answered: the walk must get past the error row. */
@@ -71,9 +76,9 @@ function finishTurn(file: string): void {
   entry(file, 'result', 'invocation', result);
   entry(file, 'answer', 'result', answer);
 }
-/** Refused at the guard, and the checkpoint never reads the turn as finished. */
-function expectRetryHistoryRefused(file: string): void {
-  expect(() => flushRetried(file)).toThrow(REFUSED);
+/** Refused at the guard by `reason`, and the checkpoint never reads the turn as finished. */
+function expectRetryHistoryRefused(file: string, reason = UNRECEIPTED): void {
+  expect(() => flushRetried(file)).toThrow(new DirectiveCheckpointError(reason));
   finishTurn(file);
   expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
 }
@@ -122,10 +127,10 @@ describe('Pi retry history (#483)', () => {
       [retryEvent({ delayMs: -1 }), error, 'malformed SDK auto_retry_start event'],
       [retryEvent({ delayMs: Number.POSITIVE_INFINITY }), error, 'malformed SDK auto_retry_start event'],
       [retryEvent({ errorMessage: ' ' }), error, 'malformed SDK auto_retry_start event'],
-      [retryEvent({ errorMessage: 'HTTP 503 service unavailable' }), error, 'native branch tail is not the effect-free error row this retry names'],
-      [retryEvent(), { ...error, message: { ...error.message, stopReason: 'aborted' } }, 'native branch tail is not the effect-free error row this retry names'],
-      [retryEvent(), { ...error, message: errorMessage([...signedContent, call]) }, 'native branch tail is not the effect-free error row this retry names'],
-      [retryEvent(), { ...error, type: 'custom' }, 'native branch tail is not the effect-free error row this retry names'],
+      [retryEvent({ errorMessage: 'HTTP 503 service unavailable' }), error, TAIL],
+      [retryEvent(), { ...error, message: { ...error.message, stopReason: 'aborted' } }, TAIL],
+      [retryEvent(), { ...error, message: errorMessage([...signedContent, { type: 'image', data: 'AAAA', mimeType: 'image/png' }]) }, TAIL],
+      [retryEvent(), { ...error, type: 'custom' }, TAIL],
     ] as const;
     for (const [event, tail, reason] of refused) expect(recordDirectiveRetryStart(producer, event, tail), reason).toBe(reason);
     expect(journal(file)).toBe(before);
@@ -164,11 +169,74 @@ describe('Pi retry history (#483)', () => {
     expectRetryHistoryRefused(file);
   });
 
-  it('a retry-start receipt cannot make an error row holding a partial tool call retry history', () => {
-    const { file, producer, error } = retryScene([signedContent[1], { type: 'toolCall', id: 'partial-call', name: 'bash', arguments: {} }]);
-    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBe('native branch tail is not the effect-free error row this retry names');
-    appendReceipt(file, { state: 'retry-start', producer, entryId: 'retry-error', errorMessage: ERROR });
-    expectRetryHistoryRefused(file);
+  it('a receipted error row holding a partial tool call is retry history once the retried answer follows (owner ruling 2026-10-22)', () => {
+    const { file, producer, error } = retryScene([signedContent[1], partialCall]);
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    expect(() => flushRetried(file)).not.toThrow();
+    finishTurn(file);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a result naming a retried error row\'s never-run tool call is refused', () => {
+    const { file, producer, error } = retryScene([signedContent[1], partialCall]);
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    entry(file, 'invocation', 'retry-error', invocation);
+    entry(file, 'partial-result', 'invocation', { ...result, toolCallId: partialCall.id });
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(
+      new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'));
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'unmatched/malformed native tool result' });
+  });
+
+  it('a retry-start receipt cannot make an error row with unknown or malformed content retry history', () => {
+    const refused = [
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+      { type: 'text', text: 'Checking the failing test', annotations: [] },
+      { type: 'text', text: 'Checking the failing test', textSignature: { v: 1, id: 'msg_1' } },
+    ];
+    for (const block of refused) {
+      const { file, producer, error } = retryScene([signedContent[0], block]);
+      expect(recordDirectiveRetryStart(producer, retryEvent(), error), JSON.stringify(block)).toBe(TAIL);
+      appendReceipt(file, { state: 'retry-start', producer, entryId: 'retry-error', errorMessage: ERROR });
+      expectRetryHistoryRefused(file, NOT_HISTORY);
+    }
+  });
+
+  it('two consecutive retried error rows are both history, and the turn completes past them', () => {
+    const { file, producer, error } = retryScene();
+    const second = 'HTTP 503 service unavailable';
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    const again = entry(file, 'retry-error-2', 'retry-error', errorMessage([], second));
+    expect(recordDirectiveRetryStart(producer, retryEvent({ attempt: 2, delayMs: 4000, errorMessage: second }), again)).toBeNull();
+    expect(journal(file).match(/"state":"retry-start"/gu)).toHaveLength(2);
+    expect(() => flushRetried(file, 'retry-error-2')).not.toThrow();
+    finishTurn(file);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a retry whose attempts ran out ends the turn on the final unreceipted error row: terminal, not ok', () => {
+    const { file, producer, error } = retryScene();
+    const last = 'HTTP 503 service unavailable';
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    // auto_retry_end {success:false}: the final error has no retry-start.
+    entry(file, 'final-error', 'retry-error', errorMessage([], last));
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: last, checkpointId: 'final-error' });
+  });
+
+  it('an abandoned receipted retry row followed by a later bound request or control is the earlier turn\'s terminal, not ok', () => {
+    const later: DirectiveTurnIdentity = { ...identity, requestId: 'later-request', payloadHash: 'b'.repeat(64) };
+    for (const control of [false, true]) {
+      const { file, producer, error } = retryScene();
+      expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+      let baseline = 'retry-error';
+      if (control) {
+        appendFileSync(file, `${JSON.stringify({ type: 'model_change', id: 'switch-model', parentId: baseline, provider: 'openai', modelId: 'gpt-next' })}\n`);
+        baseline = 'switch-model';
+      }
+      prepareDirectiveBinding({ identity: later, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text: 'a later directive', authorityManifest: 'manifest' });
+      entry(file, 'later-receipt', baseline, { role: 'user', content: [{ type: 'text', text: 'a later directive' }] });
+      expect(inspectDirectiveAdmission(file, later).userEntryId).toBe('later-receipt');
+      expect(inspectDirectiveCheckpoint(file, identity), `control: ${String(control)}`).toMatchObject({ state: 'terminal', ok: false, error: ERROR, checkpointId: 'retry-error' });
+    }
   });
 
   it('conflicting retry-start receipts for one error row are never trusted', () => {
@@ -184,6 +252,7 @@ describe('Pi retry history (#483)', () => {
     const malformed = [
       [{ errorMessage: ERROR }, 'malformed native retry-start receipt'],
       [{ entryId: '', errorMessage: ERROR }, 'malformed native retry-start receipt'],
+      [{ entryId: ' ', errorMessage: ERROR }, 'malformed native retry-start receipt'],
       [{ entryId: 7, errorMessage: ERROR }, 'malformed native retry-start receipt'],
       [{ entryId: 'retry-error' }, 'malformed native retry-start receipt'],
       [{ entryId: 'retry-error', errorMessage: ' ' }, 'malformed native retry-start receipt'],

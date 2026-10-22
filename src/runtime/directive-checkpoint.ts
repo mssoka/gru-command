@@ -452,8 +452,9 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
-      // A retried error row is history the turn went past, never its terminal.
-      if (!isRetryHistoryRow(entry.id, message, retries)) {
+      // A receipted error row is history only when the SDK's retried answer
+      // follows it; otherwise (an abandoned retry) it is the turn's terminal.
+      if (!isRetryHistoryRow(entry, () => native(index + 1), retries)) {
         for (const block of message.content as Record<string, unknown>[]) {
           if (block.type !== 'toolCall') continue;
           if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
@@ -812,7 +813,7 @@ function producerReceipts(file: string): readonly ProducerReceipt[] {
         !(typeof receipt.toolCallId === 'string' && receipt.toolCallId.length > 0 || receipt.boundary === 'authority' && receipt.toolCallId === undefined))) {
       throw new DirectiveCheckpointError('malformed native guard refusal receipt');
     }
-    if (state === 'retry-start' && (typeof receipt.entryId !== 'string' || !receipt.entryId || !nonBlank(receipt.errorMessage))) {
+    if (state === 'retry-start' && (!nonBlank(receipt.entryId) || !nonBlank(receipt.errorMessage))) {
       throw new DirectiveCheckpointError('malformed native retry-start receipt');
     }
     if (!['started', 'ceased', 'independent', 'completed', 'guard-refused', 'retry-start'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
@@ -875,12 +876,15 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 function nonBlank(value: unknown): value is string { return typeof value === 'string' && value.trim() !== ''; }
-/** Text and thinking only. Tool calls (unfinished or malformed ones too) and
- * unknown blocks may be effects, so they are never retry history. */
+/** Text, thinking and tool calls only. The SDK executes no tool call of an
+ * error row (owner ruling 2026-10-22), so its calls, partial ones included,
+ * are inert history. Unknown blocks, and text or thinking with other keys,
+ * are never history. */
 function validRetryErrorContent(content: unknown): boolean {
   if (!Array.isArray(content)) return false;
   return content.every((value: unknown) => {
     const block = objectRecord(value);
+    if (block?.['type'] === 'toolCall') return true;
     if (block?.['type'] === 'text') return typeof block['text'] === 'string' &&
       (block['textSignature'] === undefined || typeof block['textSignature'] === 'string') &&
       Object.keys(block).every((key) => ['type', 'text', 'textSignature'].includes(key));
@@ -891,12 +895,21 @@ function validRetryErrorContent(content: unknown): boolean {
     return false;
   });
 }
-/** The one retry-history predicate both walks use: an effect-free assistant
- * error row whose exact entry and error a live SDK retry-start receipt names.
- * Error text alone proves nothing. */
-function isRetryHistoryRow(entryId: string, message: Record<string, unknown>, evidence: ReadonlyMap<string, string>): boolean {
+/** An assistant error row whose exact entry and error a live SDK retry-start
+ * receipt names, holding only history content. Error text alone proves nothing. */
+function isReceiptedErrorRow(entryId: string, message: Record<string, unknown>, evidence: ReadonlyMap<string, string>): boolean {
   return message['role'] === 'assistant' && message['stopReason'] === 'error' && typeof message['errorMessage'] === 'string' &&
     evidence.get(entryId) === message['errorMessage'] && validRetryErrorContent(message['content']);
+}
+/** The one retry-history predicate both walks use: a receipted error row the
+ * SDK's retried answer (an assistant parented on it) follows. Its tool calls
+ * never enter the pending set, so a result naming one is unmatched. Without
+ * that answer (a retry cancelled during backoff) the row is the turn's
+ * terminal. `successor` is read only for a receipted row. */
+function isRetryHistoryRow(entry: NativeEntry, successor: () => NativeEntry | 'malformed' | undefined, evidence: ReadonlyMap<string, string>): boolean {
+  if (entry.message === undefined || !isReceiptedErrorRow(entry.id, entry.message, evidence)) return false;
+  const next = successor();
+  return typeof next === 'object' && next.type === 'message' && next.parentId === entry.id && next.message?.role === 'assistant';
 }
 /** entryId → errorMessage from this exact directive's retry-start receipts,
  * whichever of its physical producers recorded them. */
@@ -913,9 +926,12 @@ function retryEvidence(receipts: readonly ProducerReceipt[], identity: Directive
 /** Called only for a live Pi `auto_retry_start` event, never synthesized from
  * history. Pi emits it from `_prepareRetry` after its retry classifier and
  * budget checks, once the error row is persisted and before that row leaves
- * the in-memory context. The durable receipt binds the exact physical
- * producer to that branch tail; the ancestry walks later prove the chain and
- * the row. Null once recorded, else why nothing was. */
+ * the in-memory context. Recording checks the event, that the given row is an
+ * error row carrying this retry's error and only history content, and the
+ * directive's pi association and started producer; it then writes that
+ * producer, the row's id and its error. It proves no ancestry: the walks do,
+ * and they admit the row only with the retried answer after it. Null once
+ * recorded, else why nothing was. */
 export function recordDirectiveRetryStart(producer: DirectiveProducer, event: unknown, latestEntry: unknown): string | null {
   validateDirectiveIdentity(producer.identity);
   const sdkEvent = objectRecord(event);
@@ -928,7 +944,7 @@ export function recordDirectiveRetryStart(producer: DirectiveProducer, event: un
   const message = objectRecord(entry?.['message']);
   const entryId = entry?.['id'];
   if (entry?.['type'] !== 'message' || typeof entryId !== 'string' || !entryId || message === null ||
-      !isRetryHistoryRow(entryId, message, new Map([[entryId, errorMessage]]))) return 'native branch tail is not the effect-free error row this retry names';
+      !isReceiptedErrorRow(entryId, message, new Map([[entryId, errorMessage]]))) return 'native branch tail is not the effect-free error row this retry names';
   const binding = readDirectiveBinding(producer.sessionFile, producer.identity.requestId);
   if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, producer.identity)) return 'exact pi directive association unavailable';
   const rows = producerReceipts(producer.sessionFile);
@@ -998,7 +1014,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   if (prepared === null || !isDeepStrictEqual(prepared.identity, identity) || prepared.runtime !== 'pi') {
     throw new DirectiveCheckpointError('exact native admission association unavailable');
   }
-  const refuse = (): never => { throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'); };
+  const refuse = (reason = 'native tool intent is not persisted before execution or its invocation/results changed'): never => { throw new DirectiveCheckpointError(reason); };
   // One read (#469): the admission and the live turn, receipt first, every
   // entry with its own unique id.
   const { binding, native } = withPiTranscript(file, prepared.baseline, 'whole', (transcript) => {
@@ -1046,8 +1062,12 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     ancestor = entry.id;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
-      // An error row the live SDK retried is history, not a tool invocation.
-      if (!isRetryHistoryRow(entry.id, message!, retries)) {
+      // An error row the live SDK retried past is history, not a tool invocation.
+      if (!isRetryHistoryRow(entry, () => native[native.indexOf(entry) + 1], retries)) {
+        if (message!.stopReason === 'error') {
+          refuse(retries.get(entry.id) === message!['errorMessage'] ? 'native retry-start receipted error row is not retry history: unknown content or no retried answer'
+            : 'native error row has no matching live SDK retry-start receipt');
+        }
         if (message!.stopReason !== 'toolUse') refuse();
         for (const block of message!.content as Record<string, unknown>[]) {
           if (block.type !== 'toolCall') continue;

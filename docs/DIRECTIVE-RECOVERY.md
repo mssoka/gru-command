@@ -330,6 +330,38 @@ whose fence failed. Each leaves a `guard-refused` receipt, and the turn
 stays UNKNOWN. On pi every later tool call of that directive is refused too,
 and on Claude Code the refusal ends the turn.
 
+A provider error the pi SDK retries is not the turn's end either (#483).
+After a retryable error, such as a truncated stream, the SDK keeps the
+assistant error row in the transcript and retries from it. When the SDK
+emits its live `auto_retry_start`, the adapter writes a `retry-start`
+receipt to the producer journal (below), through the directive's own started
+physical producer. The receipt names the error row's entry id and its error
+message. It is written only from that live event, never from transcript
+history, so a retry the adapter never saw has no receipt. The tool fence,
+the checkpoint and settlement read the row as history only when all of
+these hold:
+
+- a receipt from a producer of this exact directive identity names the row
+  and its exact error;
+- the row holds only text, thinking and tool calls (owner ruling
+  2026-10-22). The SDK executes no tool call of an error row, so its calls,
+  partial ones included, never enter the pending set, and a result naming
+  one is refused as unmatched;
+- the SDK's retried answer, an assistant entry parented on the row, follows
+  it.
+
+Without that retried answer (a retry cancelled during backoff, or attempts
+exhausted on an unreceipted final error) the row is the turn's terminal, a
+failed one. Any other error row still refuses the next tool, under its own
+reason. When the adapter cannot record a receipt it logs `native SDK retry
+evidence not recorded; retry-history tool effects remain refused` at warn,
+with the reason or the error, and the directive stays fail-closed. A
+malformed `retry-start` receipt, or two that give one row different errors,
+makes the journal read refuse loudly. A build from before this change does
+not know the `retry-start` state, so rolling back past it makes a journal
+that holds one unreadable: inspection of every directive on that session
+refuses (fail-closed) until the rollback is undone.
+
 Physical ownership is recorded separately in `<session.jsonl>.producers.jsonl`:
 request/hash/revision/epoch, logical minion, native session/file, physical UUID,
 host and PID. Dispatch reservation is not native admission or producer start.
