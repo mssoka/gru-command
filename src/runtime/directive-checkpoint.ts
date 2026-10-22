@@ -118,7 +118,7 @@ interface NativeEntry {
  * never holds one whole. The header is its first line. The session before a
  * directive's baseline is streamed past: pi keeps each entry's id and parent
  * id, never its content, for duplicate and ancestry checks (memory grows with
- * the session's entry count), Claude re-hashes its exact bytes. The directive's
+ * the session's entry count); Claude re-hashes its exact bytes. The directive's
  * own turn after the baseline is read only as far as an inspection walks, and
  * only the lines read count against transcript byte and entry limits, so a
  * session's later work never refuses an earlier directive.
@@ -263,10 +263,16 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
  * prefix's links, which are shared and never copied. */
 class PiAncestry {
   private readonly turn = new Map<string, string | null>();
+  /** The walked compactions; the prefix keeps no entry types. */
+  private readonly compactions = new Set<string>();
   private readonly prefix: ReadonlyMap<string, string | null>;
   private readonly headerId: string | undefined;
   constructor({ header, parentIds }: Pick<PiTranscript, 'header' | 'parentIds'>) { this.prefix = parentIds; this.headerId = header?.id; }
-  link(entry: NativeEntry): void { this.turn.set(entry.id, entry.parentId ?? null); }
+  link(entry: NativeEntry): void {
+    this.turn.set(entry.id, entry.parentId ?? null);
+    if (entry.type === 'compaction') this.compactions.add(entry.id);
+  }
+  isCompaction(id: string): boolean { return this.compactions.has(id); }
   /** True only when `candidateId` is on the parent chain active at `parentId`.
    * Known sibling entries and the session header are not checkpoint ancestry. */
   isActiveAncestor(candidateId: string, parentId: string): boolean {
@@ -293,12 +299,14 @@ class PiAncestry {
  */
 function linkedCompactionRefusal(entry: NativeEntry, parentId: string | null, ancestry: PiAncestry): string | null {
   if (parentId === null || entry.parentId !== parentId) return 'native compaction is not linked to the active checkpoint';
+  // The pinned SDK's appendCompaction always writes the boolean.
   if (entry.fromHook === true) return 'native compaction summary was authored by an extension hook';
-  if (entry.fromHook !== undefined && typeof entry.fromHook !== 'boolean') return 'native compaction hook marker is malformed';
+  if (entry.fromHook !== false) return 'native compaction hook marker is malformed';
   if (typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '') return 'native compaction lacks a timestamp';
   if (typeof entry.summary !== 'string' || entry.summary.trim() === '') return 'native compaction lacks a summary';
   if (typeof entry.tokensBefore !== 'number' || !Number.isFinite(entry.tokensBefore) || entry.tokensBefore < 0) return 'native compaction token count is malformed';
   if (typeof entry.firstKeptEntryId !== 'string' || !ancestry.isActiveAncestor(entry.firstKeptEntryId, parentId)) return 'native compaction keeps an entry off the active chain';
+  if (ancestry.isCompaction(entry.firstKeptEntryId)) return 'native compaction keeps another compaction, not a message';
   return null;
 }
 /** Inside a directive's turn Pi compacts only after a completed tool round,
@@ -307,6 +315,32 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
   if (openToolCalls > 0) return 'native compaction interrupts an open tool round';
   if (previous.type !== 'message' || previous.message?.role !== 'toolResult') return 'native compaction does not follow a completed tool round';
   return linkedCompactionRefusal(entry, previous.id, ancestry);
+}
+/** Pi's context-overflow recovery: an `error` or `length` reply, a compaction
+ * linked on it, then the retried reply on that compaction (`agent.continue()`,
+ * no prompt). The failed reply ran no tool: tool calls in it never executed
+ * and are inert history, never pending. `after(1)` and `after(2)` are the
+ * entries that follow `reply`, read only for such a reply. Returns that
+ * compaction, or null when `reply` is not one Pi retried. */
+function overflowRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | null {
+  if (reply.message?.role !== 'assistant' || !['error', 'length'].includes(String(reply.message.stopReason))) return null;
+  const compaction = after(1);
+  if (typeof compaction !== 'object' || compaction.type !== 'compaction' || linkedCompactionRefusal(compaction, reply.id, ancestry) !== null) return null;
+  const retried = after(2);
+  if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
+  return compaction;
+}
+/** Why `control`, after a completed checkpoint, is not one Pi links on `tip`:
+ * a model or thinking-level change, or an automatic compaction that does not
+ * follow another. Null when it is. */
+function controlRefusal(control: NativeEntry, tip: NativeEntry, ancestry: PiAncestry): string | null {
+  if (control.type === 'compaction') return tip.type === 'compaction' ? 'native compaction follows another compaction' : linkedCompactionRefusal(control, tip.id, ancestry);
+  if (control.parentId !== tip.id) return 'native control is not linked to the completed checkpoint';
+  if (control.type === 'model_change' &&
+      (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim())) return 'native model control is malformed';
+  if (control.type === 'thinking_level_change' &&
+      (typeof control.thinkingLevel !== 'string' || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return 'native thinking-level control is malformed';
+  return null;
 }
 /** Where a directive's user receipt is: directly after its baseline, or after
  * Pi's pre-prompt compaction linked on the baseline. A compaction there that
@@ -393,27 +427,28 @@ function readDirectiveBindings(file: string): readonly DirectiveNativeBinding[] 
 export function readDirectiveBinding(file: string, requestId: string): DirectiveNativeBinding | null {
   return readDirectiveBindings(file).find((row) => row.identity.requestId === requestId) ?? null;
 }
-/** Reads only the few entries after the checkpoint (#469); a read refusal
- * propagates, a binding that does not read back is no later request. */
-function hasLaterBoundRequest(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): boolean {
+const UNBOUND_TAIL = 'native entries follow the correlated terminal checkpoint without a distinct bound request';
+/** Why the entries after a completed checkpoint are not a later request's own
+ * durably bound admission, or null when they are. Reads only the few entries
+ * after the checkpoint (#469); a read refusal propagates, a binding that does
+ * not read back is no later request. */
+function laterBoundRequestRefusal(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): string | null {
   const checkpoint = native(checkpointIndex);
-  if (typeof checkpoint !== 'object') return false;
+  if (typeof checkpoint !== 'object') return UNBOUND_TAIL;
   let tip = checkpoint;
   let nextIndex = checkpointIndex + 1;
   // These controls change the NEXT request's model, or compact the model's
   // context (Pi's post-run and pre-prompt compaction), not the completed
   // request's ancestry. No branch or unbound effect is skipped.
   for (let control = native(nextIndex); typeof control === 'object' && ['model_change', 'thinking_level_change', 'compaction'].includes(control.type); control = native(nextIndex)) {
-    if (control.type === 'compaction' ? linkedCompactionRefusal(control, tip.id, ancestry) !== null : control.parentId !== tip.id || control.type === 'model_change' &&
-        (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim()) ||
-        control.type === 'thinking_level_change' && (typeof control.thinkingLevel !== 'string' ||
-          !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return false;
+    const refusal = controlRefusal(control, tip, ancestry);
+    if (refusal !== null) return refusal;
     ancestry.link(control);
     tip = control;
     nextIndex += 1;
   }
   const immediate = native(nextIndex);
-  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== tip.id || !Array.isArray(immediate.message.content)) return false;
+  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== tip.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
   // The later binding's baseline is the receipt's parent, or the entry Pi
   // compacted on before that prompt (see piReceiptAt).
   const baselines = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];
@@ -427,10 +462,10 @@ function hasLaterBoundRequest(file: string, native: PiTurn, identity: DirectiveT
     // unique exact preparation can be read back; identical rejected/later
     // preparations are ambiguous, never fabricated into another admission.
     const candidate = named.length === 1 ? named[0] : named.length === 0 && matching.length === 1 ? matching[0] : undefined;
-    if (candidate === undefined) return false;
+    if (candidate === undefined) return UNBOUND_TAIL;
     const admitted = inspectDirectiveAdmission(file, candidate.identity);
-    return admitted.userEntryId === immediate.id && isDeepStrictEqual(admitted, { ...candidate, userEntryId: immediate.id });
-  } catch { return false; }
+    return admitted.userEntryId === immediate.id && isDeepStrictEqual(admitted, { ...candidate, userEntryId: immediate.id }) ? null : UNBOUND_TAIL;
+  } catch { return UNBOUND_TAIL; }
 }
 /** Admission is a prefix fact, independent of later unfinished/unknown effects.
  * Read only through the exact user receipt, never infer admission from a shape. */
@@ -533,8 +568,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       // distinct, durably read-back admission binds it. Keep the earlier
       // checkpoint readable without treating an unbound/replayed user tail
       // as proof that the old request completed.
-      if (hasLaterBoundRequest(file, native, identity, terminal.index, ancestry)) return completed(terminal);
-      return unknown('native entries follow the correlated terminal checkpoint without a distinct bound request');
+      const refusal = laterBoundRequestRefusal(file, native, identity, terminal.index, ancestry);
+      return refusal === null ? completed(terminal) : unknown(refusal);
     }
     if (entry.type === 'compaction') {
       const refusal = turnCompactionRefusal(entry, previous, pending.size, ancestry);
@@ -551,6 +586,15 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
+      const retry = overflowRetryCompaction(entry, (offset) => native(index + offset), ancestry);
+      if (retry !== null) {
+        // The failed reply is history; the turn continues on the compaction.
+        ancestry.link(retry);
+        previous = retry;
+        index += 1;
+        lastMessage = message;
+        continue;
+      }
       for (const block of message.content as Record<string, unknown>[]) {
         if (block.type !== 'toolCall') continue;
         if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
@@ -1018,7 +1062,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   if (prepared === null || !isDeepStrictEqual(prepared.identity, identity) || prepared.runtime !== 'pi') {
     throw new DirectiveCheckpointError('exact native admission association unavailable');
   }
-  const refuse = (): never => { throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'); };
+  const refuse = (reason = 'native tool intent is not persisted before execution or its invocation/results changed'): never => { throw new DirectiveCheckpointError(reason); };
   // One read (#469): the admission and the live turn, receipt first (after
   // Pi's pre-prompt compaction, if any), every entry with its own unique id.
   const { binding, native, receipt, ancestry } = withPiTranscript(file, prepared.baseline, 'whole', (transcript) => {
@@ -1061,10 +1105,12 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   let previous = native[receipt]!;
   ancestry.link(previous);
   const chainPending = new Map<string, string>();
-  for (const entry of native.slice(receipt + 1)) {
+  for (let at = receipt + 1; at < native.length; at += 1) {
+    const entry = native[at]!;
     const message = entry.message;
     if (entry.type === 'compaction') {
-      if (turnCompactionRefusal(entry, previous, chainPending.size, ancestry) !== null) refuse();
+      const refusal = turnCompactionRefusal(entry, previous, chainPending.size, ancestry);
+      if (refusal !== null) refuse(refusal);
       ancestry.link(entry);
       previous = entry;
       continue;
@@ -1073,7 +1119,15 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     ancestry.link(entry);
     previous = entry;
     if (message!.role === 'assistant') {
-      if (chainPending.size > 0 || message!.stopReason !== 'toolUse' || !Array.isArray(message!.content)) refuse();
+      if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
+      const retry = overflowRetryCompaction(entry, (offset) => native[at + offset], ancestry);
+      if (retry !== null) {
+        ancestry.link(retry);
+        previous = retry;
+        at += 1;
+        continue;
+      }
+      if (message!.stopReason !== 'toolUse') refuse();
       for (const block of message!.content as Record<string, unknown>[]) {
         if (block.type !== 'toolCall') continue;
         if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();

@@ -476,7 +476,7 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
     expect(() => flushDirectiveToolIntent(file, asked, next, identity)).not.toThrow();
   });
 
-  it('allows the next call after Pi compacted the turn or the prompt, and refuses one compacted inside a tool round or by a hook (#481)', () => {
+  it('allows the next call after Pi compacted the turn, the prompt or an overflow retry, and refuses by name one compacted inside a tool round or by a hook (#481)', () => {
     const compaction = (file: string, id: string, parentId: string, firstKeptEntryId: string, fields: Record<string, unknown> = {}): string => {
       appendFileSync(file, `${JSON.stringify({ type: 'compaction', id, parentId, timestamp: '2026-10-22T00:00:00.000Z', summary: 'Pi automatic compaction summary',
         firstKeptEntryId, tokensBefore: 90_000, fromHook: false, ...fields })}\n`);
@@ -485,7 +485,9 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
     const next = { ...toolCall, id: 'call-2' };
     const asked = { ...invocation, content: [next] };
     const sibling = { ...toolCall, id: 'call-x' };
-    for (const [mode, refused] of [['after-round', false], ['pre-prompt', false], ['inside-round', true], ['inside-batch', true], ['hook-authored', true]] as const) {
+    const OPEN_ROUND = 'native compaction interrupts an open tool round';
+    for (const [mode, refusal] of [['after-round', null], ['pre-prompt', null], ['overflow-retry', null], ['inside-round', OPEN_ROUND], ['inside-batch', OPEN_ROUND],
+      ['hook-authored', 'native compaction summary was authored by an extension hook']] as const) {
       const file = sessionFile(piHeader);
       const earlier = piEntry(file, 'h1', piEntry(file, 'h0', null, prompt('earlier')), answer);
       preparePi(file);
@@ -494,10 +496,13 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
       let settled = piEntry(file, 'result-1', mode === 'inside-round' ? compaction(file, 'compaction', first, receipt) : first, toolResult('call-1'));
       // Between two results of one batch: the round is still open.
       if (mode === 'inside-batch') settled = piEntry(file, 'result-x', compaction(file, 'compaction', settled, receipt), toolResult('call-x'));
+      // Pi's overflow recovery: a failed reply (its tool call never ran), a compaction on it, then the retried call.
+      if (mode === 'overflow-retry') settled = compaction(file, 'compaction', piEntry(file, 'overflowed', settled, { role: 'assistant', stopReason: 'error',
+        errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: [{ ...toolCall, id: 'never-run' }] }), receipt);
       const tip = mode === 'after-round' || mode === 'hook-authored'
         ? compaction(file, 'compaction', settled, receipt, mode === 'hook-authored' ? { fromHook: true } : {}) : settled;
       piEntry(file, 'use-2', tip, asked);
-      if (refused) expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).toThrow(NOT_PERSISTED);
+      if (refusal !== null) expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).toThrow(new RegExp(`^${refusal}$`, 'u'));
       else expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).not.toThrow();
     }
   });

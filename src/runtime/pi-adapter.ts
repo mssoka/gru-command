@@ -1130,8 +1130,6 @@ export class PiAgentHandle implements AgentHandle {
   private cessationState: 'live' | 'ceased' | 'unknown' = 'live';
   private pendingCompactionEnd: RuntimeEvent | null = null;
   private nativeCompactionOpen = false;
-  private nativeCompactionGeneration = 0;
-  private publishedCompactionGeneration = 0;
   private readonly compactionTerminalWaiters = new Set<() => void>();
   private compactionEndDeadline = 0;
   private compactionEndTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1234,14 +1232,13 @@ export class PiAgentHandle implements AgentHandle {
         const directive = this.liveDirective;
         try {
           if (directive !== undefined) this.assertDirectiveExecutionAuthority(directive, signal);
-          const compactionGeneration = this.nativeCompactionGeneration;
           const update = await beforeNextTurn?.(turn, signal);
           if (directive !== undefined) {
             // Automatic compaction may begin and finish inside the SDK's
             // preparation await. Its terminal is deliberately withheld until
-            // the native gate clears; publish that exact episode before the
+            // the native gate clears; publish every open episode before the
             // after-preparation authority check so supervision sees closure.
-            await this.waitForCompactionTerminalAfter(compactionGeneration, signal);
+            await this.waitForCompactionTerminal(signal);
             this.assertDirectiveExecutionAuthority(directive, signal);
             const context = update?.context ?? turn.context;
             if ((update?.model !== undefined && !isDeepStrictEqual(update.model, session.model)) ||
@@ -1903,12 +1900,13 @@ export class PiAgentHandle implements AgentHandle {
     }
   }
 
-  /** Resolves once every compaction episode begun after `generation` has
-   * published its terminal. Disposal or the run's abort ends the wait with a
-   * refusal: the terminal may never be published. */
-  private async waitForCompactionTerminalAfter(generation: number, signal?: AbortSignal): Promise<void> {
+  /** Resolves once no native compaction is open and no terminal is pending
+   * (an SDK start that arrives while one is open joins that episode).
+   * Disposal or the run's abort ends the wait with a refusal: the terminal
+   * may never be published. */
+  private async waitForCompactionTerminal(signal?: AbortSignal): Promise<void> {
     const cancelled = (): boolean => this.disposed || signal?.aborted === true;
-    while (this.nativeCompactionGeneration > generation && this.publishedCompactionGeneration < this.nativeCompactionGeneration) {
+    while (this.nativeCompactionOpen || this.pendingCompactionEnd !== null) {
       if (!cancelled()) {
         await new Promise<void>((resolve) => {
           const wake = (): void => { this.compactionTerminalWaiters.delete(wake); signal?.removeEventListener('abort', wake); resolve(); };
@@ -1931,6 +1929,8 @@ export class PiAgentHandle implements AgentHandle {
         this.pendingCompactionEnd = null;
         this.nativeCompactionOpen = false;
         this.compactionEndDeadline = 0;
+        // Revoked before any waiter wakes: each one refuses on disposal.
+        this.disposed = true;
         this.publishCompactionEnd({
           type: 'compaction_end',
           success: false,
@@ -1945,9 +1945,16 @@ export class PiAgentHandle implements AgentHandle {
           this.flushCompactionEndWhenSettled();
         }, 10);
         this.compactionEndTimer.unref();
+        // Pi clears its gate synchronously after emitting the terminal, before
+        // any caller awaiting the compaction resumes: a microtask re-check
+        // publishes it ahead of a prompt's admission, an overflow retry or the
+        // next turn. The timer polls a gate that stays closed.
+        queueMicrotask(() => this.flushCompactionEndWhenSettled());
       }
       return;
     }
+    if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
+    this.compactionEndTimer = null;
     const terminal = this.pendingCompactionEnd;
     this.pendingCompactionEnd = null;
     this.nativeCompactionOpen = false;
@@ -1958,9 +1965,8 @@ export class PiAgentHandle implements AgentHandle {
   private publishCompactionEnd(
     terminal: Extract<RuntimeEvent, { type: 'compaction_end' }>,
   ): void {
-    // Every episode begun so far has ended, even when an explicit compaction
-    // already settled and this terminal is not published again.
-    this.publishedCompactionGeneration = this.nativeCompactionGeneration;
+    // Every open episode has ended, even when an explicit compaction already
+    // settled and this terminal is not published again.
     this.wakeCompactionTerminalWaiters();
     const waiter = this.explicitCompactionTerminal;
     if (waiter?.settled === true) return;
@@ -2080,7 +2086,6 @@ export class PiAgentHandle implements AgentHandle {
       case 'compaction_start':
         if (this.nativeCompactionOpen) return;
         this.nativeCompactionOpen = true;
-        this.nativeCompactionGeneration += 1;
         this.emit({ type: 'compaction_start' });
         return;
       case 'compaction_end': {

@@ -4628,6 +4628,95 @@ it('Pi post-run compaction after the directive terminal settles the original com
   } finally { await f.cleanup(); }
 });
 
+/** A real Supervisor over the fixture's registry: directive admission fences
+ * consult its producer blockers, which an unpublished compaction keeps open. */
+async function superviseDirectiveFixture(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
+  const { Supervisor } = await import('../src/supervision/supervisor.js');
+  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 600000, restartWindowMs: 600000, maxRestarts: 3, restartBackoffMs: 10 },
+    registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60000 });
+  supervisor.start();
+  return { supervisor, deps: { ...f.deps, pendingProducerBlockers: supervisor.pendingProducerBlockers.bind(supervisor) } };
+}
+/** The native transcript's entries, in file order. */
+function nativeEntries(file: string) {
+  return readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly type: string; readonly id: string; readonly parentId?: string | null;
+    readonly message?: { readonly role: string; readonly stopReason?: string; readonly toolCallId?: string; readonly isError?: boolean } });
+}
+
+it('Pi context-overflow compact-and-retry keeps the directive: the failed reply is history, a tool after the retry runs once, and it settles once', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const effect = (line: string) => `printf '${line}\\n' >> overflow-effect.txt`;
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: ['history '.repeat(100)], toolCall: { id: 'before-overflow', name: 'bash', args: { command: effect('before') } } },
+    // The provider rejects the next request as too long; the tool call in that failed reply never runs.
+    { deltas: [], toolCall: { id: 'never-run', name: 'bash', args: { command: effect('never') } }, error: 'prompt is too long: 150000 tokens > 100000 maximum' },
+    { deltas: ['overflow recovery summary'] },
+    { deltas: [], toolCall: { id: 'after-retry', name: 'bash', args: { command: effect('after') } } },
+    { deltas: ['completed after overflow recovery'] },
+  ]);
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  const { supervisor, deps } = await superviseDirectiveFixture(f);
+  try {
+    await executeAcceptedDirective(deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const rows = nativeEntries(row.nativeTarget!.sessionFile);
+    const failed = rows.findIndex((entry) => entry.message?.stopReason === 'error');
+    expect(rows[failed + 1]).toMatchObject({ type: 'compaction', parentId: rows[failed]!.id });
+    expect(rows[failed + 2]).toMatchObject({ type: 'message', parentId: rows[failed + 1]!.id, message: { role: 'assistant', stopReason: 'toolUse' } });
+    expect(readFileSync(join(f.scene.lane.path, 'overflow-effect.txt'), 'utf8')).toBe('before\nafter\n');
+    expect(rows.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message!.toolCallId, entry.message!.isError]))
+      .toEqual([['before-overflow', false], ['after-retry', false]]);
+    const final = rows.at(-1)!;
+    expect(final).toMatchObject({ type: 'message', message: { role: 'assistant', stopReason: 'stop' } });
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final.id });
+    expect(row.state).toBe('settled');
+    expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
+      .filter((event) => (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId)).toHaveLength(1);
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
+    expect(f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, false, true, false, false]);
+    expect(f.sessions[0]!.prompt).toHaveBeenCalledTimes(1);
+  } finally { supervisor.dispose(); await f.cleanup(); }
+});
+
+it('Pi pre-prompt compaction publishes its terminal before the supervised directive\'s admission fences run', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  // The earlier reply crosses the threshold but its post-run summary fails, so
+  // Pi compacts again inside the directive's prompt, before its first model call.
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: ['history '.repeat(100)], usageTokens: 90_000 },
+    { deltas: [], error: 'summary provider failed' },
+    { deltas: ['pre-prompt summary'] },
+    { deltas: [], toolCall: { id: 'after-pre-prompt', name: 'bash', args: { command: "printf 'once\\n' >> pre-prompt-effect.txt" } } },
+    { deltas: ['completed after pre-prompt compaction'] },
+  ]);
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  const { supervisor, deps } = await superviseDirectiveFixture(f);
+  const published: string[] = [];
+  try {
+    const minion = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'pre-prompt-supervised-minion' });
+    minion.subscribe((event) => {
+      if (event.type === 'compaction_start' || event.type === 'tool_start') published.push(event.type);
+      if (event.type === 'compaction_end') published.push(`compaction_end:${event.success ? 'success' : event.error ?? 'failed'}`);
+    });
+    await minion.prompt('earlier ordinary work');
+    await waitFor(() => minion.isCompacting?.() === false, 'failed post-run compaction terminal');
+    published.length = 0; // only the directive's own episode
+    await executeAcceptedDirective(deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row.nativeTarget?.agentId).toBe(minion.id);
+    const rows = nativeEntries(minion.sessionFile!);
+    const user = rows.findIndex((entry) => entry.id === row.nativeBinding?.userEntryId);
+    expect(rows[user - 1]).toMatchObject({ type: 'compaction', parentId: row.nativeBinding!.baseline });
+    expect(published).toEqual(['compaction_start', 'compaction_end:success', 'tool_start']);
+    expect(readFileSync(join(f.scene.lane.path, 'pre-prompt-effect.txt'), 'utf8')).toBe('once\n');
+    expect(inspectDirectiveCheckpoint(minion.sessionFile!, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(row.state).toBe('settled');
+    expect(readFileSync(`${minion.sessionFile!}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
+  } finally { supervisor.dispose(); await f.cleanup(); }
+});
+
 it('Pi pre-prompt compaction before a directive receipt is admitted and the directive completes', async () => {
   const { inspectDirectiveAdmission, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   let summaries = 0;
@@ -4667,9 +4756,10 @@ it('Pi pre-prompt compaction before a directive receipt is admitted and the dire
 });
 
 /** Preparation waits for a compaction terminal the adapter withholds while
- * Pi's compaction state does not settle; the run's abort or disposal ends
- * that wait at once, with its own refusal and no further model request. */
-async function assertCompactionWaitCancelled(by: 'abort' | 'dispose') {
+ * Pi's compaction state does not settle; the run's abort, disposal, or the
+ * reconcile deadline (which disposes) ends that wait with its own refusal
+ * and no further model request. */
+async function assertCompactionWaitCancelled(by: 'abort' | 'dispose' | 'deadline') {
   const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
   const f = await fixture([
@@ -4690,6 +4780,8 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose') {
   Object.defineProperty(session, 'isCompacting', { configurable: true, get: () => held || nativeCompacting.call(session) });
   session.subscribe((event) => { if (event.type === 'compaction_end') held = true; });
   const events = collect(handle);
+  // The deadline published its failed terminal; the gate then opens so disposal can prove native quiescence.
+  if (by === 'deadline') handle.subscribe((event) => { if (event.type === 'compaction_end') held = false; });
   // Synchronization only: preparation has registered its wait for the withheld terminal.
   const waiters = (handle as unknown as { readonly compactionTerminalWaiters: ReadonlySet<unknown> }).compactionTerminalWaiters;
   try {
@@ -4698,15 +4790,22 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose') {
       onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
     await waitFor(() => waiters.size === 1, 'next-turn preparation waiting for the withheld compaction terminal');
     let disposing: Promise<void> | null = null;
+    let clock: { mockRestore(): void } | null = null;
     if (by === 'abort') session.agent.abort();
-    else { disposing = handle.dispose(); held = false; }
+    else if (by === 'dispose') { disposing = handle.dispose(); held = false; }
+    else {
+      // The gate stays closed past COMPACTION_END_RECONCILE_MS: the next poll publishes a failed terminal and disposes.
+      const now = Date.now.bind(Date);
+      clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + 10_000);
+    }
     const verdict = await turn;
+    clock?.mockRestore();
     expect(verdict.ok).toBe(false);
     expect(verdict.error).toContain('native directive ownership cancelled while its compaction terminal was pending');
     expect(waiters.size).toBe(0);
-    // Abort: the turn settled while the terminal was still withheld. Dispose publishes it as failed.
+    // Abort: the turn settled while the terminal was still withheld. Dispose and the deadline publish it as failed.
     expect(events.filter((event) => event.type === 'compaction_end')).toEqual(by === 'abort' ? [] :
-      [{ type: 'compaction_end', success: false, error: 'agent session disposed during native compaction' }]);
+      [{ type: 'compaction_end', success: false, error: by === 'dispose' ? 'agent session disposed during native compaction' : 'native compaction state did not settle after its terminal event' }]);
     expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
     expect(readFileSync(join(scene.lane.path, 'wait-effect.txt'), 'utf8')).toBe('once\n');
     const refusals = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trimEnd().split('\n')
@@ -4725,8 +4824,104 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose') {
 }
 it('a directive abort during the compaction terminal wait refuses at once, without another model request', () => assertCompactionWaitCancelled('abort'));
 it('disposal during the compaction terminal wait refuses at once and releases native ownership', () => assertCompactionWaitCancelled('dispose'));
+it('a compaction terminal that never settles ends the waiting preparation at the reconcile deadline with a refusal', () => assertCompactionWaitCancelled('deadline'));
 
-async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
+it('a compaction Pi starts while an earlier terminal is still withheld holds next-turn preparation until it publishes', async () => {
+  const { AgentSession } = await import('@earendil-works/pi-coding-agent');
+  // Summary requests answer apart from replies: the first fails, so Pi
+  // compacts again before the directive's prompt.
+  let summaries = 0; let replies = 0;
+  const f = await fixture((prompt) => {
+    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['automatic summary'] };
+    return [
+      { deltas: ['history '.repeat(100)], usageTokens: 90_000 },
+      { deltas: ['history '.repeat(100)], toolCall: { id: 'during-hold', name: 'bash', args: { command: "printf 'once\\n' >> held-effect.txt" } }, usageTokens: 90_000 },
+      { deltas: ['completed after both compactions'] },
+    ][replies++] ?? { deltas: ['unexpected extra reply'] };
+  });
+  writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  const scene = await directiveRecoveryLedgerFixture('swallowed-compaction-start');
+  const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: 'swallowed-start-minion' });
+  const session = await actualDirectiveSdkSession(handle); session.agent.toolExecution = 'sequential';
+  scene.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: scene.request.jobId, sessionFile: handle.sessionFile });
+  scene.ledger.setAgentState(handle.id, 'idle');
+  scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+  // During the directive, Pi's compaction gate stays set after the pre-prompt
+  // terminal, so the adapter still withholds it when Pi starts the mid-run one.
+  const nativeCompacting = Object.getOwnPropertyDescriptor(AgentSession.prototype, 'isCompacting')!.get!;
+  let armed = false; let held = false; let nativeEnds = 0;
+  Object.defineProperty(session, 'isCompacting', { configurable: true, get: () => held || nativeCompacting.call(session) });
+  session.subscribe((event) => { if (armed && event.type === 'compaction_end') { held = true; nativeEnds += 1; } });
+  // Outside the adapter's wrapper: whether the adapter still reported compaction when preparation returned.
+  let compactingAfterPreparation: boolean | null = null;
+  const prepare = session.agent.prepareNextTurnWithContext!.bind(session.agent);
+  session.agent.prepareNextTurnWithContext = async (turn, signal) => {
+    const update = await prepare(turn, signal);
+    compactingAfterPreparation ??= handle.isCompacting!();
+    return update;
+  };
+  const events = collect(handle);
+  // Synchronization only: preparation has registered its wait for the withheld terminal.
+  const waiters = (handle as unknown as { readonly compactionTerminalWaiters: ReadonlySet<unknown> }).compactionTerminalWaiters;
+  try {
+    await handle.prompt('earlier ordinary work');
+    await waitFor(() => handle.isCompacting?.() === false, 'failed post-run compaction terminal');
+    events.length = 0;
+    armed = true;
+    const turn = handle.promptWithVerdict!('approved directive', { directive: { identity: scene.identity,
+      beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+      onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    await waitFor(() => nativeEnds === 2 && waiters.size === 1, 'next-turn preparation waiting after both native compactions');
+    expect(compactingAfterPreparation).toBeNull();
+    // The second native start joined the open episode: one start, nothing published yet.
+    expect(events.filter((event) => event.type === 'compaction_start' || event.type === 'compaction_end').map((event) => event.type)).toEqual(['compaction_start']);
+    held = false;
+    expect(await turn).toEqual({ ok: true, error: null });
+    expect(compactingAfterPreparation).toBe(false);
+    expect(events.filter((event) => event.type === 'compaction_end')).toEqual([{ type: 'compaction_end', success: true }]);
+    expect(readFileSync(join(scene.lane.path, 'held-effect.txt'), 'utf8')).toBe('once\n');
+    expect(replies).toBe(3);
+  } finally { held = false; await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
+});
+
+it('restart recovery continues a directive the host lost right after Pi\'s mid-run compaction: one model call, the earlier effect never re-run', async () => {
+  const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['completed after the compacted checkpoint'] }]);
+  let service: InstanceType<typeof DirectiveProgressService> | null = null;
+  let compaction = '';
+  try {
+    // The ceased host's persisted round: its bash effect ran once, then Pi
+    // compacted, and the host died before the next model call.
+    const seeded = await seedSdkUserCheckpoint(f, (session, receipt) => {
+      const call = { type: 'toolCall', id: 'before-crash', name: 'bash', arguments: { command: "printf 'once\\n' >> resumed-effect.txt" } };
+      session.sessionManager.appendMessage({ role: 'assistant', content: [call], api: 'gru-stub', provider: 'gru-stub', model: 'stub-model', stopReason: 'toolUse', timestamp: Date.now(),
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as never);
+      session.sessionManager.appendMessage({ role: 'toolResult', toolCallId: 'before-crash', toolName: 'bash', content: [{ type: 'text', text: '' }], isError: false, timestamp: Date.now() } as never);
+      writeFileSync(join(f.scene.lane.path, 'resumed-effect.txt'), 'once\n');
+      compaction = session.sessionManager.appendCompaction('summary of the interrupted turn', receipt, 90_000, undefined, false);
+    });
+    expect(seeded.proof).toMatchObject({ state: 'resumable', checkpointId: compaction });
+    service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row.state).toBe('settled');
+    expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
+      .filter((event) => (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId)).toHaveLength(1);
+    expect(f.fx.script.calls).toHaveLength(1);
+    expect(readFileSync(join(f.scene.lane.path, 'resumed-effect.txt'), 'utf8')).toBe('once\n');
+    const resumed = f.sessions.at(-1)!;
+    expect(resumed.prompt).not.toHaveBeenCalled();
+    expect(resumed.agent.continue).toHaveBeenCalledTimes(1);
+    const final = nativeEntries(row.nativeTarget!.sessionFile).at(-1)!;
+    expect(final).toMatchObject({ type: 'message', parentId: compaction, message: { role: 'assistant', stopReason: 'stop' } });
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final.id });
+  } finally { await service?.dispose(); await f.cleanup(); }
+});
+
+/** `afterReceipt` writes, through the same SDK primitives, what the original
+ * host persisted after the receipt before it ceased. */
+async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>,
+  afterReceipt?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, receipt: string) => void) {
   const { prepareDirectiveBinding, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const original = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'guarded-original-minion' });
   const session = await actualDirectiveSdkSession(original);
@@ -4743,7 +4938,8 @@ async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveEx
     sessionFile: original.sessionFile!, text, authorityManifest: authority });
   // Accountable checkpoint fixture: the SDK's public persistence primitive
   // writes the original user receipt. No model, effects or terminal is forged.
-  session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
+  const receipt = session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
+  afterReceipt?.(session, receipt);
   const proof = inspectDirectiveCheckpoint(original.sessionFile!, identity);
   if (proof.state !== 'resumable') throw new Error('SDK user fixture did not produce a resumable checkpoint');
   f.scene.ledger.bindDirectiveNativeAdmission(proof.binding);

@@ -77,6 +77,34 @@ classification already in flight when compaction starts is discarded as
 stale, so old silence evidence can never kill a handle that entered
 compaction.
 
+**A Pi directive's own automatic compaction is not a foreign control.**
+Pi compacts a long session on its own; each compaction appends a summary
+entry that runs no tool and sends no message. While a directive runs, the
+adapter publishes that compaction's terminal as soon as Pi's gate clears,
+and next-turn preparation waits for it before the authority check, so
+supervision never holds the directive's own compaction against it.
+Directive proof (admission, the tool fence before every effect, and the
+checkpoint read for completion or recovery) walks past a compaction only
+when it is Pi's own automatic summary (`fromHook: false`, a timestamp, a
+summary and a token count) linked directly on the active chain, with its
+kept entry on that chain, in one of four places:
+
+- **pre-prompt:** between the directive's baseline and its user receipt;
+- **mid-run:** after a completed tool round, before the next model call. A
+  turn lost right there is resumable at the compaction;
+- **post-run:** directly after the final reply, which stays the turn's
+  checkpoint;
+- **overflow retry:** on a reply that failed with a context overflow (or a
+  recoverable `length` stop), followed by the retried reply. The failed
+  reply is history: tool calls in it never ran.
+
+Anything else is refused by name and the request stays UNKNOWN: a
+hook-authored or malformed summary, a wrong parent, a kept entry off the
+chain or one of the turn's own compactions, a compaction inside an open
+tool round, directly after the user entry or on another compaction, and a
+compaction after the terminal followed by a prompt that is not durably
+bound.
+
 **Sleep/wake is not a hang.** A watchdog tick separated from the
 previous one by a wall-clock gap beyond the tick cadence means the
 machine was suspended; every open turn gets a fresh silence window, a
