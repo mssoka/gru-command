@@ -4966,77 +4966,76 @@ const followingCommand = { id: 'following-command', name: 'bash', args: { comman
 it('a real SDK bash command that fails is ordinary work once the model answers it: the directive settles', () => assertSdkFailedCommandIsOrdinary([
   { deltas: [], toolCalls: [failingCommand] }, { deltas: ['the command failed, so the minion reported it'] },
 ], [['failing-command', true]]));
-it('a real SDK minion may go on calling tools after a failed command, and the directive settles #contract:directive-tool-error:pi', async () => {
-  await assertSdkFailedCommandIsOrdinary([
-    { deltas: [], toolCalls: [failingCommand] }, { deltas: [], toolCalls: [followingCommand] }, { deltas: ['fixed it after the failure'] },
-  ], [['failing-command', true], ['following-command', false]]);
-  await assertRealOpenAIResponsesTruncatedRetry('effect-free-error');
-  await assertRealOpenAIResponsesTruncatedRetry('partial-tool-call-error');
-});
+it('a real SDK minion may go on calling tools after a failed command, and the directive settles #contract:directive-tool-error:pi', () => assertSdkFailedCommandIsOrdinary([
+  { deltas: [], toolCalls: [failingCommand] }, { deltas: [], toolCalls: [followingCommand] }, { deltas: ['fixed it after the failure'] },
+], [['failing-command', true], ['following-command', false]]));
+it('a later call in the same sequential batch still runs after a failed one, and the directive settles', () => assertSdkFailedCommandIsOrdinary([
+  { deltas: [], toolCalls: [failingCommand, followingCommand] }, { deltas: ['both calls settled'] },
+], [['failing-command', true], ['following-command', false]]));
 
-async function assertRealOpenAIResponsesTruncatedRetry(retryHistory: 'effect-free-error' | 'partial-tool-call-error'): Promise<void> {
+/*
+ * Pi retry history (#483). A retryable provider error (a truncated OpenAI
+ * Responses stream, read by the real pi-ai parser over a synthetic fetch)
+ * leaves its error row in the transcript, and the SDK retries from it. The
+ * live auto_retry_start is durably receipted, so the tool guard, the turn's
+ * checkpoint and settlement all walk past that row; nothing else does.
+ */
+type ResponsesEvent = Readonly<Record<string, unknown>>;
+const responsesUsage = { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
+  output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 };
+function responsesFunctionCall(ordinal: number, name: string, callId: string, args: Record<string, unknown>): readonly ResponsesEvent[] {
+  const json = JSON.stringify(args);
+  const item = { id: `item-${ordinal}`, type: 'function_call', call_id: callId, name, arguments: json, status: 'completed' };
+  return [
+    { type: 'response.created', response: { id: `response-${ordinal}`, status: 'in_progress' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: json },
+    { type: 'response.function_call_arguments.done', output_index: 0, arguments: json },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response: { id: `response-${ordinal}`, object: 'response', status: 'completed', output: [item], usage: responsesUsage } },
+  ];
+}
+function responsesAnswer(text: string): readonly ResponsesEvent[] {
+  const item = { id: 'answer-item', type: 'message', role: 'assistant', status: 'completed', phase: 'final_answer', content: [{ type: 'output_text', text }] };
+  return [
+    { type: 'response.created', response: { id: 'response-answer', status: 'in_progress' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, delta: text },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response: { id: 'response-answer', object: 'response', status: 'completed', output: [item], usage: responsesUsage } },
+  ];
+}
+/** A stream that ends before any terminal response event, having output nothing. */
+const responsesTruncated: readonly ResponsesEvent[] = [{ type: 'response.created', response: { id: 'truncated-response', status: 'in_progress' } }];
+/** The same end after a completed commentary message, which the parser signs. */
+function responsesTruncatedAfterCommentary(text: string): readonly ResponsesEvent[] {
+  const item = { id: 'commentary-item', type: 'message', role: 'assistant', status: 'completed', phase: 'commentary', content: [{ type: 'output_text', text }] };
+  return [...responsesTruncated,
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, delta: text },
+    { type: 'response.output_item.done', output_index: 0, item }];
+}
+/** The same end while a function call is still streaming its arguments. */
+function responsesTruncatedToolCall(name: string): readonly ResponsesEvent[] {
+  return [...responsesTruncated,
+    { type: 'response.output_item.added', output_index: 0, item: { id: 'partial-item', type: 'function_call', call_id: 'partial-call', name, arguments: '', status: 'in_progress' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"partial":' }];
+}
+/** Serves `providerId/modelId` through the real Responses parser: request n
+ * reads `bodies[n]`. Returns the count of requests made. */
+async function registerSyntheticResponses(modelRuntime: ModelRuntime, providerId: string, modelId: string, bodies: readonly (readonly ResponsesEvent[])[]): Promise<() => number> {
   const { stream: streamOpenAIResponses } = await import('@earendil-works/pi-ai/api/openai-responses');
-  const fx = await fixture([]);
-  const providerId = 'gru-synthetic-truncated-responses';
-  const modelId = 'synthetic-responses-model';
-  const model = {
-    id: modelId, name: 'Synthetic Responses Model', api: 'openai-responses' as const, provider: providerId,
+  const model = { id: modelId, name: 'Synthetic Responses Model', api: 'openai-responses' as const, provider: providerId,
     baseUrl: 'http://synthetic.invalid/v1', reasoning: false, input: ['text'] as ('text' | 'image')[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_000, maxTokens: 1_024,
-  };
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_000, maxTokens: 1_024 };
   let requests = 0;
-  const functionCallResponse = (ordinal: number, name: string, callId: string, args: string) => {
-    const item = { id: `item-${ordinal}`, type: 'function_call', call_id: callId, name, arguments: args, status: 'completed' };
-    return [
-      { type: 'response.created', response: { id: `response-${ordinal}`, status: 'in_progress' } },
-      { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } },
-      { type: 'response.function_call_arguments.delta', output_index: 0, delta: args },
-      { type: 'response.function_call_arguments.done', output_index: 0, arguments: args },
-      { type: 'response.output_item.done', output_index: 0, item },
-      { type: 'response.completed', response: {
-        id: `response-${ordinal}`, object: 'response', status: 'completed', output: [item],
-        usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
-          output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 },
-      } },
-    ];
-  };
-  const finalResponse = () => {
-    const item = { id: 'final-item', type: 'message', role: 'assistant', status: 'completed', phase: 'final_answer',
-      content: [{ type: 'output_text', text: 'synthetic retry completed' }] };
-    return [
-      { type: 'response.created', response: { id: 'response-final', status: 'in_progress' } },
-      { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
-      { type: 'response.output_text.delta', output_index: 0, delta: 'synthetic retry completed' },
-      { type: 'response.output_item.done', output_index: 0, item },
-      { type: 'response.completed', response: {
-        id: 'response-final', object: 'response', status: 'completed', output: [item],
-        usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
-          output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 },
-      } },
-    ];
-  };
   const fakeFetch: typeof fetch = async () => {
+    const events = bodies[requests];
     requests += 1;
-    // The second response is either a true no-effect truncated stream or a
-    // truncated stream with a partial function call; both reach the real
-    // Responses parser's terminal-event EOF path.
-    const truncatedEvents = retryHistory === 'effect-free-error'
-      ? [{ type: 'response.created', response: { id: 'truncated-response', status: 'in_progress' } }]
-      : [
-          { type: 'response.created', response: { id: 'truncated-response', status: 'in_progress' } },
-          { type: 'response.output_item.added', output_index: 0, item: { id: 'partial-item', type: 'function_call',
-            call_id: 'partial-call', name: 'synthetic_followup', arguments: '', status: 'in_progress' } },
-          { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"partial":' },
-        ];
-    const events = requests === 2 ? truncatedEvents : requests === 1
-      ? functionCallResponse(1, 'synthetic_fail', 'call-first', '{}')
-      : requests === 3
-        ? functionCallResponse(3, 'synthetic_followup', 'call-followup', '{"value":"exact-argument"}')
-        : finalResponse();
-    const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
-    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    if (events === undefined) throw new Error(`synthetic Responses provider has no body for request ${String(requests)}`);
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
   };
-  fx.modelRuntime.registerNativeProvider({
+  modelRuntime.registerNativeProvider({
     id: providerId, name: 'Synthetic offline Responses',
     auth: { apiKey: { name: 'synthetic key', resolve: async () => ({ auth: { apiKey: 'offline-only' }, source: 'test' }) } },
     getModels: () => [model],
@@ -5045,81 +5044,146 @@ async function assertRealOpenAIResponsesTruncatedRetry(retryHistory: 'effect-fre
     streamSimple: (selectedModel, context, options) => streamOpenAIResponses(selectedModel as Parameters<typeof streamOpenAIResponses>[0], context,
       { ...options, apiKey: 'offline-only', fetch: fakeFetch } as Parameters<typeof streamOpenAIResponses>[2]),
   });
-  await fx.modelRuntime.refresh({ allowNetwork: false, providers: [providerId] });
-  let failedToolCalls = 0;
-  const executedFollowups: unknown[] = [];
-  const nativeTools = [
-    { name: 'synthetic_fail', description: 'Return a deterministic ordinary tool error.', authorityManifest: 'synthetic-fail-v1',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      async execute() { failedToolCalls += 1; throw new Error('synthetic ordinary tool error'); } },
-    { name: 'synthetic_followup', description: 'Record a deterministic synthetic retry effect.', authorityManifest: 'synthetic-followup-v1',
-      inputSchema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
-      async execute(args: unknown) { executedFollowups.push(structuredClone(args)); return { text: 'synthetic follow-up tool completed' }; } },
-  ] as const;
-  const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: `${providerId}/${modelId}`, nativeTools });
-  const session = await actualDirectiveSdkSession(handle);
-  const sdkEvents: { readonly type: string; readonly willRetry?: boolean; readonly errorMessage?: string }[] = [];
-  session.subscribe((event) => sdkEvents.push({ type: event.type, ...('willRetry' in event ? { willRetry: event.willRetry } : {}),
-    ...('errorMessage' in event ? { errorMessage: event.errorMessage } : {}) }));
-  const identity = { requestId: 'synthetic-truncated-stream-retry', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
-    jobId: 'synthetic-stream-retry-job', workRevision: 0, authorityEpoch: 0 };
-  try {
-    expect(session.autoRetryEnabled).toBe(true);
-    const verdict = await handle.promptWithVerdict!('synthetic native retry investigation', {
-      directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} },
-    });
-    const rows = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as {
-      id: string; parentId: string | null; message?: { role?: string; stopReason?: string; errorMessage?: string; toolCallId?: string;
-        toolName?: string; isError?: boolean; content?: unknown[] };
-    });
-    const toolUses = rows.filter((row) => row.message?.role === 'assistant' && row.message.stopReason === 'toolUse');
-    const providerError = rows.find((row) => row.message?.role === 'assistant' && row.message.stopReason === 'error');
-    const retryToolUse = toolUses.find((row) => (row.message?.content ?? []).some((block) =>
-      (block as { name?: string }).name === 'synthetic_followup'));
-    const ordinaryErrorResult = rows.find((row) => row.message?.role === 'toolResult' && row.message.toolName === 'synthetic_fail');
-    const retryResult = rows.find((row) => row.message?.role === 'toolResult' && row.message.toolName === 'synthetic_followup');
-    expect(providerError?.message?.errorMessage).toContain('OpenAI Responses stream ended before a terminal response event');
-    expect(ordinaryErrorResult?.message).toMatchObject({ role: 'toolResult', toolName: 'synthetic_fail', isError: true });
-    expect(providerError!.parentId).toBe(ordinaryErrorResult!.id);
-    expect(retryToolUse).toBeDefined();
-    expect(retryToolUse!.parentId).toBe(providerError!.id);
-    expect(sdkEvents).toContainEqual(expect.objectContaining({ type: 'agent_end', willRetry: true }));
-    expect(sdkEvents).toContainEqual(expect.objectContaining({ type: 'auto_retry_start', errorMessage: providerError!.message!.errorMessage }));
-    expect(failedToolCalls).toBe(1);
-    if (retryHistory === 'partial-tool-call-error') {
-      // Parser result: the persisted EOF error itself contains an unfinished
-      // function call. Retry admission happened, but ambiguous error content
-      // is not effect-free retry history and the follow-up executor stays shut.
-      expect((providerError!.message?.content ?? []).find((block) => (block as { type?: string }).type === 'toolCall')).toMatchObject({
-        type: 'toolCall', name: 'synthetic_followup',
-      });
-      expect(verdict.ok).toBe(false);
-      expect(executedFollowups).toEqual([]);
-      expect(requests).toBeGreaterThanOrEqual(3);
-      expect(retryResult?.parentId).toBe(retryToolUse!.id);
-      expect(retryResult?.message).toMatchObject({ role: 'toolResult', toolName: 'synthetic_followup', isError: true });
-      expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8')).toContain('native tool intent is not persisted before execution');
-    } else {
-      expect(verdict, readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8')).toMatchObject({ ok: true, error: null });
-      expect(retryResult?.parentId).toBe(retryToolUse!.id);
-      expect(retryResult?.message).toMatchObject({ role: 'toolResult', toolName: 'synthetic_followup', isError: false });
-      expect(retryResult?.message?.toolCallId).toBe('call-followup|item-3');
-      expect((retryToolUse!.message?.content ?? []).find((block) => (block as { type?: string }).type === 'toolCall')).toMatchObject({
-        type: 'toolCall', id: 'call-followup|item-3', name: 'synthetic_followup', arguments: { value: 'exact-argument' },
-      });
-      expect(requests).toBe(4);
-      expect(executedFollowups).toEqual([{ value: 'exact-argument' }]);
-      expect(retryResult?.message?.content).toContainEqual({ type: 'text', text: 'synthetic follow-up tool completed' });
-      const completedAssistant = rows.filter((row) => row.message?.role === 'assistant' && row.message.stopReason === 'stop').at(-1);
-      expect(completedAssistant).toBeDefined();
-      const { readDirectiveCompletion } = await import('../src/runtime/directive-checkpoint.js');
-      expect(readDirectiveCompletion(handle.sessionFile!, identity, completedAssistant!.id)).toMatchObject({ checkpointId: completedAssistant!.id });
-    }
-  } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+  await modelRuntime.refresh({ allowNetwork: false, providers: [providerId] });
+  return () => requests;
 }
-it('a later call in the same sequential batch still runs after a failed one, and the directive settles', () => assertSdkFailedCommandIsOrdinary([
-  { deltas: [], toolCalls: [failingCommand, followingCommand] }, { deltas: ['both calls settled'] },
-], [['failing-command', true], ['following-command', false]]));
+interface NativeRow {
+  readonly id: string; readonly parentId: string | null;
+  readonly message?: { readonly role?: string; readonly stopReason?: string; readonly errorMessage?: string; readonly toolCallId?: string; readonly isError?: boolean; readonly content?: readonly unknown[] };
+}
+function nativeRows(file: string): readonly NativeRow[] {
+  return readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as NativeRow);
+}
+function producerJournal(file: string): readonly Readonly<Record<string, unknown>>[] {
+  return readFileSync(`${file}.producers.jsonl`, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+const toolResultsOf = (rows: readonly NativeRow[]) => rows.filter((row) => row.message?.role === 'toolResult').map((row) => [row.message?.toolCallId, row.message?.isError]);
+
+it('a real SDK retry after a truncated Responses stream settles the directive once, and its checkpoint outlives the turn and the minion (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  let minion: AgentHandle | undefined;
+  const f = await sdkDirectiveExecutionFixture([], (_session, handle) => { minion = handle; });
+  // The fixture's default model, now read by the real Responses parser.
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesFunctionCall(1, 'bash', 'failing-call', { command: 'exit 3' }), responsesTruncated,
+    responsesFunctionCall(3, 'bash', 'following-call', { command: 'true' }), responsesAnswer('retried past the truncated stream'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    const answer = rows.filter((entry) => entry.message?.role === 'assistant' && entry.message.stopReason === 'stop').at(-1)!;
+    expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
+    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(toolResultsOf(rows)).toEqual([['failing-call|item-1', true], ['following-call|item-3', false]]);
+    expect(requests()).toBe(4);
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+    const journal = producerJournal(file);
+    expect(journal.filter((receipt) => receipt['state'] === 'retry-start')).toEqual([
+      expect.objectContaining({ entryId: error.id, errorMessage: error.message?.errorMessage })]);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    const identity = f.scene.ledger.directiveTurnIdentity(row.requestId);
+    const terminal = { state: 'terminal', ok: true, error: null, checkpointId: answer.id };
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject(terminal);
+    expect(minion?.id).toBe(row.nativeTarget!.agentId);
+    await minion!.dispose();
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject(terminal);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK retry of the directive\'s first request, after a fractional backoff, lets its next tool call run once and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const retryStarts: unknown[] = [];
+  const f = await sdkDirectiveExecutionFixture([], (session) => {
+    session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); });
+  });
+  // SDK delayMs is baseDelayMs·2^(attempt-1): a fractional base stays fractional.
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 0.5 } }));
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesTruncated, responsesFunctionCall(2, 'bash', 'once-call', { command: `printf ran >> ${JSON.stringify(effect)}` }),
+    responsesAnswer('ran once after the retried first request'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    const user = rows.find((entry) => entry.message?.role === 'user')!;
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    expect(error.parentId).toBe(user.id);
+    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 0.5, errorMessage: error.message?.errorMessage })]);
+    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(toolResultsOf(rows)).toEqual([['once-call|item-2', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(requests()).toBe(3);
+    const journal = producerJournal(file);
+    expect(journal.filter((receipt) => receipt['state'] === 'retry-start')).toEqual([
+      expect.objectContaining({ entryId: error.id, errorMessage: error.message?.errorMessage })]);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK retry after a stream that broke past signed commentary text lets the next tool call run and settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([]);
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesTruncatedAfterCommentary('Checking the failing test first.'), responsesFunctionCall(2, 'bash', 'after-commentary', { command: 'true' }),
+    responsesAnswer('settled after the signed commentary'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const rows = nativeRows(row.nativeTarget!.sessionFile);
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    expect(error.message?.content).toEqual([{ type: 'text', text: 'Checking the failing test first.', textSignature: expect.stringContaining('commentary-item') }]);
+    expect(toolResultsOf(rows)).toEqual([['after-commentary|item-2', false]]);
+    expect(requests()).toBe(3);
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK retry of a truncated stream holding a partial tool call records no retry evidence, says why, and keeps the next tool refused (#483)', async () => {
+  const logs: { readonly level: string; readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
+  const fx = await fixture([], ['text'], { log: (level, msg, fields) => logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }) });
+  writeFileSync(join(fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
+  const requests = await registerSyntheticResponses(fx.modelRuntime, 'gru-synthetic-responses', 'synthetic-model', [
+    responsesTruncatedToolCall('synthetic_followup'), responsesFunctionCall(2, 'synthetic_followup', 'call-followup', { value: 'exact-argument' }),
+  ]);
+  const executed: unknown[] = [];
+  const nativeTools = [{ name: 'synthetic_followup', description: 'Record a deterministic synthetic retry effect.', authorityManifest: 'synthetic-followup-v1',
+    inputSchema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+    async execute(args: unknown) { executed.push(structuredClone(args)); return { text: 'synthetic follow-up tool completed' }; } }] as const;
+  const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'gru-synthetic-responses/synthetic-model', nativeTools });
+  const identity = { requestId: 'synthetic-partial-retry', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+    jobId: 'synthetic-partial-retry-job', workRevision: 0, authorityEpoch: 0 };
+  try {
+    const verdict = await handle.promptWithVerdict!('synthetic native retry investigation', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+    const file = handle.sessionFile!;
+    const rows = nativeRows(file);
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    // The real parser keeps the unfinished call inside the persisted error row.
+    expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
+    expect(error.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', name: 'synthetic_followup' }));
+    const retried = rows.find((entry) => entry.parentId === error.id)!;
+    expect(retried.message?.stopReason).toBe('toolUse');
+    expect(toolResultsOf(rows)).toEqual([['call-followup|item-2', true]]);
+    expect(executed).toEqual([]);
+    expect(verdict.ok).toBe(false);
+    expect(requests()).toBe(2);
+    const journal = producerJournal(file);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('retry-start');
+    expect(journal).toContainEqual(expect.objectContaining({ state: 'guard-refused', reason: expect.stringContaining('native tool intent is not persisted before execution') }));
+    expect(logs).toContainEqual({ level: 'warn', msg: 'native SDK retry evidence not recorded; retry-history tool effects remain refused',
+      fields: { requestId: identity.requestId, reason: 'native branch tail is not the effect-free error row this retry names' } });
+  } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+});
 
 async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing' | 'missing-head' | 'parked-missing-head') {
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
