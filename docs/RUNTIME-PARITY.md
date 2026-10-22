@@ -89,8 +89,8 @@ that proves it on each adapter.
 
 Every top-level block in the two adapter test files is placed here. A block maps
 to the contract it proves (`umbrella` for the long round-trip block, which holds
-tests for many contracts), or is `adapter-internal`: a pure parser or a pin with
-no counterpart on the other runtime.
+tests for many contracts), or is `adapter-internal`: a pure parser, a pin, or a
+runtime's own behaviour with no counterpart on the other runtime.
 
 <!-- adapter-blocks:start -->
 | File | Top-level block | Contract or kind |
@@ -116,6 +116,7 @@ no counterpart on the other runtime.
 | `test/claude-adapter.test.ts` | isolated-review confinement guards | isolated-review-tools |
 | `test/claude-adapter.test.ts` | ReviewMcpBridge fail-closed guards | review-native-tools |
 | `test/claude-adapter.test.ts` | scheduled verification ordinary Claude Bash | scheduled-verification |
+| `test/claude-adapter.test.ts` | a replied Claude turn waiting on background work (#471 follow-up) | adapter-internal |
 <!-- adapter-blocks:end -->
 
 ## Above the adapter layer
