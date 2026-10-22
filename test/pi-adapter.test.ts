@@ -4399,7 +4399,7 @@ it('PR334 runtime causal real supervisor permits its exact current native tool o
   } finally { supervisor.dispose(); await f.cleanup(); }
 });
 
-it('automatic SDK compaction completes before the same admitted native authority check resumes', async () => {
+it('automatic SDK compaction completes before the same admitted native authority check resumes, and later native tools run once', async () => {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const { inspectDirectiveAdmission, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const { Supervisor } = await import('../src/supervision/supervisor.js');
@@ -4411,7 +4411,6 @@ it('automatic SDK compaction completes before the same admitted native authority
   type CompactionObservation = {
     readonly view: ReturnType<InstanceType<typeof Supervisor>['viewFor']>;
     readonly adapterCompacting: boolean;
-    readonly sdkCompacting: boolean;
     readonly openControl: boolean | undefined;
     readonly openTurn: boolean;
     readonly openToolCalls: number;
@@ -4422,21 +4421,25 @@ it('automatic SDK compaction completes before the same admitted native authority
     readonly mismatchedBlockers: Readonly<Record<string, readonly string[]>>;
   };
   let sample: (() => CompactionObservation | null) | null = null;
-  const rawCompaction: { readonly type: string; readonly sdkCompacting: boolean }[] = [];
+  const rawCompaction: string[] = [];
+  /** What the adapter published, in order: compaction episodes and turn starts. */
+  const published: string[] = [];
   const preparations: { readonly before: CompactionObservation; readonly after: CompactionObservation }[] = [];
   const afterCompactionTurnStarts: CompactionObservation[] = [];
   let rawTerminalObserved = false;
   const f = await sdkDirectiveExecutionFixture([
     { deltas: [history], toolCall: { id: 'compact-once', name: 'bash', args: { command: "printf 'once\\n' >> compacted-native-effect.txt" } }, usageTokens: 90_000 },
     { deltas: ['automatic compaction summary'], hold: summaryHold },
+    // A native tool call after the compaction: the fence walks past it (#481).
+    { deltas: [], toolCall: { id: 'after-compaction', name: 'bash', args: { command: "printf 'after\\n' >> compacted-native-effect.txt" } } },
     { deltas: ['completed after automatic compaction'] },
   ], (session, spawned) => {
     handle = spawned;
-    const sdk = session as unknown as { subscribe(listener: (event: unknown) => void): () => void; readonly isCompacting: boolean };
+    const sdk = session as unknown as { subscribe(listener: (event: unknown) => void): () => void };
     sdk.subscribe((event) => {
       const type = (event as { readonly type?: unknown }).type;
       if (type === 'compaction_start' || type === 'compaction_end') {
-        rawCompaction.push({ type, sdkCompacting: sdk.isCompacting });
+        rawCompaction.push(type);
         if (type === 'compaction_end') rawTerminalObserved = true;
       }
     });
@@ -4450,6 +4453,8 @@ it('automatic SDK compaction completes before the same admitted native authority
       }
     };
     spawned.subscribe((event) => {
+      if (event.type === 'compaction_start' || event.type === 'turn_start') published.push(event.type);
+      if (event.type === 'compaction_end') published.push(`compaction_end:${event.success ? 'success' : event.error ?? 'failed'}`);
       if (event.type === 'turn_start' && rawTerminalObserved) {
         const observation = sample?.();
         if (observation !== null && observation !== undefined) afterCompactionTurnStarts.push(observation);
@@ -4493,11 +4498,9 @@ it('automatic SDK compaction completes before the same admitted native authority
       session: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, sessionId: `${owner.producer.sessionId}-foreign` } }),
       identity: supervisor.pendingProducerBlockers(f.scene.request.jobId, { handle, producer: { ...owner.producer, identity: { ...owner.producer.identity, requestId: `${owner.producer.identity.requestId}-foreign` } } }),
     };
-    const sdk = (f.sessions.at(-1) as unknown as { readonly isCompacting: boolean } | undefined);
     return {
       view,
       adapterCompacting: handle.isCompacting?.() === true,
-      sdkCompacting: sdk?.isCompacting === true,
       openControl: view?.openControl,
       openTurn: view?.openTurn ?? false,
       openToolCalls: view?.openToolCalls ?? -1,
@@ -4511,22 +4514,23 @@ it('automatic SDK compaction completes before the same admitted native authority
   let runError: unknown = null;
   try {
     const running = executeAcceptedDirective({ ...f.deps, pendingProducerBlockers: supervisor.pendingProducerBlockers.bind(supervisor) }, f.scene.request.requestId);
-    await waitFor(() => rawCompaction.some((event) => event.type === 'compaction_start') && f.fx.script.calls.some((call) => call.prompt.startsWith('<conversation>')), 'held automatic compaction summary');
+    await waitFor(() => rawCompaction.includes('compaction_start') && f.fx.script.calls.some((call) => call.prompt.startsWith('<conversation>')), 'held automatic compaction summary');
     const active = sample();
     expect(active).not.toBeNull();
-    expect(active).toMatchObject({ openControl: true, openTurn: false, openToolCalls: 0, adapterCompacting: true, sdkCompacting: true, ownNative: true });
+    expect(active).toMatchObject({ openControl: true, openTurn: false, openToolCalls: 0, adapterCompacting: true, ownNative: true });
     expect(active?.exactBlockers.some((blocker) => blocker.includes('open turn/control/tool'))).toBe(true);
     expect(f.fx.script.calls.filter((call) => !call.prompt.startsWith('<conversation>'))).toHaveLength(1);
     releaseSummary();
     try { await running; } catch (error) { runError = error; }
 
-    const afterPreparation = preparations.at(-1)?.after;
+    // One preparation compacted; the second follows the post-compaction tool call.
+    expect(preparations).toHaveLength(2);
+    const afterPreparation = preparations[0]?.after;
     expect(afterPreparation, JSON.stringify({ rawCompaction, preparations, runError: String(runError) })).toMatchObject({
       openControl: false,
       openTurn: false,
       openToolCalls: 0,
       adapterCompacting: false,
-      sdkCompacting: false,
       ownNative: true,
       exactBlockers: [],
       identityMatches: {
@@ -4541,14 +4545,12 @@ it('automatic SDK compaction completes before the same admitted native authority
         startedProducerReceipt: true,
       },
     });
-    expect(preparations).toHaveLength(1);
-    expect(rawCompaction).toEqual([
-      { type: 'compaction_start', sdkCompacting: false },
-      { type: 'compaction_end', sdkCompacting: true },
-    ]);
+    expect(rawCompaction).toEqual(['compaction_start', 'compaction_end']);
+    // The adapter publishes the episode's successful terminal before the next model turn starts.
+    expect(published.slice(published.indexOf('compaction_start'))).toEqual(['compaction_start', 'compaction_end:success', 'turn_start', 'turn_start']);
     expect(runError).toBeNull();
 
-    expect(afterCompactionTurnStarts).toHaveLength(1);
+    expect(afterCompactionTurnStarts).toHaveLength(2);
     const continued = afterCompactionTurnStarts[0]!;
     expect(continued).toMatchObject({ openControl: false, openTurn: true, openToolCalls: 0, ownNative: true, exactBlockers: [] });
     expect(continued.unownedBlockers.some((blocker) => blocker.includes('open turn/control/tool'))).toBe(true);
@@ -4581,18 +4583,87 @@ it('automatic SDK compaction completes before the same admitted native authority
     expect(completions).toHaveLength(1);
     expect(completions[0]).toMatchObject({ producer: originalProducer, checkpointId: checkpoint.checkpointId,
       head: execFileSync('git', ['-C', f.scene.lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() });
-    const effect = readFileSync(join(f.scene.lane.path, 'compacted-native-effect.txt'), 'utf8');
-    const effectOccurrences = effect.split('\n').filter((line) => line === 'once');
-    expect(effectOccurrences).toHaveLength(1);
-    expect(effect).toBe('once\n');
+    // Both native effects ran exactly once: before the compaction and after it.
+    expect(readFileSync(join(f.scene.lane.path, 'compacted-native-effect.txt'), 'utf8')).toBe('once\nafter\n');
+    const nativeRows = readFileSync(row.nativeTarget!.sessionFile, 'utf8').trimEnd().split('\n')
+      .map((line) => JSON.parse(line) as { readonly type: string; readonly message?: { readonly role: string; readonly toolCallId?: string; readonly isError?: boolean } });
+    expect(nativeRows.filter((entry) => entry.type === 'compaction')).toHaveLength(1);
+    expect(nativeRows.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message!.toolCallId, entry.message!.isError]))
+      .toEqual([['compact-once', false], ['after-compaction', false]]);
+    expect(producerRecords.filter((record) => record.state === 'guard-refused')).toEqual([]);
     expect(nativeSession.prompt).toHaveBeenCalledTimes(1);
-    expect(f.fx.script.calls).toHaveLength(3);
+    expect(f.fx.script.calls).toHaveLength(4);
     expect(f.sessions).toHaveLength(1);
   } finally {
     releaseSummary();
     supervisor.dispose();
     await f.cleanup();
   }
+});
+
+it('Pi post-run compaction after the directive terminal settles the original completion once', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  // The final reply's usage crosses the compaction threshold: Pi compacts after the run, before it settles.
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['history '.repeat(100)], usageTokens: 90_000 }, { deltas: ['post-run summary'] }]);
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const rows = readFileSync(row.nativeTarget!.sessionFile, 'utf8').trimEnd().split('\n')
+      .map((line) => JSON.parse(line) as { readonly type: string; readonly id: string; readonly parentId?: string | null; readonly message?: { readonly role: string; readonly stopReason?: string } });
+    const [final, compaction] = rows.slice(-2);
+    expect(final).toMatchObject({ type: 'message', message: { role: 'assistant', stopReason: 'stop' } });
+    expect(compaction).toMatchObject({ type: 'compaction', parentId: final!.id });
+    expect(f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final!.id, binding: row.nativeBinding });
+    expect(row.state).toBe('settled');
+    const deliveries = f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
+      .filter((event) => (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId);
+    expect(deliveries).toHaveLength(1);
+    const completions = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8').trimEnd().split('\n')
+      .map((line) => JSON.parse(line) as { readonly state: string; readonly checkpointId?: string }).filter((record) => record.state === 'completed');
+    expect(completions.map((record) => record.checkpointId)).toEqual([final!.id]);
+    expect(f.sessions[0]!.prompt).toHaveBeenCalledTimes(1);
+  } finally { await f.cleanup(); }
+});
+
+it('Pi pre-prompt compaction before a directive receipt is admitted and the directive completes', async () => {
+  const { inspectDirectiveAdmission, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  let summaries = 0;
+  // The earlier reply crosses the threshold but its post-run summary fails, so
+  // Pi compacts again before the next prompt: after the directive's baseline.
+  const f = await fixture((prompt, index) => {
+    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
+    return index === 0 ? { deltas: ['history '.repeat(100)], usageTokens: 90_000 } : { deltas: ['directive done'] };
+  });
+  writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
+  const scene = await directiveRecoveryLedgerFixture('pre-prompt-compaction');
+  const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: 'pre-prompt-compaction-minion' });
+  scene.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: scene.request.jobId, sessionFile: handle.sessionFile });
+  scene.ledger.setAgentState(handle.id, 'idle');
+  try {
+    await handle.prompt('earlier ordinary work');
+    await waitFor(() => handle.isCompacting?.() === false, 'failed post-run compaction terminal');
+    const baseline = (JSON.parse(readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').at(-1)!) as { readonly id: string }).id;
+    scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+    const verdict = await handle.promptWithVerdict!('approved directive', { directive: { identity: scene.identity,
+      beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+      onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    expect(verdict).toEqual({ ok: true, error: null });
+    const rows = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n')
+      .map((line) => JSON.parse(line) as { readonly type: string; readonly id: string; readonly parentId?: string | null; readonly message?: { readonly role: string } });
+    const at = rows.findIndex((entry) => entry.id === baseline);
+    const [compaction, user, final] = rows.slice(at + 1);
+    expect(compaction).toMatchObject({ type: 'compaction', parentId: baseline });
+    expect(user).toMatchObject({ type: 'message', parentId: compaction!.id, message: { role: 'user' } });
+    expect(rows.slice(at + 4)).toEqual([]);
+    const admission = inspectDirectiveAdmission(handle.sessionFile!, scene.identity);
+    expect(admission).toMatchObject({ baseline, userEntryId: user!.id });
+    expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'admitted', nativeBinding: admission });
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final!.id });
+    expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>') ? 'summary' : call.prompt)).toEqual(['earlier ordinary work', 'summary', 'summary', 'approved directive']);
+  } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
 });
 
 async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
