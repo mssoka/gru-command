@@ -196,11 +196,16 @@ unavailable or failed, a foreign or repeated response, a result before
 initialization), reports itself, untagged, as before #485; the owed refusal
 stays durable in its guard receipt, and the channel's own failure texts name
 no wall word.
-No tool is allowed once the turn has a failure: an allow is re-checked as it
-is written, and denied with a durable guard receipt. GC's own texts name a
-thrown non-error value (`a directive step threw a non-error value: null`):
-verdicts, receipts and the events GC builds. On Pi, an event its SDK reduces
-from such a throw can still read a bare `null`. On a directive turn the supervisor neither paces a tagged, nonfatal,
+No tool is allowed once the turn has a recorded failure: an allow is
+re-checked as it is written, and denied with a durable guard receipt. After a
+failure of the CLI process, or of the permission channel's transport or
+protocol, nothing is recorded: the allow is dropped at the stdin GC has
+ended, with no deny and no receipt, and no tool runs. GC's own texts name a
+thrown non-error value (`a non-error value was thrown: null`): verdicts,
+receipts and the events GC builds. On Pi, an event its SDK reduces from such
+a throw can still read a bare `null`.
+
+On a directive turn the supervisor neither paces a tagged, nonfatal,
 untyped error as a rate limit nor classifies it as a wall: the directive's
 recovery path owns it (it disposes the handle, fails or reconciles the
 directive, and surfaces the recovery to Gru). Each skipped refusal leaves a
@@ -209,10 +214,12 @@ directive, and surfaces the recovery to Gru). Each skipped refusal leaves a
 `error_truncated: true` and the original `error_length`). A fatal or typed
 tagged error is still routed, and a tag on a turn that carries no directive
 is logged as a warning and routed. After a refusal GC reports the last
-main-thread API error it saw from a real call, even one the CLI's own result
-would drop (a wall seen is a wall), untagged, with an error result's text when
-there is one, through the ordinary path's text helper; a subagent's API
-error, or a result error GC's own abort caused, is not reported.
+main-thread API error it saw, even one the CLI's own result would drop (a
+wall seen is a wall), unless a later real main-thread call cleared it (the
+CLI's own `<synthetic>` replies do not). It is reported untagged, with an
+error result's text when there is one, through the ordinary path's text
+helper; a subagent's API error, or a result error GC's own abort caused, is
+not reported.
 
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent

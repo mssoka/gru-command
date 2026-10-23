@@ -50,7 +50,7 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { isPublicModelToken } from './review-model-identity.js';
-import { DirectiveBookkeepingError, DirectiveCheckpointError, isNativeDirectiveRefusal, thrownText, withOwnIo, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveBookkeepingError, DirectiveCheckpointError, isNativeDirectiveRefusal, thrownDetail, thrownText, withOwnIo, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -1115,8 +1115,9 @@ export class PiAgentHandle implements AgentHandle {
    * replaced one whose receipt could not be journaled. Reset per turn. See
    * RuntimeEvent `nativeControl`. */
   private readonly nativeDirectiveRefusals = new Set<Error>();
-  /** Bookkeeping faults already logged: each is logged once, first failure or not. */
-  private readonly loggedBookkeepingFaults = new WeakSet<DirectiveBookkeepingError>();
+  /** Bookkeeping faults already logged (the fault itself, or its refusal when the
+   * fault is no object): each is logged once, first failure or not. */
+  private readonly loggedBookkeepingFaults = new WeakSet<object>();
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
@@ -1347,11 +1348,11 @@ export class PiAgentHandle implements AgentHandle {
 
   /** Every bookkeeping fault is logged, first failure or not, and once. */
   private logBookkeepingFault(error: unknown): void {
-    if (!(error instanceof DirectiveBookkeepingError) || this.loggedBookkeepingFaults.has(error)) return;
-    this.loggedBookkeepingFaults.add(error);
-    this.log('error', 'native directive bookkeeping failed; the directive is refused', {
-      error: error.message, fault: error.fault instanceof Error ? error.fault.stack ?? error.fault.message : thrownText(error.fault),
-    });
+    if (!(error instanceof DirectiveBookkeepingError)) return;
+    const fault = typeof error.fault === 'object' && error.fault !== null ? error.fault : error;
+    if (this.loggedBookkeepingFaults.has(fault)) return;
+    this.loggedBookkeepingFaults.add(fault);
+    this.log('error', 'native directive bookkeeping failed; the directive is refused', { error: error.message, fault: thrownDetail(error.fault) });
   }
 
   /** Keeps a refusal GC raised for the live directive; a plain error, or GC's
@@ -1919,7 +1920,7 @@ export class PiAgentHandle implements AgentHandle {
               const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
               captured = proof.state === 'terminal' ? { ok: proof.ok, error: proof.error } : { ok: false, error: 'native correlated terminal proof unavailable' };
             } catch (error) {
-              captured = { ok: false, error: `native correlated terminal proof unavailable: ${String(error)}` };
+              captured = { ok: false, error: `native correlated terminal proof unavailable: ${thrownText(error, 'string')}` };
             }
             if (this.directiveAdmissionFailure !== null) captured = { ok: false, error: thrownText(this.directiveAdmissionFailure.error, 'string') };
           }

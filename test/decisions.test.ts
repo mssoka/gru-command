@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DirectiveBookkeepingError, DirectiveCheckpointError, thrownText } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveBookkeepingError, DirectiveCheckpointError, thrownDetail, thrownText } from '../src/runtime/directive-checkpoint.js';
 import {
   DEFAULT_DECISIONS_CONFIG,
   effectiveDecisionProviders,
@@ -262,10 +262,12 @@ describe('typed decision semantics', () => {
   });
 
   it('Claude Code 2.1.309\'s typed error codes that name a deterministic wall classify alone and as the in-band suffix (#485)', () => {
+    // By the CLI's own policy: it stops on account_on_hold as an auth failure, and
+    // retries cloud_credential_error (its only transient code), so that one walls nothing.
     const walls = {
       authentication_failed: 'authentication_wall', oauth_org_not_allowed: 'authentication_wall',
-      cloud_credential_error: 'authentication_wall', verification_required: 'authentication_wall',
-      billing_error: 'quota_wall', account_on_hold: 'quota_wall', rate_limit: 'quota_wall',
+      verification_required: 'authentication_wall', account_on_hold: 'authentication_wall',
+      billing_error: 'quota_wall', rate_limit: 'quota_wall',
     } as const;
     for (const [code, wall] of Object.entries(walls)) {
       expect(deterministicFailureClass(code), code).toBe(wall);
@@ -274,20 +276,32 @@ describe('typed decision semantics', () => {
     }
     expect(deterministicFailureClass('Credit balance is too low (billing_error)')).toBe('quota_wall');
     // The rest of the closed enum names no deterministic wall.
-    for (const code of ['overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
-      expect(['unknown', 'network_failure'], code).toContain(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`));
+    for (const code of ['cloud_credential_error', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
+      expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe('unknown');
     }
+    // A word boundary never falls at "_": only the listed spellings match.
+    expect(deterministicFailureClass('rate_limit_remaining: 0')).toBe('unknown');
   });
 
   it('names every thrown value, any realm\'s error included, and never throws (#485)', () => {
     expect(thrownText(new TypeError('bad'))).toBe('bad');
     expect(thrownText(new TypeError('bad'), 'string')).toBe('TypeError: bad');
     expect(thrownText(runInNewContext('new Error("from another realm")') as unknown)).toBe('from another realm');
-    expect(thrownText(null)).toBe('a directive step threw a non-error value: null');
-    expect(thrownText(Object.create(null) as unknown)).toBe('a directive step threw a non-error value: an unprintable value');
-    expect(thrownText({ toString: () => { throw new Error('no text'); } })).toBe('a directive step threw a non-error value: an unprintable value');
+    expect(thrownText(null)).toBe('a non-error value was thrown: null');
+    expect(thrownText(Object.create(null) as unknown)).toBe('a non-error value was thrown: an unprintable value');
+    expect(thrownText({ toString: () => { throw new Error('no text'); } })).toBe('a non-error value was thrown: an unprintable value');
     expect(new DirectiveBookkeepingError('admission publication', Object.create(null) as unknown).message)
-      .toBe('directive bookkeeping failed: admission publication: a directive step threw a non-error value: an unprintable value');
+      .toBe('directive bookkeeping failed: admission publication: a non-error value was thrown: an unprintable value');
+    // A value that cannot be read at all still gets a text.
+    const unreadable = new Error('hidden');
+    Object.defineProperty(unreadable, 'message', { get: () => { throw new Error('no message'); } });
+    expect(thrownText(unreadable)).toBe('a thrown value that cannot be read');
+    const trap = new Proxy({}, { getPrototypeOf: () => { throw new Error('trap'); } });
+    expect(thrownText(trap)).toBe('a thrown value that cannot be read');
+    // A log line keeps any realm's stack.
+    const foreign = runInNewContext('new Error("from another realm")') as unknown;
+    expect(thrownDetail(foreign)).toMatch(/^Error: from another realm\n\s+at /u);
+    expect(thrownDetail(null)).toBe('a non-error value was thrown: null');
   });
 
   // Scanned below: every literal message of `new DirectiveCheckpointError(…)` and
@@ -297,19 +311,20 @@ describe('typed decision semantics', () => {
   // reason (Claude's checkpoint refusal text quotes them); ledger/api.ts's
   // refuse() reasons; the Claude permission channel's refusal and failure texts
   // (claude-directive.ts); the call names given to withOwnIo()/ownIoRefusal();
-  // and the texts the refusal classes write themselves. Not visible to it,
-  // checked by hand in #485 (none names a wall): the texts that arrive in
-  // variables — directive-progress.ts's result.note, lockBlocker,
-  // proof.reason/proof.error and verdict.error (directive recovery only;
-  // verdict.error can carry a provider's own text), directive-checkpoint.ts's
-  // oversized, at, refusal and retry (fed by literals scanned here), and the
-  // Claude channel's `new DirectiveCheckpointError(reason)` (its reasons are
-  // scanned here); the ledger's recovery-decision ternary of two literals
-  // ("request is …, not retired — …", "terminal work cannot be revived by
-  // recovery"); the
-  // "current gate duty " prefix ledger/api.ts's refuse() puts before its
-  // reasons; and a bookkeeping refusal's fault text after GC's prefix, which is
-  // the disk's or the OS's words and is guarded by the tag, not by its text.
+  // a constant passed to a refusal by name (EARLIER_DIRECTIVE_FAILURE), resolved
+  // to its literal; and the texts the refusal classes write themselves.
+  // Not visible to it, checked by hand in #485 (none names a wall): the texts
+  // that arrive in variables — directive-progress.ts's result.note,
+  // lockBlocker, proof.reason/proof.error and verdict.error (directive recovery
+  // only; verdict.error can carry a provider's own text),
+  // directive-checkpoint.ts's oversized, at, refusal and retry (fed by literals
+  // scanned here), and the Claude channel's `new DirectiveCheckpointError(reason)`
+  // (its reasons are scanned here); the ledger's recovery-decision ternary of
+  // two literals ("request is …, not retired — …", "terminal work cannot be
+  // revived by recovery"); the "current gate duty " prefix ledger/api.ts's
+  // refuse() puts before its reasons; and a bookkeeping refusal's fault text
+  // after GC's prefix, which is the disk's or the OS's words and is guarded by
+  // the tag, not by its text.
   it('no refusal text GC writes is blank or names a wall (#485)', () => {
     const tick = '`';
     const literal = String.raw`'(?:[^'\\]|\\.)*'|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
@@ -325,16 +340,22 @@ describe('typed decision semantics', () => {
     const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
       entry.isDirectory() ? sources(join(dir, entry.name)) : entry.name.endsWith('.ts') ? [join(dir, entry.name)] : []);
     const texts: string[] = [];
+    // Interpolations are runtime detail; the text GC writes around them is what is classified.
+    const textOf = (literals: string): string => [...literals.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('').replace(/\$\{[^}]*\}/gu, 'x');
     for (const file of sources(join(import.meta.dirname, '..', 'src'))) {
       const source = readFileSync(file, 'utf-8');
       for (const [pattern, applies] of scans) {
         if (!applies(file)) continue;
-        // Interpolations are runtime detail; the text GC writes around them is what is classified.
-        for (const match of source.matchAll(pattern)) {
-          texts.push([...match[1]!.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('').replace(/\$\{[^}]*\}/gu, 'x'));
-        }
+        for (const match of source.matchAll(pattern)) texts.push(textOf(match[1]!));
+      }
+      // A constant passed to a refusal by name is resolved to its own literal.
+      for (const match of source.matchAll(/new Directive(?:CheckpointError|RuntimeUnsupportedError)\(\s*([A-Z][A-Z0-9_]*)\s*\)/gu)) {
+        const definition = new RegExp(String.raw`\bconst ${match[1]!} = (${chain});`, 'u').exec(source);
+        expect(definition, `${file}: ${match[1]!}`).not.toBeNull();
+        texts.push(textOf(definition![1]!));
       }
     }
+    expect(texts.some((text) => text.startsWith('an earlier directive failure refused this turn'))).toBe(true);
     // The refusal classes' own texts.
     texts.push(new DirectiveCheckpointError(' ').message, new DirectiveBookkeepingError('x', new Error('x')).message, thrownText(null));
     expect(texts.length).toBeGreaterThan(300);

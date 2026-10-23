@@ -3334,6 +3334,32 @@ describe('supervisor — decision-backed failure guidance', () => {
     } finally { h.dispose(); }
   });
 
+  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall, and walls only with no pacing policy (#485)', async () => {
+    // 2.1.309's client-side capacity off-switch, as GC's adapter words it.
+    const error = 'Opus is experiencing high load. Switch to Sonnet. (rate_limit)';
+    const event = { type: 'error' as const, error, fatal: false, provider: 'anthropic-claude-native', model: 'claude-opus-5-5',
+      typed: { origin: 'provider-message' as const, bodyCode: 'rate_limit' } };
+    const sleeper = new ManualSleeper();
+    const paced = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-paced', null);
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-capacity' };
+      paced.registry.adopt(handle);
+      handle.emit(event);
+      expect(sleeper.delays).toEqual([100]);
+      expect(paced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(handle.disposed).toBe(false);
+    } finally { paced.dispose(); }
+    const unpaced = boot();
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-unpaced', null);
+      unpaced.registry.adopt(handle);
+      handle.emit(event);
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(unpaced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+    } finally { unpaced.dispose(); }
+  });
+
   it('a refusal tag on a turn that carries no directive is logged loud and routed as an ordinary failure (#485)', async () => {
     const logs: { level: string; msg: string }[] = [];
     const sleeper = new ManualSleeper();

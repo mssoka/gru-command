@@ -111,6 +111,23 @@ describe('the Claude directive permission channel (#424)', () => {
       response: { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' } } });
   });
 
+  it('a re-check that throws is a fence that failed: it denies, keeps a durable refusal and fails the turn, never an unhandled rejection (#485)', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const c = channel(() => ({ allow: true }), undefined, () => { throw new Error('confirm broke'); });
+      c.initialize();
+      c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+      await tick(); await tick(); await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(c.written().at(-1)).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'r1',
+        response: { behavior: 'deny', message: 'The directive tool fence failed' } } });
+      expect(c.refusals).toEqual([['toolu_1', 'directive tool fence failed: confirm broke']]);
+      expect(c.failures).toEqual(['directive tool fence failed: confirm broke']);
+      expect(unhandled).toEqual([]);
+    } finally { process.off('unhandledRejection', onUnhandled); }
+  });
+
   it('denies a lane\'s verification producer before any fence, with the verification refusal', async () => {
     const policy: WorkerVerificationPolicy = { jobId: 'job', laneId: 'lane', cwd: '/lane', scopes: ['full'], producerPrefixes: [['npm', 'test']], helper: 'gc-verify', configFile: '/config.toml' };
     const c = channel(() => ({ allow: true }), policy);

@@ -199,23 +199,28 @@ export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
 export function deterministicFailureClass(reason: string): FailureClass {
   // Word-bounded signals: bare substrings wall-classified unrelated text
-  // ("author" hit `auth`; "port 13020" hit `1302`). The stems admit the
-  // snake-case spellings real errors use (auth_error, auth-failure,
-  // rate_limit) and RateLimited; other camel-case spellings
-  // (AuthenticationFailed, authError) do not match. Claude Code's typed error
-  // codes (its closed 2.1.309 enum) that name a deterministic wall are listed
-  // whole: authentication_failed, oauth_org_not_allowed,
-  // cloud_credential_error and verification_required are authentication
-  // walls; billing_error, account_on_hold and rate_limit are quota walls.
-  // "authorized" stays a signal: providers say "no longer authorized" or "only
-  // authorized for use with Claude Code". For GC's own refusals the tag, not
-  // the text, is the guard (#485); GC's literal refusal texts avoid wall words
-  // so an untagged one still reads `unknown`.
+  // ("author" hit `auth`; "port 13020" hit `1302`). A word boundary never falls
+  // at "_", so only the spellings listed here match: auth_error, auth-failure,
+  // auth_failure, rate_limit, rate-limit and RateLimited; others
+  // (authentication_error, rate_limit_error, rate_limit_exceeded,
+  // insufficient_quota, AuthenticationFailed, authError) read unknown. Claude
+  // Code's typed error codes (its closed 2.1.309 enum) that name a
+  // deterministic wall by the CLI's own policy are listed whole:
+  // authentication_failed, oauth_org_not_allowed, verification_required and
+  // account_on_hold (the CLI stops on it as an auth failure) are
+  // authentication walls; billing_error and rate_limit are quota walls. A
+  // statusless typed rate_limit is the CLI's capacity off-switch: pacing's
+  // bounded retry sees it first, and with no pacing policy it walls here.
+  // cloud_credential_error is transient (the CLI retries it) and reads
+  // unknown. "authorized" stays a signal: providers say "no longer
+  // authorized" or "only authorized for use with Claude Code". For GC's own
+  // refusals the tag, not the text, is the guard (#485); GC's literal refusal
+  // texts avoid wall words so an untagged one still reads `unknown`.
   if (
-    /\b(?:unauthorized|oauth|oauth_org_not_allowed|cloud_credential_error|verification_required|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+    /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';
   if (
-    /\bquota\b|\brate[-_ ]?limit(?:ed)?\b|\bbilling_error\b|\baccount_on_hold\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
+    /\bquota\b|\brate[-_ ]?limit(?:ed)?\b|\bbilling_error\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
   ) return 'quota_wall';
   if (/network|connect|dns|socket|econn|fetch failed/i.test(reason)) return 'network_failure';
   if (/turn hang|compaction hang|silence|watchdog/i.test(reason)) return 'turn_hang';

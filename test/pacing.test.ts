@@ -49,6 +49,13 @@ describe('rate-limit error class (provider-agnostic)', () => {
     }
   });
 
+  it('matches Claude Code\'s typed rate_limit, as its capacity off-switch reports it with no status (#485)', () => {
+    // GC's own text for 2.1.309's client-side capacity off-switch: a typed code, no HTTP status.
+    expect(isRateLimitErrorText('Opus is experiencing high load. Switch to Sonnet. (rate_limit)')).toBe(true);
+    // A word boundary never falls at "_": a field named after it is no rate limit.
+    expect(isRateLimitErrorText('rate_limit_remaining: 0')).toBe(false);
+  });
+
   it('does not match auth, billing, transport, server, or hang failures', () => {
     const notRateLimited = [
       'HTTP 401 unauthorized',

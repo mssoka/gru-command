@@ -73,7 +73,8 @@ export class ClaudeDirectivePermissionChannel {
       readonly refused: (toolUseId: string | undefined, reason: string) => unknown;
       /** Called once per tool request, after the request frame is durable. */
       readonly decide: (request: ClaudeToolRequest, durable: Promise<void>) => Promise<ClaudeToolDecision>;
-      /** Called as an allow is written: the decision written instead (#485). */
+      /** Called as an allow is written: the decision written instead (#485).
+       * A throw is a fence that failed. */
       readonly confirm: (request: ClaudeToolRequest) => ClaudeToolDecision;
       readonly verification?: WorkerVerificationPolicy;
     },
@@ -135,19 +136,29 @@ export class ClaudeDirectivePermissionChannel {
     }
     this.deps.decide(tool, durable).then(
       (decided) => {
-        // A failure recorded since the fence passed still denies the allow.
-        const decision = decided.allow ? this.deps.confirm(tool) : decided;
+        let decision: ClaudeToolDecision;
+        try {
+          // A failure recorded since the fence passed still denies the allow.
+          decision = decided.allow ? this.deps.confirm(tool) : decided;
+        } catch (error) {
+          // A re-check that throws is a fence that failed, never an unhandled rejection (#485).
+          this.fenceFailed(id as string, tool, error);
+          return;
+        }
         this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message });
       },
-      (error: unknown) => {
-        const reason = `directive tool fence failed: ${thrownText(error)}`;
-        let report: unknown;
-        if (!this.closed && this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' })) {
-          report = this.deps.refused(tool.toolUseId, reason);
-        }
-        this.deps.fail(reason, report);
-      },
+      (error: unknown) => this.fenceFailed(id as string, tool, error),
     );
+  }
+
+  /** The fence could not decide: deny the tool, keep a durable refusal of it, and end the turn. */
+  private fenceFailed(requestId: string, tool: ClaudeToolRequest, error: unknown): void {
+    const reason = `directive tool fence failed: ${thrownText(error)}`;
+    let report: unknown;
+    if (!this.closed && this.respond(requestId, { behavior: 'deny', message: 'The directive tool fence failed' })) {
+      report = this.deps.refused(tool.toolUseId, reason);
+    }
+    this.deps.fail(reason, report);
   }
 
   /** Whether the response was handed to the CLI. */

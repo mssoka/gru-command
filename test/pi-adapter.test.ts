@@ -4008,9 +4008,12 @@ it('real sequential SDK tools recheck revoked directive authority after prior-ho
 /** A supervised real-SDK directive scene for native directive refusals (#485). */
 async function nativeRefusalFixture(turns: readonly StubTurn[] | StubResponder, configureSession?: Parameters<typeof sdkDirectiveExecutionFixture>[1]) {
   const f = await sdkDirectiveExecutionFixture(turns, configureSession);
+  // The supervisor's own log lines, kept for assertions.
+  const supervisorLogs: { readonly level: string; readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
   const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
     restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
-    registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60_000 });
+    registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60_000,
+    log: (level, msg, fields) => { supervisorLogs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); } });
   const handle = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'logical-minion' });
   if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
   const events = collect(handle);
@@ -4026,7 +4029,7 @@ async function nativeRefusalFixture(turns: readonly StubTurn[] | StubResponder, 
     expect(handle.health().state).not.toBe('disposed');
   };
   const cleanup = async () => { supervisor.dispose(); await f.cleanup(); };
-  return { ...f, supervisor, handle, events, errors, retained, expectRetained, cleanup };
+  return { ...f, supervisor, supervisorLogs, handle, events, errors, retained, expectRetained, cleanup };
 }
 
 /** Starts the scene's one ledger directive on its minion. */
@@ -4215,7 +4218,7 @@ const EXTENSION_AUTH = '401 Unauthorized: invalid x-api-key';
 
 /** An error from code GC does not own (an extension hook, the SDK) in a directive
  * turn, and GC's wrapper around one, are routed as the failures they are (#485). */
-async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjournaled' | 'extension-tool-fence') {
+async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjournaled' | 'extension-unjournaled-persistent' | 'extension-tool-fence') {
   const checkpoint = await import('../src/runtime/directive-checkpoint.js');
   const f = await nativeRefusalFixture([
     { deltas: [], toolCall: { id: 'permitted-effect', name: 'bash', args: { command: 'printf ran > foreign-error.txt' } } },
@@ -4234,10 +4237,14 @@ async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjo
     vi.spyOn(runner, 'emitToolCall').mockRejectedValue(new Error(EXTENSION_AUTH));
   });
   const { handle } = f;
-  const journals = where === 'extension-unjournaled'
+  const unjournaled = where === 'extension-unjournaled' || where === 'extension-unjournaled-persistent';
+  const journals = unjournaled
     ? [vi.spyOn(checkpoint, 'recordDirectiveToolRefusal'), vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal')]
-      // Each fails once in the turn; the wall stop's disposal retries them and succeeds.
-      .map((journal) => journal.mockImplementationOnce(() => { throw new Error('refusal journal unavailable'); }))
+      // Each fails once in the turn, and the wall stop's disposal retries them and succeeds;
+      // or the journal stays down through that disposal too.
+      .map((journal) => where === 'extension-unjournaled-persistent'
+        ? journal.mockImplementation(() => { throw new Error('refusal journal unavailable'); })
+        : journal.mockImplementationOnce(() => { throw new Error('refusal journal unavailable'); }))
     : [];
   try {
     const { options } = startLedgerDirective(f);
@@ -4249,6 +4256,8 @@ async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjo
       // either, and keeps the foreign error's own words.
       'extension-unjournaled': 'native guard refusal could not be durably recorded; physical ownership retained: DirectiveCheckpointError: '
         + `native directive admission/guard failed; further tool effects refused: Error: ${EXTENSION_AUTH}`,
+      'extension-unjournaled-persistent': 'native guard refusal could not be durably recorded; physical ownership retained: DirectiveCheckpointError: '
+        + `native directive admission/guard failed; further tool effects refused: Error: ${EXTENSION_AUTH}`,
       // GC's wrapper names its foreign cause: still the extension's failure, never a refusal.
       'extension-tool-fence': `native directive admission/guard failed; further tool effects refused: Error: ${EXTENSION_AUTH}`,
     }[where] }]);
@@ -4258,6 +4267,23 @@ async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjo
       // The extension's 401 is classified by its own words: an authentication wall.
       await waitFor(() => f.supervisor.viewFor(handle.id)?.state === 'stopped', 'the authentication-wall stop');
       expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+      expect(f.scene.ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === `supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+      if (where === 'extension-unjournaled-persistent') {
+        // The stop's disposal cannot settle the owed receipts: it fails loud and named, and the
+        // handle keeps its physical ownership (registered, cessation unknown), never ceased silently.
+        await waitFor(() => f.supervisorLogs.some((line) => line.msg === 'dispose after provider-wall escalation failed'), 'the failed disposal');
+        expect(f.supervisorLogs).toContainEqual({ level: 'warn', msg: 'dispose after provider-wall escalation failed',
+          fields: { agent_id: handle.id, error: 'Error: refusal journal unavailable' } });
+        expect(f.registry.getHandle(handle.id)).toBe(handle);
+        expect(handle.cessationEvidence!()).toBe('unknown');
+        // Once the journal is back, the next disposal settles the receipts and the handle ceases.
+        for (const journal of journals) journal.mockRestore();
+        await f.registry.disposeHandle(handle);
+        expect(handle.cessationEvidence!()).toBe('ceased');
+      } else {
+        await waitFor(() => handle.health().state === 'disposed', 'the stop\'s disposal');
+        expect(handle.cessationEvidence!()).toBe('ceased');
+      }
     } else {
       // Routed, and classified by words that name no wall.
       expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
@@ -4266,6 +4292,7 @@ async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjo
 }
 it('the SDK\'s own next-turn failure in a directive turn stays untagged with its provider identity (#485)', () => assertForeignErrorRouted('sdk-next-turn'));
 it('a Pi extension\'s 401 whose refusal receipts cannot be journaled stays untagged in its AggregateError, and still walls (#485)', () => assertForeignErrorRouted('extension-unjournaled'));
+it('a refusal journal that stays down through the wall stop leaves the disposal failed loud and the handle owned, until a retry settles it (#485)', () => assertForeignErrorRouted('extension-unjournaled-persistent'));
 it('a Pi extension\'s 401 at a tool fence, wrapped by GC at the next fence, stays untagged and stops as authentication_wall (#485)', () => assertForeignErrorRouted('extension-tool-fence'));
 
 /** GC code outside its bookkeeping calls (the authority manifest) failing at Pi's
@@ -4287,7 +4314,7 @@ async function assertPreflightManifestFailure(thrown: 'error' | 'null') {
     if (thrown === 'error') await expect(turn).rejects.toThrow(new TypeError('authority manifest computation failed'));
     else await expect(turn).rejects.toBeNull();
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
-    const error = thrown === 'error' ? 'TypeError: authority manifest computation failed' : 'a directive step threw a non-error value: null';
+    const error = thrown === 'error' ? 'TypeError: authority manifest computation failed' : 'a non-error value was thrown: null';
     expect(f.errors()).toEqual([{ type: 'error', error, fatal: false }]);
     expect(handle.health().error).toBe(error);
     expect(f.retained()).toEqual([]);
@@ -4297,6 +4324,29 @@ async function assertPreflightManifestFailure(thrown: 'error' | 'null') {
 }
 it('a GC failure outside its bookkeeping at Pi\'s preflight rejects the prompt untagged (#485)', () => assertPreflightManifestFailure('error'));
 it('a null thrown outside GC\'s bookkeeping at Pi\'s preflight is routed untagged and named (#485)', () => assertPreflightManifestFailure('null'));
+
+it('a value the turn\'s own proof read throws that cannot be printed still settles a named verdict, and frees the turn (#485)', async () => {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  const f = await nativeRefusalFixture([{ deltas: ['done'] }]);
+  const { handle } = f;
+  // Read 1 is the completion's checkpoint read; read 2 the verdict's own proof read.
+  const inspect = checkpoint.inspectDirectiveCheckpoint;
+  let reads = 0;
+  const proof = vi.spyOn(checkpoint, 'inspectDirectiveCheckpoint').mockImplementation((...args) => {
+    if (++reads !== 2) return inspect(...args);
+    const value: unknown = Object.create(null);
+    throw value;
+  });
+  try {
+    const verdict = await handle.promptWithVerdict!('proof directive', { directive: { identity: { requestId: 'unprintable-proof', payloadHash: 'a'.repeat(64),
+      contractSha256: 'c'.repeat(64), jobId: 'unprintable-job', workRevision: 0, authorityEpoch: 0 }, beforeAdmission: () => {}, onAdmitted: () => {} } });
+    expect(reads).toBe(2);
+    expect(verdict).toEqual({ ok: false, error: 'native correlated terminal proof unavailable: a non-error value was thrown: an unprintable value' });
+    // The settle path ran to its end: no live turn is left behind.
+    expect(handle.pendingTurn?.()).toBeNull();
+    expect(handle.health().state).toBe('idle');
+  } finally { proof.mockRestore(); await f.cleanup(); }
+});
 
 type PiBookkeepingCall = 'authority check at preflight' | 'binding read at preflight' | 'authority check' | 'tool intent journal' | 'binding read'
   | 'admission receipt' | 'admission publication' | 'checkpoint read' | 'completion receipt';
@@ -4397,7 +4447,7 @@ async function assertNullishFailure(site: 'fence' | 'admission publication', thr
     // Neither tool ran: the failure refuses every later effect.
     expect(existsSync(join(f.scene.lane.path, 'nullish-fence.txt'))).toBe(false);
     expect(f.fx.script.calls).toHaveLength(1);
-    const named = `a directive step threw a non-error value: ${String(thrown)}`;
+    const named = `a non-error value was thrown: ${String(thrown)}`;
     // The turn's durable texts name the bare value: its verdict, and the first tool's refusal receipt.
     const failure = site === 'fence' ? named : `DirectiveCheckpointError: directive bookkeeping failed: admission publication: ${named}`;
     expect(verdict).toEqual({ ok: false, error: failure });

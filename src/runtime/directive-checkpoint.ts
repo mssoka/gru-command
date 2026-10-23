@@ -62,12 +62,28 @@ export function isNativeDirectiveRefusal(error: unknown): error is DirectiveChec
 /** The text GC records for a thrown value: an error's own text (`message`,
  * or `string` for String(error)), any realm's error included, and a non-error
  * throw named, never a bare "null" (#485). It never throws itself: it runs in
- * failure handlers. */
+ * failure handlers, so a value that cannot be read at all (a throwing
+ * `message` getter, a Proxy whose trap throws) gets a fixed text. */
 export function thrownText(value: unknown, form: 'message' | 'string' = 'message'): string {
-  if (types.isNativeError(value) || value instanceof Error) {
-    return form === 'string' ? printable(value) : printable((value as Error).message);
+  try {
+    if (isError(value)) return form === 'string' ? String(value) : String(value.message);
+    return `a non-error value was thrown: ${printable(value)}`;
+  } catch {
+    return 'a thrown value that cannot be read';
   }
-  return `a directive step threw a non-error value: ${printable(value)}`;
+}
+
+/** An error from any realm (#485). */
+function isError(value: unknown): value is Error {
+  return types.isNativeError(value) || value instanceof Error;
+}
+
+/** A thrown value for a log line: an error's stack (any realm's), else its text. */
+export function thrownDetail(value: unknown): string {
+  try {
+    if (isError(value) && typeof value.stack === 'string') return value.stack;
+  } catch { /* falls through to its text */ }
+  return thrownText(value);
 }
 
 /** String(value), or a named stand-in when the value cannot be printed (a
