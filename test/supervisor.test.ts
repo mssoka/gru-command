@@ -2047,6 +2047,46 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
+  it('#497 re-runs a failed replacement disposal once its adapter attests cessation, so custody settles', async () => {
+    // A Pi replacement whose cessation receipt cannot be written rejects its
+    // disposal and keeps UNKNOWN. The receipt is written either at once (the
+    // registry re-queries on the rejection) or by a later custody query; Pi
+    // then resolves a re-run disposal immediately.
+    for (const written of ['on-rejection', 'later'] as const) {
+      vi.useFakeTimers();
+      const f = await deferredRestart();
+      try {
+        f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer work', briefing: null });
+        let receipt = false;
+        let disposals = 0;
+        const dispose = f.replacement.dispose.bind(f.replacement);
+        f.replacement.dispose = async () => {
+          await dispose();
+          disposals += 1;
+          if (disposals > 1) return;
+          if (written === 'on-rejection') receipt = true;
+          throw new Error('ENOSPC: no space left on device, write');
+        };
+        f.replacement.cessationEvidence = () => receipt ? 'ceased' : 'unknown';
+        f.releaseSpawn(f.replacement);
+        await flushMicrotasks();
+        if (written === 'later') {
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' '), written).toContain(`restart cleanup unconfirmed: ${f.replacement.id}`);
+          expect(disposals, written).toBe(1);
+          receipt = true; // the journal recovers; the next custody query writes the receipt
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' '), written).toContain(`restart cleanup unconfirmed: ${f.replacement.id}`);
+          await flushMicrotasks();
+        }
+        expect(disposals, written).toBe(2);
+        expect(f.rig.supervisor.pendingProducerBlockers(f.jobId), written).toEqual([]);
+        expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')[0]?.resolvedBy, written).toBe('supervision-cleanup-confirmed');
+        expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-cleanup-confirmed')?.payload, written)
+          .toMatchObject({ replacement_agent_id: f.replacement.id });
+        expect(f.replacement.promptCalls, written).toEqual([]);
+      } finally { f.rig.dispose(); vi.useRealTimers(); }
+    }
+  });
+
   it('rejects a same-id resumed replacement without reviving its historical job binding or swapping the slot', async () => {
     vi.useFakeTimers();
     const f = await deferredRestart(true);

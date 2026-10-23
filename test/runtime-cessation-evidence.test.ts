@@ -572,7 +572,7 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     }
   });
 
-  it('a listener of the disposed state reads ceased and never re-enters the release, at disposal and on a retry', async () => {
+  it('a listener of the disposed state reads ceased and the release runs once, at disposal and on a retry', async () => {
     for (const late of [false, true]) {
       const { handle, session, events, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
       store.acquireLock(sessionFile);

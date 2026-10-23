@@ -309,6 +309,9 @@ interface RejectedRestartCleanup {
    * replacement (binding failure) whose controller stays retryable. */
   readonly superseded: boolean;
   disposalAcknowledged: boolean;
+  /** The supervisor's own disposal rejected; a re-run may acknowledge it. */
+  disposalFailed: boolean;
+  redisposing: boolean;
   notificationId: string | null;
   debt: RestartCleanupDebt | null;
   detach: () => void;
@@ -2536,7 +2539,7 @@ export class Supervisor {
     const { jobId } = authority;
     const preserveController = agent.breakerOpen && this.agents.get(agent.agentId) === agent;
     const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, superseded,
-      disposalAcknowledged: false, notificationId: null, debt: null, detach: () => {}, settling: false };
+      disposalAcknowledged: false, disposalFailed: false, redisposing: false, notificationId: null, debt: null, detach: () => {}, settling: false };
     this.rejectedRestartCleanup.set(spawned, cleanup);
     // A published-but-rejected replacement is already registry-gettable: its
     // publication preceded these post-spawn fences. Revoke that eligibility
@@ -2545,7 +2548,8 @@ export class Supervisor {
     // disposal later rejects (#280 AC1).
     this.registry.quarantineHandle(spawned);
     const observeProof = (): void => {
-      if (!cleanup.disposalAcknowledged || !this.restartCessationConfirmed(spawned)) return;
+      if (!cleanup.disposalAcknowledged) { this.redisposeRejectedReplacement(spawned, cleanup); return; }
+      if (!this.restartCessationConfirmed(spawned)) return;
       try { this.settleRejectedRestartCleanup(spawned, cleanup); }
       catch (error) { this.log('error', 'restart cleanup proof persistence failed — custody retained', { agent_id: spawned.id, error: String(error) }); }
     };
@@ -2603,6 +2607,8 @@ export class Supervisor {
       this.settleRejectedRestartCleanup(spawned, cleanup);
     } catch (error) {
       disposalError = String(error);
+      cleanup.disposalFailed = true;
+      this.redisposeRejectedReplacement(spawned, cleanup);
     }
     // CURRENT custody, never the historical journal error, decides the outcome.
     // The disposal await can retry the pending write and fully settle custody
@@ -2660,6 +2666,25 @@ export class Supervisor {
       }
     }
     return cleanupError;
+  }
+
+  /** A rejected replacement whose disposal failed but whose adapter now
+   * attests cessation (a Pi receipt written on a later query, #497) gets its
+   * disposal re-run, so custody is acknowledged by a fulfilled disposal and
+   * never assumed. Only after the supervisor's own disposal failed, and one
+   * re-run at a time. */
+  private redisposeRejectedReplacement(handle: AgentHandle, cleanup: RejectedRestartCleanup): void {
+    if (!cleanup.disposalFailed || cleanup.disposalAcknowledged || cleanup.redisposing || this.rejectedRestartCleanup.get(handle) !== cleanup) return;
+    if (!this.restartCessationConfirmed(handle)) return;
+    cleanup.redisposing = true;
+    void this.registry.disposeHandle(handle).then(() => {
+      cleanup.disposalAcknowledged = true;
+      if (!this.restartCessationConfirmed(handle)) return;
+      try { this.settleRejectedRestartCleanup(handle, cleanup); }
+      catch (error) { this.log('error', 'restart cleanup proof persistence failed — custody retained', { agent_id: handle.id, error: String(error) }); }
+    }, (error: unknown) => {
+      this.log('warn', 'restart cleanup re-disposal failed — custody retained', { agent_id: handle.id, error: String(error) });
+    }).finally(() => { cleanup.redisposing = false; });
   }
 
   private restartCessationConfirmed(handle: AgentHandle): boolean {
@@ -3863,7 +3888,8 @@ export class Supervisor {
       if (cleanup.jobId !== jobId) continue;
       try {
         cleanup.debt ??= this.cleanupJournal.begin(handle, cleanup.jobId, cleanup.agent.agentId);
-        if (cleanup.disposalAcknowledged && this.restartCessationConfirmed(handle)) this.settleRejectedRestartCleanup(handle, cleanup);
+        if (!cleanup.disposalAcknowledged) this.redisposeRejectedReplacement(handle, cleanup);
+        else if (this.restartCessationConfirmed(handle)) this.settleRejectedRestartCleanup(handle, cleanup);
       } catch (error) {
         this.log('error', 'restart cleanup journal unavailable — custody retained', { agent_id: handle.id, error: String(error) });
       }
