@@ -2621,6 +2621,104 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
+    it('a process failure reported while a refusal is still pending is the process\'s own failure, never tagged (#485)', async () => {
+      const spawnProcess = ((binary: string, args: readonly string[], options: object) => {
+        const child = spawn(binary, args, options);
+        const stdin = child.stdin as unknown as { write: (chunk: unknown, ...rest: unknown[]) => boolean };
+        const write = stdin.write.bind(stdin);
+        let faulted = false;
+        stdin.write = (chunk, ...rest) => {
+          const written = write(chunk, ...rest);
+          // The fence's deny is written; the refusal's own failure is still queued behind it.
+          if (!faulted && String(chunk).includes('"behavior":"deny"')) { faulted = true; child.emit('error', new Error('synthetic transport fault')); }
+          return written;
+        };
+        return child;
+      }) as unknown as typeof spawn;
+      const fx = fixture({ spawnProcess, killGraceMs: 50 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      let checks = 0;
+      try {
+        await expect(handle.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor('claude-refusal-then-process-failure'),
+          beforeAdmission: () => { if (++checks > 1) throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work is authorized'); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^claude process failed: Error: synthetic transport fault$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'claude process failed: Error: synthetic transport fault', fatal: false }]);
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+      } finally { await handle.dispose(); }
+    });
+
+    it('a typed provider wall the CLI reports after a refusal is still emitted typed and untagged (#485)', async () => {
+      const fx = fixture({ killGraceMs: 100 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'claude-opus-5-5' });
+      const events = collect(handle);
+      // The CLI answers before its echo (a refusal), then reports its usage-limit wall before the abort lands.
+      process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('usage-limit now', { directive: { identity: identityFor('claude-refusal-then-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused: the Claude CLI began answering without echoing the directive instruction/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([
+          { type: 'error', error: expect.stringMatching(/^directive refused: the Claude CLI began answering without echoing/u), fatal: false, nativeControl: 'directive-refusal' },
+          { type: 'error', error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)", fatal: false, provider: 'anthropic-claude-native',
+            model: 'claude-opus-5-5', typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } },
+        ]);
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_ECHO'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        await handle.dispose();
+      }
+    });
+
+    it('the supervisor keeps a Claude directive refusal for directive recovery, and still stops on a provider wall reported after one (#485)', async () => {
+      const { LedgerDb } = await import('../src/ledger/db.js');
+      const { LedgerApi } = await import('../src/ledger/api.js');
+      const { EventBus } = await import('../src/events/bus.js');
+      const { NotificationCenter } = await import('../src/notifications/center.js');
+      const { Supervisor } = await import('../src/supervision/supervisor.js');
+      const fx = fixture();
+      writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[runtimes.roles]\nminion = "claude-code"\n`);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-claude-refusal-ledger-')));
+      const bus = new EventBus({});
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const registry = new RuntimeRegistry({ config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+        claude: { binary: DOUBLE, killGraceMs: 100, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') } });
+      const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+        registry, ledger, notifications, tickMs: 60_000 });
+      const refusal = 'directive authority is terminal, held or superseded — no work is authorized';
+      const retained = (agentId: string) => ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'supervision.native-refusal-retained' && event.agentId === agentId).map((event) => event.payload);
+      try {
+        // A refusal alone: no wall, no stop, one durable trace.
+        const refused = await registry.spawn('minion', { cwd: fx.workspace, agentId: 'claude-refused-minion' });
+        let checks = 0;
+        await expect(refused.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor('claude-supervised-refusal'),
+          beforeAdmission: () => { if (++checks > 1) throw new DirectiveCheckpointError(refusal); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(`directive refused: ${refusal}`);
+        for (let i = 0; i < 16; i += 1) await Promise.resolve();
+        expect(supervisor.viewFor(refused.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+        expect(retained(refused.id)).toEqual([{ error: `directive refused: ${refusal}` }]);
+        expect(refused.health().state).not.toBe('disposed');
+        expect(ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
+        // A provider wall after a refusal: the refusal is kept, the wall stops the minion.
+        const walled = await registry.spawn('minion', { cwd: fx.workspace, agentId: 'claude-walled-minion' });
+        process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
+        process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+        await expect(walled.prompt('usage-limit now', { directive: { identity: identityFor('claude-supervised-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused/u);
+        await vi.waitFor(() => expect(supervisor.viewFor(walled.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' }));
+        expect(retained(walled.id)).toHaveLength(1);
+        expect(ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === `supervision.provider-wall.${walled.id}.quota_wall`)).toHaveLength(1);
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_ECHO'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        supervisor.dispose();
+        await registry.dispose();
+        db.close();
+      }
+    });
+
     it('a refused tool\'s deny is written before the turn ends, and a CLI that ignores SIGTERM is killed after the grace period', async () => {
       const fx = fixture({ killGraceMs: 1500 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });

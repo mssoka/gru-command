@@ -2014,14 +2014,14 @@ export class ClaudeCodeHandle implements AgentHandle {
     return { directive, producer, content, settings, admission: null, admitted: null, failure: null, completion: null };
   }
 
-  private failDirective(turn: DirectiveTurn, error: unknown, abortTurn: (detail: string) => void): void {
+  private failDirective(turn: DirectiveTurn, error: unknown, abortTurn: (detail: string, cause?: unknown) => void): void {
     turn.failure ??= error;
-    abortTurn(`directive refused: ${error instanceof Error ? error.message : String(error)}`);
+    abortTurn(`directive refused: ${error instanceof Error ? error.message : String(error)}`, error);
   }
 
   /** Admission at the CLI's own echo; completion at the turn's own result. Each
    * reads back the frame only once it is durable in the transcript. */
-  private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string) => void): void {
+  private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string, cause?: unknown) => void): void {
     const { directive, producer } = turn;
     if (frame['type'] === 'user' && frame['isReplay'] === true) {
       // The CLI's own task notification is neither the echo nor a second prompt (#471).
@@ -2074,7 +2074,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** The tool fence (#424): admission published, authority current, the exact
    * intent durable in the admitted turn. Anything else refuses the tool and
    * ends the turn, with a durable guard receipt. */
-  private decideDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest, durable: Promise<void>, abortTurn: (detail: string) => void): Promise<ClaudeToolDecision> {
+  private decideDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest, durable: Promise<void>, abortTurn: (detail: string, cause?: unknown) => void): Promise<ClaudeToolDecision> {
     return durable.then(async (): Promise<ClaudeToolDecision> => {
       await turn.admission;
       if (turn.failure !== null || turn.admitted === null) {
@@ -2123,6 +2123,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       let settled = false;
       let failed = false;
       let failure = '';
+      /** The turn failed as GC's own directive refusal (#485). */
+      let refused = false;
       let child: ChildProcess;
       let stderrTail = '';
 
@@ -2252,13 +2254,16 @@ export class ClaudeCodeHandle implements AgentHandle {
 
       // Mark the turn failed (loud, once). Settling happens in the close
       // handler so the transcript stream is always flushed first.
-      const failTurn = (detail: string): void => {
+      // A failure whose cause is a DirectiveCheckpointError GC raised for the
+      // live directive is a native directive refusal (#485): the cause is the
+      // very failure reported here, never one the turn recorded earlier.
+      const failTurn = (detail: string, cause?: unknown): void => {
         if (failed) return;
         failed = true;
         failure = detail;
+        refused = turn !== null && cause instanceof DirectiveCheckpointError;
         if (!this.disposed) {
-          this.emit({ type: 'error', error: detail, fatal: false,
-            ...(turn?.failure instanceof DirectiveCheckpointError ? { nativeControl: 'directive-refusal' as const } : {}) });
+          this.emit({ type: 'error', error: detail, fatal: false, ...(refused ? { nativeControl: 'directive-refusal' as const } : {}) });
           this.setState('error', detail);
         }
       };
@@ -2290,8 +2295,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       let escalation: ReturnType<typeof setTimeout> | null = null;
       /** A live directive child already reported an error (handled once). */
       let liveError = false;
-      const abortTurn = (detail: string): void => {
-        failTurn(detail);
+      const abortTurn = (detail: string, cause?: unknown): void => {
+        failTurn(detail, cause);
         if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
         try { child.stdin?.end(); } catch { /* already closed */ }
         try { child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -2510,7 +2515,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         // admission was never published at all — is no success, whatever the
         // CLI reported.
         if (turn !== null && turn.failure !== null && !failed) {
-          failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`);
+          failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`, turn.failure);
         }
         if (turn !== null && turn.admitted === null && !failed && translator.result !== null) {
           failTurn('directive turn ended without the CLI\'s admission echo; nothing it did counts as delivered');
@@ -2536,6 +2541,12 @@ export class ClaudeCodeHandle implements AgentHandle {
           }
           settle(null);
           return;
+        }
+        if (refused && result !== null && result.isError) {
+          // The refusal is GC's, but a provider wall the CLI reported in the
+          // same turn is still the provider's: it is routed as itself (#485).
+          const wall = claudeInBandError(result, translator.apiError, translator.init?.model ?? params.model ?? null);
+          if (wall.typed !== undefined) this.emit(wall);
         }
         if (!failed) {
           const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
