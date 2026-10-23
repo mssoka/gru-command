@@ -2872,19 +2872,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     /** Fails one chunk of this handle's own transcript stream, written alone or in a
      * batch (a failed batch fails every chunk in it, as Node does). With `holdUntil`,
      * the failing write's callback waits until a write made after the hold began
-     * brings the frames queued behind it (its batch-mates count) to that many, so
-     * Node hands each of them the same root error, deterministically. `sharedRoot`
+     * finds at least that many frames queued behind it (its batch-mates count, so
+     * a hold whose batch-mates already number that many waits for one more
+     * write), and Node hands each of them the same root error. `sharedRoot`
      * counts, apart from the hold's own count, the write callbacks that received
      * that root error object itself: the failing write and every frame behind it.
      * Once the hold is released, a write made outside a callback that got the
      * root error waits for that error to land, so exactly the frames queued
      * before it share it; one made inside such a callback is queued at once, as
-     * Node queues it. A permission request is never held, and one queued behind
-     * a hold (written while it is open, or batched behind the held chunk) is
+     * Node queues it. A permission request is never held, and one queued with
+     * a hold (written while it is open, or in the held chunk's batch) is
      * failed: the CLI waits for its answer, so no frame would come to release
-     * the hold. The helper fails such a write with a text naming the misuse.
-     * Any other held frame is released by `holdUntil` frames behind it, or by
-     * the stream's end.
+     * the hold. The helper fails such a write with a text naming the misuse,
+     * and the turn that fails on it ends its stream, which releases the hold.
      * No adapter seam fails a transcript write: the stream comes straight from
      * node:fs createWriteStream, which only a file-wide vi.mock('node:fs') could
      * replace, and that would reach every test in this file. */
@@ -2914,7 +2914,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           // Not on setImmediate: some callers hold it with fake timers.
           process.nextTick(() => callback(root));
         };
-        // The turn ends its stream once the CLI is gone: a hold still waiting fails then, never hangs.
+        // A turn that fails while a hold is open ends its stream: the hold fails then, never hangs.
         stream.end = (...args) => { release(); return end(...args); };
         // The chunks after the failing one in its own batch are queued behind it too.
         const failing = (callback: Callback, behind: number, chunk: string): void => {
@@ -2933,8 +2933,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         };
         stream._writev = (chunks, callback) => {
           const at = state.broken ? -1 : chunks.findIndex(({ chunk }) => matches(chunk.toString()));
-          // A permission request already batched behind the chunk to hold.
-          if (at >= 0 && holdUntil > 0 && chunks.slice(at + 1).some(({ chunk }) => permissionRequest(chunk.toString()))) {
+          // A permission request in the batch of the chunk to hold, ahead of it or behind.
+          if (at >= 0 && holdUntil > 0 && chunks.some(({ chunk }, index) => index !== at && permissionRequest(chunk.toString()))) {
             state.broken = true;
             callback(new Error(queuedRefusal));
             return;
@@ -2998,6 +2998,43 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(lost.broken).toBe(true);
         expect(lost.sharedRoot).toBe(0); // never held: the root error was never handed out
       } finally { await handle.dispose(); }
+    });
+
+    /** Drives the lost-write helper on a real file stream: holds `"held"` and writes a
+     * permission request with it, in one corked batch (ahead of it or behind) or after it.
+     * Returns what the request's write got, or "hung" after 500 ms (#485). */
+    async function queuedPermission(placement: 'after' | 'batched ahead' | 'batched behind'): Promise<string> {
+      const dir = mkdtempSync(join(tmpdir(), 'gru-lost-write-'));
+      const stream = createWriteStream(join(dir, 'transcript.jsonl'));
+      try {
+        await once(stream, 'open');
+        stream.on('error', () => { /* the root error, as the adapter's own listener takes it */ });
+        const listeners: ((event: RuntimeEvent) => void)[] = [];
+        const handle = { liveTranscript: stream, subscribe: (listener: (event: RuntimeEvent) => void) => { listeners.push(listener); return () => {}; } };
+        failTranscriptChunk(handle as unknown as AgentHandle, (chunk) => chunk.includes('"held"'), 'EDQUOT: disk quota exceeded', 5);
+        for (const listener of listeners) listener({ type: 'turn_start' });
+        if (placement !== 'after') stream.cork();
+        const request = (): Promise<string> => new Promise<string>((resolve) => {
+          stream.write(`${JSON.stringify({ type: 'control_request', request_id: 'r1' })}\n`, (error?: Error | null) => resolve(String(error)));
+        });
+        const answer = placement === 'batched ahead' ? request() : null;
+        stream.write(`${JSON.stringify({ type: 'held' })}\n`);
+        const answered = answer ?? request();
+        if (placement !== 'after') stream.uncork();
+        const hung = new Promise<string>((resolve) => { setTimeout(() => resolve('hung'), 500).unref(); });
+        return await Promise.race([answered, hung]);
+      } finally {
+        stream.destroy();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    const queuedRefusal = /^Error: failTranscriptChunk refuses a permission request queued behind a held write/u;
+    it('the lost-write helper fails a permission request written while a hold is open, by name (#485)', async () => {
+      expect(await queuedPermission('after')).toMatch(queuedRefusal);
+    });
+    it('the lost-write helper fails a permission request batched with the held chunk, ahead of it or behind, by name (#485)', async () => {
+      expect(await queuedPermission('batched behind')).toMatch(queuedRefusal);
+      expect(await queuedPermission('batched ahead')).toMatch(queuedRefusal);
     });
 
     it('the lost-write helper queues a write made inside a callback that got the root error at once, as Node does (#485)', async () => {
@@ -3263,12 +3300,32 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       return { spawnProcess, answers };
     };
 
+    /** Makes the tool pair's two permission requests durable in one tick, as the
+     * concurrent-fence tests assume: the transcript is corked from the tool_use frame
+     * until the second request is queued, so their writes share one `_writev` batch
+     * (Node batches them only when a write is in flight; #485). */
+    const batchPermissionRequests = (handle: AgentHandle): void => {
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        const stream = (handle as unknown as { liveTranscript: { write: (...args: unknown[]) => boolean; cork(): void; uncork(): void } }).liveTranscript;
+        const write = stream.write.bind(stream);
+        stream.write = (...args) => {
+          const chunk = String(args[0]);
+          if (chunk.includes('"type":"assistant"') && chunk.includes('toolu_pair_1')) stream.cork();
+          const written = write(...args);
+          if (chunk.includes('"can_use_tool"') && chunk.includes('toolu_pair_2')) stream.uncork();
+          return written;
+        };
+      });
+    };
+
     /** Two concurrent permission requests, durable in one tick: once either fence has
      * failed, neither tool is allowed, even an allow its own fence already passed (#485). */
     async function assertConcurrentFenceRefusal(failing: 'first' | 'second') {
       const wire = recordingAnswers();
       const fx = fixture({ killGraceMs: 300, spawnProcess: wire.spawnProcess });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      batchPermissionRequests(handle);
       const events = collect(handle);
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
       const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
@@ -3282,8 +3339,12 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // before any authority check of its own.
         expect(checks).toBe(failing === 'first' ? 2 : 3);
         expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: `directive refused: ${refusal}`, fatal: false, nativeControl: 'directive-refusal' }]);
-        // Both answers the channel wrote to the CLI are denies.
-        expect(wire.answers.map((answer) => answer['behavior'])).toEqual(['deny', 'deny']);
+        // Both answers the channel wrote to the CLI are denies: the failing fence's own, and
+        // the other request's, refused by the earlier failure (the first's allow is re-checked
+        // as it is written, so it goes out first).
+        const fenceDeny = { behavior: 'deny', message: `Refused by the directive's authority fence: ${refusal}` };
+        const earlierDeny = { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' };
+        expect(wire.answers).toEqual(failing === 'first' ? [fenceDeny, earlierDeny] : [earlierDeny, fenceDeny]);
         // The other request's deny is durable too: its own guard receipt.
         const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; reason?: string });
         expect(receipts.filter((receipt) => receipt.state === 'guard-refused').map((receipt) => receipt.toolCallId).sort()).toEqual(['toolu_pair_1', 'toolu_pair_2']);
@@ -3301,6 +3362,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const wire = recordingAnswers();
       const fx = fixture({ killGraceMs: 300, spawnProcess: wire.spawnProcess });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      batchPermissionRequests(handle);
       const events = collect(handle);
       // A fence's refusal ends a CLI that ignores SIGTERM; the completion's lets it exit on its own.
       if (site !== 'completion manifest') process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';

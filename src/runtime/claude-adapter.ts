@@ -2421,12 +2421,10 @@ export class ClaudeCodeHandle implements AgentHandle {
                 } catch (failure) {
                   // The directive still fails, and its CLI is still ended. An
                   // earlier failure still owed its report stays the turn's.
+                  // recordDirectiveFailure keeps the failure in memory, and
+                  // emit() isolates abortTurn's listeners; no guard is added.
                   const owed = this.recordDirectiveFailure(turn, failure);
                   this.log('error', 'directive failure handling threw after a lost transcript write', { error: thrownDetail(failure) });
-                  // abortTurn cannot throw: failTurn cannot (emit() isolates
-                  // listeners and names what they throw through thrownText, and
-                  // the logger swallows its own faults), and its signals are
-                  // guarded.
                   abortTurn(owed === failure ? `directive failure handling threw: ${thrownText(failure)}` : `directive refused: ${thrownText(owed)}`, owed);
                 } finally {
                   resolveWritten();
@@ -2707,12 +2705,9 @@ export class ClaudeCodeHandle implements AgentHandle {
             const failure = this.recordDirectiveFailure(turn, refusal);
             return { failure, owed: failure !== refusal };
           },
-          // Handling the channel's own failure threw (#485). refused() and
-          // fail() above don't throw in production (see the channel's
-          // contract), so this is a backstop for a GC bug: the turn is
-          // refused, tagged, or fails with the failure it already owes. The
-          // refusal stays on the turn and the CLI is ended before anything is
-          // logged, so no later effect or completion passes it.
+          // The channel's backstop for a GC bug in refused() or fail() above,
+          // which don't throw in production (#485): the turn fails as a tagged
+          // handling refusal, unless it has already reported a failure.
           failRefused: (reason) => {
             const refusal = new DirectiveCheckpointError(reason);
             let unrecorded: { readonly error: unknown } | null = null;

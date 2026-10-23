@@ -277,8 +277,8 @@ describe('typed decision semantics', () => {
       expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe(wall);
     }
     expect(deterministicFailureClass('Credit balance is too low (billing_error)')).toBe('quota_wall');
-    // The rest of the closed enum names no wall by its token: model_not_found too
-    // (a restart, then the breaker if it persists).
+    // The rest of the closed enum names no wall by its token, model_not_found too: in
+    // band, such a turn fails and neither walls nor restarts.
     for (const code of ['overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
       expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe('unknown');
     }
@@ -335,24 +335,25 @@ describe('typed decision semantics', () => {
   // Scanned below: the message of `new DirectiveCheckpointError(…)` and `new
   // DirectiveRuntimeUnsupportedError(…)`; in directive-checkpoint.ts the reasons
   // of its local refuse()/refused() helpers, refuse's default reason, every
-  // unknown(…) reason (Claude's checkpoint refusal text quotes them) and what its
-  // *Refusal and *RetryCompaction helpers return as a text; ledger/api.ts's
-  // refuse() reasons; the Claude permission channel's texts (claude-directive.ts:
-  // what it hands this.fail(), this.refuse() and deps.failRefused(), and each
-  // `const reason`); the call names given to withOwnIo()/ownIoRefusal(); and the
-  // texts the refusal classes and thrownText write themselves. Each is read as an
-  // expression: every branch of a ternary (not its condition), both sides of a
-  // `??` or `||` fallback, a parenthesised or `as`-cast arm, and an arm's `+`
-  // chain of literals (single, double or backtick quoted) and constants, with
-  // anything else in the chain as runtime detail. A constant, a `+` operand or a
-  // template's `${…}`, is resolved to its literal in the same file, and one that
-  // is no literal fails the scan; a numeric bound interpolated into a template is
-  // runtime detail. A call to one of the helpers whose returns are scanned is
-  // exempt. An arm with no literal or constant must be one of KNOWN_UNSCANNED,
-  // counted per site, or it fails the scan by name. Not visible to it either: the
-  // "current gate duty " prefix ledger/api.ts's refuse() puts before its reasons,
-  // and a bookkeeping refusal's fault text after GC's prefix, which is the disk's
-  // or the OS's words and is guarded by the tag, not by its text.
+  // unknown(…) reason (Claude's checkpoint refusal text quotes them), the oversize
+  // texts it hands its line reader, and what its *Refusal and *RetryCompaction
+  // helpers return as a text; ledger/api.ts's refuse() reasons; the Claude
+  // permission channel's texts (claude-directive.ts: what it hands this.fail(),
+  // this.refuse() and deps.failRefused(), and each `const reason`); the call names
+  // given to withOwnIo()/ownIoRefusal(); and the texts the refusal classes and
+  // thrownText write themselves. Each is read as an expression: every branch of a
+  // ternary (not its condition), both sides of a `??` or `||` fallback, a
+  // parenthesised or `as`-cast arm, and an arm's `+` chain of literals (single,
+  // double or backtick quoted) and UPPER_CASE constants. Only an UPPER_CASE
+  // constant resolves, as a `+` operand or a template's `${…}`, to its literal in
+  // the same file; one that is no literal fails the scan. Anything else in a chain
+  // is runtime detail: a lower-case identifier, a numeric bound interpolated into
+  // a template, and a call to a helper whose returns are scanned. An arm with no
+  // literal or constant must be one of KNOWN_UNSCANNED, counted per site, or it
+  // fails the scan by name. Not visible to it either: the "current gate duty "
+  // prefix ledger/api.ts's refuse() puts before its reasons, and a bookkeeping
+  // refusal's fault text after GC's prefix, which is the disk's or the OS's words
+  // and is guarded by the tag, not by its text.
   /** The arms the scan cannot read, counted per site, each checked by hand in #485 (none names a wall). */
   const KNOWN_UNSCANNED: Readonly<Record<string, number>> = {
     // Directive recovery's texts from its proofs and verdicts (verdict.error can carry a provider's own text).
@@ -394,6 +395,8 @@ describe('typed decision semantics', () => {
       [/\bthis\.refuse\(/gu, channel, 1],
       [/\bdeps\.failRefused\(/gu, channel, 0],
       [/(?<!function )\b(?:withOwnIo|ownIoRefusal)\(/gu, () => true, 0],
+      // The checkpoint's oversize texts, handed to its line reader.
+      [/\bthis(?:\.lines)?\.next\(/gu, checkpoint, 1],
       [/\bconst reason = /gu, channel, -1],
     ];
     // A small lexer: the index just past a literal (with its interpolations),
@@ -473,20 +476,24 @@ describe('typed decision semantics', () => {
     // skipped, by name.
     const scanArm = (file: string, source: string, raw: string): void => {
       const arm = raw.trim().replace(/\s+as\s+[\w.<>[\]| ]+$/u, '').replace(/!$/u, '');
-      // No argument (a default reason, scanned on its own), no text, or a helper whose returns are scanned.
-      if (arm === '' || arm === 'null' || arm === 'undefined' || arm.startsWith('{') || scannedHelpers.has(/^(\w+)\(/u.exec(arm)?.[1] ?? '')) return;
+      // No argument (a default reason, scanned on its own), or no text.
+      if (arm === '' || arm === 'null' || arm === 'undefined' || arm.startsWith('{')) return;
       if (arm.startsWith('(') && pastGroup(arm, 0) === arm.length) { scanExpression(file, source, arm.slice(1, -1)); return; }
       let text = '';
       let read = false;
+      let helpersOnly = true;
       for (const [at, operand] of split(arm, ['+']).entries()) {
         if (at % 2 === 1) continue;
         const part = operand.trim();
+        // A call to a helper whose returns are scanned is runtime detail here; the rest of the chain is read.
+        const helper = scannedHelpers.has(/^(\w+)\([^]*\)$/u.exec(part)?.[1] ?? '');
+        helpersOnly &&= helper;
         if (new RegExp(String.raw`^(?:${literal})$`, 'u').test(part)) { text += textOf(file, source, part); read = true; }
         else if (/^[A-Z][A-Z0-9_]*$/u.test(part)) { text += constant(file, source, part); read = true; }
         else text += 'x';
       }
       if (read) texts.push(text);
-      else skipped.push(`${relative(srcDir, file)}: ${arm.replace(/\s+/gu, ' ')}`);
+      else if (!helpersOnly) skipped.push(`${relative(srcDir, file)}: ${arm.replace(/\s+/gu, ' ')}`);
     };
     // Every arm of the expression: each ternary's branches (not its conditions),
     // and both sides of a `??` or `||` fallback.
@@ -522,7 +529,7 @@ describe('typed decision semantics', () => {
     for (const site of skipped) unscanned[site] = (unscanned[site] ?? 0) + 1;
     expect(unscanned).toEqual(KNOWN_UNSCANNED);
     expect(texts.some((text) => text.startsWith('an earlier directive failure refused this turn'))).toBe(true);
-    expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'MALFORMED', 'RETRIED_TWICE', 'UNBOUND_TAIL']));
+    expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'ENTRY_OVERSIZED', 'HEADER_OVERSIZED', 'MALFORMED', 'RETRIED_TWICE', 'UNBOUND_TAIL']));
     expect(texts).toEqual(expect.arrayContaining(['native error row has no matching live SDK retry-start receipt',
       'native receipted error row holds content that is not retry history', 'native receipted error row has no retried answer after it',
       'native compaction follows another compaction', 'native compaction lacks a summary',

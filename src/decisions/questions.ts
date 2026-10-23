@@ -234,11 +234,12 @@ export function deterministicFailureClass(reason: string): FailureClass {
   // text (rate limit, rate_limit, 429, …) then walls here with no pacing policy,
   // or once the bounded budget is spent, and it alone walls at once when there
   // is nothing to re-deliver; pacing's other texts ("too many requests",
-  // "throttled", "rate limiting") read unknown and restart. The other codes name
-  // no wall: model_not_found reads unknown (a restart, then the breaker if it
-  // persists). For GC's own refusals the tag, not the text, is the guard (#485);
-  // GC's literal refusal texts avoid wall words so an untagged one still reads
-  // `unknown`.
+  // "throttled", "rate limiting") read unknown. The other codes name no wall:
+  // model_not_found reads unknown. An unknown in-band error neither walls nor
+  // restarts (in-band failures never restart): the turn fails, and only the
+  // decision service's guidance can stop the minion. For GC's own refusals the
+  // tag, not the text, is the guard (#485); GC's literal refusal texts avoid
+  // wall words so an untagged one still reads `unknown`.
   if (
     /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|cloud_credential_error|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';

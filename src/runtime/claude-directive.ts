@@ -68,17 +68,10 @@ export class ClaudeDirectivePermissionChannel {
        * failure from it (the deny, or an earlier failure still owed). A
        * transport or protocol failure names no report and reports itself. */
       readonly fail: (message: string, refused?: unknown) => void;
-      /** Handling one of the channel's failures threw: the host's `refused()`
-       * or `fail()` (#485). The Claude host's don't throw in production (its
-       * logger swallows its own faults, the guard receipt's journal faults are
-       * caught and retried at cessation, the turn's failure is recorded in
-       * memory, and emit() isolates listeners), so this is a backstop for a GC
-       * bug. It is GC's own directive control failing: after `refused()`
-       * throws, the host fails the turn with a refusal of `reason`, tagged, or
-       * with the failure the turn already owes (a directive turn reports its
-       * first failure). After `fail()` throws, the turn's failure is already
-       * set (the text `fail()` was given), so this adds nothing but ending the
-       * CLI. If this throws too, the channel ends the CLI itself. */
+      /** A backstop for a GC bug in the host's `refused()` or `fail()`, which
+       * don't throw in production (#485): the channel logs, then this fails
+       * the turn as a tagged handling refusal, unless the turn has already
+       * reported a failure. If this throws too, the channel ends the CLI. */
       readonly failRefused: (reason: string) => void;
       /** A tool request this channel denied itself (malformed or foreign, or a
        * fence that failed), once the deny is handed to the CLI's stdin: the
