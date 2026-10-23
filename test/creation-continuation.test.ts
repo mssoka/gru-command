@@ -380,16 +380,16 @@ describe('same-job retained initial-creation continuation', () => {
       receiptTokenSha256: h.inspection.receiptTokenSha256,
     });
     const api = await httpHarness(h);
-    const read = await request(api.base, 'GET', { job_id: api.job.id, request_id: 'restart-request' });
+    const read = await request(api.base, 'GET', { job_id: api.jobId, request_id: 'restart-request' });
     expect(read.status).toBe(200);
     expect((read.body['readback'] as Record<string, unknown>)).toMatchObject({ state: 'custody-unknown', active: false });
-    const retry = await request(api.base, 'POST', { job_id: api.job.id, request_id: 'restart-request' });
+    const retry = await request(api.base, 'POST', { job_id: api.jobId, request_id: 'restart-request' });
     expect(retry.status).toBe(409);
     expect((retry.body['readback'] as Record<string, unknown>)['state']).toBe('custody-unknown');
     expect(api.spawns).toHaveLength(0);
     expect(api.prompts).toHaveLength(0);
-    expect(api.ledger.getWorktree(api.job.id)).toBeNull();
-    expect(git(api.repo, ['rev-parse', `refs/heads/gru/${api.job.id}`])).toBe(api.inspection.sha);
+    expect(api.ledger.getWorktree(api.jobId)).toBeNull();
+    expect(git(api.repo, ['rev-parse', `refs/heads/gru/${api.jobId}`])).toBe(api.inspection!.sha);
     expect(receiptFiles(api.repo)).toHaveLength(1);
   });
 

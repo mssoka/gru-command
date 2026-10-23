@@ -3414,7 +3414,7 @@ export class WorktreeManager {
         closed && child.pid !== undefined) {
       try {
         this.opts.ledger.recordCreationProducerSettlement({
-          jobId: custody.lane.id, branch, sha: custody.sha,
+          jobId: custody.lane.id, branch: custody.branch, sha: custody.sha,
           tokenSha256: createHash('sha256').update(custody.token, 'utf8').digest('hex'),
           pid: child.pid, exitCode: status, signal,
         });
