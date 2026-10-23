@@ -4229,7 +4229,9 @@ it('typed provider terminal errors with local-authority words retain auth and qu
       const events: RuntimeEvent[] = [];
       handle.subscribe((event) => events.push(event));
       const runtimeBoundary = handle as unknown as { onPiEvent: (event: unknown) => void };
-      const localControlWords = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+      const localControlWords = status === 429
+        ? 'DirectiveCheckpointError: directive authority is terminal, held or superseded — further work is not permitted'
+        : 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
       const errorMessage = `${status}: ${JSON.stringify({ error: { code: bodyCode, message: localControlWords } })}`;
       runtimeBoundary.onPiEvent({ type: 'message_end', message: { role: 'assistant', stopReason: 'error',
         errorMessage, provider: 'zai-coding-cn', model: 'glm-5.3' } });
