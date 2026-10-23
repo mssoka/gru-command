@@ -446,3 +446,43 @@ describe('Pi rows by what the SDK does with their tool calls (#483)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
   });
 });
+
+describe('Pi retry history beside compact-and-retry (#483, #481)', () => {
+  const RETRIED_TWICE = 'native error row carries both a retry-start receipt and a compact-and-retry';
+  /** Pi's automatic compaction linked on `parentId`, keeping the receipt. */
+  const appendCompaction = (file: string, id: string, parentId: string) => appendFileSync(file, `${JSON.stringify({ type: 'compaction', id, parentId,
+    timestamp: '2026-10-22T00:00:00.000Z', summary: 'Pi automatic compaction summary', firstKeptEntryId: 'receipt', tokensBefore: 90_000, fromHook: false })}\n`);
+
+  it('a receipted error row that Pi also compacted and retried is refused by name: Pi does one or the other', () => {
+    const { file, producer, error } = retryScene();
+    expect(recordDirectiveRetryStart(producer, retryEvent(), error)).toBeNull();
+    appendCompaction(file, 'retry-compaction', 'retry-error');
+    entry(file, 'invocation', 'retry-compaction', invocation);
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: RETRIED_TWICE });
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(new DirectiveCheckpointError(RETRIED_TWICE));
+  });
+
+  it('an unreceipted error row holding a call that Pi compacted and retried is history: the continued call runs and the turn completes', () => {
+    const { file } = retryScene([signedContent[1], partialCall]);
+    appendCompaction(file, 'retry-compaction', 'retry-error');
+    entry(file, 'invocation', 'retry-compaction', invocation);
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).not.toThrow();
+    finishTurn(file);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a compact-and-retry lost before the continued reply, whose failed reply holds calls, reads that failed terminal', () => {
+    const { file } = retryScene([signedContent[1], partialCall]);
+    appendCompaction(file, 'retry-compaction', 'retry-error');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: ERROR, checkpointId: 'retry-error' });
+  });
+
+  it('a length row holding calls is never compacted and retried: a compaction on it interrupts its open tool round', () => {
+    const { file } = admittedScene();
+    entry(file, 'truncated', 'receipt', { role: 'assistant', stopReason: 'length', content: [partialCall] });
+    appendCompaction(file, 'retry-compaction', 'truncated');
+    entry(file, 'invocation', 'retry-compaction', invocation);
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native compaction interrupts an open tool round' });
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(new DirectiveCheckpointError('native compaction interrupts an open tool round'));
+  });
+});

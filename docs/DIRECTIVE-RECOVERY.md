@@ -371,9 +371,13 @@ receipted row is the turn's terminal, a failed one. When attempts run out,
 the SDK starts no retry for the last error: the receipted rows before it
 are history, and that unreceipted last row is the failed terminal. An error
 row that ends the turn is that failed terminal even when it holds tool
-calls. At the tool fence any other error row still refuses the next tool,
-under a reason naming what it lacks: a matching receipt, history-only
-content, or the retried answer.
+calls. Pi's other continuation of an error reply, its compact-and-retry
+(#481, [SUPERVISION.md](./SUPERVISION.md)), is read before that terminal:
+an error row Pi compacted on and continued is history too. Pi auto-retries
+a reply or compacts and retries it, never both, so a receipted row that is
+also compacted and retried is refused by name. At the tool fence any other
+error row still refuses the next tool, under a reason naming what it lacks:
+a matching receipt, history-only content, or the retried answer.
 
 Every pi stop can hold tool calls, and the walks and the fence follow what
 the SDK's agent loop does with them:
@@ -387,7 +391,8 @@ the SDK's agent loop does with them:
   on. Those calls are pending until those results arrive, and the minion
   may call tools after them. Since nothing ran, a turn cut off right after
   those results is resumable, not a tool error awaiting a recovery
-  judgment. A turn cut off before them stays UNKNOWN.
+  judgment. A turn cut off before them stays UNKNOWN. Such a row is never
+  compacted and retried; only a length row without calls may be.
 - `error` and `aborted`: the SDK runs none (for an error row, the ruling
   above). Such a row owes no results; ending the turn, it is a failed
   terminal, and a result naming one of its calls is refused.
