@@ -36,8 +36,8 @@ function guardStderrErrors(): void {
  * `<data_dir>/logs/service.log` and mirrored to stderr. Synchronous writes:
  * nothing is lost at shutdown.
  *
- * `log()` never throws (#496): unserializable fields fall back to a line
- * carrying ts/level/msg and the serialization error, and rotation, the
+ * `log()` never throws for anything in `fields` (#496): an unserializable
+ * field is dropped and named (see serializeRecord), and rotation, the
  * append and the stderr mirror each fail on their own without stopping
  * the others or reaching the call site.
  *
@@ -75,7 +75,7 @@ export class Logger {
       appendFileSync(this.logFile, line, 'utf-8');
     } catch {
       // Disk-full or permissions must never take the serving process down;
-      // the stderr mirror below still carries the line.
+      // the best-effort stderr mirror below may still carry the line.
     }
     if (this.mirrorToStderr) {
       try {
@@ -155,23 +155,38 @@ export class Logger {
 }
 
 /**
- * One JSON line for the record. A BigInt, a cycle, or a throwing getter or
- * toJSON in `fields` falls back to ts/level/msg plus the serialization
- * error, so the line still lands and the call site never sees a throw.
+ * One JSON line for the record. Reserved keys go last, so a call site can
+ * never overwrite ts/level/msg, and `toJSON: undefined` disarms an own
+ * toJSON field that would otherwise replace the whole line (undefined keys
+ * never reach the output). A field that cannot be serialized (a BigInt, a
+ * cycle, a throwing getter or toJSON) is dropped and named with its reason
+ * under `fields_unserializable`; the other fields still land. If even that
+ * fails, the line keeps ts/level/msg alone.
  */
 function serializeRecord(level: LogLevel, msg: string, fields: Record<string, unknown>): string {
   const ts = new Date().toISOString();
   try {
-    // Reserved keys last: a call site can never overwrite ts/level/msg.
-    const record: LogRecord = { ...fields, ts, level, msg };
+    const record: LogRecord = { ...fields, toJSON: undefined, ts, level, msg };
     return JSON.stringify(record);
-  } catch (error) {
-    const fallback: LogRecord = {
-      ts,
-      level,
-      msg,
-      fields_unserializable: error instanceof Error ? error.message : typeof error,
-    };
-    return JSON.stringify(fallback);
+  } catch {
+    /* salvage field by field below */
+  }
+  try {
+    const kept: Record<string, unknown> = {};
+    const unserializable: Record<string, string> = {};
+    for (const key of Object.keys(fields)) {
+      try {
+        const value = fields[key];
+        JSON.stringify(value);
+        kept[key] = value;
+      } catch (error) {
+        unserializable[key] = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const record: LogRecord = { ...kept, toJSON: undefined, ts, level, msg, fields_unserializable: unserializable };
+    return JSON.stringify(record);
+  } catch {
+    const lastResort: LogRecord = { ts, level, msg, fields_unserializable: 'unknown' };
+    return JSON.stringify(lastResort);
   }
 }
