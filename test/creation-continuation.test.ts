@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { basename, join } from 'node:path';
@@ -231,6 +231,7 @@ describe('same-job retained initial-creation continuation', () => {
     const readback = await waitForState(api.base, api.jobId, requestId, 'delivered');
     expect(readback).toMatchObject({ state: 'delivered', active: false, job_status: 'delivered' });
     expect(readback['original']).toMatchObject({
+      handoff_repo_path: h.repo.path, repo_path: inspection.repoPath,
       branch: `gru/${api.jobId}`, base_sha: inspection.sha, base_source: inspection.baseSource,
       producer_settlement_seq: inspection.producerSettlementSeq,
     });
@@ -367,7 +368,7 @@ describe('same-job retained initial-creation continuation', () => {
     const identityPayload = {
       schema: 'same-job-retained-creation-continuation-v1', job_id: h.job.id, request_id: 'restart-request',
       handoff_seq: h.ledger.listJobEventsByKinds(h.job.id, ['job.handoff'], { limit: 2 })[0]!.seq,
-      briefing_sha256: createHash('sha256').update(h.job.briefing!, 'utf8').digest('hex'), repo_path: h.repo.path,
+      briefing_sha256: createHash('sha256').update(h.job.briefing!, 'utf8').digest('hex'), handoff_repo_path: h.repo.path, repo_path: h.inspection!.repoPath,
       branch: h.inspection.branch, base_sha: h.inspection.sha, base_source: h.inspection.baseSource,
       producer_settlement_seq: h.inspection.producerSettlementSeq,
       receipt_token_sha256: h.inspection.receiptTokenSha256,
@@ -375,7 +376,7 @@ describe('same-job retained initial-creation continuation', () => {
     h.ledger.acceptCreationContinuation({
       jobId: h.job.id, requestId: 'restart-request', payloadSha256: requestPayloadSha256(identityPayload),
       handoffSeq: identityPayload.handoff_seq, briefingSha256: identityPayload.briefing_sha256,
-      repoPath: identityPayload.repo_path, branch: h.inspection.branch, baseSha: h.inspection.sha,
+      handoffRepoPath: identityPayload.handoff_repo_path, repoPath: identityPayload.repo_path, branch: h.inspection.branch, baseSha: h.inspection.sha,
       baseSource: h.inspection.baseSource, producerSettlementSeq: h.inspection.producerSettlementSeq,
       receiptTokenSha256: h.inspection.receiptTokenSha256,
     });
@@ -400,14 +401,14 @@ describe('same-job retained initial-creation continuation', () => {
     const briefingSha256 = createHash('sha256').update(h.job.briefing!, 'utf8').digest('hex');
     const identityPayload = {
       schema: 'same-job-retained-creation-continuation-v1', job_id: h.job.id, request_id: requestId,
-      handoff_seq: handoff.seq, briefing_sha256: briefingSha256, repo_path: h.repo.path,
+      handoff_seq: handoff.seq, briefing_sha256: briefingSha256, handoff_repo_path: h.repo.path, repo_path: h.inspection.repoPath,
       branch: h.inspection.branch, base_sha: h.inspection.sha, base_source: h.inspection.baseSource,
       producer_settlement_seq: h.inspection.producerSettlementSeq,
       receipt_token_sha256: h.inspection.receiptTokenSha256,
     };
     const accepted = h.ledger.acceptCreationContinuation({
       jobId: h.job.id, requestId, payloadSha256: requestPayloadSha256(identityPayload),
-      handoffSeq: handoff.seq, briefingSha256, repoPath: h.repo.path,
+      handoffSeq: handoff.seq, briefingSha256, handoffRepoPath: h.repo.path, repoPath: h.inspection.repoPath,
       branch: h.inspection.branch, baseSha: h.inspection.sha, baseSource: h.inspection.baseSource,
       producerSettlementSeq: h.inspection.producerSettlementSeq, receiptTokenSha256: h.inspection.receiptTokenSha256,
     });
@@ -473,7 +474,7 @@ describe('same-job retained initial-creation continuation', () => {
     const token = `gru-creation:${randomUUID()}`;
     writeCreationIntent(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']), {
       lane: { id: jobId, kind: 'job', jobId, roundId: null, path: join(h.root, basename(h.repo.path), `job-${jobId}`) },
-      repoPath: h.repo.path, branch, sha, baseSource: 'local-head-fallback', token,
+      repoPath: realpathSync(h.repo.path), branch, sha, baseSource: 'local-head-fallback', token,
     });
     git(h.repo, ['update-ref', '-m', token, `refs/heads/${branch}`, sha]);
     const api = await httpHarness({ ...h, job });
@@ -538,7 +539,7 @@ describe('same-job retained initial-creation continuation', () => {
       await expect(h.worktrees.inspectRetainedJobCreation({ repoPath: h.repo.path, jobId: h.job.id })).rejects.toThrow(
         guard === 'lock' ? /unsettled ref transaction/u
           : guard === 'unreadable-receipt' ? /not valid JSON/u
-            : guard === 'symbolic-ref' ? /symbolic ref/u
+            : guard === 'symbolic-ref' ? /symbolic ref|reflog/u
             : guard === 'moved-ref' ? /names base/u
               : guard === 'foreign-holder' ? /held by a worktree/u
                 : guard === 'foreign-checkout' ? /checkout at/u

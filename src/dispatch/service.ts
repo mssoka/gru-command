@@ -1,5 +1,6 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
 import type { CreationContinuationState, CreationContinuationTimeline, JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
@@ -48,6 +49,7 @@ export interface CreationContinuationReadback {
   readonly original: {
     readonly handoff_seq: number | null;
     readonly briefing_sha256: string | null;
+    readonly handoff_repo_path: string | null;
     readonly repo_path: string | null;
     readonly branch: string | null;
     readonly base_sha: string | null;
@@ -341,7 +343,8 @@ export class DispatchService {
     const handoffs = this.opts.ledger.listJobEventsByKinds(input.jobId, ['job.handoff'], { limit: 2 });
     const handoff = handoffs.length === 1 ? handoffs[0]! : null;
     const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
-    const repoPath = typeof handoffPayload?.['repoPath'] === 'string' ? handoffPayload['repoPath'] : null;
+    const handoffRepoPath = typeof handoffPayload?.['repoPath'] === 'string' ? handoffPayload['repoPath'] : null;
+    let repoPath: string | null = null;
     const briefingSha256 = typeof job.briefing === 'string'
       ? createHash('sha256').update(job.briefing, 'utf8').digest('hex') : null;
     let inspection: RetainedJobCreationInspection | null = null;
@@ -350,17 +353,21 @@ export class DispatchService {
     else if (job.deliverable !== null && job.deliverable !== 'pr') refusalReason = `job "${job.id}" is not a PR-owing initial dispatch`;
     else if (job.prUrl !== null || job.targetRef !== null || job.targetSha !== null) refusalReason = `job "${job.id}" has report or pull-request state incompatible with initial-creation continuation`;
     else if (job.briefing === null || job.briefing.trim() === '') refusalReason = `job "${job.id}" has no original briefing to reuse`;
-    else if (handoff === null || repoPath === null) refusalReason = `job "${job.id}" has no unique original job.handoff with its repository path`;
-    else if ((repoPath.split('/').filter(Boolean).at(-1) ?? '') !== job.repo) refusalReason = `job "${job.id}" handoff repository path does not match its recorded repository`;
+    else if (handoff === null || handoffRepoPath === null) refusalReason = `job "${job.id}" has no unique original job.handoff with its repository path`;
+    else if ((handoffRepoPath.split('/').filter(Boolean).at(-1) ?? '') !== job.repo) refusalReason = `job "${job.id}" handoff repository path does not match its recorded repository`;
+    else if (this.opts.ledger.listJobAmendments(input.jobId).length > 0) refusalReason = `job "${job.id}" has an amended contract outside initial-dispatch continuation`;
     else if (this.opts.worktrees.inspectRetainedJobCreation === undefined || this.opts.worktrees.createRetainedJobWorktree === undefined) {
       refusalReason = 'retained-creation inspection and strict manager continuation are not wired';
     } else {
       try {
-        inspection = await this.opts.worktrees.inspectRetainedJobCreation({ repoPath, jobId: input.jobId });
-        if (inspection.jobId !== input.jobId || inspection.repoPath !== repoPath || inspection.branch !== `gru/${input.jobId}` ||
+        inspection = await this.opts.worktrees.inspectRetainedJobCreation({ repoPath: handoffRepoPath, jobId: input.jobId });
+        const canonicalRepoPath = realpathSync(handoffRepoPath);
+        if (inspection.jobId !== input.jobId || inspection.repoPath !== canonicalRepoPath || inspection.branch !== `gru/${input.jobId}` ||
             inspection.sha.length < 40 || inspection.baseSource === null) {
           refusalReason = 'WorktreeManager returned a retained-creation identity that does not match the original job handoff';
           inspection = null;
+        } else {
+          repoPath = inspection.repoPath;
         }
       } catch (error) {
         refusalReason = this.safeContinuationReason(error);
@@ -368,7 +375,7 @@ export class DispatchService {
     }
     const identityPayload = {
       schema: 'same-job-retained-creation-continuation-v1', job_id: input.jobId, request_id: input.requestId,
-      handoff_seq: handoff?.seq ?? null, briefing_sha256: briefingSha256, repo_path: repoPath,
+      handoff_seq: handoff?.seq ?? null, briefing_sha256: briefingSha256, handoff_repo_path: handoffRepoPath, repo_path: repoPath,
       branch: inspection?.branch ?? null, base_sha: inspection?.sha ?? null, base_source: inspection?.baseSource ?? null,
       producer_settlement_seq: inspection?.producerSettlementSeq ?? null,
       receipt_token_sha256: inspection?.receiptTokenSha256 ?? null,
@@ -376,7 +383,7 @@ export class DispatchService {
     const payloadSha256 = createHash('sha256').update(JSON.stringify(identityPayload), 'utf8').digest('hex');
     const accepted = this.opts.ledger.acceptCreationContinuation({
       jobId: input.jobId, requestId: input.requestId, payloadSha256,
-      handoffSeq: handoff?.seq ?? null, briefingSha256, repoPath,
+      handoffSeq: handoff?.seq ?? null, briefingSha256, handoffRepoPath, repoPath,
       branch: inspection?.branch ?? null, baseSha: inspection?.sha ?? null,
       baseSource: inspection?.baseSource ?? null, producerSettlementSeq: inspection?.producerSettlementSeq ?? null,
       receiptTokenSha256: inspection?.receiptTokenSha256 ?? null,
@@ -514,7 +521,8 @@ export class DispatchService {
       job_id: identity.jobId, request_id: identity.requestId, generation: identity.generation,
       payload_sha256: identity.payloadSha256, state, active, job_status: job?.status ?? null,
       original: {
-        handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256, repo_path: identity.repoPath,
+        handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256,
+        handoff_repo_path: identity.handoffRepoPath, repo_path: identity.repoPath,
         branch: identity.branch, base_sha: identity.baseSha, base_source: identity.baseSource,
         producer_settlement_seq: identity.producerSettlementSeq,
       },

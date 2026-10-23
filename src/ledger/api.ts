@@ -279,6 +279,7 @@ export interface CreationContinuationIdentity {
   readonly payloadSha256: string;
   readonly handoffSeq: number | null;
   readonly briefingSha256: string | null;
+  readonly handoffRepoPath: string | null;
   readonly repoPath: string | null;
   readonly branch: string | null;
   readonly baseSha: string | null;
@@ -1736,6 +1737,7 @@ export class LedgerApi {
       payloadSha256: String(firstPayload['payload_sha256']),
       handoffSeq: typeof firstPayload['handoff_seq'] === 'number' ? firstPayload['handoff_seq'] : null,
       briefingSha256: typeof firstPayload['briefing_sha256'] === 'string' ? firstPayload['briefing_sha256'] : null,
+      handoffRepoPath: typeof firstPayload['handoff_repo_path'] === 'string' ? firstPayload['handoff_repo_path'] : null,
       repoPath: typeof firstPayload['repo_path'] === 'string' ? firstPayload['repo_path'] : null,
       branch: typeof firstPayload['branch'] === 'string' ? firstPayload['branch'] : null,
       baseSha: typeof firstPayload['base_sha'] === 'string' ? firstPayload['base_sha'] : null,
@@ -1813,6 +1815,7 @@ export class LedgerApi {
     readonly payloadSha256: string;
     readonly handoffSeq: number | null;
     readonly briefingSha256: string | null;
+    readonly handoffRepoPath: string | null;
     readonly repoPath: string | null;
     readonly branch: string | null;
     readonly baseSha: string | null;
@@ -1872,7 +1875,7 @@ export class LedgerApi {
               : job.prUrl !== null ? `job "${input.jobId}" already has a pull request`
                 : !briefingMatches ? `job "${input.jobId}" has no unchanged original briefing`
                 : this.listJobAmendments(input.jobId).length > 0 ? `job "${input.jobId}" has an amended contract outside initial-dispatch continuation`
-                  : handoff === null || handoff.seq !== input.handoffSeq || handoffPayload?.['repoPath'] !== input.repoPath
+                  : handoff === null || handoff.seq !== input.handoffSeq || handoffPayload?.['repoPath'] !== input.handoffRepoPath
                     ? `job "${input.jobId}" has no unique matching original handoff`
                     : input.repoPath?.split('/').filter(Boolean).at(-1) !== job.repo
                       ? `job "${input.jobId}" handoff repository path does not match its repository`
@@ -1890,7 +1893,8 @@ export class LedgerApi {
                                 : null);
       const identity: CreationContinuationIdentity = {
         jobId: input.jobId, requestId: input.requestId, generation, payloadSha256: input.payloadSha256,
-        handoffSeq: input.handoffSeq, briefingSha256: input.briefingSha256, repoPath: input.repoPath,
+        handoffSeq: input.handoffSeq, briefingSha256: input.briefingSha256, handoffRepoPath: input.handoffRepoPath,
+        repoPath: input.repoPath,
         branch: input.branch, baseSha: input.baseSha, baseSource: input.baseSource,
         producerSettlementSeq: input.producerSettlementSeq,
       };
@@ -1898,7 +1902,7 @@ export class LedgerApi {
       this.appendEvent({ kind: 'job.creation-continuation', jobId: identity.jobId, payload: {
         request_id: identity.requestId, generation: identity.generation, payload_sha256: identity.payloadSha256, state: initialState,
         stage: initialState, handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256,
-        repo_path: identity.repoPath, branch: identity.branch, base_sha: identity.baseSha,
+        handoff_repo_path: identity.handoffRepoPath, repo_path: identity.repoPath, branch: identity.branch, base_sha: identity.baseSha,
         base_source: identity.baseSource, producer_settlement_seq: identity.producerSettlementSeq,
         ...(input.receiptTokenSha256 !== null ? { receipt_token_sha256: input.receiptTokenSha256 } : {}),
         ...(scopeProblem !== null ? { reason: scopeProblem.slice(0, 1000) } : {}),
