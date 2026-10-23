@@ -100,7 +100,7 @@ describe('[env] parsing', () => {
     const atLimit = fill(MAX_ENV_TABLE_BYTES - 'BIG='.length - 1);
     const home = instance(`[env]\nBIG = "${atLimit}"\n`);
     expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').env.names).toEqual(['BIG']);
-    // One byte over, counted in UTF-8 bytes as execve sees them: 32767
+    // One byte over, counted in UTF-8 bytes as execve sees them: some 32.8k
     // two-byte characters are far under the limit in UTF-16 units.
     const over = `${CANARY}${'é'.repeat((MAX_ENV_TABLE_BYTES - 'A='.length - CANARY.length) / 2)}`;
     expect(Buffer.byteLength(`A=${over}`) + 1).toBe(MAX_ENV_TABLE_BYTES + 1);

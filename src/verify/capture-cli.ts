@@ -361,7 +361,7 @@ function readTokenFromConfig(path: string): string | null {
     // The reason and position only: the parser's excerpt quotes the file.
     const where = error instanceof TomlError ? ` (${error.message.split('\n', 1)[0] ?? ''} at line ${error.line}, column ${error.column})` : '';
     throw new UsageError(
-      `--config ${path} is not valid TOML${where}, so its [auth] token cannot be read — the running service keeps the config it loaded; fix the file, or pass --token`,
+      `--config ${path} is not valid TOML${where}, so its [auth] token cannot be read. The running service keeps the config it loaded; the operator must fix this file (do not open or edit it from a job), then retry the same request`,
     );
   }
   const token = raw.auth?.token;

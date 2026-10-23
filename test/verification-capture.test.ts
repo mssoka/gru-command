@@ -1118,6 +1118,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     const message = errors.join('');
     expect(message).toContain(`--config ${configPath} is not valid TOML (Invalid TOML document:`);
     expect(message).toMatch(/at line 4, column \d+\), so its \[auth\] token cannot be read/);
+    expect(message).toContain('the operator must fix this file (do not open or edit it from a job)');
     expect(message).not.toContain('SYNTHETIC-ENV-SECRET-494');
   });
 

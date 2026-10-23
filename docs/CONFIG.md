@@ -165,10 +165,11 @@ The section is optional. Without it, nothing changes.
   `--now`) and `gru roll` load the config first and refuse when it is
   invalid, leaving the service as it is. The service runs the same check
   when it boots. `gru update` and a roll started from the board do not
-  check first: with an invalid config the relaunched service refuses to
-  start. On macOS launchd retries every few seconds, so the service comes
-  back by itself once the file is fixed; on Linux systemd gives up after a
-  few tries, so run `gru start` once it is fixed.
+  check first. That matters only after an edit nothing has checked yet:
+  the running service keeps the config it loaded, so the update's restart
+  is the first boot to read the edited file. It refuses it, and the service
+  stays down while launchd (about every 5 s) or systemd (about every 2 s)
+  retries; it comes back once the file is fixed (`gru start` if not).
 - **Plaintext secrets.** `[env]` is not an encrypted secret store. Values
   sit in `config.toml` in plaintext, so the file must be private to you:
   `chmod 600 ~/.gru-command/config.toml`. If the file holds `[env]` values
