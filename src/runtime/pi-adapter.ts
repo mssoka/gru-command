@@ -1153,6 +1153,9 @@ export class PiAgentHandle implements AgentHandle {
   private directiveAdmissionError: unknown = null;
   /** Exact local guard error object; later event text alone can never establish this provenance. */
   private nativeDirectiveRefusal: DirectiveCheckpointError | null = null;
+  /** The SDK turns a local next-turn guard throw into a new error message.
+   * This single-use token binds that synthetic message to its actual throw site. */
+  private pendingNativeGuardFailure: { readonly directive: NonNullable<PromptOptions['directive']> } | null = null;
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'` holding no tool calls).
@@ -1287,7 +1290,20 @@ export class PiAgentHandle implements AgentHandle {
             }
           }
           return update;
-        } catch (error) { this.refuseDirectiveGuard(directive, undefined, error); }
+        } catch (error) {
+          try { this.refuseDirectiveGuard(directive, undefined, error); }
+          catch (refusal) {
+            // The SDK turns a failure from this local next-turn guard into a
+            // fresh assistant stopReason=error message, losing the thrown
+            // object. Arm a one-message token only at this exact local throw
+            // boundary; a provider error emitted after an earlier tool refusal
+            // never passes through here and cannot inherit this provenance.
+            if (directive !== undefined && error instanceof DirectiveCheckpointError && this.liveDirective === directive) {
+              this.pendingNativeGuardFailure = { directive };
+            }
+            throw refusal;
+          }
+        }
       };
       const before = session.agent.beforeToolCall;
       session.agent.beforeToolCall = async (input, signal) => {
@@ -1832,6 +1848,7 @@ export class PiAgentHandle implements AgentHandle {
     this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
     this.nativeDirectiveRefusal = null;
+    this.pendingNativeGuardFailure = null;
     this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
@@ -1920,6 +1937,7 @@ export class PiAgentHandle implements AgentHandle {
             if (this.directiveAdmissionError !== null) captured = { ok: false, error: String(this.directiveAdmissionError) };
           }
           this.preparedDirectiveEffects.clear();
+          this.pendingNativeGuardFailure = null;
           this.liveDirective = undefined;
           this.liveTurn = null;
           this.liveOwner = null;
@@ -2139,6 +2157,14 @@ export class PiAgentHandle implements AgentHandle {
               holdsCalls,
             };
           }
+          // The SDK discards the thrown object when a local next-turn guard
+          // fails and synthesizes an assistant error message. Consume the
+          // single-use token at the next assistant terminal, not by comparing
+          // error text. A separate provider terminal can only carry native
+          // provenance if it came from that exact local-throw boundary.
+          const pendingNativeGuardFailure = this.pendingNativeGuardFailure;
+          this.pendingNativeGuardFailure = null;
+          const isCorrelatedNativeGuardFailure = pendingNativeGuardFailure?.directive === this.liveDirective;
           // pi reports in-band model errors as an assistant message with
           // stopReason 'error' — surface it as a runtime error event.
           if (msg['stopReason'] === 'error') {
@@ -2167,6 +2193,7 @@ export class PiAgentHandle implements AgentHandle {
                 : this.session.model !== undefined
                   ? { model: this.session.model.id }
                   : {}),
+              ...(typed === null && isCorrelatedNativeGuardFailure ? { nativeControl: 'directive-refusal' as const } : {}),
               ...(typed !== null ? { typed } : {}),
             });
             this.setState('error', detail);
