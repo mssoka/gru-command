@@ -351,7 +351,8 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
     };
     expect(first.error).toBeUndefined();
     expect(first.result?.content?.[0]?.text).toContain('has not returned within the 150 ms transport wait');
-    expect(first.result?.structuredContent).toMatchObject({ stillRunning: true, tool: 'perkins_probe', waitedMs: 150 });
+    // The re-attach guidance is the text; no structuredContent shadows it.
+    expect(first.result?.structuredContent).toBeUndefined();
     expect(executions).toBe(1);
     gate.resolve();
     const second = (await client.call(3, 'tools/call', { name: 'perkins_probe', arguments: { runs: ['blind'] } })) as {
@@ -360,9 +361,37 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
     };
     expect(second.error).toBeUndefined();
     expect(second.result?.content?.[0]?.text).toBe('final-results');
-    expect(second.result?.structuredContent).toMatchObject({ resultCount: 1 });
+    expect(second.result?.structuredContent).toBeUndefined();
     // The re-attach joined the live execution; it did not start a second one.
     expect(executions).toBe(1);
+  });
+
+  it('returns the full tool text with no structuredContent, so Claude Code shows the model the text', async () => {
+    // Claude Code 2.1.309 hands the model the structuredContent JSON instead
+    // of the text when both are present: specialist findings, preflight
+    // errors and re-attach guidance would reach the lead as counts only.
+    const bridge = await ReviewMcpBridge.start([{
+      name: 'perkins_probe',
+      description: 'probe',
+      inputSchema: { type: 'object' },
+      execute: async () => ({
+        text: JSON.stringify({ results: [{ lens: 'performance', findings: [{ title: 'Unbounded queue' }] }] }),
+        details: { resultCount: 1, findingCount: 1 },
+      }),
+    }]);
+    bridges.push(bridge);
+    const client = serverClient(spawnServer(bridge.socketPath));
+    await client.call(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+    const response = (await client.call(2, 'tools/call', { name: 'perkins_probe', arguments: {} })) as {
+      result?: { content?: Array<{ type?: string; text?: string }>; structuredContent?: unknown };
+      error?: unknown;
+    };
+    expect(response.error).toBeUndefined();
+    expect(response.result?.structuredContent).toBeUndefined();
+    expect(response.result?.content).toEqual([{
+      type: 'text',
+      text: JSON.stringify({ results: [{ lens: 'performance', findings: [{ title: 'Unbounded queue' }] }] }),
+    }]);
   });
 
   it('reports a dead bridge as an accurate terminal error, never still-running', async () => {

@@ -2656,6 +2656,11 @@ export class PerkinsWholeReview {
       renderPropertyCampaignEvidence(propertyEvidence),
       ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_revision to list prior-target changes and read bounded path diffs while revisiting prior findings.']),
       'Specialists never inherit these tools. You, the lead, own every retained finding, every prior-finding disposition, and the verdict. Do not write implementation files.',
+      '',
+      // The lead chooses lenses; without the briefs it would choose from
+      // bare names. Each line is the brief that lens's specialist receives.
+      '--- SPECIALIST LENSES (what each perkins_run_specialists lens reviews) ---',
+      ...catalog.map((lens) => `- ${lens}: ${this.policy.portableContract.lenses[lens]}`),
     ].join('\n');
     const restoredResults = [...results.values()].map((result) => ({
       lens: result.lens, attempt: result.attempt, status: result.status,

@@ -919,6 +919,26 @@ describe('Perkins whole-PR lead engine', () => {
     expect(h.childCalls.some((call) => call.prompt!.includes('"source": "operations"'))).toBe(true);
   });
 
+  it('the lead system prompt carries each catalog lens with its brief, so the lead chooses by focus, not bare names', async () => {
+    const policy = loadPerkinsPolicy();
+    const full = wholeHarness(ALL_CLEAN, { spec: 'return 43' });
+    await full.run();
+    const fullPrompt = full.leadCalls[0]!.options.reviewLead!.systemPrompt;
+    expect(fullPrompt).toContain('--- SPECIALIST LENSES (what each perkins_run_specialists lens reviews) ---');
+    for (const lens of policy.portableContract.rules.fullLenses) {
+      expect(fullPrompt).toContain(`- ${lens}: ${policy.portableContract.lenses[lens]}`);
+    }
+    // No-spec mode lists only its own catalog: acceptance is not a lens the
+    // lead can run there, so it is not offered.
+    const noSpec = wholeHarness(ALL_CLEAN, { noSpec: true });
+    await noSpec.run();
+    const noSpecPrompt = noSpec.leadCalls[0]!.options.reviewLead!.systemPrompt;
+    for (const lens of policy.portableContract.rules.noSpecLenses) {
+      expect(noSpecPrompt).toContain(`- ${lens}: ${policy.portableContract.lenses[lens]}`);
+    }
+    expect(noSpecPrompt).not.toContain('- acceptance: ');
+  });
+
   it('a performance and an operations finding survive child validation, lead submission and attribution', async () => {
     const h = wholeHarness({
       childAnswer: (prompt) => {

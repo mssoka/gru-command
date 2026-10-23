@@ -440,7 +440,10 @@ async function mcpSession(configFile) {
   };
 }
 
+/** What the model reads from an MCP tool result. Like Claude Code 2.1.309,
+ * a structuredContent object replaces the text content entirely. */
 function mcpToolText(response) {
+  if (response.result?.structuredContent !== undefined) return JSON.stringify(response.result.structuredContent);
   const text = response.result?.content?.[0]?.text;
   if (typeof text !== 'string') throw new Error('mcp tool returned no text');
   return text;

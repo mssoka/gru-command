@@ -166,9 +166,13 @@ function dispatch(raw) {
         if (result.terminate !== undefined && typeof result.terminate !== 'boolean') {
           throw new Error('native review tool returned invalid termination state');
         }
+        /* The text is the whole model-facing result. No structuredContent:
+         * Claude Code (2.1.309) hands the model the structuredContent JSON
+         * INSTEAD of the text when both are present, so the host's summary
+         * details would replace specialist findings, preflight errors and
+         * still-running guidance. The details stay host-side. */
         respond(request.id, {
           content: [{ type: 'text', text: result.text }],
-          structuredContent: result.details ?? {},
           ...(result.terminate === true ? { _meta: { terminate: true } } : {}),
         });
         return;
