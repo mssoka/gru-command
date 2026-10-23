@@ -100,6 +100,8 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
   'CLAUDE_DOUBLE_REPLAY',
+  'CLAUDE_DOUBLE_API_ERROR_HOLD',
+  'CLAUDE_DOUBLE_ERROR_TEXT',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -2648,44 +2650,135 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       } finally { await handle.dispose(); }
     });
 
-    it('a typed provider wall the CLI reports after a refusal is still emitted typed and untagged (#485)', async () => {
-      const fx = fixture({ killGraceMs: 100 });
+    /** A directive the double answers before its echo: GC refuses it at that first answer (#485). */
+    const answeredBeforeEcho = async (prompt: string, knobs: Readonly<Record<string, string>>, killGraceMs = 100) => {
+      const fx = fixture({ killGraceMs });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'claude-opus-5-5' });
       const events = collect(handle);
-      // The CLI answers before its echo (a refusal), then reports its usage-limit wall before the abort lands.
-      process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
-      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      Object.assign(process.env, { CLAUDE_DOUBLE_ECHO: 'skip', ...knobs });
       try {
-        await expect(handle.prompt('usage-limit now', { directive: { identity: identityFor('claude-refusal-then-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        await expect(handle.prompt(prompt, { directive: { identity: identityFor(`claude-before-echo-${prompt.replace(/\W+/gu, '-')}`), beforeAdmission: () => {}, onAdmitted: () => {} } }))
           .rejects.toThrow(/^directive refused: the Claude CLI began answering without echoing the directive instruction/u);
-        expect(events.filter((event) => event.type === 'error')).toEqual([
-          { type: 'error', error: expect.stringMatching(/^directive refused: the Claude CLI began answering without echoing/u), fatal: false, nativeControl: 'directive-refusal' },
-          { type: 'error', error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)", fatal: false, provider: 'anthropic-claude-native',
-            model: 'claude-opus-5-5', typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } },
-        ]);
-      } finally {
-        delete process.env['CLAUDE_DOUBLE_ECHO'];
-        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
-        await handle.dispose();
-      }
+        return { errors: events.filter((event) => event.type === 'error'), file: handle.sessionFile! };
+      } finally { await handle.dispose(); }
+    };
+    const beforeEchoRefusal = { type: 'error', error: expect.stringMatching(/^directive refused: the Claude CLI began answering without echoing/u), fatal: false, nativeControl: 'directive-refusal' };
+    const usageWall = { type: 'error', error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)", fatal: false, provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5', typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } };
+
+    it('after a refusal, a typed wall in the CLI\'s result is emitted untagged, as an ordinary turn would emit it (#485)', async () => {
+      // The usage-limit wall arrives in the result before the abort lands.
+      const { errors } = await answeredBeforeEcho('usage-limit now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, usageWall]);
     });
 
-    it('the supervisor keeps a Claude directive refusal for directive recovery, and still stops on a provider wall reported after one (#485)', async () => {
+    it('after a refusal, an untyped CLI error result is emitted untagged, so its text reaches the classifier (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('error now', { CLAUDE_DOUBLE_IGNORE_TERM: '1', CLAUDE_DOUBLE_ERROR_TEXT: 'Invalid API key · Please run /login' });
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'Invalid API key · Please run /login', fatal: false }]);
+      expect(deterministicFailureClass('Invalid API key · Please run /login')).toBe('authentication_wall');
+      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'result', is_error: true }));
+    });
+
+    it('after a refusal, an API error whose result the abort cut off is still emitted as the wall it reported (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('usage-limit now', { CLAUDE_DOUBLE_API_ERROR_HOLD: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, usageWall]);
+      expect(frames(file)).not.toContainEqual(expect.objectContaining({ type: 'result' }));
+    });
+
+    it('a failed turn that is no refusal reports only its own failure, even when its CLI then reports a wall (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'claude-opus-5-5' });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_MISMATCH'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('usage-limit now', { directive: { identity: identityFor('claude-foreign-then-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/session id mismatch/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: expect.stringMatching(/^session id mismatch/u), fatal: false }]);
+        // Not vacuous: the CLI did report its typed usage-limit result.
+        expect(readFileSync(handle.sessionFile!, 'utf-8')).toContain('"api_error_status":429');
+      } finally { await handle.dispose(); }
+    });
+
+    it('a refusal recorded at the turn\'s completion is the failure the turn reports, and is tagged (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      try {
+        await expect(handle.prompt('follow it', { directive: { identity: identityFor('claude-completion-authority'), beforeAdmission: () => {},
+          // Authority moves after admission: only the completion step re-checks it.
+          onAdmitted: () => { (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => 'changed manifest'; } } }))
+          .rejects.toThrow(/^directive turn refused: live native directive role\/tools\/model authority changed before completion$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error',
+          error: 'directive turn refused: live native directive role/tools/model authority changed before completion', fatal: false, nativeControl: 'directive-refusal' }]);
+      } finally { await handle.dispose(); }
+    });
+
+    it('the permission channel\'s own deny of a repeated ask is a tagged refusal (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-channel-deny'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^malformed or foreign directive permission request$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([
+          { type: 'error', error: 'malformed or foreign directive permission request', fatal: false, nativeControl: 'directive-refusal' },
+        ]);
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"reason":"malformed or foreign directive permission request"');
+      } finally { await handle.dispose(); }
+    });
+
+    it('a gating frame the transcript cannot write is GC\'s refusal, never the disk\'s quota wall (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      let broken = false;
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        type Chunk = { toString(): string };
+        const stream = (handle as unknown as { liveTranscript: { _writev: unknown; _write: (chunk: Chunk, encoding: unknown, callback: (error?: Error) => void) => void } }).liveTranscript;
+        const write = stream._write.bind(stream);
+        stream._writev = null;
+        stream._write = (chunk, encoding, callback) => {
+          // The echo gates admission: it is written and synced before it is read back.
+          if (!broken && chunk.toString().includes('"isReplay":true')) { broken = true; callback(new Error('EDQUOT: disk quota exceeded')); return; }
+          write(chunk, encoding, callback);
+        };
+      });
+      try {
+        await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-edquot'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused: directive transcript write failed: EDQUOT: disk quota exceeded$/u);
+        expect(broken).toBe(true);
+        const errors = events.filter((event) => event.type === 'error');
+        expect(errors).toEqual([{ type: 'error', error: 'directive refused: directive transcript write failed: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' }]);
+        // Its words alone would wall: the tag is what keeps it with directive recovery.
+        expect(deterministicFailureClass(errors[0]!.type === 'error' ? errors[0]!.error : '')).toBe('quota_wall');
+      } finally { await handle.dispose(); }
+    });
+
+    it('the supervisor skips a tagged Claude refusal with a durable trace, and with decisions wired still stops on a wall reported after one (#485)', async () => {
       const { LedgerDb } = await import('../src/ledger/db.js');
       const { LedgerApi } = await import('../src/ledger/api.js');
       const { EventBus } = await import('../src/events/bus.js');
       const { NotificationCenter } = await import('../src/notifications/center.js');
       const { Supervisor } = await import('../src/supervision/supervisor.js');
+      const { DecisionRuntime } = await import('../src/decisions/runtime.js');
       const fx = fixture();
       writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[runtimes.roles]\nminion = "claude-code"\n`);
+      const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
       const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-claude-refusal-ledger-')));
       const bus = new EventBus({});
       const ledger = new LedgerApi(db.handle, { bus });
       const notifications = new NotificationCenter({ ledger, bus });
-      const registry = new RuntimeRegistry({ config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      // The decision service as main.ts wires it: the supervisor awaits it before any stop.
+      const decisions = new DecisionRuntime(config.decisions, { instanceDir: config.instanceDir, env: {}, dataDir: config.dataDir, notifications, watchConfig: false });
+      await decisions.start();
+      const registry = new RuntimeRegistry({ config, store: fx.store,
         claude: { binary: DOUBLE, killGraceMs: 100, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') } });
       const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
-        registry, ledger, notifications, tickMs: 60_000 });
+        registry, ledger, notifications, decisions, tickMs: 60_000 });
       const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
       const retained = (agentId: string) => ledger.listEvents({ limit: 100 })
         .filter((event) => event.kind === 'supervision.native-refusal-retained' && event.agentId === agentId).map((event) => event.payload);
@@ -2700,21 +2793,25 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(supervisor.viewFor(refused.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
         expect(retained(refused.id)).toEqual([{ error: `directive refused: ${refusal}` }]);
         expect(refused.health().state).not.toBe('disposed');
-        expect(ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
-        // A provider wall after a refusal: the refusal is kept, the wall stops the minion.
+        expect(ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.guidance' && event.agentId === refused.id)).toBe(false);
+        // A wall after a refusal: the refusal is kept, the wall stops the minion, though the
+        // directive's recovery disposes the handle as soon as its prompt rejects.
         const walled = await registry.spawn('minion', { cwd: fx.workspace, agentId: 'claude-walled-minion' });
         process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
         process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
         await expect(walled.prompt('usage-limit now', { directive: { identity: identityFor('claude-supervised-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
           .rejects.toThrow(/^directive refused/u);
+        await registry.disposeHandle(walled);
         await vi.waitFor(() => expect(supervisor.viewFor(walled.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' }));
         expect(retained(walled.id)).toHaveLength(1);
         expect(ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === `supervision.provider-wall.${walled.id}.quota_wall`)).toHaveLength(1);
+        // The stop came through the decision service's guidance, not around it.
+        expect(ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.guidance' && event.agentId === walled.id).map((event) => event.payload))
+          .toEqual([expect.objectContaining({ class: 'quota_wall' })]);
       } finally {
-        delete process.env['CLAUDE_DOUBLE_ECHO'];
-        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
         supervisor.dispose();
         await registry.dispose();
+        decisions.dispose();
         db.close();
       }
     });

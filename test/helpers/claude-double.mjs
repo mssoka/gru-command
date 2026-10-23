@@ -78,6 +78,8 @@
  *   CLAUDE_DOUBLE_INIT_DELAY_MS=<ms> wait this long after taking the prompt before init
  *   CLAUDE_DOUBLE_PRE_ECHO=1    a request status and a keepalive ping between init and the echo
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
+ *   CLAUDE_DOUBLE_API_ERROR_HOLD=1 "usage-limit" sends its API-error frame, then no result: it waits to be ended
+ *   CLAUDE_DOUBLE_ERROR_TEXT=<text> the "error" sentinel's result text
  *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string|string-false  the tool_use carries
  *                               run_in_background: true, or the string "true" or
  *                               "false" the real CLI coerces
@@ -884,12 +886,16 @@ async function run() {
   if (prompt.includes('usage-limit')) {
     const text = "You've hit your limit · resets 3pm (UTC)";
     out({ ...assistantFrame([{ type: 'text', text }]), error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
+    if (process.env.CLAUDE_DOUBLE_API_ERROR_HOLD === '1') {
+      setInterval(() => {}, 60_000); // no result frame: wait to be ended
+      return;
+    }
     out({ ...resultFrame(text, true), subtype: 'success', api_error_status: 429 });
     return;
   }
   if (prompt.includes('error')) {
     await emitTextTurn('about to fail');
-    out(resultFrame('double exploded', true));
+    out(resultFrame(process.env.CLAUDE_DOUBLE_ERROR_TEXT ?? 'double exploded', true));
     return;
   }
   const answer = images > 0 ? `echo: ${prompt} (+${images} image)` : `echo: ${prompt}`;

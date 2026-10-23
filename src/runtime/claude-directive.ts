@@ -61,11 +61,13 @@ export class ClaudeDirectivePermissionChannel {
   constructor(
     private readonly child: ChildProcess,
     private readonly deps: {
-      readonly fail: (message: string) => void;
+      /** Ends the turn; `refusal` is the refusal this failure reports, when it
+       * reports one. */
+      readonly fail: (message: string, refusal?: unknown) => void;
       /** A tool request this channel denied itself (malformed or foreign, or a
        * fence that failed), once the deny is handed to the CLI's stdin: the
-       * host keeps a durable refusal of it. */
-      readonly refused: (toolUseId: string | undefined, reason: string) => void;
+       * host keeps a durable refusal of it and returns it. */
+      readonly refused: (toolUseId: string | undefined, reason: string) => unknown;
       /** Called once per tool request, after the request frame is durable. */
       readonly decide: (request: ClaudeToolRequest, durable: Promise<void>) => Promise<ClaudeToolDecision>;
       readonly verification?: WorkerVerificationPolicy;
@@ -109,11 +111,12 @@ export class ClaudeDirectivePermissionChannel {
       input !== null && typeof input === 'object' && !Array.isArray(input);
     if (!valid) {
       // Only a deny handed to the CLI's stdin is a refusal.
+      let refusal: unknown;
       if (typeof id === 'string' && id !== '' && !this.closed &&
           this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' })) {
-        this.deps.refused(undefined, 'malformed or foreign directive permission request');
+        refusal = this.deps.refused(undefined, 'malformed or foreign directive permission request');
       }
-      this.deps.fail('malformed or foreign directive permission request');
+      this.deps.fail('malformed or foreign directive permission request', refusal);
       return;
     }
     this.requests.add(id as string);
@@ -129,10 +132,11 @@ export class ClaudeDirectivePermissionChannel {
       (decision) => this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message }),
       (error: unknown) => {
         const reason = `directive tool fence failed: ${error instanceof Error ? error.message : String(error)}`;
+        let refusal: unknown;
         if (!this.closed && this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' })) {
-          this.deps.refused(tool.toolUseId, reason);
+          refusal = this.deps.refused(tool.toolUseId, reason);
         }
-        this.deps.fail(reason);
+        this.deps.fail(reason, refusal);
       },
     );
   }
