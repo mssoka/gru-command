@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
+import { newLaneToken } from '../worktrees/lane-provenance.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
@@ -896,6 +897,11 @@ export interface WorktreeRecord {
   readonly note: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** #486: the lane incarnation's random token, which every session
+   * spawned in the lane carries as GRU_LANE_TOKEN (see
+   * worktrees/lane-provenance.ts). NULL only for a lane swept before the
+   * token existed. */
+  readonly laneToken: string | null;
 }
 
 /** Durable review-owner cessation (#464): recorded only through
@@ -3019,8 +3025,8 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, base_source, job_id, round_id, status, note, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
+          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, base_source, job_id, round_id, status, note, created_at, updated_at, lane_token)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)`,
         )
         .run(
           input.id,
@@ -3035,6 +3041,7 @@ export class LedgerApi {
           input.roundId ?? null,
           ts,
           ts,
+          newLaneToken(),
         );
       this.appendEvent({
         kind: 'worktree.created',
@@ -3055,6 +3062,19 @@ export class LedgerApi {
 
   getWorktree(id: string): WorktreeRecord | null {
     const row = this.db.prepare('SELECT * FROM worktrees WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.worktreeFromRow(row);
+  }
+
+  /** #486: the lane not yet swept whose registered path is exactly `path`
+   * (paths are unique), or null: the lane a session spawned there belongs to. */
+  findLiveWorktreeAtPath(path: string): WorktreeRecord | null {
+    const row = this.db.prepare("SELECT * FROM worktrees WHERE path = ? AND status <> 'swept'").get(path) as Row | undefined;
+    return row === undefined ? null : this.worktreeFromRow(row);
+  }
+
+  /** #486: the lane a lane token belongs to, or null. */
+  findWorktreeByLaneToken(token: string): WorktreeRecord | null {
+    const row = this.db.prepare('SELECT * FROM worktrees WHERE lane_token = ?').get(token) as Row | undefined;
     return row === undefined ? null : this.worktreeFromRow(row);
   }
 
@@ -5623,6 +5643,17 @@ export class LedgerApi {
 
   /** The open (unresolved) rows of some kinds (#427: the lane rows a
    * reconcile settles once their lane is gone). */
+  /** Open rows whose kind starts with `prefix` (#486: a lane's sweep-pause
+   * cards, `worktree-sweep-paused:<lane>:<pause>`), oldest first. */
+  listOpenNotificationsByKindPrefix(prefix: string): readonly NotificationRecord[] {
+    if (prefix === '') throw new Error('kind prefix must be non-empty');
+    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+    const rows = this.db
+      .prepare("SELECT id FROM notifications WHERE kind LIKE ? ESCAPE '\\' AND resolved_at IS NULL ORDER BY ts, id")
+      .all(`${escaped}%`) as Row[];
+    return rows.map((raw) => this.getNotification(str(raw.id))).filter((record): record is NotificationRecord => record !== null);
+  }
+
   listOpenNotificationsByKinds(kinds: readonly string[]): readonly NotificationRecord[] {
     if (kinds.length === 0) return [];
     const rows = this.db
@@ -6097,6 +6128,7 @@ export class LedgerApi {
       note: nstr(row.note),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
+      laneToken: nstr(row.lane_token),
     };
   }
 

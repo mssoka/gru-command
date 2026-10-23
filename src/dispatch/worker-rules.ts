@@ -21,12 +21,25 @@ export const REVIEW_CONVERGENCE_RULE = [
 ].join('\n');
 
 /**
+ * Background processes (#486): a browser daemon, dev server or watcher a
+ * minion starts and leaves running holds its lane's sweep. GC stops what
+ * the lane's sessions leave behind once their turns end (each process
+ * carries the lane's token), but the minion stopping its own is the first
+ * line, and the only one for a process that drops its environment.
+ */
+export const BACKGROUND_PROCESS_RULE = [
+  'BACKGROUND PROCESS RULE:',
+  '- Stop every background process you start (browser daemons such as `agent-browser close`, local servers, watchers) before you end your turn.',
+  '- GC stops what your commands leave running in the lane once your turn ends: never rely on a process outliving the turn that started it; start it again in the turn that needs it.',
+].join('\n');
+
+/**
  * The complete set of current rule blocks an assembled worker instruction
  * carries. Rendering and appending live here (one ordered list, one append
  * helper DERIVED from it) so briefings, re-briefs and follow-up directives
  * cannot drift apart block by block.
  */
-export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE];
+export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE];
 
 /** Append every current worker rule block to an authored instruction text
  * (one blank line between blocks, always). Derived from the ordered list so

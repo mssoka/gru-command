@@ -26,6 +26,7 @@ import { ROLE_DEFINITIONS } from '../roles.js';
 import { managedSkillsPromptNote } from './managed-skills.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
+import { laneProvenanceEnv } from '../worktrees/lane-provenance.js';
 import { buildClaudeCodeAuthArgs, claudeCliModel, claudeReviewIsolationArgs } from './claude-model.js';
 import {
   claudeReviewProcessEnv, materializeClaudeReviewCredentials, privateClaudeReviewSettings,
@@ -570,6 +571,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
               onVerificationCeased: () => verificationSettings?.dispose(),
             } : {}),
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
+          ...(options.laneProvenance !== undefined ? { laneEnv: laneProvenanceEnv(options.laneProvenance) } : {}),
           fileTools,
           nativeTools,
           ambientMcp,
@@ -749,6 +751,9 @@ interface HandleParams {
   /** Invoked once when every original policy child has actually closed. */
   readonly onVerificationCeased?: () => void;
   readonly reviewAuthEnv?: NodeJS.ProcessEnv;
+  /** #486: the lane's provenance variables, added to the CLI's environment
+   * (and so to every process its tools start). */
+  readonly laneEnv?: Readonly<Record<string, string>>;
   readonly fileTools?: readonly string[];
   readonly nativeTools?: readonly string[];
   /** Raw perkins_* names wired through the bridge (capability declaration). */
@@ -772,6 +777,14 @@ interface HandleParams {
   readonly thinkingLevel?: string;
   /** Issue #283: the bound GC-managed BMAD runtime, loaded as a plugin dir. */
   readonly managedPluginDir?: string;
+}
+
+/** The CLI child's environment: the review credentials' when the session
+ * has them, the service's otherwise, plus the lane's provenance (#486).
+ * Empty = inherit the service's environment unchanged. */
+export function claudeChildEnv(params: Pick<HandleParams, 'reviewAuthEnv' | 'laneEnv'>): { readonly env?: NodeJS.ProcessEnv } {
+  if (params.laneEnv === undefined) return params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {};
+  return { env: { ...(params.reviewAuthEnv ?? process.env), ...params.laneEnv } };
 }
 
 /**
@@ -1877,7 +1890,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         child = (params.spawnProcess ?? spawn)(params.binary, claudeTurnArgs(params, true), {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
+          ...claudeChildEnv(params),
         });
       } catch (error) {
         this.onInfraError(error);
@@ -2436,7 +2449,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         child = (params.spawnProcess ?? spawn)(params.binary, args, {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
+          ...claudeChildEnv(params),
         });
       } catch (error) {
         // Synchronous spawn faults (async ENOENT arrives via 'error').

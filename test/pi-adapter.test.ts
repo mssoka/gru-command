@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { COMPACTION_END_RECONCILE_MS, PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
@@ -3399,6 +3399,34 @@ describe('Perkins r1 regressions', () => {
       expect(readFileSync(handle.sessionFile!, 'utf8')).toContain('Minion verification refused before execution');
     } finally {
       await handle.dispose();
+      await fx.runtime.dispose();
+    }
+  });
+
+  it('#486: a lane session\'s bash commands carry the lane token and job; a session outside a lane carries none', async () => {
+    // A suite run inside a GC lane inherits that lane's variables.
+    const inherited = { token: process.env['GRU_LANE_TOKEN'], job: process.env['GRU_LANE_JOB'] };
+    delete process.env['GRU_LANE_TOKEN'];
+    delete process.env['GRU_LANE_JOB'];
+    onTestFinished(() => {
+      if (inherited.token !== undefined) process.env['GRU_LANE_TOKEN'] = inherited.token;
+      if (inherited.job !== undefined) process.env['GRU_LANE_JOB'] = inherited.job;
+    });
+    const laneDir = mkdtempSync(join(tmpdir(), 'gru-command-486-'));
+    cleanupDirs.push(laneDir);
+    const record = (file: string) => ({ deltas: [], toolCall: { id: `call-${file}`, name: 'bash', args: { command: `printf '%s|%s' "$GRU_LANE_TOKEN" "$GRU_LANE_JOB" > ${file}` } } });
+    const fx = await fixture([record('in-lane.txt'), { deltas: ['recorded'] }, record('outside.txt'), { deltas: ['recorded'] }]);
+    const token = 'c3'.repeat(16);
+    const inLane = await fx.runtime.spawn('gru', { cwd: laneDir, laneProvenance: { laneId: 'job-486', jobId: 'job-486', token } });
+    const outside = await fx.runtime.spawn('gru', { cwd: laneDir });
+    try {
+      await inLane.prompt('record the lane', { owner: 'alice' });
+      await outside.prompt('record the lane', { owner: 'alice' });
+      expect(readFileSync(join(laneDir, 'in-lane.txt'), 'utf8')).toBe(`${token}|job-486`);
+      expect(readFileSync(join(laneDir, 'outside.txt'), 'utf8')).toBe('|');
+    } finally {
+      await inLane.dispose();
+      await outside.dispose();
       await fx.runtime.dispose();
     }
   });

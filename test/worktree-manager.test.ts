@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { commandReferencesTree, psEnumerator, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
+import { commandReferencesTree, psEnumerator, WorktreeManager, type PausedProcess, type TreeProcess, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { runWorktreePortContract } from './helpers/worktree-port-contract.js';
 
@@ -32,6 +32,8 @@ interface Harness {
   manager: WorktreeManager;
   ledger: LedgerApi;
   escalations: { title: string; detail: string }[];
+  /** #486: each pause's id and what it said about each process. */
+  pauses: { pauseId: string; details: readonly PausedProcess[] }[];
   swept: string[];
   baseFallbacks: BaseFallbackNotice[];
   logs: { level: string; msg: string; fields: Record<string, unknown> }[];
@@ -41,9 +43,10 @@ interface Harness {
   dispose: () => Promise<void>;
 }
 
-function makeHarness(useDefaultEnumerator = false): Harness {
+function makeHarness(useDefaultEnumerator = false, extra: Partial<WorktreeManagerOptions> = {}): Harness {
   const repos: FixtureRepo[] = [];
   const escalations: { title: string; detail: string }[] = [];
+  const pauses: Harness['pauses'] = [];
   const swept: string[] = [];
   const baseFallbacks: BaseFallbackNotice[] = [];
   const logs: Harness['logs'] = [];
@@ -57,11 +60,12 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     preserveRoot,
     setupTimeoutMs: 30_000,
     killGraceMs: 25, // real-signal tests stay fast; production default is 1.5 s
-    onSweepPaused: ({ worktree, processes }) => {
+    onSweepPaused: ({ worktree, processes, pauseId, details }) => {
       escalations.push({
         title: `paused: ${worktree.id}`,
         detail: processes.map((p) => p.pid).join(','),
       });
+      pauses.push({ pauseId, details });
     },
     onSwept: ({ worktree }) => {
       swept.push(worktree.id);
@@ -69,12 +73,14 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     onBaseFallback: (input) => baseFallbacks.push({ ...input }),
     log: (level, msg, fields) => logs.push({ level, msg, fields: fields ?? {} }),
     ...(useDefaultEnumerator ? {} : { enumerateProcesses: (treePath: string) => enumerator(treePath) }),
+    ...extra,
   });
   return {
     repos,
     manager,
     ledger,
     escalations,
+    pauses,
     swept,
     baseFallbacks,
     logs,
@@ -97,8 +103,8 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!.dispose();
 });
 
-function harness(useDefaultEnumerator = false): Harness {
-  const h = makeHarness(useDefaultEnumerator);
+function harness(useDefaultEnumerator = false, extra: Partial<WorktreeManagerOptions> = {}): Harness {
+  const h = makeHarness(useDefaultEnumerator, extra);
   cleanups.push(h);
   return h;
 }
@@ -1584,6 +1590,10 @@ describe('Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, fo
         expect(result.processes.map((p) => p.pid)).toContain(777777);
       }
       expect(h.ledger.getWorktree('job-unkillable')?.status).toBe('paused');
+      // #486: the survivor is asked about again, with its own card, and is on
+      // the record for that answer.
+      expect(h.escalations.map((escalation) => escalation.detail)).toEqual(['777777', '777777']);
+      expect(h.ledger.listWorktreeProcesses('job-unkillable').find((proc) => proc.pid === 777777)?.state).toBe('live');
     } finally {
       kill.mockRestore();
     }
@@ -1840,6 +1850,178 @@ describe('owner incident 2026-09-23: the sweep reaps its OWN spawned services', 
         /* already gone */
       }
     }
+  });
+});
+
+describe('#486: lane provenance — the lane\'s own processes are reaped, the rest asked about by name', () => {
+  const daemons: number[] = [];
+  afterEach(() => {
+    for (const pid of daemons.splice(0)) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* reaped */ }
+    }
+  });
+  const alive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  /** The test process's environment without any lane variables it inherited
+   * (a suite run inside a GC lane carries its lane's). */
+  const cleanEnv = (): NodeJS.ProcessEnv => {
+    const env = { ...process.env };
+    delete env['GRU_LANE_TOKEN'];
+    delete env['GRU_LANE_JOB'];
+    return env;
+  };
+  /** A daemon that double-forks: its launcher exits, so it is reparented,
+   * with its cwd in the tree and the environment it was given. */
+  async function detachedDaemon(cwd: string, env: NodeJS.ProcessEnv): Promise<number> {
+    const launcher = spawn(process.execPath, ['-e', [
+      "const { spawn } = require('node:child_process');",
+      `const daemon = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { cwd: ${JSON.stringify(cwd)}, detached: true, stdio: 'ignore' });`,
+      'daemon.unref();',
+      'process.stdout.write(String(daemon.pid));',
+    ].join('\n')], { env, stdio: ['ignore', 'pipe', 'inherit'] });
+    let out = '';
+    launcher.stdout?.on('data', (chunk: Buffer) => { out += chunk.toString(); });
+    await new Promise((resolveClose) => launcher.on('close', resolveClose));
+    const pid = Number(out);
+    expect(Number.isInteger(pid) && pid > 0).toBe(true);
+    daemons.push(pid);
+    return pid;
+  }
+  async function rooted(path: string, pids: readonly number[]): Promise<void> {
+    await vi.waitFor(() => {
+      const listed = psEnumerator(path).map((proc) => proc.pid);
+      for (const pid of pids) expect(listed).toContain(pid);
+    }, { timeout: 5_000 });
+  }
+
+  it('ACCEPTANCE: a detached, double-forked daemon the lane\'s session started is reaped at the sweep, with no card, recorded killed by lane-token', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-daemon', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-daemon' });
+    const token = h.ledger.getWorktree('job-daemon')!.laneToken!;
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: token, GRU_LANE_JOB: 'job-daemon' });
+    await rooted(row.path, [pid]);
+
+    const result = await h.manager.release({ worktreeId: 'job-daemon' });
+    expect(result.status).toBe('swept');
+    expect(h.escalations).toEqual([]);
+    expect(alive(pid)).toBe(false);
+    expect(h.ledger.listWorktreeProcesses('job-daemon').find((proc) => proc.pid === pid)).toMatchObject({ evidence: 'lane-token', state: 'killed' });
+    const reaped = h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.lane-processes-reaped');
+    expect(reaped?.payload).toMatchObject({ id: 'job-daemon', trigger: 'sweep', pids: [pid], survivors: [] });
+    expect(existsSync(row.path)).toBe(false);
+  });
+
+  it('a process with no lane token, or another lane\'s, still pauses and asks, and the ask says which', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-mine', repo);
+    ledgerJob(h, 'job-theirs', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-mine' });
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-theirs' });
+    const theirs = h.ledger.getWorktree('job-theirs')!.laneToken!;
+    const stranger = await detachedDaemon(row.path, cleanEnv());
+    const neighbour = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: theirs });
+    await rooted(row.path, [stranger, neighbour]);
+
+    const result = await h.manager.release({ worktreeId: 'job-mine' });
+    expect(result.status).toBe('paused');
+    expect(alive(stranger)).toBe(true);
+    expect(alive(neighbour)).toBe(true);
+    const details = h.pauses[0]!.details;
+    expect(details.find((detail) => detail.pid === stranger)).toMatchObject({ provenance: 'no-token', otherLane: null, name: expect.stringMatching(/node/u) });
+    expect(details.find((detail) => detail.pid === neighbour)).toMatchObject({ provenance: 'other-lane', otherLane: 'job-theirs' });
+    expect(details.every((detail) => detail.startedAt !== null)).toBe(true);
+    // The pause's event carries the id the card is named by.
+    const pause = h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.paused');
+    expect((pause?.payload as { pause_id?: string }).pause_id).toBe(h.pauses[0]!.pauseId);
+    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.lane-processes-reaped')).toBe(false);
+  });
+
+  it('a pid recycled between the enumeration and the kill is never signalled', async () => {
+    let reads = 0;
+    const h = harness(false, {
+      // The first read sees the lane's token; by the read just before the
+      // signal, the pid belongs to a process that carries none.
+      readLaneTokens: async (procs) => {
+        reads += 1;
+        const token = reads === 1 ? h.ledger.getWorktree('job-recycled')!.laneToken : null;
+        return new Map(procs.map((proc) => [proc.pid, { readable: true as const, token }]));
+      },
+    });
+    const repo = h.make();
+    ledgerJob(h, 'job-recycled', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-recycled' });
+    const outsider = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', env: cleanEnv() });
+    daemons.push(outsider.pid as number);
+    h.enumerator.mockReturnValue([{ pid: outsider.pid as number, command: 'node -e recycled', evidence: 'cwd' }]);
+
+    const result = await h.manager.release({ worktreeId: 'job-recycled' });
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(alive(outsider.pid as number)).toBe(true);
+    expect(result.status).toBe('paused');
+    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.lane-processes-reaped')).toBe(false);
+  });
+
+  it('never reaps while a session GC runs in the lane is busy: its own processes carry the token too', async () => {
+    const h = harness(true, { laneQuiet: () => false });
+    const repo = h.make();
+    ledgerJob(h, 'job-busy', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-busy' });
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-busy')!.laneToken! });
+    await rooted(row.path, [pid]);
+
+    expect(await h.manager.reapLaneAfterTurn('job-busy')).toEqual([]);
+    const result = await h.manager.release({ worktreeId: 'job-busy' });
+    expect(result.status).toBe('paused');
+    expect(alive(pid)).toBe(true);
+    expect(h.pauses[0]!.details.find((detail) => detail.pid === pid)?.provenance).toBe('this-lane');
+  });
+
+  it('when the lane\'s turns end, what they left running is reaped at once — unless a verification run owns the tree', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-turn', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-turn' });
+    const env = { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-turn')!.laneToken! };
+    const first = await detachedDaemon(row.path, env);
+    await rooted(row.path, [first]);
+    expect(await h.manager.reapLaneAfterTurn('job-turn')).toEqual([first]);
+    expect(alive(first)).toBe(false);
+    expect(h.ledger.getWorktree('job-turn')?.status).toBe('active');
+    const reaped = h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.lane-processes-reaped');
+    expect(reaped?.payload).toMatchObject({ trigger: 'turn-settled', pids: [first] });
+
+    // A verification run GC spawned is live in the lane: it may use what the
+    // minion started, so nothing is reaped until it ends.
+    const second = await detachedDaemon(row.path, env);
+    await rooted(row.path, [second]);
+    h.ledger.recordWorktreeProcesses({ worktreeId: 'job-turn', processes: [{ pid: 999_999, command: 'npm test', evidence: 'registry' }], state: 'live' });
+    expect(await h.manager.reapLaneAfterTurn('job-turn')).toEqual([]);
+    expect(alive(second)).toBe(true);
+  });
+
+  it('an answer that names some of the paused pids kills only those; the rest are asked about again', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-named', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-named' });
+    const a = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', env: cleanEnv() });
+    const b = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', env: cleanEnv() });
+    daemons.push(a.pid as number, b.pid as number);
+    const listed = (): TreeProcess[] => [a, b].filter((child) => alive(child.pid as number))
+      .map((child) => ({ pid: child.pid as number, command: `node -e sleeper-${String(child.pid)}`, evidence: 'cwd' as const }));
+    h.enumerator.mockImplementation(() => listed());
+    expect((await h.manager.release({ worktreeId: 'job-named' })).status).toBe('paused');
+
+    const answered = await h.manager.release({ worktreeId: 'job-named', confirmKill: true, confirmKillPids: [a.pid as number] });
+    expect(alive(a.pid as number)).toBe(false);
+    expect(alive(b.pid as number)).toBe(true);
+    expect(answered.status).toBe('paused');
+    expect(h.pauses).toHaveLength(2);
+    expect(h.pauses[1]!.details.map((detail) => detail.pid)).toEqual([b.pid]);
   });
 });
 

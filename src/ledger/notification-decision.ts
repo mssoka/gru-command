@@ -67,8 +67,13 @@ export interface NotificationDecision {
  * owner row stays open until answered. */
 const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal', 'onboarding.proposal', 'worktree.repo-mismatch', 'disk.reclaim-proposal'];
 
+/** #486: a paused sweep's card (`worktree-sweep-paused:<lane>:<pause>`) is
+ * withdrawn undecided when its lane is swept without it, or a newer pause of
+ * the lane asks about what is running now. */
+const PRODUCER_WITHDRAWABLE_PREFIXES: readonly string[] = ['worktree-sweep-paused:'];
+
 export function producerWithdrawable(kind: string): boolean {
-  return PRODUCER_WITHDRAWABLE_KINDS.includes(kind);
+  return PRODUCER_WITHDRAWABLE_KINDS.includes(kind) || PRODUCER_WITHDRAWABLE_PREFIXES.some((prefix) => kind.startsWith(prefix));
 }
 
 const OPTION_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;

@@ -82,8 +82,9 @@ confirmed kill is grounded on lands in the registry, so the ask always
 names exactly what was live.
 
 A recorded process row leaves `live` in one of three ways (#464):
-- **`killed`**: a confirmed kill, or the verification scheduler's
-  reconcile of its own `registry` rows;
+- **`killed`**: a confirmed kill, the verification scheduler's reconcile
+  of its own `registry` rows, or a reap of the lane's own processes
+  (evidence `lane-token`, recorded `killed` directly, [§3a](#3a-lane-provenance-486));
 - **`exited`, `not-enumerated`**: a release's fresh enumeration no longer
   finds the process rooted in the tree, and its pid is dead. A process
   still alive keeps its row `live` until the tree is swept, because an
@@ -102,6 +103,12 @@ The orchestrator's OWN spawned services land there too: the verification
 scheduler records every run it spawns for a lane (pid + argv, evidence
 `registry`) and reconciles it on exit. A service the orchestrator started
 for a lane is the lane's to tear down — not a stranger's.
+
+Each row also carries the lane's **token** (`lane_token`, #486): random per
+lane incarnation, minted when the row is registered (lanes not yet swept
+when the column arrived got one then). Every session GC spawns in the lane
+carries it, and so does everything that session starts
+([§3a](#3a-lane-provenance-486)).
 
 ## 3. Preserve-first ordered sweep (18c)
 
@@ -279,18 +286,27 @@ for a lane is the lane's to tear down — not a stranger's.
    killed, with a `worktree.service-reaped` event. Dual-keyed: a pid is
    signalled only when its registry row is live AND it still enumerates
    as rooted in the tree (a recycled pid can never redirect the kill).
+   Then **reap the lane's own processes** (#486): a process rooted in the
+   tree that carries the lane's token is reaped the same way, recorded
+   killed with evidence `lane-token` ([§3a](#3a-lane-provenance-486)). A
+   release that does not pause (`onLiveProcess: 'refuse'`, the disk
+   budget's) reaps neither.
 3. **Enumerate** processes rooted in the tree: argv **path-boundary**
    match (a sibling lane `job-a-2` is never confused with `job-a`) OR
    the process's actual **cwd** (lsof on macOS, procfs on Linux; other
    platforms argv-only, declared).
 4. **Pause and ask** — any other live process pauses the sweep (needs-owner
    escalation — a destructive step is the owner's ruling) and touches
-   nothing. `confirm_kill` answers the RECORDED ask: it kills exactly
-   the acknowledged pids (never a fresh enumeration — later arrivals
-   were never acknowledged), with a SIGTERM grace before SIGKILL.
-   Survivors re-pause; newcomers get their own ask; `confirm_kill`
-   without a recorded pause is not honored. Silent kills do not exist
-   for processes the orchestrator did not spawn.
+   nothing: one with no lane token, another lane's token, or an
+   environment GC cannot read, or one carrying this lane's token while a
+   session GC runs in the lane is still busy. `confirm_kill` answers the
+   RECORDED ask: it kills exactly the acknowledged pids (never a fresh
+   enumeration — later arrivals were never acknowledged), with a SIGTERM
+   grace before SIGKILL. Survivors re-pause; newcomers get their own ask;
+   `confirm_kill` without a recorded pause is not honored. Silent kills
+   do not exist for processes nothing ties to the lane. The owner's card
+   ([§3a](#3a-lane-provenance-486)) names what runs and offers that answer
+   as its one action.
 5. **Snapshot** the uncommitted tracked work (#427), then **remove** the
    worktree. `worktree remove --force` keeps nothing tracked, so every
    release (operator, autopilot, child, review, failed-dispatch cleanup)
@@ -432,6 +448,63 @@ for a lane is the lane's to tear down — not a stranger's.
    Swept-row retries and missing-tree reconciliation refresh before
    disposal too.
 6. **Return the fresh head** — follow-on work starts from now.
+
+## 3a. Lane provenance (#486)
+
+A minion's tool calls start processes that outlive them: a browser
+automation daemon, a headless Chrome, a dev server. They double-fork or are
+reparented to pid 1, so nothing in the process tree ties them to the session
+any more, and before #486 every one paused its lane's sweep and asked the
+owner about bare pids.
+
+- **The token.** When the runtime registry spawns a session whose cwd is a
+  registered lane not yet swept (the row whose `path` is exactly that cwd),
+  the session's environment carries `GRU_LANE_TOKEN=<the row's token>` and,
+  for a lane with a job, `GRU_LANE_JOB=<job id>`: on claude-code, the CLI's
+  environment (every CLI child of the session: turns and compaction); on
+  Pi, every command of its `bash` tool (GC supplies Pi's own bash tool,
+  built with the session's shell settings and a spawn hook that adds them).
+  Every descendant inherits them, a daemon that detached included. GC never
+  sets them in its own environment.
+- **Reading it.** On Linux GC reads `/proc/<pid>/environ`; on macOS
+  `ps -E`, whose environment follows the command line, which must still be
+  the one the listing showed (a process that exec'd since, or a recycled
+  pid, reads as unreadable). **Limits:** macOS shows no environment for a
+  system binary (`/bin/sh`, `/bin/sleep`), Linux none for a non-dumpable
+  process, and other platforms none at all: such a process keeps the ask. A
+  process that clears its environment drops the token and keeps the ask
+  too.
+- **At the sweep** (step 2), a process rooted in the tree whose token is
+  exactly the lane's is reaped (process group SIGTERM, grace, SIGKILL) and
+  recorded `killed` with evidence `lane-token`, with a
+  `worktree.lane-processes-reaped { id, path, trigger: "sweep", pids,
+  survivors }` event. Dual-keyed: the token is read again just before each
+  signal, so a pid recycled between the enumeration and the kill is never
+  signalled. Never while a session GC runs in the lane is busy there (a
+  call in flight, a turn streaming or being spawned, a compaction or a
+  disposal): its own processes carry the token too. A survivor stays for
+  the ask.
+- **When the turns end.** Once every session on a lane has settled its
+  calls, or been disposed, the registry tells the manager, which reaps the
+  same way right away (`trigger: "turn-settled"`), listing off the event
+  loop and under the lane's lock. Skipped for a lane that is not active,
+  and while a verification run GC spawned owns the tree (a live `registry`
+  row: the run may use what the minion started). The worker rule blocks
+  tell minions to stop what they start before their turn ends, and that GC
+  stops what they leave.
+- **The card.** What still runs is not provably the lane's. The pause's
+  FOR YOU card (`worktree-sweep-paused:<lane>:<pause>`, its id too; the
+  pause's `worktree.paused` event carries `pause_id`) groups the processes
+  by executable name (`agent-browser + Google Chrome Helper (Renderer)
+  ×9`), gives each group's pids, start times and working directory, and
+  says why GC did not stop it: no lane token, another lane's token (named),
+  an environment it cannot read, or this lane's token while a session was
+  busy. Its one option, **Stop these N processes and finish the sweep**,
+  is carried out as an operator's `confirm_kill` limited to the pids that
+  card named: a survivor or a newcomer pauses again with a new card, and the
+  answered card closes saying what happened. A newer pause of the lane
+  withdraws an older unanswered card, and a sweep withdraws the lane's
+  unanswered cards. An answer a restart interrupted is carried out at start.
 
 ## 4. Detached-for-reviews, branch-for-jobs (18d)
 
@@ -1068,7 +1141,8 @@ like every product surface.
 
 `POST /api/dispatch/release` — `{ job_id | round_id | worktree_id,
 confirm_kill?, base_branch?, discard_submodule_work? }`. The paused response carries the FULL
-process list (pid, command, evidence) and the ask note: that payload is
+process list (pid, command, evidence, and the working directory when the
+listing read it) and the ask note: that payload is
 what a human acknowledges against. A submodule refusal answers 400 with
 the `detail`, the `digest` and the `submodules` it found;
 `discard_submodule_work: "<digest>"` lets an operator release destroy
