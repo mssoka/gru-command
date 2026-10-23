@@ -6821,6 +6821,22 @@ describe('WaveRunner request guards', () => {
     expect(lane.escalations.some((line) => line.includes('NO pull request'))).toBe(false);
   });
 
+  it('an owner decision holding PR registration holds publication-time linking too (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-held');
+    const decision = lane.ledger.recordDecision({
+      subject: `job:${lane.job.id}`, decision: 'hold', covers: ['delivered-pr-register'], by: 'owner', reason: 'owner links this PR',
+    });
+    const findOpenPullRequests = vi.fn(async () => [{ url: 'https://github.com/acme/fixture/pull/6', headSha: lane.target, state: 'open' }]);
+    const recordPr = vi.fn();
+    const outcome = asWave(await lane.wave({ findOpenPullRequests, recordPr }).runRound({ jobId: lane.job.id }));
+    expect(outcome.round.status).toBe('aborted');
+    expect(findOpenPullRequests).not.toHaveBeenCalled();
+    expect(recordPr).not.toHaveBeenCalled();
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.escalations.some((line) =>
+      line.includes(`an active decision (${decision.id}) covers delivered-pr-register, so no open pull request is linked`))).toBe(true);
+  });
+
   it('refuses a PR finder without its linker, and the reverse (#488)', async () => {
     const lane = await unlinkedPublicationLane('unlinked-miswired');
     expect(() => lane.wave({ findOpenPullRequests: async () => [] }))

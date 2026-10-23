@@ -1606,14 +1606,18 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       !verificationInFlight(input.ledger, job.id) ? currentInspectionOwed(input.ledger, job) : null;
     if (inspection !== null) digest.currentInspections.push({ jobId: job.id, repo: job.repo, ...inspection });
 
-    // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
+    // (1) Delivered, no PR yet. A job whose every round aborted unlinked
+    // (a restart, an INCOMPLETE lead) still owes its PR registration: no
+    // other row offers it, and the clean-abort re-arm needs the link (#488).
+    // Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
     // investigation job completes at its handback, so flagging it as
     // PR-overdue would manufacture ops work and false missing-PR alarms.
     // A pending material correction (owner rule 2) withholds the PR/review
     // offer for the outdated candidate until the corrective delivery.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        revision === null && verificationDebt === null && job.prUrl === null && rounds.length === 0 &&
+        revision === null && verificationDebt === null && job.prUrl === null &&
+        rounds.every((round) => round.status === 'aborted') &&
         (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose

@@ -394,9 +394,10 @@ whose head is the job lane's branch. Exactly one at the reviewed head is
 linked to the job (`round.pr-discovered`) and receives the review. Anything
 else — none, several, a different head, a non-GitHub origin or a failed
 lookup — aborts the round `no_pr_link`, and the escalation names what the
-lookup found and the next step (link the PR, then re-arm). A shutdown during
-the lookup ends the round as the restart's clean abort, never as a missing
-PR.
+lookup found and the next step (link the PR, then re-arm). An active owner
+decision holding `delivered-pr-register` for the delivery holds this link
+too. A shutdown during the lookup ends the round as the restart's clean
+abort, never as a missing PR.
 
 Beside the four route-deciding legs, the same pass evaluates the
 **non-blocking advisory leg `verdict-publication-identity`** (issue #444):
@@ -915,7 +916,9 @@ the judgment; the dispatch surface is the mechanical hand.
   new item that resolves the earlier head's item and wakes once. Always on
   for every `managed_repos` entry; no config key.
 - **The digest** handed to every wake carries the actionable states,
-  computed from the ledger: delivered jobs with no PR registered; PRs
+  computed from the ledger: delivered jobs with no PR registered (again
+  once every round armed before the link aborted, since the clean-abort
+  re-arm needs the link); PRs
   whose follow-up delivery proves the lane head moved past the newest
   round's reviewed target (first review AND re-review after a fix round);
   or a proven `service_restart` abort on the unchanged delivered head (a

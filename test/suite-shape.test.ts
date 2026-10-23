@@ -288,7 +288,7 @@ const PINS: Record<string, number> = {
   'patch-vitest-rpc-timeout.test.ts': 11,
   'perkins-admission-preflight.test.ts': 84,
   'perkins-admission-sysctl.test.ts': 1,
-  'perkins-builtin-wave.test.ts': 289,
+  'perkins-builtin-wave.test.ts': 290,
   'perkins-checkpoint-enumeration.test.ts': 1,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-findings-dedupe.test.ts': 11,
@@ -359,7 +359,7 @@ const PINS: Record<string, number> = {
   'silas-deterministic-seam.test.ts': 2,
   'session-store.test.ts': 28,
   'shutdown.test.ts': 8,
-  'silas-driver.test.ts': 175,
+  'silas-driver.test.ts': 176,
   'silas-verification-debt.test.ts': 27,
   'silas-followthrough.test.ts': 2,
   'silas-h4-checkpoint.test.ts': 3,

@@ -34,6 +34,7 @@ import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoff
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
 import { deliveredTargetSha } from './silas-driver.js';
+import { decisionHold, deliveredPrRegisterHold } from './silas-autopilot.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
@@ -3013,6 +3014,10 @@ export class WaveRunner {
     if (lane === null || branch === null || branch.trim() === '') {
       return { url: null, note: 'the job has no lane branch to look up an open pull request for' };
     }
+    // An owner decision holding PR registration for this delivery holds
+    // here too: publication never links past what Silas may not.
+    const held = decisionHold(this.opts.ledger, jobId, deliveredPrRegisterHold(this.opts.ledger, jobId));
+    if (held !== null) return { url: null, note: `${held}, so no open pull request is linked` };
     // The lookup never holds an aborting round: the race settles on the
     // abort, and a late lookup result or failure is dropped.
     let onAbort = (): void => {};

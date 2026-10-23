@@ -678,6 +678,30 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('offers PR registration again once every round on the unlinked delivery aborted, never during a live one (#488)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-unlinked');
+      const digestNow = async () => computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // A round armed before the PR was registered: while it is live the
+      // round itself looks the PR up at publication, so no row is offered.
+      const round = h.ledger.addRound({ jobId: 'job-unlinked', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      expect((await digestNow()).deliveredWithoutPr).toEqual([]);
+      // It aborted (a restart, an INCOMPLETE lead): before #488 the job had
+      // rounds, so nothing ever offered the registration the re-arm needs.
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      expect((await digestNow()).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-unlinked']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('a review offer is retracted when a retirement hold opens during the compute await', async () => {
     const h = makeLedger();
     try {
