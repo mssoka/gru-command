@@ -4112,6 +4112,55 @@ it('routes a real local native authority refusal away from provider authenticati
   }
 });
 
+it('preserves provider authentication recovery after a local refusal in the same Pi turn', async () => {
+  let applyAcceptedClarification: (() => void) | null = null;
+  const f = await sdkDirectiveExecutionFixture((_prompt, index) => {
+    if (index === 0) applyAcceptedClarification?.();
+    return index === 0
+      ? { deltas: [], toolCall: { id: 'refused-local-effect-before-provider-error', name: 'bash', args: { command: 'printf forbidden > local-authority-effect.txt' } } }
+      : { deltas: [], error: 'HTTP 401 Unauthorized' };
+  });
+  const { scene, registry, fx } = f;
+  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
+    restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+    registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
+  try {
+    expect(scene.ledger.claimDirectiveDispatch(scene.request.requestId)).toBe(true);
+    const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: 'local-refusal-then-provider-error' });
+    scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+    if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
+    const producer = handle.prepareDirectiveProducer(scene.identity);
+    scene.ledger.startDirectiveProducer(scene.identity, producer);
+    applyAcceptedClarification = () => {
+      expect(scene.ledger.addJobAmendment({ jobId: scene.request.jobId, body: 'Synthetic accepted administrative contract clarification.',
+        supersedes: [], approval: { by: 'owner', reference: 'synthetic accepted clarification' }, effect: 'material',
+        expectedContractSha256: scene.identity.contractSha256 }).status).toBe('accepted');
+      scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'accepted contract clarification superseded the original continuation' });
+    };
+    const events: RuntimeEvent[] = [];
+    handle.subscribe((event) => events.push(event));
+    const verdict = await handle.promptWithVerdict('original accepted synthetic directive', { owner: `silas-directive:${scene.request.requestId}`,
+      directive: { identity: scene.identity, beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+        onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    expect(verdict.ok).toBe(false);
+    await waitFor(() => events.some((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized'), 'synthetic provider authentication error');
+    const providerFailure = [...events].reverse().find((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized');
+    expect(providerFailure?.type).toBe('error');
+    if (providerFailure?.type !== 'error') throw new Error('synthetic provider error event was not emitted');
+    expect(providerFailure.nativeControl).toBeUndefined();
+    expect(providerFailure).toMatchObject({ provider: 'gru-stub', model: 'stub-model' });
+    expect(fx.script.calls).toHaveLength(2);
+    await vi.waitFor(() => expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' }));
+    expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall') && notice.agentId === handle.id)).toBe(true);
+    expect(scene.ledger.listProviderWaits()).toEqual([]);
+    expect(existsSync(join(scene.lane.path, 'local-authority-effect.txt'))).toBe(false);
+    expect(scene.ledger.getDirective(scene.request.requestId)?.state).toBe('failed');
+  } finally {
+    supervisor.dispose();
+    await f.cleanup();
+  }
+});
+
 it('routes a late Pi preflight authority refusal through native recovery without accepting or replaying the prompt', async () => {
   let checks = 0;
   const f = await sdkDirectiveExecutionFixture([{ deltas: ['provider must not be called'] }]);
