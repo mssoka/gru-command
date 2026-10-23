@@ -2871,8 +2871,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
 
     /** Fails one chunk of this handle's own transcript stream, written alone or in a
      * batch (a failed batch fails every chunk in it, as Node does). With `holdUntil`,
-     * the failing write's callback waits until that many more frames are queued
-     * behind it (its batch-mates, and the writes made after the hold began), so
+     * the failing write's callback waits until a write made after the hold began
+     * brings the frames queued behind it (its batch-mates count) to that many, so
      * Node hands each of them the same root error, deterministically. `sharedRoot`
      * counts, apart from the hold's own count, the write callbacks that received
      * that root error object itself: the failing write and every frame behind it.
@@ -2926,7 +2926,6 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           }
           held = callback;
           state.queuedBehind = behind;
-          if (behind >= holdUntil) release();
         };
         stream._write = (chunk, encoding, callback) => {
           if (!state.broken && matches(chunk.toString())) { failing(callback, 0, chunk.toString()); return; }
@@ -3097,6 +3096,21 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     it('an EDQUOT in the completion receipt is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('completion receipt'));
     it('an EDQUOT in the spawn-time controller receipt is one tagged refusal, and no CLI starts (#485)', () => assertClaudeBookkeepingFault('controller receipt'));
 
+    it('a permission channel transport failure reports itself, untagged (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        (handle as unknown as { live: ChildProcess }).live.stdin!.emit('error', new Error('write EPIPE'));
+      });
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-transport-untagged'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(new Error('directive permission transport failed'));
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'directive permission transport failed', fatal: false }]);
+      } finally { await handle.dispose(); }
+    });
+
     /** Models a GC bug: the handle's `recordDirectiveFailure`, which only keeps the turn's
      * failure in memory and cannot throw in production, throws a TypeError whose words name a
      * wall, on the permission channel's own refusal, once, or on every call (#485). */
@@ -3122,10 +3136,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
       const unrecorded = throwOnChannelRefusal(handle, times);
+      // The turn itself, to read the failure it keeps.
+      const target = handle as unknown as { prepareDirectiveTurn(...args: unknown[]): { readonly failure: { readonly error: unknown } | null } };
+      const prepare = target.prepareDirectiveTurn.bind(handle);
+      let turn: { readonly failure: { readonly error: unknown } | null } | null = null;
+      const prepared = vi.spyOn(target, 'prepareDirectiveTurn').mockImplementation((...args) => (turn = prepare(...args)));
       const error = 'directive permission handling failed: Cannot read properties of undefined (reading \'quota\')';
       try {
         await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor(`claude-channel-unrecorded-${times}`), beforeAdmission: () => {}, onAdmitted: () => {} } }))
           .rejects.toThrow(new Error(error));
+        // The refusal is kept on the turn even when recording it threw, so no later effect,
+        // and no completion, passes it.
+        expect(turn!.failure?.error, times).toEqual(new DirectiveCheckpointError(error));
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8'), times).not.toContain('"state":"completed"');
         // Reported by the guard's own abort, never merely at the CLI's close.
         expect(events.filter((event) => event.type === 'error'), times).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
         // Its words alone would wall: the tag is what keeps it with directive recovery.
@@ -3135,6 +3158,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(fx.logs.some((line) => line.msg === 'claude directive refusal could not be recorded; the turn is refused regardless'), times).toBe(times === 'always');
       } finally {
         unrecorded.mockRestore();
+        prepared.mockRestore();
         await handle.dispose();
       }
     }

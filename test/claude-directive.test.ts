@@ -192,6 +192,51 @@ describe('the Claude directive permission channel (#424)', () => {
     expect(caught).toEqual([]);
   });
 
+  it('every failure the channel reports goes through its guard: a throwing fail() at each site is handed on, logged with that failure (#485)', async () => {
+    const sites: readonly { readonly failure: string; readonly act: (c: ReturnType<typeof channel>, reject: (error: Error) => void) => Promise<void> | void; readonly decide?: 'allow' | 'held' }[] = [
+      // ingest's own checks
+      { failure: 'directive permission initialization did not complete before result', act: (c) => { c.permissions.ingest({ type: 'result' }, Promise.resolve()); } },
+      { failure: 'foreign or repeated directive permission response', act: (c) => {
+        c.initialize();
+        c.permissions.ingest({ type: 'control_response', response: { subtype: 'success', request_id: 'stranger', response: {} } }, Promise.resolve());
+      } },
+      { failure: 'malformed or foreign directive permission request', act: (c) => { c.initialize(); c.permissions.ingest(request('', 'toolu_1'), Promise.resolve()); } },
+      // the fence, once its deny can no longer be written
+      { failure: 'directive tool fence failed: fence broke at teardown', decide: 'held', act: async (c, reject) => {
+        c.initialize();
+        c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+        await tick(); await tick();
+        c.child.emit('close');
+        reject(new Error('fence broke at teardown'));
+      } },
+      // the write: its stdin ended, or its write throwing
+      { failure: 'directive permission transport is unavailable', decide: 'allow', act: (c) => {
+        c.initialize();
+        c.child.stdin!.end();
+        c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+      } },
+      { failure: 'directive permission transport failed', decide: 'allow', act: (c) => {
+        c.initialize();
+        Object.assign(c.child.stdin!, { write: () => { throw new Error('write EPIPE'); } });
+        c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+      } },
+    ];
+    for (const site of sites) {
+      let reject!: (error: Error) => void;
+      const c = channel(site.decide === 'held' ? () => new Promise<ClaudeToolDecision>((_resolve, rejected) => { reject = rejected; }) : () => ({ allow: true }),
+        undefined, undefined, { failThrows: true });
+      const caught = await escaped(async () => {
+        await site.act(c, (error) => reject(error));
+        await tick(); await tick(); await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+      expect(c.failures[0], site.failure).toBe(site.failure);
+      expect(c.logs[0], site.failure).toEqual(['claude directive permission handling threw; the turn is refused',
+        { failure: site.failure, error: expect.stringMatching(/^Error: turn failure handling broke\n/u) }]);
+      expect(c.refusedFailures[0], site.failure).toBe('directive permission handling failed: turn failure handling broke');
+      expect(caught, site.failure).toEqual([]);
+    }
+  });
+
   it('a throwing fail() reached from a stdin write callback is a refusal of GC\'s own, never an uncaught exception (#485)', async () => {
     const c = channel(undefined, undefined, undefined, { failThrows: true });
     const caught = await escaped(async () => {
