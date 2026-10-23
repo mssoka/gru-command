@@ -73,6 +73,8 @@ export const DIRECTIVE_RETIREMENT_REFUSAL_CODES = [
   'terminal_receipt_present',
   'admission_evidence_incomplete',
   'stale_head',
+  'stale_generation',
+  'stale_authority',
   'lane_unavailable',
   'live_work',
 ] as const;
@@ -90,21 +92,34 @@ export class DirectiveRetirementError extends Error {
   }
 }
 
-/** The canonical retirement intent: the caller's binding expectations plus
- * audit provenance. The fingerprint over exactly these fields is the
- * replay-identity — a replay with changed content is a conflict, never a
- * second transition. */
+/** The canonical retirement intent: the caller's request/lane binding and
+ * current generation/approved-authority expectations plus audit provenance.
+ * The fingerprint over exactly these fields is the replay identity — a replay
+ * with changed content is a conflict, never a second transition. The optional
+ * context exists only to preserve exact replay of pre-context retired rows;
+ * a live transition requires the complete context. */
 export interface DirectiveRetirementIntent {
   readonly requestId: string;
   readonly expectedJobId: string;
   readonly expectedState: LiveDirectiveState;
   readonly expectedPayloadHash: string;
   readonly expectedHead: string;
+  /** Current directive-recovery generation, or null when no recovery debt exists. */
+  readonly expectedGeneration?: number | null;
+  /** Fresh write-boundary authority context; omitted only for replay of a legacy retirement. */
+  readonly expectedAuthorityEpoch?: number;
+  readonly expectedWorkRevision?: number;
+  readonly expectedContractSha256?: string;
   readonly reason: string;
   readonly by: string;
 }
 
 export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent): string {
+  const context = [intent.expectedGeneration, intent.expectedAuthorityEpoch, intent.expectedWorkRevision, intent.expectedContractSha256];
+  const hasContext = context.some((value) => value !== undefined);
+  if (hasContext && context.some((value) => value === undefined)) {
+    throw new Error('directive retirement identity requires a complete generation/authority context');
+  }
   return createHash('sha256')
     .update(
       JSON.stringify([
@@ -113,6 +128,7 @@ export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent
         intent.expectedState,
         intent.expectedPayloadHash,
         intent.expectedHead,
+        ...(hasContext ? context : []),
         intent.reason,
         intent.by,
       ]),
@@ -159,6 +175,13 @@ export interface DirectiveRequestRecord {
    * lost-response retry can reconstruct the identical canonical intent. */
   readonly retireExpectedState: LiveDirectiveState | null;
   readonly retireExpectedHead: string | null;
+  /** Fresh generation/current authority expectations are preserved in the
+   * retirement audit event (no mutable row-side duplicate). Null means no
+   * recovery obligation existed at the write boundary. */
+  readonly retireExpectedGeneration: number | null;
+  readonly retireExpectedAuthorityEpoch: number | null;
+  readonly retireExpectedWorkRevision: number | null;
+  readonly retireExpectedContractSha256: string | null;
   /** Continuation hold: set to the identity of the fresh accepted request
    * that superseded this retirement; null while the hold is open. */
   readonly holdReleasedBy: string | null;

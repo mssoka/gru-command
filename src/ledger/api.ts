@@ -2398,14 +2398,21 @@ export class LedgerApi {
   }
 
   /** Durable execution blockers for an irreversible terminal disposition:
-   * open worker turns, non-terminal tracked children, live review rounds
-   * and unsettled verification runs. Idle/disposed/historical bookkeeping
-   * rows are NOT execution evidence (issue #171 ownership classifies
-   * leftovers at the runtime boundary; a historical gap must not block a
-   * truthful closure) and directive/re-brief control rows are owned by
-   * their own reconcilers — neither is read here. */
+   * open worker turns, non-terminal tracked children, live review rounds,
+   * unsettled verification runs and live directive controls. Idle/disposed/
+   * historical bookkeeping rows are NOT execution evidence (issue #171
+   * ownership classifies leftovers at the runtime boundary; a historical
+   * gap must not block a truthful closure). A live directive must first be
+   * closed through its own evidence-fenced native control; binning cannot
+   * hide an unresolved request. Re-brief marker retirement retains its
+   * separate terminal-job reconciliation contract. */
   private terminalLiveWorkBlockers(jobId: string): readonly string[] {
     const blockers: string[] = [];
+    const liveDirectives = this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES, limit: 1000 });
+    if (liveDirectives.length > 0) {
+      const sample = liveDirectives.slice(0, 20).map((request) => `${request.requestId} (${request.state})`).join(', ');
+      blockers.push(`live directive request(s): ${sample}${liveDirectives.length >= 1000 ? ' (at least 1000; inspection bound reached)' : ''}`);
+    }
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === jobId && (agent.state === 'spawning' || agent.state === 'streaming'),
     );
@@ -9464,7 +9471,9 @@ export class LedgerApi {
         }
         if (input.decision.requestId === row.requestId || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request id');
         this.retireInterruptedDirective({ requestId: row.requestId, expectedJobId: row.jobId, expectedState: row.state as LiveDirectiveState,
-          expectedPayloadHash: input.expectedPayloadHash, expectedHead: input.expectedHead, lane: input.lane, reason: input.reason, by: 'gru-recovery' });
+          expectedPayloadHash: input.expectedPayloadHash, expectedHead: input.expectedHead, expectedGeneration: input.generation,
+          expectedAuthorityEpoch: input.expectedEpoch, expectedWorkRevision: input.expectedWorkRevision,
+          expectedContractSha256: input.expectedContractSha256, lane: input.lane, reason: input.reason, by: 'gru-recovery' });
         successor = (input.decision.kind === 'successor'
           ? this.beginDirectiveIntent({ jobId: row.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' })
           : this.beginRebriefIntent({ jobId: row.jobId, requestId: input.decision.requestId, note: input.decision.note, holder: 'gru-recovery' })).record;
@@ -9905,8 +9914,9 @@ export class LedgerApi {
   // `retired` closes ONLY an interrupted request's control ownership, and
   // only after the service itself re-derives a fresh cessation predicate
   // from durable ownership marks plus the caller's binding expectations.
-  // The caller contributes expectations (job, state, payload hash, head)
-  // and audit labels — never evidence booleans. The transition runs in ONE
+  // The caller contributes request/lane binding, recovery generation,
+  // current epoch/revision/contract expectations and audit labels — never
+  // physical cessation evidence. The transition runs in ONE
   // transaction: refusal checks, admission preservation, the state flip,
   // exactly one `silas.directive-retired` audit event, the durable
   // continuation hold, and the closure (never completion) of an awaiting
@@ -10006,6 +10016,10 @@ export class LedgerApi {
     expectedState: LiveDirectiveState;
     expectedPayloadHash: string;
     expectedHead: string;
+    expectedGeneration?: number | null;
+    expectedAuthorityEpoch?: number;
+    expectedWorkRevision?: number;
+    expectedContractSha256?: string;
     /** Server-resolved lane evidence; required on the live path and
      * deliberately ignored on the consumed-replay path (the lane may be
      * gone by then — the decision is already durable). */
@@ -10021,6 +10035,10 @@ export class LedgerApi {
       expectedState: input.expectedState,
       expectedPayloadHash: input.expectedPayloadHash,
       expectedHead: input.expectedHead,
+      ...(input.expectedGeneration === undefined ? {} : { expectedGeneration: input.expectedGeneration }),
+      ...(input.expectedAuthorityEpoch === undefined ? {} : { expectedAuthorityEpoch: input.expectedAuthorityEpoch }),
+      ...(input.expectedWorkRevision === undefined ? {} : { expectedWorkRevision: input.expectedWorkRevision }),
+      ...(input.expectedContractSha256 === undefined ? {} : { expectedContractSha256: input.expectedContractSha256 }),
       reason: input.reason,
       by: input.by,
     };
@@ -10071,6 +10089,25 @@ export class LedgerApi {
           'request_mismatch',
           `directive request "${input.requestId}" payload hash does not match the accepted request`,
         );
+      }
+      if (input.expectedGeneration === undefined || !(input.expectedGeneration === null ||
+          Number.isSafeInteger(input.expectedGeneration) && input.expectedGeneration >= 0) ||
+          !Number.isSafeInteger(input.expectedAuthorityEpoch) || !Number.isSafeInteger(input.expectedWorkRevision) ||
+          !/^[a-f0-9]{64}$/u.test(input.expectedContractSha256 ?? '')) {
+        throw new DirectiveRetirementError('stale_authority',
+          `directive request "${input.requestId}" retirement requires fresh recovery-generation and current approved-authority expectations`);
+      }
+      const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
+      if ((currentDebt?.generation ?? null) !== input.expectedGeneration) {
+        throw new DirectiveRetirementError('stale_generation',
+          `directive request "${input.requestId}" recovery generation changed — read the exact obligation again`);
+      }
+      const currentAuthority = this.directiveCurrentAuthority(row.jobId);
+      if (input.expectedAuthorityEpoch !== currentAuthority.authorityEpoch ||
+          input.expectedWorkRevision !== currentAuthority.workRevision ||
+          input.expectedContractSha256 !== currentAuthority.contractSha256) {
+        throw new DirectiveRetirementError('stale_authority',
+          `directive request "${input.requestId}" current control epoch or approved work inputs changed — read authority again`);
       }
       if (input.lane === undefined) {
         throw new Error(`retirement of live directive request "${input.requestId}" requires resolved lane evidence`);
@@ -10174,6 +10211,10 @@ export class LedgerApi {
           admission_minion: current.admissionMinion,
           expected_state: input.expectedState,
           expected_head: input.expectedHead,
+          expected_generation: input.expectedGeneration,
+          expected_authority_epoch: input.expectedAuthorityEpoch,
+          expected_work_revision: input.expectedWorkRevision,
+          expected_contract_sha256: input.expectedContractSha256,
           lane_id: input.lane.id,
           phase_handoff_closed: phaseClosed,
         },
@@ -10926,6 +10967,25 @@ export class LedgerApi {
         `pending_directives row "${str(row.request_id)}" has unknown retirement expected state "${retireExpectedStateRaw}"`,
       );
     }
+    const retiredEvent = state === 'retired'
+      ? this.latestJobEventByRequestId(str(row.job_id), 'silas.directive-retired', str(row.request_id))
+      : null;
+    const retiredPayload = typeof retiredEvent?.payload === 'object' && retiredEvent.payload !== null
+      ? retiredEvent.payload as Record<string, unknown>
+      : {};
+    const readRetireInteger = (key: string): number | null => {
+      const value = retiredPayload[key];
+      if (value === undefined || value === null) return null;
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`silas.directive-retired event for "${str(row.request_id)}" has malformed ${key}`);
+      }
+      return value;
+    };
+    const retireExpectedContractSha256 = retiredPayload['expected_contract_sha256'];
+    if (retireExpectedContractSha256 !== undefined && retireExpectedContractSha256 !== null &&
+        (typeof retireExpectedContractSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(retireExpectedContractSha256))) {
+      throw new Error(`silas.directive-retired event for "${str(row.request_id)}" has malformed expected_contract_sha256`);
+    }
     const nativeTarget = row.native_target == null ? null : JSON.parse(str(row.native_target)) as DirectiveRequestRecord['nativeTarget'];
     const nativeBinding = row.native_binding == null ? null : JSON.parse(str(row.native_binding)) as DirectiveNativeBinding;
     if (nativeTarget !== null && (!nativeTarget.agentId || !nativeTarget.sessionFile)) throw new DirectiveCheckpointError('malformed directive native target');
@@ -10956,6 +11016,10 @@ export class LedgerApi {
       retireFingerprint: nstr(row.retire_fingerprint),
       retireExpectedState: retireExpectedStateRaw,
       retireExpectedHead: nstr(row.retire_expected_head),
+      retireExpectedGeneration: readRetireInteger('expected_generation'),
+      retireExpectedAuthorityEpoch: readRetireInteger('expected_authority_epoch'),
+      retireExpectedWorkRevision: readRetireInteger('expected_work_revision'),
+      retireExpectedContractSha256: typeof retireExpectedContractSha256 === 'string' ? retireExpectedContractSha256 : null,
       holdReleasedBy: nstr(row.hold_released_by),
       holdReleasedAt: nstr(row.hold_released_at),
       workRevision: row.work_revision === null || row.work_revision === undefined ? null : Number(row.work_revision),

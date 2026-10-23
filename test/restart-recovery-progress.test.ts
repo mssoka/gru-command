@@ -1,4 +1,4 @@
-import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, directiveRetirementFreshness, directiveRetirementInputs, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
@@ -728,7 +728,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const head = resolveGitCommit(f.lane.path, 'HEAD'); const watermark = f.ledger.latestEventSeq(); const original = f.ledger.getDirective(f.intent.requestId);
     let refusal: unknown;
     try { f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId, expectedState: 'dispatching', expectedPayloadHash: f.intent.payloadHash,
-      expectedHead: head, lane: { id: f.lane.id, resolvedHead: head }, reason: 'no unsafe retirement', by: 'gru' }); } catch (error) { refusal = error; }
+      expectedHead: head, ...directiveRetirementInputs(f.ledger, f.intent.requestId), lane: { id: f.lane.id, resolvedHead: head },
+      reason: 'no unsafe retirement', by: 'gru' }); } catch (error) { refusal = error; }
     expect(refusal).toMatchObject({ code: 'live_work', blockers: ['original native physical owner cessation remains UNKNOWN'] });
     const input = { ledger: f.ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [], requestId: f.intent.requestId, generation: debt.generation,
       expectedPayloadHash: f.intent.payloadHash, expectedHead: head, expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: f.identity.workRevision,
@@ -812,7 +813,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const head = resolveGitCommit(f.lane.path, 'HEAD');
     const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
       expectedState: f.ledger.getDirective(f.intent.requestId)!.state as 'dispatching', expectedPayloadHash: f.intent.payloadHash,
-      expectedHead: head, lane: { id: f.lane.id, resolvedHead: head },
+      expectedHead: head, ...directiveRetirementInputs(f.ledger, f.intent.requestId), lane: { id: f.lane.id, resolvedHead: head },
       reason: 'preparation refused before any native target', by: 'gru' });
     expect(retired.record.state).toBe('retired');
   });
@@ -829,7 +830,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const head = resolveGitCommit(f.lane.path, 'HEAD');
     const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
       expectedState: 'dispatching', expectedPayloadHash: f.intent.payloadHash, expectedHead: head,
-      lane: { id: f.lane.id, resolvedHead: head },
+      ...directiveRetirementInputs(f.ledger, f.intent.requestId), lane: { id: f.lane.id, resolvedHead: head },
       reason: 'interrupted before any target was retained', by: 'gru' });
     expect(retired.record.state).toBe('retired');
   });
@@ -2588,7 +2589,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // The named successor ends without native admission, so it can never settle the debt.
     if (end === 'failed') f.ledger.failDirective({ requestId: f.successor.requestId, reason: 'positive no-effect before any prompt' });
     else retireInterruptedDirectiveFromRoute({ ...f.deps, requestId: f.successor.requestId, reason: 'stuck before admission; ceased', by: 'silas-ops',
-      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash, head: resolveGitCommit(f.lane.path, 'HEAD') } });
+      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash,
+        head: resolveGitCommit(f.lane.path, 'HEAD'), ...directiveRetirementFreshness(f.ledger, f.successor.requestId) } });
     const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
     expect(f.ledger.getObligation(f.debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'superseded', byObligationId: reopened.id } });
     expect(reopened).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision',
@@ -3092,7 +3094,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, old)).toThrow(/exact current physical/);
     expect(f.ledger.latestEventSeq()).toBe(watermark); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(bytes);
     expect(() => f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId, expectedState: 'admitted', expectedPayloadHash: f.intent.payloadHash,
-      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), lane: { id: f.lane.id, resolvedHead: resolveGitCommit(f.lane.path, 'HEAD') }, reason: 'must not exempt an executing native owner', by: 'gru' })).toThrow(/live ownership/);
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), ...directiveRetirementInputs(f.ledger, f.intent.requestId),
+      lane: { id: f.lane.id, resolvedHead: resolveGitCommit(f.lane.path, 'HEAD') }, reason: 'must not exempt an executing native owner', by: 'gru' })).toThrow(/live ownership/);
     expect(f.ledger.latestEventSeq()).toBe(watermark);
   });
 

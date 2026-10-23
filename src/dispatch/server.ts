@@ -1726,6 +1726,34 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/u.test(expectedHead)) {
         throw new Error('expected_head must be a full git object id (40 or 64 hex characters)');
       }
+      const currentRow = options.ledger.getDirective(requestId);
+      if (currentRow === null) {
+        json(res, 404, { error: 'not_found', detail: `directive request "${requestId}" not found` });
+        return true;
+      }
+      const expectedGenerationRaw = body['expected_generation'];
+      const expectedAuthorityEpochRaw = body['expected_authority_epoch'];
+      const expectedWorkRevisionRaw = body['expected_work_revision'];
+      const expectedContractSha256Raw = body['expected_contract_sha256'];
+      const rawAuthorityContext = [expectedGenerationRaw, expectedAuthorityEpochRaw, expectedWorkRevisionRaw, expectedContractSha256Raw];
+      const legacyRetirementWithoutContext = currentRow.state === 'retired' && currentRow.retireExpectedAuthorityEpoch === null &&
+        rawAuthorityContext.every((value) => value === undefined || value === null);
+      const hasAuthorityContext = !legacyRetirementWithoutContext && rawAuthorityContext.some((value) => value !== undefined);
+      const liveRequest = currentRow.state === 'dispatching' || currentRow.state === 'admitted';
+      if (liveRequest && (!hasAuthorityContext ||
+          !(expectedGenerationRaw === null || typeof expectedGenerationRaw === 'number' && Number.isSafeInteger(expectedGenerationRaw) && expectedGenerationRaw >= 0) ||
+          typeof expectedAuthorityEpochRaw !== 'number' || !Number.isSafeInteger(expectedAuthorityEpochRaw) || expectedAuthorityEpochRaw < 0 ||
+          typeof expectedWorkRevisionRaw !== 'number' || !Number.isSafeInteger(expectedWorkRevisionRaw) || expectedWorkRevisionRaw < 0 ||
+          typeof expectedContractSha256Raw !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedContractSha256Raw))) {
+        throw new Error('live directive retirement requires expected_generation (number or null), expected_authority_epoch, expected_work_revision, and expected_contract_sha256 from fresh readback');
+      }
+      if (hasAuthorityContext &&
+          (!(expectedGenerationRaw === null || typeof expectedGenerationRaw === 'number' && Number.isSafeInteger(expectedGenerationRaw) && expectedGenerationRaw >= 0) ||
+          typeof expectedAuthorityEpochRaw !== 'number' || !Number.isSafeInteger(expectedAuthorityEpochRaw) || expectedAuthorityEpochRaw < 0 ||
+          typeof expectedWorkRevisionRaw !== 'number' || !Number.isSafeInteger(expectedWorkRevisionRaw) || expectedWorkRevisionRaw < 0 ||
+          typeof expectedContractSha256Raw !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedContractSha256Raw))) {
+        throw new Error('retirement authority expectations must be complete safe integers and a lowercase SHA-256 digest');
+      }
       const reason = strField(body, 'reason');
       const by = strField(body, 'by');
       let outcome: ReturnType<typeof retireInterruptedDirectiveFromRoute>;
@@ -1741,6 +1769,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             state: expectedState,
             payloadHash: expectedPayloadHash,
             head: expectedHead,
+            ...(hasAuthorityContext ? {
+              generation: expectedGenerationRaw as number | null,
+              authorityEpoch: expectedAuthorityEpochRaw as number,
+              workRevision: expectedWorkRevisionRaw as number,
+              contractSha256: expectedContractSha256Raw as string,
+            } : {}),
           },
           reason,
           by,
@@ -1774,6 +1808,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         retire_reason: record.retireReason,
         retire_expected_state: record.retireExpectedState,
         retire_expected_head: record.retireExpectedHead,
+        retire_expected_generation: record.retireExpectedGeneration,
+        retire_expected_authority_epoch: record.retireExpectedAuthorityEpoch,
+        retire_expected_work_revision: record.retireExpectedWorkRevision,
+        retire_expected_contract_sha256: record.retireExpectedContractSha256,
         hold_released_by: record.holdReleasedBy,
         hold_released_at: record.holdReleasedAt,
         phase_handoff_closed: outcome.phaseClosed,
@@ -1828,6 +1866,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               retire_reason: record.retireReason,
               retire_expected_state: record.retireExpectedState,
               retire_expected_head: record.retireExpectedHead,
+              retire_expected_generation: record.retireExpectedGeneration,
+              retire_expected_authority_epoch: record.retireExpectedAuthorityEpoch,
+              retire_expected_work_revision: record.retireExpectedWorkRevision,
+              retire_expected_contract_sha256: record.retireExpectedContractSha256,
               hold_released_by: record.holdReleasedBy,
               hold_released_at: record.holdReleasedAt,
             }

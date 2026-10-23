@@ -8,8 +8,9 @@
  * durable ledger state.
  *
  * The caller's expectations are binding inputs, never evidence: a wrong
- * job/state/payload hash is refused by the ledger, and a head that does not
- * match the fresh `git rev-parse` is refused as stale before any write.
+ * job/state/payload hash, recovery generation, current authority epoch,
+ * work revision or contract digest is refused by the ledger, and a head that
+ * does not match the fresh `git rev-parse` is refused before any write.
  * Every failure is a typed `DirectiveRetirementError` (or `RecordNotFound`)
  * and leaves the row, events and holds untouched. The whole path from
  * evidence read to transaction commit is synchronous, so no producer can
@@ -41,6 +42,10 @@ export interface DirectiveRetirementRequest {
     readonly state: LiveDirectiveState;
     readonly payloadHash: string;
     readonly head: string;
+    readonly generation?: number | null;
+    readonly authorityEpoch?: number;
+    readonly workRevision?: number;
+    readonly contractSha256?: string;
   };
   readonly reason: string;
   readonly by: string;
@@ -93,6 +98,10 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
       expectedState: input.expected.state,
       expectedPayloadHash: input.expected.payloadHash,
       expectedHead: input.expected.head,
+      ...(input.expected.generation === undefined ? {} : { expectedGeneration: input.expected.generation }),
+      ...(input.expected.authorityEpoch === undefined ? {} : { expectedAuthorityEpoch: input.expected.authorityEpoch }),
+      ...(input.expected.workRevision === undefined ? {} : { expectedWorkRevision: input.expected.workRevision }),
+      ...(input.expected.contractSha256 === undefined ? {} : { expectedContractSha256: input.expected.contractSha256 }),
       ...(lane !== undefined ? { lane } : {}),
       reason: input.reason,
       by: input.by,

@@ -28,6 +28,7 @@ import { WorktreeManager } from '../src/worktrees/manager.js';
 import { writeCreationIntent } from '../src/worktrees/creation-intent.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
+import { directiveRetirementInputs } from './helpers/directive-native-fixture.js';
 
 const repos: FixtureRepo[] = [];
 const dirs: string[] = [];
@@ -3241,7 +3242,8 @@ if (argv.includes('POST')) {
           const { record } = h.ledger.beginDirectiveIntent({ jobId: h.job.id, directive: 'new own work', holder: 'fixture' });
           if (change === 'retirement') h.ledger.retireInterruptedDirective({ requestId: record.requestId, expectedJobId: h.job.id,
             expectedState: 'dispatching', expectedPayloadHash: record.payloadHash, expectedHead: lane.sha,
-            lane: { id: lane.id, resolvedHead: lane.sha }, reason: 'interrupted request', by: 'fixture' });
+            ...directiveRetirementInputs(h.ledger, record.requestId), lane: { id: lane.id, resolvedHead: lane.sha },
+            reason: 'interrupted request', by: 'fixture' });
           return { ok: false, failures: [{ leg: 'review-policy', detail: 'fixture refusal', remediation: 'fixture repair' }] };
         },
         fallbackGate: { skillPath, runFallbackReview: async () => { fallbackRuns += 1; return []; }, fixDirectiveSink: async () => ({ delivered: true }) },

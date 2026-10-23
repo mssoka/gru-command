@@ -32,6 +32,7 @@ import type {
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
+import { directiveRetirementInputs } from './helpers/directive-native-fixture.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { rebriefFreshMinion, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
@@ -883,8 +884,8 @@ describe('supervisor — watchdog + restart ladder', () => {
       api.setAgentState(old.id, 'disposed'); // the real fixture disposer acknowledged cessation
       expect(supervisor.pendingProducerBlockers('retired-breaker-job')).toEqual([]);
       api.retireInterruptedDirective({ requestId: intent.record.requestId, expectedJobId: 'retired-breaker-job', expectedState: 'dispatching',
-        expectedPayloadHash: intent.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'breaker-fixture-lane', resolvedHead: 'a'.repeat(40) },
-        reason: 'fixture restart stopped and disposed', by: 'silas-ops' });
+        expectedPayloadHash: intent.record.payloadHash, expectedHead: 'a'.repeat(40), ...directiveRetirementInputs(api, intent.record.requestId),
+        lane: { id: 'breaker-fixture-lane', resolvedHead: 'a'.repeat(40) }, reason: 'fixture restart stopped and disposed', by: 'silas-ops' });
       const stop = api.listNotifications({ limit: 30 }).find((notification) => notification.kind === 'supervision.breaker')!;
       const before = registry.spawnCalls.length;
       registry.spawnImpl = async (role) => new FakeHandle(role, 'should-not-replay-retired', null);
@@ -1195,8 +1196,8 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       if (retirementHistory) {
         const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: 'deferred-retired' });
         rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
-          expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'fixture-lane', resolvedHead: 'a'.repeat(40) },
-          reason: 'fixture has no active producer', by: 'silas-ops' });
+          expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40), ...directiveRetirementInputs(rig.api, retired.record.requestId),
+          lane: { id: 'fixture-lane', resolvedHead: 'a'.repeat(40) }, reason: 'fixture has no active producer', by: 'silas-ops' });
       }
       const fresh = rig.api.beginPendingRebrief({ jobId, note: 'fresh authorized work', briefing: null });
       const epoch = rig.api.directiveRecoveryEpoch(jobId);
@@ -2829,7 +2830,7 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
     rig.api.setJobStatus(jobId, 'working');
     const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: `${jobId}-retired` });
     rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
-      expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40),
+      expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40), ...directiveRetirementInputs(rig.api, retired.record.requestId),
       lane: { id: `${jobId}-lane`, resolvedHead: 'a'.repeat(40) }, reason: 'fixture has no live producer', by: 'silas-ops' });
     expect(rig.api.hasOpenDirectiveRecoveryHold(jobId)).toBe(true);
     const epoch = rig.api.directiveRecoveryEpoch(jobId);
@@ -2961,7 +2962,7 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       // releases and the native epoch advances past the captured turn.
       const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: `${jobId}-retired` });
       rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
-        expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40),
+        expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40), ...directiveRetirementInputs(rig.api, retired.record.requestId),
         lane: { id: `${jobId}-lane`, resolvedHead: 'a'.repeat(40) }, reason: 'fixture ceased', by: 'silas-ops' });
       rig.api.beginDirectiveIntent({ jobId, directive: 'fresh authorized work', holder: 'silas-ops', requestId: `${jobId}-fresh` });
       expect(rig.api.hasOpenDirectiveRecoveryHold(jobId)).toBe(false);

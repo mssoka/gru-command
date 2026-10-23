@@ -400,6 +400,20 @@ describe('ledger api — the record of state', () => {
       expect(api.getJob(id)?.status, source).toBe('binned');
       expect(api.listEvents().length, source).toBe(eventsBefore);
     }
+    // A live native directive cannot be hidden behind terminal discard.
+    api.addJob({ id: 'binned-live-directive', repo: 'discard-fixture', title: 'Live control prevents discard' });
+    api.setJobStatus('binned-live-directive', 'working');
+    const live = api.beginDirectiveIntent({ jobId: 'binned-live-directive', directive: 'still live', holder: 'test', requestId: 'live-directive-before-bin' }).record;
+    const liveEvents = api.listJobEvents('binned-live-directive');
+    expect(() => api.setJobStatus('binned-live-directive', 'binned')).toThrow(/live directive request.*live-directive-before-bin \(dispatching\)/u);
+    expect(api.getJob('binned-live-directive')?.status).toBe('working');
+    expect(api.getDirective(live.requestId)).toEqual(live);
+    expect(api.listJobEvents('binned-live-directive')).toEqual(liveEvents);
+    // Once the original control has an explicit terminal outcome, the
+    // ordinary binned path remains available.
+    api.failDirective({ requestId: live.requestId, reason: 'fixture proves no native effect occurred' });
+    expect(api.setJobStatus('binned-live-directive', 'binned').status).toBe('binned');
+
     // Re-binning an already-binned lane is the generic same-status no-op:
     // no transition, no duplicate event — a timed-out retry is safe.
     const rebinEvents = api.listEvents().length;

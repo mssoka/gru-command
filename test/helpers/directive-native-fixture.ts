@@ -69,6 +69,23 @@ export function markHistoricalDirectiveFixture(ledger: LedgerApi, requestId: str
   db.prepare('UPDATE pending_directives SET request_kind = NULL, authority_epoch = NULL, contract_snapshot = NULL, contract_sha256 = NULL WHERE request_id = ?').run(requestId);
 }
 
+/** Fresh retirement expectations for route-orchestration tests. Production
+ * callers must supply these values from the authenticated direct readback. */
+export function directiveRetirementFreshness(ledger: LedgerApi, requestId: string) {
+  const row = ledger.getDirective(requestId);
+  if (row === null) throw new Error(`no directive request ${requestId}`);
+  const authority = ledger.directiveCurrentAuthority(row.jobId);
+  const obligation = ledger.recoveryObligation(row.jobId, 'directive', requestId);
+  return { generation: obligation?.generation ?? null, authorityEpoch: authority.authorityEpoch,
+    workRevision: authority.workRevision, contractSha256: authority.contractSha256 } as const;
+}
+
+export function directiveRetirementInputs(ledger: LedgerApi, requestId: string) {
+  const current = directiveRetirementFreshness(ledger, requestId);
+  return { expectedGeneration: current.generation, expectedAuthorityEpoch: current.authorityEpoch,
+    expectedWorkRevision: current.workRevision, expectedContractSha256: current.contractSha256 } as const;
+}
+
 /** Persist genuine current-protocol admission for non-runtime ledger consumers. */
 export function admitNativeDirectiveFixture(ledger: LedgerApi, requestId: string, minionId: string, file: string,
   completed?: { readonly head: string | null; readonly cwd: string }): number {

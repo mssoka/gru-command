@@ -32,6 +32,16 @@ ledger re-checks durable producer facts and the binding expectations in
 one transaction. No await separates the evidence read from the commit;
 the caller supplies expectations only:
 
+- **Request/generation identity**: job id, live state, exact payload hash,
+  and current directive-recovery generation (or explicit `null` when there
+  is no recovery obligation) must still match the ledger row.
+- **Current approved authority**: `expected_authority_epoch`,
+  `expected_work_revision`, and `expected_contract_sha256` must equal the
+  service's current control epoch and approved scope at the write boundary.
+  The fresh values are exposed by the directive readback as
+  `current_authority_epoch`, `current_approved_authority`, and
+  `recovery_obligation.generation`; they are not inferred from a prior
+  decision or from the accepted prompt alone.
 - **Lane identity/head**: exactly one non-swept job lane for the job, and
   its freshly resolved checkout `HEAD` must equal the caller's
   `expected_head` (a registered branch tip is not checkout evidence).
@@ -85,21 +95,30 @@ same configured auth boundary as every Silas surface):
   "expected_state": "dispatching",
   "expected_payload_hash": "<payload_hash from GET /api/silas/directives/{id}>",
   "expected_head": "2a37ffb26f9b1a90793b608aedb1e222f6ed7ee6",
+  "expected_generation": 1,
+  "expected_authority_epoch": 74,
+  "expected_work_revision": 0,
+  "expected_contract_sha256": "<current_approved_authority.contractSha256>",
   "reason": "service restart 00:37:49Z disposed the writer; no terminal receipt exists",
   "by": "silas-ops"
 }
 ```
 
 `expected_state` is the state the caller verified (`dispatching` or
-`admitted`). Success returns 200 with `state: "retired"`,
-`admission_class`, the preserved admission fields, the hold state, the
-recorded `retire_expected_state`/`retire_expected_head`, and the closed
-phase-handoff id (if one was attached). Replays with the identical
-canonical intent return `idempotent: true` and append nothing; a
-lost-response retry reconstructs the identical intent from the readback
-(`retire_expected_state`, `retire_expected_head`, plus the already
-exposed job/payload hash), and a replay of a phase-closing retirement
-reports the same `phase_handoff_closed` id.
+`admitted`). `expected_generation` may be JSON `null` only when no recovery
+obligation exists; all four freshness fields are required for a live write.
+Success returns 200 with `state: "retired"`, `admission_class`, the
+preserved admission fields, the hold state, all `retire_expected_*`
+expectations, and the closed phase-handoff id (if one was attached). The
+exact context is kept in the audit event for restart-safe replay. Replays
+with the identical canonical intent return `idempotent: true` and append
+nothing; a lost-response retry reconstructs the identical intent from the
+retired readback (`retire_expected_state`, `retire_expected_head`,
+`retire_expected_generation`, `retire_expected_authority_epoch`,
+`retire_expected_work_revision`, `retire_expected_contract_sha256`, plus
+the exposed job/payload hash), and a replay of a phase-closing retirement
+reports the same `phase_handoff_closed` id. Existing pre-context retired
+rows can still replay their original canonical intent.
 
 ### Refusals (all leave the record byte-identical)
 
@@ -111,6 +130,8 @@ reports the same `phase_handoff_closed` id.
 | 409 | `directive_not_live` | already settled/failed; use normal flows |
 | 409 | `request_mismatch` | wrong job/state/payload hash; re-read the row |
 | 409 | `stale_head` | lane head moved; re-verify cessation at the new head |
+| 409 | `stale_generation` | recovery generation changed; re-read the exact obligation |
+| 409 | `stale_authority` | control epoch or current approved work inputs changed; re-read authority |
 | 409 | `terminal_receipt_present` | correlated delivery exists; let settlement/reconcile own it |
 | 409 | `admission_evidence_incomplete` | admission event without identity; reconcile the actual turn |
 | 409 | `lane_unavailable` | unreadable registry / no single live lane / unresolvable head; fail closed |
@@ -224,9 +245,11 @@ a generation is never id-clearable.
 
 ## Proof identity to cite
 
-- request id + accepted payload hash + expected/resolved lane head (the
-  event payload carries `expected_head`, `lane_id`, `admission_class`,
-  `admission_seq`, `admission_minion`, `by`, `reason`);
+- request id + accepted payload hash + expected/resolved lane head + fresh
+  recovery/current authority context (the event payload carries
+  `expected_head`, `expected_generation`, `expected_authority_epoch`,
+  `expected_work_revision`, `expected_contract_sha256`, `lane_id`,
+  `admission_class`, `admission_seq`, `admission_minion`, `by`, `reason`);
 - event `silas.directive-retired` (exactly one per request);
 - a later accepted `silas.directive-recovery-handoff` when citing fresh
   authority (never a delivery/retirement receipt);
@@ -241,6 +264,24 @@ or decisions, never authorizes integration, never merges/deploys, and
 never rewrites a terminal receipt or a late event. It does not modify
 job status, obligations, approvals, reports, verification outcomes or
 other jobs.
+
+### Binning an abandoned lane
+
+A deliberate job discard is a separate operation from directive retirement.
+Use the existing authenticated `POST /api/jobs/<id>/status` surface with
+`{"status":"binned"}` only after every live directive request has first
+settled through its ordinary path or been retired through this exact
+cessation-fenced path. The status transaction refuses while any directive
+is still `dispatching` or `admitted`; a caller cannot make an unknown
+native request disappear by binning its job. Other live-work blockers
+remain in force.
+
+Binning records only the terminal administrative discard. It does not
+prove cessation, no effects, completion, delivery, onboarding, or READY,
+and does not clean retained resources. If the exact original producer
+identity/journal is missing, retirement remains refused and the job must
+remain unbinned until genuine service-verifiable custody evidence exists;
+owner approval and metadata absence do not replace that evidence.
 
 ## Activation rules
 
