@@ -13,10 +13,33 @@ export interface LogRecord {
 /** Default rotation policy: rotate at 10 MB, keep 5 rotated files. */
 export const LOG_ROTATION_DEFAULTS = { maxBytes: 10_485_760, keep: 5 } as const;
 
+let stderrErrorsGuarded = false;
+
+/**
+ * One process-wide 'error' listener on stderr (#496). A failed stderr
+ * write (ENOSPC/EDQUOT on launchd's StandardErrorPath, EPIPE on a closed
+ * pipe) arrives as an asynchronous 'error' event; unheard, it becomes an
+ * uncaught exception and main.ts exits the service on the very line that
+ * reported the problem. The mirror is best-effort: service.log stays the
+ * record.
+ */
+function guardStderrErrors(): void {
+  if (stderrErrorsGuarded) return;
+  stderrErrorsGuarded = true;
+  process.stderr.on('error', () => {
+    /* best-effort mirror — service.log stays the record */
+  });
+}
+
 /**
  * Structured JSON-lines logger. One JSON object per line, written to
  * `<data_dir>/logs/service.log` and mirrored to stderr. Synchronous writes:
  * nothing is lost at shutdown.
+ *
+ * `log()` never throws (#496): unserializable fields fall back to a line
+ * carrying ts/level/msg and the serialization error, and rotation, the
+ * append and the stderr mirror each fail on their own without stopping
+ * the others or reaching the call site.
  *
  * Size-based rotation (E1 deferral, E7 home): when the live file exceeds
  * `maxBytes` BEFORE a write, it rotates to `service.log.1` (shifting
@@ -38,26 +61,28 @@ export class Logger {
     this.logFile = join(logsDir, 'service.log');
     this.maxBytes = rotation.maxBytes ?? LOG_ROTATION_DEFAULTS.maxBytes;
     this.keep = rotation.keep ?? LOG_ROTATION_DEFAULTS.keep;
+    if (mirrorToStderr) guardStderrErrors();
   }
 
   log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
-    const record: LogRecord = {
-      // Reserved keys last: a call site can never overwrite ts/level/msg.
-      ...fields,
-      ts: new Date().toISOString(),
-      level,
-      msg,
-    };
-    const line = `${JSON.stringify(record)}\n`;
+    const line = `${serializeRecord(level, msg, fields)}\n`;
     try {
       this.rotateIfNeeded(line.length);
+    } catch {
+      /* a failed rotation never blocks the write */
+    }
+    try {
       appendFileSync(this.logFile, line, 'utf-8');
     } catch {
       // Disk-full or permissions must never take the serving process down;
       // the stderr mirror below still carries the line.
     }
     if (this.mirrorToStderr) {
-      process.stderr.write(line);
+      try {
+        process.stderr.write(line);
+      } catch {
+        /* best-effort mirror — an async failure lands on guardStderrErrors */
+      }
     }
   }
 
@@ -126,5 +151,27 @@ export class Logger {
     } catch {
       /* best effort — the append still goes to the live file */
     }
+  }
+}
+
+/**
+ * One JSON line for the record. A BigInt, a cycle, or a throwing getter or
+ * toJSON in `fields` falls back to ts/level/msg plus the serialization
+ * error, so the line still lands and the call site never sees a throw.
+ */
+function serializeRecord(level: LogLevel, msg: string, fields: Record<string, unknown>): string {
+  const ts = new Date().toISOString();
+  try {
+    // Reserved keys last: a call site can never overwrite ts/level/msg.
+    const record: LogRecord = { ...fields, ts, level, msg };
+    return JSON.stringify(record);
+  } catch (error) {
+    const fallback: LogRecord = {
+      ts,
+      level,
+      msg,
+      fields_unserializable: error instanceof Error ? error.message : typeof error,
+    };
+    return JSON.stringify(fallback);
   }
 }

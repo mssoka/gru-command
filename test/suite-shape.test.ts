@@ -282,7 +282,7 @@ const PINS: Record<string, number> = {
   'lessons-references.test.ts': 5,
   'lessons-server.test.ts': 12,
   'listener-probe.test.ts': 5,
-  'logger.test.ts': 3,
+  'logger.test.ts': 6,
   'managed-repositories-runtime.test.ts': 4,
   'native-tools-parity.test.ts': 2,
   'notification-decisions.test.ts': 28,

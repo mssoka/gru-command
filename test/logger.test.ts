@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { Logger } from '../src/logger.js';
 
 const cleanupDirs: string[] = [];
@@ -57,5 +57,76 @@ describe('logger size-based rotation (E7)', () => {
     expect(() => {
       for (let i = 0; i < 5; i += 1) logger.info('still-alive', { i });
     }).not.toThrow();
+  });
+});
+
+describe('logger never throws (#496)', () => {
+  it('unserializable fields still write a ts/level/msg line and never throw at the call site', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-logger-unser-'));
+    cleanupDirs.push(dir);
+    const logger = new Logger(dir, false);
+    const cycle: Record<string, unknown> = { name: 'cycle' };
+    cycle['self'] = cycle;
+    const cases: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+      ['bigint', { count: 10n }],
+      ['cycle', { node: cycle }],
+      [
+        'throwing-getter',
+        Object.defineProperty({}, 'boom', {
+          enumerable: true,
+          get() {
+            throw new Error('getter exploded');
+          },
+        }) as Record<string, unknown>,
+      ],
+    ];
+    for (const [name, fields] of cases) {
+      expect(() => logger.error(`unserializable-${name}`, fields), name).not.toThrow();
+    }
+    const lines = readFileSync(join(dir, 'logs', 'service.log'), 'utf-8').trim().split('\n');
+    expect(lines).toHaveLength(cases.length);
+    for (const [index, [name]] of cases.entries()) {
+      const record = JSON.parse(lines[index] ?? '') as Record<string, unknown>;
+      expect(record['msg'], name).toBe(`unserializable-${name}`);
+      expect(record['level'], name).toBe('error');
+      expect(typeof record['ts'], name).toBe('string');
+      expect(typeof record['fields_unserializable'], name).toBe('string');
+    }
+    expect(JSON.parse(lines[2] ?? '')['fields_unserializable']).toBe('getter exploded');
+  });
+
+  it('a throwing stderr mirror never escapes log(), and the file line still lands', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-logger-stderr-throw-'));
+    cleanupDirs.push(dir);
+    const logger = new Logger(dir, true);
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => {
+      throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    });
+    try {
+      expect(() => logger.warn('mirror-throws')).not.toThrow();
+      expect(write).toHaveBeenCalledTimes(1);
+    } finally {
+      write.mockRestore();
+    }
+    const record = JSON.parse(readFileSync(join(dir, 'logs', 'service.log'), 'utf-8').trim()) as Record<string, unknown>;
+    expect(record['msg']).toBe('mirror-throws');
+  });
+
+  it('an asynchronous stderr error event is heard, not an uncaught exception', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-logger-stderr-event-'));
+    cleanupDirs.push(dir);
+    // EventEmitter throws an 'error' event nobody listens for, which is the
+    // uncaught exception that main.ts turns into process.exit(1).
+    const logger = new Logger(dir, false);
+    const enospc = Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    new Logger(dir, true);
+    const guarded = process.stderr.listenerCount('error');
+    expect(() => process.stderr.emit('error', enospc)).not.toThrow();
+    // One process-wide listener: more mirroring loggers add none.
+    new Logger(dir, true);
+    expect(process.stderr.listenerCount('error')).toBe(guarded);
+    logger.info('after-stderr-error');
+    const record = JSON.parse(readFileSync(join(dir, 'logs', 'service.log'), 'utf-8').trim()) as Record<string, unknown>;
+    expect(record['msg']).toBe('after-stderr-error');
   });
 });
