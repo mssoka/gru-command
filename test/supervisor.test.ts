@@ -3236,16 +3236,18 @@ describe('supervisor — decision-backed failure guidance', () => {
 
   it('provider auth and unproven local-looking errors retain deterministic wall protections', async () => {
     const localLooking = 'HTTP 401 provider rejection: DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
-    for (const { id, typed, localControl } of [
-      { id: 'provider-auth-local-words', typed: true, localControl: false },
-      { id: 'provider-auth-local-words-conflicting-origin', typed: true, localControl: true },
-      { id: 'untyped-local-words', typed: false, localControl: false },
+    for (const { id, typed, localControl, fatal } of [
+      { id: 'provider-auth-local-words', typed: true, localControl: false, fatal: false },
+      { id: 'provider-auth-local-words-conflicting-origin', typed: true, localControl: true, fatal: false },
+      { id: 'untyped-local-words', typed: false, localControl: false, fatal: false },
+      // A fatal error is never skipped as a refusal, tag or not.
+      { id: 'fatal-local-words-tagged', typed: false, localControl: true, fatal: true },
     ] as const) {
       const h = boot();
       const handle = new FakeHandle('minion', id, null);
       h.registry.adopt(handle);
       const spawns = h.registry.spawnCalls.length;
-      handle.emit({ type: 'error', error: localLooking, fatal: false,
+      handle.emit({ type: 'error', error: localLooking, fatal,
         ...(localControl ? { nativeControl: 'directive-refusal' as const } : {}), ...(typed ? {
           provider: 'synthetic-provider', model: 'synthetic-model', typed: { origin: 'provider-message' as const, status: 401 },
         } : {}) });
@@ -3254,8 +3256,40 @@ describe('supervisor — decision-backed failure guidance', () => {
       expect(h.registry.spawnCalls).toHaveLength(spawns);
       expect(h.notificationsOfKind(`supervision.provider-wall.${id}.authentication_wall`)).toHaveLength(1);
       expect(h.api.listProviderWaits()).toEqual([]);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
       h.dispose();
     }
+  });
+
+  it('a tagged native directive refusal skips pacing and the decision service, and leaves a durable trace (#485)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    const sleeper = new ManualSleeper();
+    const h = boot({ decide } as unknown as DecisionService, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      h.api.addJob({ id: 'job-native-refusal', repo: 'fixture', title: 'job-native-refusal' });
+      const handle = new FakeHandle('minion', 'minion-native-refusal', null);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-native-refusal' });
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-native-refusal' };
+      h.registry.adopt(handle);
+      // Rate-limit-looking text: routed, it would start the automatic retry.
+      const error = 'DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work is authorized';
+      handle.emit({ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' });
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+      expect(sleeper.delays).toEqual([]);
+      expect(decide).not.toHaveBeenCalled();
+      const events = h.api.listEvents({ limit: 100 });
+      expect(events.some((event) => event.kind.startsWith('pacing.') || event.kind === 'supervision.guidance')).toBe(false);
+      expect(events.filter((event) => event.kind === 'supervision.native-refusal-retained')).toEqual([
+        expect.objectContaining({ agentId: handle.id, jobId: 'job-native-refusal', payload: { error } }),
+      ]);
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+      expect(handle.disposed).toBe(false);
+      expect(handle.promptCalls).toHaveLength(0);
+      // The same text untagged is routed: the automatic retry is scheduled.
+      handle.emit({ type: 'error', error, fatal: false });
+      expect(sleeper.delays).toEqual([100]);
+    } finally { h.dispose(); }
   });
 
   it('a legacy machine-routed provider-wall row dedupes the new machine stop: one row, Gru disposition re-arms', async () => {

@@ -1007,14 +1007,15 @@ export class Supervisor {
             break;
           }
           if (!event.fatal && event.nativeControl === 'directive-refusal' && event.typed === undefined) {
-            // A locally proven native directive fence is already fail-closed
-            // and belongs to the directive's guarded recovery path. It is not
-            // a provider response: do not pace, classify, stop as a wall, or
-            // hand its accepted prompt to restart/replay recovery here.
-            this.log('info', 'native directive control refusal retained for native recovery; provider failure routing skipped', {
+            // GC's own directive fence refused the turn (#485). That is no
+            // provider response, and the directive's recovery path owns it:
+            // do not pace, classify, stop as a wall, or hand its accepted
+            // prompt to restart/replay recovery here.
+            this.log('info', 'native directive refusal retained for directive recovery; provider failure routing skipped', {
               agent_id: agent.agentId,
               error: event.error,
             });
+            this.recordEvent('supervision.native-refusal-retained', agent.agentId, { error: event.error });
             break;
           }
           // Publication can replay a startup error while its owner is still
