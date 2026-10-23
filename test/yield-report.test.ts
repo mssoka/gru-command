@@ -153,6 +153,7 @@ function digestJson(jobIdsByCategory: Partial<Record<(typeof DIGEST_CATEGORY_KEY
       lanePath: null,
       minionSessionFile: null,
       deliveredAt: null,
+      abortedRounds: 0,
     })),
     prWithoutReview: (jobIdsByCategory.prWithoutReview ?? []).map((jobId) => ({
       jobId,

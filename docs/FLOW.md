@@ -155,7 +155,9 @@ one real Perkins lead reviewing the complete frozen change. The pinned
 policy's catalog makes nine whole-change specialist lenses available (blind,
 edge, acceptance, security, architecture, codebase, tests, performance,
 operations) — eight when `no_spec: true` explicitly removes the
-spec-dependent acceptance lens. The lead SELECTS which specialists help the
+spec-dependent acceptance lens. The lead's system prompt lists each lens of
+its catalog with that lens's policy brief, and the lead
+SELECTS which specialists help the
 change: availability is never a mandatory coverage gate, and a subset (or
 none) is a valid review. Specialists run in explicit tool-call batches
 bounded by the round's admitted resident wave and provider pacing; the lead
@@ -164,6 +166,11 @@ inside the SAME round, frozen target and lead. A round is bounded to 16 real
 specialist runs (retries included), two attempts per lens, and two real
 terminal submissions (free preflight is distinct); failed attempts count and
 stay recorded, and a completed lens cannot be rerun for a second opinion.
+Every specialist result fits one tool response the lead can read (a larger
+one fails its attempt with feedback to report fewer, shorter findings); a
+response lists any result it could not carry whole as `withheld`, and the
+lead collects it by calling the tool again for that lens, which starts no
+child. A result never collected stays recorded as not delivered.
 Lenses the lead did not use are reported as `not used`, never as coverage.
 Immediately after the freeze (and before the run promise or any lead/child
 spawn), an **admission preflight** re-validates the complete frozen packet
@@ -387,6 +394,17 @@ the lookup account and never proves absence. GitHub
 bundle is installed; with a bundle, github.com publication is App-authored
 while the review preflight still probes remotes through `gh` (see
 [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
+A conclusive review is published only to a linked PR. When the job had no
+link as its round started, publication first re-reads the job (a link
+registered during the review is used), then asks GitHub for the open PRs
+whose head is the job lane's branch. Exactly one at the reviewed head is
+linked to the job (`round.pr-discovered`) and receives the review. Anything
+else — none, several, a different head, a non-GitHub origin or a failed
+lookup — aborts the round `no_pr_link`, and the escalation names what the
+lookup found and the next step (link the PR, then re-arm). An active owner
+decision holding `delivered-pr-register` for the delivery holds this link
+too. A shutdown during the lookup ends the round as the restart's clean
+abort, never as a missing PR.
 
 Beside the four route-deciding legs, the same pass evaluates the
 **non-blocking advisory leg `verdict-publication-identity`** (issue #444):
@@ -769,6 +787,10 @@ the ordered, preserve-first sweep (ruling 18c):
    `registry`) are signalled on teardown: process-group SIGTERM, grace,
    then SIGKILL. Dual-keyed on the live registry row AND a current
    in-tree enumeration, so a recycled pid can never redirect the kill.
+   Processes rooted in the tree that carry the lane's own token (every
+   session spawned in the lane passes `GRU_LANE_TOKEN` to what it starts,
+   #486) are reaped the same way, with the token read again before each
+   signal; see [WORKTREES.md §3a](./WORKTREES.md#3a-lane-provenance-486).
 3. **Enumerate** processes rooted in the tree: a process counts when
    the registered path appears in its ARGV as a whole path
    (path-boundary match — a sibling lane `job-a-2` is never confused
@@ -786,8 +808,8 @@ the ordered, preserve-first sweep (ruling 18c):
    SIGKILL. Processes that survive both signals re-pause; processes that
    appeared after the acknowledged kill get their own ask.
    `confirm_kill` without a recorded pause is not honored — the ask
-   always comes first. Silent kills do not exist for processes the
-   orchestrator did not spawn.
+   always comes first. Silent kills do not exist for processes nothing
+   ties to the lane.
 5. **Remove** the worktree; **containment-verified** branch delete (a
    branch is deleted only when its commits are provably contained in an
    existing ref — otherwise it is retained and noted, never
@@ -871,8 +893,10 @@ the judgment; the dispatch surface is the mechanical hand.
   `POST /api/decisions` (issue #218) with a matching basis defers the
   wake to the hold's recheck instead.
 - **The default-branch CI alert (#446)** rides the managed repository
-  overview pass, not the lane poll: each committed observation hands its
-  default-branch run page (20 runs, the same single call) to a watch. Per
+  overview pass, not the lane poll: each committed GitHub observation hands
+  its default-branch run page (20 runs, the same single call) to a watch.
+  GitLab rows (#480) are overview-only: their pipelines never reach the
+  watch, so a red GitLab pipeline shows on its row without waking Gru. Per
   `workflow_id`, the newest decisive run (passed, failed, timed-out,
   startup-failure) is the verdict; queued (incl. waiting/pending/
   requested), running, cancelled, skipped, neutral, action-required,
@@ -903,7 +927,9 @@ the judgment; the dispatch surface is the mechanical hand.
   new item that resolves the earlier head's item and wakes once. Always on
   for every `managed_repos` entry; no config key.
 - **The digest** handed to every wake carries the actionable states,
-  computed from the ledger: delivered jobs with no PR registered; PRs
+  computed from the ledger: delivered jobs with no PR registered (again
+  once every round armed before the link aborted, since the clean-abort
+  re-arm needs the link); PRs
   whose follow-up delivery proves the lane head moved past the newest
   round's reviewed target (first review AND re-review after a fix round);
   or a proven `service_restart` abort on the unchanged delivered head (a

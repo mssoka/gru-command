@@ -34,6 +34,7 @@ import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoff
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
 import { deliveredTargetSha } from './silas-driver.js';
+import { decisionHold, deliveredPrRegisterHold } from './silas-autopilot.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
@@ -1820,6 +1821,13 @@ export interface EscalationContext {
   readonly agentId?: string;
 }
 
+/** One open pull request as the publication-time PR lookup reports it. */
+export interface OpenPullRequest {
+  readonly url: string | null;
+  readonly headSha: string | null;
+  readonly state: string;
+}
+
 export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
@@ -1849,6 +1857,16 @@ export interface WaveRunnerOptions {
    * released before the wait so the retry can reacquire admission. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
+  /** Open pull requests on a lane branch (production: the GitHub pulls API,
+   * filtered by head branch). Asked only when a conclusive review reaches
+   * publication and its job has no PR link, so the review is not thrown
+   * away for a PR the lane opened but never registered. Absent = no lookup;
+   * a link registered in the ledger during the review is still used. */
+  readonly findOpenPullRequests?: (input: { readonly repoPath: string; readonly branch: string }) => Promise<readonly OpenPullRequest[]>;
+  /** Links a discovered PR to its job — the function POST /api/dispatch/pr
+   * calls. Supplied together with {@link findOpenPullRequests} or not at
+   * all (the constructor refuses one without the other). */
+  readonly recordPr?: (jobId: string, url: string) => void;
   readonly escalate?: (title: string, detail: string, context?: EscalationContext) => void;
   /** FYI channel, never action-required: an automatic admission retry was
    * scheduled or skipped. Absent = the durable ledger trail only. */
@@ -2402,6 +2420,11 @@ export class WaveRunner {
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    if ((opts.findOpenPullRequests === undefined) !== (opts.recordPr === undefined)) {
+      throw new Error(
+        `WaveRunner: findOpenPullRequests and recordPr are supplied together or not at all (got only ${opts.findOpenPullRequests === undefined ? 'recordPr' : 'findOpenPullRequests'})`,
+      );
+    }
     const delays = opts.admissionRetryDelaysMs ?? ADMISSION_RETRY_DELAYS_MS;
     if (delays.some((delay) => !Number.isSafeInteger(delay) || delay < 0 || delay > MAX_TIMER_MS)) {
       throw new Error(`admissionRetryDelaysMs must be whole milliseconds from 0 to ${MAX_TIMER_MS}, got [${delays.join(', ')}]`);
@@ -2971,6 +2994,85 @@ export class WaveRunner {
       throw new Error('Perkins review requires a stable reviewArtifactRoot');
     }
     return this.opts.reviewArtifactRoot;
+  }
+
+  /** The PR a conclusive review publishes to when its job had no link at
+   * round start. A link registered during the review is used as is.
+   * Otherwise the job lane's branch is looked up and its ONE open PR whose
+   * head is the frozen target is linked through `recordPr`. Anything else
+   * leaves the link absent and says why, and the round aborts `no_pr_link`. */
+  private async findPublicationPr(
+    jobId: string, roundId: string, targetSha: string, signal: AbortSignal,
+  ): Promise<{ readonly url: string | null; readonly note: string | null }> {
+    const current = this.opts.ledger.getJob(jobId)?.prUrl ?? null;
+    if (current !== null) return { url: current, note: null };
+    const find = this.opts.findOpenPullRequests;
+    const record = this.opts.recordPr;
+    if (find === undefined || record === undefined) return { url: null, note: null };
+    const lane = this.opts.worktrees.listWorktrees({ jobId }).find((entry) => entry.kind === 'job') ?? null;
+    const branch = lane?.branch ?? null;
+    if (lane === null || branch === null || branch.trim() === '') {
+      return { url: null, note: 'the job has no lane branch to look up an open pull request for' };
+    }
+    // An owner decision holding PR registration for this delivery holds
+    // here too: publication never links past what Silas may not. It is
+    // proved again after the awaited lookup, before the link.
+    const holdNote = (): string | null => {
+      const held = decisionHold(this.opts.ledger, jobId, deliveredPrRegisterHold(this.opts.ledger, jobId));
+      return held === null ? null : `${held}, so no open pull request is linked`;
+    };
+    const abortedNote = 'the review was aborted during the open pull request lookup';
+    const heldBefore = holdNote();
+    if (heldBefore !== null) return { url: null, note: heldBefore };
+    if (signal.aborted) return { url: null, note: abortedNote };
+    // The lookup never holds an aborting round: the race settles on the
+    // abort, and a late lookup result or failure is dropped.
+    let onAbort = (): void => {};
+    const aborted = new Promise<null>((resolve) => {
+      onAbort = () => resolve(null);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    // The race subscribes to the lookup, so a late failure is handled.
+    const lookup = (async () => find({ repoPath: lane.path, branch }))();
+    let pulls: readonly OpenPullRequest[] | null = null;
+    let lookupError: unknown = null;
+    try {
+      pulls = await Promise.race([lookup, aborted]);
+    } catch (error) {
+      lookupError = error;
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+    if (signal.aborted) return { url: null, note: abortedNote };
+    // A link registered while the lookup was awaited wins, whatever the
+    // lookup found; it is never overwritten.
+    const raced = this.opts.ledger.getJob(jobId)?.prUrl ?? null;
+    if (raced !== null) return { url: raced, note: null };
+    if (lookupError !== null || pulls === null) {
+      return { url: null, note: `looking up open pull requests for branch ${branch} failed: ${sanitizeErrorLog(lookupError)}` };
+    }
+    const open = pulls.filter((pull) => pull.state === 'open' && pull.url !== null);
+    const matching = open.filter((pull) => pull.headSha === targetSha);
+    if (matching.length !== 1) {
+      return {
+        url: null,
+        note: `${matching.length} of the ${open.length} open pull request(s) for branch ${branch} have the reviewed head ${targetSha}`,
+      };
+    }
+    const heldAfter = holdNote();
+    if (heldAfter !== null) return { url: null, note: heldAfter };
+    const url = matching[0]!.url!;
+    try {
+      record(jobId, url);
+    } catch (error) {
+      return { url: null, note: `linking the open pull request ${url} failed: ${sanitizeErrorLog(error)}` };
+    }
+    this.opts.ledger.appendCustomEvent({
+      kind: 'round.pr-discovered', jobId, roundId,
+      payload: { url, branch, targetSha },
+    });
+    this.log('info', 'Perkins publication linked the lane branch open pull request', { round: roundId, url });
+    return { url, note: null };
   }
 
   private writeInterruptedArtifacts(roundId: string, reason: string, note: string, preAbortFacts?: string): {
@@ -6760,12 +6862,20 @@ export class WaveRunner {
       });
     }
 
+    // The job was read when the round started. A conclusive review whose
+    // job had no PR link then looks for one now, before it is given up as
+    // `no_pr_link` (a full review was re-run on the same head for a PR that
+    // existed all along).
+    const prLink = canonical !== 'INCOMPLETE' && job.prUrl === null
+      ? await this.findPublicationPr(job.id, round.id, review.targetSha, signal)
+      : { url: job.prUrl, note: null };
+    const linkedPrUrl = prLink.url;
     let posted = false;
     let deliveryError: unknown;
     let deliveryFailureKind: 'report_not_posted' | 'no_pr_link' = 'report_not_posted';
-    if (canonical !== 'INCOMPLETE' && job.prUrl !== null && this.opts.poster !== undefined) {
+    if (canonical !== 'INCOMPLETE' && linkedPrUrl !== null && this.opts.poster !== undefined) {
       const poster = this.opts.poster;
-      const providerKind = publicationProviderKindFor(job.prUrl);
+      const providerKind = publicationProviderKindFor(linkedPrUrl);
       // The wanted formal event derives ONLY from the native judgment and
       // its own eligibility facts (owner ruling j-1615): a completed
       // whole-change READY that owes no final whole-change pass enacts a
@@ -6784,7 +6894,7 @@ export class WaveRunner {
       // that carries the delivery.
       const wantedEnacted = wantedEnactedStateFor(providerKind, reviewEvent);
       const deliveryInput = () => {
-        const prUrl = new URL(job.prUrl!);
+        const prUrl = new URL(linkedPrUrl!);
         // The publication carries the lead-authored report PLUS a compact
         // host-owned factual appendix assembled from the structured result:
         // EVERY retained finding and the real execution facts
@@ -6845,7 +6955,7 @@ export class WaveRunner {
         // writer and reader can never drift apart (R2/R21).
         if (verdict === null) throw new Error('internal: delivery recorded without a conclusive verdict');
         const postedPayload: PostedEventPayload = {
-            verdict, canonicalVerdict: canonical, url: job.prUrl!, host: new URL(job.prUrl!).host,
+            verdict, canonicalVerdict: canonical, url: linkedPrUrl!, host: new URL(linkedPrUrl!).host,
             // The delivery record carries the identity and receipt the
             // poster PROVED: the provider review id, the actual actor and
             // the state the provider ACTUALLY enacted (which must equal the
@@ -6923,7 +7033,7 @@ export class WaveRunner {
         // attempted", and a failed intent write aborts with no POST at all.
         if (verdict === null) throw new Error('internal: publication attempt without a conclusive verdict');
         const attemptPayload: PublicationAttemptPayload = {
-          verdict, canonicalVerdict: canonical, url: job.prUrl!, host: prUrl.host,
+          verdict, canonicalVerdict: canonical, url: linkedPrUrl!, host: prUrl.host,
           targetSha: review.targetSha, baseSha: frozenReview.manifest.baseRefSha,
           publicationFile, publicationSha256, reviewEvent,
         };
@@ -6943,7 +7053,7 @@ export class WaveRunner {
         };
         const delivered = verifyPostedReceipt(
           await poster.post({
-            prUrl: job.prUrl!,
+            prUrl: linkedPrUrl!,
             host: prUrl.host,
             repoPath: frozenReview.manifest.repoPath,
             body: publicationBody,
@@ -7002,7 +7112,7 @@ export class WaveRunner {
             // the backend fail it closed (j-642) instead of re-reading the
             // provider under recovery semantics after a failed post.
             const found = await poster.reconcile!({
-              prUrl: job.prUrl!,
+              prUrl: linkedPrUrl!,
               host: prUrl.host,
               repoPath: frozenReview.manifest.repoPath,
               body: publicationBody,
@@ -7022,7 +7132,7 @@ export class WaveRunner {
               // uncredited evidence instead of discarding it.
               if (verdict === null) throw new Error('internal: reconciled publication without a conclusive verdict');
               const receiptEvidence: PublicationReceiptEvidencePayload = {
-                verdict, canonicalVerdict: canonical, url: job.prUrl!, host: prUrl.host,
+                verdict, canonicalVerdict: canonical, url: linkedPrUrl!, host: prUrl.host,
                 targetSha: review.targetSha, baseSha: frozenReview.manifest.baseRefSha,
                 publicationFile, publicationSha256, reviewEvent,
                 receipt: reconciledDelivery, credited: false, reason: 'reconciled-after-ambiguous-post',
@@ -7121,17 +7231,22 @@ export class WaveRunner {
           this.log('error', 'Perkins report post failed', { round: round.id, error: String(deliveryError) });
         }
       }
-    } else if (canonical !== 'INCOMPLETE' && job.prUrl === null) {
+    } else if (canonical !== 'INCOMPLETE' && linkedPrUrl === null) {
       // No linked PR means publication is impossible: a conclusive verdict
       // can never become a completed published round.
       deliveryFailureKind = 'no_pr_link';
-      deliveryError = new Error('the job has no pull request link; a conclusive review cannot be published');
-      this.escalate(
-        `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
-        'the job has no pull request link; a conclusive review cannot be published',
-        { jobId: round.jobId, roundId: round.id },
-      );
-    } else if (canonical !== 'INCOMPLETE' && job.prUrl !== null) {
+      const noLink = `the job has no pull request link; a conclusive review cannot be published${prLink.note === null ? '' : ` (${prLink.note})`}`;
+      deliveryError = new Error(noLink);
+      // An aborted round is reported by its abort (a shutdown records the
+      // restart's clean abort), never as a missing PR the owner must fix.
+      if (!signal.aborted) {
+        this.escalate(
+          `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
+          `${noLink}; link the PR with POST /api/dispatch/pr, then re-arm the review`,
+          { jobId: round.jobId, roundId: round.id },
+        );
+      }
+    } else if (canonical !== 'INCOMPLETE' && linkedPrUrl !== null) {
       deliveryError = new Error('the PR poster is unavailable');
       this.escalate(
         `Perkins report for round ${round.id} was recorded but NOT posted to the pull request`,

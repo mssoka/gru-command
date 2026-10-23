@@ -77,6 +77,54 @@ classification already in flight when compaction starts is discarded as
 stale, so old silence evidence can never kill a handle that entered
 compaction.
 
+**A Pi directive's own automatic compaction is not a foreign control.**
+Pi compacts a long session on its own; each compaction appends a summary
+entry that runs no tool and sends no message. While a directive runs, the
+adapter publishes that compaction's terminal as soon as Pi's compaction
+flag clears, admission publishes one still withheld once the flag has
+cleared (and otherwise refuses the directive before Pi writes its
+receipt), and next-turn preparation waits for it before the authority
+check, so supervision never holds the directive's own compaction against
+it. A terminal stays withheld past Pi's settle point, and a later start
+joins its episode, only while another holder (a manual compaction or a
+branch summary) keeps Pi's flag set.
+Directive proof (admission, the tool fence before every effect, and the
+checkpoint read for completion or recovery) walks past a compaction only
+when it is a Pi-authored summary, with a timestamp, a summary and a token
+count, linked directly on the active chain, with its kept entry on that
+chain. `fromHook: false` marks a Pi-authored summary: an automatic one, or
+a manual compact, which GC runs only on an idle session and so never inside
+a live turn. The SDK GC ships (^0.85.1) always writes `fromHook`; a
+compaction without it is refused. Such a compaction is walked past in one
+of four places:
+
+- **pre-prompt:** between the directive's baseline and its user receipt;
+- **mid-run:** after a completed tool round, before the next model call. A
+  turn lost right there is resumable at the compaction;
+- **post-run:** directly after the final reply, which stays the turn's
+  checkpoint;
+- **compact-and-retry:** an error reply, or a length reply without tool
+  calls, a compaction linked on it, and a reply continued from that
+  compaction. The failed reply is history: an error reply's tool calls
+  never ran, and it may hold only text, thinking and tool calls, as an
+  auto-retried one must; anything else is refused by name. A length reply
+  holding calls is never compacted and retried:
+  Pi answers its calls with its own "not executed" results and goes on
+  ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md) lists what Pi does with
+  each stop's calls). A turn lost between that compaction and the continued
+  reply reads as the failed reply's terminal (not ok), with or without tool
+  calls in it, and is never resumed: the run ended on that error, and only
+  Pi's compaction ran after it. An error reply that also carries a
+  `retry-start` receipt is refused by name: Pi auto-retries a reply or
+  compacts and retries it, never both.
+
+Anything else is refused by name and the request stays UNKNOWN: a
+hook-authored or malformed summary, a wrong parent, a kept entry off the
+chain or one of the turn's own compactions, a compaction inside an open
+tool round, directly after the user entry or on another compaction, and a
+compaction after the terminal followed by a prompt that is not durably
+bound.
+
 **Sleep/wake is not a hang.** A watchdog tick separated from the
 previous one by a wall-clock gap beyond the tick cadence means the
 machine was suspended; every open turn gets a fresh silence window, a

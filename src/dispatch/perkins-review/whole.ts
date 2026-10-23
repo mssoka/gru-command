@@ -12,6 +12,7 @@ import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
+import { REVIEW_TOOL_ERROR_MAX_BYTES, REVIEW_TOOL_TEXT_MAX_BYTES } from '../../runtime/review-mcp-bridge.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
@@ -50,20 +51,55 @@ const MAX_LEAD_ARTIFACT_BYTES = 100 * 1024;
 /** Response bound for one native-tool response, measured on the FULL wire
  * frame the Claude MCP bridge serializes (result text re-serialized inside
  * a JSON-RPC frame whose server rejects >1 MiB), leaving margin for ids and
- * protocol growth. Pi's in-process path has the same ceiling by symmetry. */
+ * protocol growth. Pi's in-process path has the same ceiling by symmetry.
+ * What a lead can READ of one result is smaller: REVIEW_TOOL_TEXT_MAX_BYTES. */
 const MAX_TOOL_RESPONSE_BYTES = 900 * 1024;
 const MAX_WIRE_FRAME_BYTES = 1024 * 1024 - 64 * 1024;
 
-/** Assert a tool response fits the serialized MCP wire frame the server
- * will actually accept (inner payload AND its frame). */
+/** Assert a tool response is one the lead can read whole and that fits the
+ * serialized MCP wire frame the server will actually accept (inner payload
+ * AND its frame). */
 function assertToolResponseFits(text: string, details: Readonly<Record<string, unknown>>, what: string): void {
+  if (Buffer.byteLength(text, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) {
+    throw new Error(`${what} exceeds the ${REVIEW_TOOL_TEXT_MAX_BYTES}-byte tool result the lead can read`);
+  }
   const frame = JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text, details } });
   if (Buffer.byteLength(frame, 'utf8') > MAX_WIRE_FRAME_BYTES) {
     throw new Error(`${what} exceeds the bounded serialized tool response; select a smaller scope`);
   }
 }
-/** Response bound for the aggregated submission-validation rejection. */
-const MAX_VALIDATION_MESSAGE_BYTES = 256 * 1024;
+/** One specialist result must fit a lead-readable response on its own,
+ * with room left for the batch envelope and its withheld list. */
+const LENS_RESULT_MAX_BYTES = REVIEW_TOOL_TEXT_MAX_BYTES - 8 * 1024;
+/** Room kept in a specialist batch response for its withheld list. */
+const WITHHELD_RESERVE_BYTES = 4 * 1024;
+/** Bound on a failed attempt's error text in the lead's view. */
+const LEAD_VIEW_ERROR_MAX_CHARS = 2_000;
+
+/** A failed attempt's error as the lead reads it: whole, or cut with the
+ * count of what was cut — never silently. */
+export function leadViewError(error: string): string {
+  if (error.length <= LEAD_VIEW_ERROR_MAX_CHARS) return error;
+  const suffix = ` … (+${error.length - (LEAD_VIEW_ERROR_MAX_CHARS - 80)} characters cut; the full error is in the run record)`;
+  return `${error.slice(0, LEAD_VIEW_ERROR_MAX_CHARS - 80)}${suffix}`;
+}
+
+/** What the lead reads of one specialist result: the review content, never
+ * host bookkeeping (delivery stamps, recording errors). The child-side size
+ * bound and the batch packing both measure exactly this view. */
+function leadView(result: {
+  readonly resultId: string; readonly lens: string; readonly attempt: number; readonly status: string;
+  readonly findings: readonly unknown[]; readonly failureKind?: string; readonly error?: string;
+}): Record<string, unknown> {
+  return {
+    resultId: result.resultId, lens: result.lens, attempt: result.attempt, status: result.status, findings: result.findings,
+    ...(result.failureKind !== undefined ? { failureKind: result.failureKind } : {}),
+    ...(result.error !== undefined ? { error: leadViewError(result.error) } : {}),
+  };
+}
+/** Bound for the aggregated submission-validation rejection: it reaches
+ * the lead as a tool ERROR, which Claude Code cuts past ~10,000 characters. */
+const MAX_VALIDATION_MESSAGE_BYTES = REVIEW_TOOL_ERROR_MAX_BYTES;
 export const PERKINS_REPORT_MAX_BYTES = 128 * 1024;
 const REVIEW_OWNER = 'perkins-whole-review';
 
@@ -535,17 +571,21 @@ function rejectionMessage(issues: readonly SubmissionValidationIssue[]): string 
   const lines = [
     `terminal submission rejected with ${issues.length} error(s); every listed rule must be fixed before a real submission is accepted:`,
   ];
+  // Room for the omitted-count line, so the whole message stays bounded.
+  const budget = MAX_VALIDATION_MESSAGE_BYTES - 200;
   let bytes = Buffer.byteLength(lines[0]!, 'utf8') + 1;
   let shown = 0;
   for (const issue of issues) {
     const line = `- [${issue.subject}] ${issue.rule}: ${issue.message}`;
     const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
-    if (bytes + lineBytes > MAX_VALIDATION_MESSAGE_BYTES) break;
+    if (bytes + lineBytes > budget) break;
     lines.push(line);
     bytes += lineBytes;
     shown += 1;
   }
-  if (shown < issues.length) lines.push(`- (+${issues.length - shown} further error(s) omitted from this bounded response)`);
+  if (shown < issues.length) {
+    lines.push(`- (+${issues.length - shown} further error(s) omitted; perkins_preflight_submission returns the full list)`);
+  }
   return lines.join('\n');
 }
 
@@ -1659,6 +1699,17 @@ export class PerkinsWholeReview {
           throw new Error('specialist raw output exceeds the checkpoint byte limit');
         }
         const resultId = `${lens}-a${attempt}-${hash(handle.id).slice(0, 16)}`;
+        // A valid result the lead could never read whole is no result: the
+        // attempt fails with feedback a retry can act on.
+        const leadBytes = Buffer.byteLength(JSON.stringify(leadView({
+          resultId, lens, attempt, status: 'valid', findings: reviewFindings,
+        })), 'utf8');
+        if (leadBytes > LENS_RESULT_MAX_BYTES) {
+          outputRejected = true;
+          throw new Error(
+            `specialist findings come to ${leadBytes} bytes, over the ${LENS_RESULT_MAX_BYTES}-byte result a lead can read; report fewer findings and quote only the decisive evidence lines`,
+          );
+        }
         const envelope: LensEnvelope = {
           schemaVersion: 1, lens, attempt, status: 'valid', outputSha256: hash(outputBytes), findings: reviewFindings,
           ...(recovery !== undefined ? { recovery } : {}),
@@ -1873,10 +1924,53 @@ export class PerkinsWholeReview {
 
     const resultsHaveValid = (lens: PerkinsLens): boolean =>
       [...results.values()].some((result) => result.lens === lens && result.status === 'valid');
+    /** Valid results a response withheld for size; the lead collects them
+     * by calling perkins_run_specialists with exactly their lenses. */
+    const withheldForSize = new Set<string>();
+    /** Pack whole results into one lead-readable response: failed attempts
+     * (no findings) first, then valid results in call order while they fit.
+     * Each valid result fits alone (LENS_RESULT_MAX_BYTES), so every call
+     * delivers at least one; the rest are listed as withheld. */
+    const packForLead = (candidates: readonly SpecialistResult[]): {
+      readonly delivered: readonly SpecialistResult[];
+      readonly withheld: readonly SpecialistResult[];
+      readonly payload: string;
+    } => {
+      const delivered: SpecialistResult[] = [];
+      const withheld: SpecialistResult[] = [];
+      const ordered = [...candidates.filter((result) => result.status !== 'valid'), ...candidates.filter((result) => result.status === 'valid')];
+      for (const result of ordered) {
+        const fits = Buffer.byteLength(JSON.stringify({ results: [...delivered, result].map(leadView) }), 'utf8') <=
+          REVIEW_TOOL_TEXT_MAX_BYTES - WITHHELD_RESERVE_BYTES;
+        if (fits) delivered.push(result);
+        else withheld.push(result);
+      }
+      // Each view fits alone by construction; a response that could carry
+      // none would be a collect the lead repeats forever.
+      if (delivered.length === 0 && withheld.length > 0) {
+        throw new Error(`specialist result ${withheld[0]!.lens} does not fit one tool result the lead can read`);
+      }
+      const payload = JSON.stringify({
+        results: delivered.map(leadView),
+        ...(withheld.length === 0 ? {} : {
+          withheld: withheld.map((result) => ({ lens: result.lens, findingCount: result.findings.length })),
+          collect: `These results did not fit in this response whole. Call perkins_run_specialists with runs ${JSON.stringify(withheld.map((result) => ({ lens: result.lens })))} to collect them; no child is started.`,
+        }),
+      });
+      return { delivered, withheld, payload };
+    };
+    /** A collected result is delivered: its undelivered stamp is lifted. */
+    const deliverPacked = (packed: ReturnType<typeof packForLead>): void => {
+      for (const result of packed.delivered) {
+        withheldForSize.delete(result.resultId);
+        const { findingsDelivered: _undelivered, ...delivered } = results.get(result.resultId) ?? result;
+        results.set(result.resultId, delivered);
+      }
+    };
 
     const runTool: NativeAgentTool = {
       name: 'perkins_run_specialists',
-      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. One call starts all its runs together: the host admits at most this round's resident wave per call (a smaller wave is refused with a split-the-batch error, never a lens failure) and the round is bounded to ${MAX_SPECIALISTS_PER_ROUND} total runs. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. If a call reports the wave still running at the transport wait, call this same tool again with the SAME runs to attach to the running wave and collect its results; never start a second run for a lens that is already running. Specialists are optional: use the lenses that help this change.`,
+      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. One call starts all its runs together: the host admits at most this round's resident wave per call (a smaller wave is refused with a split-the-batch error, never a lens failure) and the round is bounded to ${MAX_SPECIALISTS_PER_ROUND} total runs. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. If a call reports the wave still running at the transport wait, call this same tool again with the SAME runs to attach to the running wave and collect its results; never start a second run for a lens that is already running. A response lists under \`withheld\` any valid result that did not fit in it whole; call this tool again with exactly those lenses to collect them (no child is started). Specialists are optional: use the lenses that help this change.`,
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['runs'],
         properties: {
@@ -1910,6 +2004,23 @@ export class PerkinsWholeReview {
         });
         const lensesRun = requested.map((run) => run.lens);
         if (new Set(lensesRun).size !== lensesRun.length) throw new Error('one tool call cannot duplicate a lens');
+        // Collecting results an earlier response withheld for size starts
+        // no child: the stored results are delivered, as many as fit.
+        const collectable = (lens: PerkinsLens): SpecialistResult | undefined => [...results.values()]
+          .find((result) => result.lens === lens && withheldForSize.has(result.resultId));
+        const toCollect = lensesRun.map(collectable);
+        if (toCollect.some((result) => result !== undefined)) {
+          if (toCollect.some((result) => result === undefined)) {
+            throw new Error(`collect withheld results (${lensesRun.filter((lens) => collectable(lens) !== undefined).join(', ')}) in a call of their own, without new lenses`);
+          }
+          const packed = packForLead(toCollect as SpecialistResult[]);
+          assertToolResponseFits(packed.payload, { resultCount: packed.delivered.length }, 'withheld specialist results');
+          deliverPacked(packed);
+          return {
+            text: packed.payload,
+            details: { resultCount: packed.delivered.length, withheldCount: packed.withheld.length, collected: true },
+          };
+        }
         const scheduled = requested.map((run) => {
           if (resultsHaveValid(run.lens)) throw new Error(`specialist ${run.lens} already has a valid result`);
           const priorAttempt = attempts.get(run.lens) ?? 0;
@@ -2053,7 +2164,6 @@ export class PerkinsWholeReview {
         /** Runs of THIS batch whose findings never reached the lead (R17):
          * commitResults stamps them undelivered even on the error path. */
         const undeliveredRuns = new Set<string>();
-        const payload = JSON.stringify({ results: childResults });
         const commitResults = (): void => {
           // Real executed children are committed to the durable run record
           // and the lens state, whatever happens to the response: their
@@ -2077,11 +2187,13 @@ export class PerkinsWholeReview {
           commitResults();
           throw new Error('review already has an accepted terminal submission');
         }
+        // Whole results only, up to what the lead can read; the rest wait,
+        // undelivered, until the lead collects them.
+        let packed: ReturnType<typeof packForLead>;
         try {
-          if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
-            throw new Error('specialist result batch exceeds the bounded tool response');
-          }
-          assertToolResponseFits(payload, { resultCount: childResults.length }, 'specialist result batch');
+          packed = packForLead(childResults);
+          assertToolResponseFits(packed.payload, { resultCount: childResults.length }, 'specialist result batch');
+          for (const result of packed.withheld) undeliveredRuns.add(result.resultId);
         } catch (error) {
           // The children really ran: their envelopes/artifacts/run records
           // stay committed (never restored or hidden) — only the response
@@ -2109,9 +2221,14 @@ export class PerkinsWholeReview {
           throw acquireError instanceof Error ? acquireError : new Error(String(acquireError));
         }
         commitResults();
+        for (const result of packed.withheld) withheldForSize.add(result.resultId);
         return {
-          text: payload,
-          details: { resultCount: childResults.length, findingCount: childResults.reduce((sum, result) => sum + result.findings.length, 0) },
+          text: packed.payload,
+          details: {
+            resultCount: packed.delivered.length,
+            findingCount: packed.delivered.reduce((sum, result) => sum + result.findings.length, 0),
+            withheldCount: packed.withheld.length,
+          },
         };
       }),
     };
@@ -2207,7 +2324,27 @@ export class PerkinsWholeReview {
               throw new Error(`git diff reported an unhandled name-status "${status}" — refusing an incomplete prior-revision listing`);
             }
           }
-          payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, changes });
+          // As many changes as the lead can read, with the exact count left
+          // out; it reads any listed or known path with { path }.
+          let listed = changes.length;
+          const render = (count: number): string => JSON.stringify({
+            priorTargetSha, targetSha: review.manifest.targetSha, changes: changes.slice(0, count),
+            ...(count < changes.length
+              ? { omittedChangeCount: changes.length - count, note: 'The listing is bounded; read any changed path with {"path": ...}.' }
+              : {}),
+          });
+          payload = render(listed);
+          if (Buffer.byteLength(payload, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) {
+            let low = 0;
+            let high = changes.length - 1;
+            while (low < high) {
+              const middle = Math.ceil((low + high) / 2);
+              if (Buffer.byteLength(render(middle), 'utf8') <= REVIEW_TOOL_TEXT_MAX_BYTES) low = middle;
+              else high = middle - 1;
+            }
+            listed = low;
+            payload = render(listed);
+          }
         } else {
           if (typeof value.path !== 'string' || !safeFixPath(value.path)) {
             throw new Error('prior revision path must be a bounded safe relative file path');
@@ -2253,9 +2390,9 @@ export class PerkinsWholeReview {
             '--unified=3', priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
           ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, path: value.path, diff });
-        }
-        if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
-          throw new Error('prior revision response exceeds the bounded tool response; select a smaller path');
+          if (Buffer.byteLength(payload, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) {
+            throw new Error(`the diff of ${value.path} between the revisions exceeds the ${REVIEW_TOOL_TEXT_MAX_BYTES}-byte tool result the lead can read and cannot be delivered; review that file in the current tree`);
+          }
         }
         assertToolResponseFits(payload, { priorTargetSha, targetSha: review.manifest.targetSha }, 'prior revision response');
         return { text: payload, details: { priorTargetSha, targetSha: review.manifest.targetSha } };
@@ -2350,9 +2487,10 @@ export class PerkinsWholeReview {
           errorCount: issues.length,
           errors: issues,
         });
-        // The response is wire-bounded: every issue stays durable in the
-        // artifact above; the response carries as many as fit plus an
-        // explicit omitted count and pointer — never silent truncation.
+        // The response is bounded to what the lead can read: every issue
+        // stays durable in the artifact above; the response carries as many
+        // as fit plus an explicit omitted count and pointer — never silent
+        // truncation.
         const included: SubmissionValidationIssue[] = [];
         for (const issue of issues) {
           const candidate = JSON.stringify({
@@ -2361,7 +2499,7 @@ export class PerkinsWholeReview {
             omittedErrorCount: issues.length - included.length - 1,
             fullList: artifact,
           });
-          if (Buffer.byteLength(JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text: candidate } }), 'utf8') > MAX_WIRE_FRAME_BYTES) break;
+          if (Buffer.byteLength(candidate, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) break;
           included.push(issue);
         }
         return {
@@ -2656,6 +2794,11 @@ export class PerkinsWholeReview {
       renderPropertyCampaignEvidence(propertyEvidence),
       ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_revision to list prior-target changes and read bounded path diffs while revisiting prior findings.']),
       'Specialists never inherit these tools. You, the lead, own every retained finding, every prior-finding disposition, and the verdict. Do not write implementation files.',
+      '',
+      // The lead chooses lenses; without the briefs it would choose from
+      // bare names. Each line is that lens's policy brief.
+      '--- SPECIALIST LENSES (what each perkins_run_specialists lens reviews) ---',
+      ...catalog.map((lens) => `- ${lens}: ${this.policy.portableContract.lenses[lens]}`),
     ].join('\n');
     const restoredResults = [...results.values()].map((result) => ({
       lens: result.lens, attempt: result.attempt, status: result.status,

@@ -1143,4 +1143,35 @@ export const MIGRATIONS: readonly Migration[] = [
          AND worktree_id IN (SELECT id FROM worktrees WHERE status = 'swept');
     `,
   },
+  {
+    // #486: lane provenance. Each lane incarnation gets a random token that
+    // every session spawned in it carries (GRU_LANE_TOKEN), so a process
+    // that detached from the session is still known as the lane's. Lanes
+    // not yet swept get theirs now, so sessions spawned after the upgrade
+    // carry it. A process reaped by its token is recorded with evidence
+    // `lane-token`; SQLite cannot widen a CHECK in place, so the process
+    // table is rebuilt as in migration 30.
+    id: 31,
+    name: 'worktree-lane-token',
+    sql: `
+      ALTER TABLE worktrees ADD COLUMN lane_token TEXT;
+      UPDATE worktrees SET lane_token = lower(hex(randomblob(16))) WHERE status <> 'swept';
+      CREATE UNIQUE INDEX idx_worktrees_lane_token ON worktrees(lane_token) WHERE lane_token IS NOT NULL;
+      CREATE TABLE worktree_processes_new (
+        worktree_id TEXT NOT NULL REFERENCES worktrees(id),
+        pid         INTEGER NOT NULL,
+        command     TEXT NOT NULL,
+        evidence    TEXT NOT NULL CHECK (evidence IN ('argv','cwd','registry','lane-token')),
+        state       TEXT NOT NULL CHECK (state IN ('live','killed','exited')),
+        first_seen  TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,
+        PRIMARY KEY (worktree_id, pid)
+      );
+      INSERT INTO worktree_processes_new (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+        SELECT worktree_id, pid, command, evidence, state, first_seen, last_seen FROM worktree_processes;
+      DROP TABLE worktree_processes;
+      ALTER TABLE worktree_processes_new RENAME TO worktree_processes;
+      CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
+    `,
+  },
 ];

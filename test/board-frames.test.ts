@@ -111,6 +111,7 @@ const SNAPSHOT_VALID = {
         key: 'demo',
         displayName: 'demo',
         linked: true,
+        provider: 'github',
         host: 'github.com',
         link: 'https://github.com/example/demo',
         linkReason: null,

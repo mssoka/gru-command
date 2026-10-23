@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  assertClaudeDirectiveToolIntent, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint,
-  prepareClaudeDirectiveBinding, prepareDirectiveBinding, readDirectiveBinding, readDirectiveSessionHeader, type DirectiveTurnIdentity,
+  DirectiveCheckpointError, assertClaudeDirectiveToolIntent, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint,
+  prepareClaudeDirectiveBinding, prepareDirectiveBinding, prepareDirectiveProducer, readDirectiveBinding, readDirectiveSessionHeader,
+  recordDirectiveRetryStart, type DirectiveTurnIdentity,
 } from '../src/runtime/directive-checkpoint.js';
 
 /**
@@ -123,6 +124,14 @@ function preparePi(file: string, who = identity, body = text) {
 }
 const toolCall = { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'true' } };
 const invocation = { role: 'assistant', stopReason: 'toolUse', content: [toolCall] };
+/** A provider error the pi SDK retried (#483), and its live retry-start. */
+const RETRY_ERROR = 'OpenAI Responses stream ended before a terminal response event';
+const retryError = (body = '') => ({ role: 'assistant', stopReason: 'error', errorMessage: RETRY_ERROR, content: body === '' ? [] : [{ type: 'text', text: body }] });
+const retryStart = { type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: RETRY_ERROR };
+/** Records the live retry-start for the directive's error row `entry`. */
+function recordRetry(file: string, entry: Record<string, unknown>): void {
+  expect(recordDirectiveRetryStart(prepareDirectiveProducer({ identity, agentId: 'minion', sessionId: 'pi-session', sessionFile: file }), retryStart, entry)).toBeNull();
+}
 const toolResult = (id: string, body = 'ok') => ({ role: 'toolResult', toolCallId: id, toolName: 'bash', isError: false, content: [{ type: 'text', text: body }] });
 
 const claudeHeader = { type: 'session', version: 1, id: 'cli-session', cwd: '/lane', runtime: 'claude-code' };
@@ -354,6 +363,23 @@ describe('an earlier directive on a session that kept working (#469)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
   });
 
+  it('pi: a turn just under the limit ending on an abandoned receipted retry row stays inspectable once a later request follows (#483)', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+    const error = (body: string) => ({ type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError(body) });
+    // The whole turn, receipt and receipted error row, is 10 bytes under the limit.
+    const row = error('x'.repeat(LIMIT - 10 - Buffer.byteLength(receipt) - Buffer.byteLength(`${JSON.stringify(error('x'))}\n`) + 1));
+    appendFileSync(file, `${receipt}${JSON.stringify(row)}\n`);
+    inspectDirectiveAdmission(file, identity);
+    recordRetry(file, row);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: RETRY_ERROR, checkpointId: 'retry-error' });
+    preparePi(file, laterIdentity, 'the next approved step');
+    piEntry(file, 'receipt-b', 'retry-error', prompt('the next approved step'));
+    expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: RETRY_ERROR, checkpointId: 'retry-error' });
+  });
+
   it('Claude Code: stays inspectable after a later directive turn past the limit, reading only through its own turn', () => {
     const file = sessionFile(claudeHeader);
     prepareClaude(file);
@@ -475,6 +501,43 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
     piEntry(file, 'use-40', parent, asked);
     expect(() => flushDirectiveToolIntent(file, asked, next, identity)).not.toThrow();
   });
+
+  it('allows the next call after Pi compacted the turn, the prompt or an overflow retry, and refuses by name one compacted inside a tool round or by a hook (#481)', () => {
+    const compaction = (file: string, id: string, parentId: string, firstKeptEntryId: string, fields: Record<string, unknown> = {}): string => {
+      appendFileSync(file, `${JSON.stringify({ type: 'compaction', id, parentId, timestamp: '2026-10-22T00:00:00.000Z', summary: 'Pi automatic compaction summary',
+        firstKeptEntryId, tokensBefore: 90_000, fromHook: false, ...fields })}\n`);
+      return id;
+    };
+    const next = { ...toolCall, id: 'call-2' };
+    const asked = { ...invocation, content: [next] };
+    const sibling = { ...toolCall, id: 'call-x' };
+    const OPEN_ROUND = 'native compaction interrupts an open tool round';
+    const HOOK_AUTHORED = 'native compaction summary was authored by an extension hook';
+    for (const [mode, refusal] of [['after-round', null], ['pre-prompt', null], ['overflow-retry', null], ['overflow-retry-kept-failed', null],
+      ['inside-round', OPEN_ROUND], ['inside-batch', OPEN_ROUND], ['hook-authored', HOOK_AUTHORED],
+      ['overflow-retry-hook', HOOK_AUTHORED], ['overflow-retry-no-summary', 'native compaction lacks a summary']] as const) {
+      const file = sessionFile(piHeader);
+      const earlier = piEntry(file, 'h1', piEntry(file, 'h0', null, prompt('earlier')), answer);
+      preparePi(file);
+      const receipt = piEntry(file, 'receipt', mode === 'pre-prompt' ? compaction(file, 'pre-prompt', earlier, earlier) : earlier, prompt(text));
+      const first = piEntry(file, 'use-1', receipt, mode === 'inside-batch' ? { ...invocation, content: [toolCall, sibling] } : invocation);
+      let settled = piEntry(file, 'result-1', mode === 'inside-round' ? compaction(file, 'compaction', first, receipt) : first, toolResult('call-1'));
+      // Between two results of one batch: the round is still open.
+      if (mode === 'inside-batch') settled = piEntry(file, 'result-x', compaction(file, 'compaction', settled, receipt), toolResult('call-x'));
+      // Pi's compact-and-retry: a failed reply (its tool call never ran), a compaction on it, then the continued call.
+      if (mode.startsWith('overflow-retry')) {
+        const failed = piEntry(file, 'overflowed', settled, { role: 'assistant', stopReason: 'error',
+          errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: [{ ...toolCall, id: 'never-run' }] });
+        settled = compaction(file, 'compaction', failed, mode === 'overflow-retry-kept-failed' ? failed : receipt,
+          mode === 'overflow-retry-hook' ? { fromHook: true } : mode === 'overflow-retry-no-summary' ? { summary: undefined } : {});
+      }
+      const tip = mode === 'after-round' || mode === 'hook-authored'
+        ? compaction(file, 'compaction', settled, receipt, mode === 'hook-authored' ? { fromHook: true } : {}) : settled;
+      piEntry(file, 'use-2', tip, asked);
+      if (refusal !== null) expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).toThrow(new DirectiveCheckpointError(refusal));
+      else expect(() => flushDirectiveToolIntent(file, asked, next, identity), mode).not.toThrow();
+    }
+  });
 });
 
 describe('pinned identities and read refusals (#469)', () => {
@@ -561,6 +624,62 @@ describe('limits at their exact boundaries (#469)', () => {
     expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
   });
 
+  it('pi: a turn of exactly 32 MiB ending on its retried answer is read; one byte more refuses as the turn (#483)', () => {
+    const turn = (bytes: number) => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+      const error = (body: string) => ({ type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError(body) });
+      // The retried answer is read as lookahead, then charged back to the turn.
+      const retried = `${JSON.stringify({ type: 'message', id: 'retried-answer', parentId: 'retry-error', message: answer })}\n`;
+      const row = error('x'.repeat(bytes - Buffer.byteLength(receipt) - Buffer.byteLength(retried) - Buffer.byteLength(`${JSON.stringify(error('x'))}\n`) + 1));
+      appendFileSync(file, `${receipt}${JSON.stringify(row)}\n`);
+      inspectDirectiveAdmission(file, identity);
+      recordRetry(file, row);
+      appendFileSync(file, retried);
+      return file;
+    };
+    expect(inspectDirectiveCheckpoint(turn(LIMIT), identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'retried-answer' });
+    expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
+  });
+
+  it('pi: a turn of exactly 32 MiB ending on an error reply nothing continued leaves Pi\'s compaction on it to the lookahead (#481)', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const overflow = 'prompt is too long: 150000 tokens > 100000 maximum';
+    const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+    const failed = (body: string) => `${JSON.stringify({ type: 'message', id: 'failed-a', parentId: 'receipt-a',
+      message: { role: 'assistant', stopReason: 'error', errorMessage: overflow, content: [{ type: 'text', text: body }] } })}\n`;
+    appendFileSync(file, receipt + failed('x'.repeat(LIMIT - Buffer.byteLength(receipt) - Buffer.byteLength(failed('')))));
+    // Read to see whether Pi continued the failed reply, the compaction is lookahead: no reply follows it.
+    appendFileSync(file, `${JSON.stringify({ type: 'compaction', id: 'post-run', parentId: 'failed-a', timestamp: '2026-10-22T00:00:00.000Z',
+      summary: 'Pi automatic compaction summary', firstKeptEntryId: 'receipt-a', tokensBefore: 90_000, fromHook: false })}\n`);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'failed-a', error: overflow });
+  });
+
+  it('pi: a turn of exactly 32 MiB through a compact-and-retry is read; one byte more refuses as the turn (#481)', () => {
+    /** The receipt, a failed reply, Pi's compaction on it and the reply continued from it: `bytes` in all, padded in `padded`. */
+    const turn = (bytes: number, padded: 'failed' | 'continued') => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      const line = (row: Record<string, unknown>) => `${JSON.stringify(row)}\n`;
+      const receipt = line({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) });
+      const failed = (body: string) => line({ type: 'message', id: 'failed-a', parentId: 'receipt-a',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: [{ type: 'text', text: body }] } });
+      const compaction = line({ type: 'compaction', id: 'retry-compaction', parentId: 'failed-a', timestamp: '2026-10-22T00:00:00.000Z',
+        summary: 'Pi automatic compaction summary', firstKeptEntryId: 'receipt-a', tokensBefore: 90_000, fromHook: false });
+      const continued = (body: string) => line({ type: 'message', id: 'answer-a', parentId: 'retry-compaction', message: { ...answer, content: [{ type: 'text', text: body }] } });
+      const pad = 'x'.repeat(bytes - Buffer.byteLength(receipt + failed('') + compaction + continued('')));
+      appendFileSync(file, receipt + failed(padded === 'failed' ? pad : '') + compaction + continued(padded === 'continued' ? pad : ''));
+      return file;
+    };
+    // The entries read to see whether Pi continued the failed reply are the turn's own once it did.
+    for (const padded of ['failed', 'continued'] as const) {
+      expect(inspectDirectiveCheckpoint(turn(LIMIT, padded), identity), padded).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
+      expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1, padded), identity), padded).toThrow(new DirectiveCheckpointError('native directive turn exceeds the 33554432-byte inspection limit'));
+    }
+  });
+
   it('a header line of exactly 64 KiB is read; one byte more refuses', () => {
     const header = (bytes: number) => {
       const line = (cwd: string) => JSON.stringify({ ...piHeader, cwd });
@@ -593,5 +712,39 @@ describe('limits at their exact boundaries (#469)', () => {
     const final = piEntry(bytes, 'answer-a', piEntry(bytes, 'receipt-a', null, prompt(text)), answer);
     piEntry(bytes, 'huge', final, prompt('x'.repeat(LIMIT)));
     expect(() => inspectDirectiveCheckpoint(bytes, identity)).toThrow(/^native lookahead after the directive turn exceeds the 33554432-byte inspection limit$/u);
+  });
+
+  it('pi: the lookahead past an abandoned receipted retry row has its own entry bound, the entry read after the row counted once (#483)', () => {
+    /** An abandoned receipted retry row ends a 2-entry turn; then `controls` controls and the next directive's receipt. */
+    const lookahead = (controls: number) => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      piEntry(file, 'receipt-a', null, prompt(text));
+      inspectDirectiveAdmission(file, identity);
+      const row = { type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError() };
+      piEntry(file, row.id, row.parentId, row.message);
+      recordRetry(file, row);
+      appendRows(file, controls, (index) => ({ type: 'thinking_level_change', id: `level-${index}`, parentId: index === 0 ? 'retry-error' : `level-${index - 1}`, thinkingLevel: 'low' }));
+      preparePi(file, laterIdentity, 'the next approved step');
+      piEntry(file, 'receipt-b', `level-${controls - 1}`, prompt('the next approved step'));
+      expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
+      return file;
+    };
+    // 249,999 controls and the receipt are 250,000 lookahead entries: within their own bound.
+    expect(inspectDirectiveCheckpoint(lookahead(249_999), identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'retry-error' });
+    // One more is past it: the turn ends once, so the control read after the row stays counted.
+    expect(() => inspectDirectiveCheckpoint(lookahead(250_000), identity)).toThrow(/^native lookahead after the directive turn exceeds the entry inspection limit$/u);
+  });
+
+  it('pi: the entry after an abandoned receipted retry row is lookahead, refused under its own name, never the turn\'s (#483)', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    piEntry(file, 'receipt-a', null, prompt(text));
+    inspectDirectiveAdmission(file, identity);
+    const row = { type: 'message', id: 'retry-error', parentId: 'receipt-a', message: retryError() };
+    piEntry(file, row.id, row.parentId, row.message);
+    recordRetry(file, row);
+    piEntry(file, 'huge', 'retry-error', prompt('x'.repeat(LIMIT)));
+    expect(() => inspectDirectiveCheckpoint(file, identity)).toThrow(/^native lookahead after the directive turn exceeds the 33554432-byte inspection limit$/u);
   });
 });

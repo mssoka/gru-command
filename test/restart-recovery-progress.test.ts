@@ -13,7 +13,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
-import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
@@ -155,9 +155,11 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   const stop = new AbortController();
   let supervised: readonly string[] = [];
   const deps = { ledger, registry, worktrees, notifications, signal: stop.signal, pendingProducerBlockers: () => supervised };
-  const seed = (text = 'accepted native prompt') => {
+  /** `beforeReceipt` writes what Pi appends between the baseline and the user receipt. */
+  const seed = (text = 'accepted native prompt', beforeReceipt?: () => void) => {
     ledger.prepareDirectiveTarget(intent.requestId, { agentId: 'logical-minion', sessionFile: file });
     prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file, text, authorityManifest: manifest });
+    beforeReceipt?.();
     native.append({ role: 'user', content: [{ type: 'text', text }] });
     recordDirectiveProducerCessation(prepareDirectiveProducer({ identity, agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file }));
     return identity;
@@ -845,34 +847,297 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
     expect(readFileSync(f.file, 'utf8')).toBe(bytes);
   }
-  async function assertBoundControlTail(mode: 'linked' | 'wrong-parent' | 'unsupported' | 'malformed-model') {
+  /** The original's controls tail, then a later prompt bound on it. The
+   * original stays unsettled until the tail is read: only a linked tail lets
+   * it settle. */
+  async function assertBoundControlTail(mode: 'linked' | 'max-thinking' | 'off-thinking' | 'wrong-parent' | 'malformed-compaction' | 'malformed-model' | 'malformed-thinking') {
     const f = await fixture(); f.seed(); f.native.finish();
     const original = inspectDirectiveCheckpoint(f.file, f.identity);
     if (original.state !== 'terminal') throw new Error('original fixture must genuinely complete');
-    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
-    const model = { type: mode === 'unsupported' ? 'compaction' : 'model_change', id: 'later-model-control',
+    const model = { type: 'model_change', id: 'later-model-control',
       parentId: mode === 'wrong-parent' ? 'unbound-parent' : original.checkpointId,
       provider: mode === 'malformed-model' ? undefined : 'fixture', modelId: 'later-model' };
-    const thinking = { type: 'thinking_level_change', id: 'later-thinking-control', parentId: model.id, thinkingLevel: 'high' };
-    appendFileSync(f.file, `${JSON.stringify(model)}\n${JSON.stringify(thinking)}\n`);
-    const later = f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId: 'bound-after-controls', directive: 'separate accepted turn', holder: 'gru' }).record;
-    const identity = f.ledger.directiveTurnIdentity(later.requestId);
-    f.ledger.prepareDirectiveTarget(later.requestId, { agentId: 'logical-minion', sessionFile: f.file });
-    const binding = prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
-      sessionFile: f.file, text: 'separate accepted turn', authorityManifest: 'later independently accepted authority' });
-    expect(binding.baseline).toBe(thinking.id);
-    f.native.append({ role: 'user', content: [{ type: 'text', text: 'separate accepted turn' }] });
-    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, identity));
+    const thinking = { type: 'thinking_level_change', id: 'later-thinking-control', parentId: model.id,
+      thinkingLevel: mode === 'malformed-thinking' ? 'turbo' : mode === 'max-thinking' ? 'max' : mode === 'off-thinking' ? 'off' : 'high' };
+    // Pi's own compaction shape, but with a blank summary.
+    const control = mode === 'malformed-compaction' ? piCompaction(model.id, original.checkpointId, original.checkpointId, { summary: ' ' }) : JSON.stringify(model);
+    appendFileSync(f.file, `${control}\n${JSON.stringify(thinking)}\n`);
+    const later = bindLaterRequest(f, undefined, true);
+    expect(readDirectiveBinding(f.file, later.requestId)?.baseline).toBe(thinking.id);
     const bytes = readFileSync(f.file, 'utf8');
     const observed = inspectDirectiveCheckpoint(f.file, f.identity);
-    if (mode === 'linked') expect(observed).toEqual(original);
-    else expect(observed.state).toBe('unknown');
+    const reasons = { 'wrong-parent': 'native control is not linked to the completed checkpoint', 'malformed-compaction': 'native compaction lacks a summary',
+      'malformed-model': 'native model control is malformed', 'malformed-thinking': 'native thinking-level control is malformed' };
+    const linked = mode === 'linked' || mode === 'max-thinking' || mode === 'off-thinking';
+    if (linked) expect(observed).toEqual(original);
+    else expect(observed).toEqual({ state: 'unknown', reason: reasons[mode] });
     expect(readFileSync(f.file, 'utf8')).toBe(bytes);
+    expectSettlement(f, linked, mode);
   }
   it('P46 preserves original completion through linked model and thinking controls into a later bound request', () => assertBoundControlTail('linked'));
+  it('P46 preserves original completion through Pi\'s max thinking level into a later bound request, and settles once', () => assertBoundControlTail('max-thinking'));
+  it('P46 preserves original completion through Pi\'s off thinking level into a later bound request, and settles once', () => assertBoundControlTail('off-thinking'));
   it('P46 refuses later bound controls whose ancestry does not descend from the original checkpoint', () => assertBoundControlTail('wrong-parent'));
-  it('P46 refuses compaction controls even when a later request is independently bound', () => assertBoundControlTail('unsupported'));
+  it('P46 refuses a malformed compaction control even when a later request is independently bound', () => assertBoundControlTail('malformed-compaction'));
   it('P46 refuses malformed model controls before an independently bound later request', () => assertBoundControlTail('malformed-model'));
+  it('P46 refuses a malformed thinking-level control before an independently bound later request, and never settles', () => assertBoundControlTail('malformed-thinking'));
+  /** Pi's own automatic compaction entry (#481), as the pinned SDK appends it.
+   * `tokensBefore: '1e400'` writes the raw JSON number, which parses as Infinity. */
+  const piCompaction = (id: string, parentId: string, firstKeptEntryId: string, fields: Record<string, unknown> = {}) =>
+    JSON.stringify({ type: 'compaction', id, parentId, timestamp: new Date().toISOString(), summary: 'Pi automatic compaction summary',
+      firstKeptEntryId, tokensBefore: 90_000, details: { readFiles: [], modifiedFiles: [] }, fromHook: false, ...fields })
+      .replace('"tokensBefore":"1e400"', '"tokensBefore":1e400');
+  const appendLine = (file: string, line: string) => appendFileSync(file, `${line}\n`);
+  const lastEntryId = (file: string) => (JSON.parse(readFileSync(file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string }).id;
+  /** A terminal settles and delivers exactly once; an UNKNOWN checkpoint neither settles nor delivers. */
+  function expectSettlement(f: Awaited<ReturnType<typeof fixture>>, settles: boolean, label: string) {
+    expect(settleNativeDirective(f.deps, f.identity), label).toBe(settles);
+    expect(f.ledger.getDirective(f.identity.requestId)?.state === 'settled', label).toBe(settles);
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered']), label).toHaveLength(settles ? 1 : 0);
+  }
+  const NOT_LINKED = 'native compaction is not linked to the active checkpoint';
+  const OFF_CHAIN = 'native compaction keeps an entry off the active chain';
+  const NO_TIMESTAMP = 'native compaction lacks a timestamp';
+  const NO_SUMMARY = 'native compaction lacks a summary';
+  const BAD_TOKENS = 'native compaction token count is malformed';
+  const HOOK_AUTHORED = 'native compaction summary was authored by an extension hook';
+  const HOOK_MARKER = 'native compaction hook marker is malformed';
+  const NOT_AFTER_ROUND = 'native compaction does not follow a completed tool round';
+  const OPEN_ROUND = 'native compaction interrupts an open tool round';
+  type TurnCompaction = 'linked' | 'active-ancestor-first-kept' | 'kept-after-directive' | 'second-compaction' | 'overflow-retry' | 'length-retry' |
+    'overflow-retry-kept-failed' | 'overflow-retry-hook' | 'wrong-parent' | 'unknown-first-kept' | 'known-sibling-first-kept' | 'session-header-first-kept' | 'self-first-kept' |
+    'compaction-first-kept' | 'hook-authored' | 'hook-marker-string' | 'missing-hook-marker' | 'missing-timestamp' |
+    'blank-timestamp' | 'missing-summary' | 'blank-summary' | 'tokens-nan' | 'tokens-infinite' | 'tokens-negative' | 'tokens-string' |
+    'after-user' | 'open-tool-call' | 'mid-batch' | 'consecutive-compaction' | 'branch-control';
+  /** One directive turn with Pi's mid-run compaction after a completed tool
+   * round (or a defect in it), then the turn's own terminal. */
+  async function assertTurnCompaction(mode: TurnCompaction, refusal: string | null) {
+    const f = await fixture();
+    const headerId = (JSON.parse(readFileSync(f.file, 'utf8').split('\n')[0]!) as { id: string }).id;
+    if (mode === 'active-ancestor-first-kept' || mode === 'known-sibling-first-kept' || mode === 'session-header-first-kept') {
+      // A branched prefix: the baseline descends from active-ancestor, never from the sibling.
+      const prefixParent = { type: 'message', id: 'prefix-parent', parentId: headerId, message: { role: 'assistant', stopReason: 'stop', content: [] } };
+      const activeAncestor = { type: 'message', id: 'active-ancestor', parentId: prefixParent.id, message: { role: 'assistant', stopReason: 'stop', content: [] } };
+      const sibling = { type: 'message', id: 'sibling-first-kept', parentId: prefixParent.id, message: { role: 'assistant', stopReason: 'stop', content: [] } };
+      const baseline = { type: 'model_change', id: 'active-baseline', parentId: activeAncestor.id, provider: 'fixture', modelId: 'model' };
+      appendLine(f.file, [prefixParent, activeAncestor, sibling, baseline].map((entry) => JSON.stringify(entry)).join('\n'));
+    }
+    f.seed();
+    const user = lastEntryId(f.file);
+    if (mode === 'after-user') appendLine(f.file, piCompaction('compaction', user, user));
+    const call = f.native.append(mode === 'mid-batch' ? { ...bashCall('first'), content: [...bashCall('first').content, ...bashCall('sibling').content] } : bashCall('first'));
+    if (mode === 'open-tool-call') appendLine(f.file, piCompaction('compaction', call, user));
+    const result = f.native.append(bashResult('first', false));
+    if (mode === 'mid-batch') {
+      // Between two results of one parallel batch: the round is still open.
+      appendLine(f.file, piCompaction('compaction', result, user));
+      f.native.append(bashResult('sibling', false));
+    }
+    if (mode === 'overflow-retry' || mode === 'length-retry' || mode === 'overflow-retry-kept-failed' || mode === 'overflow-retry-hook') {
+      // Pi's compact-and-retry: the failed reply, a compaction on it, then
+      // finish() as the reply continued from that compaction. A tool call in
+      // the failed reply never ran.
+      const failed = f.native.append(mode === 'length-retry' ? { role: 'assistant', stopReason: 'length', content: [{ type: 'text', text: 'truncated' }] }
+        : { role: 'assistant', stopReason: 'error', errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum', content: bashCall('never-run').content });
+      // Pi may keep the failed reply itself in the rebuilt context.
+      appendLine(f.file, piCompaction('compaction', failed, mode === 'overflow-retry-kept-failed' ? failed : user, mode === 'overflow-retry-hook' ? { fromHook: true } : {}));
+    } else if (mode !== 'after-user' && mode !== 'open-tool-call' && mode !== 'mid-batch') {
+      const kept: Partial<Record<TurnCompaction, string>> = { 'active-ancestor-first-kept': 'active-ancestor', 'known-sibling-first-kept': 'sibling-first-kept',
+        // Kept after the directive's own user entry: its text leaves the model's
+        // context but stays in the transcript, and GC correlates effects only.
+        'kept-after-directive': call, 'unknown-first-kept': 'foreign-entry', 'session-header-first-kept': headerId, 'self-first-kept': 'compaction' };
+      const fields: Partial<Record<TurnCompaction, Record<string, unknown>>> = { 'hook-authored': { fromHook: true }, 'hook-marker-string': { fromHook: 'false' },
+        'missing-hook-marker': { fromHook: undefined },
+        'missing-timestamp': { timestamp: undefined }, 'blank-timestamp': { timestamp: ' ' }, 'missing-summary': { summary: undefined }, 'blank-summary': { summary: '\n' },
+        // JSON writes NaN as null.
+        'tokens-nan': { tokensBefore: Number.NaN }, 'tokens-infinite': { tokensBefore: '1e400' }, 'tokens-negative': { tokensBefore: -1 }, 'tokens-string': { tokensBefore: '90000' } };
+      if (mode === 'branch-control') appendLine(f.file, JSON.stringify({ type: 'branch', id: 'compaction', parentId: result }));
+      else appendLine(f.file, piCompaction('compaction', mode === 'wrong-parent' ? 'foreign-parent' : result, kept[mode] ?? user, fields[mode]));
+      if (mode === 'consecutive-compaction') appendLine(f.file, piCompaction('second-compaction', 'compaction', user));
+      if (mode === 'second-compaction' || mode === 'compaction-first-kept') {
+        const second = f.native.append(bashCall('second')); f.native.append(bashResult('second', false));
+        // Pi keeps a message; the earlier compaction is never a kept entry.
+        appendLine(f.file, piCompaction('second-compaction', lastEntryId(f.file), mode === 'second-compaction' ? second : 'compaction'));
+      }
+    }
+    f.native.finish();
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (refusal === null) expect(proof, mode).toMatchObject({ state: 'terminal', ok: true, checkpointId: lastEntryId(f.file) });
+    else expect(proof, mode).toEqual({ state: 'unknown', reason: refusal });
+    expectSettlement(f, refusal === null, mode);
+  }
+  it('P46 walks past Pi compaction linked after a completed tool round and settles the directive once', async () => {
+    for (const mode of ['linked', 'active-ancestor-first-kept', 'kept-after-directive', 'second-compaction'] as const) await assertTurnCompaction(mode, null);
+  });
+  it('P46 walks past Pi\'s overflow compact-and-retry: the failed reply is history and the retried turn settles once', async () => {
+    for (const mode of ['overflow-retry', 'length-retry', 'overflow-retry-kept-failed'] as const) await assertTurnCompaction(mode, null);
+    // A hook-authored compaction on the failed reply (which carries a tool call) is refused by its own name.
+    await assertTurnCompaction('overflow-retry-hook', HOOK_AUTHORED);
+  });
+  it('P46 refuses by name a compaction that is not Pi\'s own automatic summary, and never settles', async () => {
+    for (const [mode, reason] of [['hook-authored', HOOK_AUTHORED], ['hook-marker-string', HOOK_MARKER], ['missing-hook-marker', HOOK_MARKER],
+      ['missing-timestamp', NO_TIMESTAMP], ['blank-timestamp', NO_TIMESTAMP], ['missing-summary', NO_SUMMARY], ['blank-summary', NO_SUMMARY],
+      ['tokens-nan', BAD_TOKENS], ['tokens-infinite', BAD_TOKENS], ['tokens-negative', BAD_TOKENS], ['tokens-string', BAD_TOKENS]] as const) {
+      await assertTurnCompaction(mode, reason);
+    }
+  });
+  it('P46 refuses by name a compaction off the active chain, and never settles', async () => {
+    for (const [mode, reason] of [['wrong-parent', NOT_LINKED], ['unknown-first-kept', OFF_CHAIN], ['known-sibling-first-kept', OFF_CHAIN],
+      ['session-header-first-kept', OFF_CHAIN], ['self-first-kept', OFF_CHAIN], ['compaction-first-kept', 'native compaction keeps another compaction, not a message']] as const) {
+      await assertTurnCompaction(mode, reason);
+    }
+  });
+  it('P46 refuses by name a compaction inside an open tool round or before the first call, and never settles', async () => {
+    for (const [mode, reason] of [['after-user', NOT_AFTER_ROUND], ['open-tool-call', OPEN_ROUND], ['mid-batch', OPEN_ROUND],
+      ['consecutive-compaction', NOT_AFTER_ROUND], ['branch-control', 'native branch/control/partial checkpoint']] as const) {
+      await assertTurnCompaction(mode, reason);
+    }
+  });
+
+  it('P46 reads a turn the host lost right after Pi\'s mid-run compaction as resumable at the compaction, never settled', async () => {
+    const f = await fixture(); f.seed();
+    const user = lastEntryId(f.file);
+    f.native.append(bashCall('first'));
+    const result = f.native.append(bashResult('first', false));
+    // crash-after-compaction: Pi wrote the compaction; the next model call never started.
+    appendLine(f.file, piCompaction('compaction', result, user));
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'resumable', checkpointId: 'compaction' });
+    expectSettlement(f, false, 'crash-after-compaction');
+  });
+
+  it('P46 reads a turn the host lost between Pi\'s compaction on a failed reply and the continued reply as that failed reply, never resumed', async () => {
+    for (const calls of [false, true]) {
+      const f = await fixture(); f.seed();
+      const user = lastEntryId(f.file);
+      f.native.append(bashCall('first')); f.native.append(bashResult('first', false));
+      const overflow = 'prompt is too long: 150000 tokens > 100000 maximum';
+      const failed = f.native.append({ role: 'assistant', stopReason: 'error', errorMessage: overflow, content: calls ? bashCall('never-run').content : [] });
+      // The run ended on that error: only Pi's compaction ran after it, and
+      // continue() would reject the assistant tip. This is the failed reply's
+      // terminal, with or without tool calls: an error reply's calls never
+      // ran and owe no results (owner ruling 2026-10-22, #483).
+      appendLine(f.file, piCompaction('compaction', failed, user));
+      expect(inspectDirectiveCheckpoint(f.file, f.identity), `calls: ${String(calls)}`).toMatchObject({ state: 'terminal', ok: false, checkpointId: failed, error: overflow });
+      expectSettlement(f, false, calls ? 'lost-continued-reply-with-calls' : 'lost-continued-reply');
+    }
+  });
+
+  it('P46 admits the receipt after Pi\'s pre-prompt compaction linked on the baseline, and refuses an unlinked one by name', async () => {
+    for (const [label, fields, refusal] of [['linked', {}, null], ['no summary', { summary: undefined }, NO_SUMMARY],
+      ['wrong parent', { parentId: 'foreign-parent' }, NOT_LINKED]] as const) {
+      const f = await fixture();
+      f.native.append({ role: 'user', content: [{ type: 'text', text: 'earlier ordinary work' }] });
+      // An aborted reply is never compacted after its run, so Pi compacts before the next prompt.
+      const baseline = f.native.append({ role: 'assistant', stopReason: 'aborted', content: [] });
+      f.seed('accepted native prompt', () => appendLine(f.file, piCompaction('pre-prompt-compaction', baseline, baseline, fields)));
+      const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string; parentId: string };
+      expect(user.parentId, label).toBe('pre-prompt-compaction');
+      expect(readDirectiveBinding(f.file, f.identity.requestId)?.baseline, label).toBe(baseline);
+      if (refusal === null) expect(inspectDirectiveAdmission(f.file, f.identity), label).toMatchObject({ baseline, userEntryId: user.id });
+      else expect(() => inspectDirectiveAdmission(f.file, f.identity), label).toThrow(new DirectiveCheckpointError(refusal));
+      f.native.finish();
+      const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+      if (refusal === null) expect(proof, label).toMatchObject({ state: 'terminal', ok: true, binding: { baseline, userEntryId: user.id } });
+      else expect(proof, label).toEqual({ state: 'unknown', reason: refusal });
+      // Settlement restores admission first, so an unreadable receipt refuses it by the same name.
+      if (refusal === null) expectSettlement(f, true, label);
+      else {
+        expect(() => settleNativeDirective(f.deps, f.identity), label).toThrow(new DirectiveCheckpointError(refusal));
+        expect(f.ledger.getDirective(f.identity.requestId)?.state, label).not.toBe('settled');
+        expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered']), label).toHaveLength(0);
+      }
+    }
+  });
+
+  /** A later request bound on the same session after the original's terminal.
+   * `nativeOnly`: the original is still live in the ledger, which admits no
+   * second request; the native association alone binds the later prompt, and
+   * that is all checkpoint readback consults. */
+  function bindLaterRequest(f: Awaited<ReturnType<typeof fixture>>, beforeReceipt?: () => void, nativeOnly = false): DirectiveTurnIdentity {
+    const identity = nativeOnly ? { ...f.identity, requestId: 'later-bound-native-turn', payloadHash: 'b'.repeat(64) }
+      : f.ledger.directiveTurnIdentity(f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId: 'later-bound-native-turn', directive: 'separate accepted turn', holder: 'gru' }).record.requestId);
+    if (!nativeOnly) f.ledger.prepareDirectiveTarget(identity.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
+      sessionFile: f.file, text: 'separate accepted turn', authorityManifest: 'separate accepted fixture authority' });
+    beforeReceipt?.();
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'separate accepted turn' }] });
+    const admitted = inspectDirectiveAdmission(f.file, identity);
+    if (!nativeOnly) f.ledger.bindDirectiveNativeAdmission(admitted);
+    return identity;
+  }
+  /** Pi's post-run compaction follows the directive's final assistant (#481):
+   * lookahead after the terminal, alone or before a later prompt. */
+  async function assertPostRunCompaction(tail: 'alone' | 'hook-authored' | 'unbound-user' | 'bound-after-compaction' | 'bound-before-compaction' |
+    'bound-after-control-compaction' | 'hook-after-control' | 'malformed-after-control' | 'compaction-after-compaction') {
+    const f = await fixture(); f.seed();
+    const user = lastEntryId(f.file);
+    f.native.finish();
+    const terminal = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (terminal.state !== 'terminal' || !terminal.ok) throw new Error('fixture must contain a real successful terminal assistant');
+    const compaction = (fields?: Record<string, unknown>) => appendLine(f.file, piCompaction('post-run-compaction', terminal.checkpointId, user, fields));
+    if (tail === 'bound-before-compaction') {
+      // The compaction is the later request's own pre-prompt compaction: its binding's baseline is the original terminal.
+      expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+      const later = bindLaterRequest(f, () => compaction());
+      expect(readDirectiveBinding(f.file, later.requestId)?.baseline).toBe(terminal.checkpointId);
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(terminal);
+      expect(inspectDirectiveCheckpoint(f.file, later)).toMatchObject({ state: 'resumable', binding: { baseline: terminal.checkpointId } });
+      return;
+    }
+    if (tail === 'bound-after-control-compaction') {
+      // A later prompt's model change, then that prompt's own pre-prompt compaction on it.
+      expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+      appendLine(f.file, JSON.stringify({ type: 'model_change', id: 'later-model-control', parentId: terminal.checkpointId, provider: 'fixture', modelId: 'later-model' }));
+      const later = bindLaterRequest(f, () => appendLine(f.file, piCompaction('later-compaction', 'later-model-control', terminal.checkpointId)));
+      expect(readDirectiveBinding(f.file, later.requestId)?.baseline).toBe('later-model-control');
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(terminal);
+      expect(inspectDirectiveCheckpoint(f.file, later)).toMatchObject({ state: 'resumable', binding: { baseline: 'later-model-control' } });
+      return;
+    }
+    if (tail === 'hook-after-control' || tail === 'malformed-after-control' || tail === 'compaction-after-compaction') {
+      // A later prompt's own controls, then a compaction Pi never writes there, then that bound prompt.
+      if (tail === 'compaction-after-compaction') compaction();
+      else appendLine(f.file, JSON.stringify({ type: 'thinking_level_change', id: 'later-thinking-control', parentId: terminal.checkpointId, thinkingLevel: 'high' }));
+      const tip = lastEntryId(f.file);
+      appendLine(f.file, piCompaction('later-compaction', tip, user, tail === 'hook-after-control' ? { fromHook: true } : tail === 'malformed-after-control' ? { summary: undefined } : {}));
+      const later = bindLaterRequest(f, undefined, true);
+      expect(readDirectiveBinding(f.file, later.requestId)).toMatchObject({ baseline: 'later-compaction', userEntryId: lastEntryId(f.file) });
+      const reason = { 'hook-after-control': HOOK_AUTHORED, 'malformed-after-control': NO_SUMMARY, 'compaction-after-compaction': 'native compaction follows another compaction' }[tail];
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason });
+      expectSettlement(f, false, tail);
+      return;
+    }
+    compaction(tail === 'hook-authored' ? { fromHook: true } : {});
+    if (tail === 'alone') {
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(terminal);
+      expectSettlement(f, true, tail);
+      expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)?.payload)
+        .toMatchObject({ native_completion: { checkpoint_id: terminal.checkpointId } });
+    } else if (tail === 'hook-authored') {
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: HOOK_AUTHORED });
+      expectSettlement(f, false, tail);
+    } else if (tail === 'unbound-user') {
+      // The same shape as bound-after-compaction; only the later prompt's own durable admission differs.
+      f.native.append({ role: 'user', content: [{ type: 'text', text: 'unbound later prompt' }] });
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+      expectSettlement(f, false, tail);
+    } else {
+      expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+      const later = bindLaterRequest(f);
+      expect(readDirectiveBinding(f.file, later.requestId)?.baseline).toBe('post-run-compaction');
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(terminal);
+      expect(inspectDirectiveCheckpoint(f.file, later)).toMatchObject({ state: 'resumable', binding: { baseline: 'post-run-compaction' } });
+    }
+  }
+  it('P46 reads Pi\'s post-run compaction after the terminal as lookahead: the original completion settles once', () => assertPostRunCompaction('alone'));
+  it('P46 refuses by name a hook-authored compaction after the terminal, and never settles', () => assertPostRunCompaction('hook-authored'));
+  it('P46 refuses an unbound user turn after a valid post-run compaction', () => assertPostRunCompaction('unbound-user'));
+  it('P46 keeps the original completion readable when a later request binds after its post-run compaction', () => assertPostRunCompaction('bound-after-compaction'));
+  it('P46 keeps the original completion readable when a later request binds before its own pre-prompt compaction', () => assertPostRunCompaction('bound-before-compaction'));
+  it('P46 keeps the original completion readable through a later model change and that prompt\'s pre-prompt compaction', () => assertPostRunCompaction('bound-after-control-compaction'));
+  it('P46 refuses by name a hook-authored compaction after a later prompt\'s control, and never settles', () => assertPostRunCompaction('hook-after-control'));
+  it('P46 refuses by name a malformed compaction after a later prompt\'s control, and never settles', () => assertPostRunCompaction('malformed-after-control'));
+  it('P46 refuses by name a compaction on another compaction after the terminal, and never settles', () => assertPostRunCompaction('compaction-after-compaction'));
 
   it('keeps an exact completed checkpoint readable after a later distinct request is durably admitted on the same session', async () => {
     const f = await fixture(); f.seed(); f.native.finish();

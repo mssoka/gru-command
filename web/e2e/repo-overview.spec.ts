@@ -75,6 +75,7 @@ function overview(): RepoOverviewView {
     key: 'demo',
     displayName: 'demo',
     linked: true,
+    provider: 'github',
     host: 'github.com',
     link: 'https://github.com/example/demo',
     linkReason: null,
@@ -124,8 +125,8 @@ function overview(): RepoOverviewView {
         // The exact server absence shape: no provider strings at all.
         run: run({ state: 'no-workflow', status: null, conclusion: null, workflow: null, url: null }),
       }),
-      row({ key: 'demo-lab', displayName: 'demo-lab', linked: false, host: null, link: null, linkReason: 'non-GitHub remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
-      row({ key: 'demo-lab-2', displayName: 'demo-lab-2', linked: false, host: null, link: null, linkReason: 'no usable origin remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
+      row({ key: 'demo-lab', displayName: 'demo-lab', linked: false, provider: null, host: null, link: null, linkReason: 'unsupported code host', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
+      row({ key: 'demo-lab-2', displayName: 'demo-lab-2', linked: false, provider: null, host: null, link: null, linkReason: 'no usable origin remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
       row({
         key: 'demo-long-name-with-an-unbreakable-token-abcdefghijklmnopqrstuvwxyz-0123456789',
         displayName: 'demo-long-name-with-an-unbreakable-token-abcdefghijklmnopqrstuvwxyz-0123456789',
@@ -139,6 +140,27 @@ function overview(): RepoOverviewView {
         openPrs: 0,
         openIssues: 0,
         run: run({ state: 'never-run', status: null, conclusion: null, workflow: null, url: null }),
+      }),
+      // A GitLab row (#480): nested groups, exact MR/issue counts and the
+      // newest default-branch pipeline, worded in GitLab's own terms.
+      row({
+        key: 'demo-gitlab',
+        displayName: 'demo-gitlab',
+        provider: 'gitlab',
+        host: 'gitlab.example.com',
+        link: 'https://gitlab.example.com/group/sub/demo-gitlab',
+        fullName: 'group/sub/demo-gitlab',
+        openPrs: 7,
+        openIssues: 0,
+        run: run({
+          state: 'failed',
+          status: 'failed',
+          conclusion: null,
+          workflow: null,
+          runNumber: 314,
+          url: 'https://gitlab.example.com/group/sub/demo-gitlab/-/pipelines/9001',
+          runStartedAt: null,
+        }),
       }),
     ],
   };
@@ -211,7 +233,7 @@ async function pairAndSeed(page: Page): Promise<{ push: (snapshot: BoardSnapshot
   await page.locator('#pair-token').fill(MOCK_TOKEN);
   await page.locator('#pair-submit').click();
   await expect(page.locator('#board-view')).toBeVisible();
-  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(14);
   // Read-only surface: nothing here ever talks to GitHub from the browser,
   // and the seed never issues a mutating API call.
   const github = requests.filter((url) => /github\.com/u.test(url));
@@ -253,6 +275,7 @@ const STATES = [
   'NOT LINKED',
   'PASSED',
   'NO RUNS',
+  'FAILED',
 ] as const;
 
 test('compact rows: states, exact counts, safe links, light/dark desktop and narrow', async ({ page }) => {
@@ -307,9 +330,31 @@ test('compact rows: states, exact counts, safe links, light/dark desktop and nar
   }
   // The unlinked rows render their name as text, not as a link.
   expect(await page.locator('#board-repos .repo-row').nth(9).locator('a.repo-row__name').count()).toBe(0);
-  expect(await page.locator('#board-repos .repo-row').nth(9).locator('.repo-row__note').textContent()).toContain(
-    'non-GitHub remote',
+  expect(await page.locator('#board-repos .repo-row').nth(9).locator('.repo-row__note').textContent()).toBe(
+    'Not linked (unsupported code host) — no repository data is fetched.',
   );
+
+  // The GitLab row speaks merge requests and pipelines and links to its
+  // own host; nothing on it says GitHub, Actions or PRs.
+  const gitlab = page.locator('#board-repos .repo-row').nth(13);
+  await expect(gitlab.locator('a.repo-row__name')).toHaveAttribute('href', 'https://gitlab.example.com/group/sub/demo-gitlab');
+  await expect(gitlab.locator('a.repo-row__name')).toHaveAttribute('title', 'group/sub/demo-gitlab on GitLab');
+  await expect(gitlab.locator('.repo-row__metric-count')).toHaveText(['7', '0']);
+  await expect(gitlab.locator('.repo-row__metric-label')).toHaveText(['OPEN MRs', 'OPEN issues excl. MRs']);
+  await expect(gitlab.locator('.repo-row__ci-link')).toHaveText('pipeline #314');
+  await expect(gitlab.locator('.repo-row__ci-link')).toHaveAttribute(
+    'href',
+    'https://gitlab.example.com/group/sub/demo-gitlab/-/pipelines/9001',
+  );
+  const gitlabText = await gitlab.evaluate((node) =>
+    [
+      node.textContent ?? '',
+      node.getAttribute('aria-label') ?? '',
+      ...[...node.querySelectorAll('[title]')].map((titled) => titled.getAttribute('title') ?? ''),
+    ].join('\n'),
+  );
+  expect(gitlabText).not.toMatch(/GitHub|Actions|PRs|pull request/u);
+  await expect(page.locator('.repo-overview__sub')).toHaveText('CI = default-branch only · not deployment health');
 
   // Independent scroll regions: the crew list and the repository list each
   // bound and scroll on their own; the rail keeps its own overflow.
@@ -350,7 +395,7 @@ test('compact rows: states, exact counts, safe links, light/dark desktop and nar
     await page.locator('#theme-toggle').click();
   }
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(14);
   // Close the mobile chat sheet if pairing opened it: the capture must show
   // the module, not an overlay (closing the sheet is a local UI toggle).
   if ((await page.locator('#chat-sheet').getAttribute('data-open')) === 'true') {
@@ -393,7 +438,7 @@ test('the overview follows the CREW tab and never leaks into TRANSCRIPTS', async
 test('a live push replaces the overview rows without duplicating them', async ({ page }) => {
   const seed = await pairAndSeed(page);
   await page.setViewportSize({ width: 1280, height: 900 });
-  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(14);
   const reduced: BoardSnapshot = { ...seededSnapshot(), repoOverview: { rows: overview().rows.slice(0, 2) } };
   seed.push(reduced);
   await expect(page.locator('#board-repos .repo-row')).toHaveCount(2);
@@ -403,7 +448,7 @@ test('a live push replaces the overview rows without duplicating them', async ({
 test('a snapshot without the overview (absent or null) keeps the module hidden', async ({ page }) => {
   const seed = await pairAndSeed(page);
   await page.setViewportSize({ width: 1280, height: 900 });
-  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(14);
 
   // Pre-upgrade/not-yet-refreshed servers omit the field entirely; a
   // null field means the same. Both must leave the section invisible.
@@ -417,7 +462,7 @@ test('a snapshot without the overview (absent or null) keeps the module hidden',
 
   // And a real overview brings the module back on the same socket.
   seed.push(seededSnapshot());
-  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(14);
 });
 
 test('a snapshot push restores focus without stealing the list scroll position', async ({ page }) => {
@@ -437,7 +482,7 @@ test('a snapshot push restores focus without stealing the list scroll position',
   // Keep the list scrollable (the same row count) so the assertion proves
   // the restoration, not a scroll-height clamp.
   seed.push({ ...seededSnapshot(), repoOverview: { rows: overview().rows } });
-  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(14);
   expect(await list.evaluate((node) => node.scrollTop)).toBe(before);
   const focusStayedOnLink = await page.evaluate(
     () => document.activeElement?.className?.includes('repo-row__name') ?? false,
