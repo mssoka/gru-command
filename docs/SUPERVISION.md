@@ -106,7 +106,9 @@ of four places:
 - **compact-and-retry:** an error reply, or a length reply without tool
   calls, a compaction linked on it, and a reply continued from that
   compaction. The failed reply is history: an error reply's tool calls
-  never ran. A length reply holding calls is never compacted and retried:
+  never ran, and it may hold only text, thinking and tool calls, as an
+  auto-retried one must; anything else is refused by name. A length reply
+  holding calls is never compacted and retried:
   Pi answers its calls with its own "not executed" results and goes on
   ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md) lists what Pi does with
   each stop's calls). A turn lost between that compaction and the continued

@@ -345,11 +345,13 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
  * compaction linked on it, and a reply continued from that compaction
  * (`agent.continue()`, no prompt). The failed reply ran no tool: an error
  * reply's tool calls never executed (see rowCalls) and are inert history,
- * never pending. A length reply holding calls is never compacted and
- * retried: the SDK answers its calls and goes on. `after(1)` and `after(2)`
- * are the entries that follow `reply`, read only for such a reply. Returns
- * that compaction; the named refusal when the compaction on such a reply is
- * not Pi's; null when nothing continued `reply`. */
+ * never pending. An error reply is history under the same content rule as
+ * an auto-retried one (validRetryErrorContent). A length reply holding calls
+ * is never compacted and retried: the SDK answers its calls and goes on.
+ * `after(1)` and `after(2)` are the entries that follow `reply`, read only
+ * for such a reply. Returns that compaction; the named refusal when the
+ * compaction on such a reply is not Pi's, or the error reply it continued
+ * holds content that is not history; null when nothing continued `reply`. */
 function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
   const stop = reply.message?.stopReason;
   if (reply.message?.role !== 'assistant' || !(stop === 'error' || stop === 'length' && !holdsToolCalls(reply.message))) return null;
@@ -359,6 +361,7 @@ function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) =>
   if (refusal !== null) return refusal;
   const retried = after(2);
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
+  if (stop === 'error' && !validRetryErrorContent(reply.message.content)) return 'native compaction retries an error row holding content that is not history';
   return compaction;
 }
 /** The level Pi's session records in a thinking_level_change: what

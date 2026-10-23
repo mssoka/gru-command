@@ -471,6 +471,15 @@ describe('Pi retry history beside compact-and-retry (#483, #481)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
   });
 
+  it('an error row holding content that is not history is refused by name when Pi compacted and retried it, as under auto-retry', () => {
+    const { file } = retryScene([signedContent[1], { type: 'serverToolUse', id: 'server-call', name: 'web_search' }]);
+    appendCompaction(file, 'retry-compaction', 'retry-error');
+    entry(file, 'invocation', 'retry-compaction', invocation);
+    const refusal = 'native compaction retries an error row holding content that is not history';
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: refusal });
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(new DirectiveCheckpointError(refusal));
+  });
+
   it('a compact-and-retry lost before the continued reply, whose failed reply holds calls, reads that failed terminal', () => {
     const { file } = retryScene([signedContent[1], partialCall]);
     appendCompaction(file, 'retry-compaction', 'retry-error');
