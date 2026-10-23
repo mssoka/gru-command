@@ -89,7 +89,7 @@ export async function openPullRequestsForBranch(
   input: { readonly repoPath: string; readonly remote: RepoRef | null; readonly branch: string },
 ): Promise<readonly GhPull[]> {
   if (input.remote === null || !isGitHubRemote(input.remote.host)) {
-    throw new Error(`no GitHub remote resolves for lane "${input.repoPath}"`);
+    throw new GhApiError(`no GitHub remote resolves for lane "${input.repoPath}"`);
   }
   return api.listPullsForHead({ repo: input.remote, head: input.branch });
 }

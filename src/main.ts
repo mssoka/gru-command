@@ -17,7 +17,7 @@ import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
 import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
-import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
+import { createServiceReviewWave, liveReviewSessionIds, publicationPrLookup } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
 import { bindSupervisorNotificationDisposition } from './supervision/notification-disposition.js';
@@ -49,7 +49,7 @@ import {
   type NativeContextPort,
 } from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
-import { GhCliApi, GitHubSignalPoll, openPullRequestsForBranch, type LaneRemoteResolver } from './dispatch/github-poll.js';
+import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GitLabRepoOverviewApi } from './repos/gitlab-overview.js';
 import { GhRepoOverviewApi } from './repos/overview.js';
 import { DefaultBranchCiWatch } from './repos/default-branch-ci.js';
@@ -1346,9 +1346,7 @@ async function main(): Promise<number> {
     poster: createStartupVerdictPoster(config),
     // A conclusive review whose lane opened a PR but never registered it
     // finds that PR at publication instead of aborting `no_pr_link`.
-    findOpenPullRequests: ({ repoPath, branch }) =>
-      openPullRequestsForBranch(new GhCliApi(), { repoPath, remote: repoRemote(repoPath), branch }),
-    recordPr: (jobId, url) => { dispatcher.recordPr(jobId, url); },
+    ...publicationPrLookup({ gh: new GhCliApi(), resolveRemote: (repoPath) => repoRemote(repoPath), dispatch: dispatcher }),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     reconcileReviewAgent: async (agentId, marker) => registry.reviewOwnerCeased(agentId, marker),
     proveReviewHostExit: (proofInput) => registry.proveReviewHostExit(proofInput),

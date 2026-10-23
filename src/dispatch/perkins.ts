@@ -1859,11 +1859,12 @@ export interface WaveRunnerOptions {
   /** Open pull requests on a lane branch (production: the GitHub pulls API,
    * filtered by head branch). Asked only when a conclusive review reaches
    * publication and its job has no PR link, so the review is not thrown
-   * away for a PR the lane opened but never registered. Absent = no lookup:
-   * the round aborts `no_pr_link` as before. */
+   * away for a PR the lane opened but never registered. Absent = no lookup;
+   * a link registered in the ledger during the review is still used. */
   readonly findOpenPullRequests?: (input: { readonly repoPath: string; readonly branch: string }) => Promise<readonly OpenPullRequest[]>;
   /** Links a discovered PR to its job — the function POST /api/dispatch/pr
-   * calls. Required alongside {@link findOpenPullRequests}. */
+   * calls. Supplied together with {@link findOpenPullRequests} or not at
+   * all (the constructor refuses one without the other). */
   readonly recordPr?: (jobId: string, url: string) => void;
   readonly escalate?: (title: string, detail: string, context?: EscalationContext) => void;
   /** FYI channel, never action-required: an automatic admission retry was
@@ -2418,6 +2419,11 @@ export class WaveRunner {
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    if ((opts.findOpenPullRequests === undefined) !== (opts.recordPr === undefined)) {
+      throw new Error(
+        `WaveRunner: findOpenPullRequests and recordPr are supplied together or not at all (got only ${opts.findOpenPullRequests === undefined ? 'recordPr' : 'findOpenPullRequests'})`,
+      );
+    }
     const delays = opts.admissionRetryDelaysMs ?? ADMISSION_RETRY_DELAYS_MS;
     if (delays.some((delay) => !Number.isSafeInteger(delay) || delay < 0 || delay > MAX_TIMER_MS)) {
       throw new Error(`admissionRetryDelaysMs must be whole milliseconds from 0 to ${MAX_TIMER_MS}, got [${delays.join(', ')}]`);
@@ -3007,13 +3013,24 @@ export class WaveRunner {
     if (lane === null || branch === null || branch.trim() === '') {
       return { url: null, note: 'the job has no lane branch to look up an open pull request for' };
     }
-    let pulls: readonly OpenPullRequest[];
+    // The lookup never holds an aborting round: the race settles on the
+    // abort, and a late lookup result or failure is dropped.
+    let onAbort = (): void => {};
+    const aborted = new Promise<null>((resolve) => {
+      onAbort = () => resolve(null);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const lookup = (async () => find({ repoPath: lane.path, branch }))();
+    lookup.catch(() => {});
+    let pulls: readonly OpenPullRequest[] | null;
     try {
-      pulls = await find({ repoPath: lane.path, branch });
+      pulls = signal.aborted ? null : await Promise.race([lookup, aborted]);
     } catch (error) {
       return { url: null, note: `looking up open pull requests for branch ${branch} failed: ${sanitizeErrorLog(error)}` };
+    } finally {
+      signal.removeEventListener('abort', onAbort);
     }
-    if (signal.aborted) return { url: null, note: 'the review was aborted during the open pull request lookup' };
+    if (pulls === null || signal.aborted) return { url: null, note: 'the review was aborted during the open pull request lookup' };
     const open = pulls.filter((pull) => pull.state === 'open' && pull.url !== null);
     const matching = open.filter((pull) => pull.headSha === targetSha);
     if (matching.length !== 1) {
@@ -7201,11 +7218,15 @@ export class WaveRunner {
       deliveryFailureKind = 'no_pr_link';
       const noLink = `the job has no pull request link; a conclusive review cannot be published${prLink.note === null ? '' : ` (${prLink.note})`}`;
       deliveryError = new Error(noLink);
-      this.escalate(
-        `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
-        noLink,
-        { jobId: round.jobId, roundId: round.id },
-      );
+      // An aborted round is reported by its abort (a shutdown records the
+      // restart's clean abort), never as a missing PR the owner must fix.
+      if (!signal.aborted) {
+        this.escalate(
+          `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
+          `${noLink}; link the PR with POST /api/dispatch/pr, then re-arm the review`,
+          { jobId: round.jobId, roundId: round.id },
+        );
+      }
     } else if (canonical !== 'INCOMPLETE' && linkedPrUrl !== null) {
       deliveryError = new Error('the PR poster is unavailable');
       this.escalate(

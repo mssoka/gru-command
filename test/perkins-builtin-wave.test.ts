@@ -159,7 +159,8 @@ function waveFor(lane: Awaited<ReturnType<typeof verificationHistoryLane>>): Wav
 
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
-import type { AgentSpawner } from '../src/dispatch/service.js';
+import { DispatchService, type AgentSpawner } from '../src/dispatch/service.js';
+import { publicationPrLookup } from '../src/dispatch/service-review-wave.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -6654,6 +6655,7 @@ describe('WaveRunner request guards', () => {
     readonly target: string;
     readonly branch: string;
     readonly lanePath: string;
+    readonly port: GitReviewPort;
     readonly escalations: string[];
     readonly poster: VerdictPoster & { readonly post: ReturnType<typeof vi.fn> };
     readonly wave: (extra: Partial<ConstructorParameters<typeof WaveRunner>[0]>) => WaveRunner;
@@ -6690,7 +6692,7 @@ describe('WaveRunner request guards', () => {
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       ...extra,
     });
-    return { ledger, job, target, branch, lanePath: lane.path, escalations, poster, wave };
+    return { ledger, job, target, branch, lanePath: lane.path, port, escalations, poster, wave };
   }
 
   it('publishes a conclusive review to the one open PR at the reviewed head when the lane never registered it (#488)', async () => {
@@ -6712,6 +6714,7 @@ describe('WaveRunner request guards', () => {
     expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')?.payload)
       .toEqual({ url, branch: lane.branch, targetSha: lane.target });
     expect(lane.poster.post).toHaveBeenCalledTimes(1);
+    expect(lane.poster.post).toHaveBeenCalledWith(expect.objectContaining({ prUrl: url, targetSha: lane.target }));
     expect(lane.escalations.some((line) => line.includes('NO pull request'))).toBe(false);
   });
 
@@ -6730,7 +6733,122 @@ describe('WaveRunner request guards', () => {
     expect(outcome.round.status).toBe('verdict-posted');
     expect(findOpenPullRequests).not.toHaveBeenCalled();
     expect(lane.poster.post).toHaveBeenCalledTimes(1);
+    expect(lane.poster.post).toHaveBeenCalledWith(expect.objectContaining({ prUrl: url }));
     expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')).toBeNull();
+  });
+
+  it('never looks up a PR for a job linked when its round started (#488)', async () => {
+    const lane = await unlinkedPublicationLane('linked-at-start');
+    const url = 'https://github.com/acme/fixture/pull/12';
+    lane.ledger.setJobPr(lane.job.id, url);
+    const findOpenPullRequests = vi.fn(async () => []);
+    const outcome = asWave(await lane.wave({ findOpenPullRequests, recordPr: vi.fn() }).runRound({ jobId: lane.job.id }));
+    expect(outcome.posted).toBe(true);
+    expect(findOpenPullRequests).not.toHaveBeenCalled();
+    expect(lane.poster.post).toHaveBeenCalledWith(expect.objectContaining({ prUrl: url }));
+  });
+
+  it('a link registered during the lookup wins: it is published to and never overwritten (#488)', async () => {
+    const lane = await unlinkedPublicationLane('linked-during-lookup');
+    const registered = 'https://github.com/acme/fixture/pull/900';
+    const recordPr = vi.fn();
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests: async () => {
+        lane.ledger.setJobPr(lane.job.id, registered);
+        return [{ url: 'https://github.com/acme/fixture/pull/901', headSha: lane.target, state: 'open' }];
+      },
+      recordPr,
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.posted).toBe(true);
+    expect(recordPr).not.toHaveBeenCalled();
+    expect(lane.ledger.getJob(lane.job.id)?.prUrl).toBe(registered);
+    expect(lane.poster.post).toHaveBeenCalledWith(expect.objectContaining({ prUrl: registered }));
+    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')).toBeNull();
+  });
+
+  it('two open PRs at the reviewed head are ambiguous: no_pr_link, nothing linked (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-two-prs');
+    const recordPr = vi.fn();
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests: async () => [
+        { url: 'https://github.com/acme/fixture/pull/3', headSha: lane.target, state: 'open' },
+        { url: 'https://github.com/acme/fixture/pull/4', headSha: lane.target, state: 'open' },
+      ],
+      recordPr,
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.round.status).toBe('aborted');
+    expect((lane.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string }).reason)
+      .toBe('no_pr_link');
+    expect(recordPr).not.toHaveBeenCalled();
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.escalations.some((line) =>
+      line.includes(`2 of the 2 open pull request(s) for branch ${lane.branch} have the reviewed head ${lane.target}`))).toBe(true);
+  });
+
+  it('a failed link keeps no_pr_link and names the failure (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-link-fails');
+    const url = 'https://github.com/acme/fixture/pull/5';
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests: async () => [{ url, headSha: lane.target, state: 'open' }],
+      recordPr: () => { throw new Error('job is binned'); },
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.round.status).toBe('aborted');
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')).toBeNull();
+    expect(lane.escalations.some((line) =>
+      line.includes(`linking the open pull request ${url} failed: Error: job is binned`))).toBe(true);
+  });
+
+  it('a shutdown during the lookup ends the round as the restart abort, not a missing PR (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-shutdown');
+    let lookupStarted!: () => void;
+    const started = new Promise<void>((resolve) => { lookupStarted = resolve; });
+    const recordPr = vi.fn();
+    const wave = lane.wave({
+      // A lookup that never answers: only the abort race lets the round end.
+      findOpenPullRequests: () => { lookupStarted(); return new Promise(() => {}); },
+      recordPr,
+    });
+    const running = wave.runRound({ jobId: lane.job.id });
+    await started;
+    await wave.shutdown();
+    const outcome = asWave(await running);
+    expect(outcome.round.status).toBe('aborted');
+    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload)
+      .toMatchObject({ reason: 'service_restart', deliveryFailure: 'no_pr_link' });
+    expect(recordPr).not.toHaveBeenCalled();
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.escalations.some((line) => line.includes('NO pull request'))).toBe(false);
+  });
+
+  it('refuses a PR finder without its linker, and the reverse (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-miswired');
+    expect(() => lane.wave({ findOpenPullRequests: async () => [] }))
+      .toThrow('WaveRunner: findOpenPullRequests and recordPr are supplied together or not at all (got only findOpenPullRequests)');
+    expect(() => lane.wave({ recordPr: () => {} }))
+      .toThrow('WaveRunner: findOpenPullRequests and recordPr are supplied together or not at all (got only recordPr)');
+  });
+
+  it('the service wiring links through the dispatcher and publishes (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-service-wiring');
+    const url = 'https://github.com/acme/fixture/pull/776';
+    const remote = { host: 'github.com', owner: 'acme', repo: 'fixture' };
+    const listPullsForHead = vi.fn(async () => [{
+      number: 776, headRef: lane.branch, headSha: lane.target, state: 'open',
+      merged: false, mergeableState: null, mergeCommitSha: null, url,
+    }]);
+    const dispatch = new DispatchService({
+      ledger: lane.ledger, worktrees: lane.port, spawner: async () => { throw new Error('no agent is spawned here'); },
+    });
+    const outcome = asWave(await lane.wave(publicationPrLookup({
+      gh: { listPullsForHead }, resolveRemote: () => remote, dispatch,
+    })).runRound({ jobId: lane.job.id }));
+    expect(outcome.posted).toBe(true);
+    expect(listPullsForHead).toHaveBeenCalledWith({ repo: remote, head: lane.branch });
+    // The dispatcher's own link record, as POST /api/dispatch/pr writes it.
+    expect(lane.ledger.latestJobEvent(lane.job.id, 'job.pr-linked')?.payload).toEqual({ url });
+    expect(lane.ledger.getJob(lane.job.id)?.prUrl).toBe(url);
+    expect(lane.poster.post).toHaveBeenCalledWith(expect.objectContaining({ prUrl: url }));
   });
 
   it('keeps no_pr_link when no open PR is at the reviewed head, naming what the lookup found (#488)', async () => {
@@ -6751,16 +6869,21 @@ describe('WaveRunner request guards', () => {
     expect(lane.poster.post).not.toHaveBeenCalled();
     expect(lane.ledger.getJob(lane.job.id)?.prUrl).toBeNull();
     expect(lane.escalations.some((line) => line.includes('NO pull request to publish to') &&
-      line.includes(`0 of the 1 open pull request(s) for branch ${lane.branch} have the reviewed head ${lane.target}`))).toBe(true);
+      line.includes(`0 of the 1 open pull request(s) for branch ${lane.branch} have the reviewed head ${lane.target}`) &&
+      line.includes('link the PR with POST /api/dispatch/pr, then re-arm the review'))).toBe(true);
   });
 
   it('keeps no_pr_link when the open PR lookup fails, and says so (#488)', async () => {
     const lane = await unlinkedPublicationLane('unlinked-lookup-fails');
+    const recordPr = vi.fn();
     const outcome = asWave(await lane.wave({
       findOpenPullRequests: async () => { throw new Error('gh: not logged in'); },
-      recordPr: vi.fn(),
+      recordPr,
     }).runRound({ jobId: lane.job.id }));
     expect(outcome.round.status).toBe('aborted');
+    expect((lane.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string }).reason)
+      .toBe('no_pr_link');
+    expect(recordPr).not.toHaveBeenCalled();
     expect(lane.poster.post).not.toHaveBeenCalled();
     expect(lane.escalations.some((line) => line.includes('NO pull request to publish to') &&
       line.includes(`looking up open pull requests for branch ${lane.branch} failed: Error: gh: not logged in`))).toBe(true);

@@ -394,7 +394,9 @@ whose head is the job lane's branch. Exactly one at the reviewed head is
 linked to the job (`round.pr-discovered`) and receives the review. Anything
 else — none, several, a different head, a non-GitHub origin or a failed
 lookup — aborts the round `no_pr_link`, and the escalation names what the
-lookup found.
+lookup found and the next step (link the PR, then re-arm). A shutdown during
+the lookup ends the round as the restart's clean abort, never as a missing
+PR.
 
 Beside the four route-deciding legs, the same pass evaluates the
 **non-blocking advisory leg `verdict-publication-identity`** (issue #444):
