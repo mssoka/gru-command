@@ -308,6 +308,7 @@ describe('board server — HTTP API', () => {
           key: 'alpha',
           displayName: 'alpha',
           linked: true,
+          provider: 'github',
           host: 'github.com',
           link: 'https://github.com/acme/alpha',
           linkReason: null,
