@@ -1344,9 +1344,8 @@ export class PiAgentHandle implements AgentHandle {
     throw error;
   }
 
-  private isNativeDirectiveRefusal(detail: string, directive: PromptOptions['directive']): boolean {
-    const refusal = this.nativeDirectiveRefusal;
-    return directive !== undefined && refusal !== null && (detail.includes(refusal.message) || detail.includes(String(refusal)));
+  private isNativeDirectiveRefusal(directive: PromptOptions['directive']): boolean {
+    return directive !== undefined && this.nativeDirectiveRefusal !== null && this.liveDirective === directive;
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -1858,7 +1857,7 @@ export class PiAgentHandle implements AgentHandle {
             type: 'error',
             error: errorText,
             fatal: false,
-            ...(typed === null && this.isNativeDirectiveRefusal(errorText, directive) ? { nativeControl: 'directive-refusal' as const } : {}),
+            ...(typed === null && this.isNativeDirectiveRefusal(directive) ? { nativeControl: 'directive-refusal' as const } : {}),
             ...(typed !== null && this.session.model !== undefined
               ? { provider: this.session.model.provider, model: this.session.model.id }
               : {}),
@@ -2139,7 +2138,7 @@ export class PiAgentHandle implements AgentHandle {
               type: 'error',
               error: detail,
               fatal: false,
-              ...(typed === null && this.isNativeDirectiveRefusal(detail, this.liveDirective) ? { nativeControl: 'directive-refusal' as const } : {}),
+              ...(typed === null && this.isNativeDirectiveRefusal(this.liveDirective) ? { nativeControl: 'directive-refusal' as const } : {}),
               ...(typeof msg['provider'] === 'string'
                 ? { provider: msg['provider'] }
                 : this.session.model !== undefined
