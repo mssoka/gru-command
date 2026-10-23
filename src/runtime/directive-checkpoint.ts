@@ -43,10 +43,26 @@ export class DirectiveCheckpointError extends Error {
 }
 
 /** A native directive refusal (#485): a DirectiveCheckpointError GC raised
- * itself, or GC's wrapper whose own cause is one. A wrapper around a plain
- * error (a ledger fault, a Pi extension's throw) is no refusal. */
+ * over its own state, or GC's wrapper whose own cause is one. A wrapper
+ * names its cause even when that is null or undefined; one around an error
+ * from code GC does not own (an extension hook, the SDK, the provider) is no
+ * refusal. */
 export function isNativeDirectiveRefusal(error: unknown): error is DirectiveCheckpointError {
-  return error instanceof DirectiveCheckpointError && (error.cause === undefined || isNativeDirectiveRefusal(error.cause));
+  return error instanceof DirectiveCheckpointError && (!Object.hasOwn(error, 'cause') || isNativeDirectiveRefusal(error.cause));
+}
+
+/** A fault in GC's own transcript, binding or receipt I/O is GC's refusal
+ * (#485). It keeps the fault's text and names no cause, so supervision never
+ * routes the disk's words ("EDQUOT: disk quota exceeded" reads as a quota
+ * wall). A refusal passes through as itself. */
+export function ownIoRefusal(what: string, error: unknown): DirectiveCheckpointError {
+  if (error instanceof DirectiveCheckpointError) return error;
+  return new DirectiveCheckpointError(`${what} failed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+/** Runs GC's own directive I/O; a fault there is GC's refusal (see ownIoRefusal). */
+export function withOwnIo<T>(what: string, run: () => T): T {
+  try { return run(); } catch (error) { throw ownIoRefusal(what, error); }
 }
 /** Bounds a directive's own turn (#469), never the session before it. */
 const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;

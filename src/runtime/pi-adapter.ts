@@ -50,7 +50,7 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { isPublicModelToken } from './review-model-identity.js';
-import { DirectiveCheckpointError, isNativeDirectiveRefusal, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, isNativeDirectiveRefusal, withOwnIo, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -1106,7 +1106,9 @@ export class PiAgentHandle implements AgentHandle {
   private livePromptText: string | null = null;
   private livePromptImages: PromptOptions['images'] | undefined;
   private liveDirective: PromptOptions['directive'] | undefined;
-  private directiveAdmissionError: unknown = null;
+  /** The live directive's first admission/guard failure, boxed: a thrown
+   * null or undefined still fails it, so every later fence refuses. */
+  private directiveAdmissionFailure: { readonly error: unknown } | null = null;
   /** Every native directive refusal this turn threw (#485), as the exact
    * object thrown: a `DirectiveCheckpointError` GC raised for the live
    * directive, GC's wrapper whose cause is one, or the `AggregateError` that
@@ -1295,8 +1297,9 @@ export class PiAgentHandle implements AgentHandle {
   private assertDirectiveExecutionAuthority(directive: NonNullable<PromptOptions['directive']>, signal?: AbortSignal, recheckCurrentAdmission = true): void {
     if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
     // GC's wrapper names its cause: it is a refusal only when that cause is one.
-    if (this.directiveAdmissionError !== null) {
-      throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`, { cause: this.directiveAdmissionError });
+    const failure = this.directiveAdmissionFailure;
+    if (failure !== null) {
+      throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(failure.error)}`, { cause: failure.error });
     }
     if (this.publishedDirectiveAdmission !== directive) throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
     if (recheckCurrentAdmission) directive.beforeAdmission();
@@ -1305,7 +1308,7 @@ export class PiAgentHandle implements AgentHandle {
 
   private refuseDirectiveGuard(directive: PromptOptions['directive'], toolCallId: string | undefined, error: unknown): never {
     if (directive !== undefined) {
-      this.directiveAdmissionError ??= error;
+      this.directiveAdmissionFailure ??= { error };
       this.recordDirectiveRefusal(error);
       const producer = this.directiveProducers.get(directive.identity.requestId);
       if (producer !== undefined) {
@@ -1805,7 +1808,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveTurnStop = { stopReason: null, error: null };
     this.liveDirective = directive;
     this.preparedDirectiveEffects.clear();
-    this.directiveAdmissionError = null;
+    this.directiveAdmissionFailure = null;
     this.nativeDirectiveRefusals.clear();
     this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
@@ -1893,7 +1896,7 @@ export class PiAgentHandle implements AgentHandle {
             } catch (error) {
               captured = { ok: false, error: `native correlated terminal proof unavailable: ${String(error)}` };
             }
-            if (this.directiveAdmissionError !== null) captured = { ok: false, error: String(this.directiveAdmissionError) };
+            if (this.directiveAdmissionFailure !== null) captured = { ok: false, error: String(this.directiveAdmissionFailure.error) };
           }
           this.preparedDirectiveEffects.clear();
           this.liveDirective = undefined;
@@ -2050,11 +2053,12 @@ export class PiAgentHandle implements AgentHandle {
           // real persisted native user entry, fsyncs it, then calls the host.
           queueMicrotask(() => {
             try {
-              const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
+              // The readback and its binding write are GC's own receipt I/O.
+              const binding = withOwnIo('directive receipt I/O', () => inspectDirectiveAdmission(this.sessionFile, directive.identity));
               directive.onAdmitted(binding);
               if (this.liveDirective === directive) this.publishedDirectiveAdmission = directive;
             } catch (error) {
-              if (this.liveDirective === directive) this.directiveAdmissionError ??= error;
+              if (this.liveDirective === directive) this.directiveAdmissionFailure ??= { error };
             }
           });
         }
@@ -2077,7 +2081,7 @@ export class PiAgentHandle implements AgentHandle {
                 if (producer === undefined || proof.state !== 'terminal' || !proof.ok) throw new DirectiveCheckpointError('native completion checkpoint/producer unavailable');
                 recordDirectiveCompletion(producer, proof.checkpointId, head);
               } catch (error) {
-                if (this.liveDirective === directive) this.directiveAdmissionError ??= error;
+                if (this.liveDirective === directive) this.directiveAdmissionFailure ??= { error };
               }
             });
           }

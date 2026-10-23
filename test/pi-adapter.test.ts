@@ -4269,6 +4269,61 @@ it('a plain error at the next-turn fence stays untagged with its provider identi
 it('a plain error whose receipt cannot be journaled stays untagged as its AggregateError (#485)', () => assertPlainErrorRouted('unjournaled'));
 it('a Pi extension\'s 401 at a tool fence, wrapped by GC at the next fence, stays untagged and stops as authentication_wall (#485)', () => assertPlainErrorRouted('extension-tool-fence'));
 
+it('GC\'s own admission receipt I/O fault (EDQUOT) is a tagged refusal at every later fence, never a quota wall (#485)', async () => {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  const f = await nativeRefusalFixture([
+    { deltas: [], toolCall: { id: 'unadmitted-effect', name: 'bash', args: { command: 'printf forbidden > receipt-fault.txt' } } },
+    { deltas: ['directive reply that must never be requested'] },
+  ]);
+  const { handle } = f;
+  const fault = vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(() => {
+    throw Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
+  });
+  try {
+    const { options } = startLedgerDirective(f);
+    expect(await handle.promptWithVerdict!('original accepted synthetic directive', options)).toMatchObject({ ok: false });
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    expect(fault).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(f.scene.lane.path, 'receipt-fault.txt'))).toBe(false);
+    const error = 'native directive admission/guard failed; further tool effects refused: DirectiveCheckpointError: directive receipt I/O failed: EDQUOT: disk quota exceeded, write';
+    expect(f.errors()).toHaveLength(1);
+    f.expectRetained(f.errors()[0], error);
+    // Its words alone would wall: the tag is what keeps it with directive recovery.
+    const { deterministicFailureClass } = await import('../src/decisions/questions.js');
+    expect(deterministicFailureClass(error)).toBe('quota_wall');
+  } finally { fault.mockRestore(); await f.cleanup(); }
+});
+
+/** A fence that throws a bare null or undefined still fails the directive closed (#485, on main too). */
+async function assertNullishFenceFailure(thrown: null | undefined) {
+  const f = await nativeRefusalFixture([
+    { deltas: [], toolCalls: [
+      { id: 'refused-first', name: 'bash', args: { command: 'printf first > nullish-fence.txt' } },
+      { id: 'refused-second', name: 'bash', args: { command: 'printf second >> nullish-fence.txt' } },
+    ] },
+    { deltas: ['directive reply that must never be requested'] },
+  ]);
+  const { handle } = f;
+  let checks = 0;
+  try {
+    // Checks 1 and 2 admit the turn (its own check, Pi's preflight); 3 is the first tool's fence.
+    expect(await handle.promptWithVerdict!('nullish fence directive', { directive: { identity: { requestId: `nullish-${String(thrown)}`, payloadHash: 'a'.repeat(64),
+      contractSha256: 'c'.repeat(64), jobId: 'nullish-job', workRevision: 0, authorityEpoch: 0 }, beforeAdmission: () => {
+      if (++checks === 3) { const nothing: unknown = thrown; throw nothing; }
+    }, onAdmitted: () => {} } })).toMatchObject({ ok: false });
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    // Neither tool ran: the first was refused, and the failure refuses every later effect.
+    expect(existsSync(join(f.scene.lane.path, 'nullish-fence.txt'))).toBe(false);
+    expect(f.fx.script.calls).toHaveLength(1);
+    // GC's wrapper names a cause that is no refusal: untagged, with its provider identity.
+    expect(f.errors()).toEqual([{ type: 'error', error: `native directive admission/guard failed; further tool effects refused: ${String(thrown)}`,
+      fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID }]);
+    expect(f.retained()).toEqual([]);
+  } finally { await f.cleanup(); }
+}
+it('a fence that throws null refuses every later effect, and its wrapper is untagged (#485)', () => assertNullishFenceFailure(null));
+it('a fence that throws undefined refuses every later effect, and its wrapper is untagged (#485)', () => assertNullishFenceFailure(undefined));
+
 it('a provider authentication rejection in a directive turn is never tagged and still stops as authentication_wall (#485)', async () => {
   const f = await nativeRefusalFixture([{ deltas: ['directive reply that must never be requested'] }], (session) => {
     // Pi's own untyped rejection for an expired OAuth login.
