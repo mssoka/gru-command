@@ -372,7 +372,7 @@ export function recordBlindAdmission(ledger: LedgerApi, jobId: string, admission
  * no attested blind review. An attested blind review whose package was not
  * kept (admitted before packages were kept) throws by name: a replacement
  * briefed without its input would review nothing it was given. */
-export function admittedBlindPackage(ledger: LedgerApi, jobId: string): BlindInputPackage | null {
+export function admittedBlindPackage(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): BlindInputPackage | null {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null || admitted.role !== 'blind' || !admitted.attested) return null;
   const event = ledger.latestJobEvent(jobId, BLIND_PACKAGE_EVENT);
@@ -417,7 +417,7 @@ export function renderBlindPackageBlock(pkg: BlindInputPackage): readonly string
   ];
 }
 
-function admittedOf(ledger: LedgerApi, jobId: string): AdmittedPayload | null {
+function admittedOf(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): AdmittedPayload | null {
   const event = ledger.latestJobEvent(jobId, BLIND_ADMITTED_EVENT);
   return event === null ? null : (event.payload as AdmittedPayload);
 }
@@ -640,7 +640,7 @@ function laneRootsOf(ledger: LedgerApi, jobId: string): readonly string[] {
 }
 
 /** Whether a job was admitted as a blind review (observation applies). */
-export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
+export function isAdmittedBlind(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): boolean {
   return admittedOf(ledger, jobId)?.role === 'blind';
 }
 

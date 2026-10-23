@@ -46,7 +46,7 @@ import {
   renderBlindPackageBlock,
   type BlindCoverage,
 } from './blind-review.js';
-import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
+import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult, type ReviewRole } from './blind-input.js';
 
 /** A file's lines as a diff counts them (a final newline ends the last). */
 function fileLines(text: string): readonly string[] {
@@ -197,6 +197,8 @@ export function renderMinionBriefing(input: {
   agentId?: string;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
+  /** Host-admitted review role; blind contexts cannot receive lesson pointers. */
+  reviewRole?: ReviewRole | null;
   /** Issue #161: this parent has GC-mediated child-worker tools wired. */
   childWorkerTools?: boolean;
   /** The job's deliverable kind (E19). Non-PR kinds get their own closing
@@ -209,7 +211,7 @@ export function renderMinionBriefing(input: {
   /** #360 R5-B3: an admitted blind reviewer's package — its input. */
   blindPackage?: BlindInputPackage;
 }): string {
-  const lessonsSection = renderLessonsSection(input.lessons ?? []);
+  const lessonsSection = input.reviewRole === 'blind' ? '' : renderLessonsSection(input.lessons ?? []);
   return [
     `Dispatch briefing — job ${input.jobId}`,
     `Repo: ${input.repoName}`,
@@ -630,7 +632,10 @@ export class DispatchService {
       // rate-limited turn stays pending until its bounded automatic retry
       // path concludes — never recorded as delivered while a retry could
       // still carry it, never disposed out from under that retry.
-      const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      const reviewRole = blindAdmission?.payload.role ?? null;
+      const lessons = reviewRole === 'blind'
+        ? []
+        : this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
       const settleTurn = async (
         failure: unknown | null,
         verdict: PromptTurnVerdict | null,
@@ -786,6 +791,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        reviewRole,
         ...(reviewSource !== null ? { reviewSource } : {}),
         ...(blindAdmission?.payload.role === 'blind' && input.inputPackage !== undefined ? { blindPackage: input.inputPackage } : {}),
         agentId: handle.id,

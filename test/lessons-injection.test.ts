@@ -89,6 +89,13 @@ describe('progressive-disclosure injection', () => {
       '- read /tmp/gru-bible/chapters/ops-restarts.md#shell-hang (why: task mentions restart, shell)',
     );
     expect(briefing).not.toContain(BODY_SENTINEL);
+    const blind = renderMinionBriefing({
+      jobId: 'review-blind', repoName: 'repo', branch: 'gru/review-blind',
+      worktreePath: '/tmp/wt', sha: 'abc123', briefing: 'Review only the frozen source.',
+      deliverable: 'review', reviewRole: 'blind', lessons: [POINTER],
+    });
+    expect(blind).not.toContain('RELEVANT LESSONS');
+    expect(blind).not.toContain('/tmp/gru-bible/chapters/ops-restarts.md');
   });
 
   it('renders deliverable-specific closing orders (E19)', () => {
@@ -190,6 +197,12 @@ describe('progressive-disclosure injection', () => {
     expect(prompt).toContain('RELEVANT LESSONS');
     expect(prompt).toContain('- read /tmp/gru-bible/chapters/ops-restarts.md#shell-hang');
     expect(prompt).not.toContain(BODY_SENTINEL);
+    const blind = renderRebriefPrompt({
+      jobId: 'review-blind', briefing: 'frozen-source-only contract',
+      note: 'continue from the package', reviewRole: 'blind', lessons: [POINTER],
+    });
+    expect(blind).not.toContain('RELEVANT LESSONS');
+    expect(blind).not.toContain('/tmp/gru-bible/chapters/ops-restarts.md');
   });
 
   it('re-briefs from the original contract when an evicted minion transcript cannot resume', async () => {

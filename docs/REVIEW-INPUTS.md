@@ -480,6 +480,16 @@ lifecycle fact — so a settled report read as independent coverage.
   never a replacement briefed without its input.
 - **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
   refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
+- **Role-specific host context.** The durable admitted role is checked before
+  provider prompt construction. A blind reviewer receives no automatic Book of
+  Lessons lookup, chapter pointer or other GC-injected out-of-package reading
+  obligation, on initial dispatch, native directive continuation, fresh
+  re-brief or provider-recovery-created fresh session. Fresh blind sessions keep
+  the admitted frozen package/source; the role boundary filters lesson pointers
+  before rendering as well as at the renderer. Ordinary workers and `claims`
+  reviewers continue to receive the generic lesson references. This does not
+  alter native runtime, credentials, workflow authority, package attestation or
+  observed-access checks.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 
@@ -518,10 +528,13 @@ that turn read is unknown, whatever came after (#360). And
 `POST /api/dispatch/blind-access {job_id, tool_results:[{tool_name?, text}]}`
 records a LATER read. Any prohibited observation makes the coverage
 `invalidated`; the report, its findings, its status and its disposition are left
-exactly as recorded (no replay, no debt revival). A blind commission for a target
-whose blind coverage is already `qualifying` under the same parent answers
-`409 blind_coverage_owned` naming the job to reuse (or `409
-blind_coverage_unreadable` naming a sibling whose recorded blind-access facts
-cannot be counted — repair them in the ledger first); invalidated coverage may be
-replaced and the new admission lists what it replaces.
+exactly as recorded (no replay, no debt revival and no binning or revival of a
+terminal report). A blind commission for a target whose blind coverage is
+already `qualifying` under the same parent answers `409 blind_coverage_owned`
+naming the job to reuse (or `409 blind_coverage_unreadable` naming a sibling
+whose recorded blind-access facts cannot be counted — repair them in the ledger
+first). After prohibited access has invalidated a terminal report, the existing
+API permits a fresh blind commission for that same parent and target; its new
+admission records the replaced sibling. The old report remains preserved and
+invalidated and never counts as blind coverage.
 

@@ -17,6 +17,8 @@ import type { WorktreePort } from './worktree-port.js';
 import { readGitState } from '../verify/scheduler.js';
 import { readDirectiveSessionHeader } from '../runtime/directive-checkpoint.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
+import { admittedBlindPackage, isAdmittedBlind, renderBlindPackageBlock } from './blind-review.js';
+import type { ReviewRole } from './blind-input.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -63,7 +65,7 @@ export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
   readonly ledger: Pick<
     LedgerApi,
-    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'
+    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent' | 'latestJobEvent'
   >;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
@@ -85,6 +87,12 @@ export interface DirectiveRoutingDeps {
    * own error boundary); absent = no observation (non-review directives,
    * tests). */
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+}
+
+function blindReviewFor(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): boolean {
+  // Some narrow routing test doubles predate admission-aware context assembly;
+  // the production LedgerApi always supplies this durable role lookup.
+  return typeof ledger.latestJobEvent === 'function' && isAdmittedBlind(ledger, jobId);
 }
 
 function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
@@ -212,10 +220,16 @@ export async function routeFixDirectiveToMinion(
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
+  const blindReview = blindReviewFor(input.ledger, input.jobId);
+  const blindPackage = blindReview ? admittedBlindPackage(input.ledger, input.jobId) : null;
+  const withBlindPackage = (text: string): string => {
+    if (blindPackage === null || text.includes('BLIND INPUT PACKAGE (')) return text;
+    return `${text}\n\n${renderBlindPackageBlock(blindPackage).join('\n')}`;
+  };
   const compose = (revisionText: string): string => appendWorkerRules(
     appendLessonPointers(
       withRevisionContinuation(input.directive, revisionText),
-      input.lessons?.referencesFor(input.directive) ?? [],
+      blindReview ? [] : input.lessons?.referencesFor(input.directive) ?? [],
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
@@ -398,6 +412,7 @@ export async function routeFixDirectiveToMinion(
     const freshPrompt = (contract: string): string =>
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
     let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
+    if (resumeFile === null) prompt = withBlindPackage(prompt);
     try {
       assertHandoff();
       assertAdmissible();
@@ -423,7 +438,7 @@ export async function routeFixDirectiveToMinion(
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
-      prompt = freshPrompt(contract);
+      prompt = withBlindPackage(freshPrompt(contract));
     }
     assertAdmissible();
     guard();
@@ -693,8 +708,10 @@ export function renderRebriefPrompt(input: {
   workRevision?: number | null;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
+  /** Host-admitted review role; blind contexts cannot receive lesson pointers. */
+  reviewRole?: ReviewRole | null;
 }): string {
-  const lessonsSection = renderLessonsSection(input.lessons ?? []);
+  const lessonsSection = input.reviewRole === 'blind' ? '' : renderLessonsSection(input.lessons ?? []);
   return [
     `Re-brief — job ${input.jobId}`,
     '',
@@ -845,12 +862,18 @@ export async function rebriefFreshMinion(
         ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
+      const blindReview = blindReviewFor(input.ledger, input.jobId);
+      const blindPackage = blindReview ? admittedBlindPackage(input.ledger, input.jobId) : null;
+      const briefing = blindPackage === null || input.briefing?.includes('BLIND INPUT PACKAGE (')
+        ? input.briefing
+        : [input.briefing, renderBlindPackageBlock(blindPackage).join('\n')].filter((part): part is string => part !== null && part !== undefined && part !== '').join('\n\n');
       prompt = renderRebriefPrompt({
         jobId: input.jobId,
-        briefing: input.briefing,
+        briefing,
         note: input.note,
+        reviewRole: blindReview ? 'blind' : null,
         ...(input.workRevision !== undefined ? { workRevision: input.workRevision } : {}),
-        ...(input.lessons !== undefined
+        ...(!blindReview && input.lessons !== undefined
           ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
           : {}),
       });

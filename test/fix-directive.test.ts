@@ -17,6 +17,7 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate, RetrySettlementUnavailableError, type RetrySettlement } from '../src/runtime/pacing.js';
 import { admitBlindReview, blindCoverageOf, observeBlindSessionAccess, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { AgentRecord } from '../src/ledger/api.js';
+import type { LessonPointer } from '../src/lessons/types.js';
 
 /**
  * The follow-up delivery signal (R2 review B3): a settled directive or
@@ -1155,13 +1156,14 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
     // binding): it survives listImplementerMinions, so the directive router is
     // a real continuation seam for it.
     ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+    const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
     const admission = admitBlindReview({
       ledger, jobId, title: 'review (blind)', deliverable: 'review',
       briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
-      inputPackage: { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+      inputPackage,
     });
     if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-    recordBlindAdmission(ledger, jobId, admission);
+    recordBlindAdmission(ledger, jobId, admission, inputPackage);
     return { ledger, dispose: () => db.close() };
   }
 
@@ -1235,6 +1237,88 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
       expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
         state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
       });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('does not give a blind native directive continuation the automatic lesson pointer', async () => {
+    const jobId = 'job-blind-directive-context';
+    const agentId = 'blind-directive-context-minion';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-directive-context-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, agentId, sessionFile);
+    const canary: LessonPointer = {
+      chapter: 'synthetic-book-canary', lesson: 'outside-package',
+      path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
+    };
+    let referenceLookups = 0;
+    const prompts: string[] = [];
+    try {
+      const handle = {
+        id: agentId, role: 'minion', sessionFile,
+        async prompt(text: string) { prompts.push(text); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const result = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        lessons: { referencesFor: () => { referenceLookups += 1; return [canary]; } },
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+        onPrepared: () => {},
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: agentId });
+      expect(referenceLookups).toBe(0);
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).not.toContain('/synthetic-book/chapters/synthetic-book-canary.md');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('keeps the frozen package and excludes lesson pointers in a fresh blind re-brief context', async () => {
+    const jobId = 'job-blind-fresh-rebrief-context';
+    const agentId = 'fresh-blind-context-minion';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-rebrief-context-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, 'prior-blind-context-minion', join(dir, 'prior.jsonl'));
+    const canary: LessonPointer = {
+      chapter: 'synthetic-book-canary', lesson: 'outside-package',
+      path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
+    };
+    let referenceLookups = 0;
+    const prompts: string[] = [];
+    try {
+      const handle = {
+        id: agentId, role: 'minion', sessionFile,
+        async prompt(text: string) { prompts.push(text); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const result = await rebriefFreshMinion({
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        jobId, note: 'continue only from the frozen source', briefing: 'Review the admitted package read-only.',
+        lessons: { referencesFor: () => { referenceLookups += 1; return [canary]; } },
+      });
+      expect(result.outcome).toBe('completed');
+      expect(referenceLookups).toBe(0);
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain('BLIND INPUT PACKAGE (your review input');
+      expect(prompts[0]).toContain('File src/feature.ts (at the target):');
+      expect(prompts[0]).not.toContain('/synthetic-book/chapters/synthetic-book-canary.md');
     } finally {
       h.dispose();
     }
