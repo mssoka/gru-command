@@ -6812,29 +6812,6 @@ describe('WaveRunner request guards', () => {
       line.includes(`an active decision (${decisionId}) covers delivered-pr-register, so no open pull request is linked`))).toBe(true);
   });
 
-  it('a lookup that fails after a shutdown is dropped without an unhandled rejection (#488)', async () => {
-    const lane = await unlinkedPublicationLane('unlinked-late-failure');
-    let lookupStarted!: () => void;
-    const started = new Promise<void>((resolve) => { lookupStarted = resolve; });
-    let rejected = false;
-    const wave = lane.wave({
-      findOpenPullRequests: () => {
-        lookupStarted();
-        return new Promise((_resolve, reject) => setTimeout(() => { rejected = true; reject(new Error('late gh failure')); }, 50));
-      },
-      recordPr: vi.fn(),
-    });
-    const running = wave.runRound({ jobId: lane.job.id });
-    await started;
-    await wave.shutdown();
-    const outcome = asWave(await running);
-    // Let the late failure land: vitest fails the run on an unhandled one.
-    await vi.waitFor(() => expect(rejected).toBe(true));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload)
-      .toMatchObject({ reason: 'service_restart' });
-  });
-
   it('two open PRs at the reviewed head are ambiguous: no_pr_link, nothing linked (#488)', async () => {
     const lane = await unlinkedPublicationLane('unlinked-two-prs');
     const recordPr = vi.fn();

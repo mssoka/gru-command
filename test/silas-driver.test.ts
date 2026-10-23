@@ -3744,6 +3744,12 @@ describe('silas digest fingerprint (issue #217)', () => {
       ],
     });
     expect(digestFingerprint(volatile)).toBe(before);
+    // #488: a row whose rounds already aborted asks Silas for a different
+    // action (register only), so abortedRounds is actionable, not volatile.
+    const unlinkedRow = { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/l', minionSessionFile: null, deliveredAt: null };
+    const fresh = baseDigest({ deliveredWithoutPr: [{ ...unlinkedRow, abortedRounds: 0 }] });
+    const afterAbort = baseDigest({ deliveredWithoutPr: [{ ...unlinkedRow, abortedRounds: 1 }] });
+    expect(digestFingerprint(afterAbort)).not.toBe(digestFingerprint(fresh));
     // identity + actionable content is what the gate compares
     const newPr = baseDigest({
       prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/9', priorRounds: 0 }],

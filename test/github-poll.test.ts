@@ -337,8 +337,9 @@ describe('open pull requests for a lane branch (#488)', () => {
     });
     await expect(gitlab).rejects.toBeInstanceOf(GhApiError);
     await expect(gitlab).rejects.toThrow('no GitHub remote resolves for lane "/lanes/gl"');
-    await expect(openPullRequestsForBranch({ listPullsForHead }, { repoPath: '/lanes/none', remote: null, branch: 'gru/x' }))
-      .rejects.toBeInstanceOf(GhApiError);
+    const missing = openPullRequestsForBranch({ listPullsForHead }, { repoPath: '/lanes/none', remote: null, branch: 'gru/x' });
+    await expect(missing).rejects.toBeInstanceOf(GhApiError);
+    await expect(missing).rejects.toThrow('no GitHub remote resolves for lane "/lanes/none"');
     expect(listPullsForHead).not.toHaveBeenCalled();
   });
 });

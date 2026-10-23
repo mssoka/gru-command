@@ -435,7 +435,7 @@ export interface DeliveredWithoutPrRow {
   readonly minionSessionFile: string | null;
   readonly deliveredAt: string | null;
   /** Rounds that already ran on this job and aborted unlinked (#488): the
-   * PR is registered only; any review is the clean-abort row's call. */
+   * PR is registered only; any review still owed is offered by row (2). */
   readonly abortedRounds: number;
 }
 

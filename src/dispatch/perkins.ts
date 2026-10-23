@@ -3032,8 +3032,8 @@ export class WaveRunner {
       onAbort = () => resolve(null);
       signal.addEventListener('abort', onAbort, { once: true });
     });
+    // The race subscribes to the lookup, so a late failure is handled.
     const lookup = (async () => find({ repoPath: lane.path, branch }))();
-    lookup.catch(() => {});
     let pulls: readonly OpenPullRequest[] | null = null;
     let lookupError: unknown = null;
     try {
