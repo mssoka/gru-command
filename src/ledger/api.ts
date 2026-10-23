@@ -1895,11 +1895,11 @@ export class LedgerApi {
         producerSettlementSeq: input.producerSettlementSeq,
       };
       const initialState: CreationContinuationState = scopeProblem === null ? 'accepted' : 'refused';
-      this.appendEvent({ kind: 'job.creation-continuation', jobId: input.jobId, payload: {
-        request_id: input.requestId, generation, payload_sha256: input.payloadSha256, state: initialState,
-        stage: initialState, handoff_seq: input.handoffSeq, briefing_sha256: input.briefingSha256,
-        repo_path: input.repoPath, branch: input.branch, base_sha: input.baseSha,
-        base_source: input.baseSource, producer_settlement_seq: input.producerSettlementSeq,
+      this.appendEvent({ kind: 'job.creation-continuation', jobId: identity.jobId, payload: {
+        request_id: identity.requestId, generation: identity.generation, payload_sha256: identity.payloadSha256, state: initialState,
+        stage: initialState, handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256,
+        repo_path: identity.repoPath, branch: identity.branch, base_sha: identity.baseSha,
+        base_source: identity.baseSource, producer_settlement_seq: identity.producerSettlementSeq,
         ...(input.receiptTokenSha256 !== null ? { receipt_token_sha256: input.receiptTokenSha256 } : {}),
         ...(scopeProblem !== null ? { reason: scopeProblem.slice(0, 1000) } : {}),
       } });
