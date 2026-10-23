@@ -172,6 +172,8 @@ function piHandle(opts: {
   session: { disposed: boolean; disposeCalls: number; waitForIdleCalls: number; bashRunning: boolean; pendingBash: boolean };
   events: RuntimeEvent[];
   logs: { level: string; msg: string; fields?: Record<string, unknown> }[];
+  /** How many times the handle released its runtime owner (onDispose). */
+  owner: { releases: number };
   store: SessionStore;
   sessionFile: string;
   settleIdle: () => void;
@@ -214,6 +216,7 @@ function piHandle(opts: {
   piCleanupDirs.push(store.dataDir);
   const sessionFile = join(store.dataDir, 'session-341.jsonl');
   const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+  const owner = { releases: 0 };
   const handle = new PiAgentHandle(
     'perkins',
     session,
@@ -223,10 +226,11 @@ function piHandle(opts: {
     [],
     store,
     (level, msg, fields) => { logs.push({ level, msg, ...(fields === undefined ? {} : { fields }) }); },
+    () => { owner.releases += 1; },
   );
   const events: RuntimeEvent[] = [];
   handle.subscribe((event) => events.push(event));
-  return { handle, session: state, events, logs, store, sessionFile, settleIdle: () => settleIdle() };
+  return { handle, session: state, events, logs, owner, store, sessionFile, settleIdle: () => settleIdle() };
 }
 
 /** Exact cessation-evidence events of one verdict (once-only assertions must
@@ -431,6 +435,8 @@ const GH497_IDENTITY = { requestId: 'gh497-request', payloadHash: 'a'.repeat(64)
   jobId: 'gh497-job', workRevision: 1, authorityEpoch: 0 };
 const RECEIPT_FAILED = 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written';
 const LOCK_RELEASE_FAILED = 'session lock release failed; ownership stays UNKNOWN until it is released';
+/** A read-only journal refuses the append only for a non-root user. */
+const runsAsRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 
 /** The producer journal's receipt states, in order. */
 function producerStates(sessionFile: string): string[] {
@@ -439,8 +445,8 @@ function producerStates(sessionFile: string): string[] {
 }
 
 describe('pi cessation receipts that cannot be written stay UNKNOWN and are retried (#497)', () => {
-  it('a re-query whose receipt append fails reports unknown, keeps the lock and owner, and writes it once the journal recovers', async () => {
-    const { handle, session, events, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+  it.skipIf(runsAsRoot)('a re-query whose receipt append fails reports unknown, keeps the lock and owner, and writes it once the journal recovers', async () => {
+    const { handle, session, events, logs, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
     store.acquireLock(sessionFile);
     handle.prepareDirectiveProducer(GH497_IDENTITY);
     // The first settlement leaves the evidence UNKNOWN: an independent bash
@@ -464,23 +470,34 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     expect(producerStates(sessionFile)).toEqual(['started']);
     expect(store.isHeld(sessionFile)).toBe(true);
     expect(handle.health().state).not.toBe('disposed');
+    expect(owner.releases).toBe(0);
+    expect(cessationEvents(events, 'unknown')).toHaveLength(1);
     expect(cessationEvents(events, 'ceased')).toHaveLength(0);
     // The journal recovers: the next query writes the receipt, then releases.
     expect(handle.cessationEvidence()).toBe('ceased');
     expect(producerStates(sessionFile)).toEqual(['started', 'ceased']);
     expect(store.isHeld(sessionFile)).toBe(false);
     expect(handle.health().state).toBe('disposed');
+    expect(owner.releases).toBe(1);
     expect(cessationEvents(events, 'ceased')).toHaveLength(1);
   });
 
-  it('a receipt append that fails at disposal rejects that disposal and leaves an unknown a later query settles', async () => {
-    const { handle, events, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+  it.skipIf(runsAsRoot)('a receipt append that fails at disposal settles the disposal as unknown, and a later query writes it', async () => {
+    const { handle, events, logs, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
     store.acquireLock(sessionFile);
     handle.prepareDirectiveProducer(GH497_IDENTITY);
+    // A consumer that re-queries on every evidence event (as the fallback
+    // wrapper and the supervisor do) reads the evidence; it never re-runs the
+    // failing write inside the settlement that emitted the event.
+    const requeried: string[] = [];
+    handle.subscribe((event) => { if (event.type === 'cessation_evidence') requeried.push(handle.cessationEvidence()); });
     const journal = `${sessionFile}.producers.jsonl`;
     chmodSync(journal, 0o400);
     try {
-      await expect(handle.dispose()).rejects.toThrow(/EACCES/);
+      // As in Claude, disposal itself settles: ownership is the evidence's to keep.
+      await handle.dispose();
+      expect(requeried).toEqual(['unknown']);
+      expect(logs.filter((entry) => entry.msg === RECEIPT_FAILED)).toHaveLength(1);
       expect(handle.cessationEvidence()).toBe('unknown');
     } finally {
       chmodSync(journal, 0o600);
@@ -488,16 +505,46 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     expect(logs.filter((entry) => entry.msg === RECEIPT_FAILED)).toHaveLength(2);
     expect(cessationEvents(events, 'unknown')).toHaveLength(1);
     expect(store.isHeld(sessionFile)).toBe(true);
-    // The failed disposal no longer leaves the evidence 'live', which no
-    // query ever retried: the next query writes the receipt.
+    expect(owner.releases).toBe(0);
+    // The evidence is UNKNOWN, not 'live' (which no query retried): the next
+    // query writes the receipt.
     expect(handle.cessationEvidence()).toBe('ceased');
     expect(producerStates(sessionFile)).toEqual(['started', 'ceased']);
     expect(store.isHeld(sessionFile)).toBe(false);
+    expect(owner.releases).toBe(1);
     expect(cessationEvents(events, 'ceased')).toHaveLength(1);
   });
 
+  it.skipIf(runsAsRoot)('an owed guard refusal stays owed through a failing settlement and is written before cessation', async () => {
+    const { handle, session, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+    store.acquireLock(sessionFile);
+    handle.prepareDirectiveProducer(GH497_IDENTITY);
+    const journal = `${sessionFile}.producers.jsonl`;
+    chmodSync(journal, 0o400);
+    try {
+      // The guard's own receipt write fails, so the refusal is owed.
+      const guarded = handle as unknown as {
+        refuseDirectiveGuard(directive: { readonly identity: typeof GH497_IDENTITY }, toolCallId: string, error: unknown): never;
+      };
+      expect(() => guarded.refuseDirectiveGuard({ identity: GH497_IDENTITY }, 'gh497-tool', new Error('gh497 guard refused the tool')))
+        .toThrow(AggregateError);
+      session.bashRunning = true;
+      await handle.dispose();
+      session.bashRunning = false;
+      expect(handle.cessationEvidence()).toBe('unknown');
+      expect(logs.filter((entry) => entry.msg === RECEIPT_FAILED)).toHaveLength(1);
+      expect(producerStates(sessionFile)).toEqual(['started']);
+      expect(store.isHeld(sessionFile)).toBe(true);
+    } finally {
+      chmodSync(journal, 0o600);
+    }
+    expect(handle.cessationEvidence()).toBe('ceased');
+    expect(producerStates(sessionFile)).toEqual(['started', 'guard-refused', 'ceased']);
+    expect(store.isHeld(sessionFile)).toBe(false);
+  });
+
   it('a lock release that fails reports unknown and is retried without a duplicate receipt', async () => {
-    const { handle, session, events, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+    const { handle, session, events, logs, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
     store.acquireLock(sessionFile);
     handle.prepareDirectiveProducer(GH497_IDENTITY);
     session.bashRunning = true;
@@ -508,14 +555,40 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     });
     try {
       expect(handle.cessationEvidence()).toBe('unknown');
-      expect(logs.filter((entry) => entry.msg === LOCK_RELEASE_FAILED)).toHaveLength(1);
+      expect(logs.filter((entry) => entry.msg === LOCK_RELEASE_FAILED).map((entry) => entry.level)).toEqual(['error']);
       expect(store.isHeld(sessionFile)).toBe(true);
+      expect(handle.health().state).not.toBe('disposed');
+      expect(owner.releases).toBe(0);
       expect(cessationEvents(events, 'ceased')).toHaveLength(0);
       expect(handle.cessationEvidence()).toBe('ceased');
       expect(release).toHaveBeenCalledTimes(2);
       expect(producerStates(sessionFile)).toEqual(['started', 'ceased']); // the retry wrote no second receipt
       expect(store.isHeld(sessionFile)).toBe(false);
+      expect(owner.releases).toBe(1);
       expect(cessationEvents(events, 'ceased')).toHaveLength(1);
+    } finally {
+      release.mockRestore();
+    }
+  });
+
+  it('a listener that re-queries on the disposed state does not re-enter the release', async () => {
+    const { handle, session, events, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+    store.acquireLock(sessionFile);
+    handle.prepareDirectiveProducer(GH497_IDENTITY);
+    session.bashRunning = true;
+    await handle.dispose();
+    session.bashRunning = false;
+    // The registry's resident listener queries the evidence when the handle
+    // reports the disposed state, which the release itself emits.
+    handle.subscribe((event) => { if (event.type === 'state' && event.state === 'disposed') handle.cessationEvidence(); });
+    const release = vi.spyOn(store, 'releaseLock');
+    try {
+      expect(handle.cessationEvidence()).toBe('ceased');
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(events.filter((event) => event.type === 'state' && event.state === 'disposed')).toHaveLength(1);
+      expect(owner.releases).toBe(1);
+      expect(cessationEvents(events, 'ceased')).toHaveLength(1);
+      expect(producerStates(sessionFile)).toEqual(['started', 'ceased']);
     } finally {
       release.mockRestore();
     }
