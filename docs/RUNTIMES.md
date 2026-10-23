@@ -56,8 +56,14 @@ branch on harness. The ADAPTER implements the declaration:
   cannot open, so each review tool declares
   `_meta["anthropic/maxResultSizeChars"]`, review sessions run with
   `MAX_MCP_OUTPUT_TOKENS` set, and the host bounds what a tool hands the lead
-  below both (`src/runtime/review-tool-limits.ts`, the same bound on pi): a
-  larger specialist batch is refused and recorded as not delivered.
+  below both (`src/runtime/review-mcp-bridge.ts`, the same bounds on pi). A
+  specialist result the lead could never read whole fails its attempt with
+  retry feedback; a batch that does not fit one response delivers whole
+  results and lists the rest as `withheld` for the lead to collect; the
+  preflight error list and the prior-revision listing carry what fits plus
+  an exact omitted count. A tool error is cut by Claude Code past ~10,000
+  characters, so a submission rejection stays under that and points at
+  preflight for the full list.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes

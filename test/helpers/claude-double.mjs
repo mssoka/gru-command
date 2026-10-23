@@ -771,6 +771,12 @@ async function run() {
           for (const finding of result.findings) findings.push(finding);
         }
       }
+      // Bulk delivery probe: every bulk finding must have reached the lead
+      // inline; the lead then drops them, as one it cannot ground.
+      const bulkCount = Number(process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] ?? '0');
+      const bulkSeen = findings.filter((finding) => finding.title.startsWith('Bulk delivery finding')).length;
+      if (bulkSeen !== bulkCount) throw new Error(`lead received ${bulkSeen} of ${bulkCount} bulk findings`);
+      findings.splice(0, findings.length, ...findings.filter((finding) => !finding.title.startsWith('Bulk delivery finding')));
       const submission = await session.call('tools/call', {
         name: 'perkins_submit_review',
         arguments: {
@@ -819,8 +825,13 @@ async function run() {
       // scoped bridge): submit findings through the product tool exactly as
       // the real model would. The host owns the lens id, so the input omits
       // `source` — the same shape the prompt demands.
+      const bulkCount = Number(process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] ?? '0');
+      const bulk = Array.from({ length: lens === 'security' ? bulkCount : 0 }, (_, index) => ({
+        severity: 'note', category: 'bulk', title: `Bulk delivery finding ${index}`, location: 'src/main.ts:2', evidence: '  return 43;',
+        detail: 'One of many findings that must reach the lead inline.', recommended_fix: 'No change needed for this delivery probe.',
+      }));
       const findings = lens === 'security'
-        ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }]
+        ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }, ...bulk]
         : lens === 'tests'
           ? [{ severity: 'warning', category: 'coverage', title: 'Changed behavior lacks test tracing', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed return value has no direct assertion.', recommended_fix: 'Add an assertion for the changed return value.' }]
           : [];

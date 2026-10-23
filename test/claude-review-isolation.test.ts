@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildClaudeCodeAuthArgs, claudeReviewIsolationArgs } from '../src/runtime/claude-model.js';
 import { claudeReviewProcessEnv } from '../src/runtime/claude-review-settings.js';
-import { REVIEW_MCP_OUTPUT_TOKENS } from '../src/runtime/review-tool-limits.js';
+import { REVIEW_MCP_OUTPUT_TOKENS } from '../src/runtime/review-mcp-bridge.js';
 import { claudeTurnArgs } from '../src/runtime/claude-adapter.js';
 
 // Flags that make the CLI ignore --mcp-config. The review lead can only submit

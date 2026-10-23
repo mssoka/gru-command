@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { NativeAgentTool } from './types.js';
-import { REVIEW_TOOL_RESULT_MAX_CHARS } from './review-tool-limits.js';
 
 const MAX_BRIDGE_MESSAGE_BYTES = 1024 * 1024;
 const PARTIAL_FRAME_TIMEOUT_MS = 5_000;
@@ -30,6 +29,31 @@ const MAX_BRIDGE_CONNECTIONS = 16;
 /** Cap on bridge teardown during disposal. Exported so the service shutdown
  * force-exit budget can be reconciled with the bounded teardown (issue #341). */
 export const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
+/*
+ * What a review lead can read of one native-tool result.
+ *
+ * Claude Code hands the model an MCP tool result inline only up to two
+ * limits, and replaces a longer one with a pointer to a file the confined
+ * review lead cannot open (probed on 2.1.309): a per-tool size limit (about
+ * 50,000 characters unless the tool declares `anthropic/maxResultSizeChars`
+ * in its `_meta`) and an output-token cap (`MAX_MCP_OUTPUT_TOKENS`, 25,000 by
+ * default, estimated at about four characters a token). A tool ERROR is cut
+ * to about 10,000 characters, middle dropped. The bridge declares the size
+ * and review sessions run with the token cap set, so the host's own bounds
+ * decide what reaches the lead, on every runtime.
+ */
+/** Host bound on one model-facing tool result text, in UTF-8 bytes (which
+ * bound its characters from above). */
+export const REVIEW_TOOL_TEXT_MAX_BYTES = 192 * 1024;
+/** The per-tool inline size the bridge declares to Claude Code, above the
+ * host bound. */
+export const REVIEW_TOOL_RESULT_MAX_CHARS = 200_000;
+/** `MAX_MCP_OUTPUT_TOKENS` for review sessions: one token per two characters
+ * of the declared size, twice the room the CLI's four-characters-a-token
+ * estimate needs. */
+export const REVIEW_MCP_OUTPUT_TOKENS = 100_000;
+/** Host bound on a tool error message the lead must read whole. */
+export const REVIEW_TOOL_ERROR_MAX_BYTES = 9_000;
 export const PERKINS_MCP_SERVER_SHA256 = 'ae53ef1bf15f295c4118457585aff5708a323956278f97ba8c261e6de319a719';
 
 interface BridgeRequest {

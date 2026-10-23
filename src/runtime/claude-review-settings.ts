@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from '
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Role } from '../config.js';
-import { REVIEW_MCP_OUTPUT_TOKENS } from './review-tool-limits.js';
+import { REVIEW_MCP_OUTPUT_TOKENS } from './review-mcp-bridge.js';
 
 /** Only model selection and credential/provider environment are permitted
  * from the user's Claude settings. Never load repo settings, tools, hooks,

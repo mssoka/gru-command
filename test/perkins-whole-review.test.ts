@@ -24,12 +24,13 @@ import {
   type FrozenReview,
 } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
-import { REVIEW_TOOL_TEXT_MAX_BYTES } from '../src/runtime/review-tool-limits.js';
+import { REVIEW_TOOL_ERROR_MAX_BYTES, REVIEW_TOOL_TEXT_MAX_BYTES } from '../src/runtime/review-mcp-bridge.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
 import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { commitManyPaths, LARGE_UNIT_TIMEOUT_MS } from './helpers/large-integration-unit.js';
 import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
@@ -68,6 +69,7 @@ interface WholeHarness {
   readonly preflightResults: ReturnType<typeof fakeWholeSpawner>['preflightResults'];
   readonly attemptedBatches: ReturnType<typeof fakeWholeSpawner>['attemptedBatches'];
   readonly runBatches: ReturnType<typeof fakeWholeSpawner>['runBatches'];
+  readonly collectBatches: ReturnType<typeof fakeWholeSpawner>['collectBatches'];
   readonly probeOutcomes: ReturnType<typeof fakeWholeSpawner>['probeOutcomes'];
   run(input?: { noSpec?: boolean; priorConsolidatedFile?: string }): Promise<PerkinsWholeResult>;
 }
@@ -128,6 +130,7 @@ function wholeHarness(
     preflightResults: fake.preflightResults,
     attemptedBatches: fake.attemptedBatches,
     runBatches: fake.runBatches,
+    collectBatches: fake.collectBatches,
     probeOutcomes: fake.probeOutcomes,
     run: (input = {}) => engine.run({
       roundId: 'whole-round',
@@ -943,33 +946,78 @@ describe('Perkins whole-PR lead engine', () => {
     expect(noSpecPrompt).not.toContain('- acceptance: ');
   });
 
-  it('a specialist batch larger than the lead can read is refused and recorded undelivered, never cut (#487)', async () => {
-    // 2 lenses x 30 findings x ~3.5 KB of located evidence is about 210 KB:
-    // under the 900 KiB wire bound, over what one tool result can carry to
-    // a lead (Claude Code would hand it a file pointer it cannot open).
+  /** Two lenses whose ~105 KB results each fit one lead-readable response,
+   * but not both together. */
+  const twoLargeLenses = (extra: Partial<WholeLeadOptions> = {}): WholeHarness => {
     const line = (n: number): string => `export const value${n} = '${'x'.repeat(3_500)}';`;
-    const h = wholeHarness({
+    return wholeHarness({
       specialists: ['security', 'tests'],
       childAnswer: (prompt) => {
         const source = /"source": "(security|tests)"/u.exec(prompt)?.[1];
         if (source === undefined) return '[]';
         return JSON.stringify(Array.from({ length: 30 }, (_, index) => groundedFinding(source, 'note', {
-          title: `${source} oversized finding ${index}`, location: `src/big.ts:${index + 1}`, evidence: line(index + 1),
+          title: `${source} large finding ${index}`, location: `src/big.ts:${index + 1}`, evidence: line(index + 1),
         })));
       },
+      ...extra,
     }, {
       beforeFreeze: (repo) => {
         repo.commitFile('src/big.ts', `${Array.from({ length: 30 }, (_, index) => line(index + 1)).join('\n')}\n`);
       },
     });
+  };
+
+  it('a batch too large for one response delivers whole results and the lead collects the rest, with no new child (#487)', async () => {
+    const h = twoLargeLenses();
     const result = await h.run();
-    expect(h.toolErrors.some((entry) => entry.error.includes(
-      `specialist result batch exceeds the ${REVIEW_TOOL_TEXT_MAX_BYTES}-byte tool result the lead can read; run fewer lenses per call`,
-    ))).toBe(true);
-    expect(result.specialistRuns).toEqual(expect.arrayContaining([
-      expect.objectContaining({ lens: 'security', status: 'valid', findingsDelivered: false }),
-      expect.objectContaining({ lens: 'tests', status: 'valid', findingsDelivered: false }),
-    ]));
+    expect(h.toolErrors).toEqual([]);
+    // One lens was withheld from the first response and collected after.
+    expect(h.collectBatches).toEqual([['tests']]);
+    expect(h.childCalls).toHaveLength(2);
+    expect(result.specialistRuns.filter((run) => run.status === 'valid').map((run) => [run.lens, run.findingsDelivered]))
+      .toEqual(expect.arrayContaining([['security', undefined], ['tests', undefined]]));
+  });
+
+  it('a preflight error list larger than the lead can read is cut by whole errors with the exact omitted count (#487)', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      // 500 empty findings: thousands of named errors, far past one result.
+      preflight: { payload: (submission) => ({ ...submission, findings: Array.from({ length: 500 }, () => ({})) }) },
+    });
+    await h.run();
+    const text = h.preflightResults[0]!.text;
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(REVIEW_TOOL_TEXT_MAX_BYTES);
+    const body = JSON.parse(text) as { ok: boolean; errorCount: number; errors: unknown[]; omittedErrorCount?: number; fullList?: string };
+    expect(body.ok).toBe(false);
+    expect(body.omittedErrorCount).toBeGreaterThan(0);
+    expect(body.errors.length + body.omittedErrorCount!).toBe(body.errorCount);
+    expect(body.fullList).toBe('lead/preflight-attempt-1.json');
+  });
+
+  it('a submission rejection fits the tool-error text the lead can read, and points at preflight for the rest (#487)', async () => {
+    const h = wholeHarness({ ...ALL_CLEAN, neverSubmit: true });
+    await expect(h.run()).rejects.toThrow(/without an accepted terminal submission/u);
+    const submit = h.leadCalls[0]!.options.reviewLead!.nativeTools.find((entry) => entry.name === 'perkins_submit_review')!;
+    const error = await submit.execute({
+      verdict: 'READY TO MERGE', findings: Array.from({ length: 500 }, () => ({})), prior_dispositions: [], report_markdown: '# Perkins Code Review',
+    }).then(() => null, (rejection: unknown) => rejection);
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    // Claude Code shows a tool error whole only up to ~10,000 characters.
+    expect(Buffer.byteLength(message, 'utf8')).toBeLessThan(10_000);
+    expect(Buffer.byteLength(message, 'utf8')).toBeLessThanOrEqual(REVIEW_TOOL_ERROR_MAX_BYTES);
+    expect(message).toMatch(/further error\(s\) omitted; perkins_preflight_submission returns the full list/u);
+  });
+
+  it('a withheld result the lead never collects stays durably undelivered (#487, R17)', async () => {
+    const h = twoLargeLenses({ ignoreWithheld: true });
+    const result = await h.run();
+    expect(h.collectBatches).toEqual([]);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      specialistRuns: Array<{ lens: string; status: string; findingsDelivered?: boolean }>;
+    };
+    expect(consolidated.specialistRuns.filter((run) => run.status === 'valid').map((run) => [run.lens, run.findingsDelivered]))
+      .toEqual(expect.arrayContaining([['security', undefined], ['tests', false]]));
   });
 
   it('a performance and an operations finding survive child validation, lead submission and attribution', async () => {
@@ -1858,10 +1906,10 @@ function priorHarness(options: {
 }
 
 describe('whole-PR engine: independent-review repairs', () => {
-  it('an over-bound specialist batch commits its real runs and never hides them as unused (B7)', async () => {
+  it('a lens result the lead could never read whole fails its attempt with feedback; its real runs stay recorded (B7)', async () => {
     // 200 schema-valid findings per lens, each quoting a real ~3.8 KiB
-    // substring of the (padded) frozen file: two in one batch exceed even
-    // the wire frame, far past what one tool result carries to a lead.
+    // substring of the (padded) frozen file: one lens alone is far past
+    // what one tool result can carry to a lead.
     const bulk = (lens: string): string => JSON.stringify(
       Array.from({ length: 200 }, (_unused, index) => ({
         source: lens, severity: 'note', category: 'bulk', title: `${lens} bulk finding ${index}`,
@@ -1882,21 +1930,21 @@ describe('whole-PR engine: independent-review repairs', () => {
       },
     });
     const result = await h.run();
-    // Both specialists really ran and produced valid envelopes...
-    const validRuns = result.specialistRuns.filter((run) => run.status === 'valid');
-    expect(validRuns.map((run) => run.lens).sort()).toEqual(['codebase', 'security']);
-    const envelopeFiles = readdirSync(join(result.artifactDirectory, 'specialists')).filter((name) => name.endsWith('.envelope.json'));
-    expect(envelopeFiles).toHaveLength(2);
-    // ...but their oversized batch could not be delivered: the honest
-    // transport error is reported, the runs are NOT "not used".
-    expect(h.toolErrors.some((entry) =>
-      entry.tool === 'perkins_run_specialists' &&
-      /exceeds the \d+-byte tool result the lead can read; run fewer lenses per call.*recorded but their findings were not delivered/.test(entry.error),
-    )).toBe(true);
+    // Both specialists really ran (each retried once with the feedback);
+    // no oversized result is ever recorded valid-but-unreadable.
+    const runs = result.specialistRuns.filter((run) => run.lens === 'security' || run.lens === 'codebase');
+    expect(runs).toHaveLength(4);
+    for (const run of runs) {
+      expect(run.status).not.toBe('valid');
+      expect(run.error).toMatch(/over the \d+-byte result a lead can read; report fewer findings and quote only the decisive evidence lines/u);
+    }
+    // The retry prompt hands the child that feedback.
+    const retries = h.childCalls.filter((call) => (call.prompt ?? '').includes('report fewer findings'));
+    expect(retries).toHaveLength(2);
     // The lead still completes its own whole-change review honestly.
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
     const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
-    expect(receipt.specialistRuns).toBe(2);
+    expect(receipt.specialistRuns).toBe(4);
   }, 120_000);
 
   it('refusals that a child would satisfy are checked before any spawn (B7)', async () => {
@@ -2093,6 +2141,40 @@ describe('whole-PR engine: independent-review repairs', () => {
     expect(added).toBeDefined();
     expect(added!.status).toBe('A');
   });
+
+  it('a prior-revision listing larger than the lead can read lists what fits and counts the rest exactly (#487)', async () => {
+    const repo = makeFixtureRepo('whole-reader-many');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/reader']);
+    repo.commitFile('src/seed.ts', 'export const seed = 1;\n');
+    const priorTarget = repo.head();
+    // ~2,000 added paths of ~125 bytes each: past one lead-readable result.
+    commitManyPaths(repo, 2_000, `listing-${'x'.repeat(60)}`);
+    const root = temp('perkins-reader-many-');
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'NEEDS CHANGES', complete: true, headMoved: false,
+      findings: [], frozen: { targetSha: priorTarget, diffBaseSha: base },
+    }));
+    const frozen = freezeReviewInputs({
+      roundId: 'reader-many', repoPath: repo.path, artifactRoot: root,
+      baseRef: base, targetRef: repo.head(), movementRef: 'feature/reader', spec: 'reader',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-reader-many-sessions-'), { childAnswer: () => '[]', specialists: [], onPriorRevision: () => {} });
+    await new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'reader-many', roundNumber: 2, frozenReview: frozen,
+      movementRef: 'feature/reader', noSpec: false, priorConsolidatedFile: priorFile,
+    });
+    const tool = fake.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    const text = (await tool.execute({})).text;
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(REVIEW_TOOL_TEXT_MAX_BYTES);
+    const listing = JSON.parse(text) as { changes: unknown[]; omittedChangeCount?: number; note?: string };
+    expect(listing.omittedChangeCount).toBeGreaterThan(0);
+    expect(listing.changes.length + listing.omittedChangeCount!).toBe(2_000);
+    expect(listing.note).toContain('read any changed path with {"path": ...}');
+  }, LARGE_UNIT_TIMEOUT_MS);
 
   it('prior-revision path reads defeat -diff attributes and refuse ambiguous selections (N3/H7/H8)', async () => {
     const repo = makeFixtureRepo('whole-reader-attrs');
@@ -2675,35 +2757,6 @@ describe('whole-PR engine: repair pass 3', () => {
     // The un-recordable cleanup failure is still disclosed durably.
     expect(typeof consolidated.specialistRuns.find((run) => run.lens === 'edge')?.cleanupRecordingError).toBe('string');
   });
-
-  it('durably marks over-bound specialist batches as findings never delivered to the lead (R17)', async () => {
-    const bulk = (lens: string): string => JSON.stringify(
-      Array.from({ length: 200 }, (_unused, index) => ({
-        source: lens, severity: 'note', category: 'bulk', title: `${lens} bulk finding ${index}`,
-        location: 'src/main.ts:2', evidence: `  return 43; /*${'x'.repeat(3_800)}`,
-        detail: 'Bulk finding to exceed the response bound.', recommended_fix: 'None needed.',
-      })),
-    );
-    const h = wholeHarness({
-      childAnswer: (prompt) => {
-        const lens = /"source": "(security|codebase)"/u.exec(prompt)?.[1];
-        return lens === undefined ? '[]' : bulk(lens);
-      },
-      specialists: ['security', 'codebase'],
-    }, {
-      beforeFreeze: (repo) => {
-        repo.git(['checkout', 'feature/review']);
-        repo.commitFile('src/main.ts', `export function answer(): number {\n  return 43; /*${'x'.repeat(3_950)}*/\n}\n`);
-      },
-    });
-    const result = await h.run();
-    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
-      specialistRuns: Array<{ lens: string; status: string; findingsDelivered?: boolean }>;
-    };
-    const valid = consolidated.specialistRuns.filter((run) => run.status === 'valid');
-    expect(valid.map((run) => run.lens).sort()).toEqual(['codebase', 'security']);
-    expect(valid.every((run) => run.findingsDelivered === false)).toBe(true);
-  }, 120_000);
 
   it('refuses to credit a valid-but-empty lens for a lead-invented finding (R12)', async () => {
     const h = wholeHarness({

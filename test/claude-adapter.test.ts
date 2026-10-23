@@ -97,6 +97,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT',
   'CLAUDE_DOUBLE_COMPACT_HOLD_FILE',
   'CLAUDE_DOUBLE_WORKFLOW_CANDIDATE',
+  'CLAUDE_DOUBLE_BULK_FINDINGS',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
   'CLAUDE_DOUBLE_REPLAY',
@@ -1590,6 +1591,39 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await vi.waitFor(() => expect(existsSync(bridgeDirectory)).toBe(false));
       expect(result.findings).toHaveLength(2);
       expect(result.findings[0]?.verification).toMatchObject({ disposition: 'confirmed' });
+    } finally {
+      await fx.runtime.dispose();
+      repo.cleanup();
+    }
+  });
+
+  it('hands the lead a specialist batch over Claude Code\'s default inline limit whole (#487)', async () => {
+    // 199 findings (the child cap is 200) make a ~70,000-character batch: without the declared
+    // size (or the review token cap) the CLI would hand the lead a file
+    // pointer, and the double's lead fails to parse its results.
+    const fx = fixture();
+    const repo = makeFixtureRepo('claude-perkins-bulk');
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] = '1';
+    process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] = '199';
+    try {
+      const frozen = freezeReviewInputs({
+        roundId: 'claude-bulk-round', repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
+        baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'Acceptance: answer returns 43.',
+      });
+      const engine = new PerkinsWholeReview({
+        spawner: (role, options) => fx.runtime.spawn(role, options),
+        policy: loadPerkinsPolicy(),
+      });
+      const result = await engine.run({
+        roundId: 'claude-bulk-round', roundNumber: 1, frozenReview: frozen,
+        movementRef: 'feature/review', noSpec: false,
+      });
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      const security = result.specialistRuns.find((run) => run.lens === 'security' && run.status === 'valid');
+      expect(security?.findingsDelivered).toBeUndefined();
     } finally {
       await fx.runtime.dispose();
       repo.cleanup();

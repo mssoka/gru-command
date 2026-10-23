@@ -6,9 +6,11 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PERKINS_MCP_SERVER_SHA256, ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
+import {
+  PERKINS_MCP_SERVER_SHA256, REVIEW_MCP_OUTPUT_TOKENS, REVIEW_TOOL_ERROR_MAX_BYTES, REVIEW_TOOL_RESULT_MAX_CHARS,
+  REVIEW_TOOL_TEXT_MAX_BYTES, ReviewMcpBridge,
+} from '../src/runtime/review-mcp-bridge.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
-import { REVIEW_TOOL_RESULT_MAX_CHARS } from '../src/runtime/review-tool-limits.js';
 
 /**
  * Stage 1 transport survival: a bounded wait that ends without a result
@@ -395,6 +397,16 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
       type: 'text',
       text: JSON.stringify({ results: [{ lens: 'performance', findings: [{ title: 'Unbounded queue' }] }] }),
     }]);
+  });
+
+  it('keeps the lead-readable limits in order (#487)', () => {
+    // The host bound sits under the declared size (UTF-8 bytes bound the
+    // characters from above), the token cap covers the declared size at two
+    // characters a token, and an error stays under Claude Code's ~10,000-
+    // character error display.
+    expect(REVIEW_TOOL_TEXT_MAX_BYTES).toBeLessThan(REVIEW_TOOL_RESULT_MAX_CHARS);
+    expect(REVIEW_MCP_OUTPUT_TOKENS * 2).toBeGreaterThanOrEqual(REVIEW_TOOL_RESULT_MAX_CHARS);
+    expect(REVIEW_TOOL_ERROR_MAX_BYTES).toBeLessThan(10_000);
   });
 
   it('declares the inline result size Claude Code allows each review tool (#487)', async () => {

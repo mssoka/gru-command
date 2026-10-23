@@ -166,6 +166,11 @@ inside the SAME round, frozen target and lead. A round is bounded to 16 real
 specialist runs (retries included), two attempts per lens, and two real
 terminal submissions (free preflight is distinct); failed attempts count and
 stay recorded, and a completed lens cannot be rerun for a second opinion.
+Every specialist result fits one tool response the lead can read (a larger
+one fails its attempt with feedback to report fewer, shorter findings); a
+response lists any result it could not carry whole as `withheld`, and the
+lead collects it by calling the tool again for that lens, which starts no
+child. A result never collected stays recorded as not delivered.
 Lenses the lead did not use are reported as `not used`, never as coverage.
 Immediately after the freeze (and before the run promise or any lead/child
 spawn), an **admission preflight** re-validates the complete frozen packet
