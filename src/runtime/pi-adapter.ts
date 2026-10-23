@@ -1666,7 +1666,11 @@ export class PiAgentHandle implements AgentHandle {
         this.pendingCompactionEnd === null && this.explicitCompactionTerminal?.settled !== false && this.queue.length === 0;
       if (!this.nativeQuiescent) throw new Error('Pi disposal lacks genuine native/adapter quiescence — writer ownership retained');
     } catch (error) { failures.push(error); }
-    try { this.settleCessationEvidence(); } catch (error) { failures.push(error); }
+    try {
+      // A kept owner fails this disposal (retryable); a re-query only logs it.
+      const kept = this.settleCessationEvidence();
+      if (kept !== null) failures.push(kept.error);
+    } catch (error) { failures.push(error); }
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, `Pi native disposal/ownership cleanup failed: ${failures.map(String).join('; ')}`);
   }
@@ -1695,15 +1699,16 @@ export class PiAgentHandle implements AgentHandle {
    * (UNKNOWN can later flip to 'ceased' when an independently owned bash
    * controller finishes — the evidence event fires on that late transition
    * too). 'ceased' requires BOTH the post-dispose idle proof and an
-   * idle-free controller set. */
-  private settleCessationEvidence(): void {
-    if (this.cessationState === 'ceased') return; // once-only positive
-    if (this.settlingCessation) return;
+   * idle-free controller set. Returns the receipt or lock failure that kept
+   * ownership (#497), or null. */
+  private settleCessationEvidence(): { readonly error: unknown } | null {
+    if (this.cessationState === 'ceased') return null; // once-only positive
+    if (this.settlingCessation) return null;
     this.settlingCessation = true;
-    try { this.settleCessationEvidenceOnce(); } finally { this.settlingCessation = false; }
+    try { return this.settleCessationEvidenceOnce(); } finally { this.settlingCessation = false; }
   }
 
-  private settleCessationEvidenceOnce(): void {
+  private settleCessationEvidenceOnce(): { readonly error: unknown } | null {
     let evidence: 'ceased' | 'unknown';
     try {
       const bashActive = this.session.isBashRunning === true || this.session.hasPendingBashMessages === true;
@@ -1718,29 +1723,37 @@ export class PiAgentHandle implements AgentHandle {
     } catch {
       evidence = 'unknown'; // throwing probes are unknown, never false
     }
+    let kept: { readonly error: unknown } | null = null;
     if (evidence === 'ceased' && !this.ownershipReleased) {
       // Fallible physical receipts and the lock release precede release of
       // the runtime owner. A failed (or committed-then-thrown) write keeps the
-      // evidence UNKNOWN and the next query retries it (#497).
-      if (this.releaseNativeOwnership()) {
+      // evidence UNKNOWN; the next query or dispose() retries it (#497).
+      kept = this.releaseNativeOwnership();
+      if (kept === null) {
+        // Commit the release before publishing it: a listener of the disposed
+        // state that re-queries (the review pair's) must read 'ceased'.
+        this.ownershipReleased = true;
+        this.cessationState = 'ceased';
         this.setState('disposed');
         this.onDispose();
-        this.ownershipReleased = true;
-      } else evidence = 'unknown';
+        this.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+        return null;
+      }
+      evidence = 'unknown';
     }
     if (this.cessationState !== evidence) {
       this.cessationState = evidence;
       this.emit({ type: 'cessation_evidence', evidence });
     }
+    return kept;
   }
 
   /** The directive producers' physical receipts (#424): guard refusals still
    * owed, then cessation, then the native writer lock. A failed write is
-   * logged and returns false, as Claude's recordProducerCessation() does:
-   * disposal still settles, but ownership stays UNKNOWN until a later query
-   * writes it (#497). Each step is idempotent, so a retry never duplicates a
-   * receipt. */
-  private releaseNativeOwnership(): boolean {
+   * logged and returned: ownership stays UNKNOWN, disposal fails (retryable)
+   * and a later query retries it too (#497). Each step is idempotent, so a
+   * retry never duplicates a receipt. */
+  private releaseNativeOwnership(): { readonly error: unknown } | null {
     try {
       for (const [key, refusal] of this.pendingGuardRefusals) {
         if (refusal.toolCallId === undefined) recordDirectiveAuthorityRefusal(refusal.producer, refusal.reason);
@@ -1750,15 +1763,15 @@ export class PiAgentHandle implements AgentHandle {
       for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
     } catch (error) {
       this.log('error', 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written', { role: this.role, session: this.id, error: String(error) });
-      return false;
+      return { error };
     }
     try {
       this.store.releaseLock(this.sessionFile);
     } catch (error) {
       this.log('error', 'session lock release failed; ownership stays UNKNOWN until it is released', { role: this.role, session: this.id, error: String(error) });
-      return false;
+      return { error };
     }
-    return true;
+    return null;
   }
 
   cessationEvidence(): 'ceased' | 'unknown' {

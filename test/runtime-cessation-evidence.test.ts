@@ -482,7 +482,7 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     expect(cessationEvents(events, 'ceased')).toHaveLength(1);
   });
 
-  it.skipIf(runsAsRoot)('a receipt append that fails at disposal settles the disposal as unknown, and a later query writes it', async () => {
+  it.skipIf(runsAsRoot)('a receipt append that fails at disposal rejects that disposal and leaves an unknown a later query writes', async () => {
     const { handle, events, logs, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
     store.acquireLock(sessionFile);
     handle.prepareDirectiveProducer(GH497_IDENTITY);
@@ -494,8 +494,9 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     const journal = `${sessionFile}.producers.jsonl`;
     chmodSync(journal, 0o400);
     try {
-      // As in Claude, disposal itself settles: ownership is the evidence's to keep.
-      await handle.dispose();
+      // The failed disposal is retryable; its callers (resident reclaim,
+      // restart cleanup, re-brief) handle a rejection loudly.
+      await expect(handle.dispose()).rejects.toThrow(/EACCES/);
       expect(requeried).toEqual(['unknown']);
       expect(logs.filter((entry) => entry.msg === RECEIPT_FAILED)).toHaveLength(1);
       expect(handle.cessationEvidence()).toBe('unknown');
@@ -571,26 +572,36 @@ describe('pi cessation receipts that cannot be written stay UNKNOWN and are retr
     }
   });
 
-  it('a listener that re-queries on the disposed state does not re-enter the release', async () => {
-    const { handle, session, events, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
-    store.acquireLock(sessionFile);
-    handle.prepareDirectiveProducer(GH497_IDENTITY);
-    session.bashRunning = true;
-    await handle.dispose();
-    session.bashRunning = false;
-    // The registry's resident listener queries the evidence when the handle
-    // reports the disposed state, which the release itself emits.
-    handle.subscribe((event) => { if (event.type === 'state' && event.state === 'disposed') handle.cessationEvidence(); });
-    const release = vi.spyOn(store, 'releaseLock');
-    try {
-      expect(handle.cessationEvidence()).toBe('ceased');
-      expect(release).toHaveBeenCalledTimes(1);
-      expect(events.filter((event) => event.type === 'state' && event.state === 'disposed')).toHaveLength(1);
-      expect(owner.releases).toBe(1);
-      expect(cessationEvents(events, 'ceased')).toHaveLength(1);
-      expect(producerStates(sessionFile)).toEqual(['started', 'ceased']);
-    } finally {
-      release.mockRestore();
+  it('a listener of the disposed state reads ceased and never re-enters the release, at disposal and on a retry', async () => {
+    for (const late of [false, true]) {
+      const { handle, session, events, owner, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+      store.acquireLock(sessionFile);
+      handle.prepareDirectiveProducer(GH497_IDENTITY);
+      // The registry's review pair proves a member only when it reports the
+      // disposed state, which the release itself emits.
+      const seen: string[] = [];
+      handle.subscribe((event) => { if (event.type === 'state' && event.state === 'disposed') seen.push(handle.cessationEvidence()); });
+      const release = vi.spyOn(store, 'releaseLock');
+      try {
+        // Late: an independent bash controller outlives disposal, and a later
+        // query releases the owner.
+        session.bashRunning = late;
+        await handle.dispose();
+        if (late) {
+          expect(handle.cessationEvidence()).toBe('unknown');
+          session.bashRunning = false;
+          expect(handle.cessationEvidence()).toBe('ceased');
+        }
+        const path = late ? 'on a retry' : 'at disposal';
+        expect(seen, path).toEqual(['ceased']);
+        expect(release, path).toHaveBeenCalledTimes(1);
+        expect(events.filter((event) => event.type === 'state' && event.state === 'disposed'), path).toHaveLength(1);
+        expect(owner.releases, path).toBe(1);
+        expect(cessationEvents(events, 'ceased'), path).toHaveLength(1);
+        expect(producerStates(sessionFile), path).toEqual(['started', 'ceased']);
+      } finally {
+        release.mockRestore();
+      }
     }
   });
 });
