@@ -284,7 +284,7 @@ const PINS: Record<string, number> = {
   'notification-decisions.test.ts': 28,
   'notifications.test.ts': 20,
   'pacing-admission.test.ts': 14,
-  'pacing.test.ts': 37,
+  'pacing.test.ts': 38,
   'patch-vitest-rpc-timeout.test.ts': 11,
   'perkins-admission-preflight.test.ts': 84,
   'perkins-admission-sysctl.test.ts': 1,

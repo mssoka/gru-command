@@ -295,17 +295,17 @@ export type RuntimeEvent =
       readonly error: string;
       readonly fatal: boolean;
       /** A native directive refusal (#485): the turn failed with a
-       * `DirectiveCheckpointError` GC raised over its own state — its
-       * authority and fence checks; its own transcript, binding and receipt
-       * I/O; its own protocol checks (an answer before the echo, a second
-       * prompt, a lost frame, the permission channel's deny) — or with the
-       * `AggregateError` that replaced one whose receipt could not be
-       * journaled. GC's wrapper around an error from code GC does not own (an
-       * extension hook, the SDK, the provider) never carries it, and Pi's
-       * re-check wrapper carries it only when its own cause is a refusal. Pi
-       * correlates the failure with the refusals it recorded: by object
-       * identity while it holds the thrown object, by exact message equality
-       * where its SDK reduced it to text (a refusal always states a reason),
+       * DirectiveCheckpointError GC raised for its own directive control —
+       * its fences and authority checks, its protocol checks, and every GC
+       * directive bookkeeping I/O call (transcript, binding, receipt,
+       * producer journal, and the GC ledger calls `beforeAdmission` and
+       * `onAdmitted`), a GC bug inside those calls included — or with the
+       * AggregateError that replaced one whose receipt could not be
+       * journaled. An error from code GC does not own (an extension hook, the
+       * SDK, the provider), or GC's wrapper around one, never carries it (see
+       * `isNativeDirectiveRefusal`). Pi correlates the failure with the
+       * refusals it recorded: by object identity while it holds the thrown
+       * object, by exact message equality where its SDK reduced it to text,
        * never by substring. Claude tags a failure whose named cause is such a
        * refusal. A tagged event names no provider or model. Supervision skips
        * only a nonfatal, untyped tagged error on a directive turn (the

@@ -3326,7 +3326,7 @@ describe('supervisor — decision-backed failure guidance', () => {
       Object.defineProperty(handle, 'pendingTurn', { value: () => { throw new Error('pending turn unreadable'); } });
       h.registry.adopt(handle);
       // Routed, GC's refusal text with the disk's words walls: the fallback is visible.
-      handle.emit({ type: 'error', error: 'directive refused: directive transcript write failed: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' });
+      handle.emit({ type: 'error', error: 'directive refused: directive bookkeeping failed: transcript write: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' });
       await vi.waitFor(() => expect(handle.disposed).toBe(true));
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' });
       expect(logs).toContainEqual({ level: 'warn', msg: 'pending-turn read failed — a native directive refusal is routed as an ordinary failure' });

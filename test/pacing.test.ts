@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULT_PACING_CONFIG, type PacingConfig } from '../src/config.js';
 import {
   backoffDelayMs,
+  boundedErrorText,
   compileRateLimitPatterns,
   isRateLimitErrorText,
+  MAX_PACING_ERROR_CHARS,
   PacingGate,
   pacingExhaustedPayload,
   pacingRecoveredPayload,
@@ -648,6 +650,16 @@ describe('pacing ledger honesty (r4 triage rows A3/A4/A9)', () => {
     expect(exhausted.error.length).toBe(500);
     // Short text passes through untouched.
     expect(pacingRetryPayload(1, 3, 100, 'HTTP 429').error).toBe('HTTP 429');
+  });
+
+  it('one bounded error text for every ledger payload: whole up to the bound, marked with its length when cut, never mid code point (#485)', () => {
+    expect(boundedErrorText('x'.repeat(MAX_PACING_ERROR_CHARS))).toEqual({ error: 'x'.repeat(MAX_PACING_ERROR_CHARS) });
+    expect(boundedErrorText('y'.repeat(MAX_PACING_ERROR_CHARS + 7))).toEqual({ error: 'y'.repeat(MAX_PACING_ERROR_CHARS), error_truncated: true, error_length: MAX_PACING_ERROR_CHARS + 7 });
+    // The bound falls inside an emoji's surrogate pair: the cut keeps whole code points.
+    const split = `${'z'.repeat(MAX_PACING_ERROR_CHARS - 1)}😀 and more`;
+    expect(boundedErrorText(split)).toEqual({ error: 'z'.repeat(MAX_PACING_ERROR_CHARS - 1), error_truncated: true, error_length: split.length });
+    // Both retry producers' payloads carry the same marker.
+    expect(pacingExhaustedPayload(3, 3, split)).toEqual({ attempts: 3, max_auto_retries: 3, ...boundedErrorText(split) });
   });
 
   it('fails loud at the gate boundary on a non-finite cap instead of wedging the pool (r12 blind#6)', () => {

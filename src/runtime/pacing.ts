@@ -115,21 +115,31 @@ export function backoffDelayMs(
  * text is bounded here so both producers record the same bound. */
 export const MAX_PACING_ERROR_CHARS = 500;
 
-function boundedPacingError(error: string): string {
-  return error.length > MAX_PACING_ERROR_CHARS ? error.slice(0, MAX_PACING_ERROR_CHARS) : error;
+/** An error text bounded for a ledger payload: at most MAX_PACING_ERROR_CHARS,
+ * cut on a code-point boundary, and when cut, marked with the original length.
+ * The supervisor's retained refusals use it too (#485). */
+export interface BoundedErrorText {
+  readonly error: string;
+  readonly error_truncated?: true;
+  readonly error_length?: number;
 }
 
-export interface PacingRetryPayload {
+export function boundedErrorText(error: string): BoundedErrorText {
+  if (error.length <= MAX_PACING_ERROR_CHARS) return { error };
+  const cut = error.slice(0, MAX_PACING_ERROR_CHARS);
+  const last = cut.charCodeAt(cut.length - 1);
+  return { error: last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut, error_truncated: true, error_length: error.length };
+}
+
+export interface PacingRetryPayload extends BoundedErrorText {
   readonly attempt: number;
   readonly max_auto_retries: number;
   readonly delay_ms: number;
-  readonly error: string;
 }
 
-export interface PacingExhaustedPayload {
+export interface PacingExhaustedPayload extends BoundedErrorText {
   readonly attempts: number;
   readonly max_auto_retries: number;
-  readonly error: string;
 }
 
 export interface PacingRecoveredPayload {
@@ -143,7 +153,7 @@ export function pacingRetryPayload(
   delayMs: number,
   error: string,
 ): PacingRetryPayload {
-  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, error: boundedPacingError(error) };
+  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, ...boundedErrorText(error) };
 }
 
 export function pacingExhaustedPayload(
@@ -151,7 +161,7 @@ export function pacingExhaustedPayload(
   maxAutoRetries: number,
   error: string,
 ): PacingExhaustedPayload {
-  return { attempts, max_auto_retries: maxAutoRetries, error: boundedPacingError(error) };
+  return { attempts, max_auto_retries: maxAutoRetries, ...boundedErrorText(error) };
 }
 
 export function pacingRecoveredPayload(attempts: number, maxAutoRetries: number): PacingRecoveredPayload {
