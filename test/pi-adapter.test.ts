@@ -4117,7 +4117,7 @@ it('routes a synthesized next-turn native guard refusal locally and consumes its
   let preparations = 0;
   let clarificationApplied = false;
   let injectedProviderError = false;
-  let localRefusalBeforeProvider: RuntimeEvent | null = null;
+  const localRefusalBeforeProvider: RuntimeEvent[] = [];
   let supervisorViewBeforeProvider: ReturnType<Supervisor['viewFor']> | null = null;
   let providerWallBeforeProvider = false;
   let guardRefusalReceiptBeforeProvider = false;
@@ -4141,7 +4141,8 @@ it('routes a synthesized next-turn native guard refusal locally and consumes its
     session.subscribe((event) => {
       if (injectedProviderError || event.type !== 'message_end' || event.message.role !== 'assistant' || event.message.stopReason !== 'error') return;
       injectedProviderError = true;
-      localRefusalBeforeProvider = [...events].reverse().find((candidate) => candidate.type === 'error' && candidate.nativeControl === 'directive-refusal') ?? null;
+      const localRefusal = [...events].reverse().find((candidate) => candidate.type === 'error' && candidate.nativeControl === 'directive-refusal');
+      if (localRefusal !== undefined) localRefusalBeforeProvider.push(localRefusal);
       const liveSupervisor = supervisorHolder.current;
       if (liveSupervisor === null) throw new Error('supervisor must be constructed before the synthetic Pi session is spawned');
       supervisorViewBeforeProvider = liveSupervisor.viewFor(handle.id);
@@ -4185,10 +4186,11 @@ it('routes a synthesized next-turn native guard refusal locally and consumes its
     expect(preparations).toBeGreaterThan(0);
     expect(clarificationApplied).toBe(true);
     expect(injectedProviderError).toBe(true);
-    expect(localRefusalBeforeProvider?.type).toBe('error');
-    expect(localRefusalBeforeProvider?.type === 'error' ? localRefusalBeforeProvider.error : '').toContain('directive authority is terminal, held or superseded — no work is authorized');
-    expect(localRefusalBeforeProvider).toMatchObject({ nativeControl: 'directive-refusal', fatal: false });
-    expect(localRefusalBeforeProvider?.type === 'error' ? localRefusalBeforeProvider.typed : undefined).toBeUndefined();
+    const localRefusal = localRefusalBeforeProvider[0];
+    expect(localRefusal?.type).toBe('error');
+    expect(localRefusal?.type === 'error' ? localRefusal.error : '').toContain('directive authority is terminal, held or superseded — no work is authorized');
+    expect(localRefusal).toMatchObject({ nativeControl: 'directive-refusal', fatal: false });
+    expect(localRefusal?.type === 'error' ? localRefusal.typed : undefined).toBeUndefined();
     expect(supervisorViewBeforeProvider).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
     expect(providerWallBeforeProvider).toBe(false);
     const providerFailure = events.find((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized');
