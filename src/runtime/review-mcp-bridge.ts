@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { NativeAgentTool } from './types.js';
+import { REVIEW_TOOL_RESULT_MAX_CHARS } from './review-tool-limits.js';
 
 const MAX_BRIDGE_MESSAGE_BYTES = 1024 * 1024;
 const PARTIAL_FRAME_TIMEOUT_MS = 5_000;
@@ -274,6 +275,9 @@ export class ReviewMcpBridge {
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
+            // Claude Code otherwise cuts a result over ~50,000 characters
+            // to a file pointer the confined lead cannot open.
+            _meta: { 'anthropic/maxResultSizeChars': REVIEW_TOOL_RESULT_MAX_CHARS },
           })),
         });
         return;

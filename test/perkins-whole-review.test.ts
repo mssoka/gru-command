@@ -24,6 +24,7 @@ import {
   type FrozenReview,
 } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
+import { REVIEW_TOOL_TEXT_MAX_BYTES } from '../src/runtime/review-tool-limits.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
 import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
@@ -942,6 +943,35 @@ describe('Perkins whole-PR lead engine', () => {
     expect(noSpecPrompt).not.toContain('- acceptance: ');
   });
 
+  it('a specialist batch larger than the lead can read is refused and recorded undelivered, never cut (#487)', async () => {
+    // 2 lenses x 30 findings x ~3.5 KB of located evidence is about 210 KB:
+    // under the 900 KiB wire bound, over what one tool result can carry to
+    // a lead (Claude Code would hand it a file pointer it cannot open).
+    const line = (n: number): string => `export const value${n} = '${'x'.repeat(3_500)}';`;
+    const h = wholeHarness({
+      specialists: ['security', 'tests'],
+      childAnswer: (prompt) => {
+        const source = /"source": "(security|tests)"/u.exec(prompt)?.[1];
+        if (source === undefined) return '[]';
+        return JSON.stringify(Array.from({ length: 30 }, (_, index) => groundedFinding(source, 'note', {
+          title: `${source} oversized finding ${index}`, location: `src/big.ts:${index + 1}`, evidence: line(index + 1),
+        })));
+      },
+    }, {
+      beforeFreeze: (repo) => {
+        repo.commitFile('src/big.ts', `${Array.from({ length: 30 }, (_, index) => line(index + 1)).join('\n')}\n`);
+      },
+    });
+    const result = await h.run();
+    expect(h.toolErrors.some((entry) => entry.error.includes(
+      `specialist result batch exceeds the ${REVIEW_TOOL_TEXT_MAX_BYTES}-byte tool result the lead can read; run fewer lenses per call`,
+    ))).toBe(true);
+    expect(result.specialistRuns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ lens: 'security', status: 'valid', findingsDelivered: false }),
+      expect.objectContaining({ lens: 'tests', status: 'valid', findingsDelivered: false }),
+    ]));
+  });
+
   it('a performance and an operations finding survive child validation, lead submission and attribution', async () => {
     const h = wholeHarness({
       childAnswer: (prompt) => {
@@ -1830,8 +1860,8 @@ function priorHarness(options: {
 describe('whole-PR engine: independent-review repairs', () => {
   it('an over-bound specialist batch commits its real runs and never hides them as unused (B7)', async () => {
     // 200 schema-valid findings per lens, each quoting a real ~3.8 KiB
-    // substring of the (padded) frozen file: one lens fits the transport,
-    // two in one batch exceed the wire frame.
+    // substring of the (padded) frozen file: two in one batch exceed even
+    // the wire frame, far past what one tool result carries to a lead.
     const bulk = (lens: string): string => JSON.stringify(
       Array.from({ length: 200 }, (_unused, index) => ({
         source: lens, severity: 'note', category: 'bulk', title: `${lens} bulk finding ${index}`,
@@ -1861,7 +1891,7 @@ describe('whole-PR engine: independent-review repairs', () => {
     // transport error is reported, the runs are NOT "not used".
     expect(h.toolErrors.some((entry) =>
       entry.tool === 'perkins_run_specialists' &&
-      /exceeds the bounded (serialized )?tool response.*recorded but their findings were not delivered/.test(entry.error),
+      /exceeds the \d+-byte tool result the lead can read; run fewer lenses per call.*recorded but their findings were not delivered/.test(entry.error),
     )).toBe(true);
     // The lead still completes its own whole-change review honestly.
     expect(result.canonicalVerdict).toBe('READY TO MERGE');

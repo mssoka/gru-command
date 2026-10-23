@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PERKINS_MCP_SERVER_SHA256, ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
+import { REVIEW_TOOL_RESULT_MAX_CHARS } from '../src/runtime/review-tool-limits.js';
 
 /**
  * Stage 1 transport survival: a bounded wait that ends without a result
@@ -394,6 +395,23 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
       type: 'text',
       text: JSON.stringify({ results: [{ lens: 'performance', findings: [{ title: 'Unbounded queue' }] }] }),
     }]);
+  });
+
+  it('declares the inline result size Claude Code allows each review tool (#487)', async () => {
+    // Without the declaration Claude Code turns a result over ~50,000
+    // characters into a file pointer the confined lead cannot open.
+    const bridge = await ReviewMcpBridge.start([
+      { name: 'perkins_probe', description: 'probe', inputSchema: { type: 'object' }, execute: async () => ({ text: 'ok' }) },
+      { name: 'perkins_other', description: 'other', inputSchema: { type: 'object' }, execute: async () => ({ text: 'ok' }) },
+    ]);
+    bridges.push(bridge);
+    const client = serverClient(spawnServer(bridge.socketPath));
+    await client.call(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+    const listed = (await client.call(2, 'tools/list', {})) as { result?: { tools?: Array<{ name: string; _meta?: unknown }> } };
+    expect(listed.result?.tools?.map((tool) => [tool.name, tool._meta])).toEqual([
+      ['perkins_probe', { 'anthropic/maxResultSizeChars': REVIEW_TOOL_RESULT_MAX_CHARS }],
+      ['perkins_other', { 'anthropic/maxResultSizeChars': REVIEW_TOOL_RESULT_MAX_CHARS }],
+    ]);
   });
 
   it('reports a dead bridge as an accurate terminal error, never still-running', async () => {

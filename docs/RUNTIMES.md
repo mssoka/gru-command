@@ -51,7 +51,13 @@ branch on harness. The ADAPTER implements the declaration:
   bridge's summary details, never sending `structuredContent`: Claude Code
   shows the model the structuredContent JSON instead of the text when both
   are present, which would hand the lead summary counts in place of
-  specialist findings or preflight errors.
+  specialist findings or preflight errors. Claude Code also replaces a
+  result over its inline limits with a pointer to a file the confined lead
+  cannot open, so each review tool declares
+  `_meta["anthropic/maxResultSizeChars"]`, review sessions run with
+  `MAX_MCP_OUTPUT_TOKENS` set, and the host bounds what a tool hands the lead
+  below both (`src/runtime/review-tool-limits.ts`, the same bound on pi): a
+  larger specialist batch is refused and recorded as not delivered.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes

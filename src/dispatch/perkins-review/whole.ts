@@ -12,6 +12,7 @@ import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
+import { REVIEW_TOOL_TEXT_MAX_BYTES } from '../../runtime/review-tool-limits.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
@@ -50,7 +51,8 @@ const MAX_LEAD_ARTIFACT_BYTES = 100 * 1024;
 /** Response bound for one native-tool response, measured on the FULL wire
  * frame the Claude MCP bridge serializes (result text re-serialized inside
  * a JSON-RPC frame whose server rejects >1 MiB), leaving margin for ids and
- * protocol growth. Pi's in-process path has the same ceiling by symmetry. */
+ * protocol growth. Pi's in-process path has the same ceiling by symmetry.
+ * What a lead can READ of one result is smaller: REVIEW_TOOL_TEXT_MAX_BYTES. */
 const MAX_TOOL_RESPONSE_BYTES = 900 * 1024;
 const MAX_WIRE_FRAME_BYTES = 1024 * 1024 - 64 * 1024;
 
@@ -2078,8 +2080,10 @@ export class PerkinsWholeReview {
           throw new Error('review already has an accepted terminal submission');
         }
         try {
-          if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
-            throw new Error('specialist result batch exceeds the bounded tool response');
+          // The lead reads at most REVIEW_TOOL_TEXT_MAX_BYTES of one result;
+          // a longer batch would reach it as a file pointer it cannot open.
+          if (Buffer.byteLength(payload, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) {
+            throw new Error(`specialist result batch exceeds the ${REVIEW_TOOL_TEXT_MAX_BYTES}-byte tool result the lead can read; run fewer lenses per call`);
           }
           assertToolResponseFits(payload, { resultCount: childResults.length }, 'specialist result batch');
         } catch (error) {
@@ -2254,8 +2258,8 @@ export class PerkinsWholeReview {
           ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, path: value.path, diff });
         }
-        if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
-          throw new Error('prior revision response exceeds the bounded tool response; select a smaller path');
+        if (Buffer.byteLength(payload, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) {
+          throw new Error(`prior revision response exceeds the ${REVIEW_TOOL_TEXT_MAX_BYTES}-byte tool result the lead can read; select a smaller path`);
         }
         assertToolResponseFits(payload, { priorTargetSha, targetSha: review.manifest.targetSha }, 'prior revision response');
         return { text: payload, details: { priorTargetSha, targetSha: review.manifest.targetSha } };
@@ -2350,9 +2354,10 @@ export class PerkinsWholeReview {
           errorCount: issues.length,
           errors: issues,
         });
-        // The response is wire-bounded: every issue stays durable in the
-        // artifact above; the response carries as many as fit plus an
-        // explicit omitted count and pointer — never silent truncation.
+        // The response is bounded to what the lead can read: every issue
+        // stays durable in the artifact above; the response carries as many
+        // as fit plus an explicit omitted count and pointer — never silent
+        // truncation.
         const included: SubmissionValidationIssue[] = [];
         for (const issue of issues) {
           const candidate = JSON.stringify({
@@ -2361,7 +2366,7 @@ export class PerkinsWholeReview {
             omittedErrorCount: issues.length - included.length - 1,
             fullList: artifact,
           });
-          if (Buffer.byteLength(JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text: candidate } }), 'utf8') > MAX_WIRE_FRAME_BYTES) break;
+          if (Buffer.byteLength(candidate, 'utf8') > REVIEW_TOOL_TEXT_MAX_BYTES) break;
           included.push(issue);
         }
         return {

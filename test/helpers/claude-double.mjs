@@ -398,6 +398,8 @@ async function mcpSession(configFile) {
   });
   let nextId = 1;
   const pending = new Map();
+  // Per-tool inline size each tools/list declared (the real CLI reads it).
+  const declaredSizes = new Map();
   const lines = createInterface({ input: proc.stdout });
   lines.on('line', (line) => {
     if (!line.trim()) return;
@@ -422,8 +424,19 @@ async function mcpSession(configFile) {
       timer.unref?.();
       pending.set(id, (message) => {
         clearTimer(timer);
-        if (message.error !== undefined) reject(new Error(message.error.message ?? 'mcp error'));
-        else resolve(message);
+        if (message.error !== undefined) {
+          reject(new Error(message.error.message ?? 'mcp error'));
+          return;
+        }
+        if (method === 'tools/list') {
+          for (const tool of message.result?.tools ?? []) {
+            const size = tool._meta?.['anthropic/maxResultSizeChars'];
+            if (typeof size === 'number') declaredSizes.set(tool.name, size);
+          }
+        }
+        resolve(method === 'tools/call'
+          ? { ...message, inlineLimit: declaredSizes.get(params?.name) ?? MCP_DEFAULT_INLINE_CHARS }
+          : message);
       });
       proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     });
@@ -440,12 +453,22 @@ async function mcpSession(configFile) {
   };
 }
 
+/** Claude Code 2.1.309's inline limits for one MCP tool result: about
+ * 50,000 characters unless the tool declares `anthropic/maxResultSizeChars`,
+ * and MAX_MCP_OUTPUT_TOKENS (default 25,000; ~4 characters a token). */
+const MCP_DEFAULT_INLINE_CHARS = 50_000;
+
 /** What the model reads from an MCP tool result. Like Claude Code 2.1.309,
- * a structuredContent object replaces the text content entirely. */
+ * a structuredContent object replaces the text content entirely, and a
+ * result over either inline limit becomes a saved-file pointer. */
 function mcpToolText(response) {
   if (response.result?.structuredContent !== undefined) return JSON.stringify(response.result.structuredContent);
   const text = response.result?.content?.[0]?.text;
   if (typeof text !== 'string') throw new Error('mcp tool returned no text');
+  const tokenCap = Number(process.env['MAX_MCP_OUTPUT_TOKENS'] ?? '25000');
+  if (text.length > (response.inlineLimit ?? MCP_DEFAULT_INLINE_CHARS) || text.length / 4 > tokenCap) {
+    return `Error: result (${text.length} characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /tmp/claude-double-tool-result.txt`;
+  }
   return text;
 }
 
