@@ -160,8 +160,10 @@ export class Logger {
  * toJSON field that would otherwise replace the whole line (undefined keys
  * never reach the output). A field that cannot be serialized (a BigInt, a
  * cycle, a throwing getter or toJSON) is dropped and named with its reason
- * under `fields_unserializable`; the other fields still land. If the
- * salvaged record still fails as a whole, the line keeps ts/level/msg alone.
+ * under `fields_unserializable`; the other fields still land. If salvage
+ * itself fails (the salvaged record still throws, or the field keys cannot
+ * be read), the line keeps ts/level/msg plus `fields_unserializable:
+ * 'unknown'`.
  */
 function serializeRecord(level: LogLevel, msg: string, fields: Record<string, unknown>): string {
   const ts = new Date().toISOString();

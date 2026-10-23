@@ -137,15 +137,22 @@ describe('logger never throws (#496)', () => {
         'odd',
         /^unknown$/,
       ],
-      // The salvaged record keeps the reserved-keys-last order and the
-      // toJSON disarm.
+      // In the salvaged record the reserved keys still win over call-site
+      // values, and the toJSON disarm still holds.
       [
         'spoof-and-hijack',
         { lane: 'L-42', count: 10n, level: 'fake', msg: 'spoofed', toJSON: () => ({ hijacked: true }) },
         'count',
         /BigInt/,
       ],
-      // An own __proto__ field (JSON.parse makes one) stays a field.
+      // An own __proto__ field (JSON.parse makes one) stays a field, and is
+      // named when it is the unserializable one.
+      [
+        'bad-own-proto',
+        Object.defineProperty({ lane: 'L-42' }, '__proto__', { value: 10n, enumerable: true }),
+        '__proto__',
+        /BigInt/,
+      ],
       ['own-proto', Object.assign(JSON.parse('{"__proto__":{"x":1},"lane":"L-42"}'), { count: 10n }), 'count', /BigInt/],
     ];
     for (const [name, fields] of cases) {
