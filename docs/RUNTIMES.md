@@ -46,7 +46,29 @@ branch on harness. The ADAPTER implements the declaration:
   that declared set over a private 0700 Unix socket; the CLI sees it via
   `--mcp-config` + `--allowedTools`. The bridge lives and dies with its
   handle — closed on dispose and on failed-spawn cleanup — so every
-  concurrent lens child of a round owns one bridge and none leaks.
+  concurrent lens child of a round owns one bridge and none leaks. The MCP
+  server forwards a tool result to the CLI as its text only and drops the
+  bridge's summary details, never sending `structuredContent`: Claude Code
+  shows the model the structuredContent JSON instead of the text when both
+  are present, which would hand the lead summary counts in place of
+  specialist findings or preflight errors. Claude Code also replaces a
+  result over its inline limits with a pointer to a file the confined lead
+  cannot open, so each review tool declares
+  `_meta["anthropic/maxResultSizeChars"]`, review sessions run with
+  `MAX_MCP_OUTPUT_TOKENS` set, and the host bounds what a tool hands the lead
+  below both (`src/runtime/review-mcp-bridge.ts`, the same bounds on pi). A
+  specialist result the lead could never read whole fails its attempt with
+  retry feedback; a batch that does not fit one response delivers whole
+  results and lists the rest as `withheld` for the lead to collect; the
+  preflight error list and the prior-revision listing carry what fits plus
+  an exact omitted count. A tool error is cut by Claude Code past ~10,000
+  characters, so a submission rejection stays under that and points at
+  preflight for the full list. The bridge keeps a settled success for a
+  caller whose transport wait ended (it re-attaches with the same request)
+  and drops it once its response is flushed to a live caller, so a retry or
+  a collect with the same arguments runs for real. The MCP server's
+  15-minute wait answers still-running only on a quiet transport: a
+  response already arriving is read to its end, not dropped.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes
@@ -73,10 +95,13 @@ single-operation queue.
   Pi also compacts automatically: before a prompt, between a completed tool
   round and the next model call, and after a run's final reply. After an
   error reply, or a truncated reply without tool calls, Pi may compact and
-  continue the turn; GC reads only that linked shape (an error or length
-  reply, a compaction linked on it, a reply continued from it), never Pi's
-  reason for it. The adapter publishes an automatic compaction's terminal at
-  Pi's settle point, as soon as Pi's compaction flag clears. Next-turn
+  continue the turn; GC reads only that linked shape (an error or call-less
+  length reply, a compaction linked on it, a reply continued from it), never
+  Pi's reason for it. A retryable provider error Pi auto-retries instead is
+  read by its live `retry-start` receipt
+  ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md)). The adapter
+  publishes an automatic compaction's terminal at Pi's settle point, as
+  soon as Pi's compaction flag clears. Next-turn
   preparation waits for it before a directive's authority check. A
   continued reply has no preparation and relies on that settle point, so it
   is ordered while Pi's own compaction holds the flag alone; another holder

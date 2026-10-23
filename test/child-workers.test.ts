@@ -1059,15 +1059,14 @@ legacy.handle
          VALUES ('job-1', 'r', 'legacy', 'dispatched', NULL, NULL, NULL, 'b', ?, ?)`,
       )
       .run(seededAt, seededAt);
-    before.registerWorktree({
-      id: 'job-1',
-      kind: 'job',
-      repoPath: '/tmp/r',
-      repoName: 'r',
-      path: '/tmp/r/wt',
-      sha: 'abc',
-      jobId: 'job-1',
-    });
+    // The lane too: the merged build's registerWorktree also writes
+    // worktrees.lane_token (migration 31).
+    legacy.handle
+      .prepare(
+        `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at)
+         VALUES ('job-1', 'job', '/tmp/r', 'r', '/tmp/r/wt', NULL, 'abc', 'job-1', NULL, 'active', NULL, ?, ?)`,
+      )
+      .run(seededAt, seededAt);
     before.recordWorktreeProcesses({
       worktreeId: 'job-1',
       processes: [{ pid: 123, command: 'sleep 1', evidence: 'argv' }],

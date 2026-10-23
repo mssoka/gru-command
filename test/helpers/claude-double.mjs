@@ -220,7 +220,8 @@ function recordInvocation(prompt, images) {
   if (!logFile) return;
   appendFileSync(
     logFile,
-    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: resolvedBackgroundSwitch() })}\n`,
+    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: resolvedBackgroundSwitch(),
+      laneToken: process.env['GRU_LANE_TOKEN'] ?? null, laneJob: process.env['GRU_LANE_JOB'] ?? null })}\n`,
     'utf8',
   );
 }
@@ -444,6 +445,8 @@ async function mcpSession(configFile) {
   });
   let nextId = 1;
   const pending = new Map();
+  // Per-tool inline size each tools/list declared (the real CLI reads it).
+  const declaredSizes = new Map();
   const lines = createInterface({ input: proc.stdout });
   lines.on('line', (line) => {
     if (!line.trim()) return;
@@ -468,8 +471,19 @@ async function mcpSession(configFile) {
       timer.unref?.();
       pending.set(id, (message) => {
         clearTimer(timer);
-        if (message.error !== undefined) reject(new Error(message.error.message ?? 'mcp error'));
-        else resolve(message);
+        if (message.error !== undefined) {
+          reject(new Error(message.error.message ?? 'mcp error'));
+          return;
+        }
+        if (method === 'tools/list') {
+          for (const tool of message.result?.tools ?? []) {
+            const size = tool._meta?.['anthropic/maxResultSizeChars'];
+            if (typeof size === 'number') declaredSizes.set(tool.name, size);
+          }
+        }
+        resolve(method === 'tools/call'
+          ? { ...message, inlineLimit: declaredSizes.get(params?.name) ?? MCP_DEFAULT_INLINE_CHARS }
+          : message);
       });
       proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     });
@@ -486,9 +500,22 @@ async function mcpSession(configFile) {
   };
 }
 
+/** Claude Code 2.1.309's inline limits for one MCP tool result: about
+ * 50,000 characters unless the tool declares `anthropic/maxResultSizeChars`,
+ * and MAX_MCP_OUTPUT_TOKENS (default 25,000; ~4 characters a token). */
+const MCP_DEFAULT_INLINE_CHARS = 50_000;
+
+/** What the model reads from an MCP tool result. Like Claude Code 2.1.309,
+ * a structuredContent object replaces the text content entirely, and a
+ * result over either inline limit becomes a saved-file pointer. */
 function mcpToolText(response) {
+  if (response.result?.structuredContent !== undefined) return JSON.stringify(response.result.structuredContent);
   const text = response.result?.content?.[0]?.text;
   if (typeof text !== 'string') throw new Error('mcp tool returned no text');
+  const tokenCap = Number(process.env['MAX_MCP_OUTPUT_TOKENS'] ?? '25000');
+  if (text.length > (response.inlineLimit ?? MCP_DEFAULT_INLINE_CHARS) || text.length / 4 > tokenCap) {
+    return `Error: result (${text.length} characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /tmp/claude-double-tool-result.txt`;
+  }
   return text;
 }
 
@@ -791,6 +818,12 @@ async function run() {
           for (const finding of result.findings) findings.push(finding);
         }
       }
+      // Bulk delivery probe: every bulk finding must have reached the lead
+      // inline; the lead then drops them, as one it cannot ground.
+      const bulkCount = Number(process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] ?? '0');
+      const bulkSeen = findings.filter((finding) => finding.title.startsWith('Bulk delivery finding')).length;
+      if (bulkSeen !== bulkCount) throw new Error(`lead received ${bulkSeen} of ${bulkCount} bulk findings`);
+      findings.splice(0, findings.length, ...findings.filter((finding) => !finding.title.startsWith('Bulk delivery finding')));
       const submission = await session.call('tools/call', {
         name: 'perkins_submit_review',
         arguments: {
@@ -839,8 +872,18 @@ async function run() {
       // scoped bridge): submit findings through the product tool exactly as
       // the real model would. The host owns the lens id, so the input omits
       // `source` — the same shape the prompt demands.
+      const bulkCount = Number(process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] ?? '0');
+      // CLAUDE_DOUBLE_BULK_LONG=1 pads each finding (~760 bytes) so the batch
+      // passes the CLI's default token cap as well as its size limit.
+      const long = process.env['CLAUDE_DOUBLE_BULK_LONG'] === '1';
+      const bulk = Array.from({ length: lens === 'security' ? bulkCount : 0 }, (_, index) => ({
+        severity: 'note', category: 'bulk',
+        title: `Bulk delivery finding ${index}${long ? ` ${'t'.repeat(100)}` : ''}`, location: 'src/main.ts:2', evidence: '  return 43;',
+        detail: long ? `One of many findings that must reach the lead inline ${'d'.repeat(190)}` : 'One of many findings that must reach the lead inline.',
+        recommended_fix: long ? `No change needed for this delivery probe ${'f'.repeat(200)}` : 'No change needed for this delivery probe.',
+      }));
       const findings = lens === 'security'
-        ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }]
+        ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }, ...bulk]
         : lens === 'tests'
           ? [{ severity: 'warning', category: 'coverage', title: 'Changed behavior lacks test tracing', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed return value has no direct assertion.', recommended_fix: 'Add an assertion for the changed return value.' }]
           : [];

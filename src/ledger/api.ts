@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
+import { newLaneToken } from '../worktrees/lane-provenance.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
@@ -896,6 +897,11 @@ export interface WorktreeRecord {
   readonly note: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** #486: the lane incarnation's random token, which every session
+   * spawned in the lane carries as GRU_LANE_TOKEN (see
+   * worktrees/lane-provenance.ts). NULL only for a lane swept before the
+   * token existed. */
+  readonly laneToken: string | null;
 }
 
 /** Durable review-owner cessation (#464): recorded only through
@@ -3019,8 +3025,8 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, base_source, job_id, round_id, status, note, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
+          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, base_source, job_id, round_id, status, note, created_at, updated_at, lane_token)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)`,
         )
         .run(
           input.id,
@@ -3035,6 +3041,7 @@ export class LedgerApi {
           input.roundId ?? null,
           ts,
           ts,
+          newLaneToken(),
         );
       this.appendEvent({
         kind: 'worktree.created',
@@ -3055,6 +3062,19 @@ export class LedgerApi {
 
   getWorktree(id: string): WorktreeRecord | null {
     const row = this.db.prepare('SELECT * FROM worktrees WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.worktreeFromRow(row);
+  }
+
+  /** #486: the lane not yet swept whose registered path is exactly `path`
+   * (paths are unique), or null: the lane a session spawned there belongs to. */
+  findLiveWorktreeAtPath(path: string): WorktreeRecord | null {
+    const row = this.db.prepare("SELECT * FROM worktrees WHERE path = ? AND status <> 'swept'").get(path) as Row | undefined;
+    return row === undefined ? null : this.worktreeFromRow(row);
+  }
+
+  /** #486: the lane a lane token belongs to, or null. */
+  findWorktreeByLaneToken(token: string): WorktreeRecord | null {
+    const row = this.db.prepare('SELECT * FROM worktrees WHERE lane_token = ?').get(token) as Row | undefined;
     return row === undefined ? null : this.worktreeFromRow(row);
   }
 
@@ -3173,7 +3193,14 @@ export class LedgerApi {
          ON CONFLICT (worktree_id, pid) DO UPDATE SET
            state = excluded.state,
            command = excluded.command,
-           last_seen = excluded.last_seen`,
+           last_seen = excluded.last_seen,
+           -- #486: a reap by the lane's token is the row's proof, whatever
+           -- first tied the pid to the tree; and a row that had left 'live'
+           -- (killed, exited) recorded live again is another process, or one
+           -- seen afresh, with the evidence it is seen by now (stale
+           -- 'registry' or 'lane-token' proof never carries over). A live row
+           -- keeps the evidence it was first found by.
+           evidence = CASE WHEN excluded.evidence = 'lane-token' OR (state <> 'live' AND excluded.state = 'live') THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
         upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
@@ -4072,6 +4099,20 @@ export class LedgerApi {
       .prepare('SELECT * FROM child_workers WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1')
       .get(agentId) as Row | undefined;
     return row === undefined ? null : this.childWorkerFromRow(row);
+  }
+
+  /** Issue #161: the child workers that have not finished and that a
+   * release of `lane` would abandon: a child lane's own child, or every one
+   * of a job lane's job. Every release an operator or the owner asks for
+   * refuses while any is left (#486: the owner's answer to a paused sweep's
+   * card too). */
+  unfinishedChildWorkersOf(lane: Pick<WorktreeLane, 'id' | 'kind' | 'jobId'>): readonly ChildWorkerRecord[] {
+    if (lane.kind === 'child') {
+      const child = this.getChildWorker(lane.id);
+      return child !== null && child.resultState === null ? [child] : [];
+    }
+    if (lane.kind !== 'job' || lane.jobId === null) return [];
+    return this.listChildWorkers({ jobId: lane.jobId }).filter((child) => child.resultState === null);
   }
 
   listChildWorkers(
@@ -5621,6 +5662,17 @@ export class LedgerApi {
     });
   }
 
+  /** Open rows whose kind starts with exactly `prefix`, case included
+   * (#486: a lane's sweep-pause cards, `worktree-sweep-paused:<lane>:<pause>`),
+   * oldest first. */
+  listOpenNotificationsByKindPrefix(prefix: string): readonly NotificationRecord[] {
+    if (prefix === '') throw new Error('kind prefix must be non-empty');
+    const rows = this.db
+      .prepare('SELECT id FROM notifications WHERE substr(kind, 1, length(?)) = ? AND resolved_at IS NULL ORDER BY ts, id')
+      .all(prefix, prefix) as Row[];
+    return rows.map((raw) => this.getNotification(str(raw.id))).filter((record): record is NotificationRecord => record !== null);
+  }
+
   /** The open (unresolved) rows of some kinds (#427: the lane rows a
    * reconcile settles once their lane is gone). */
   listOpenNotificationsByKinds(kinds: readonly string[]): readonly NotificationRecord[] {
@@ -6097,6 +6149,7 @@ export class LedgerApi {
       note: nstr(row.note),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
+      laneToken: nstr(row.lane_token),
     };
   }
 

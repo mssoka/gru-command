@@ -1013,12 +1013,11 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       const overflow = 'prompt is too long: 150000 tokens > 100000 maximum';
       const failed = f.native.append({ role: 'assistant', stopReason: 'error', errorMessage: overflow, content: calls ? bashCall('never-run').content : [] });
       // The run ended on that error: only Pi's compaction ran after it, and
-      // continue() would reject the assistant tip. Without tool calls this is
-      // the failed reply's terminal; an error reply holding tool calls reads
-      // UNKNOWN ('malformed native tool identity').
+      // continue() would reject the assistant tip. This is the failed reply's
+      // terminal, with or without tool calls: an error reply's calls never
+      // ran and owe no results (owner ruling 2026-10-22, #483).
       appendLine(f.file, piCompaction('compaction', failed, user));
-      if (calls) expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual({ state: 'unknown', reason: 'malformed native tool identity' });
-      else expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: failed, error: overflow });
+      expect(inspectDirectiveCheckpoint(f.file, f.identity), `calls: ${String(calls)}`).toMatchObject({ state: 'terminal', ok: false, checkpointId: failed, error: overflow });
       expectSettlement(f, false, calls ? 'lost-continued-reply-with-calls' : 'lost-continued-reply');
     }
   });

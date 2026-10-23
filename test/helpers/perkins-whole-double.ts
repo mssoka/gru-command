@@ -90,6 +90,9 @@ export interface WholeLeadOptions {
    * runtime.
    */
   readonly childNativeTools?: 'tool' | 'text-only';
+  /** Leave results a response withheld for size uncollected (default: the
+   * lead collects them, as the tool tells it to). */
+  readonly ignoreWithheld?: boolean;
   /** Lenses the lead runs as specialists. Default: the review's whole
    * catalog parsed from the run tool's declared schema. [] = none. */
   readonly specialists?: readonly string[];
@@ -168,6 +171,8 @@ export function fakeWholeSpawner(
   readonly attemptedBatches: ReadonlyArray<ReadonlyArray<string>>;
   /** Accepted run tool calls' lens lists in order (children actually started). */
   readonly runBatches: ReadonlyArray<ReadonlyArray<string>>;
+  /** Calls that collected results an earlier response withheld for size. */
+  readonly collectBatches: ReadonlyArray<ReadonlyArray<string>>;
   /** Post-worklist probes, success or refusal. */
   readonly probeOutcomes: ReadonlyArray<{ readonly lenses: readonly string[]; readonly ok: boolean; readonly error?: string }>;
 } {
@@ -177,6 +182,7 @@ export function fakeWholeSpawner(
   const toolErrors: { tool: string; error: string }[] = [];
   const attemptedBatches: string[][] = [];
   const runBatches: string[][] = [];
+  const collectBatches: string[][] = [];
   const probeOutcomes: { lenses: readonly string[]; ok: boolean; error?: string }[] = [];
   const preflightResults: { text: string; details?: Readonly<Record<string, unknown>>; terminate?: boolean }[] = [];
   let next = 0;
@@ -298,9 +304,11 @@ export function fakeWholeSpawner(
       first = false;
       attemptedBatches.push([...runs]);
       try {
-        const response = JSON.parse((await runTool.execute({ runs: runs.map((lens) => ({ lens })) })).text) as {
+        type RunResponse = {
           results: Array<{ lens: string; status: string; failureKind?: string; error?: string; findings?: WholeFindingView[] }>;
+          withheld?: Array<{ lens: string }>;
         };
+        const response = JSON.parse((await runTool.execute({ runs: runs.map((lens) => ({ lens })) })).text) as RunResponse;
         runBatches.push([...runs]);
         for (const result of response.results) {
           if (result.status === 'valid') findings.push(...(result.findings ?? []));
@@ -308,6 +316,16 @@ export function fakeWholeSpawner(
             retried.add(result.lens);
             worklist.push(result.lens);
           }
+        }
+        // Collect what the response withheld for size, as the tool says.
+        let withheld = options.ignoreWithheld === true ? [] : (response.withheld ?? []).map((entry) => entry.lens);
+        while (withheld.length > 0) {
+          const collected = JSON.parse((await runTool.execute({ runs: withheld.map((lens) => ({ lens })) })).text) as RunResponse;
+          collectBatches.push([...withheld]);
+          for (const result of collected.results) {
+            if (result.status === 'valid') findings.push(...(result.findings ?? []));
+          }
+          withheld = (collected.withheld ?? []).map((entry) => entry.lens);
         }
       } catch (error) {
         // A refused batch (duplicate lens, exhausted attempts, transport
@@ -583,7 +601,7 @@ export function fakeWholeSpawner(
     return handle;
   };
 
-  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults, attemptedBatches, runBatches, probeOutcomes };
+  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults, attemptedBatches, runBatches, collectBatches, probeOutcomes };
 }
 
 /** A grounded finding the scripted child can return for a fixture diff. */

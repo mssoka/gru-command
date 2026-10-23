@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from '
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Role } from '../config.js';
+import { REVIEW_MCP_OUTPUT_TOKENS } from './review-mcp-bridge.js';
 
 /** Only model selection and credential/provider environment are permitted
  * from the user's Claude settings. Never load repo settings, tools, hooks,
@@ -128,8 +129,14 @@ export function claudeReviewProcessEnv(configuration: ClaudeReviewConfiguration)
     if (AUTH_ENV.test(name)) delete env[name];
   }
   // Without --safe-mode the CLI would load the user's auto-memory into the
-  // review; the flag is set last so authEnv cannot re-enable it.
-  return { ...env, ...configuration.authEnv, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
+  // review; the flag is set last so authEnv cannot re-enable it. The MCP
+  // output-token cap is fixed, not left to the CLI's default or a flag, so
+  // a review tool result the host admits reaches the lead whole.
+  return {
+    ...env, ...configuration.authEnv,
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+    MAX_MCP_OUTPUT_TOKENS: String(REVIEW_MCP_OUTPUT_TOKENS),
+  };
 }
 
 /** Do not put credentials on argv. Claude --settings accepts a path; keep

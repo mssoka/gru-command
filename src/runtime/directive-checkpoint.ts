@@ -418,21 +418,27 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
   if (previous.type !== 'message' || previous.message?.role !== 'toolResult') return 'native compaction does not follow a completed tool round';
   return linkedCompactionRefusal(entry, previous.id, ancestry);
 }
-/** Pi's compact-and-retry: an `error` or `length` reply, a compaction linked
- * on it, and a reply continued from that compaction (`agent.continue()`, no
- * prompt). The failed reply ran no tool: tool calls in it never executed and
- * are inert history, never pending. `after(1)` and `after(2)` are the entries
- * that follow `reply`, read only for such a reply. Returns that compaction;
- * the named refusal when the compaction on such a reply is not Pi's; null
- * when nothing continued `reply`. */
+/** Pi's compact-and-retry: an `error` or call-less `length` reply, a
+ * compaction linked on it, and a reply continued from that compaction
+ * (`agent.continue()`, no prompt). The failed reply ran no tool: an error
+ * reply's tool calls never executed (see rowCalls) and are inert history,
+ * never pending. An error reply is history under the same content rule as
+ * an auto-retried one (validRetryErrorContent). A length reply holding calls
+ * is never compacted and retried: the SDK answers its calls and goes on.
+ * `after(1)` and `after(2)` are the entries that follow `reply`, read only
+ * for such a reply. Returns that compaction; the named refusal when the
+ * compaction on such a reply is not Pi's, or the error reply it continued
+ * holds content that is not history; null when nothing continued `reply`. */
 function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
-  if (reply.message?.role !== 'assistant' || !['error', 'length'].includes(String(reply.message.stopReason))) return null;
+  const stop = reply.message?.stopReason;
+  if (reply.message?.role !== 'assistant' || !(stop === 'error' || stop === 'length' && !holdsToolCalls(reply.message))) return null;
   const compaction = after(1);
   if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
   const refusal = linkedCompactionRefusal(compaction, reply.id, ancestry);
   if (refusal !== null) return refusal;
   const retried = after(2);
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
+  if (stop === 'error' && !validRetryErrorContent(reply.message.content)) return 'native compaction retries an error row holding content that is not history';
   return compaction;
 }
 /** The level Pi's session records in a thinking_level_change: what
@@ -653,7 +659,9 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
   syncFile(file);
   const admitted = { ...binding, userEntryId: user.id };
   if (binding.userEntryId === null) appendBinding(admitted);
-  if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
+  const receipts = producerReceipts(file);
+  if (receipts.some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
+  const retries = retryEvidence(receipts, identity);
   ancestry.link(user);
   let previous: NativeEntry = user;
   const pending = new Map<string, string>();
@@ -665,8 +673,10 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
   };
   // A tool error the turn went on to answer is ordinary work (a failing test,
-  // a grep with no match). One it never answered may be an interrupted effect.
+  // a grep with no match). One it never answered may be an interrupted effect,
+  // unless it is the SDK's own "not executed" result for a length row's call.
   let unanswered = false;
+  const notExecuted = new Set<string>();
   for (let index = at.index + 1; ; index += 1) {
     const entry = native(index);
     if (entry === undefined) break;
@@ -703,11 +713,22 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
-      // Unless Pi continued it, an error or length reply is the terminal: what
-      // follows is read as lookahead, and taken back into the turn if it is.
-      const retry = compactAndRetryCompaction(entry, (offset) => { endTurn(); return native(index + offset); }, ancestry);
+      // Unless the SDK continued it, an error or call-less length reply is the
+      // terminal: what follows is read as lookahead, and taken back into the
+      // turn if it continued the reply. Both continuations below read that
+      // one lookahead; each entry is read, and charged, once.
+      const lookahead = (offset: number) => { endTurn(); return native(index + offset); };
+      // A receipted error row is history when the SDK's retried answer follows it (#483).
+      if (isRetryHistoryRow(entry, () => lookahead(1), retries)) {
+        resumeTurn();
+        lastMessage = message;
+        continue;
+      }
+      // Or Pi compacted on it and continued (#481).
+      const retry = compactAndRetryCompaction(entry, lookahead, ancestry);
       if (typeof retry === 'string') return unknown(retry);
       if (retry !== null) {
+        if (retries.has(entry.id)) return unknown(RETRIED_TWICE);
         resumeTurn();
         // The failed reply is history; the turn continues on the compaction.
         ancestry.link(retry);
@@ -716,10 +737,14 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
         lastMessage = message;
         continue;
       }
+      const calls = rowCalls(message.stopReason);
       for (const block of message.content as Record<string, unknown>[]) {
-        if (block.type !== 'toolCall') continue;
-        if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
+        // Ending the turn, an error or aborted row owes no results.
+        if (block.type !== 'toolCall' || calls === 'never-run') continue;
+        if (calls === null) return unknown('native assistant stop reason holding tool calls is unsupported');
+        if (typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
         pending.set(block.id, block.name);
+        if (calls === 'not-executed') notExecuted.add(block.id);
       }
       if (pending.size === 0) {
         if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
@@ -731,7 +756,10 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
       pending.delete(message.toolCallId);
       if (!Array.isArray(message.content) || typeof message.toolName !== 'string') return unknown('malformed native tool result content/name');
-      if (message.isError) unanswered = true;
+      // Nothing ran for the SDK's own "not executed" result (always isError):
+      // there is no effect to judge. A success result is an ordinary answer.
+      const notRun = notExecuted.delete(message.toolCallId) && message.isError === true;
+      if (message.isError && !notRun) unanswered = true;
     } else return unknown('another user/custom message owns this session');
     lastMessage = message;
   }
@@ -1037,7 +1065,7 @@ export interface DirectiveProducer {
   readonly sessionId: string;
   readonly sessionFile: string;
 }
-interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly boundary?: 'authority'; readonly reason?: string }
+interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused' | 'retry-start'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly boundary?: 'authority'; readonly reason?: string; readonly entryId?: string; readonly errorMessage?: string }
 export interface DirectiveCompletion { readonly producer: DirectiveProducer; readonly checkpointId: string; readonly head: string | null }
 function appendProducer(receipt: ProducerReceipt): void {
   const fd = openSync(`${receipt.producer.sessionFile}.producers.jsonl`, 'a', 0o600);
@@ -1069,7 +1097,10 @@ function producerReceipts(file: string): readonly ProducerReceipt[] {
         !(typeof receipt.toolCallId === 'string' && receipt.toolCallId.length > 0 || receipt.boundary === 'authority' && receipt.toolCallId === undefined))) {
       throw new DirectiveCheckpointError('malformed native guard refusal receipt');
     }
-    if (!['started', 'ceased', 'independent', 'completed', 'guard-refused'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
+    if (state === 'retry-start' && (!nonBlank(receipt.entryId) || !nonBlank(receipt.errorMessage))) {
+      throw new DirectiveCheckpointError('malformed native retry-start receipt');
+    }
+    if (!['started', 'ceased', 'independent', 'completed', 'guard-refused', 'retry-start'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
         !producer.host || !producer.agentId || !producer.sessionId || producer.sessionFile !== file ||
         producer.lockOwner !== undefined && (producer.lockOwner.host !== producer.host || producer.lockOwner.pid !== producer.pid || !producer.lockOwner.bootId)) throw new DirectiveCheckpointError('malformed native producer journal');
     const start = starts.get(producer.incarnation);
@@ -1124,6 +1155,110 @@ export function recordDirectiveAuthorityRefusal(producer: DirectiveProducer, rea
   if (!rows.some((row) => row.state === 'guard-refused' && row.boundary === 'authority' && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'guard-refused', producer, boundary: 'authority', reason });
   else syncFile(`${producer.sessionFile}.producers.jsonl`);
 }
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+function nonBlank(value: unknown): value is string { return typeof value === 'string' && value.trim() !== ''; }
+function holdsToolCalls(message: Record<string, unknown>): boolean {
+  return Array.isArray(message['content']) && message['content'].some((block) => objectRecord(block)?.['type'] === 'toolCall');
+}
+/** What the pinned SDK's agent loop (pi-agent-core agent-loop.js) does with
+ * an assistant row's tool calls: it runs none of an error or aborted row's
+ * (owner ruling 2026-10-22, see validRetryErrorContent); it answers each of a
+ * length row's with its own failed "not executed" result and goes on; it
+ * runs a toolUse or stop row's (providers that report `stop` with tool calls,
+ * e.g. OpenAI-compatible chat completions). Null for any other stop, such as
+ * pi-ai's `pending` or `deferred`: unsupported, never trusted. */
+function rowCalls(stopReason: unknown): 'never-run' | 'not-executed' | 'executed' | null {
+  if (stopReason === 'error' || stopReason === 'aborted') return 'never-run';
+  if (stopReason === 'length') return 'not-executed';
+  return stopReason === 'toolUse' || stopReason === 'stop' ? 'executed' : null;
+}
+/** Text, thinking and tool calls only. Owner ruling 2026-10-22: an error
+ * row's tool calls, partial ones included, never ran (the SDK executes none),
+ * so they are inert retry history when the row is retried, and owe no
+ * results when it ends the turn. Unknown blocks, and text or thinking with
+ * other keys, are never history. */
+function validRetryErrorContent(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.every((value: unknown) => {
+    const block = objectRecord(value);
+    if (block?.['type'] === 'toolCall') return true;
+    if (block?.['type'] === 'text') return typeof block['text'] === 'string' &&
+      (block['textSignature'] === undefined || typeof block['textSignature'] === 'string') &&
+      Object.keys(block).every((key) => ['type', 'text', 'textSignature'].includes(key));
+    if (block?.['type'] === 'thinking') return typeof block['thinking'] === 'string' &&
+      (block['thinkingSignature'] === undefined || typeof block['thinkingSignature'] === 'string') &&
+      (block['redacted'] === undefined || typeof block['redacted'] === 'boolean') &&
+      Object.keys(block).every((key) => ['type', 'thinking', 'thinkingSignature', 'redacted'].includes(key));
+    return false;
+  });
+}
+/** An assistant error row whose exact entry and error a live SDK retry-start
+ * receipt names, holding only history content. Error text alone proves nothing. */
+function isReceiptedErrorRow(entryId: string, message: Record<string, unknown>, evidence: ReadonlyMap<string, string>): boolean {
+  return message['role'] === 'assistant' && message['stopReason'] === 'error' && typeof message['errorMessage'] === 'string' &&
+    evidence.get(entryId) === message['errorMessage'] && validRetryErrorContent(message['content']);
+}
+/** The one retry-history predicate both walks use: a receipted error row the
+ * SDK's retried answer (an assistant parented on it) follows. Its tool calls
+ * never enter the pending set, so a result naming one is unmatched. Without
+ * that answer (a retry cancelled during backoff) the row is the turn's
+ * terminal. `successor` is read only for a receipted row. */
+function isRetryHistoryRow(entry: NativeEntry, successor: () => NativeEntry | 'malformed' | undefined, evidence: ReadonlyMap<string, string>): boolean {
+  if (entry.message === undefined || !isReceiptedErrorRow(entry.id, entry.message, evidence)) return false;
+  const next = successor();
+  return typeof next === 'object' && next.type === 'message' && next.parentId === entry.id && next.message?.role === 'assistant';
+}
+/** The SDK auto-retries an error reply or compacts and retries it, never
+ * both: a row that carries both shapes is evidence of neither. */
+const RETRIED_TWICE = 'native error row carries both a retry-start receipt and a compact-and-retry';
+/** entryId → errorMessage from this exact directive's retry-start receipts,
+ * whichever of its physical producers recorded them. */
+function retryEvidence(receipts: readonly ProducerReceipt[], identity: DirectiveTurnIdentity): ReadonlyMap<string, string> {
+  const evidence = new Map<string, string>();
+  for (const row of receipts) {
+    if (row.state !== 'retry-start' || !isDeepStrictEqual(row.producer.identity, identity)) continue;
+    const prior = evidence.get(row.entryId!);
+    if (prior !== undefined && prior !== row.errorMessage) throw new DirectiveCheckpointError('conflicting native retry-start receipts for one error row');
+    evidence.set(row.entryId!, row.errorMessage!);
+  }
+  return evidence;
+}
+/** Called only for a live Pi `auto_retry_start` event, never synthesized from
+ * history. Pi emits it from `_prepareRetry` after its retry classifier and
+ * budget checks, once the error row is persisted and before that row leaves
+ * the in-memory context. Recording checks the event, that the given row is an
+ * error row carrying this retry's error and only history content, and the
+ * directive's pi association and started producer; it then writes that
+ * producer, the row's id and its error. It proves no ancestry: the walks do,
+ * and they admit the row only with the retried answer after it. Null once
+ * recorded, else why nothing was. */
+export function recordDirectiveRetryStart(producer: DirectiveProducer, event: unknown, latestEntry: unknown): string | null {
+  validateDirectiveIdentity(producer.identity);
+  const sdkEvent = objectRecord(event);
+  if (sdkEvent?.['type'] !== 'auto_retry_start') return 'not an SDK auto_retry_start event';
+  const { attempt, maxAttempts, delayMs, errorMessage } = sdkEvent;
+  // SDK delayMs is baseDelayMs·2^(attempt-1), and the configured base may be fractional.
+  if (!Number.isSafeInteger(attempt) || (attempt as number) < 1 || !Number.isSafeInteger(maxAttempts) || (maxAttempts as number) < (attempt as number) ||
+      typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 0 || !nonBlank(errorMessage)) return 'malformed SDK auto_retry_start event';
+  const entry = objectRecord(latestEntry);
+  const message = objectRecord(entry?.['message']);
+  const entryId = entry?.['id'];
+  if (entry?.['type'] !== 'message' || !nonBlank(entryId) || message === null ||
+      !isReceiptedErrorRow(entryId, message, new Map([[entryId, errorMessage]]))) return 'native branch tail is not an error row of retry-history content carrying this retry\'s error';
+  const binding = readDirectiveBinding(producer.sessionFile, producer.identity.requestId);
+  if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, producer.identity)) return 'exact pi directive association unavailable';
+  const rows = producerReceipts(producer.sessionFile);
+  if (!rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) return 'exact original physical producer start missing';
+  const prior = rows.filter((row) => row.state === 'retry-start' && row.entryId === entryId && isDeepStrictEqual(row.producer.identity, producer.identity));
+  if (prior.some((row) => row.errorMessage !== errorMessage)) return 'conflicting retry-start receipt for this error row';
+  if (!prior.some((row) => isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'retry-start', producer, entryId, errorMessage });
+  else syncFile(`${producer.sessionFile}.producers.jsonl`);
+  return null;
+}
+
 
 export function recordDirectiveCompletion(producer: DirectiveProducer, checkpointId: string, head: string | null): void {
   if (!(head === null || typeof head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head))) throw new DirectiveCheckpointError('native completion HEAD malformed');
@@ -1203,7 +1338,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   while (index >= 0 && native[index]?.type === 'message' && native[index]?.message?.role === 'toolResult') index -= 1;
   const invocation = native[index];
   const content = invocation?.message?.content;
-  if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || invocation.message.stopReason !== 'toolUse' ||
+  if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || rowCalls(invocation.message.stopReason) !== 'executed' ||
       !isDeepStrictEqual(invocation.message, JSON.parse(JSON.stringify(assistantMessage))) || !Array.isArray(content)) refuse();
   const pending = new Map<string, Record<string, unknown>>();
   for (const block of content as Record<string, unknown>[]) {
@@ -1226,6 +1361,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   let previous = native[receipt]!;
   ancestry.link(previous);
   const chainPending = new Map<string, string>();
+  const retries = retryEvidence(producerReceipts(file), identity);
   for (let at = receipt + 1; at < native.length; at += 1) {
     const entry = native[at]!;
     const message = entry.message;
@@ -1241,15 +1377,26 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     previous = entry;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
+      // An error row the live SDK retried past is history, not a tool invocation (#483).
+      if (isRetryHistoryRow(entry, () => native[at + 1], retries)) continue;
+      // Nor is a failed reply Pi compacted on and continued (#481).
       const retry = compactAndRetryCompaction(entry, (offset) => native[at + offset], ancestry);
       if (typeof retry === 'string') refuse(retry);
       else if (retry !== null) {
+        if (retries.has(entry.id)) refuse(RETRIED_TWICE);
         ancestry.link(retry);
         previous = retry;
         at += 1;
         continue;
       }
-      if (message!.stopReason !== 'toolUse') refuse();
+      if (message!.stopReason === 'error') {
+        refuse(!retries.has(entry.id) || retries.get(entry.id) !== message!['errorMessage'] ? 'native error row has no matching live SDK retry-start receipt'
+          : !isReceiptedErrorRow(entry.id, message!, retries) ? 'native receipted error row holds content that is not retry history'
+            : 'native receipted error row has no retried answer after it');
+      }
+      // An executed row's calls, or a length row's, each get a result.
+      const calls = rowCalls(message!.stopReason);
+      if (calls !== 'executed' && calls !== 'not-executed') refuse();
       for (const block of message!.content as Record<string, unknown>[]) {
         if (block.type !== 'toolCall') continue;
         if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();

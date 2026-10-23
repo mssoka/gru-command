@@ -16,6 +16,7 @@ import {
   ClaudeCodeRuntime,
   backgroundStopNotice,
   checkedInProjectMcpConfig,
+  claudeChildEnv,
   claudeDirectiveContent,
   claudeInBandError,
   gitFailure,
@@ -97,6 +98,8 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT',
   'CLAUDE_DOUBLE_COMPACT_HOLD_FILE',
   'CLAUDE_DOUBLE_WORKFLOW_CANDIDATE',
+  'CLAUDE_DOUBLE_BULK_FINDINGS',
+  'CLAUDE_DOUBLE_BULK_LONG',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
   'CLAUDE_DOUBLE_REPLAY',
@@ -180,6 +183,8 @@ function doubleInvocations(fx: Fixture): {
   sessionId: string;
   stdin: string;
   backgroundTasks: string | null;
+  laneToken: string | null;
+  laneJob: string | null;
 }[] {
   if (!existsSync(fx.doubleLog)) return [];
   const records: {
@@ -190,6 +195,8 @@ function doubleInvocations(fx: Fixture): {
     sessionId: string;
     stdin: string;
     backgroundTasks: string | null;
+    laneToken: string | null;
+    laneJob: string | null;
   }[] = [];
   for (const raw of readFileSync(fx.doubleLog, 'utf-8').split('\n')) {
     const line = raw.trim();
@@ -1597,6 +1604,52 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await fx.runtime.dispose();
       repo.cleanup();
     }
+  });
+
+  /** Runs a whole-PR lead whose security lens returns 199 bulk findings, and
+   * proves every one reached the lead inline (the double's lead throws
+   * otherwise). */
+  const bulkLeadRound = async (name: string, long: boolean): Promise<void> => {
+    const fx = fixture();
+    const repo = makeFixtureRepo(name);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] = '1';
+    process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] = '199';
+    if (long) process.env['CLAUDE_DOUBLE_BULK_LONG'] = '1';
+    try {
+      const frozen = freezeReviewInputs({
+        roundId: `${name}-round`, repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
+        baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'Acceptance: answer returns 43.',
+      });
+      const engine = new PerkinsWholeReview({
+        spawner: (role, options) => fx.runtime.spawn(role, options),
+        policy: loadPerkinsPolicy(),
+      });
+      const result = await engine.run({
+        roundId: `${name}-round`, roundNumber: 1, frozenReview: frozen,
+        movementRef: 'feature/review', noSpec: false,
+      });
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      const security = result.specialistRuns.find((run) => run.lens === 'security' && run.status === 'valid');
+      expect(security?.findingsDelivered).toBeUndefined();
+    } finally {
+      await fx.runtime.dispose();
+      repo.cleanup();
+    }
+  };
+
+  it('hands the lead a specialist batch over Claude Code\'s default inline size limit whole (#487)', async () => {
+    // 199 findings (the child cap is 200) make a ~70,000-character batch:
+    // without the declared size the CLI would hand the lead a file pointer.
+    await bulkLeadRound('claude-perkins-bulk', false);
+  });
+
+  it('hands the lead a batch over Claude Code\'s default output-token cap whole (#487)', async () => {
+    // ~150,000 characters: past the default 25,000-token cap too, so it
+    // arrives whole only with the review sessions' MAX_MCP_OUTPUT_TOKENS.
+    await bulkLeadRound('claude-perkins-bulk-long', true);
   });
 
   it('gives an isolated child its own scoped bridge exposing exactly its declared native tools', async () => {
@@ -4690,6 +4743,53 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
       /does not exist/,
     );
     expect(doubleInvocations(fx)).toHaveLength(0);
+  });
+});
+
+describe('#486: lane provenance rides the CLI environment', () => {
+  const lane = { laneId: 'job-lane', jobId: 'job-lane', token: 'a1'.repeat(16) };
+
+  it('a session in a lane hands every CLI child (turns and compaction) its lane\'s variables, never ones the service inherited; one outside a lane hands none #contract:lane-provenance:claude-code', async () => {
+    // The service itself was started inside another lane: what it inherited
+    // never reaches a session.
+    const inherited = { token: process.env['GRU_LANE_TOKEN'], job: process.env['GRU_LANE_JOB'] };
+    process.env['GRU_LANE_TOKEN'] = 'f0'.repeat(16);
+    process.env['GRU_LANE_JOB'] = 'outer-job';
+    onTestFinished(() => {
+      if (inherited.token === undefined) delete process.env['GRU_LANE_TOKEN']; else process.env['GRU_LANE_TOKEN'] = inherited.token;
+      if (inherited.job === undefined) delete process.env['GRU_LANE_JOB']; else process.env['GRU_LANE_JOB'] = inherited.job;
+    });
+    const fx = fixture();
+    const project = join(fx.workspace, 'lane-project');
+    mkdirSync(project, { recursive: true });
+    const inLane = await fx.runtime.spawn('minion', { cwd: project, laneProvenance: lane });
+    await inLane.prompt('first turn');
+    await inLane.compact?.();
+    await inLane.prompt('second turn');
+    await inLane.dispose();
+    const reviewLane = await fx.runtime.spawn('minion', { cwd: project, laneProvenance: { laneId: 'round-1', jobId: null, token: 'b2'.repeat(16) } });
+    await reviewLane.prompt('a lane with no job');
+    await reviewLane.dispose();
+    const outside = await fx.runtime.spawn('minion', { cwd: project });
+    await outside.prompt('no lane');
+    await outside.dispose();
+    expect(doubleInvocations(fx).map((call) => [call.prompt, call.laneToken, call.laneJob])).toEqual([
+      ['first turn', lane.token, 'job-lane'],
+      ['/compact', lane.token, 'job-lane'],
+      ['second turn', lane.token, 'job-lane'],
+      ['a lane with no job', 'b2'.repeat(16), null],
+      ['no lane', null, null],
+    ]);
+  });
+
+  it('the lane variables go on top of the review credentials\' environment, never in its place', () => {
+    const review = { PATH: '/review/bin', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
+    expect(claudeChildEnv({})).toEqual({});
+    expect(claudeChildEnv({ reviewAuthEnv: review })).toEqual({ env: review });
+    expect(claudeChildEnv({ reviewAuthEnv: review, laneEnv: { GRU_LANE_TOKEN: lane.token } }))
+      .toEqual({ env: { ...review, GRU_LANE_TOKEN: lane.token } });
+    expect(claudeChildEnv({ laneEnv: { GRU_LANE_TOKEN: lane.token } }).env).toMatchObject({ PATH: process.env['PATH'], GRU_LANE_TOKEN: lane.token });
+    expect(claudeChildEnv({ reviewAuthEnv: { ...review, GRU_LANE_TOKEN: 'f0'.repeat(16), GRU_LANE_JOB: 'outer' } })).toEqual({ env: review });
   });
 });
 

@@ -678,6 +678,35 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('offers PR registration again once every round on the unlinked delivery aborted, never during a live one (#488)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-unlinked');
+      const digestNow = async () => computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // A round armed before the PR was registered: while it is live the
+      // round itself looks the PR up at publication, so no row is offered.
+      const round = h.ledger.addRound({ jobId: 'job-unlinked', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      expect((await digestNow()).deliveredWithoutPr).toEqual([]);
+      // It aborted (a restart, an INCOMPLETE lead): before #488 the job had
+      // rounds, so nothing ever offered the registration the re-arm needs.
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      // The row says a round already ran, and the skill tells Silas to
+      // register only: a non-clean abort warrants no new round.
+      expect((await digestNow()).deliveredWithoutPr.map((row) => [row.jobId, row.abortedRounds])).toEqual([['job-unlinked', 1]]);
+      const skill = readFileSync(join(import.meta.dirname, '..', 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf8');
+      expect(skill).toContain("When the row's `abortedRounds` is above 0");
+      expect(skill).toContain('register the PR only, and send no\n   review request');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('a review offer is retracted when a retirement hold opens during the compute await', async () => {
     const h = makeLedger();
     try {
@@ -838,6 +867,7 @@ describe('silas digest (the four actionable states)', () => {
           lanePath: '/lanes/job-lane',
           minionSessionFile: '/sessions/min-lane.jsonl',
           deliveredAt: expect.any(String),
+          abortedRounds: 0,
         },
       ]);
     } finally {
@@ -3675,7 +3705,7 @@ describe('silas digest fingerprint (issue #217)', () => {
     computedAt: '2026-10-05T00:00:00.000Z',
     trigger: 'sweep',
     deliveredWithoutPr: [
-      { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/lane', minionSessionFile: '/sess.json', deliveredAt: '2026-10-04T00:00:00.000Z' },
+      { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/lane', minionSessionFile: '/sess.json', deliveredAt: '2026-10-04T00:00:00.000Z', abortedRounds: 0 },
     ],
     prWithoutReview: [],
     verdictsAwaitingDirective: [
@@ -3710,10 +3740,16 @@ describe('silas digest fingerprint (issue #217)', () => {
       computedAt: '2026-10-06T12:00:00.000Z',
       trigger: 'job.delivered',
       deliveredWithoutPr: [
-        { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/other', minionSessionFile: '/other.json', deliveredAt: '2026-10-05T09:00:00.000Z' },
+        { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/other', minionSessionFile: '/other.json', deliveredAt: '2026-10-05T09:00:00.000Z', abortedRounds: 0 },
       ],
     });
     expect(digestFingerprint(volatile)).toBe(before);
+    // #488: a row whose rounds already aborted asks Silas for a different
+    // action (register only), so abortedRounds is actionable, not volatile.
+    const unlinkedRow = { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/l', minionSessionFile: null, deliveredAt: null };
+    const fresh = baseDigest({ deliveredWithoutPr: [{ ...unlinkedRow, abortedRounds: 0 }] });
+    const afterAbort = baseDigest({ deliveredWithoutPr: [{ ...unlinkedRow, abortedRounds: 1 }] });
+    expect(digestFingerprint(afterAbort)).not.toBe(digestFingerprint(fresh));
     // identity + actionable content is what the gate compares
     const newPr = baseDigest({
       prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/9', priorRounds: 0 }],
@@ -3823,8 +3859,8 @@ describe('silas digest delta (issue #217)', () => {
       computedAt: '2026-10-05T00:00:00.000Z',
       trigger: 'sweep',
       deliveredWithoutPr: [
-        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
-        { jobId: 'job-gone', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 },
+        { jobId: 'job-gone', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 },
       ],
       prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/1', priorRounds: 1 }],
       verdictsAwaitingDirective: [],
@@ -3841,8 +3877,8 @@ describe('silas digest delta (issue #217)', () => {
       computedAt: '2026-10-05T00:05:00.000Z',
       deliveredWithoutPr: [
         // job-kept stays; job-gone resolved; job-new added
-        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: '2026-10-05T00:04:00.000Z' },
-        { jobId: 'job-new', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: '2026-10-05T00:04:00.000Z', abortedRounds: 0 },
+        { jobId: 'job-new', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 },
       ],
       prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/1', priorRounds: 2 }],
     };

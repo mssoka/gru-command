@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildClaudeCodeAuthArgs, claudeReviewIsolationArgs } from '../src/runtime/claude-model.js';
 import { claudeReviewProcessEnv } from '../src/runtime/claude-review-settings.js';
+import { REVIEW_MCP_OUTPUT_TOKENS } from '../src/runtime/review-mcp-bridge.js';
 import { claudeTurnArgs } from '../src/runtime/claude-adapter.js';
 
 // Flags that make the CLI ignore --mcp-config. The review lead can only submit
@@ -32,5 +33,17 @@ describe('claude review isolation', () => {
   it('disables auto-memory in the review process env, even if auth env tries to enable it', () => {
     const env = claudeReviewProcessEnv({ authEnv: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0' } } as never);
     expect(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
+  });
+
+  it('fixes the MCP output-token cap in the review env, whatever the auth or process env says (#487)', () => {
+    const previous = process.env['MAX_MCP_OUTPUT_TOKENS'];
+    process.env['MAX_MCP_OUTPUT_TOKENS'] = '1000';
+    try {
+      const env = claudeReviewProcessEnv({ authEnv: { MAX_MCP_OUTPUT_TOKENS: '2000' } } as never);
+      expect(env['MAX_MCP_OUTPUT_TOKENS']).toBe(String(REVIEW_MCP_OUTPUT_TOKENS));
+    } finally {
+      if (previous === undefined) delete process.env['MAX_MCP_OUTPUT_TOKENS'];
+      else process.env['MAX_MCP_OUTPUT_TOKENS'] = previous;
+    }
   });
 });

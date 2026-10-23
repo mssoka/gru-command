@@ -288,7 +288,11 @@ continuations and `/recover` successors.
   session's later growth never pushes an earlier directive past its limits.
   A pi checkpoint's lookahead past its terminal (the next request and its
   model/thinking controls) has its own 32 MiB / 250,000-entry bound and is
-  refused under its own name, as the lookahead, never as the turn.
+  refused under its own name, as the lookahead, never as the turn. The
+  entry after a receipted retry error row (#483, below) is read as that
+  lookahead, and charged back to the turn when it is the SDK's retried
+  answer. One too large to read at all is refused as the lookahead before
+  its role is known; it is past both bounds.
 
 What is still refused by name, wherever a walk reads it:
 
@@ -304,9 +308,11 @@ before #469.
 
 Boot and bounded deterministic reconsideration inspect correlated ledger
 completion, then exact native completion, **before** considering execution.
-A proven native user or complete successful tool-results checkpoint can
-continue once through the adapter-owned operation on the same logical
-minion/session, job lane, branch and PR. The original user prompt is never
+A proven native user checkpoint, or a complete tool-results checkpoint that
+leaves no tool error unanswered, can continue once through the
+adapter-owned operation on the same logical minion/session, job lane,
+branch and PR. The SDK's own "not executed" results for a `length` row's
+calls (below) are no such error: nothing ran. The original user prompt is never
 replayed. Every producer/permission fence is rechecked around asynchronous
 pacing/spawn/continuation boundaries. A durable checkpoint claim cannot be
 reissued by age or lease expiry. A turn that ended in its own native error
@@ -320,8 +326,10 @@ failing test or a `grep` with no match. The minion may go on calling tools,
 and a turn that reaches its own successful end completes, on both runtimes.
 A turn cut off right after a tool error the minion never answered never
 completes: it stays UNKNOWN, or reads as a failed turn when pi recorded the
-abort. On pi that may be an interrupted effect. On Claude Code, a success
-result straight after one means the CLI ended the turn by itself. A lane's
+abort. On pi that may be an interrupted effect, except the SDK's own "not
+executed" results for a `length` row's calls (below): nothing ran, so a turn
+cut off right after them is resumable. On Claude Code, a success result
+straight after one means the CLI ended the turn by itself. A lane's
 verification policy refusing a test command is ordinary too: the minion is
 told why and goes on. A tool the directive refused is never ordinary. That
 covers the authority fence's refusal and, on Claude Code, a request the
@@ -329,6 +337,77 @@ permission channel denied itself: one that was malformed or foreign, or
 whose fence failed. Each leaves a `guard-refused` receipt, and the turn
 stays UNKNOWN. On pi every later tool call of that directive is refused too,
 and on Claude Code the refusal ends the turn.
+
+A provider error the pi SDK retries is not the turn's end either (#483).
+After a retryable error, such as a truncated stream, the SDK keeps the
+assistant error row in the transcript and retries from it. When the SDK
+emits its live `auto_retry_start`, the adapter writes a `retry-start`
+receipt to the producer journal (below), through the directive's own
+started physical producer. The receipt names the error row's entry id and
+its error message. It is written only from that live event, never from
+transcript history, so a retry the adapter never saw has no receipt.
+
+Owner ruling 2026-10-22: an error row's tool calls, partial ones included,
+never ran, because the SDK executes no call of an error row. They are inert
+retry history when the row is retried, and owe no results when the row
+ends the turn. The tool fence, the checkpoint and settlement read an error
+row as retry history only when all of these hold:
+
+- a receipt from a producer of this exact directive identity names the row
+  and its exact error;
+- the row holds only text, thinking and tool calls;
+- the SDK's retried answer, an assistant entry parented on the row, follows
+  it.
+
+Its calls never enter the pending set, so a result naming one is never a
+match, and the turn reads UNKNOWN. After a retried answer that leaves
+calls pending, the reason is `unmatched/malformed native tool result`.
+After one that ends the turn (an aborted answer holding calls ends it too),
+or when the error row itself ended it, the reason is `native entries follow
+the correlated terminal checkpoint without a distinct bound request`.
+
+When a retry is cancelled during backoff, no retried answer follows, so the
+receipted row is the turn's terminal, a failed one. When attempts run out,
+the SDK starts no retry for the last error: the receipted rows before it
+are history, and that unreceipted last row is the failed terminal. An error
+row that ends the turn is that failed terminal even when it holds tool
+calls. Pi's other continuation of an error reply, its compact-and-retry
+(#481, [SUPERVISION.md](./SUPERVISION.md)), is read before that terminal:
+an error row Pi compacted on and continued is history too. Pi auto-retries
+a reply or compacts and retries it, never both, so a receipted row that is
+also compacted and retried is refused by name. At the tool fence any other
+error row still refuses the next tool, under a reason naming what it lacks:
+a matching receipt, history-only content, or the retried answer.
+
+Every pi stop can hold tool calls, and the walks and the fence follow what
+the SDK's agent loop does with them:
+
+- `toolUse` and `stop`: the SDK runs them. Providers that report `stop`
+  with tool calls (e.g. OpenAI-compatible chat completions) leave a `stop`
+  row holding calls, so such a row is pending work, not the turn's end, and
+  never a successful turn verdict; one without calls is the terminal.
+- `length`: the calls were cut off by the output token limit. The SDK runs
+  none and answers each with its own failed "not executed" result, then goes
+  on. Those calls are pending until those results arrive, and the minion
+  may call tools after them. Since nothing ran, a turn cut off right after
+  those results is resumable, not a tool error awaiting a recovery
+  judgment. A turn cut off before them stays UNKNOWN. Such a row is never
+  compacted and retried; only a length row without calls may be.
+- `error` and `aborted`: the SDK runs none (for an error row, the ruling
+  above). Such a row owes no results; ending the turn, it is a failed
+  terminal, and a result naming one of its calls is refused.
+- Any other stop (pi-ai also has `pending` and `deferred`): a row holding
+  calls under it is refused, by the checkpoint as `native assistant stop
+  reason holding tool calls is unsupported` and by the fence.
+
+When the adapter cannot record a receipt it logs `native SDK retry
+evidence not recorded; retry-history tool effects remain refused` at warn,
+with the reason or the error, and the directive stays fail-closed. A
+malformed `retry-start` receipt, or two that give one row different errors,
+makes the journal read refuse loudly. A build from before this change does
+not know the `retry-start` state, so rolling back past it makes a journal
+that holds one unreadable: inspection of every directive on that session
+refuses (fail-closed) until the rollback is undone.
 
 Physical ownership is recorded separately in `<session.jsonl>.producers.jsonl`:
 request/hash/revision/epoch, logical minion, native session/file, physical UUID,

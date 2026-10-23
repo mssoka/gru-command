@@ -75,6 +75,7 @@ that proves it on each adapter.
 | `review-owner-durable-cessation` | A review session's `ceased` evidence is recorded in the ledger against its round's owner marker (#464), so a restarted registry still accepts that owner as ceased, even when the host pid looks alive | `test/pi-adapter.test.ts` | `test/review-owner-cessation.test.ts` |
 | `scheduled-verification` | The #315 guard refuses a scheduled-verification producer before it runs | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `spawn-cwd` | A session is rooted at the explicit project cwd, never the workspace root | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
+| `lane-provenance` | A session spawned in a registered lane passes `GRU_LANE_TOKEN` (and `GRU_LANE_JOB`) to every process it starts: pi in its bash tool's commands, Claude in the CLI's environment. Lane variables the service itself inherited never reach a session's processes, and a session outside a lane passes none (#486) | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
@@ -114,6 +115,7 @@ runtime's own behaviour with no counterpart on the other runtime.
 | `test/claude-adapter.test.ts` | Claude context usage from recorded stream-json (#461) | context-usage |
 | `test/claude-adapter.test.ts` | ReviewMcpBridge bounded protocol failures | review-native-tools |
 | `test/claude-adapter.test.ts` | spawn cwd (SPEC ruling 17 — dispatch roots in the project) | spawn-cwd |
+| `test/claude-adapter.test.ts` | #486: lane provenance rides the CLI environment | lane-provenance |
 | `test/claude-adapter.test.ts` | isolated-review confinement guards | isolated-review-tools |
 | `test/claude-adapter.test.ts` | ReviewMcpBridge fail-closed guards | review-native-tools |
 | `test/claude-adapter.test.ts` | scheduled verification ordinary Claude Bash | scheduled-verification |
