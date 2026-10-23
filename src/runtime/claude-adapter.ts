@@ -288,7 +288,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
 
   /** Turn-spawn ENOENT after a previously-ok probe: the binary vanished. */
   private onInfraError(error: unknown): void {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if ((error as NodeJS.ErrnoException | null | undefined)?.code === 'ENOENT') {
       this.binaryOk = false;
       this.down = `binary "${this.binary}" vanished mid-run (ENOENT)`;
     }
@@ -2046,8 +2046,10 @@ export class ClaudeCodeHandle implements AgentHandle {
   private recordDirectiveFailure(turn: DirectiveTurn, error: unknown): unknown {
     turn.failure ??= { error };
     // Every bookkeeping fault is logged, first or not, and once per fault: the
-    // writes Node buffered behind a failed transcript write share its root
-    // error, and a write to the stream it destroyed only restates that root.
+    // writes Node had buffered behind a failed transcript write (and the rest
+    // of its batch) get that root error itself, so one fault is wrapped once
+    // per frame. Only a write made after the stream was destroyed gets
+    // ERR_STREAM_DESTROYED, which restates the root and is not logged.
     if (error instanceof DirectiveBookkeepingError && !isDestroyedStreamWrite(error.fault)) {
       const fault = typeof error.fault === 'object' && error.fault !== null ? error.fault : error;
       if (!this.loggedBookkeepingFaults.has(fault)) {
@@ -2530,7 +2532,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         } else {
           // Synchronous spawn faults (async ENOENT arrives via 'error').
           this.onInfraError(error);
-          failTurn(`claude process failed to spawn: ${String(error)}`);
+          failTurn(`claude process failed to spawn: ${thrownText(error, 'string')}`);
         }
         turn?.settings.dispose();
         keepNotice();

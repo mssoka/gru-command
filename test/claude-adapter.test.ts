@@ -3308,6 +3308,17 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
+    it('a spawn that throws a non-error value fails the turn with the value named, never a bare "null" (#485)', async () => {
+      const thrown: unknown = null;
+      const fx = fixture({ spawnProcess: (() => { throw thrown; }) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      const error = 'claude process failed to spawn: a non-error value was thrown: null';
+      await expect(handle.prompt('answer plainly')).rejects.toThrow(new Error(error));
+      expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false }]);
+      await handle.dispose();
+    });
+
     it('a CLI that closes stdin under the prompt write fails the turn instead of crashing the service', async () => {
       // The real failure: the CLI is gone before it reads its frame, so the
       // stdin write rejects with EPIPE. An unhandled stream 'error' was an
