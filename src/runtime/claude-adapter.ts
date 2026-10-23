@@ -71,6 +71,8 @@ import {
   inspectDirectiveCheckpoint,
   isClaudeTaskNotification,
   isNativeDirectiveRefusal,
+  ownIoRefusal,
+  withOwnIo,
   prepareClaudeDirectiveBinding,
   prepareDirectiveProducer as prepareNativeDirectiveProducer,
   readDirectiveBinding,
@@ -2034,7 +2036,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       turn.admission = durable.then(() => {
         // A directive that already failed admits nothing more.
         if (turn.failure !== null) return;
-        const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
+        // The readback and its binding write are GC's own receipt I/O.
+        const binding = withOwnIo('directive receipt I/O', () => inspectDirectiveAdmission(this.sessionFile, directive.identity));
         directive.onAdmitted(binding);
         turn.admitted = binding;
       }).catch((error: unknown) => this.failDirective(turn, error, abortTurn));
@@ -2066,7 +2069,8 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
         recordDirectiveCompletion(producer, proof.checkpointId, head);
       }).catch((error: unknown) => {
-        turn.failure ??= error;
+        // Every step here is GC's own binding, transcript or receipt I/O.
+        turn.failure ??= ownIoRefusal('directive receipt I/O', error);
         this.log('error', 'claude directive completion was not recorded', { request: directive.identity.requestId, error: String(error) });
       });
     }
@@ -2336,10 +2340,8 @@ export class ClaudeCodeHandle implements AgentHandle {
               });
             })
             : new Promise<void>((resolveDurable, rejectDurable) => {
-              // A lost gating frame is GC's refusal, never the disk's words
-              // ("EDQUOT: disk quota exceeded" reads as a provider wall).
-              const lost = (error: unknown): void => rejectDurable(new DirectiveCheckpointError(
-                `directive transcript write failed: ${error instanceof Error ? error.message : String(error)}`));
+              // A lost gating frame is GC's own transcript I/O: its refusal.
+              const lost = (error: unknown): void => rejectDurable(ownIoRefusal('directive transcript write', error));
               transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
                 if (error != null) { lost(error); return; }
                 try { syncTranscript(params.sessionFile); resolveDurable(); } catch (syncError) { lost(syncError); }
@@ -2549,14 +2551,16 @@ export class ClaudeCodeHandle implements AgentHandle {
           settle(null);
           return;
         }
-        // The refusal is GC's, but an error the CLI reported in the same turn
-        // is the CLI's (#485): emitted, untagged, exactly as an ordinary turn
-        // would emit it, so supervision classifies it. A result the abort cut
-        // off still leaves the API error it followed. Any other failed turn
-        // reports only its own failure.
-        if (refused && (result?.isError === true || (result === null && translator.apiError !== null))) {
-          this.emit(claudeInBandError(result ?? { subtype: 'error', isError: true, text: null, apiErrorStatus: null },
-            translator.apiError, translator.init?.model ?? params.model ?? null));
+        // The refusal is GC's, but an API error the CLI reported on the main
+        // thread of the same turn is the provider's (#485): emitted untagged,
+        // as an ordinary turn would emit it, so supervision classifies it,
+        // even when the abort cut off its result. A subagent's API error, and
+        // a result error the abort itself caused, are not the turn's. Any
+        // other failed turn reports only its own failure.
+        const apiError = translator.apiError;
+        if (refused && apiError !== null && (apiError.text.trim() !== '' || apiError.status !== null || apiError.code !== null)) {
+          this.emit(claudeInBandError({ subtype: 'error', isError: true, text: apiError.text.trim() === '' ? 'the CLI reported an API error' : apiError.text,
+            apiErrorStatus: result?.apiErrorStatus ?? null }, apiError, translator.init?.model ?? params.model ?? null));
         }
         if (!failed) {
           const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
@@ -2588,8 +2592,9 @@ export class ClaudeCodeHandle implements AgentHandle {
           refused: (toolUseId, reason) => {
             const refusal = new DirectiveCheckpointError(reason);
             this.recordGuardRefusal(turn.producer, toolUseId, refusal.message);
+            // An earlier failure still owed its report stays the turn's.
             turn.failure ??= refusal;
-            return refusal;
+            return turn.failure;
           },
           decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
           ...(params.workerVerification !== undefined ? { verification: params.workerVerification } : {}),

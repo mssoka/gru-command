@@ -353,10 +353,13 @@ export class ClaudeTurnTranslator {
     if (typeof message !== 'object' || message === null) return [];
     const content = (message as StreamFrame)['content'];
     if (!Array.isArray(content)) return [];
+    const mainThread = (frame['parent_tool_use_id'] ?? null) === null;
     if (frame['is_api_error_message'] === true) {
       // The CLI reports an API failure (unknown model, auth, overload) as a
       // synthetic assistant message. It is not model output: it must never
-      // stream as the agent's words. The turn's error event carries it.
+      // stream as the agent's words. The turn's error event carries it. A
+      // subagent's API failure is the subagent's, never the turn's (#485).
+      if (!mainThread) return [];
       const text = content
         .map((block) => (typeof block === 'object' && block !== null && typeof (block as StreamFrame)['text'] === 'string' ? (block as StreamFrame)['text'] as string : ''))
         .join('');
@@ -368,12 +371,14 @@ export class ClaudeTurnTranslator {
       };
       return [];
     }
+    // A later main-thread reply means the turn went on past that API failure.
+    if (mainThread) this.apiErrorInfo = null;
     // Context occupancy (#461): each content block of one API message repeats
     // that call's usage, so the latest main-thread frame replaces, never adds.
     // Subagent frames (a parent tool call) measure another context, and a
     // zero-token prompt is no API call: the CLI's own `<synthetic>` replies
     // ("No response requested.") report all-zero usage.
-    if ((frame['parent_tool_use_id'] ?? null) === null) {
+    if (mainThread) {
       const call = promptOccupancy(message as StreamFrame);
       if (call === null || call.tokens > 0) this.occupancy = call;
     }

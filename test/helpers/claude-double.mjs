@@ -17,6 +17,12 @@
  *   "no-result-ok"     — exit 0 with no result frame (protocol violation)
  *   "api-error"        — the real CLI's synthetic API-error assistant
  *                        message (is_api_error_message) + is_error result
+ *   "auth-error"       — the real CLI's failed-login API-error message
+ *                        (error "authentication_failed", no status) + result
+ *   "subagent-limit"   — a subagent's usage-limit API-error message, no result
+ *   "textless-api-fault" — an API-error message with a code and no text,
+ *                        no result
+ *   "answer-hold"      — an answer, then no result until it is ended
  *   "usage-limit"      — the same shape for a claude.ai usage-limit wall
  *                        (error "rate_limit", api_error_status 429)
  *   "error"            — result frame with is_error:true
@@ -79,7 +85,7 @@
  *   CLAUDE_DOUBLE_PRE_ECHO=1    a request status and a keepalive ping between init and the echo
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
  *   CLAUDE_DOUBLE_API_ERROR_HOLD=1 "usage-limit" sends its API-error frame, then no result: it waits to be ended
- *   CLAUDE_DOUBLE_ERROR_TEXT=<text> the "error" sentinel's result text
+ *   CLAUDE_DOUBLE_TERM_RESULT=1 on SIGTERM, an abort's error_during_execution result (no text), then exit 143
  *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string|string-false  the tool_use carries
  *                               run_in_background: true, or the string "true" or
  *                               "false" the real CLI coerces
@@ -110,6 +116,12 @@ const argv = process.argv.slice(2);
 if (argv[0] === '--version' || argv[0] === '-v') {
   process.stdout.write('9.9.9 (Claude Code double)\n');
   process.exit(0);
+}
+
+if (process.env['CLAUDE_DOUBLE_TERM_RESULT'] === '1') {
+  process.on('SIGTERM', () => {
+    process.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sessionId, num_turns: 1 })}\n`, () => process.exit(143));
+  });
 }
 
 if (process.env['CLAUDE_DOUBLE_IGNORE_TERM'] === '1') {
@@ -883,6 +895,34 @@ async function run() {
     out({ ...resultFrame(text, true), subtype: 'success', api_error_status: 404 });
     return;
   }
+  if (prompt.includes('auth-error')) {
+    // The real CLI's shape (2.1.309): a failed login is a main-thread API-error
+    // message with error "authentication_failed" and no HTTP status, then an
+    // is_error result carrying the same text.
+    const text = 'Invalid API key · Please run /login';
+    out({ ...assistantFrame([{ type: 'text', text }]), error: 'authentication_failed', is_api_error_message: true });
+    out({ ...resultFrame(text, true), subtype: 'success' });
+    return;
+  }
+  if (prompt.includes('subagent-limit')) {
+    // A subagent's own usage-limit API error, then no result: it waits to be ended.
+    out({ ...assistantFrame([{ type: 'text', text: "You've hit your limit · resets 3pm (UTC)" }]), parent_tool_use_id: 'toolu_double_task',
+      error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
+    setInterval(() => {}, 60_000);
+    return;
+  }
+  if (prompt.includes('textless-api-fault')) {
+    // An API-error message with a failure code but no text, then no result.
+    out({ ...assistantFrame([{ type: 'text', text: '' }]), error: 'overloaded', is_api_error_message: true });
+    setInterval(() => {}, 60_000);
+    return;
+  }
+  if (prompt.includes('answer-hold')) {
+    // An answer, then no result: it waits to be ended.
+    await emitTextTurn('a partial answer');
+    setInterval(() => {}, 60_000);
+    return;
+  }
   if (prompt.includes('usage-limit')) {
     const text = "You've hit your limit · resets 3pm (UTC)";
     out({ ...assistantFrame([{ type: 'text', text }]), error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
@@ -895,7 +935,7 @@ async function run() {
   }
   if (prompt.includes('error')) {
     await emitTextTurn('about to fail');
-    out(resultFrame(process.env.CLAUDE_DOUBLE_ERROR_TEXT ?? 'double exploded', true));
+    out(resultFrame('double exploded', true));
     return;
   }
   const answer = images > 0 ? `echo: ${prompt} (+${images} image)` : `echo: ${prompt}`;

@@ -101,7 +101,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
   'CLAUDE_DOUBLE_REPLAY',
   'CLAUDE_DOUBLE_API_ERROR_HOLD',
-  'CLAUDE_DOUBLE_ERROR_TEXT',
+  'CLAUDE_DOUBLE_TERM_RESULT',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -2672,11 +2672,49 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(errors).toEqual([beforeEchoRefusal, usageWall]);
     });
 
-    it('after a refusal, an untyped CLI error result is emitted untagged, so its text reaches the classifier (#485)', async () => {
-      const { errors, file } = await answeredBeforeEcho('error now', { CLAUDE_DOUBLE_IGNORE_TERM: '1', CLAUDE_DOUBLE_ERROR_TEXT: 'Invalid API key · Please run /login' });
-      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'Invalid API key · Please run /login', fatal: false }]);
-      expect(deterministicFailureClass('Invalid API key · Please run /login')).toBe('authentication_wall');
-      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'result', is_error: true }));
+    it('after a refusal, a failed login (an API error with no HTTP status) is emitted untagged, so its text reaches the classifier (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('auth-error now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      const login = { type: 'error', error: 'Invalid API key · Please run /login (authentication_failed)', fatal: false, provider: 'anthropic-claude-native',
+        model: 'claude-opus-5-5', typed: { origin: 'provider-message', bodyCode: 'authentication_failed' } };
+      expect(errors).toEqual([beforeEchoRefusal, login]);
+      expect(deterministicFailureClass(login.error)).toBe('authentication_wall');
+      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'assistant', is_api_error_message: true, error: 'authentication_failed' }));
+    });
+
+    it('after a refusal, a subagent\'s API error is the subagent\'s: no wall is emitted (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('subagent-limit now', {});
+      expect(errors).toEqual([beforeEchoRefusal]);
+      // Not vacuous: the subagent did report its usage-limit API error.
+      expect(frames(file)).toContainEqual(expect.objectContaining({ is_api_error_message: true, parent_tool_use_id: 'toolu_double_task', api_error_status: 429 }));
+    });
+
+    it('after a refusal, the result error GC\'s own abort caused is not re-emitted (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('answer-hold now', { CLAUDE_DOUBLE_TERM_RESULT: '1' });
+      expect(errors).toEqual([beforeEchoRefusal]);
+      // Not vacuous: the CLI did end the aborted turn with an error result.
+      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'result', subtype: 'error_during_execution', is_error: true }));
+    });
+
+    it('after a refusal, an API error with a failure code but no text is emitted with a named text, never an empty one (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('textless-api-fault now', {});
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'the CLI reported an API error (overloaded)', fatal: false,
+        provider: 'anthropic-claude-native', model: 'claude-opus-5-5', typed: { origin: 'provider-message', bodyCode: 'overloaded' } }]);
+    });
+
+    it('the translator keeps only a main-thread API error, and drops it once the main thread replies again (#485)', () => {
+      const apiErrorFrame = (parent: string | null): StreamFrame => ({ type: 'assistant', parent_tool_use_id: parent, is_api_error_message: true, error: 'rate_limit', api_error_status: 429,
+        message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your limit" }] } });
+      const subagent = new ClaudeTurnTranslator();
+      subagent.ingest(apiErrorFrame('toolu_subagent'));
+      expect(subagent.apiError).toBeNull();
+      const main = new ClaudeTurnTranslator();
+      main.ingest(apiErrorFrame(null));
+      expect(main.apiError).toEqual({ text: "You've hit your limit", code: 'rate_limit', status: 429 });
+      // A subagent's reply leaves the main thread's failure standing; the main thread's own reply ends it.
+      main.ingest({ type: 'assistant', parent_tool_use_id: 'toolu_subagent', message: { role: 'assistant', content: [{ type: 'text', text: 'subagent words' }] } });
+      expect(main.apiError).not.toBeNull();
+      main.ingest({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [{ type: 'text', text: 'retried past it' }] } });
+      expect(main.apiError).toBeNull();
     });
 
     it('after a refusal, an API error whose result the abort cut off is still emitted as the wall it reported (#485)', async () => {
@@ -2735,6 +2773,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const events = collect(handle);
       let broken = false;
+      // No adapter seam fails a transcript write: the stream comes straight from
+      // node:fs createWriteStream, which an ESM import cannot spy on. This fails
+      // one chunk of this handle's own stream instead.
       handle.subscribe((event) => {
         if (event.type !== 'turn_start') return;
         type Chunk = { toString(): string };
@@ -2756,6 +2797,67 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // Its words alone would wall: the tag is what keeps it with directive recovery.
         expect(deterministicFailureClass(errors[0]!.type === 'error' ? errors[0]!.error : '')).toBe('quota_wall');
       } finally { await handle.dispose(); }
+    });
+
+    it('a gating frame that is written but cannot be synced is one tagged refusal (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      // The stream keeps writing to its open file; the sync reopens the path, which is gone.
+      handle.subscribe((event) => { if (event.type === 'turn_start') rmSync(handle.sessionFile!); });
+      try {
+        await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-fsync'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused: directive transcript write failed: ENOENT/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([
+          { type: 'error', error: expect.stringMatching(/^directive refused: directive transcript write failed: ENOENT/u), fatal: false, nativeControl: 'directive-refusal' },
+        ]);
+      } finally { await handle.dispose(); }
+    });
+
+    it('GC\'s own receipt I/O faults are tagged refusals, never the disk\'s quota wall: the admission binding and the completion receipt (#485)', async () => {
+      const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+      for (const write of ['admission', 'completion'] as const) {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const events = collect(handle);
+        const quota = Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
+        const fault = write === 'admission'
+          ? vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(() => { throw quota; })
+          : vi.spyOn(checkpoint, 'recordDirectiveCompletion').mockImplementationOnce(() => { throw quota; });
+        const error = `${write === 'admission' ? 'directive refused' : 'directive turn refused'}: directive receipt I/O failed: EDQUOT: disk quota exceeded, write`;
+        try {
+          await expect(handle.prompt('answer plainly', { directive: { identity: identityFor(`claude-receipt-edquot-${write}`), beforeAdmission: () => {}, onAdmitted: () => {} } }), write)
+            .rejects.toThrow(error);
+          expect(fault, write).toHaveBeenCalledTimes(1);
+          expect(events.filter((event) => event.type === 'error'), write).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
+          // Its words alone would wall: the tag is what keeps it with directive recovery.
+          expect(deterministicFailureClass(error), write).toBe('quota_wall');
+        } finally { fault.mockRestore(); await handle.dispose(); }
+      }
+    });
+
+    it('a channel deny while an earlier plain fence failure awaits its report leaves that failure the turn\'s, routed (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      // The fence reports its failure on setImmediate; hold that report so the
+      // CLI's repeated ask, and the channel's own deny of it, land first.
+      vi.useFakeTimers({ toFake: ['setImmediate'] });
+      let checks = 0;
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-deny-after-plain'),
+          beforeAdmission: () => { if (++checks > 1) throw new Error('ledger read failed: SQLITE_BUSY'); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^malformed or foreign directive permission request$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'malformed or foreign directive permission request', fatal: false }]);
+        const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8');
+        expect(receipts).toContain('ledger read failed: SQLITE_BUSY');
+        expect(receipts).toContain('"reason":"malformed or foreign directive permission request"');
+      } finally {
+        vi.useRealTimers();
+        await handle.dispose();
+      }
     });
 
     it('the supervisor skips a tagged Claude refusal with a durable trace, and with decisions wired still stops on a wall reported after one (#485)', async () => {
