@@ -21,7 +21,7 @@ import {
   readPreBootstrapDependencyPatchPackage,
 } from '../src/worktrees/prebootstrap-patch.js';
 import type { LoadedPreBootstrapPatch, PreBootstrapDependencyPatchPackage } from '../src/worktrees/prebootstrap-patch.js';
-import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, Role, SpawnOptions } from '../src/runtime/types.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 const CAPABILITIES: AgentCapabilities = {
@@ -73,7 +73,7 @@ function fixture(setupCommand?: string): PatchFixture {
     preBootstrapPatchRoot: packageRoot, enumerateProcesses: () => [], });
   let manager = makeManager();
   const spawns: { role: string; cwd: string | undefined }[] = [];
-  const spawner = async (role: 'minion' | 'perkins' | 'silas' | 'bob', options?: SpawnOptions): Promise<AgentHandle> => {
+  const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, cwd: options?.cwd });
     const handle: AgentHandle = {
       role,

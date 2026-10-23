@@ -1168,7 +1168,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         'job.prebootstrap-patch-dispatch-failed',
         'job.minion-spawned',
       ];
-      const events = options.ledger.listJobEvents(jobId, { kinds: eventKinds, limit: 10_000 });
+      const events = options.ledger.listJobEvents(jobId, { kinds: eventKinds, limit: 10_000, order: 'asc' });
       const allOfKind = (kind: string) => events.filter((event) => event.kind === kind);
       const admitted = allOfKind('job.prebootstrap-patch-admitted');
       const admissionPayload = admitted.at(-1)?.payload;

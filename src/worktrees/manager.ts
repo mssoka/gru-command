@@ -1544,7 +1544,7 @@ export class WorktreeManager {
     readonly repoPath: string;
     readonly worktreePath: string;
     readonly jobId: string;
-    readonly custody: CreationIntent;
+    readonly custody: CreationCustody;
     readonly patch: LoadedPreBootstrapPatch;
   }): { readonly beforeTree: string; readonly afterTree: string; readonly beforeSha256: string; readonly afterSha256: string } {
     const { repoPath, worktreePath, jobId, custody, patch } = input;
@@ -1651,7 +1651,7 @@ export class WorktreeManager {
     return { beforeTree, afterTree, beforeSha256: entry.beforeSha256, afterSha256: entry.afterSha256 };
   }
 
-  private setupAudit(jobId: string, patch: LoadedPreBootstrapPatch, custody: CreationIntent, worktreePath: string): {
+  private setupAudit(jobId: string, patch: LoadedPreBootstrapPatch, custody: CreationCustody, worktreePath: string): {
     readonly onCommandStart: (index: number, command: string) => void;
     readonly onSpawn: (pid: number, index: number, command: string) => void;
     readonly onCommandOutcome: (index: number, command: string, result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
@@ -1688,7 +1688,7 @@ export class WorktreeManager {
     readonly path: string;
     readonly sha: string;
     readonly base: ResolvedBase;
-    readonly custody: CreationIntent;
+    readonly custody: CreationCustody;
     readonly jobId: string;
   }): Promise<WorktreeRecord> {
     const existing = this.opts.ledger.getWorktree(input.jobId);
