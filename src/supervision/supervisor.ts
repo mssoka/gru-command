@@ -1025,8 +1025,8 @@ export class Supervisor {
             // later frame is nonfatal. Equally, generic exit noise must not
             // erase a known provider wall and cause a futile blind restart.
             const previous = flight.pendingError;
-            const previousClass = previous === null ? null : deterministicFailureClass(previous.error);
-            const nextClass = deterministicFailureClass(event.error);
+            const previousClass = previous === null ? null : deterministicFailureClass(previous.error, previous.typed);
+            const nextClass = deterministicFailureClass(event.error, event.typed);
             const selected = previous !== null &&
               (previousClass === 'authentication_wall' || previousClass === 'quota_wall') &&
               nextClass !== 'authentication_wall' && nextClass !== 'quota_wall' ? previous : event;
@@ -1825,7 +1825,7 @@ export class Supervisor {
       this.abortIsolatedReviewAttempt(agent, reason);
       return;
     }
-    const deterministicClass = deterministicFailureClass(reason);
+    const deterministicClass = deterministicFailureClass(reason, source?.typed);
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
@@ -1862,6 +1862,7 @@ export class Supervisor {
     const expectedOpenControl = agent.openControl;
     const request = supervisionDecisionRequest({
       reason,
+      typed: source?.typed,
       agentId: agent.agentId,
       role: agent.role,
       restartCount: agent.restartRing.length,

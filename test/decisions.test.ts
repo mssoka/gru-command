@@ -222,6 +222,11 @@ describe('typed decision semantics', () => {
     expect(deterministicFailureClass('turn hang detected')).toBe('turn_hang');
     expect(deterministicFailureClass('compaction hang detected')).toBe('turn_hang');
     expect(deterministicFailureClass('fatal opaque runtime failure')).toBe('fatal_runtime');
+    const localAuthorityQuota = 'HTTP 429: DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+    expect(deterministicFailureClass(localAuthorityQuota, { status: 429, bodyCode: '1302' })).toBe('quota_wall');
+    expect(deterministicFailureClass('HTTP 401: quota limit', { status: 401, bodyCode: '1302' })).toBe('authentication_wall');
+    expect(supervisionDecisionRequest({ reason: localAuthorityQuota, typed: { status: 429, bodyCode: '1302' },
+      agentId: 'typed-quota-wall', role: 'minion', restartCount: 0, breakerLimit: 3 }).fallback.failure_class.choice).toBe('quota_wall');
     // Compound/camel spellings keep their walls (the r1 word-boundary fix
     // must not trade recall for precision).
     expect(deterministicFailureClass('oauth token rejected by provider')).toBe('authentication_wall');
