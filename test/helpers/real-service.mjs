@@ -138,6 +138,7 @@ export async function startRealService({
   reviewEnabled = true,
   extraEnv = {},
   extraConfig = [],
+  captureOutput = false,
 } = {}) {
   // Port-squat prevention: ephemeral or an explicit high-range override —
   // never the instance port, never privileged.
@@ -240,7 +241,13 @@ export async function startRealService({
     spawnError = error instanceof Error ? error : new Error(String(error));
   });
   let stderrTail = '';
-  child.stdout.on('data', () => {}); // drain: the service log must never wedge the pipe
+  // Full stdout + stderr only on request (what launchd keeps as
+  // launchd.{out,err}.log); otherwise drained so the pipe never wedges.
+  let captured = '';
+  child.stdout.on('data', (chunk) => {
+    if (captureOutput) captured += chunk;
+  });
+  if (captureOutput) child.stderr.on('data', (chunk) => { captured += chunk; });
   child.stderr.on('data', (chunk) => {
     stderrTail = `${stderrTail}${chunk}`.slice(-4000);
   });
@@ -329,7 +336,12 @@ export async function startRealService({
     cleanup();
   }
 
-  return { child, home, workspace, port, token, baseUrl, stop };
+  const output = () => {
+    if (!captureOutput) failLoud('output() needs startRealService({ captureOutput: true })');
+    return captured;
+  };
+
+  return { child, home, workspace, port, token, baseUrl, stop, output };
 }
 
 // ---------------------------------------------------------------------------

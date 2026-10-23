@@ -1997,7 +1997,7 @@ export function loadConfig(
 /** A parse failure without its source excerpt: smol-toml quotes the lines
  * around the error, and those lines can hold an `[env]` or `[auth]` secret.
  * The reason and the position are enough to find the mistake. */
-function tomlErrorSummary(error: unknown): string {
+export function tomlErrorSummary(error: unknown): string {
   if (error instanceof TomlError) {
     const reason = error.message.split('\n', 1)[0] ?? 'invalid TOML';
     return `${reason} (line ${error.line}, column ${error.column})`;
@@ -2012,6 +2012,16 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
  * lane, review and verification authority. The environment the service
  * manager or GC hands a process sets them, never config. */
 const RESERVED_ENV_PREFIX = 'GRU_';
+
+/** HOME locates the default instance (and every later config read): one
+ * supplied by `[env]` could move a hot reload to another config. */
+const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(['HOME']);
+
+/** Every process the service starts carries `[env]`. Linux refuses a single
+ * `NAME=value` over 128 KiB, and macOS refuses arguments plus environment
+ * over about 1 MiB (E2BIG): a cap well inside both keeps the service able to
+ * start its processes. */
+export const MAX_ENV_TABLE_BYTES = 65_536;
 
 /**
  * `[env]` (#494): a table of literal strings. Errors name the field and
@@ -2037,17 +2047,30 @@ function readEnvTable(value: unknown, file: string): ConfiguredEnvironment {
         field,
       );
     }
+    if (RESERVED_ENV_NAMES.has(name.toUpperCase())) {
+      throw new ConfigError(`${field} is reserved: it locates the instance and its config, so only the service unit sets it`, file, field);
+    }
     const text = requireString(entry, file, field, { allowEmpty: true });
     if (text.includes('\0')) {
       throw new ConfigError(`${field} must not contain a NUL character`, file, field);
     }
     entries.push([name, text]);
   }
+  const bytes = entries.reduce((sum, [name, text]) => sum + Buffer.byteLength(`${name}=${text}`) + 1, 0);
+  if (bytes > MAX_ENV_TABLE_BYTES) {
+    throw new ConfigError(
+      `[env] holds ${bytes} bytes of names and values, over the ${MAX_ENV_TABLE_BYTES}-byte limit: every process the service starts carries them, and an environment that large fails to launch (E2BIG) — put large data in a file and set its path instead`,
+      file,
+      'env',
+    );
+  }
   if (entries.length > 0 && process.platform !== 'win32') {
     const mode = statSync(file).mode & 0o777;
     if ((mode & 0o077) !== 0) {
+      // A pasteable command, the path shell-quoted when it needs it.
+      const path = /^[\w@%+=:,./-]+$/u.test(file) ? file : `'${file.replace(/'/gu, `'\\''`)}'`;
       throw new ConfigError(
-        `[env] holds values, so the config must be private to its owner, but its mode is ${mode.toString(8).padStart(4, '0')} — run: chmod 600 ${file}`,
+        `[env] holds values, so the config must be private to its owner, but its mode is ${mode.toString(8).padStart(4, '0')} — run: chmod 600 ${path}`,
         file,
         'env',
       );

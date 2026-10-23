@@ -97,7 +97,7 @@ export function configCheckedInstaller(
     } catch (error) {
       deps.stderr(
         action === 'start'
-          ? `gru: not starting the service: config.toml is invalid and the service would refuse it — ${String((error as Error).message)}`
+          ? `gru: not starting the service: config.toml is invalid and the service would refuse it (a service already running keeps the config it loaded) — ${String((error as Error).message)}`
           : `gru: not restarting the service: config.toml is invalid and the service would refuse it; the running service keeps the config it loaded — ${String((error as Error).message)}`,
       );
       return 1;

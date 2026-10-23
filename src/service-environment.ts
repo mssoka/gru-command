@@ -9,12 +9,13 @@ import { CREDENTIAL_ENV_VARS } from './decisions/profile.js';
  * unset. Values are read once per boot — an edit applies on the next start.
  */
 
-/** `inherited` plus every `[env]` name it leaves unset, as a new object. */
+/** `inherited` plus every `[env]` name it leaves unset, as a new object.
+ * "Set" is an own property: `toString` and friends are names like any other. */
 export function withConfiguredEnvironment(
   configured: ConfiguredEnvironment,
   inherited: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-  const supplied = configured.entries().filter(([name]) => inherited[name] === undefined);
+  const supplied = configured.entries().filter(([name]) => !Object.hasOwn(inherited, name));
   return { ...inherited, ...Object.fromEntries(supplied) };
 }
 
@@ -43,7 +44,7 @@ export function bootServiceEnvironment(
 ): ServiceEnvironment {
   const inheritedEnv = isolateDecisionEnvironment(ambient);
   const config = loadConfig(ambient, home);
-  const supplied = config.env.entries().filter(([name]) => inheritedEnv[name] === undefined);
+  const supplied = config.env.entries().filter(([name]) => !Object.hasOwn(inheritedEnv, name));
   for (const [name, value] of supplied) {
     if (!CREDENTIAL_ENV_VARS.includes(name)) ambient[name] = value;
   }
@@ -51,6 +52,6 @@ export function bootServiceEnvironment(
     config,
     decisionEnvironment: withConfiguredEnvironment(config.env, inheritedEnv),
     supplied: supplied.map(([name]) => name),
-    inherited: config.env.names.filter((name) => inheritedEnv[name] !== undefined),
+    inherited: config.env.names.filter((name) => Object.hasOwn(inheritedEnv, name)),
   };
 }

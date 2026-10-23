@@ -117,9 +117,9 @@ CUSTOM_SERVICE_OPTION = "enabled"
 
 The section is optional. Without it, nothing changes.
 
-- **Who gets the values.** The service itself, and every process it starts
-  (agents, git, gh, glab, verification commands), as if the service unit had
-  set them. GC's usual child-process filtering still applies on top.
+- **Who gets the values.** The service itself, from the start of its boot,
+  and every process it starts (agents, git, gh, glab, verification
+  commands). GC's usual child-process filtering still applies on top.
 - **Precedence.** The environment the service starts with wins. A name the
   service unit (or whoever starts the service) already sets keeps that
   value, even when the value is empty. `[env]` only supplies names that are
@@ -127,11 +127,15 @@ The section is optional. Without it, nothing changes.
   macOS `GRU_COMMAND_REVIEW_PYTHON`, so `[env]` cannot change those. The boot
   log line lists the names `[env]` supplied and the names the inherited
   environment kept (`config_env`). It shows names only, never values.
-- **Reserved names.** `GRU_*` names are refused, in any letter case. GC uses
-  them to select the instance and the port and to carry lane and review
-  authority, and those come only from the unit and from GC itself.
-  `[env]` can never move the service to another instance or config: the
-  config file is chosen before `[env]` is read.
+  Precedence is per name: a program that reads one of several names (the
+  GitLab token as `GITLAB_TOKEN`, then `GL_TOKEN`; the Claude CLI preferring
+  `ANTHROPIC_API_KEY` over a login) can pick an `[env]` name over a
+  different name the unit sets.
+- **Reserved names.** `GRU_*` names and `HOME` are refused, in any letter
+  case. GC uses them to select the instance, its config and the port and to
+  carry lane and review authority, and those come only from the unit and
+  from GC itself. `[env]` can never move the service to another instance or
+  config: the config file is chosen before `[env]` is read.
 - **Decision provider keys.** `OPENROUTER_API_KEY` and `TYPESAFE_API_KEY`
   in `[env]` reach Jev's credential lookup, exactly like the same variables
   set in the service unit. They take precedence over the
@@ -143,17 +147,26 @@ The section is optional. Without it, nothing changes.
   process. Every boot reads it: `gru start`, `gru restart`, `gru update`,
   login or reboot starts, the service manager restarting a crashed service,
   and a direct `node dist/main.js`. An edit takes effect at the next start
-  or restart; there is no hot reload. Variables that Node.js reads before
-  any code runs (`NODE_OPTIONS`, for example) reach only the processes the
-  service starts, not the running service.
+  or restart; there is no hot reload. An edit that makes the file invalid
+  is still noticed at once, as in any other section: Jev's config watcher
+  re-reads the whole file, and while it is invalid Jev (if enabled) falls
+  back to deterministic routing with the reason `config_invalid`.
+  Variables Node.js reads as it starts
+  (`NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS` or `UV_THREADPOOL_SIZE`, for
+  example) take effect only in the processes the service starts: `[env]` is
+  read after the running service's Node.js has started.
 - **Literal values.** Values are plain strings. There is no `$VAR`
   expansion and no shell. Names must be valid environment variable names
   (letters, digits and underscores, not starting with a digit). Values must
-  be strings without a NUL character; an empty string is allowed.
-- **Checked before starting.** `gru start` and `gru restart --now` load the
-  config first and refuse to touch the service when it is invalid, so a bad
-  edit never leaves the unit failing to start. The service runs the same
-  check when it boots.
+  be strings without a NUL character; an empty string is allowed. The whole
+  table is limited to 64 KiB of names and values, because every process the
+  service starts carries it; put large data in a file and set its path.
+- **Checked before starting.** `gru start`, `gru restart` (with or without
+  `--now`) and `gru roll` load the config first and refuse when it is
+  invalid, leaving the service as it is. The service runs the same check
+  when it boots. `gru update` and a roll started from the board do not
+  check first: with an invalid config the relaunched service refuses to
+  start until you fix the file and run `gru start`.
 - **Plaintext secrets.** `[env]` is not an encrypted secret store. Values
   sit in `config.toml` in plaintext, so the file must be private to you:
   `chmod 600 ~/.gru-command/config.toml`. If the file holds `[env]` values
@@ -227,7 +240,7 @@ token = "a-random-pairing-token"
 # Optional variables for the service and every process it starts, such as
 # a token a CLI the service runs reads. The service unit's own environment
 # wins for any name it sets (an empty value too); [env] fills the rest.
-# Literal strings, no expansion; GRU_* names are reserved. Read once per
+# Literal strings, no expansion; GRU_* names and HOME are reserved. Read once per
 # boot: apply an edit with `gru restart`. Values are plaintext, so this
 # file must stay private to you (chmod 600; [env] values in a file others
 # can read are refused).
@@ -807,6 +820,8 @@ example.
 | Bad `[env]` name | `env name "1BAD" is not a valid environment variable name …` |
 | Reserved `[env]` name | `env.GRU_COMMAND_HOME is reserved: GRU_* variables are set by Gru Command and its service unit …` |
 | NUL in an `[env]` value | `env.TOKEN must not contain a NUL character` |
+| `HOME` in `[env]` | `env.HOME is reserved: it locates the instance and its config, so only the service unit sets it` |
+| `[env]` over 64 KiB | `[env] holds 70000 bytes of names and values, over the 65536-byte limit: …` |
 | `[env]` values in a shared file | `[env] holds values, so the config must be private to its owner, but its mode is 0644 — run: chmod 600 …` |
 
 ## What reads the config today

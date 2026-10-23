@@ -1,5 +1,5 @@
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -20,7 +20,8 @@ const fetchDouble = join(import.meta.dirname, 'helpers', 'jev-fetch-double.mjs')
 const CANARY = 'SYNTHETIC-ENV-CANARY-494';
 const KEY_CANARY = 'SYNTHETIC-PROVIDER-KEY-CANARY-494';
 const LOSING = 'SYNTHETIC-OVERRIDDEN-CANARY-494';
-const SECRETS = [CANARY, KEY_CANARY, LOSING];
+const INHERITED_KEY = 'SYNTHETIC-INHERITED-PROVIDER-KEY-494';
+const SECRETS = [CANARY, KEY_CANARY, LOSING, INHERITED_KEY];
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -42,7 +43,7 @@ function recordingGit(binDir: string, record: string): void {
     join(binDir, 'git'),
     [
       '#!/bin/sh',
-      `printf '%s\\t%s\\t%s\\t%s\\n' "\${SYNTH_ENV_SUPPLIED-<unset>}" "\${SYNTH_ENV_INHERITED-<unset>}" "\${SYNTH_ENV_EMPTY-<unset>}" "\${OPENROUTER_API_KEY-<unset>}" >> '${record}'`,
+      `printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "\${SYNTH_ENV_SUPPLIED-<unset>}" "\${SYNTH_ENV_INHERITED-<unset>}" "\${SYNTH_ENV_EMPTY-<unset>}" "\${OPENROUTER_API_KEY-<unset>}" "\${TYPESAFE_API_KEY-<unset>}" >> '${record}'`,
       `exec '${realGit}' "$@"`,
       '',
     ].join('\n'),
@@ -76,7 +77,9 @@ describe('[env] in the compiled service boot (#494)', () => {
       decisionsEnabled: true,
       nodeImport: fetchDouble,
       requireWebDist: false,
-      extraEnv: { JEV_FETCH_LOG: fetchLog, SYNTH_ENV_INHERITED: 'from-service-unit', SYNTH_ENV_EMPTY: '' },
+      captureOutput: true,
+      // TYPESAFE_API_KEY: a provider key the service unit sets, isolated as before #494.
+      extraEnv: { JEV_FETCH_LOG: fetchLog, SYNTH_ENV_INHERITED: 'from-service-unit', SYNTH_ENV_EMPTY: '', TYPESAFE_API_KEY: INHERITED_KEY },
       extraConfig: [
         '[env]',
         `SYNTH_ENV_SUPPLIED = "${CANARY}"`,
@@ -103,13 +106,16 @@ describe('[env] in the compiled service boot (#494)', () => {
       await vi.waitFor(() => expect(existsSync(record)).toBe(true), { timeout: 30_000 });
       const seen = readFileSync(record, 'utf8').trim().split('\n').map((line) => line.split('\t'));
       expect(seen.length).toBeGreaterThan(0);
-      for (const fields of seen) expect(fields).toEqual([CANARY, 'from-service-unit', '', '<unset>']);
+      for (const fields of seen) expect(fields).toEqual([CANARY, 'from-service-unit', '', '<unset>', '<unset>']);
       await get('/health');
       await get('/api/board');
     } finally {
       await service.stop();
     }
     for (const answer of answers) for (const secret of SECRETS) expect(answer).not.toContain(secret);
+    // stdout and stderr: what launchd keeps as launchd.{out,err}.log.
+    expect(service.output()).toContain('"msg":"boot"');
+    for (const secret of SECRETS) expect(service.output()).not.toContain(secret);
     // The boot log names what [env] did, and only names.
     const bootLine = readFileSync(join(home, 'logs', 'service.log'), 'utf8')
       .split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
@@ -131,7 +137,11 @@ describe('[env] in the compiled service boot (#494)', () => {
     const root = tempRoot();
     const elsewhere = join(root, 'elsewhere');
     mkdirSync(elsewhere);
-    const header = '[server]\nhost = "127.0.0.1"\nport = 0\n';
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    // Jev on: a table that slipped through would start the provider probe
+    // and the fetch double would record it.
+    const header = `workspace_root = "${workspace}"\n[server]\nhost = "127.0.0.1"\nport = 0\n[decisions.jev]\nenabled = true\n`;
     const cases = [
       { label: 'non-string', toml: `[env]\nTOKEN = 7\nOTHER = "${CANARY}"\n`, field: 'env.TOKEN must be a string' },
       { label: 'bad-name', toml: `[env]\n"BAD NAME" = "${CANARY}"\n`, field: 'env name \\"BAD NAME\\" is not a valid environment variable name' },
@@ -144,7 +154,8 @@ describe('[env] in the compiled service boot (#494)', () => {
     await Promise.all(cases.map(async ({ label, toml, field, mode }) => {
       const home = join(root, label);
       mkdirSync(home);
-      writeFileSync(join(home, 'config.toml'), `${header}${toml}`, { encoding: 'utf-8', mode: mode ?? 0o600 });
+      writeFileSync(join(home, 'config.toml'), `${header}${toml}`, 'utf-8');
+      chmodSync(join(home, 'config.toml'), mode ?? 0o600);
       const record = join(root, `${label}-git-env.tsv`);
       const fetchLog = join(root, `${label}-jev-fetch.jsonl`);
       recordingGit(join(root, `${label}-bin`), record);
@@ -161,7 +172,11 @@ describe('[env] in the compiled service boot (#494)', () => {
       let output = '';
       child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); });
       child.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); });
-      const code = await new Promise<number | null>((resolveExit) => child.once('exit', resolveExit));
+      // A boot that wrongly accepted the table would keep running: bound it.
+      const code = await new Promise<number | null | 'running'>((resolveExit) => {
+        const timer = setTimeout(() => { child.kill('SIGKILL'); resolveExit('running'); }, 20_000);
+        child.once('exit', (exitCode) => { clearTimeout(timer); resolveExit(exitCode); });
+      });
       expect(code, `${label}: ${output}`).toBe(1);
       expect(output, label).toContain('configuration invalid — refusing to start');
       expect(output, label).toContain(field);

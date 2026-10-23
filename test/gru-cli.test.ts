@@ -130,8 +130,22 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
       expect(errors).toContain('gru: not restarting the service: config.toml is invalid');
       expect(errors).toContain(named);
       expect(errors).not.toContain(canary);
+      // The graceful restart and the roll load the same config before they
+      // ask the service for anything.
+      expect(await runServiceCli(['restart'], deps)).toBe(1);
+      expect(await runServiceCli(['roll'], deps)).toBe(1);
+      const refused = h.stderr.splice(0).join('\n');
+      expect(refused).toContain('gru: cannot load instance config');
+      expect(refused).toContain(named);
+      expect(refused).not.toContain(canary);
     }
     expect(h.installer).toEqual([]);
+    expect(h.urls).toEqual([]);
+    // Stopping (and updating) never depend on the config: a service its
+    // broken config keeps failing must stay stoppable.
+    expect(await runServiceCli(['stop'], deps)).toBe(0);
+    expect(await runServiceCli(['update'], deps)).toBe(0);
+    expect(h.installer.splice(0)).toEqual([['--stop'], ['--update']]);
 
     writeFileSync(file, `${base}[env]\nTOKEN = "${canary}"\n`, { encoding: 'utf-8', mode: 0o600 });
     expect(await runServiceCli(['start'], deps)).toBe(0);

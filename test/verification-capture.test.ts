@@ -1074,6 +1074,27 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(unreachable).toBe(CAPTURE_EXIT.unknown);
   });
 
+  it('sends the [auth] token, never a `token` key another table (an [env] secret) holds above it (#494)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-env-token-'));
+    dirs.push(root);
+    const configPath = join(root, 'config.toml');
+    writeFileSync(configPath, '[env]\ntoken = "SYNTHETIC-ENV-SECRET-494"\n[auth]\ntoken = "ops-token"\n');
+    let auth: string | null = null;
+    const code = await runCaptureCli(
+      ['status', '--request-id', 'req-env-token', '--url', 'http://ops', '--config', configPath],
+      {
+        fetchImpl: async (_input, init) => {
+          auth = new Headers(init?.headers).get('authorization');
+          return new Response('{"state":"running"}\n', { status: 200 });
+        },
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    expect(auth).toBe('Bearer ops-token');
+  });
+
   it('runs the advertised authenticated status action from a relocated config path with literal $ and backtick (N11)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-$`instance-'));
     dirs.push(root);

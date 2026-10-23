@@ -5,6 +5,7 @@ import { readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { pathToFileURL } from 'node:url';
+import { parse } from 'smol-toml';
 import { pidAlive } from './scheduler.js';
 import {
   CAPTURE_OWNER_VERSION,
@@ -351,8 +352,14 @@ function readTokenFromConfig(path: string): string | null {
   } catch {
     return null;
   }
-  const match = /^\s*token\s*=\s*"([^"]+)"/mu.exec(text);
-  return match?.[1] ?? null;
+  // The [auth] table's token, never a `token` key in another table (such
+  // as an [env] secret): a TOML read, not a line match.
+  try {
+    const auth = (parse(text) as { auth?: { token?: unknown } }).auth;
+    return typeof auth?.token === 'string' && auth.token !== '' ? auth.token : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Resolve the ops base URL + pairing token (flags → env → config file). */

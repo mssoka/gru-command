@@ -29,6 +29,8 @@ export interface RealServiceHandle {
   readonly token: string;
   readonly baseUrl: string;
   stop(): Promise<void>;
+  /** Everything the service wrote to stdout and stderr (captureOutput only). */
+  output(): string;
 }
 
 export declare function startRealService(options?: {
@@ -60,6 +62,8 @@ export declare function startRealService(options?: {
   reviewEnabled?: boolean;
   /** Config lines appended after the generated tables (e.g. an [env] table). */
   extraConfig?: readonly string[];
+  /** Keep the service's full stdout and stderr for output(). */
+  captureOutput?: boolean;
   /** Additional non-secret test controls for the child process. */
   extraEnv?: NodeJS.ProcessEnv;
 }): Promise<RealServiceHandle>;

@@ -827,8 +827,14 @@ describe('install.sh setup mode (one-line path)', () => {
     const env = { HOME: home, GRU_COMMAND_HOME: instance, ...seam.env };
     const rendered = await run(join(target, 'install.sh'), ['--print'], env);
     expect(rendered.status, rendered.stderr).toBe(0);
+    // The issue's shape: an operator added a variable to the installed unit
+    // by hand. The update regenerates the unit, which drops it.
+    const handAdded = process.platform === 'darwin'
+      ? rendered.stdout.replace('<key>EnvironmentVariables</key>\n  <dict>', '<key>EnvironmentVariables</key>\n  <dict>\n    <key>GITLAB_TOKEN</key>\n    <string>hand-added-entry</string>')
+      : rendered.stdout.replace(/^(Environment=GRU_COMMAND_HOME=.*)$/m, '$1\nEnvironment=GITLAB_TOKEN=hand-added-entry');
+    expect(handAdded).toContain('hand-added-entry');
     mkdirSync(dirname(seam.unit), { recursive: true });
-    writeFileSync(seam.unit, rendered.stdout);
+    writeFileSync(seam.unit, handAdded);
 
     const result = await run(join(target, 'install.sh'), ['--update', '--no-interact'], env);
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
@@ -839,6 +845,7 @@ describe('install.sh setup mode (one-line path)', () => {
     // The regenerated unit, the manager's arguments and the installer's
     // output never carry the value: config.toml is its one home.
     const unit = readFileSync(seam.unit, 'utf-8');
+    expect(unit).not.toContain('hand-added-entry');
     for (const text of [unit, readFileSync(seam.managerLog, 'utf-8'), result.stdout, result.stderr]) {
       expect(text).not.toContain(canary);
     }

@@ -261,7 +261,7 @@ function envSection(preserved: GruCommandConfig | null | undefined): string[] {
     '# Optional variables for the service and every process it starts, such as',
     '# a token a CLI the service runs reads. The service unit\'s own environment',
     '# wins for any name it sets (an empty value too); [env] fills the rest.',
-    '# Literal strings, no expansion; GRU_* names are reserved. Read once per',
+    '# Literal strings, no expansion; GRU_* names and HOME are reserved. Read once per',
     '# boot: apply an edit with `gru restart`. Values are plaintext, so this',
     '# file must stay private to you (chmod 600; [env] values in a file others',
     '# can read are refused).',

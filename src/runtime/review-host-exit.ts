@@ -93,7 +93,12 @@ function linuxIdentity(pid: number): string | null {
  * from a boot time a clock step adjusts, so they get no identity.) */
 const PS = '/bin/ps';
 const PS_START = ['-o', 'lstart=', '-p'] as const;
-const PS_ENV = { ...process.env, TZ: 'UTC', LC_ALL: 'C' };
+
+/** `ps`'s environment, built per call rather than at import: the service's
+ * own as it is now (provider keys isolated, `[env]` supplied), in UTC. */
+export function psEnvironment(): NodeJS.ProcessEnv {
+  return { ...process.env, TZ: 'UTC', LC_ALL: 'C' };
+}
 
 /** A clock-free start identity for the process now holding `pid`: Linux's
  * boot id and start ticks, or macOS's UTC `ps -o lstart`. Null when it
@@ -102,7 +107,7 @@ export async function processIdentity(pid: number): Promise<string | null> {
   if (process.platform === 'linux') return linuxIdentity(pid);
   if (process.platform !== 'darwin') return null;
   return new Promise((resolve) => {
-    execFile(PS, [...PS_START, String(pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }, (error, stdout) => {
+    execFile(PS, [...PS_START, String(pid)], { encoding: 'utf8', timeout: 10_000, env: psEnvironment() }, (error, stdout) => {
       const started = error === null ? stdout.trim() : '';
       resolve(started === '' ? null : `ps:${started}`);
     });
@@ -123,7 +128,7 @@ export function thisProcessIdentity(): string | null {
     ownIdentity = linuxIdentity(process.pid);
   } else if (process.platform === 'darwin') {
     try {
-      const started = execFileSync(PS, [...PS_START, String(process.pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }).trim();
+      const started = execFileSync(PS, [...PS_START, String(process.pid)], { encoding: 'utf8', timeout: 10_000, env: psEnvironment() }).trim();
       ownIdentity = started === '' ? null : `ps:${started}`;
     } catch {
       ownIdentity = null;
