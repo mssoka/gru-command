@@ -17,7 +17,7 @@ import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
 import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
-import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
+import { createServiceReviewWave, liveReviewSessionIds, publicationPrLookup } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
 import { bindSupervisorNotificationDisposition } from './supervision/notification-disposition.js';
@@ -1344,6 +1344,9 @@ async function main(): Promise<number> {
     rateLimitBackoff: pacing.backoff,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     poster: createStartupVerdictPoster(config),
+    // A conclusive review whose lane opened a PR but never registered it
+    // finds that PR at publication instead of aborting `no_pr_link`.
+    ...publicationPrLookup({ gh: new GhCliApi(), resolveRemote: (repoPath) => repoRemote(repoPath), dispatch: dispatcher }),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     reconcileReviewAgent: async (agentId, marker) => registry.reviewOwnerCeased(agentId, marker),
     proveReviewHostExit: (proofInput) => registry.proveReviewHostExit(proofInput),

@@ -337,6 +337,7 @@ function deliveredRow(overrides: Partial<DeliveredWithoutPrRow> = {}): Delivered
     lanePath: '/tmp/lane/job-delivered',
     minionSessionFile: null,
     deliveredAt: '2026-10-13T00:00:00.000Z',
+    abortedRounds: 0,
     ...overrides,
   };
 }

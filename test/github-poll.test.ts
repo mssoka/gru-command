@@ -27,6 +27,7 @@ import {
   classifyCheck,
   diffBranchState,
   nextBranchState,
+  openPullRequestsForBranch,
   parseGitHubPrUrl,
   readBranchState,
   repoFullName,
@@ -314,6 +315,34 @@ describe('branch state-change mapping', () => {
 // ------------------------------------------------------------------
 // Tracked lanes + gh adapter
 // ------------------------------------------------------------------
+
+describe('open pull requests for a lane branch (#488)', () => {
+  const pull: GhPull = {
+    number: 776, headRef: 'gru/rt-css', headSha: 'a'.repeat(40), state: 'open',
+    merged: false, mergeableState: null, mergeCommitSha: null, url: 'https://github.com/acme/site/pull/776',
+  };
+
+  it('asks GitHub for the open pulls whose head is the lane branch', async () => {
+    const listPullsForHead = vi.fn(async () => [pull]);
+    const remote = { host: 'github.com', owner: 'acme', repo: 'site' };
+    await expect(openPullRequestsForBranch({ listPullsForHead }, { repoPath: '/lanes/rt-css', remote, branch: 'gru/rt-css' }))
+      .resolves.toEqual([pull]);
+    expect(listPullsForHead).toHaveBeenCalledWith({ repo: remote, head: 'gru/rt-css' });
+  });
+
+  it('fails loud, naming the lane, for a non-GitHub or missing origin, and never asks GitHub', async () => {
+    const listPullsForHead = vi.fn(async () => [pull]);
+    const gitlab = openPullRequestsForBranch({ listPullsForHead }, {
+      repoPath: '/lanes/gl', remote: { host: 'gitlab.com', owner: 'acme', repo: 'site' }, branch: 'gru/x',
+    });
+    await expect(gitlab).rejects.toBeInstanceOf(GhApiError);
+    await expect(gitlab).rejects.toThrow('no GitHub remote resolves for lane "/lanes/gl"');
+    const missing = openPullRequestsForBranch({ listPullsForHead }, { repoPath: '/lanes/none', remote: null, branch: 'gru/x' });
+    await expect(missing).rejects.toBeInstanceOf(GhApiError);
+    await expect(missing).rejects.toThrow('no GitHub remote resolves for lane "/lanes/none"');
+    expect(listPullsForHead).not.toHaveBeenCalled();
+  });
+});
 
 describe('tracked lanes', () => {
   it('prefers the recorded PR URL, falls back to the lane origin remote, and skips non-GitHub or terminal lanes', () => {
