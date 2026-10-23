@@ -193,7 +193,7 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
-  'blind-input-dispatch.test.ts': 24,
+  'blind-input-dispatch.test.ts': 26,
   'blind-input.test.ts': 34,
   'blind-observer-service.test.ts': 2,
   'blind-review.test.ts': 18,
@@ -240,7 +240,7 @@ const PINS: Record<string, number> = {
   'directive-retirement.test.ts': 85,
   'directive-retry-history.test.ts': 41,
   'directive-transcript-bounds.test.ts': 32,
-  'fix-directive.test.ts': 46,
+  'fix-directive.test.ts': 48,
   'github-poll.test.ts': 45,
   'gru-cli.test.ts': 11,
   'gru-mailbox.test.ts': 39,

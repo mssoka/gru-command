@@ -310,7 +310,7 @@ describe('blind review commissioning (issue #316)', () => {
     }));
     expect(claims.status).toBe(202);
     await waitFor(() => h.ledger.latestJobEvent('rev-claims-context', 'job.delivered') !== null);
-    const claimsPrompt = h.prompts.find((prompt) => prompt.includes('review (claims)'))!;
+    const claimsPrompt = h.prompts.find((prompt) => prompt.includes('rev-claims-context'))!;
     expect(claimsPrompt).toContain('/synthetic-book/chapters/synthetic-canary.md');
   });
 

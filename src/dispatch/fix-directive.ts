@@ -874,7 +874,7 @@ export async function rebriefFreshMinion(
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
       const blindReview = blindReviewFor(input.ledger, input.jobId);
       const blindPackage = blindPackageFor(input.ledger, input.jobId, blindReview);
-      const briefing = blindPackage === null || input.briefing?.includes('BLIND INPUT PACKAGE (')
+      const briefing = blindPackage === null || input.resumeFile != null || input.briefing?.includes('BLIND INPUT PACKAGE (')
         ? input.briefing
         : [input.briefing, renderBlindPackageBlock(blindPackage).join('\n')].filter((part): part is string => part !== null && part !== undefined && part !== '').join('\n\n');
       prompt = renderRebriefPrompt({
