@@ -170,7 +170,7 @@ function dispatch(raw) {
          * Claude Code (2.1.309) hands the model the structuredContent JSON
          * INSTEAD of the text when both are present, so the host's summary
          * details would replace specialist findings, preflight errors and
-         * still-running guidance. The details stay host-side. */
+         * still-running guidance. The details the bridge sends stop here. */
         respond(request.id, {
           content: [{ type: 'text', text: result.text }],
           ...(result.terminate === true ? { _meta: { terminate: true } } : {}),

@@ -351,6 +351,8 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
     };
     expect(first.error).toBeUndefined();
     expect(first.result?.content?.[0]?.text).toContain('has not returned within the 150 ms transport wait');
+    expect(first.result?.content?.[0]?.text).toContain('The review tool "perkins_probe"');
+    expect(first.result?.content?.[0]?.text).toContain('Call the same tool again with the same arguments to attach to it');
     // The re-attach guidance is the text; no structuredContent shadows it.
     expect(first.result?.structuredContent).toBeUndefined();
     expect(executions).toBe(1);

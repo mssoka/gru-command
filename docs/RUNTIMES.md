@@ -46,11 +46,12 @@ branch on harness. The ADAPTER implements the declaration:
   that declared set over a private 0700 Unix socket; the CLI sees it via
   `--mcp-config` + `--allowedTools`. The bridge lives and dies with its
   handle — closed on dispose and on failed-spawn cleanup — so every
-  concurrent lens child of a round owns one bridge and none leaks. A tool
-  result crosses the bridge as its text only, never with
-  `structuredContent`: Claude Code shows the model the structuredContent
-  JSON instead of the text when both are present, which would hand the lead
-  summary counts in place of specialist findings or preflight errors.
+  concurrent lens child of a round owns one bridge and none leaks. The MCP
+  server forwards a tool result to the CLI as its text only and drops the
+  bridge's summary details, never sending `structuredContent`: Claude Code
+  shows the model the structuredContent JSON instead of the text when both
+  are present, which would hand the lead summary counts in place of
+  specialist findings or preflight errors.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes

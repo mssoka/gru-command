@@ -156,7 +156,7 @@ policy's catalog makes nine whole-change specialist lenses available (blind,
 edge, acceptance, security, architecture, codebase, tests, performance,
 operations) — eight when `no_spec: true` explicitly removes the
 spec-dependent acceptance lens. The lead's system prompt lists each lens of
-its catalog with the brief that lens's specialist receives, and the lead
+its catalog with that lens's policy brief, and the lead
 SELECTS which specialists help the
 change: availability is never a mandatory coverage gate, and a subset (or
 none) is a valid review. Specialists run in explicit tool-call batches

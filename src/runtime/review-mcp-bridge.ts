@@ -29,7 +29,7 @@ const MAX_BRIDGE_CONNECTIONS = 16;
 /** Cap on bridge teardown during disposal. Exported so the service shutdown
  * force-exit budget can be reconciled with the bounded teardown (issue #341). */
 export const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
-export const PERKINS_MCP_SERVER_SHA256 = 'd4ff7ad04a1e8069d843050940254b860f8fb8a8d7a4be13694415ded96c09a0';
+export const PERKINS_MCP_SERVER_SHA256 = 'ae53ef1bf15f295c4118457585aff5708a323956278f97ba8c261e6de319a719';
 
 interface BridgeRequest {
   readonly id: string;

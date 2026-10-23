@@ -928,6 +928,9 @@ describe('Perkins whole-PR lead engine', () => {
     for (const lens of policy.portableContract.rules.fullLenses) {
       expect(fullPrompt).toContain(`- ${lens}: ${policy.portableContract.lenses[lens]}`);
     }
+    // Literal anchors, so the check is not only the code's own expression.
+    expect(fullPrompt).toContain('- performance: Review the whole change for concrete resource and cost risks');
+    expect(fullPrompt).toContain('- operations: Review the end-to-end ability to detect, diagnose, and recover the changed behavior');
     // No-spec mode lists only its own catalog: acceptance is not a lens the
     // lead can run there, so it is not offered.
     const noSpec = wholeHarness(ALL_CLEAN, { noSpec: true });
