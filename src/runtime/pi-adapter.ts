@@ -249,6 +249,22 @@ export function typedFromProviderMessageLine(
     ...(parsed.bodyCode !== undefined ? { bodyCode: parsed.bodyCode } : {}),
   };
 }
+
+/** Preserve local provenance only when the emitted error object contains the exact
+ * captured guard refusal, including standard wrappers. Message text is never proof. */
+function wrapsCapturedError(error: unknown, captured: object, seen = new Set<object>()): boolean {
+  if (error === captured) return true;
+  if (typeof error !== 'object' || error === null || seen.has(error)) return false;
+  seen.add(error);
+  const nested: unknown[] = [];
+  try {
+    if (error instanceof AggregateError) nested.push(...error.errors);
+    if ('cause' in error) nested.push((error as { readonly cause?: unknown }).cause);
+  } catch {
+    return false;
+  }
+  return nested.some((candidate) => wrapsCapturedError(candidate, captured, seen));
+}
 // The declaration now lives in the dependency-light `capabilities.js` so the
 // runtime probe can report it without loading this adapter's SDK graph; the
 // re-export keeps every existing import surface (and object identity) intact.
@@ -1344,8 +1360,9 @@ export class PiAgentHandle implements AgentHandle {
     throw error;
   }
 
-  private isNativeDirectiveRefusal(directive: PromptOptions['directive']): boolean {
-    return directive !== undefined && this.nativeDirectiveRefusal !== null && this.liveDirective === directive;
+  private isNativeDirectiveRefusal(directive: PromptOptions['directive'], error: unknown): boolean {
+    const captured = this.nativeDirectiveRefusal;
+    return directive !== undefined && captured !== null && this.liveDirective === directive && wrapsCapturedError(error, captured);
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -1857,7 +1874,7 @@ export class PiAgentHandle implements AgentHandle {
             type: 'error',
             error: errorText,
             fatal: false,
-            ...(typed === null && this.isNativeDirectiveRefusal(directive) ? { nativeControl: 'directive-refusal' as const } : {}),
+            ...(typed === null && this.isNativeDirectiveRefusal(directive, error) ? { nativeControl: 'directive-refusal' as const } : {}),
             ...(typed !== null && this.session.model !== undefined
               ? { provider: this.session.model.provider, model: this.session.model.id }
               : {}),
@@ -2138,7 +2155,8 @@ export class PiAgentHandle implements AgentHandle {
               type: 'error',
               error: detail,
               fatal: false,
-              ...(typed === null && this.isNativeDirectiveRefusal(this.liveDirective) ? { nativeControl: 'directive-refusal' as const } : {}),
+              // This terminal assistant error is distinct from a previous local
+              // guard refusal; never lend its provenance to another event.
               ...(typeof msg['provider'] === 'string'
                 ? { provider: msg['provider'] }
                 : this.session.model !== undefined
