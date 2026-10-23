@@ -84,10 +84,13 @@ describe('prune-stale-dist', () => {
     // (dist/runtime/review-host-exit.js); #480 the GitLab overview transport
     // (dist/repos/gitlab-overview.js); #486 lane provenance and the paused
     // sweep's card and its follow-through (dist/worktrees/lane-provenance.js,
-    // dist/worktrees/sweep-card.js, dist/worktrees/sweep-decisions.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5227);
+    // dist/worktrees/sweep-card.js, dist/worktrees/sweep-decisions.js); and
+    // the guarded pre-bootstrap dependency patch reader
+    // (dist/worktrees/prebootstrap-patch.js) plus audited esbuild's WASM
+    // optional artifact (@esbuild/android-arm/esbuild.wasm).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5229);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('36593e02ac3a7d49deecc74e699c9f271b7855ffa555754c8e6e76b8357a74bf');
+      .toBe('66c387678a718c5b0ef659d918966d3c2e4b309f105ddbaac39a307a1b4d6dbf');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

@@ -234,7 +234,7 @@ const PINS: Record<string, number> = {
   'deploy-drift.test.ts': 22,
   'dispatch-e2e.test.ts': 6,
   'dispatch-joins.test.ts': 2,
-  'dispatch-server.test.ts': 71,
+  'dispatch-server.test.ts': 74,
   'docs-contracts.test.ts': 3,
   'directive-producer-inspection.test.ts': 2,
   'directive-retirement.test.ts': 85,

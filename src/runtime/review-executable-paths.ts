@@ -1776,6 +1776,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "@earendil-works/pi-tui/native/win32/build.mjs",
   "@earendil-works/pi-tui/native/win32/prebuilds/win32-arm64/win32-console-mode.node",
   "@earendil-works/pi-tui/native/win32/prebuilds/win32-x64/win32-console-mode.node",
+  "@esbuild/android-arm/esbuild.wasm",
   "@esbuild/darwin-arm64/bin/esbuild",
   "@esbuild/darwin-x64/bin/esbuild",
   "@esbuild/linux-arm/bin/esbuild",
