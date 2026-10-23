@@ -2949,10 +2949,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(events.filter((event) => event.type === 'error'), next).toEqual([{ type: 'error', error, fatal: false, ...(owed === 'refusal' ? { nativeControl: 'directive-refusal' } : {}) }]);
         const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8');
         expect(receipts, next).toContain(owed === 'plain' ? 'authority manifest computation failed' : refusal);
-        // The later lost write is a bookkeeping fault of its own: logged, though not the turn's first.
+        // The later lost write is a bookkeeping fault of its own: logged, though not the turn's
+        // first. The writes the destroyed stream refuses after it restate that root, unlogged.
         if (next === 'lost write') {
           expect(fx.logs.filter((line) => line.msg === 'claude directive bookkeeping failed; the directive is refused'))
-            .toContainEqual(expect.objectContaining({ fields: expect.objectContaining({ fault: expect.stringContaining('EDQUOT: disk quota exceeded') }) }));
+            .toEqual([expect.objectContaining({ fields: expect.objectContaining({ fault: expect.stringMatching(/^Error: EDQUOT: disk quota exceeded\n/u) }) })]);
         }
       } finally {
         vi.useRealTimers();

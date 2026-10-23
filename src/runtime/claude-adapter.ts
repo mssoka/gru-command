@@ -2038,8 +2038,10 @@ export class ClaudeCodeHandle implements AgentHandle {
    * reports: the first, which a later failure never supersedes (#485). */
   private recordDirectiveFailure(turn: DirectiveTurn, error: unknown): unknown {
     turn.failure ??= { error };
-    // Every bookkeeping fault is logged, first or not, and once.
-    if (error instanceof DirectiveBookkeepingError && !this.loggedBookkeepingFaults.has(error)) {
+    // Every bookkeeping fault is logged, first or not, and once. A write to a
+    // transcript stream an earlier fault destroyed only restates that root.
+    if (error instanceof DirectiveBookkeepingError && !this.loggedBookkeepingFaults.has(error) &&
+        (error.fault as NodeJS.ErrnoException | null | undefined)?.code !== 'ERR_STREAM_DESTROYED') {
       this.loggedBookkeepingFaults.add(error);
       this.log('error', 'claude directive bookkeeping failed; the directive is refused', { request: turn.directive.identity.requestId,
         error: error.message, fault: error.fault instanceof Error ? error.fault.stack ?? error.fault.message : thrownText(error.fault) });
