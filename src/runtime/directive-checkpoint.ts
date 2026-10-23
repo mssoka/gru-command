@@ -32,8 +32,21 @@ export type DirectiveCheckpoint =
   | { readonly state: 'unknown'; readonly reason: string }
   | { readonly state: 'resumable'; readonly binding: DirectiveNativeBinding; readonly checkpointId: string }
   | { readonly state: 'terminal'; readonly binding: DirectiveNativeBinding; readonly checkpointId: string; readonly ok: boolean; readonly error: string | null };
+/** GC's own directive refusal. It always states a reason: a blank one is
+ * named, so no refusal ever reads as an empty failure. `cause` marks GC's
+ * wrapper around an earlier failure. */
 export class DirectiveCheckpointError extends Error {
-  constructor(message: string) { super(message); this.name = 'DirectiveCheckpointError'; }
+  constructor(message: string, options?: ErrorOptions) {
+    super(message.trim() === '' ? 'directive refused without a stated reason' : message, options);
+    this.name = 'DirectiveCheckpointError';
+  }
+}
+
+/** A native directive refusal (#485): a DirectiveCheckpointError GC raised
+ * itself, or GC's wrapper whose own cause is one. A wrapper around a plain
+ * error (a ledger fault, a Pi extension's throw) is no refusal. */
+export function isNativeDirectiveRefusal(error: unknown): error is DirectiveCheckpointError {
+  return error instanceof DirectiveCheckpointError && (error.cause === undefined || isNativeDirectiveRefusal(error.cause));
 }
 /** Bounds a directive's own turn (#469), never the session before it. */
 const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;

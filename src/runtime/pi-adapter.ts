@@ -50,7 +50,7 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { isPublicModelToken } from './review-model-identity.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, isNativeDirectiveRefusal, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -1109,8 +1109,9 @@ export class PiAgentHandle implements AgentHandle {
   private directiveAdmissionError: unknown = null;
   /** Every native directive refusal this turn threw (#485), as the exact
    * object thrown: a `DirectiveCheckpointError` GC raised for the live
-   * directive, or the `AggregateError` that replaced one whose receipt could
-   * not be journaled. Reset per turn. See RuntimeEvent `nativeControl`. */
+   * directive, GC's wrapper whose cause is one, or the `AggregateError` that
+   * replaced one whose receipt could not be journaled. Reset per turn. See
+   * RuntimeEvent `nativeControl`. */
   private readonly nativeDirectiveRefusals = new Set<Error>();
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
@@ -1293,7 +1294,10 @@ export class PiAgentHandle implements AgentHandle {
 
   private assertDirectiveExecutionAuthority(directive: NonNullable<PromptOptions['directive']>, signal?: AbortSignal, recheckCurrentAdmission = true): void {
     if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
-    if (this.directiveAdmissionError !== null) throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`);
+    // GC's wrapper names its cause: it is a refusal only when that cause is one.
+    if (this.directiveAdmissionError !== null) {
+      throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`, { cause: this.directiveAdmissionError });
+    }
     if (this.publishedDirectiveAdmission !== directive) throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
     if (recheckCurrentAdmission) directive.beforeAdmission();
     if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect or completion');
@@ -1315,7 +1319,7 @@ export class PiAgentHandle implements AgentHandle {
         } catch (journalError) {
           const unrecorded = new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained');
           // Still the refusal: the turn now fails with this object instead.
-          if (error instanceof DirectiveCheckpointError) this.nativeDirectiveRefusals.add(unrecorded);
+          if (isNativeDirectiveRefusal(error)) this.nativeDirectiveRefusals.add(unrecorded);
           throw unrecorded;
         }
       }
@@ -1323,16 +1327,17 @@ export class PiAgentHandle implements AgentHandle {
     throw error;
   }
 
-  /** Keeps a refusal GC raised for the live directive. A plain error is not
-   * one, though the next fence's `DirectiveCheckpointError` wrapping it is. */
+  /** Keeps a refusal GC raised for the live directive; a plain error, or GC's
+   * wrapper around one, is routed as the failure it is. */
   private recordDirectiveRefusal(error: unknown): void {
-    if (error instanceof DirectiveCheckpointError) this.nativeDirectiveRefusals.add(error);
+    if (isNativeDirectiveRefusal(error)) this.nativeDirectiveRefusals.add(error);
   }
 
   /** Pi's SDK reduces a thrown refusal to its message in the failed turn's
-   * assistant message: only exact equality with a recorded one counts. */
+   * assistant message: only exact equality with a recorded one counts (a
+   * refusal always states a reason, so an empty text never matches). */
   private isNativeDirectiveRefusalText(detail: string): boolean {
-    return detail !== '' && [...this.nativeDirectiveRefusals].some((refusal) => refusal.message === detail);
+    return [...this.nativeDirectiveRefusals].some((refusal) => refusal.message === detail);
   }
 
   subscribe(listener: RuntimeEventListener): () => void {

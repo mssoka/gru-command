@@ -4044,7 +4044,7 @@ function startLedgerDirective(f: Awaited<ReturnType<typeof nativeRefusalFixture>
 
 const HELD_REFUSAL = 'directive authority is terminal, held or superseded — no work may proceed';
 
-it('a real tool-fence refusal surfaces as GC\'s own wrapper, tagged, and stays with directive recovery (#485)', async () => {
+it('a real tool-fence refusal surfaces as GC\'s wrapper around it, tagged, and the supervisor keeps watching with a durable trace (#485)', async () => {
   let applyAcceptedClarification: (() => void) | null = null;
   const f = await nativeRefusalFixture((_prompt, index) => {
     if (index === 0) applyAcceptedClarification?.();
@@ -4165,19 +4165,19 @@ it('each refused directive turn on one handle is tagged for itself; a look-alike
     }) })).toMatchObject({ ok: false });
     // 4. Turn 3's exact words from the provider in a turn that refused nothing.
     expect(await handle.promptWithVerdict!('second look-alike directive', { directive: directive('second-look-alike', () => {}) })).toMatchObject({ ok: false });
-    // 5. An empty message correlates with nothing: never matched, even for GC's own refusal.
-    expect(await handle.promptWithVerdict!('empty refusal directive', { directive: directive('empty-refusal', () => {
-      if (toolsRun === 2) throw new DirectiveCheckpointError('');
+    // 5. GC never raises a blank refusal: one given no reason still names itself, and is tagged.
+    expect(await handle.promptWithVerdict!('blank refusal directive', { directive: directive('blank-refusal', () => {
+      if (toolsRun === 2) throw new DirectiveCheckpointError(' ');
     }) })).toMatchObject({ ok: false });
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
-    const [lookAlike, atPreflight, atNextTurn, secondLookAlike, empty] = f.errors();
+    const [lookAlike, atPreflight, atNextTurn, secondLookAlike, blank] = f.errors();
     expect(f.errors()).toHaveLength(5);
     expect(lookAlike).toEqual({ type: 'error', error: HELD_REFUSAL, fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
     expect(secondLookAlike).toEqual({ type: 'error', error: nextTurnRefusal, fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
-    expect(empty).toEqual({ type: 'error', error: '', fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
     f.expectRetained(atPreflight, `DirectiveCheckpointError: ${preflightRefusal}`);
     f.expectRetained(atNextTurn, nextTurnRefusal);
-    expect(f.retained()).toEqual([{ error: nextTurnRefusal }, { error: `DirectiveCheckpointError: ${preflightRefusal}` }]);
+    f.expectRetained(blank, 'directive refused without a stated reason');
+    expect(f.retained()).toEqual([{ error: 'directive refused without a stated reason' }, { error: nextTurnRefusal }, { error: `DirectiveCheckpointError: ${preflightRefusal}` }]);
     expect(readFileSync(join(f.scene.lane.path, 'refused-turns.txt'), 'utf8')).toBe('ranagain');
   } finally { await f.cleanup(); }
 });
@@ -4210,6 +4210,64 @@ it('an in-band error that only quotes a refusal recorded in its turn is not that
     expect(f.retained()).toEqual([{ error: `DirectiveCheckpointError: ${refusal}` }]);
   } finally { await f.cleanup(); }
 });
+
+const SQLITE_BUSY = 'ledger read failed: SQLITE_BUSY';
+const EXTENSION_AUTH = '401 Unauthorized: invalid x-api-key';
+
+/** A plain (non-refusal) error in a directive turn, and GC's wrapper around one, are routed as the failures they are (#485). */
+async function assertPlainErrorRouted(where: 'preflight' | 'next-turn' | 'unjournaled' | 'extension-tool-fence') {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  let toolsRun = 0;
+  const f = await nativeRefusalFixture([
+    { deltas: [], toolCall: { id: 'permitted-effect', name: 'bash', args: { command: 'printf ran > plain-error.txt' } } },
+    { deltas: ['directive reply that must never be requested'] },
+  ], (session) => {
+    const after = session.agent.afterToolCall;
+    session.agent.afterToolCall = async (input, signal) => { const result = await after?.(input, signal); toolsRun += 1; return result; };
+    if (where !== 'extension-tool-fence') return;
+    // A third-party Pi extension's tool_call handler throws inside the native fence.
+    const runner = (session as unknown as { readonly _extensionRunner: { hasHandlers(type: string): boolean; emitToolCall(event: unknown): Promise<unknown> } })._extensionRunner;
+    const handles = runner.hasHandlers.bind(runner);
+    vi.spyOn(runner, 'hasHandlers').mockImplementation((type) => type === 'tool_call' || handles(type));
+    vi.spyOn(runner, 'emitToolCall').mockRejectedValue(new Error(EXTENSION_AUTH));
+  });
+  const { handle } = f;
+  const receipt = vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal');
+  if (where === 'unjournaled') receipt.mockImplementation(() => { throw new Error('authority refusal journal unavailable'); });
+  const { options } = startLedgerDirective(f);
+  let checks = 0;
+  const directive = { ...options.directive, beforeAdmission: () => {
+    checks += 1;
+    if ((where === 'preflight' && checks === 2) || ((where === 'next-turn' || where === 'unjournaled') && toolsRun === 1)) throw new Error(SQLITE_BUSY);
+    options.directive.beforeAdmission();
+  } };
+  try {
+    const turn = handle.promptWithVerdict!('original accepted synthetic directive', { ...options, directive });
+    if (where === 'preflight') await expect(turn).rejects.toThrow(SQLITE_BUSY);
+    else expect(await turn).toMatchObject({ ok: false });
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    const routed = { fatal: false, ...(where === 'preflight' ? {} : { provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID }) };
+    expect(f.errors()).toEqual([{ type: 'error', ...routed, error: {
+      preflight: `Error: ${SQLITE_BUSY}`,
+      'next-turn': SQLITE_BUSY,
+      unjournaled: 'native guard refusal could not be durably recorded; physical ownership retained',
+      // GC's wrapper names its plain cause: still the extension's failure, never a refusal.
+      'extension-tool-fence': `native directive admission/guard failed; further tool effects refused: Error: ${EXTENSION_AUTH}`,
+    }[where] }]);
+    expect(f.retained()).toEqual([]);
+    if (where === 'extension-tool-fence') {
+      expect(existsSync(join(f.scene.lane.path, 'plain-error.txt'))).toBe(false);
+      await waitFor(() => handle.health().state === 'disposed', 'the authentication-wall stop');
+      expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    } else {
+      expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    }
+  } finally { receipt.mockRestore(); await f.cleanup(); }
+}
+it('a plain error at Pi\'s preflight rejects the prompt untagged (#485)', () => assertPlainErrorRouted('preflight'));
+it('a plain error at the next-turn fence stays untagged with its provider identity (#485)', () => assertPlainErrorRouted('next-turn'));
+it('a plain error whose receipt cannot be journaled stays untagged as its AggregateError (#485)', () => assertPlainErrorRouted('unjournaled'));
+it('a Pi extension\'s 401 at a tool fence, wrapped by GC at the next fence, stays untagged and stops as authentication_wall (#485)', () => assertPlainErrorRouted('extension-tool-fence'));
 
 it('a provider authentication rejection in a directive turn is never tagged and still stops as authentication_wall (#485)', async () => {
   const f = await nativeRefusalFixture([{ deltas: ['directive reply that must never be requested'] }], (session) => {
