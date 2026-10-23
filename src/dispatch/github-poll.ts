@@ -80,6 +80,20 @@ export function repoFullName(repo: RepoRef): string {
   return `${repo.owner}/${repo.repo}`;
 }
 
+/** The open pull requests whose head is `branch` on a lane's origin, for
+ * Perkins publication to find a PR its lane opened but never registered.
+ * Only a GitHub origin is asked; any other remote fails loud, naming the
+ * lane. */
+export async function openPullRequestsForBranch(
+  api: Pick<GhApiPort, 'listPullsForHead'>,
+  input: { readonly repoPath: string; readonly remote: RepoRef | null; readonly branch: string },
+): Promise<readonly GhPull[]> {
+  if (input.remote === null || !isGitHubRemote(input.remote.host)) {
+    throw new GhApiError(`no GitHub remote resolves for lane "${input.repoPath}"`);
+  }
+  return api.listPullsForHead({ repo: input.remote, head: input.branch });
+}
+
 /** Parse an https GitHub pull-request URL into its coordinates. */
 export function parseGitHubPrUrl(url: string): { host: string; owner: string; repo: string; number: number } | null {
   let parsed: URL;
