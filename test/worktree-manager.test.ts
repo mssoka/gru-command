@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
@@ -1666,7 +1666,7 @@ describe('Perkins r3: the kill contract discriminators (recorded set, not the li
         expect(confirmed.status).toBe('paused');
         if (confirmed.status === 'paused') {
           expect(confirmed.processes.map((p) => p.pid)).toEqual([newcomer.pid]);
-          expect(confirmed.note).toMatch(/NEW process/);
+          expect(confirmed.note).toMatch(/did not cover \(new since the pause/);
         }
         expect(newcomer.kill(0)).toBe(true);
         // …and gets its own ask on the record, answerable in turn.
@@ -1893,6 +1893,16 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     daemons.push(pid);
     return pid;
   }
+  /** A {@link detachedDaemon} that ignores SIGTERM, returned once its
+   * handler is installed (it says so in a file beside the tree). */
+  async function stubbornDaemon(cwd: string, env: NodeJS.ProcessEnv): Promise<number> {
+    const ready = join(mkdtempSync(join(tmpdir(), 'gru-command-486-ready-')), 'ready');
+    const pid = await detachedDaemon(cwd, env,
+      `process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(ready)}, '1'); setTimeout(() => {}, 60000)`);
+    await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
+    rmSync(dirname(ready), { recursive: true, force: true });
+    return pid;
+  }
   async function rooted(path: string, pids: readonly number[]): Promise<void> {
     await vi.waitFor(() => {
       const listed = psEnumerator(path).map((proc) => proc.pid);
@@ -2032,8 +2042,7 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     ledgerJob(h, 'job-grace', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-grace' });
     // A daemon that ignores SIGTERM: only a SIGKILL would stop it.
-    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-grace')!.laneToken! },
-      "process.on('SIGTERM', () => {}); setTimeout(() => {}, 60000)");
+    const pid = await stubbornDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-grace')!.laneToken! });
     await rooted(row.path, [pid]);
     const result = await h.manager.release({ worktreeId: 'job-grace' });
     expect(checks).toBe(3);
@@ -2041,6 +2050,24 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     expect(result.status).toBe('paused');
     const reaped = h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.lane-processes-reaped');
     expect(reaped?.payload).toMatchObject({ pids: [], survivors: [pid] });
+  });
+
+  it('a stop that comes during the grace stops the SIGKILL', async () => {
+    const stop = new AbortController();
+    let checks = 0;
+    // The reap's busy checks: the after-turn gate, the reap's start, the
+    // SIGTERM (where the service starts to stop), the SIGKILL.
+    const h = harness(true, { killGraceMs: 300, laneQuiet: () => { checks += 1; if (checks === 3) stop.abort(); return true; } });
+    const repo = h.make();
+    ledgerJob(h, 'job-stop-grace', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-stop-grace' });
+    const pid = await stubbornDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-stop-grace')!.laneToken! });
+    await rooted(row.path, [pid]);
+    expect(await h.manager.reapLaneAfterTurn('job-stop-grace', stop.signal)).toEqual([]);
+    expect(checks).toBe(3);
+    expect(alive(pid)).toBe(true);
+    expect(h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.lane-processes-reaped')?.payload)
+      .toMatchObject({ trigger: 'turn-settled', pids: [], survivors: [pid] });
   });
 
   it('a reap the service\'s stop overtakes signals nothing', async () => {
@@ -2127,6 +2154,7 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     onTestFinished(async () => {
       finishTurn(); // a failed assertion never leaves the turn pending
       await registry?.dispose();
+      await Promise.allSettled(reaps); // the disposal's own quiet signal reaps too
       rmSync(dir, { recursive: true, force: true });
     });
     registry = new TestRegistry({

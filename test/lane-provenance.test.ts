@@ -126,7 +126,7 @@ describe('the lane token and its variables', () => {
   });
 
   it('groups a macOS app\'s helpers under its outermost bundle, and names any other process by its executable', () => {
-    const app = '/Users/u/.cache/chrome/Google Chrome for Testing.app';
+    const app = '/opt/browsers/chrome/Google Chrome for Testing.app';
     expect(processName(`${app}/Contents/MacOS/Google Chrome for Testing`)).toBe('Google Chrome for Testing');
     expect(processName(`${app}/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/1/Helpers/Google Chrome for Testing Helper (Renderer).app/Contents/MacOS/Google Chrome for Testing Helper (Renderer)`)).toBe('Google Chrome for Testing');
     expect(processName(`${app}/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/1/Helpers/chrome_crashpad_handler`)).toBe('Google Chrome for Testing');
@@ -168,6 +168,8 @@ interface FakeSession {
   state: AgentState;
   release: () => void;
   emit: (event: RuntimeEvent) => void;
+  /** The next disposal fails, leaving the session in place. */
+  failDispose: boolean;
 }
 
 function registryHarness() {
@@ -187,6 +189,7 @@ function registryHarness() {
         state: 'idle',
         release: () => {},
         emit: (event) => { for (const listener of listeners) listener(event); },
+        failDispose: false,
       };
       sessions.set(agentId, session);
       return {
@@ -202,6 +205,7 @@ function registryHarness() {
         steer: async () => {}, followUp: async () => {},
         hasLiveProcess: () => false, isCompacting: () => false,
         dispose: async () => {
+          if (session.failDispose) { session.failDispose = false; throw new Error('dispose failed'); }
           session.state = 'disposed';
           session.emit({ type: 'state', state: 'disposed' });
           session.emit({ type: 'cessation_evidence', evidence: 'ceased' });
@@ -266,6 +270,21 @@ describe('the registry and the lane a session runs in', () => {
     expect(h.quiet).toEqual(['job-a', 'job-a']);
     await second.dispose();
     await elsewhere.dispose();
+  });
+
+  it('a disposal that fails leaves its session in the lane, and says the lane is quiet again once the disposal is over', async () => {
+    const h = registryHarness();
+    const session = await h.registry.spawn('minion', { cwd: h.laneA });
+    h.sessions.get(session.id)!.failDispose = true;
+    await expect(session.dispose()).rejects.toThrow(/dispose failed/u);
+    expect(h.registry.laneQuiet('job-a')).toBe(true);
+    expect(h.quiet).toEqual(['job-a']);
+    // The session is still there: a turn makes the lane busy again.
+    const turn = session.prompt('work');
+    expect(h.registry.laneQuiet('job-a')).toBe(false);
+    h.sessions.get(session.id)!.release();
+    await turn;
+    await session.dispose();
   });
 });
 
@@ -443,6 +462,29 @@ describe('the owner\'s card for a paused sweep', () => {
       settleSweptLaneCards(h, 'job-b');
       expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull();
       expect(waiting(card.id)?.resolvedAt).not.toBeNull();
+    } finally { follower.stop(); h.db.close(); }
+  });
+
+  it('Gru\'s row about a waiting answer resolves however its card closes; a card closed meanwhile waits for nothing', async () => {
+    const h = ledgerHarness();
+    const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>();
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, release });
+    try {
+      h.ledger.registerAgent({ id: 'parent-b', role: 'minion', jobId: 'job-b' });
+      h.ledger.admitChildWorker({ id: 'child_b', parentAgentId: 'parent-b', jobId: 'job-b', purpose: 'check', authority: 'read-only', task: 't', idempotencyKey: 'k' });
+      const card = pausedLane(h, [65215]);
+      h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
+      follower.start();
+      await follower.follow();
+      const waiting = `worktree-sweep-answer-waiting:${card.id}`;
+      expect(h.ledger.getNotification(waiting)?.detail).toContain('answered "Stop these 5 processes and finish the sweep"');
+      // The lane was swept, and its sweep's settlement of the cards was lost
+      // (a crash between the two): the next pass closes the card, and the row.
+      h.ledger.setWorktreeStatus('job-b', 'swept');
+      await follower.follow();
+      expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull();
+      expect(h.ledger.getNotification(waiting)?.resolvedBy).toBe('card-closed');
+      expect(release).not.toHaveBeenCalled();
     } finally { follower.stop(); h.db.close(); }
   });
 

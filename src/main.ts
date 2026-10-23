@@ -1191,7 +1191,11 @@ async function main(): Promise<number> {
       // lane's cards, matched exactly (#486): an unanswered one is withdrawn
       // (what it asked about ended), an answered one closes saying the lane
       // was swept, and one Gru took over resolves.
-      settleSweptLaneCards({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) }, worktree.id);
+      try {
+        settleSweptLaneCards({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) }, worktree.id);
+      } catch (error) {
+        logger.log('error', 'a swept lane\'s sweep cards could not be settled; the next sweep of it, or the owner, closes them', { id: worktree.id, error: String(error) });
+      }
       laneHooks.onSwept({ worktree });
     },
     // #486: a lane's token-carrying processes may be a busy session's own.
@@ -1792,8 +1796,12 @@ async function main(): Promise<number> {
     // A job's review folders stay while a Perkins review owns it (#427 PR 3).
     reviewActive: (jobId) => wave.activeReview(jobId) !== null,
     onReconcile: async () => {
-      await repoMoves.reconcile();
-      await sweepAnswers.follow();
+      // A moved-repository check that fails never holds back the answers.
+      try {
+        await repoMoves.reconcile();
+      } finally {
+        await sweepAnswers.follow();
+      }
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });

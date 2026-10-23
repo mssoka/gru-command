@@ -41,6 +41,8 @@ function withdrawUndecided(ledger: SweepCardLedger, laneId: string, keep: string
   }
 }
 
+/** Close an answered card, and with it Gru's row about its answer having
+ * waited, whichever path closes it. */
 function closeCard(ledger: SweepCardLedger, card: NotificationRecord, detail: string, log: Log): void {
   try {
     ledger.resolveOwnerDecision(card.id, detail, OWNER_PROVENANCE);
@@ -48,6 +50,12 @@ function closeCard(ledger: SweepCardLedger, card: NotificationRecord, detail: st
     if (!(error instanceof NotificationDecisionRefusal)) throw error;
     log('warn', 'a paused sweep\'s card could not be closed', { notification: card.id, error: error.message });
   }
+  ledger.resolveNotificationsByIdPrefix(answerWaitingId(card.id), 'card-closed');
+}
+
+/** The label of the option a card's answer chose. */
+function answerLabel(card: NotificationRecord): string {
+  return card.decision?.options.find((option) => option.id === card.decidedOption)?.label ?? card.decidedOption ?? 'unknown';
 }
 
 /**
@@ -77,9 +85,7 @@ export function settleSweptLaneCards(deps: { readonly ledger: SweepCardLedger; r
   withdrawUndecided(deps.ledger, laneId, null, 'the lane was swept: nothing it asked about is running', log);
   for (const card of laneCards(deps.ledger, laneId)) {
     if (card.decidedAt !== null) {
-      const answer = card.decision?.options.find((option) => option.id === card.decidedOption)?.label ?? card.decidedOption ?? 'unknown';
-      closeCard(deps.ledger, card, `lane ${laneId} was swept after the answer "${answer}"`, log);
-      deps.ledger.resolveNotificationsByIdPrefix(answerWaitingId(card.id), 'sweep-completed');
+      closeCard(deps.ledger, card, `lane ${laneId} was swept after the answer "${answerLabel(card)}"`, log);
     } else if (card.routing !== 'needs-owner') {
       deps.ledger.resolveNotificationsByExactKind(card.kind, 'sweep-completed');
     }
@@ -202,13 +208,14 @@ export class SweepDecisionFollower {
     this.close(card, result.status === 'swept'
       ? `stopped the processes and swept lane ${lane.id}`
       : `the sweep paused again: ${result.note}`);
-    this.opts.ledger.resolveNotificationsByIdPrefix(answerWaitingId(card.id), 'answer-carried-out');
   }
 
   /** The answer has to wait: the card stays open and answered for the next
    * pass, and Gru hears about it once per card. */
   private wait(card: NotificationRecord, lane: WorktreeRecord, why: string): void {
     this.log('warn', 'the owner\'s answer to a paused sweep waits; its card stays open for the next pass', { notification: card.id, id: lane.id, why });
+    // A card a sweep closed meanwhile (an operator's release) waits for nothing.
+    if (this.opts.ledger.getNotification(card.id)?.resolvedAt !== null) return;
     const id = answerWaitingId(card.id);
     if (this.opts.ledger.getNotification(id) !== null) return;
     this.opts.notifications.post({
@@ -218,8 +225,8 @@ export class SweepDecisionFollower {
       severity: 'info',
       title: `Lane ${lane.id}: the owner's answer to stop its processes waits`,
       detail: [
-        `The owner answered "Stop these processes and finish the sweep" for lane ${lane.id} (${lane.path}), and GC cannot carry it out yet: ${why}.`,
-        'The card stays open with the answer recorded, and GC tries again at each answer, restart and hourly reconcile; this row resolves once the lane is swept.',
+        `The owner answered "${answerLabel(card)}" for lane ${lane.id} (${lane.path}), and GC cannot carry it out yet: ${why}.`,
+        'The card stays open with the answer recorded, and GC tries again at each answer, restart and hourly reconcile; this row resolves once the card closes (the answer carried out, or the lane swept).',
       ].join('\n'),
     });
   }
