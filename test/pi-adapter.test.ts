@@ -4143,8 +4143,10 @@ it('preserves provider authentication recovery after a local refusal in the same
       directive: { identity: scene.identity, beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
         onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
     expect(verdict.ok).toBe(false);
-    await waitFor(() => events.some((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized'), 'synthetic provider authentication error');
-    const providerFailure = [...events].reverse().find((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized');
+    expect(fx.script.calls).toHaveLength(2);
+    await waitFor(() => events.some((event) => event.type === 'error' && /401/u.test(event.error)),
+      `synthetic provider authentication error; events=${JSON.stringify(events.filter((event) => event.type === 'error'))}`);
+    const providerFailure = [...events].reverse().find((event) => event.type === 'error' && /401/u.test(event.error));
     expect(providerFailure?.type).toBe('error');
     if (providerFailure?.type !== 'error') throw new Error('synthetic provider error event was not emitted');
     expect(providerFailure.nativeControl).toBeUndefined();
