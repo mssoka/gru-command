@@ -231,6 +231,18 @@ describe('typed decision semantics', () => {
     expect(deterministicFailureClass('agent crashed on boot')).toBe('fatal_runtime');
   });
 
+  it('a bare "authorized" is no authentication wall; real credential rejections still are (#485)', () => {
+    expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized')).toBe('unknown');
+    expect(deterministicFailureClass('runtime error: the request was authorized')).toBe('unknown');
+    expect(deterministicFailureClass('the caller is not authorized for this model')).toBe('authentication_wall');
+    expect(deterministicFailureClass('Unauthorized')).toBe('authentication_wall');
+    expect(deterministicFailureClass('request failed: 401')).toBe('authentication_wall');
+    expect(deterministicFailureClass('authentication failed')).toBe('authentication_wall');
+    expect(deterministicFailureClass('invalid api key')).toBe('authentication_wall');
+    expect(deterministicFailureClass('authorization header rejected')).toBe('authentication_wall');
+    expect(deterministicFailureClass('auth-failure from upstream')).toBe('authentication_wall');
+  });
+
   it('bounds the redaction scan cost: the pre-slice order is load-bearing on hostile single-line blocks', () => {
     // One long single line of word-character filler with secret markers —
     // the shape that makes the labeled-secret scans quadratic when they run

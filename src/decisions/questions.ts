@@ -201,9 +201,11 @@ export function deterministicFailureClass(reason: string): FailureClass {
   // Word-bounded signals: bare substrings wall-classified unrelated text
   // ("author" hit `auth`; "port 13020" hit `1302`). The stems still admit
   // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed)
-  // so real walls keep their deterministic stop.
+  // so real walls keep their deterministic stop. A bare "authorized" names no
+  // credential failure: GC's own directive fence says "no work is authorized"
+  // (#485), so only "not authorized" counts.
   if (
-    /\b(?:unauthorized|oauth|auth(?:entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+    /\b(?:unauthorized|not authorized|oauth|auth(?:entication|orization|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';
   if (
     /\bquota\b|\brate[- ]?limit(?:ed)?\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
