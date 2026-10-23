@@ -2249,7 +2249,7 @@ export class Supervisor {
 
       if (interruptedDirective !== undefined) {
         const requestId = interruptedDirective.identity.requestId;
-        if (old?.cessationEvidence?.() !== 'ceased') {
+        if (old === null || !this.restartCessationConfirmed(old)) {
           agent.handle = old;
           agent.state = 'stopped';
           this.log('error', 'directive cleanup has unknown cessation — explicit supervisor ownership retained', { agent_id: agent.agentId, request_id: requestId });
@@ -3855,7 +3855,7 @@ export class Supervisor {
     const retained: string[] = [];
     for (const [handle, originalJobId] of this.retainedDirectiveProducers) {
       if (originalJobId !== jobId) continue;
-      if (handle.cessationEvidence?.() === 'ceased') this.retainedDirectiveProducers.delete(handle);
+      if (this.restartCessationConfirmed(handle)) this.retainedDirectiveProducers.delete(handle);
       else retained.push(`unproven directive producer cessation: ${handle.id}`);
     }
     const unjournaled: string[] = [];

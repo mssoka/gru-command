@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -171,6 +171,7 @@ function piHandle(opts: {
   handle: PiAgentHandle;
   session: { disposed: boolean; disposeCalls: number; waitForIdleCalls: number; bashRunning: boolean; pendingBash: boolean };
   events: RuntimeEvent[];
+  logs: { level: string; msg: string; fields?: Record<string, unknown> }[];
   store: SessionStore;
   sessionFile: string;
   settleIdle: () => void;
@@ -212,6 +213,7 @@ function piHandle(opts: {
   const store = new SessionStore(mkdtempSync(join(tmpdir(), 'gru-cessation-pi-')));
   piCleanupDirs.push(store.dataDir);
   const sessionFile = join(store.dataDir, 'session-341.jsonl');
+  const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
   const handle = new PiAgentHandle(
     'perkins',
     session,
@@ -220,11 +222,11 @@ function piHandle(opts: {
     false,
     [],
     store,
-    () => {},
+    (level, msg, fields) => { logs.push({ level, msg, ...(fields === undefined ? {} : { fields }) }); },
   );
   const events: RuntimeEvent[] = [];
   handle.subscribe((event) => events.push(event));
-  return { handle, session: state, events, store, sessionFile, settleIdle: () => settleIdle() };
+  return { handle, session: state, events, logs, store, sessionFile, settleIdle: () => settleIdle() };
 }
 
 /** Exact cessation-evidence events of one verdict (once-only assertions must
@@ -415,6 +417,107 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
       expect(cessationEvents(events, 'ceased').length).toBe(1);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #497: a cessation receipt or lock release that cannot be written keeps
+// the evidence UNKNOWN, keeps ownership, is logged by name and is retried; it
+// never throws out of cessationEvidence() into the supervisor.
+// ---------------------------------------------------------------------------
+
+const GH497_IDENTITY = { requestId: 'gh497-request', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+  jobId: 'gh497-job', workRevision: 1, authorityEpoch: 0 };
+const RECEIPT_FAILED = 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written';
+const LOCK_RELEASE_FAILED = 'session lock release failed; ownership stays UNKNOWN until it is released';
+
+/** The producer journal's receipt states, in order. */
+function producerStates(sessionFile: string): string[] {
+  return readFileSync(`${sessionFile}.producers.jsonl`, 'utf8').trimEnd().split('\n')
+    .map((line) => (JSON.parse(line) as { state: string }).state);
+}
+
+describe('pi cessation receipts that cannot be written stay UNKNOWN and are retried (#497)', () => {
+  it('a re-query whose receipt append fails reports unknown, keeps the lock and owner, and writes it once the journal recovers', async () => {
+    const { handle, session, events, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+    store.acquireLock(sessionFile);
+    handle.prepareDirectiveProducer(GH497_IDENTITY);
+    // The first settlement leaves the evidence UNKNOWN: an independent bash
+    // controller is still running when disposal completes.
+    session.bashRunning = true;
+    await handle.dispose();
+    expect(handle.cessationEvidence()).toBe('unknown');
+    session.bashRunning = false;
+    // The journal now refuses the append, as a full disk or an I/O error would.
+    const journal = `${sessionFile}.producers.jsonl`;
+    chmodSync(journal, 0o400);
+    try {
+      expect(handle.cessationEvidence()).toBe('unknown');
+      expect(handle.cessationEvidence()).toBe('unknown'); // each query retries; none throws
+    } finally {
+      chmodSync(journal, 0o600);
+    }
+    const failed = logs.filter((entry) => entry.msg === RECEIPT_FAILED);
+    expect(failed.map((entry) => entry.level)).toEqual(['error', 'error']);
+    expect(String(failed[0]!.fields?.['error'])).toContain('EACCES');
+    expect(producerStates(sessionFile)).toEqual(['started']);
+    expect(store.isHeld(sessionFile)).toBe(true);
+    expect(handle.health().state).not.toBe('disposed');
+    expect(cessationEvents(events, 'ceased')).toHaveLength(0);
+    // The journal recovers: the next query writes the receipt, then releases.
+    expect(handle.cessationEvidence()).toBe('ceased');
+    expect(producerStates(sessionFile)).toEqual(['started', 'ceased']);
+    expect(store.isHeld(sessionFile)).toBe(false);
+    expect(handle.health().state).toBe('disposed');
+    expect(cessationEvents(events, 'ceased')).toHaveLength(1);
+  });
+
+  it('a receipt append that fails at disposal rejects that disposal and leaves an unknown a later query settles', async () => {
+    const { handle, events, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+    store.acquireLock(sessionFile);
+    handle.prepareDirectiveProducer(GH497_IDENTITY);
+    const journal = `${sessionFile}.producers.jsonl`;
+    chmodSync(journal, 0o400);
+    try {
+      await expect(handle.dispose()).rejects.toThrow(/EACCES/);
+      expect(handle.cessationEvidence()).toBe('unknown');
+    } finally {
+      chmodSync(journal, 0o600);
+    }
+    expect(logs.filter((entry) => entry.msg === RECEIPT_FAILED)).toHaveLength(2);
+    expect(cessationEvents(events, 'unknown')).toHaveLength(1);
+    expect(store.isHeld(sessionFile)).toBe(true);
+    // The failed disposal no longer leaves the evidence 'live', which no
+    // query ever retried: the next query writes the receipt.
+    expect(handle.cessationEvidence()).toBe('ceased');
+    expect(producerStates(sessionFile)).toEqual(['started', 'ceased']);
+    expect(store.isHeld(sessionFile)).toBe(false);
+    expect(cessationEvents(events, 'ceased')).toHaveLength(1);
+  });
+
+  it('a lock release that fails reports unknown and is retried without a duplicate receipt', async () => {
+    const { handle, session, events, logs, store, sessionFile } = piHandle({ waitForIdleMode: 'idle' });
+    store.acquireLock(sessionFile);
+    handle.prepareDirectiveProducer(GH497_IDENTITY);
+    session.bashRunning = true;
+    await handle.dispose();
+    session.bashRunning = false;
+    const release = vi.spyOn(store, 'releaseLock').mockImplementationOnce(() => {
+      throw new Error('session lock coordinator could not commit: disk I/O error');
+    });
+    try {
+      expect(handle.cessationEvidence()).toBe('unknown');
+      expect(logs.filter((entry) => entry.msg === LOCK_RELEASE_FAILED)).toHaveLength(1);
+      expect(store.isHeld(sessionFile)).toBe(true);
+      expect(cessationEvents(events, 'ceased')).toHaveLength(0);
+      expect(handle.cessationEvidence()).toBe('ceased');
+      expect(release).toHaveBeenCalledTimes(2);
+      expect(producerStates(sessionFile)).toEqual(['started', 'ceased']); // the retry wrote no second receipt
+      expect(store.isHeld(sessionFile)).toBe(false);
+      expect(cessationEvents(events, 'ceased')).toHaveLength(1);
+    } finally {
+      release.mockRestore();
     }
   });
 });

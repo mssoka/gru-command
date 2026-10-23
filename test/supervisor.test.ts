@@ -1046,6 +1046,37 @@ it('R13 retained UNKNOWN producer inventory follows its original job after logic
   } finally { h.dispose(); }
 });
 
+it('#497 a throwing cessation probe keeps explicit restart ownership, surfaces directive recovery and blocks closure until it settles', async () => {
+  const logs: { msg: string; fields?: Record<string, unknown> }[] = [];
+  const h = boot(undefined, { log: (_level, msg, fields) => { logs.push({ msg, ...(fields === undefined ? {} : { fields }) }); } });
+  try {
+    const jobId = 'gh497-throwing-probe-job';
+    h.api.addJob({ id: jobId, repo: 'fixture', title: 'throwing probe job' }); h.api.setJobStatus(jobId, 'working');
+    const handle = new FakeHandle('minion', 'gh497-throwing-producer', null);
+    let journalFull = true;
+    // The probe throws while its receipt journal cannot be appended (Pi
+    // before #497); a recovered journal lets it attest cessation.
+    handle.cessationEvidence = () => {
+      if (journalFull) throw new Error('ENOSPC: no space left on device, write');
+      return 'ceased';
+    };
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+    const request = h.api.beginDirectiveIntent({ jobId, requestId: 'gh497-throwing-request', directive: 'original accepted turn', holder: 'gru' }).record;
+    handle.pendingTurnSnapshot = { text: 'original accepted turn', owner: `dispatch:${jobId}`, directive: {
+      identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+    } };
+    h.registry.adopt(handle); hang(handle); h.advance(60);
+    await vi.waitFor(() => expect(h.supervisor.viewFor(handle.id)?.state).toBe('stopped'));
+    expect(logs.map((entry) => entry.msg)).toContain('directive cleanup has unknown cessation — explicit supervisor ownership retained');
+    expect(logs.find((entry) => entry.msg === 'restart cessation evidence unavailable')?.fields?.['error']).toBe('Error: ENOSPC: no space left on device, write');
+    expect(h.notificationsOfKind(`silas.directive-unreconciled.${request.requestId}`)).toHaveLength(1);
+    expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([`unproven directive producer cessation: ${handle.id}`]);
+    expect(handle.promptCount).toBe(0); expect(h.registry.spawnCalls).toEqual([]);
+    journalFull = false;
+    expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+  } finally { h.dispose(); }
+});
+
 describe('supervisor — durable restart association', () => {
   it('reports failed-restart backoff as producer ownership before any pacing entry exists', async () => {
     vi.useFakeTimers();
