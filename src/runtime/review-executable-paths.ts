@@ -2705,6 +2705,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/redaction.js",
   "dist/repos/default-branch-ci.js",
   "dist/repos/discovery.js",
+  "dist/repos/gitlab-overview.js",
   "dist/repos/managed-names.js",
   "dist/repos/overview.js",
   "dist/repos/runtime.js",

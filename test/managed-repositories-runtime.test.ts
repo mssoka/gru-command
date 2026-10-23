@@ -18,6 +18,7 @@ import { resolveManagedRepoPathSync } from '../src/repos/managed-names.js';
 import {
   defaultRemoteResolver,
   type ActionsAvailability,
+  type GitLabRepoOverviewApiPort,
   type RepoOverviewApiPort,
   type RepoOverviewMeta,
   type RepoOverviewRunRaw,
@@ -80,6 +81,22 @@ class ProviderSpy implements RepoOverviewApiPort {
   }
 }
 
+/** The required GitLab port for GitHub-only registries: never called. */
+const unusedGitLab: GitLabRepoOverviewApiPort = {
+  fetchProject: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+  countOpenMergeRequests: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+  countOpenIssues: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+  latestPipelines: async () => {
+    throw new Error('GitLab port called in a GitHub-only test');
+  },
+};
+
 function configFor(instance: string, workspace: string, selected: readonly string[]) {
   const answers = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: selected }));
   const text = generateConfigToml({ answers, instanceDir: instance });
@@ -108,6 +125,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const defaultBranchPages: string[] = [];
     const tracker = createManagedRepoOverviewTracker(config, {
       api,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       now: () => Date.parse('2026-10-10T12:00:00.000Z'),
       sleep: async () => {},
@@ -141,6 +159,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const changedPaths: string[] = [];
     const changedTracker = createManagedRepoOverviewTracker(changed, {
       api: changedApi,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       sleep: async () => {},
       resolveRemote: async (path) => {
@@ -151,6 +170,64 @@ describe('managed repository config-to-runtime wiring', () => {
     expect((await changedTracker.refresh())?.rows.map((row) => row.key)).toEqual(['beta']);
     expect(changedPaths.map((path) => path.split('/').at(-1))).toEqual(['beta']);
     expect(changedApi.calls.every((call) => call.endsWith('/beta'))).toBe(true);
+  });
+
+  it('passes the GitLab port through the main runtime adapter to a GitLab origin', async () => {
+    const root = tempDir('gru-managed-repositories-gitlab-');
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    const repo = join(workspace, 'x');
+    execFileSync('git', ['init', '-q', repo]);
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@gitlab.example.com:group/sub/x.git']);
+    const { config } = configFor(join(root, 'instance'), workspace, ['x']);
+
+    const api = new ProviderSpy();
+    const gitlabCalls: string[] = [];
+    const record = (kind: string, ref: RepoRef): void => {
+      gitlabCalls.push(`${kind}:${ref.host}/${ref.owner}/${ref.repo}`);
+    };
+    const gitlabApi: GitLabRepoOverviewApiPort = {
+      fetchProject: async ({ repo: ref }) => {
+        record('project', ref);
+        return { defaultBranch: 'main', ciEnabled: true };
+      },
+      countOpenMergeRequests: async ({ repo: ref }) => {
+        record('merge-requests', ref);
+        return 4;
+      },
+      countOpenIssues: async ({ repo: ref }) => {
+        record('issues', ref);
+        return 1;
+      },
+      latestPipelines: async ({ repo: ref, branch }) => {
+        record(`pipelines@${branch}`, ref);
+        return [];
+      },
+    };
+    const tracker = createManagedRepoOverviewTracker(config, {
+      api,
+      gitlabApi,
+      intervalMs: 0,
+      now: () => Date.parse('2026-10-22T12:00:00.000Z'),
+      sleep: async () => {},
+    });
+    const view = await tracker.refresh();
+    expect(view?.rows).toHaveLength(1);
+    expect(view?.rows[0]).toMatchObject({
+      key: 'x',
+      provider: 'gitlab',
+      fullName: 'group/sub/x',
+      freshness: 'fresh',
+      openPrs: 4,
+      openIssues: 1,
+    });
+    expect(gitlabCalls).toEqual([
+      'project:gitlab.example.com/group/sub/x',
+      'merge-requests:gitlab.example.com/group/sub/x',
+      'issues:gitlab.example.com/group/sub/x',
+      'pipelines@main:gitlab.example.com/group/sub/x',
+    ]);
+    expect(api.calls).toEqual([]);
   });
 
   it('treats absent and empty config lists as no management and no provider calls', async () => {
@@ -170,6 +247,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const oldPaths: string[] = [];
     const oldTracker = createManagedRepoOverviewTracker(oldConfig, {
       api: oldApi,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       sleep: async () => {},
       resolveRemote: async (path) => {
@@ -189,6 +267,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const emptyPaths: string[] = [];
     const emptyTracker = createManagedRepoOverviewTracker(emptyConfig, {
       api: emptyApi,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       sleep: async () => {},
       resolveRemote: async (path) => {
@@ -235,6 +314,7 @@ describe('managed repository config-to-runtime wiring', () => {
     const resolvedPaths: string[] = [];
     const tracker = createManagedRepoOverviewTracker(config, {
       api,
+      gitlabApi: unusedGitLab,
       intervalMs: 0,
       now: () => Date.parse('2026-10-10T12:00:00.000Z'),
       sleep: async () => {},

@@ -12,6 +12,7 @@ function row(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
     key: 'alpha',
     displayName: 'alpha',
     linked: true,
+    provider: 'github',
     host: 'github.com',
     link: 'https://github.com/acme/alpha',
     linkReason: null,
@@ -81,8 +82,7 @@ describe('managed repository overview panel', () => {
     // The approved disclosure is pinned: default-branch CI only, never a
     // deployment-health claim.
     const caption = mount.querySelector('.repo-overview__sub')?.textContent ?? '';
-    expect(caption).toContain('default-branch CI only');
-    expect(caption).toContain('not deployment health');
+    expect(caption).toBe('CI = default-branch only · not deployment health');
     const article = mount.querySelector<HTMLElement>('.repo-row')!;
     expect(article.dataset.runState).toBe('passed');
     expect(article.dataset.freshness).toBe('fresh');
@@ -129,6 +129,7 @@ describe('managed repository overview panel', () => {
       rows: [
         row({
           linked: false,
+          provider: null,
           host: null,
           link: null,
           linkReason: 'no usable origin remote',
@@ -147,6 +148,11 @@ describe('managed repository overview panel', () => {
     expect(article.querySelector('.repo-row__badge-text')?.textContent).toBe('NOT LINKED');
     expect(article.querySelector('.repo-row__note')?.textContent).toContain('no usable origin remote');
     expect(article.dataset.runState).toBe('unlinked');
+    // No provider, so no host's vocabulary is claimed.
+    expect([...article.querySelectorAll('.repo-row__metric-label')].map((node) => node.textContent)).toEqual([
+      'OPEN PRs/MRs',
+      'OPEN issues excl. PRs/MRs',
+    ]);
   });
 
   it('renders the stale overlay and the no-health-claim note for cached data', () => {
@@ -363,5 +369,61 @@ describe('managed repository overview panel', () => {
     const link = mount.querySelector<HTMLAnchorElement>('.repo-row__ci-link');
     expect(link?.textContent).toBe('run #12');
     expect(link?.href).toBe('https://github.com/acme/alpha/actions/runs/12');
+  });
+
+  it('renders a GitLab row in merge requests and pipelines, never GitHub, Actions or PRs', () => {
+    const { mount, view } = panel();
+    view.render({
+      rows: [
+        row({
+          key: 'project',
+          displayName: 'project',
+          provider: 'gitlab',
+          host: 'gitlab.example.com',
+          link: 'https://gitlab.example.com/group/sub/project',
+          fullName: 'group/sub/project',
+          openPrs: 7,
+          openIssues: 0,
+          run: {
+            state: 'failed',
+            status: 'failed',
+            conclusion: null,
+            workflow: null,
+            branch: 'main',
+            runNumber: 41,
+            url: 'https://gitlab.example.com/group/sub/project/-/pipelines/9001',
+            runCreatedAt: CHECKED,
+            runStartedAt: null,
+            runUpdatedAt: CHECKED,
+          },
+        }),
+      ],
+    });
+    const article = mount.querySelector<HTMLElement>('.repo-row')!;
+    const name = article.querySelector<HTMLAnchorElement>('a.repo-row__name')!;
+    expect(name.href).toBe('https://gitlab.example.com/group/sub/project');
+    expect(name.title).toBe('group/sub/project on GitLab');
+    expect([...article.querySelectorAll('.repo-row__metric-count')].map((node) => node.textContent)).toEqual(['7', '0']);
+    expect([...article.querySelectorAll('.repo-row__metric-label')].map((node) => node.textContent)).toEqual([
+      'OPEN MRs',
+      'OPEN issues excl. MRs',
+    ]);
+    expect(article.querySelector('.repo-row__metric-count')?.getAttribute('title')).toBe('7 open merge requests');
+    const ciLink = article.querySelector<HTMLAnchorElement>('.repo-row__ci-link')!;
+    expect(ciLink.textContent).toBe('pipeline #41');
+    expect(ciLink.href).toBe('https://gitlab.example.com/group/sub/project/-/pipelines/9001');
+    expect(article.querySelector('.repo-row__ci')?.getAttribute('title')).toContain('pipeline #41');
+    expect(article.querySelector('.repo-row__badge-text')?.textContent).toBe('FAILED');
+    expect(article.getAttribute('aria-label')).toBe(
+      'project — FAILED — 7 open merge requests, 0 open issues excluding merge requests',
+    );
+    // Nothing the row renders — text, titles, labels — names GitHub's terms.
+    const rendered = [
+      article.textContent ?? '',
+      article.getAttribute('aria-label') ?? '',
+      ...[...article.querySelectorAll('[title]')].map((node) => node.getAttribute('title') ?? ''),
+    ].join('\n');
+    expect(rendered).not.toMatch(/GitHub|Actions|PRs|pull request/u);
+    expect(mount.querySelector('.repo-overview__sub')?.textContent).not.toMatch(/Actions/u);
   });
 });
