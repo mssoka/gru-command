@@ -10,14 +10,21 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 
 const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as const;
 
-type SweepCardLedger = Pick<LedgerApi, 'getWorktree' | 'listOpenNotificationsByKindPrefix' | 'latestEventByPayloadField' | 'resolveOwnerDecision' | 'withdrawOwnerProposal'>;
+type SweepCardLedger = Pick<LedgerApi, 'getWorktree' | 'listOpenNotificationsByKindPrefix' | 'latestEventByPayloadField' | 'resolveOwnerDecision' | 'withdrawOwnerProposal' | 'getChildWorker' | 'listChildWorkers'>;
 
-/** Withdraw a lane's undecided sweep cards (a newer pause asks about what
- * runs now, or the lane was swept without them). Decided ones stay for
- * their follow-through. */
+/** The open sweep cards of exactly this lane (a lane whose id merely
+ * starts with this one's, `job-b:x`, keeps its own). */
+function laneCards(ledger: SweepCardLedger, laneId: string): readonly NotificationRecord[] {
+  return ledger.listOpenNotificationsByKindPrefix(`${SWEEP_PAUSED_KIND_PREFIX}${laneId}:`)
+    .filter((card) => sweepPausedCardOf(card.kind)?.laneId === laneId);
+}
+
+/** Withdraw a lane's unanswered sweep cards, notices written before #486
+ * included (a newer pause asks about what runs now, or the lane was swept
+ * without them). Answered ones stay for their follow-through. */
 function withdrawUndecided(ledger: SweepCardLedger, laneId: string, keep: string | null, detail: string, log: Log): void {
-  for (const card of ledger.listOpenNotificationsByKindPrefix(`${SWEEP_PAUSED_KIND_PREFIX}${laneId}:`)) {
-    if (card.id === keep || card.decidedAt !== null || card.decision === null) continue;
+  for (const card of laneCards(ledger, laneId)) {
+    if (card.id === keep || card.decidedAt !== null) continue;
     try {
       ledger.withdrawOwnerProposal(card.id, detail);
     } catch (error) {
@@ -27,44 +34,61 @@ function withdrawUndecided(ledger: SweepCardLedger, laneId: string, keep: string
   }
 }
 
+function closeCard(ledger: SweepCardLedger, card: NotificationRecord, detail: string, log: Log): void {
+  try {
+    ledger.resolveOwnerDecision(card.id, detail, OWNER_PROVENANCE);
+  } catch (error) {
+    if (!(error instanceof NotificationDecisionRefusal)) throw error;
+    log('warn', 'a paused sweep\'s card could not be closed', { notification: card.id, error: error.message });
+  }
+}
+
 /**
  * The owner's card for a paused sweep (#486): one needs-owner row per
  * pause, its id and kind `worktree-sweep-paused:<lane>:<pause>`, naming what
  * still runs and why GC did not stop it, with one action (Stop these N
- * processes and finish the sweep). An older undecided card of the lane is
- * withdrawn: this pause asks about what runs now.
+ * processes and finish the sweep). Once it is posted, the lane's older
+ * unanswered cards are withdrawn: this pause asks about what runs now.
  */
 export function postSweepPausedCard(
   deps: { readonly ledger: SweepCardLedger; readonly notifications: Pick<NotificationCenter, 'post'>; readonly log?: Log },
   input: { readonly worktree: WorktreeRecord; readonly pauseId: string; readonly details: readonly PausedProcess[] },
 ): NotificationRecord {
-  const log = deps.log ?? (() => {});
   const id = sweepPausedKind(input.worktree.id, input.pauseId);
-  withdrawUndecided(deps.ledger, input.worktree.id, id, 'a newer pause of the lane asks about the processes running now', log);
-  const card = sweepPausedCard(input.worktree, input.details);
-  return deps.notifications.post({ id, kind: id, routing: 'needs-owner', severity: 'info', ...card });
+  const posted = deps.notifications.post({ id, kind: id, routing: 'needs-owner', severity: 'info', ...sweepPausedCard(input.worktree, input.details) });
+  withdrawUndecided(deps.ledger, input.worktree.id, id, 'a newer pause of the lane asks about the processes running now', deps.log ?? (() => {}));
+  return posted;
 }
 
-/** A lane was swept: its undecided sweep cards are withdrawn (the
- * processes ended on their own), the rest resolve with the sweep. */
-export function withdrawSweptLaneCards(deps: { readonly ledger: SweepCardLedger; readonly log?: Log }, laneId: string): void {
-  withdrawUndecided(deps.ledger, laneId, null, 'the lane was swept: nothing it asked about is running', deps.log ?? (() => {}));
+/** A lane was swept: its unanswered sweep cards are withdrawn (what they
+ * asked about ended), and its answered ones close saying so. */
+export function settleSweptLaneCards(deps: { readonly ledger: SweepCardLedger; readonly log?: Log }, laneId: string): void {
+  const log = deps.log ?? (() => {});
+  withdrawUndecided(deps.ledger, laneId, null, 'the lane was swept: nothing it asked about is running', log);
+  for (const card of laneCards(deps.ledger, laneId)) {
+    if (card.decidedAt !== null) closeCard(deps.ledger, card, `lane ${laneId} was swept after the answer "${card.decidedOption ?? ''}"`, log);
+  }
 }
 
 export interface SweepDecisionFollowerOptions {
   readonly ledger: SweepCardLedger;
   readonly bus: EventBus;
   readonly release: (input: SweepRequest) => Promise<SweepResult>;
+  /** Once aborted (the service is stopping), no answer is carried out. */
+  readonly stopSignal?: AbortSignal;
   readonly log?: Log;
 }
 
 /**
  * Carries out the owner's answer to a paused sweep's card (#486): a release
  * with `confirmKill`, as an operator's `confirm_kill`, limited to the pids
- * that card named (its pause's `worktree.paused` event). A survivor or a
- * process that appeared since is never killed by this answer: the release
- * pauses again and asks with a new card. The card closes with what
- * happened. Followed as answers are recorded and once at start, so an
+ * that card named (its pause's `worktree.paused` event, with the base
+ * branch that release named). A survivor or a process that appeared since
+ * is never killed by this answer: the release pauses again and asks with a
+ * new card. Like an operator's release, it never abandons a child worker
+ * that has not finished. The card closes with what happened; a release that
+ * fails leaves it open, answered, for the next pass (another answer, or a
+ * restart). Followed as answers are recorded and once at start, so an
  * answer a restart interrupted is still carried out.
  */
 export class SweepDecisionFollower {
@@ -107,10 +131,10 @@ export class SweepDecisionFollower {
   private async passes(): Promise<void> {
     await Promise.resolve();
     try {
-      while (this.followAgain) {
+      while (this.followAgain && !this.stopping()) {
         this.followAgain = false;
         for (const card of this.opts.ledger.listOpenNotificationsByKindPrefix(SWEEP_PAUSED_KIND_PREFIX)) {
-          if (card.decidedOption === null) continue;
+          if (card.decidedOption === null || this.stopping()) continue;
           try {
             await this.carryOut(card);
           } catch (error) {
@@ -131,8 +155,8 @@ export class SweepDecisionFollower {
     }
     const pause = this.opts.ledger.latestEventByPayloadField('worktree.paused', 'pause_id', named.pauseId);
     const lane = this.opts.ledger.getWorktree(named.laneId);
-    const listed = (pause?.payload as { readonly processes?: readonly { readonly pid?: unknown }[] } | null)?.processes ?? [];
-    const pids = listed.map((proc) => proc.pid).filter((pid): pid is number => typeof pid === 'number');
+    const payload = pause?.payload as { readonly processes?: readonly { readonly pid?: unknown }[]; readonly base_branch?: unknown } | null;
+    const pids = (payload?.processes ?? []).map((proc) => proc.pid).filter((pid): pid is number => typeof pid === 'number');
     if (lane === null || pause === null || pids.length === 0) {
       this.close(card, 'nothing was stopped: GC has no record of this pause');
       return;
@@ -141,11 +165,22 @@ export class SweepDecisionFollower {
       this.close(card, `nothing was stopped: lane ${lane.id} is ${lane.status}, no longer paused on these processes`);
       return;
     }
+    const children = this.unfinishedChildren(lane);
+    if (children.length > 0) {
+      this.close(card, `nothing was stopped: ${children.length === 1 ? 'child worker' : 'child workers'} ${children.join(', ')} of this lane ${children.length === 1 ? 'has' : 'have'} not finished; cancel ${children.length === 1 ? 'it' : 'them'} (POST /api/dispatch/children/:id/cancel), then release the lane again`);
+      return;
+    }
+    const baseBranch = typeof payload?.base_branch === 'string' ? payload.base_branch : undefined;
     let result: SweepResult;
     try {
-      result = await this.opts.release({ worktreeId: lane.id, confirmKill: true, confirmKillPids: pids });
+      result = await this.opts.release({ worktreeId: lane.id, confirmKill: true, confirmKillPids: pids, ...(baseBranch !== undefined ? { baseBranch } : {}) });
     } catch (error) {
-      this.close(card, `the sweep did not finish: ${error instanceof Error ? error.message : String(error)}`);
+      // The answer stands: the card stays open, answered, and the next pass
+      // tries again. What refused the release says why (and a submodule or
+      // sparse-checkout refusal tells Gru).
+      this.log('error', 'the answered sweep of a paused lane did not finish; its card stays open for the next pass', {
+        notification: card.id, id: lane.id, error: error instanceof Error ? error.message : String(error),
+      });
       return;
     }
     this.close(card, result.status === 'swept'
@@ -153,12 +188,22 @@ export class SweepDecisionFollower {
       : `the sweep paused again: ${result.note}`);
   }
 
-  private close(card: NotificationRecord, detail: string): void {
-    try {
-      this.opts.ledger.resolveOwnerDecision(card.id, detail, OWNER_PROVENANCE);
-    } catch (error) {
-      if (!(error instanceof NotificationDecisionRefusal)) throw error;
-      this.log('warn', 'a paused sweep\'s card could not be closed', { notification: card.id, error: error.message });
+  /** The child workers that have not finished and hold this lane, as an
+   * operator's release counts them (#161). */
+  private unfinishedChildren(lane: WorktreeRecord): readonly string[] {
+    if (lane.kind === 'child') {
+      const child = this.opts.ledger.getChildWorker(lane.id);
+      return child !== null && child.resultState === null ? [child.id] : [];
     }
+    if (lane.kind !== 'job' || lane.jobId === null) return [];
+    return this.opts.ledger.listChildWorkers({ jobId: lane.jobId }).filter((child) => child.resultState === null).map((child) => child.id);
+  }
+
+  private stopping(): boolean {
+    return this.opts.stopSignal?.aborted === true;
+  }
+
+  private close(card: NotificationRecord, detail: string): void {
+    closeCard(this.opts.ledger, card, detail, this.log);
   }
 }

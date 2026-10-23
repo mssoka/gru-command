@@ -3,6 +3,7 @@ import {
   createAgentSession,
   createBashToolDefinition,
   createReadOnlyTools,
+  defineTool,
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
@@ -22,7 +23,7 @@ import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
-import { laneProvenanceEnv } from '../worktrees/lane-provenance.js';
+import { carriesLaneEnv, laneProvenanceEnv, withoutLaneEnv } from '../worktrees/lane-provenance.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths.js';
 
@@ -79,19 +80,21 @@ export function workerVerificationExtension(policy: WorkerVerificationPolicy): I
 /**
  * #486: the bash tool of a session in a registered lane. Built as Pi builds
  * its own (the session's shell command prefix and shell path), with a spawn
- * hook that adds the lane's provenance to every command's environment, so a
- * daemon a command leaves behind is still known as the lane's. It replaces
- * Pi's built-in bash by name.
+ * hook that puts the lane's provenance in every command's environment, so a
+ * daemon a command leaves behind is still known as the lane's. Lane
+ * variables the service inherited are dropped first; `laneEnv` null drops
+ * them only (a session outside a lane, in a service started inside one).
+ * It replaces Pi's built-in bash by name.
  */
-export function laneBashTool(cwd: string, agentDir: string, laneEnv: Readonly<Record<string, string>>): ToolDefinition {
+export function laneBashTool(cwd: string, agentDir: string, laneEnv: Readonly<Record<string, string>> | null): ToolDefinition {
   const settings = SettingsManager.create(cwd, agentDir);
   const commandPrefix = settings.getShellCommandPrefix();
   const shellPath = settings.getShellPath();
-  return createBashToolDefinition(cwd, {
+  return defineTool(createBashToolDefinition(cwd, {
     ...(commandPrefix !== undefined ? { commandPrefix } : {}),
     ...(shellPath !== undefined ? { shellPath } : {}),
-    spawnHook: (context) => ({ ...context, env: { ...context.env, ...laneEnv } }),
-  }) as unknown as ToolDefinition;
+    spawnHook: (context) => ({ ...context, env: { ...withoutLaneEnv(context.env), ...(laneEnv ?? {}) } }),
+  }));
 }
 
 function confinedReviewTools(cwd: string, requested: readonly IsolatedToolName[]): {
@@ -964,9 +967,11 @@ export class PiRuntime implements AgentRuntime {
       const tools = isolatedTools === null
         ? [...declaredRoleTools, ...nativeTools.map((tool) => tool.name)]
         : [...isolatedTools.names, ...nativeTools.map((tool) => tool.name)];
-      // #486: a lane session's commands carry the lane's provenance.
-      const laneBash = isolatedTools === null && options.laneProvenance !== undefined && tools.includes('bash')
-        ? laneBashTool(cwd, this.agentDir, laneProvenanceEnv(options.laneProvenance)) : null;
+      // #486: a lane session's commands carry the lane's provenance, and no
+      // session's carry lane variables the service inherited. An isolated
+      // review session has no bash: it starts no process to carry them.
+      const laneBash = isolatedTools === null && tools.includes('bash') && (options.laneProvenance !== undefined || carriesLaneEnv(process.env))
+        ? laneBashTool(cwd, this.agentDir, options.laneProvenance === undefined ? null : laneProvenanceEnv(options.laneProvenance)) : null;
       const { session } = await createAgentSession({
         cwd,
         agentDir: this.agentDir,

@@ -7,6 +7,11 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { commandReferencesTree, psEnumerator, WorktreeManager, type PausedProcess, type TreeProcess, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
+import { laneProvenanceFromLedger } from '../src/worktrees/lane-provenance.js';
+import { loadConfig, type RuntimeId } from '../src/config.js';
+import { RuntimeRegistry } from '../src/runtime/registry.js';
+import type { AgentRuntime, AgentState, SpawnOptions } from '../src/runtime/types.js';
+import type { SessionStore } from '../src/sessions/store.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { runWorktreePortContract } from './helpers/worktree-port-contract.js';
 
@@ -1932,6 +1937,8 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     expect(alive(neighbour)).toBe(true);
     const details = h.pauses[0]!.details;
     expect(details.find((detail) => detail.pid === stranger)).toMatchObject({ provenance: 'no-token', otherLane: null, name: expect.stringMatching(/node/u) });
+    // Where it runs, as the card names it (the OS reports the resolved path).
+    expect(realpathSync(details.find((detail) => detail.pid === stranger)!.cwd!)).toBe(realpathSync(row.path));
     expect(details.find((detail) => detail.pid === neighbour)).toMatchObject({ provenance: 'other-lane', otherLane: 'job-theirs' });
     expect(details.every((detail) => detail.startedAt !== null)).toBe(true);
     // The pause's event carries the id the card is named by.
@@ -2001,6 +2008,104 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     h.ledger.recordWorktreeProcesses({ worktreeId: 'job-turn', processes: [{ pid: 999_999, command: 'npm test', evidence: 'registry' }], state: 'live' });
     expect(await h.manager.reapLaneAfterTurn('job-turn')).toEqual([]);
     expect(alive(second)).toBe(true);
+  });
+
+  it('a release that does not pause (the disk budget\'s) reaps nothing, the lane\'s own processes included', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-refuse', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-refuse' });
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-refuse')!.laneToken! });
+    await rooted(row.path, [pid]);
+    await expect(h.manager.release({ worktreeId: 'job-refuse', onLiveProcess: 'refuse' })).rejects.toThrow(/does not pause to ask/u);
+    expect(alive(pid)).toBe(true);
+    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.lane-processes-reaped')).toBe(false);
+  });
+
+  it('a reap by the token is recorded with lane-token evidence, even for a pid first recorded another way', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-evidence', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-evidence' });
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-evidence')!.laneToken! });
+    await rooted(row.path, [pid]);
+    h.ledger.recordWorktreeProcesses({ worktreeId: 'job-evidence', processes: [{ pid, command: 'node -e daemon', evidence: 'cwd' }], state: 'live' });
+    expect(await h.manager.reapLaneAfterTurn('job-evidence')).toEqual([pid]);
+    expect(h.ledger.listWorktreeProcesses('job-evidence').find((proc) => proc.pid === pid)).toMatchObject({ evidence: 'lane-token', state: 'killed' });
+  });
+
+  it('a late answer never reaches a paused pid that now runs another command (a recycled pid)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-late', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-late' });
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', env: cleanEnv() });
+    daemons.push(victim.pid as number);
+    h.enumerator.mockReturnValue([{ pid: victim.pid as number, command: 'node watcher.js', evidence: 'cwd' }]);
+    expect((await h.manager.release({ worktreeId: 'job-late' })).status).toBe('paused');
+    // By the time the answer comes, that pid runs something else.
+    h.enumerator.mockReturnValue([{ pid: victim.pid as number, command: 'vim notes.txt', evidence: 'cwd' }]);
+    const answered = await h.manager.release({ worktreeId: 'job-late', confirmKill: true });
+    expect(alive(victim.pid as number)).toBe(true);
+    expect(answered.status).toBe('paused');
+    expect(h.pauses).toHaveLength(2);
+    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.kill-confirmed')).toBe(false);
+  });
+
+  it('wired as main.ts wires them: a busy session keeps its lane\'s processes, and its settled turn reaps them', async () => {
+    const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+    const spawned: SpawnOptions[] = [];
+    let state: AgentState = 'idle';
+    let finishTurn = (): void => {};
+    const adapter: AgentRuntime = {
+      id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: async (role, opts = {}) => {
+        spawned.push(opts);
+        return {
+          id: 'minion-1', role, sessionFile: '/sessions/minion-1.jsonl', capabilities: caps,
+          health: () => ({ state, lastActivity: null, sessionFile: '/sessions/minion-1.jsonl' }),
+          cessationEvidence: () => 'unknown', subscribe: () => () => {},
+          prompt: () => new Promise<void>((resolveTurn) => { state = 'streaming'; finishTurn = () => { state = 'idle'; resolveTurn(); }; }),
+          steer: async () => {}, followUp: async () => {}, dispose: async () => {},
+        };
+      },
+    };
+    class TestRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return adapter; }
+    }
+    const reaps: Promise<readonly number[]>[] = [];
+    let registry: RuntimeRegistry | null = null;
+    const h = harness(true, { laneQuiet: (laneId) => registry!.laneQuiet(laneId) });
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-486-wiring-'));
+    registry = new TestRegistry({
+      config: { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 4 } }, store: {} as SessionStore,
+      laneProvenanceFor: laneProvenanceFromLedger(h.ledger, () => {}),
+      onLaneQuiet: (laneId) => { reaps.push(h.manager.reapLaneAfterTurn(laneId)); },
+    });
+    const repo = h.make();
+    ledgerJob(h, 'job-wired', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-wired' });
+    const token = h.ledger.getWorktree('job-wired')!.laneToken!;
+    const session = await registry.spawn('minion', { cwd: row.path });
+    expect(spawned[0]?.laneProvenance).toEqual({ laneId: 'job-wired', jobId: 'job-wired', token });
+    const turn = session.prompt('check the page in a browser');
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: token });
+    await rooted(row.path, [pid]);
+    // Mid-turn: the daemon may be the session's own, so nothing is reaped.
+    expect(await h.manager.reapLaneAfterTurn('job-wired')).toEqual([]);
+    expect(alive(pid)).toBe(true);
+    finishTurn();
+    await turn;
+    expect(reaps).toHaveLength(1);
+    expect(await reaps[0]).toEqual([pid]);
+    expect(alive(pid)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+    // main.ts binds the two sides exactly so (assembly alarm).
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/laneQuiet: \(laneId\) => registry\.laneQuiet\(laneId\)/u);
+    expect(mainSource).toMatch(/onLaneQuiet: \(laneId\) => \{\s*if \(!serviceStop\.signal\.aborted\) void laneManager\?\.reapLaneAfterTurn\(laneId\);/u);
+    expect(mainSource).toMatch(/laneProvenanceFor: \(cwd\) => laneProvenanceFromLedger\(ledger, /u);
   });
 
   it('an answer that names some of the paused pids kills only those; the rest are asked about again', async () => {

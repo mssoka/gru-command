@@ -25,7 +25,8 @@ import { TranscriptService } from './transcripts/service.js';
 import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
-import { postSweepPausedCard, SweepDecisionFollower, withdrawSweptLaneCards } from './worktrees/sweep-decisions.js';
+import { postSweepPausedCard, settleSweptLaneCards, SweepDecisionFollower } from './worktrees/sweep-decisions.js';
+import { laneProvenanceFromLedger } from './worktrees/lane-provenance.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
@@ -420,12 +421,11 @@ async function main(): Promise<number> {
     // #486: a session spawned in a registered lane carries the lane's token,
     // and once the lane's sessions have all settled, what they left running
     // in it is reaped (the manager lands below).
-    laneProvenanceFor: (cwd) => {
-      const lane = ledger.findLiveWorktreeAtPath(cwd);
-      return lane === null || lane.laneToken === null ? null : { laneId: lane.id, jobId: lane.jobId, token: lane.laneToken };
-    },
+    laneProvenanceFor: (cwd) => laneProvenanceFromLedger(ledger, (level, msg, fields) => logger.log(level, msg, fields))(cwd),
+    // Not once the service stops: its shutdown disposes every session, and
+    // the ledger closes under a reap.
     onLaneQuiet: (laneId) => {
-      void laneManager?.reapLaneAfterTurn(laneId);
+      if (!serviceStop.signal.aborted) void laneManager?.reapLaneAfterTurn(laneId);
     },
   }));
   const growth = registry.boot();
@@ -1188,8 +1188,9 @@ async function main(): Promise<number> {
     onSwept: ({ worktree }) => {
       // A completed sweep IS the evidence its pause notice asked for, and
       // the end of the lane's submodule-work and restore rows (#427). An
-      // unanswered card is withdrawn: what it asked about ended on its own.
-      withdrawSweptLaneCards({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) }, worktree.id);
+      // unanswered card is withdrawn (what it asked about ended), an answered
+      // one closes saying the lane was swept; rows Gru took over resolve.
+      settleSweptLaneCards({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) }, worktree.id);
       notifications.resolveIncidents(`worktree-sweep-paused:${worktree.id}:`, 'sweep-completed');
       laneHooks.onSwept({ worktree });
     },
@@ -1206,13 +1207,6 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   laneManager = worktreeManager;
-  // #486: the owner's answer to a paused sweep's card is carried out here.
-  new SweepDecisionFollower({
-    ledger,
-    bus,
-    release: (input) => worktreeManager.release(input),
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  }).start();
   // Moved repositories (#427 PR 2b): before any turn runs, a lane whose
   // repository moved (its folder, with workspace_root updated) is reconnected
   // to it, and one whose name now holds a different repository is proposed
@@ -1233,6 +1227,15 @@ async function main(): Promise<number> {
   } catch (error) {
     logger.log('error', 'the moved-repository check failed at start; the hourly reconcile retries it', { error: String(error) });
   }
+  // #486: the owner's answer to a paused sweep's card is carried out here,
+  // once moved lanes are reconnected, and never after the service stops.
+  new SweepDecisionFollower({
+    ledger,
+    bus,
+    release: (input) => worktreeManager.release(input),
+    stopSignal: serviceStop.signal,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  }).start();
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,

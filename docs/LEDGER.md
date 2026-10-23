@@ -672,6 +672,19 @@ The migration also moves the rows that sweeps left `live` under
 already-swept trees, with one audited event per tree. The directive
 producer fence counts only `live` rows of lanes that are not swept.
 
+### Lane tokens and processes reaped by them (#486)
+
+Migration 31 (`worktree-lane-token`) adds `worktrees.lane_token`: a random
+128-bit hex token per lane incarnation, minted when the row is registered,
+unique across rows, and never carried in an event. Lanes not yet swept
+get theirs in the migration, so a session spawned after the upgrade
+carries it; a lane swept before it keeps NULL. Every session GC spawns in
+the lane passes it on as `GRU_LANE_TOKEN` ([WORKTREES.md
+§3a](./WORKTREES.md#3a-lane-provenance-486)). The migration also rebuilds
+`worktree_processes` once more, to admit evidence `lane-token`: a process
+rooted in the lane that carried the lane's token and was reaped, recorded
+`killed` directly.
+
 ### Exact directive/rebrief restart progress
 
 Migration 28 (`directive-native-progress`) is additive/nullable. Historical

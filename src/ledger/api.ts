@@ -3193,7 +3193,10 @@ export class LedgerApi {
          ON CONFLICT (worktree_id, pid) DO UPDATE SET
            state = excluded.state,
            command = excluded.command,
-           last_seen = excluded.last_seen`,
+           last_seen = excluded.last_seen,
+           -- #486: a reap by the lane's token is the row's proof, whatever
+           -- first tied the pid to the tree; other evidence stays as found.
+           evidence = CASE WHEN excluded.evidence = 'lane-token' THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
         upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
@@ -5641,19 +5644,19 @@ export class LedgerApi {
     });
   }
 
-  /** The open (unresolved) rows of some kinds (#427: the lane rows a
-   * reconcile settles once their lane is gone). */
-  /** Open rows whose kind starts with `prefix` (#486: a lane's sweep-pause
-   * cards, `worktree-sweep-paused:<lane>:<pause>`), oldest first. */
+  /** Open rows whose kind starts with exactly `prefix`, case included
+   * (#486: a lane's sweep-pause cards, `worktree-sweep-paused:<lane>:<pause>`),
+   * oldest first. */
   listOpenNotificationsByKindPrefix(prefix: string): readonly NotificationRecord[] {
     if (prefix === '') throw new Error('kind prefix must be non-empty');
-    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
     const rows = this.db
-      .prepare("SELECT id FROM notifications WHERE kind LIKE ? ESCAPE '\\' AND resolved_at IS NULL ORDER BY ts, id")
-      .all(`${escaped}%`) as Row[];
+      .prepare('SELECT id FROM notifications WHERE substr(kind, 1, length(?)) = ? AND resolved_at IS NULL ORDER BY ts, id')
+      .all(prefix, prefix) as Row[];
     return rows.map((raw) => this.getNotification(str(raw.id))).filter((record): record is NotificationRecord => record !== null);
   }
 
+  /** The open (unresolved) rows of some kinds (#427: the lane rows a
+   * reconcile settles once their lane is gone). */
   listOpenNotificationsByKinds(kinds: readonly string[]): readonly NotificationRecord[] {
     if (kinds.length === 0) return [];
     const rows = this.db

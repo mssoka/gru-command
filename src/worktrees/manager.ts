@@ -2735,13 +2735,18 @@ export class WorktreeManager {
       // (ruling 18b rows from a prior pause), never a fresh enumeration
       // — pids that appeared since were never acknowledged by anyone.
       // No recorded pause → confirmKill is not honored; the ask comes first.
-      // #486: an answer from the owner's card covers only the pids it named.
+      // #486: an answer from the owner's card covers only the pids it named,
+      // and an acknowledged pid is killed only while this enumeration still
+      // finds it rooted here running the command it was recorded with (an
+      // answer given late, or carried out after a restart, never reaches a
+      // recycled pid).
       const named = input.confirmKillPids === undefined ? null : new Set(input.confirmKillPids);
+      const running = new Map(processes.map((proc) => [proc.pid, proc.command]));
       const acknowledged =
         input.confirmKill === true && row.status === 'paused'
           ? this.opts.ledger
               .listWorktreeProcesses(row.id)
-              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid)))
+              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid)) && running.get(proc.pid) === proc.command)
               .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
           : [];
       if (input.confirmKill === true && acknowledged.length > 0) {
@@ -2764,7 +2769,7 @@ export class WorktreeManager {
         .map((p) => p.pid)
         .join(', ')}) — acknowledge to proceed`;
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-      await this.announcePause(row, processes, null);
+      await this.announcePause(row, processes, null, input.baseBranch);
       this.log('warn', 'worktree sweep paused on live processes', {
         id: row.id,
         pids: processes.map((p) => p.pid),
@@ -2872,14 +2877,20 @@ export class WorktreeManager {
     };
     const targets = await carrying(await list());
     if (targets.length === 0) return [];
-    const signalled = quiet() ? await carrying(targets) : [];
-    if (signalled.length === 0) return [];
+    // Both keys again just before each signal, with nothing awaited between
+    // the checks and the signal: still the lane's, and the lane still quiet
+    // (a turn that started meanwhile may be using what it finds running).
+    const signalled = await carrying(targets);
+    if (signalled.length === 0 || !quiet()) return [];
     for (const proc of signalled) {
       if (!signalProcessGroup(proc.pid, 'SIGTERM')) this.log('warn', 'lane process SIGTERM failed (already gone?)', { id: row.id, pid: proc.pid });
     }
     await new Promise((resolve) => setTimeout(resolve, this.opts.killGraceMs ?? 1_500));
-    for (const proc of await carrying(signalled.filter((candidate) => pidAlive(candidate.pid)))) {
-      if (pidAlive(proc.pid)) signalProcessGroup(proc.pid, 'SIGKILL');
+    const stubborn = await carrying(signalled.filter((candidate) => pidAlive(candidate.pid)));
+    if (quiet()) {
+      for (const proc of stubborn) {
+        if (pidAlive(proc.pid)) signalProcessGroup(proc.pid, 'SIGKILL');
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(this.opts.killGraceMs ?? 1_500, 300)));
     const killed = signalled.filter((proc) => !pidAlive(proc.pid));
@@ -2910,15 +2921,20 @@ export class WorktreeManager {
     }
   }
 
-  /** Record a pause (its `worktree.paused` event, with this pause's id) and
-   * tell the owner what each process is and why GC did not stop it (#486). */
-  private async announcePause(row: WorktreeRecord, processes: readonly TreeProcess[], reason: string | null): Promise<void> {
+  /** Record a pause (its `worktree.paused` event, with this pause's id and
+   * the base branch its release named, which the owner's answer releases
+   * with) and tell the owner what each process is and why GC did not stop
+   * it (#486). */
+  private async announcePause(row: WorktreeRecord, processes: readonly TreeProcess[], reason: string | null, baseBranch: string | undefined): Promise<void> {
     const pauseId = randomUUID();
     this.opts.ledger.appendCustomEvent({
       kind: 'worktree.paused',
       jobId: row.jobId,
       roundId: row.roundId,
-      payload: { id: row.id, path: row.path, processes, pause_id: pauseId, ...(reason !== null ? { reason } : {}) },
+      payload: {
+        id: row.id, path: row.path, processes, pause_id: pauseId,
+        ...(reason !== null ? { reason } : {}), ...(baseBranch !== undefined ? { base_branch: baseBranch } : {}),
+      },
     });
     if (this.opts.onSweepPaused === undefined) return;
     const details = await this.describePaused(row, processes);
@@ -3817,7 +3833,7 @@ export class WorktreeManager {
         state: 'live',
       });
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-      await this.announcePause(row, surviving, 'survived-acknowledged-kill');
+      await this.announcePause(row, surviving, 'survived-acknowledged-kill', baseBranch);
       return { status: 'paused', processes: surviving, preserved, note };
     }
     // NEW processes since the pause are NOT covered by this ask — they
@@ -3837,7 +3853,7 @@ export class WorktreeManager {
         .map((p) => p.pid)
         .join(', ')}) — each kill needs its own acknowledgment`;
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-      await this.announcePause(row, unacknowledged, 'post-kill-new-processes');
+      await this.announcePause(row, unacknowledged, 'post-kill-new-processes', baseBranch);
       return { status: 'paused', processes: unacknowledged, preserved, note };
     }
     return this.finishSweep(row, preserved, baseBranch, assertCleanup, attempt);

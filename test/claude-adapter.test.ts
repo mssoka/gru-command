@@ -4136,28 +4136,35 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
 describe('#486: lane provenance rides the CLI environment', () => {
   const lane = { laneId: 'job-lane', jobId: 'job-lane', token: 'a1'.repeat(16) };
 
-  it('a session in a lane hands every CLI child the lane token and job; one outside a lane hands none', async () => {
-    // A suite run inside a GC lane inherits that lane's variables.
+  it('a session in a lane hands every CLI child (turns and compaction) its lane\'s variables, never ones the service inherited; one outside a lane hands none #contract:lane-provenance:claude-code', async () => {
+    // The service itself was started inside another lane: what it inherited
+    // never reaches a session.
     const inherited = { token: process.env['GRU_LANE_TOKEN'], job: process.env['GRU_LANE_JOB'] };
-    delete process.env['GRU_LANE_TOKEN'];
-    delete process.env['GRU_LANE_JOB'];
+    process.env['GRU_LANE_TOKEN'] = 'f0'.repeat(16);
+    process.env['GRU_LANE_JOB'] = 'outer-job';
     onTestFinished(() => {
-      if (inherited.token !== undefined) process.env['GRU_LANE_TOKEN'] = inherited.token;
-      if (inherited.job !== undefined) process.env['GRU_LANE_JOB'] = inherited.job;
+      if (inherited.token === undefined) delete process.env['GRU_LANE_TOKEN']; else process.env['GRU_LANE_TOKEN'] = inherited.token;
+      if (inherited.job === undefined) delete process.env['GRU_LANE_JOB']; else process.env['GRU_LANE_JOB'] = inherited.job;
     });
     const fx = fixture();
     const project = join(fx.workspace, 'lane-project');
     mkdirSync(project, { recursive: true });
     const inLane = await fx.runtime.spawn('minion', { cwd: project, laneProvenance: lane });
     await inLane.prompt('first turn');
+    await inLane.compact?.();
     await inLane.prompt('second turn');
     await inLane.dispose();
+    const reviewLane = await fx.runtime.spawn('minion', { cwd: project, laneProvenance: { laneId: 'round-1', jobId: null, token: 'b2'.repeat(16) } });
+    await reviewLane.prompt('a lane with no job');
+    await reviewLane.dispose();
     const outside = await fx.runtime.spawn('minion', { cwd: project });
     await outside.prompt('no lane');
     await outside.dispose();
     expect(doubleInvocations(fx).map((call) => [call.prompt, call.laneToken, call.laneJob])).toEqual([
       ['first turn', lane.token, 'job-lane'],
+      ['/compact', lane.token, 'job-lane'],
       ['second turn', lane.token, 'job-lane'],
+      ['a lane with no job', 'b2'.repeat(16), null],
       ['no lane', null, null],
     ]);
   });
@@ -4169,6 +4176,7 @@ describe('#486: lane provenance rides the CLI environment', () => {
     expect(claudeChildEnv({ reviewAuthEnv: review, laneEnv: { GRU_LANE_TOKEN: lane.token } }))
       .toEqual({ env: { ...review, GRU_LANE_TOKEN: lane.token } });
     expect(claudeChildEnv({ laneEnv: { GRU_LANE_TOKEN: lane.token } }).env).toMatchObject({ PATH: process.env['PATH'], GRU_LANE_TOKEN: lane.token });
+    expect(claudeChildEnv({ reviewAuthEnv: { ...review, GRU_LANE_TOKEN: 'f0'.repeat(16), GRU_LANE_JOB: 'outer' } })).toEqual({ env: review });
   });
 });
 

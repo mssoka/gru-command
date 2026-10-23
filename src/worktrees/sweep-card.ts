@@ -32,33 +32,38 @@ export function sweepPausedCardOf(kind: string): { readonly laneId: string; read
 }
 
 const WHY: Readonly<Record<PausedProcessProvenance, string>> = {
-  'this-lane': 'carries this lane\'s token, but GC did not stop it (a session was still busy in the lane, or it outlived the stop)',
+  'this-lane': 'carries this lane\'s token, but a session GC runs in the lane was still busy (or it outlived the stop), so GC left it',
   'other-lane': 'carries another lane\'s token',
-  'no-token': 'carries no lane token, so GC did not start it here',
-  unreadable: 'GC cannot read its environment (a system binary such as /bin/sh on macOS), so it cannot tell who started it',
+  'no-token': 'carries no lane token, so no session GC spawned in the lane started it',
+  unreadable: 'GC could not read its environment (macOS hides it for system binaries such as /bin/sh), so it cannot tell who started it',
 };
+
+function reasonOf(detail: PausedProcess): string {
+  return detail.provenance === 'other-lane' ? `carries the token of lane ${detail.otherLane ?? 'unknown'}` : WHY[detail.provenance];
+}
 
 interface Group {
   readonly name: string;
   readonly members: PausedProcess[];
 }
 
-/** Same-named processes together, the largest group first (then by name). */
-function groups(details: readonly PausedProcess[]): readonly Group[] {
-  const byName = new Map<string, PausedProcess[]>();
+/** Processes that share `key` together, the largest group first (then by
+ * name). */
+function groupBy(details: readonly PausedProcess[], key: (detail: PausedProcess) => string): readonly Group[] {
+  const grouped = new Map<string, Group>();
   for (const detail of details) {
-    const members = byName.get(detail.name) ?? [];
-    members.push(detail);
-    byName.set(detail.name, members);
+    const id = key(detail);
+    const group = grouped.get(id) ?? { name: detail.name, members: [] };
+    group.members.push(detail);
+    grouped.set(id, group);
   }
-  return [...byName.entries()]
-    .map(([name, members]) => ({ name, members }))
-    .sort((a, b) => b.members.length - a.members.length || a.name.localeCompare(b.name));
+  return [...grouped.values()].sort((a, b) => b.members.length - a.members.length || a.name.localeCompare(b.name));
 }
 
-/** `agent-browser + Google Chrome Helper (Renderer) ×6`. */
+/** `Google Chrome ×11 + agent-browser`. */
 export function sweepPausedSummary(details: readonly PausedProcess[]): string {
-  return groups(details).map(({ name, members }) => (members.length === 1 ? name : `${name} ×${String(members.length)}`)).join(' + ');
+  return groupBy(details, (detail) => detail.name)
+    .map(({ name, members }) => (members.length === 1 ? name : `${name} ×${String(members.length)}`)).join(' + ');
 }
 
 function span(values: readonly string[]): string {
@@ -67,14 +72,16 @@ function span(values: readonly string[]): string {
   return sorted.length === 1 ? sorted[0]! : `${sorted[0]!} to ${sorted[sorted.length - 1]!}`;
 }
 
+function startedSpan(details: readonly PausedProcess[]): string {
+  return span(details.map((detail) => detail.startedAt).filter((at): at is string => at !== null));
+}
+
+/** One line per name and reason, so each pid's reason is its own. */
 function groupLine(group: Group): string {
   const pids = group.members.map((member) => member.pid);
-  const started = span(group.members.map((member) => member.startedAt).filter((at): at is string => at !== null));
   const cwds = [...new Set(group.members.map((member) => member.cwd).filter((cwd): cwd is string => cwd !== null))];
-  const reasons = [...new Set(group.members.map((member) => member.provenance === 'other-lane'
-    ? `carries the token of lane ${member.otherLane ?? 'unknown'}` : WHY[member.provenance]))];
-  return `- ${group.name} ×${String(pids.length)} (pid${pids.length === 1 ? '' : 's'} ${pids.join(', ')}; started ${started}` +
-    `${cwds.length === 0 ? '' : `; working directory ${cwds.join(', ')}`}): ${reasons.join('; ')}.`;
+  return `- ${group.name} ×${String(pids.length)} (pid${pids.length === 1 ? '' : 's'} ${pids.join(', ')}; started ${startedSpan(group.members)}` +
+    `${cwds.length === 0 ? '' : `; working directory ${cwds.join(', ')}`}): ${reasonOf(group.members[0]!)}.`;
 }
 
 function bounded(text: string, max: number): string {
@@ -93,16 +100,16 @@ export function sweepPausedCard(worktree: WorktreeRecord, details: readonly Paus
   const summary = sweepPausedSummary(details);
   const detail = [
     `Lane ${worktree.id} (${worktree.kind}${worktree.jobId !== null ? `, job ${worktree.jobId}` : ''}) at ${worktree.path} is being released, but ${processes} still run in it.`,
-    'GC stops on its own only the processes that carry this lane\'s token, which every session GC spawns in the lane passes to what it starts. These do not:',
-    ...groups(details).map(groupLine),
+    'GC stops a process on its own only when it carries this lane\'s token (every session GC spawns in the lane passes it to what it starts) and no session of the lane is busy. It did not stop these:',
+    ...groupBy(details, (detail) => `${detail.name}\n${reasonOf(detail)}`).map(groupLine),
     'The sweep stays paused, and nothing in the lane is removed, until they are stopped.',
   ].join('\n');
   const decision = parseNotificationDecision({
     question: bounded(`Stop the ${processes} still running in lane ${worktree.id} and finish its sweep?`, 300),
-    context: bounded(`Still running in ${worktree.path}: ${summary}. The details list each one's pids, start time, working directory, and why GC did not stop it.`, 600),
+    context: bounded(`Still running in ${worktree.path}, started ${startedSpan(details)}: ${summary}. The details list each one's pids, start time, working directory, and why GC did not stop it.`, 600),
     recommendation: null,
     reservedClass: 'destructive',
-    whyNotDelegable: 'Nothing proves the lane started these processes: one may be your editor or terminal, or another lane\'s, and GC never stops a process it cannot prove is the lane\'s without you.',
+    whyNotDelegable: 'GC stops a process without you only when it carries this lane\'s token and no session of the lane is busy. For these it cannot prove that: one may be your editor or terminal, another lane\'s, or in use by a busy session, so stopping them is your call.',
     options: [{
       id: STOP_AND_SWEEP_OPTION,
       label: bounded(`Stop these ${processes} and finish the sweep`, 120),

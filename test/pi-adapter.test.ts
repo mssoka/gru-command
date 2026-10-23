@@ -1,5 +1,5 @@
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, createBashToolDefinition, defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { afterAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
-import { COMPACTION_END_RECONCILE_MS, PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
+import { COMPACTION_END_RECONCILE_MS, PiRuntime, laneBashTool, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import type { DirectiveProducer } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, applyThinkingFallback, ledgerReviewOwnerCessation, serviceRegistryOptions } from '../src/runtime/registry.js';
@@ -3403,32 +3403,50 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
-  it('#486: a lane session\'s bash commands carry the lane token and job; a session outside a lane carries none', async () => {
-    // A suite run inside a GC lane inherits that lane's variables.
+  it('#486: a lane session\'s bash commands carry its lane\'s variables, never ones the service inherited, with the session\'s shell prefix kept; a session outside a lane carries none #contract:lane-provenance:pi', async () => {
+    // The service itself was started inside another lane.
     const inherited = { token: process.env['GRU_LANE_TOKEN'], job: process.env['GRU_LANE_JOB'] };
-    delete process.env['GRU_LANE_TOKEN'];
-    delete process.env['GRU_LANE_JOB'];
+    process.env['GRU_LANE_TOKEN'] = 'f0'.repeat(16);
+    process.env['GRU_LANE_JOB'] = 'outer-job';
     onTestFinished(() => {
-      if (inherited.token !== undefined) process.env['GRU_LANE_TOKEN'] = inherited.token;
-      if (inherited.job !== undefined) process.env['GRU_LANE_JOB'] = inherited.job;
+      if (inherited.token === undefined) delete process.env['GRU_LANE_TOKEN']; else process.env['GRU_LANE_TOKEN'] = inherited.token;
+      if (inherited.job === undefined) delete process.env['GRU_LANE_JOB']; else process.env['GRU_LANE_JOB'] = inherited.job;
     });
     const laneDir = mkdtempSync(join(tmpdir(), 'gru-command-486-'));
     cleanupDirs.push(laneDir);
-    const record = (file: string) => ({ deltas: [], toolCall: { id: `call-${file}`, name: 'bash', args: { command: `printf '%s|%s' "$GRU_LANE_TOKEN" "$GRU_LANE_JOB" > ${file}` } } });
-    const fx = await fixture([record('in-lane.txt'), { deltas: ['recorded'] }, record('outside.txt'), { deltas: ['recorded'] }]);
+    const record = (file: string) => ({ deltas: [], toolCall: { id: `call-${file}`, name: 'bash', args: { command: `printf '%s|%s|%s' "$GRU_LANE_TOKEN" "$GRU_LANE_JOB" "$GC_PREFIX_SEEN" > ${file}` } } });
+    const fx = await fixture([
+      record('in-lane.txt'), { deltas: ['recorded'] },
+      record('no-job.txt'), { deltas: ['recorded'] },
+      record('outside.txt'), { deltas: ['recorded'] },
+    ]);
+    // The session's own shell setting, which Pi's built-in bash honours.
+    writeFileSync(join(fx.agentDir, 'settings.json'), JSON.stringify({ shellCommandPrefix: 'export GC_PREFIX_SEEN=1' }));
     const token = 'c3'.repeat(16);
     const inLane = await fx.runtime.spawn('gru', { cwd: laneDir, laneProvenance: { laneId: 'job-486', jobId: 'job-486', token } });
+    const noJob = await fx.runtime.spawn('gru', { cwd: laneDir, laneProvenance: { laneId: 'round-1', jobId: null, token: 'b2'.repeat(16) } });
     const outside = await fx.runtime.spawn('gru', { cwd: laneDir });
     try {
       await inLane.prompt('record the lane', { owner: 'alice' });
+      await noJob.prompt('record the lane', { owner: 'alice' });
       await outside.prompt('record the lane', { owner: 'alice' });
-      expect(readFileSync(join(laneDir, 'in-lane.txt'), 'utf8')).toBe(`${token}|job-486`);
-      expect(readFileSync(join(laneDir, 'outside.txt'), 'utf8')).toBe('|');
+      expect(readFileSync(join(laneDir, 'in-lane.txt'), 'utf8')).toBe(`${token}|job-486|1`);
+      expect(readFileSync(join(laneDir, 'no-job.txt'), 'utf8')).toBe(`${'b2'.repeat(16)}||1`);
+      expect(readFileSync(join(laneDir, 'outside.txt'), 'utf8')).toBe('||1');
     } finally {
       await inLane.dispose();
+      await noJob.dispose();
       await outside.dispose();
       await fx.runtime.dispose();
     }
+  });
+
+  it('#486: the lane bash tool is Pi\'s own bash tool, as the model sees it', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'gru-command-486-def-'));
+    cleanupDirs.push(cwd);
+    const shape = (tool: ToolDefinition) => ({ name: tool.name, label: tool.label, description: tool.description, parameters: tool.parameters,
+      promptSnippet: tool.promptSnippet, promptGuidelines: tool.promptGuidelines });
+    expect(shape(laneBashTool(cwd, cwd, { GRU_LANE_TOKEN: 'c3'.repeat(16) }))).toEqual(shape(defineTool(createBashToolDefinition(cwd))));
   });
 
   it('W7: error turn — in-band completion: error event + state error, then recovers #contract:in-band-error:pi', async () => {

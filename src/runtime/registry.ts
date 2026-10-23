@@ -841,6 +841,11 @@ export class RuntimeRegistry {
     const laneSettled = (): void => {
       if (laneProvenance !== undefined) this.noteLaneSettled(laneProvenance.laneId);
     };
+    // A session gone (disposed, or its cessation proven) holds its lane no
+    // longer, whichever path saw it go first.
+    const laneLeft = (): void => {
+      if (this.forgetLaneSession(resident)) laneSettled();
+    };
     let disposing: Promise<void> | null = null;
     let disposingNow = false;
     let released = false;
@@ -866,7 +871,7 @@ export class RuntimeRegistry {
         }
       }
       this.handles.delete(resident);
-      this.forgetLaneSession(resident);
+      laneLeft();
       this.unpublished.delete(resident);
       this.quarantined.delete(resident);
       this.publications.delete(resident);
@@ -899,6 +904,7 @@ export class RuntimeRegistry {
           // the adapter-evidence event path below if a late positive arrives.
           disposing = Promise.resolve().then(() => target.dispose()).then(
             () => {
+              laneLeft();
               notifyDisposalSettlement(resident, true);
               if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
             },
@@ -1081,7 +1087,7 @@ export class RuntimeRegistry {
       if (event.type === 'state' && event.state === 'disposed') {
         forward({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
         // #486: a disposed session holds its lane no longer.
-        if (this.forgetLaneSession(resident)) laneSettled();
+        laneLeft();
         // REAL production traversal: the existing handle-event flow drives
         // registered cleanup-debt reconcilers (no watcher/timer). Observer
         // failure is contained; shutdown stops traversal without clearing

@@ -26,7 +26,7 @@ import { ROLE_DEFINITIONS } from '../roles.js';
 import { managedSkillsPromptNote } from './managed-skills.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
-import { laneProvenanceEnv } from '../worktrees/lane-provenance.js';
+import { carriesLaneEnv, laneProvenanceEnv, withoutLaneEnv } from '../worktrees/lane-provenance.js';
 import { buildClaudeCodeAuthArgs, claudeCliModel, claudeReviewIsolationArgs } from './claude-model.js';
 import {
   claudeReviewProcessEnv, materializeClaudeReviewCredentials, privateClaudeReviewSettings,
@@ -780,11 +780,13 @@ interface HandleParams {
 }
 
 /** The CLI child's environment: the review credentials' when the session
- * has them, the service's otherwise, plus the lane's provenance (#486).
- * Empty = inherit the service's environment unchanged. */
+ * has them, the service's otherwise, with the lane's provenance (#486) in
+ * place of any lane variables the service inherited. Empty = inherit the
+ * service's environment unchanged. */
 export function claudeChildEnv(params: Pick<HandleParams, 'reviewAuthEnv' | 'laneEnv'>): { readonly env?: NodeJS.ProcessEnv } {
-  if (params.laneEnv === undefined) return params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {};
-  return { env: { ...(params.reviewAuthEnv ?? process.env), ...params.laneEnv } };
+  const base = params.reviewAuthEnv ?? process.env;
+  if (params.laneEnv === undefined && !carriesLaneEnv(base)) return params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {};
+  return { env: { ...withoutLaneEnv(base), ...(params.laneEnv ?? {}) } };
 }
 
 /**

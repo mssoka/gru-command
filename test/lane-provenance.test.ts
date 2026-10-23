@@ -13,11 +13,13 @@ import type { AgentHandle, AgentRuntime, AgentState, RuntimeEvent, RuntimeEventL
 import type { SessionStore } from '../src/sessions/store.js';
 import { BACKGROUND_PROCESS_RULE, WORKER_RULE_BLOCKS, appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import {
-  LANE_JOB_ENV, LANE_TOKEN_ENV, elapsedSeconds, isLaneToken, laneProvenanceEnv, newLaneToken, readLaneTokens, readProcessFacts,
+  LANE_JOB_ENV, LANE_TOKEN_ENV, carriesLaneEnv, elapsedSeconds, isLaneToken, laneProvenanceEnv, laneProvenanceFromLedger, newLaneToken, processName,
+  readLaneTokens, readProcessFacts, withoutLaneEnv,
 } from '../src/worktrees/lane-provenance.js';
+import type { NotificationRecord } from '../src/ledger/api.js';
 import type { PausedProcess, SweepRequest, SweepResult } from '../src/worktrees/manager.js';
 import { STOP_AND_SWEEP_OPTION, sweepPausedCard, sweepPausedCardOf, sweepPausedKind, sweepPausedSummary } from '../src/worktrees/sweep-card.js';
-import { postSweepPausedCard, SweepDecisionFollower, withdrawSweptLaneCards } from '../src/worktrees/sweep-decisions.js';
+import { postSweepPausedCard, settleSweptLaneCards, SweepDecisionFollower } from '../src/worktrees/sweep-decisions.js';
 
 /**
  * Lane provenance (#486): the token every lane session passes to what it
@@ -67,7 +69,7 @@ describe('the lane token and its variables', () => {
     expect(() => laneProvenanceEnv({ laneId: 'job-a', jobId: 'job-a', token: 'not-a-token' })).toThrow(/no valid lane token/u);
   });
 
-  it.runIf(process.platform === 'darwin' || process.platform === 'linux')('reads back the token a live process carries, and none from one that carries none', async () => {
+  it.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')('reads back the token a live process carries, and none from one that carries none', async () => {
     const token = newLaneToken();
     const carrying = sleeper({ ...cleanEnv(), [LANE_TOKEN_ENV]: token });
     const plain = sleeper(cleanEnv());
@@ -79,13 +81,39 @@ describe('the lane token and its variables', () => {
     }, { timeout: 5_000 });
   });
 
-  it.runIf(process.platform === 'darwin')('on macOS, a pid whose command line is no longer the listed one reads as unreadable (a recycled pid never matches)', async () => {
+  it.skipIf(process.platform !== 'darwin')('on macOS, a pid whose command line is no longer the listed one reads as unreadable (a recycled pid never matches)', async () => {
     const token = newLaneToken();
     const carrying = sleeper({ ...cleanEnv(), [LANE_TOKEN_ENV]: token });
     await vi.waitFor(async () => {
       const reads = await readLaneTokens([{ pid: carrying.pid, command: 'some other program --flag' }]);
       expect(reads.get(carrying.pid)).toEqual({ readable: false });
     }, { timeout: 5_000 });
+  });
+
+  it('drops lane variables a service inherited, and finds a session\'s lane by its exact registered path', () => {
+    expect(carriesLaneEnv({ PATH: '/bin' })).toBe(false);
+    expect(carriesLaneEnv({ GRU_LANE_JOB: 'outer' })).toBe(true);
+    expect(withoutLaneEnv({ PATH: '/bin', GRU_LANE_TOKEN: 'f'.repeat(32), GRU_LANE_JOB: 'outer' })).toEqual({ PATH: '/bin' });
+    const h = ledgerHarness();
+    const warnings: string[] = [];
+    try {
+      const find = laneProvenanceFromLedger(h.ledger, (_level, msg) => warnings.push(msg));
+      expect(find('/lanes/repo/job-b')).toEqual({ laneId: 'job-b', jobId: 'job-b', token: h.lane.laneToken });
+      expect(isLaneToken(h.lane.laneToken)).toBe(true);
+      expect(find('/lanes/repo/job-b/src')).toBeNull();
+      h.db.handle.prepare("UPDATE worktrees SET lane_token = NULL WHERE id = 'job-b'").run();
+      expect(find('/lanes/repo/job-b')).toBeNull();
+      expect(warnings).toEqual(['lane has no token: its session carries none, and what it leaves running is asked about at its sweep']);
+    } finally { h.db.close(); }
+  });
+
+  it('groups a macOS app\'s helpers under its outermost bundle, and names any other process by its executable', () => {
+    const app = '/Users/u/.cache/chrome/Google Chrome for Testing.app';
+    expect(processName(`${app}/Contents/MacOS/Google Chrome for Testing`)).toBe('Google Chrome for Testing');
+    expect(processName(`${app}/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/1/Helpers/Google Chrome for Testing Helper (Renderer).app/Contents/MacOS/Google Chrome for Testing Helper (Renderer)`)).toBe('Google Chrome for Testing');
+    expect(processName(`${app}/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/1/Helpers/chrome_crashpad_handler`)).toBe('Google Chrome for Testing');
+    expect(processName('/usr/local/bin/agent-browser')).toBe('agent-browser');
+    expect(processName('node')).toBe('node');
   });
 
   it('names a process by its executable and dates its start from its elapsed time', async () => {
@@ -254,30 +282,67 @@ describe('the owner\'s card for a paused sweep', () => {
       expect(card.title).toBe('Worktree sweep paused: 5 processes still running in repo');
       expect(card.detail).toContain('- agent-browser ×1 (pid 65215; started 2026-10-23T03:10:12Z; working directory /lanes/repo/job-b): carries no lane token');
       expect(card.detail).toContain('- Google Chrome Helper ×3 (pids 79503, 79510, 79511; started 2026-10-23T03:10:00Z to 2026-10-23T03:12:00Z;');
-      expect(card.detail).toContain('GC cannot read its environment');
+      expect(card.detail).toContain('GC could not read its environment');
+      expect(card.decision.context).toContain('started 2026-10-23T03:10:00Z to 2026-10-23T03:13:00Z');
       expect(card.detail).toContain('carries the token of lane job-c');
       expect(card.decision.options).toEqual([expect.objectContaining({ id: STOP_AND_SWEEP_OPTION, label: 'Stop these 5 processes and finish the sweep' })]);
       expect(card.decision.reservedClass).toBe('destructive');
     } finally { h.db.close(); }
   });
 
-  it('is named by its lane and pause, and a newer pause or the sweep withdraws an unanswered one', () => {
+  it('gives each pid its own reason, and says why a token-carrying process was left', () => {
+    const h = ledgerHarness();
+    try {
+      const card = sweepPausedCard(h.lane, [paused(1, 'node', 'no-token', '2026-10-23T03:10:00Z'), paused(2, 'node', 'this-lane', '2026-10-23T03:11:00Z')]);
+      expect(card.detail).toContain('- node ×1 (pid 1; started 2026-10-23T03:10:00Z; working directory /lanes/repo/job-b): carries no lane token');
+      expect(card.detail).toContain('- node ×1 (pid 2; started 2026-10-23T03:11:00Z; working directory /lanes/repo/job-b): carries this lane\'s token, but a session GC runs in the lane was still busy');
+      expect(card.decision.whyNotDelegable).toContain('in use by a busy session');
+    } finally { h.db.close(); }
+  });
+
+  it('is named by its lane and pause, and a newer pause or the sweep withdraws an unanswered one, a pre-#486 notice included', () => {
     const h = ledgerHarness();
     try {
       expect(sweepPausedCardOf(sweepPausedKind('job-b', 'p1'))).toEqual({ laneId: 'job-b', pauseId: 'p1' });
       expect(sweepPausedCardOf('worktree-sweep-paused')).toBeNull();
+      const legacy = h.notifications.post({ kind: 'worktree-sweep-paused:job-b:3f1c', routing: 'needs-owner', severity: 'info', title: 'Worktree sweep paused: live processes in repo' });
       const first = postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p1', details });
       expect(first.routing).toBe('needs-owner');
       expect(first.id).toBe('worktree-sweep-paused:job-b:p1');
+      expect(h.ledger.getNotification(legacy.id)?.resolvedBy).toBe('producer-withdrawn');
       const second = postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p2', details });
       expect(h.ledger.getNotification(first.id)?.resolvedBy).toBe('producer-withdrawn');
       expect(h.ledger.getNotification(second.id)?.resolvedAt).toBeNull();
-      withdrawSweptLaneCards(h, 'job-b');
+      settleSweptLaneCards(h, 'job-b');
       expect(h.ledger.getNotification(second.id)?.resolvedBy).toBe('producer-withdrawn');
     } finally { h.db.close(); }
   });
 
-  it('carries out "stop these processes" as a confirmed kill of exactly the pids that card named, then closes the card', async () => {
+  it('touches only its own lane\'s cards, never one whose lane id differs only in case', () => {
+    const h = ledgerHarness();
+    try {
+      const lane = (id: string) => {
+        h.ledger.addJob({ id, repo: 'repo', title: id });
+        return h.ledger.registerWorktree({ id, kind: 'job', repoPath: '/repos/repo', repoName: 'repo', path: `/lanes/repo/${id}`, branch: `gru/${id}`, sha: 'a'.repeat(40), jobId: id });
+      };
+      const upper = postSweepPausedCard(h, { worktree: lane('Job-B'), pauseId: 'p1', details });
+      postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p1', details });
+      settleSweptLaneCards(h, 'job-b');
+      expect(h.ledger.getNotification(upper.id)?.resolvedAt).toBeNull();
+    } finally { h.db.close(); }
+  });
+
+  function resolution(h: ReturnType<typeof ledgerHarness>, id: string): unknown {
+    return h.ledger.listEvents({ limit: 100 }).find((event) => event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === id)?.payload;
+  }
+
+  function pausedLane(h: ReturnType<typeof ledgerHarness>, pids: readonly number[], extra: Record<string, unknown> = {}): NotificationRecord {
+    h.ledger.setWorktreeStatus('job-b', 'paused', 'sweep paused');
+    h.ledger.appendCustomEvent({ kind: 'worktree.paused', jobId: 'job-b', payload: { id: 'job-b', path: h.lane.path, pause_id: 'p1', processes: pids.map((pid) => ({ pid })), ...extra } });
+    return postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p1', details });
+  }
+
+  it('carries out an answer recorded while GC runs as a confirmed kill of exactly the pids that card named, with its pause\'s base branch', async () => {
     const h = ledgerHarness();
     const releases: SweepRequest[] = [];
     const follower = new SweepDecisionFollower({
@@ -285,19 +350,77 @@ describe('the owner\'s card for a paused sweep', () => {
       bus: h.bus,
       release: async (input): Promise<SweepResult> => {
         releases.push(input);
+        return { status: 'paused', processes: [], preserved: null, note: 'sweep paused: pids 79503 survived the acknowledged kill (SIGTERM + SIGKILL)' };
+      },
+    });
+    try {
+      const card = pausedLane(h, [65215, 79503], { base_branch: 'develop' });
+      follower.start();
+      await follower.follow(); // the start pass is over: only the subscription can carry the answer out
+      h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
+      await vi.waitFor(() => expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull());
+      expect(releases).toEqual([{ worktreeId: 'job-b', confirmKill: true, confirmKillPids: [65215, 79503], baseBranch: 'develop' }]);
+      expect(resolution(h, card.id)).toMatchObject({ detail: 'the sweep paused again: sweep paused: pids 79503 survived the acknowledged kill (SIGTERM + SIGKILL)', owner_decision: STOP_AND_SWEEP_OPTION });
+    } finally { follower.stop(); h.db.close(); }
+  });
+
+  it('an answered card whose release sweeps the lane closes saying so, through the sweep\'s own settlement', async () => {
+    const h = ledgerHarness();
+    const follower = new SweepDecisionFollower({
+      ledger: h.ledger,
+      bus: h.bus,
+      // As the real release does: the sweep settles the lane's cards (main's onSwept) before it returns.
+      release: async (): Promise<SweepResult> => {
+        h.ledger.setWorktreeStatus('job-b', 'swept');
+        settleSweptLaneCards(h, 'job-b');
+        h.notifications.resolveIncidents('worktree-sweep-paused:job-b:', 'sweep-completed');
         return { status: 'swept', preserved: null, branch: 'deleted', freshHead: 'b'.repeat(40) };
       },
     });
     try {
-      h.ledger.setWorktreeStatus('job-b', 'paused', 'sweep paused');
-      h.ledger.appendCustomEvent({ kind: 'worktree.paused', jobId: 'job-b', payload: { id: 'job-b', path: h.lane.path, pause_id: 'p1', processes: [{ pid: 65215 }, { pid: 79503 }] } });
-      const card = postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p1', details });
-      follower.start();
+      const card = pausedLane(h, [65215]);
       h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
+      follower.start();
       await vi.waitFor(() => expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull());
-      expect(releases).toEqual([{ worktreeId: 'job-b', confirmKill: true, confirmKillPids: [65215, 79503] }]);
-      const resolved = h.ledger.listEvents({ limit: 50 }).find((event) => event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === card.id);
-      expect(resolved?.payload).toMatchObject({ detail: 'stopped the processes and swept lane job-b', owner_decision: STOP_AND_SWEEP_OPTION });
+      expect(resolution(h, card.id)).toMatchObject({ detail: 'lane job-b was swept after the answer "stop-and-sweep"', owner_decision: STOP_AND_SWEEP_OPTION });
+    } finally { follower.stop(); h.db.close(); }
+  });
+
+  it('a release that fails leaves the answered card open for the next pass; a child worker still running stops nothing', async () => {
+    const h = ledgerHarness();
+    const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>(async () => { throw new Error('sweep refused: a merge is in progress'); });
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, release });
+    try {
+      const card = pausedLane(h, [65215]);
+      h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
+      follower.start();
+      await vi.waitFor(() => expect(release).toHaveBeenCalledTimes(1));
+      expect(h.ledger.getNotification(card.id)).toMatchObject({ resolvedAt: null, decidedOption: STOP_AND_SWEEP_OPTION });
+      await follower.follow(); // the next pass retries the answer
+      expect(release).toHaveBeenCalledTimes(2);
+      // A pass that finds a child worker of the job that has not finished
+      // stops nothing, like an operator's release.
+      h.ledger.registerAgent({ id: 'parent-b', role: 'minion', jobId: 'job-b' });
+      h.ledger.admitChildWorker({ id: 'child_b', parentAgentId: 'parent-b', jobId: 'job-b', purpose: 'check', authority: 'read-only', task: 't', idempotencyKey: 'k' });
+      await follower.follow();
+      expect(release).toHaveBeenCalledTimes(2);
+      expect(resolution(h, card.id)).toMatchObject({ detail: expect.stringContaining('child worker child_b of this lane has not finished') });
+    } finally { follower.stop(); h.db.close(); }
+  });
+
+  it('carries out nothing once the service is stopping', async () => {
+    const h = ledgerHarness();
+    const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>();
+    const stop = new AbortController();
+    stop.abort();
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, release, stopSignal: stop.signal });
+    try {
+      const card = pausedLane(h, [65215]);
+      h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
+      follower.start();
+      await follower.follow();
+      expect(release).not.toHaveBeenCalled();
+      expect(h.ledger.getNotification(card.id)?.resolvedAt).toBeNull();
     } finally { follower.stop(); h.db.close(); }
   });
 

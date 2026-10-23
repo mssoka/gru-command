@@ -301,8 +301,10 @@ carries it, and so does everything that session starts
    environment GC cannot read, or one carrying this lane's token while a
    session GC runs in the lane is still busy. `confirm_kill` answers the
    RECORDED ask: it kills exactly the acknowledged pids (never a fresh
-   enumeration — later arrivals were never acknowledged), with a SIGTERM
-   grace before SIGKILL. Survivors re-pause; newcomers get their own ask;
+   enumeration — later arrivals were never acknowledged), and only while
+   the fresh enumeration still finds each rooted in the tree running the
+   command it was recorded with (#486: an answer given late never reaches a
+   recycled pid), with a SIGTERM grace before SIGKILL. Survivors re-pause; newcomers get their own ask;
    `confirm_kill` without a recorded pause is not honored. Silent kills
    do not exist for processes nothing ties to the lane. The owner's card
    ([§3a](#3a-lane-provenance-486)) names what runs and offers that answer
@@ -465,7 +467,11 @@ owner about bare pids.
   Pi, every command of its `bash` tool (GC supplies Pi's own bash tool,
   built with the session's shell settings and a spawn hook that adds them).
   Every descendant inherits them, a daemon that detached included. GC never
-  sets them in its own environment.
+  sets them in its own environment, and drops any it inherited (a service
+  started from inside a lane) before a session's own: a session carries
+  only the lane GC assigned it, and one outside a lane carries none. An
+  isolated Pi review session has no bash, so it starts no process to carry
+  them.
 - **Reading it.** On Linux GC reads `/proc/<pid>/environ`; on macOS
   `ps -E`, whose environment follows the command line, which must still be
   the one the listing showed (a process that exec'd since, or a recycled
@@ -482,29 +488,42 @@ owner about bare pids.
   signal, so a pid recycled between the enumeration and the kill is never
   signalled. Never while a session GC runs in the lane is busy there (a
   call in flight, a turn streaming or being spawned, a compaction or a
-  disposal): its own processes carry the token too. A survivor stays for
-  the ask.
+  disposal): its own processes carry the token too. That is checked again
+  just before the SIGTERM and before the SIGKILL. A survivor stays for the
+  ask. A pid already on the record keeps its row; the reap records it
+  with evidence `lane-token`.
 - **When the turns end.** Once every session on a lane has settled its
   calls, or been disposed, the registry tells the manager, which reaps the
   same way right away (`trigger: "turn-settled"`), listing off the event
   loop and under the lane's lock. Skipped for a lane that is not active,
-  and while a verification run GC spawned owns the tree (a live `registry`
-  row: the run may use what the minion started). The worker rule blocks
-  tell minions to stop what they start before their turn ends, and that GC
-  stops what they leave.
+  while a verification run GC spawned owns the tree (a live `registry`
+  row: the run may use what the minion started), and once the service is
+  stopping (its shutdown disposes every session). A review runs in its own
+  lane ([§4](#4-detached-for-reviews-branch-for-jobs-18d)), whose sessions
+  decide when that lane is quiet. The worker rule blocks tell minions to
+  stop what they start before their turn ends, and that GC stops what they
+  leave.
 - **The card.** What still runs is not provably the lane's. The pause's
   FOR YOU card (`worktree-sweep-paused:<lane>:<pause>`, its id too; the
-  pause's `worktree.paused` event carries `pause_id`) groups the processes
-  by executable name (`agent-browser + Google Chrome Helper (Renderer)
-  ×9`), gives each group's pids, start times and working directory, and
-  says why GC did not stop it: no lane token, another lane's token (named),
-  an environment it cannot read, or this lane's token while a session was
-  busy. Its one option, **Stop these N processes and finish the sweep**,
-  is carried out as an operator's `confirm_kill` limited to the pids that
-  card named: a survivor or a newcomer pauses again with a new card, and the
-  answered card closes saying what happened. A newer pause of the lane
-  withdraws an older unanswered card, and a sweep withdraws the lane's
-  unanswered cards. An answer a restart interrupted is carried out at start.
+  pause's `worktree.paused` event carries `pause_id`, and the base branch
+  its release named) groups the processes by name (`Google Chrome for
+  Testing ×11 + agent-browser`: a macOS app's helpers group under its
+  outermost `.app` bundle, anything else under its executable), says when
+  they started, and gives each name and reason its pids, start times and
+  working directory and why GC did not stop them: no lane token, another
+  lane's token (named), an environment it could not read, or this lane's
+  token while a session was busy. Its one option, **Stop these N processes
+  and finish the sweep**, is carried out as an operator's `confirm_kill`
+  limited to the pids that card named, with that base branch, and, like an
+  operator's release, never while a child worker of the lane has not
+  finished: a survivor or a newcomer pauses again with a new card, and the
+  answered card closes saying what happened (a sweep that finishes closes
+  it as swept). A release that fails leaves the card open and answered,
+  and the next pass (another answer, or a restart) tries again. A newer
+  pause of the lane withdraws its older unanswered cards (a notice from
+  before #486 too), and a sweep withdraws them. An answer a restart
+  interrupted is carried out at start, after moved lanes are reconnected;
+  none is carried out once the service is stopping.
 
 ## 4. Detached-for-reviews, branch-for-jobs (18d)
 

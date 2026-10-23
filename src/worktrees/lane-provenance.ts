@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import type { LedgerApi } from '../ledger/api.js';
+import type { LogLevel } from '../logger.js';
 
 /**
  * Lane provenance (#486). Every session GC spawns in a registered lane
@@ -43,6 +45,38 @@ export function isLaneToken(value: unknown): value is string {
 export function laneProvenanceEnv(lane: LaneProvenance): Readonly<Record<string, string>> {
   if (!isLaneToken(lane.token)) throw new Error(`lane ${lane.laneId} has no valid lane token`);
   return { [LANE_TOKEN_ENV]: lane.token, ...(lane.jobId !== null ? { [LANE_JOB_ENV]: lane.jobId } : {}) };
+}
+
+/** The lane a session spawned at `cwd` belongs to: the lane not yet
+ * swept whose registered path is exactly that cwd (GC spawns sessions at
+ * their lane's registered path), or null. A live lane with no token (its
+ * row was written without one) is logged, never guessed. */
+export function laneProvenanceFromLedger(
+  ledger: Pick<LedgerApi, 'findLiveWorktreeAtPath'>,
+  log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void,
+): (cwd: string) => LaneProvenance | null {
+  return (cwd) => {
+    const lane = ledger.findLiveWorktreeAtPath(cwd);
+    if (lane === null) return null;
+    if (lane.laneToken === null) {
+      log('warn', 'lane has no token: its session carries none, and what it leaves running is asked about at its sweep', { id: lane.id, path: lane.path });
+      return null;
+    }
+    return { laneId: lane.id, jobId: lane.jobId, token: lane.laneToken };
+  };
+}
+
+/** Whether an environment carries lane variables (GC itself inherited them
+ * when it was started from inside a lane). */
+export function carriesLaneEnv(env: NodeJS.ProcessEnv): boolean {
+  return env[LANE_TOKEN_ENV] !== undefined || env[LANE_JOB_ENV] !== undefined;
+}
+
+/** `env` without lane variables: a session carries only the lane GC
+ * assigned it, never one GC inherited. */
+export function withoutLaneEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const { [LANE_TOKEN_ENV]: _token, [LANE_JOB_ENV]: _job, ...rest } = env;
+  return rest;
 }
 
 /** What GC could read of one process's environment: the lane token it
@@ -135,10 +169,20 @@ export async function readLaneTokens(processes: readonly ListedProcess[], timeou
 
 /** What the owner's card says about a process GC would not stop. */
 export interface ProcessFacts {
-  /** The executable's name (`agent-browser`, `Google Chrome Helper`). */
+  /** The executable's name (`agent-browser`), or, for one inside a macOS
+   * app bundle, the outermost bundle's (a Chrome helper is `Google Chrome`). */
   readonly name: string;
   /** When it started (ISO, to the second), null when unknown. */
   readonly startedAt: string | null;
+}
+
+/** The name the card groups a process under: the outermost `.app`
+ * bundle of its executable's path when it has one (its helpers then group
+ * with it), else the executable's basename. */
+export function processName(executable: string): string {
+  const bundle = /(?:^|\/)([^/]+)\.app\//u.exec(executable)?.[1];
+  if (bundle !== undefined) return bundle;
+  return executable.slice(executable.lastIndexOf('/') + 1) || executable;
 }
 
 /** `[[dd-]hh:]mm:ss` elapsed time in seconds, null when unparseable. */
@@ -164,10 +208,8 @@ export async function readProcessFacts(pids: readonly number[], now = Date.now()
     const match = /^\s*(\S+)\s+(.*)$/u.exec(rest);
     if (match === null) continue;
     const elapsed = elapsedSeconds(match[1] ?? '');
-    const comm = (match[2] ?? '').trim();
-    const name = comm.slice(comm.lastIndexOf('/') + 1) || comm;
     facts.set(pid, {
-      name,
+      name: processName((match[2] ?? '').trim()),
       startedAt: elapsed === null ? null : new Date(Math.floor(now / 1000) * 1000 - elapsed * 1000).toISOString().replace('.000Z', 'Z'),
     });
   }
