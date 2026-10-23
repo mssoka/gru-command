@@ -1,5 +1,5 @@
 import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
-import { CreationIntentError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane } from './creation-intent.js';
+import { CreationIntentError, RetainedCreationRefusalError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -1419,6 +1419,39 @@ export class WorktreeManager {
    * registry row written (18b) with the base's provenance (18b).
    */
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeRecord> {
+    return this.createJobWorktreeUsingReceiptPolicy(input, false);
+  }
+
+  /** Read-only preflight for the one supported same-job retained-creation
+   * continuation. The existing reconciler is used in inspect-only mode, so
+   * no checkout/admin cleanup or new-base resolution can happen here. */
+  async inspectRetainedJobCreation(input: { repoPath: string; jobId: string }): Promise<{
+    readonly jobId: string; readonly repoPath: string; readonly branch: string; readonly sha: string;
+    readonly baseSource: Exclude<WorktreeBaseSource, null>; readonly receiptTokenSha256: string;
+    readonly producerSettlementSeq: number;
+  }> {
+    if (input.jobId === '') throw new Error('job id must be non-empty');
+    return this.withRepoLock(input.repoPath, async () => {
+      const repo = this.assertRepo(input.repoPath);
+      const branch = `gru/${input.jobId}`;
+      const path = join(this.opts.root, repo.repoName, `job-${input.jobId}`);
+      const lane = { id: input.jobId, kind: 'job' as const, jobId: input.jobId, roundId: null, path };
+      const retained = await this.reconcileInterruptedCreation(repo.repoPath, lane, branch, { requireRetained: true, inspectOnly: true });
+      if (retained === null || retained.baseSource === null) throw new CreationIntentError(`retained creation receipt for branch ${branch} cannot establish a fixed base`);
+      const tokenSha256 = createHash('sha256').update(retained.token, 'utf8').digest('hex');
+      const producer = this.opts.ledger.hasSettledCreationProducer({ jobId: input.jobId, branch, sha: retained.sha, tokenSha256 });
+      if (producer === null) throw new CreationIntentError(`original producer cessation for retained branch ${branch} is UNKNOWN — no exact positive close receipt; resources retained`);
+      return { jobId: input.jobId, repoPath: repo.repoPath, branch, sha: retained.sha, baseSource: retained.baseSource,
+        receiptTokenSha256: tokenSha256, producerSettlementSeq: producer.seq };
+    });
+  }
+
+  /** The only creation entry that requires an existing exact receipt. */
+  async createRetainedJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeRecord> {
+    return this.createJobWorktreeUsingReceiptPolicy(input, true);
+  }
+
+  private async createJobWorktreeUsingReceiptPolicy(input: { repoPath: string; jobId: string }, requireRetained: boolean): Promise<WorktreeRecord> {
     if (input.jobId === '') throw new Error('job id must be non-empty');
     return this.withRepoLock(input.repoPath, async () => {
       const repo = this.assertRepo(input.repoPath);
@@ -1427,8 +1460,15 @@ export class WorktreeManager {
       const lane = { id: input.jobId, kind: 'job' as const, jobId: input.jobId, roundId: null, path };
       // Issue #453: an interrupted earlier attempt may have committed the ref
       // without its checkout. Only its own retained receipt may be adopted; a
-      // ref nobody can attribute stays a refusal.
-      const retained = await this.reconcileInterruptedCreation(repo.repoPath, lane, branch);
+      // ref nobody can attribute stays a refusal. Continuations require it.
+      let retained: CreationIntent | null;
+      try {
+        retained = await this.reconcileInterruptedCreation(repo.repoPath, lane, branch, { requireRetained });
+      } catch (error) {
+        if (!requireRetained) throw error;
+        throw new RetainedCreationRefusalError(error instanceof Error ? error.message : String(error), { cause: error });
+      }
+      if (requireRetained && retained === null) throw new RetainedCreationRefusalError(`retained creation receipt for branch ${branch} is absent — new-base creation is forbidden for a continuation`);
       if (retained === null) {
         const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
         if (existing.status === 0) {
@@ -3017,13 +3057,21 @@ export class WorktreeManager {
    * the ref lock are the only other evidence consulted. A half-made
    * checkout of ours is rolled back under its own token, a foreign one is
    * refused, and a transaction that never committed is closed as spent. */
-  private async reconcileInterruptedCreation(repoPath: string, lane: CreationIntentLane, branch: string): Promise<CreationIntent | null> {
+  private async reconcileInterruptedCreation(
+    repoPath: string,
+    lane: CreationIntentLane,
+    branch: string,
+    policy: { readonly requireRetained?: boolean; readonly inspectOnly?: boolean } = {},
+  ): Promise<CreationIntent | null> {
     const common = this.creationCommonDirectory(repoPath);
     const retained = readCreationIntent(common, branch);
-    if (retained === null) return null; // no record: the ordinary ref/path refusals stand
     const refuse = (detail: string): never => {
       throw new CreationIntentError(`retained creation receipt for branch ${branch} ${detail} — resources retained, inspect before retrying`);
     };
+    if (retained === null) {
+      if (policy.requireRetained === true) refuse('is absent; a continuation cannot resolve a new base');
+      return null; // ordinary initial creation retains its established behavior
+    }
     // Publication owns a registered lane; this receipt never may. A swept
     // row is not publication's authority, but the id is still not reusable
     // (registerWorktree refuses any existing row), so the status is said and
@@ -3042,9 +3090,11 @@ export class WorktreeManager {
     }
     const checkout = existsSync(retained.lane.path);
     const admins = this.creationAdminEntries(retained.lane.path, common);
+    if (policy.requireRetained === true && tip.status === 1) {
+      refuse('has no branch ref; a continuation cannot clear the receipt or resolve a new base');
+    }
     // A receipt whose every resource is gone protects nothing. Close it and
-    // let the ordinary creation proceed, whatever the root, repository path
-    // or repository name is now: a spent receipt must never fence a branch.
+    // let ordinary initial creation proceed. Same-job continuation opts out.
     if (tip.status === 1 && !existsSync(lock) && admins.length === 0 && !checkout) {
       clearCreationIntent(common, branch, retained.token);
       this.log('info', 'retained lane creation receipt closed with nothing left to protect', { branch, lane: retained.lane.id });
@@ -3057,6 +3107,11 @@ export class WorktreeManager {
         retained.lane.roundId !== lane.roundId || retained.lane.path !== lane.path) {
       refuse(`belongs to another lane (${retained.lane.kind} ${retained.lane.id} at ${retained.lane.path})`);
     }
+    if (policy.requireRetained === true) {
+      const tokenSha256 = createHash('sha256').update(retained.token, 'utf8').digest('hex');
+      const producer = this.opts.ledger.hasSettledCreationProducer({ jobId: lane.id, branch, sha: retained.sha, tokenSha256 });
+      if (producer === null) refuse('has no exact positive original-producer close receipt; cessation is UNKNOWN');
+    }
     const custody: CreationCustody = { token: retained.token, branch, sha: retained.sha, lane: retained.lane,
       baseSource: retained.baseSource, branchCreated: tip.status === 0, addAttempted: true };
     const abandon = async (): Promise<null> => {
@@ -3068,7 +3123,11 @@ export class WorktreeManager {
     // A checkout at our path is ours only when its admin entry carries this
     // receipt's token; orphanCreationAdmin refuses a different token by name.
     const orphan = this.orphanCreationAdmin(repoPath, lane.path, custody, common);
-    if (orphan !== null) return abandon();
+    if (orphan !== null) {
+      if (policy.requireRetained === true) refuse(`has an existing receipt-owned worktree administration at ${orphan}; continuation requires a clean checkout path`);
+      if (policy.inspectOnly === true) refuse(`has an existing receipt-owned worktree administration at ${orphan}; read-only inspection will not reconcile it`);
+      return abandon();
+    }
     if (existsSync(lane.path)) refuse(`has a checkout at ${lane.path} that this receipt does not own`);
     if (tip.status !== 0) {
       // The transaction never committed (or was rolled back): the receipt is
@@ -3084,7 +3143,7 @@ export class WorktreeManager {
     const trees = spawnGit(repoPath, ['worktree', 'list', '--porcelain', '-z']);
     if (trees.status !== 0) refuse('cannot read the worktree registry');
     if (this.branchHasForeignHolder(trees.stdout, ref, null)) refuse('is held by a worktree that this receipt does not own');
-    this.log('warn', 'resuming an interrupted lane creation from its retained receipt', { branch, lane: lane.id, sha: retained.sha });
+    if (policy.inspectOnly !== true) this.log('warn', 'resuming an interrupted lane creation from its retained receipt', { branch, lane: lane.id, sha: retained.sha });
     return retained;
   }
 
@@ -3219,6 +3278,7 @@ export class WorktreeManager {
     let closed = false;
     let status: number | null = null;
     let signal: NodeJS.Signals | null = null;
+    let settlementReceiptFailure: Error | undefined;
     const transactionError = (detail: string): Error => new Error(
       `git update-ref ${operation} ${ref}: ${detail} — transaction authority unconfirmed; resources retained`,
     );
@@ -3259,8 +3319,10 @@ export class WorktreeManager {
     child.stdout.on('error', (error: Error) => { fail(transactionError(error.message)); });
     child.stderr.on('error', (error: Error) => { fail(transactionError(error.message)); });
     child.on('exit', (code, killedBy) => { exited = true; status = code; signal = killedBy; });
-    const stopped = new Promise<void>((done) => child.on('close', () => {
+    const stopped = new Promise<void>((done) => child.on('close', (code, killedBy) => {
       closed = true;
+      if (status === null) status = code;
+      if (signal === null) signal = killedBy;
       if (expected.length > 0 || pending.length > 0) {
         fail(transactionError(`missing or unterminated confirmation: ${stderrTail.toString('utf8').trim()}`));
       }
@@ -3347,6 +3409,22 @@ export class WorktreeManager {
         stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} termination unconfirmed`);
         child.unref();
       }
+    }
+    if (operation === 'create' && custody.lane.kind === 'job' && custody.branch === `gru/${custody.lane.id}` &&
+        closed && child.pid !== undefined) {
+      try {
+        this.opts.ledger.recordCreationProducerSettlement({
+          jobId: custody.lane.id, branch, sha: custody.sha,
+          tokenSha256: createHash('sha256').update(custody.token, 'utf8').digest('hex'),
+          pid: child.pid, exitCode: status, signal,
+        });
+      } catch (error) {
+        settlementReceiptFailure = transactionError(`owned Git child closed but its exact producer settlement could not be recorded: ${String(error)}`);
+      }
+    }
+    if (settlementReceiptFailure !== undefined) {
+      throw new AggregateError([...(failure === undefined ? [] : [failure]), ...(stopFailure === undefined ? [] : [stopFailure]), settlementReceiptFailure],
+        'Git producer closed but durable settlement evidence could not be recorded');
     }
     if (stopFailure !== undefined) {
       throw new AggregateError([...(failure === undefined ? [] : [failure]), stopFailure],

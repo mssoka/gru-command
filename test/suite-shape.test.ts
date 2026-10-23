@@ -224,6 +224,7 @@ const PINS: Record<string, number> = {
   'claude-review-isolation.test.ts': 4,
   'config-generate.test.ts': 26,
   'config.test.ts': 87,
+  'creation-continuation.test.ts': 14,
   'decisions-backtest.test.ts': 20,
   'decisions-cli.test.ts': 8,
   'decisions-deadline.test.ts': 28,

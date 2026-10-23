@@ -91,6 +91,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'decisions-service-integration.test.ts',
     workload: 'boots and restarts the real service with compiled CLIs',
   },
+  { file: 'creation-continuation.test.ts', workload: 'same-job continuation over owned Git child closure, retained refs, linked worktrees, HTTP and durable SQLite state' },
   { file: 'dispatch-e2e.test.ts', workload: 'end-to-end dispatch arc over real git fixtures' },
   {
     file: 'dispatch-server.test.ts',

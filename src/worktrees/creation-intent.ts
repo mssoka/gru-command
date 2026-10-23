@@ -45,6 +45,14 @@ export class CreationIntentError extends Error {
   }
 }
 
+/** A strict continuation guard refused before it began any checkout work. */
+export class RetainedCreationRefusalError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RetainedCreationRefusalError';
+  }
+}
+
 /** The lane a creation receipt belongs to. Identity fields only — every one
  * is revalidated on read against the caller's request, never trusted. */
 export interface CreationIntentLane {

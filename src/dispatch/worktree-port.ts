@@ -68,6 +68,17 @@ export type WorktreeSweepResult = WorktreeSweepPaused | WorktreeSweepSwept;
 
 import type { WorktreeBaseSource } from '../ledger/api.js';
 
+/** Read-only identity of the original retained creation, never its raw token. */
+export interface RetainedJobCreationInspection {
+  readonly jobId: string;
+  readonly repoPath: string;
+  readonly branch: string;
+  readonly sha: string;
+  readonly baseSource: WorktreeBaseSource;
+  readonly receiptTokenSha256: string;
+  readonly producerSettlementSeq: number;
+}
+
 /** The worktree subsystem the dispatch flow rides on. */
 export interface WorktreePort {
   /** Resolve a review target exactly as `createReviewWorktree` would:
@@ -85,6 +96,10 @@ export interface WorktreePort {
     readonly trackingRef: string | null;
   }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
+  /** Strict same-job continuation only: inspection is read-only and the
+   * create method refuses absent receipts/refs instead of resolving a base. */
+  inspectRetainedJobCreation?(input: { readonly repoPath: string; readonly jobId: string }): Promise<RetainedJobCreationInspection>;
+  createRetainedJobWorktree?(input: { readonly repoPath: string; readonly jobId: string }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
     repoPath: string;
     roundId: string;

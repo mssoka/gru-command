@@ -1,9 +1,9 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
-import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
-import { requireSafeRecordId } from '../ledger/api.js';
+import type { CreationContinuationState, CreationContinuationTimeline, JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
+import { RecordNotFound, requireSafeRecordId } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobStatus, isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
@@ -12,7 +12,8 @@ import { requireSpawnCwd } from '../roles.js';
 import { renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
-import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
+import type { RetainedJobCreationInspection, WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
+import { RetainedCreationRefusalError } from '../worktrees/creation-intent.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
 import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
@@ -35,6 +36,50 @@ import {
 } from './review-source.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+export interface CreationContinuationReadback {
+  readonly job_id: string;
+  readonly request_id: string;
+  readonly generation: number;
+  readonly payload_sha256: string;
+  readonly state: CreationContinuationState;
+  readonly active: boolean;
+  readonly job_status: string | null;
+  readonly original: {
+    readonly handoff_seq: number | null;
+    readonly briefing_sha256: string | null;
+    readonly repo_path: string | null;
+    readonly branch: string | null;
+    readonly base_sha: string | null;
+    readonly base_source: string | null;
+    readonly producer_settlement_seq: number | null;
+  };
+  readonly custody: {
+    readonly worktree_id: string;
+    readonly path: string;
+    readonly branch: string | null;
+    readonly sha: string;
+    readonly base_source: string | null;
+    readonly status: string;
+    readonly evidence: 'manager-reconciliation' | 'ledger-registry-only';
+  } | null;
+  readonly queue: { readonly gate: string; readonly reason: string | null } | null;
+  readonly admission: { readonly agent_id: string; readonly event_seq: number } | null;
+  readonly delivery: { readonly event_seq: number; readonly agent_id: string | null; readonly sha: string | null } | null;
+  readonly reason: string | null;
+  readonly timeline: readonly { readonly seq: number; readonly ts: string; readonly state: string; readonly stage: string }[];
+}
+
+export interface CreationContinuationRequestResult {
+  readonly created: boolean;
+  readonly readback: CreationContinuationReadback;
+}
+
+interface CreationContinuationExecution {
+  readonly job: JobRecord;
+  readonly timeline: CreationContinuationTimeline;
+  readonly releaseAdmission: () => void;
+}
 
 import {
   admitBlindReview,
@@ -266,10 +311,236 @@ export function renderMinionBriefing(input: {
 export class DispatchService {
   private readonly opts: DispatchServiceOptions;
   private readonly log: Log;
+  private readonly activeCreationContinuations = new Set<string>();
 
   constructor(opts: DispatchServiceOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+  }
+
+  private continuationKey(jobId: string, requestId: string): string {
+    return `${jobId}\0${requestId}`;
+  }
+
+  private safeContinuationReason(error: unknown): string {
+    const raw = error instanceof Error ? error.message : String(error);
+    return raw.replace(/gru-creation:[A-Za-z0-9-]+/gu, '<redacted-creation-token>').slice(0, 1000);
+  }
+
+  /** Authenticated route entry: inspect only, durably fence one identity,
+   * then run the same dispatch body in the background. Retries only return
+   * the recorded request; they never start it again. */
+  async requestCreationContinuation(input: { readonly jobId: string; readonly requestId: string }): Promise<CreationContinuationRequestResult> {
+    requireSafeRecordId(input.jobId, 'job id');
+    requireSafeRecordId(input.requestId, 'creation continuation request id');
+    const existing = this.opts.ledger.getCreationContinuation(input.jobId, input.requestId);
+    if (existing !== null) return { created: false, readback: this.creationContinuationReadback(existing) };
+
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+    const handoffs = this.opts.ledger.listJobEventsByKinds(input.jobId, ['job.handoff'], { limit: 2 });
+    const handoff = handoffs.length === 1 ? handoffs[0]! : null;
+    const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
+    const repoPath = typeof handoffPayload?.['repoPath'] === 'string' ? handoffPayload['repoPath'] : null;
+    const briefingSha256 = typeof job.briefing === 'string'
+      ? createHash('sha256').update(job.briefing, 'utf8').digest('hex') : null;
+    let inspection: RetainedJobCreationInspection | null = null;
+    let refusalReason: string | undefined;
+    if (job.status !== 'blocked') refusalReason = `job "${job.id}" is ${job.status}, not blocked`;
+    else if (job.deliverable !== null && job.deliverable !== 'pr') refusalReason = `job "${job.id}" is not a PR-owing initial dispatch`;
+    else if (job.prUrl !== null || job.targetRef !== null || job.targetSha !== null) refusalReason = `job "${job.id}" has report or pull-request state incompatible with initial-creation continuation`;
+    else if (job.briefing === null || job.briefing.trim() === '') refusalReason = `job "${job.id}" has no original briefing to reuse`;
+    else if (handoff === null || repoPath === null) refusalReason = `job "${job.id}" has no unique original job.handoff with its repository path`;
+    else if ((repoPath.split('/').filter(Boolean).at(-1) ?? '') !== job.repo) refusalReason = `job "${job.id}" handoff repository path does not match its recorded repository`;
+    else if (this.opts.worktrees.inspectRetainedJobCreation === undefined || this.opts.worktrees.createRetainedJobWorktree === undefined) {
+      refusalReason = 'retained-creation inspection and strict manager continuation are not wired';
+    } else {
+      try {
+        inspection = await this.opts.worktrees.inspectRetainedJobCreation({ repoPath, jobId: input.jobId });
+        if (inspection.jobId !== input.jobId || inspection.repoPath !== repoPath || inspection.branch !== `gru/${input.jobId}` ||
+            inspection.sha.length < 40 || inspection.baseSource === null) {
+          refusalReason = 'WorktreeManager returned a retained-creation identity that does not match the original job handoff';
+          inspection = null;
+        }
+      } catch (error) {
+        refusalReason = this.safeContinuationReason(error);
+      }
+    }
+    const identityPayload = {
+      schema: 'same-job-retained-creation-continuation-v1', job_id: input.jobId, request_id: input.requestId,
+      handoff_seq: handoff?.seq ?? null, briefing_sha256: briefingSha256, repo_path: repoPath,
+      branch: inspection?.branch ?? null, base_sha: inspection?.sha ?? null, base_source: inspection?.baseSource ?? null,
+      producer_settlement_seq: inspection?.producerSettlementSeq ?? null,
+      receipt_token_sha256: inspection?.receiptTokenSha256 ?? null,
+    };
+    const payloadSha256 = createHash('sha256').update(JSON.stringify(identityPayload), 'utf8').digest('hex');
+    const accepted = this.opts.ledger.acceptCreationContinuation({
+      jobId: input.jobId, requestId: input.requestId, payloadSha256,
+      handoffSeq: handoff?.seq ?? null, briefingSha256, repoPath,
+      branch: inspection?.branch ?? null, baseSha: inspection?.sha ?? null,
+      baseSource: inspection?.baseSource ?? null, producerSettlementSeq: inspection?.producerSettlementSeq ?? null,
+      receiptTokenSha256: inspection?.receiptTokenSha256 ?? null,
+      ...(refusalReason !== undefined ? { refusalReason } : {}),
+    });
+    if (!accepted.created || accepted.timeline.state !== 'accepted') {
+      return { created: accepted.created, readback: this.creationContinuationReadback(accepted.timeline) };
+    }
+
+    let releaseUnderlying: (() => void) | null = null;
+    let held = true;
+    const releaseAdmission = (): void => {
+      if (!held) return;
+      held = false;
+      const release = releaseUnderlying;
+      releaseUnderlying = null;
+      release?.();
+    };
+    try {
+      // Reserve the normal ledger admission synchronously after the durable
+      // acceptance and before the first continuation side effect/await.
+      releaseUnderlying = this.opts.ledger.beginJobAdmission(input.jobId, `initial creation continuation ${input.requestId}`);
+    } catch (error) {
+      this.opts.ledger.recordCreationContinuationState({
+        jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+        state: 'refused', stage: 'admission-refused', details: { reason: this.safeContinuationReason(error) },
+      });
+      return { created: true, readback: this.creationContinuationReadback(this.opts.ledger.getCreationContinuation(input.jobId, input.requestId)!) };
+    }
+    const key = this.continuationKey(input.jobId, input.requestId);
+    this.activeCreationContinuations.add(key);
+    let custodyAttempted = false;
+    let custodyAdopted = false;
+    const execution: CreationContinuationExecution = { job, timeline: accepted.timeline, releaseAdmission };
+    void Promise.resolve().then(async () => {
+      try {
+        const continuation = {
+          ...execution,
+          custodyAttempted: () => { custodyAttempted = true; },
+          custodyAdopted: (lane: WorktreeLane) => {
+            custodyAdopted = true;
+            this.opts.ledger.recordCreationContinuationState({
+              jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+              stage: 'custody-adopted', details: {
+                worktree_id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha,
+                base_source: accepted.timeline.identity.baseSource, worktree_status: lane.status,
+              },
+            });
+          },
+          queued: (gate: string, reason: string) => {
+            this.opts.ledger.recordCreationContinuationState({
+              jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+              state: 'queued', stage: 'queued', details: { gate, reason },
+            });
+          },
+        };
+        const outcome = await this.dispatch({
+          jobId: job.id, repoPath: repoPath!, title: job.title,
+          ...(job.displayName !== null ? { displayName: job.displayName } : {}),
+          ...(job.deliverable !== null ? { deliverable: job.deliverable } : {}),
+          ...(job.parentJobId !== null ? { parentJobId: job.parentJobId } : {}),
+          briefing: job.briefing!, creationContinuation: continuation,
+        });
+        const settled = await outcome.settled;
+        if (!settled.ok) {
+          this.opts.ledger.recordCreationContinuationState({
+            jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+            state: 'failed', stage: 'turn-settled-failure', details: { reason: this.safeContinuationReason(settled.error ?? 'minion turn failed') },
+          });
+        }
+      } catch (error) {
+        const reason = this.safeContinuationReason(error);
+        if (error instanceof RetainedCreationRefusalError) {
+          this.opts.ledger.recordCreationContinuationState({
+            jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+            state: 'refused', stage: 'manager-guard-refused', details: { reason },
+          });
+        } else if (!custodyAttempted) {
+          this.opts.ledger.recordCreationContinuationState({
+            jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+            state: 'failed', stage: 'failed-before-manager', details: { reason },
+          });
+        } else {
+          const lane = this.opts.ledger.getWorktree(input.jobId);
+          const admitted = this.opts.ledger.getCreationContinuationDispatchEvidence(input.jobId, input.requestId, accepted.timeline.identity.generation).spawned;
+          if (custodyAdopted && lane?.status === 'swept' && admitted === null) {
+            this.opts.ledger.recordCreationContinuationState({
+              jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+              state: 'failed', stage: 'known-swept-failure', details: { reason, worktree_status: lane.status },
+            });
+          } else {
+            this.opts.ledger.recordCreationContinuationState({
+              jobId: input.jobId, requestId: input.requestId, generation: accepted.timeline.identity.generation,
+              state: 'custody-unknown', stage: 'unsettled-failure', details: {
+                reason, manager_attempted: true, custody_adopted: custodyAdopted,
+                worktree_status: lane?.status ?? null, agent_spawn_event_observed: admitted !== null,
+              },
+            });
+          }
+        }
+      } finally {
+        releaseAdmission();
+        this.activeCreationContinuations.delete(key);
+      }
+    }).catch((error: unknown) => {
+      this.log('error', 'creation continuation settlement could not be durably recorded', {
+        job: input.jobId, request: input.requestId, error: this.safeContinuationReason(error),
+      });
+    });
+    return { created: true, readback: this.creationContinuationReadback(accepted.timeline) };
+  }
+
+  getCreationContinuationReadback(jobId: string, requestId: string): CreationContinuationReadback | null {
+    const timeline = this.opts.ledger.getCreationContinuation(jobId, requestId);
+    return timeline === null ? null : this.creationContinuationReadback(timeline);
+  }
+
+  private creationContinuationReadback(timeline: CreationContinuationTimeline): CreationContinuationReadback {
+    const { identity } = timeline;
+    const active = this.activeCreationContinuations.has(this.continuationKey(identity.jobId, identity.requestId));
+    const job = this.opts.ledger.getJob(identity.jobId);
+    const evidence = this.opts.ledger.getCreationContinuationDispatchEvidence(identity.jobId, identity.requestId, identity.generation);
+    const lane = this.opts.ledger.getWorktree(identity.jobId);
+    const managerCustodyRecorded = timeline.events.some((event) => (event.payload as Record<string, unknown>)['stage'] === 'custody-adopted');
+    let state = timeline.state;
+    if (evidence.delivery !== null) state = 'delivered';
+    else if (state !== 'failed' && state !== 'refused' && state !== 'delivered' && !active) state = 'custody-unknown';
+    else if (evidence.spawned !== null && state !== 'failed' && state !== 'refused') state = 'admitted';
+    const latestPayload = timeline.events.at(-1)!.payload as Record<string, unknown>;
+    const queueEvent = [...timeline.events].reverse().find((event) => (event.payload as Record<string, unknown>)['state'] === 'queued');
+    const queuePayload = queueEvent?.payload as Record<string, unknown> | undefined;
+    const spawnPayload = evidence.spawned?.payload as Record<string, unknown> | undefined;
+    const deliveryPayload = evidence.delivery?.payload as Record<string, unknown> | undefined;
+    return {
+      job_id: identity.jobId, request_id: identity.requestId, generation: identity.generation,
+      payload_sha256: identity.payloadSha256, state, active, job_status: job?.status ?? null,
+      original: {
+        handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256, repo_path: identity.repoPath,
+        branch: identity.branch, base_sha: identity.baseSha, base_source: identity.baseSource,
+        producer_settlement_seq: identity.producerSettlementSeq,
+      },
+      custody: lane === null ? null : {
+        worktree_id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha,
+        base_source: lane.baseSource, status: lane.status,
+        evidence: managerCustodyRecorded ? 'manager-reconciliation' : 'ledger-registry-only',
+      },
+      queue: queuePayload === undefined ? null : {
+        gate: typeof queuePayload['gate'] === 'string' ? queuePayload['gate'] : 'unknown',
+        reason: typeof queuePayload['reason'] === 'string' ? queuePayload['reason'] : null,
+      },
+      admission: evidence.spawned === null || typeof spawnPayload?.['agentId'] !== 'string' ? null : {
+        agent_id: spawnPayload['agentId'], event_seq: evidence.spawned.seq,
+      },
+      delivery: evidence.delivery === null ? null : {
+        event_seq: evidence.delivery.seq,
+        agent_id: typeof deliveryPayload?.['agentId'] === 'string' ? deliveryPayload['agentId'] : null,
+        sha: typeof deliveryPayload?.['sha'] === 'string' ? deliveryPayload['sha'] : null,
+      },
+      reason: typeof latestPayload['reason'] === 'string' ? latestPayload['reason'] : null,
+      timeline: timeline.events.map((event) => {
+        const payload = event.payload as Record<string, unknown>;
+        return { seq: event.seq, ts: event.ts, state: String(payload['state']), stage: String(payload['stage']) };
+      }),
+    };
   }
 
   /**
@@ -323,6 +594,13 @@ export class DispatchService {
      * validated completion owes the named decision durably. Omitted =
      * ordinary Silas completion. */
     completionHandoff?: CompletionHandoffIntent;
+    /** Internal only: an authenticated same-job continuation has already
+     * persisted its request and reserves the normal job admission. */
+    creationContinuation?: CreationContinuationExecution & {
+      readonly custodyAttempted: () => void;
+      readonly custodyAdopted: (lane: WorktreeLane) => void;
+      readonly queued: (gate: string, reason: string) => void;
+    };
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
@@ -421,7 +699,8 @@ export class DispatchService {
     });
 
     // (1) The job row: the briefing IS the contract (recorded verbatim).
-    const job = this.opts.ledger.addJob({
+    // A continuation uses that exact existing row and never calls addJob.
+    const job = input.creationContinuation?.job ?? this.opts.ledger.addJob({
       id: input.jobId,
       repo: repoName,
       title: input.title,
@@ -452,12 +731,15 @@ export class DispatchService {
 
     if (blindAdmission !== null) recordBlindAdmission(this.opts.ledger, job.id, blindAdmission, input.inputPackage);
 
-    // (2) Ops handoff: dispatched → working, on the record.
-    this.opts.ledger.appendCustomEvent({
-      kind: 'job.handoff',
-      jobId: job.id,
-      payload: { repo: repoName, repoPath: input.repoPath },
-    });
+    // (2) Ops handoff: dispatched → working, on the record. An existing
+    // continuation reuses its original handoff and never writes another.
+    if (input.creationContinuation === undefined) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'job.handoff',
+        jobId: job.id,
+        payload: { repo: repoName, repoPath: input.repoPath },
+      });
+    }
 
     let handoffPhaseId: string | null = null;
     // Tracks whether THIS run committed the terminal delivery event: a
@@ -466,7 +748,7 @@ export class DispatchService {
     let deliveredRecorded = false;
     let workerLease: PacingLease | null = null;
     let floorAdmission: FloorAdmission | null = null;
-    let releaseAdmission: (() => void) | null = null;
+    let releaseAdmission: (() => void) | null = input.creationContinuation?.releaseAdmission ?? null;
     const releaseJobAdmission = (): void => {
       const release = releaseAdmission;
       releaseAdmission = null;
@@ -506,22 +788,30 @@ export class DispatchService {
       // the worker gate as promptly as before (#429: a commission answers
       // with the recorded job while that gate holds it).
       const floor = this.opts.diskFloor;
-      if (floor !== undefined) floorAdmission = await this.waitAtDiskFloor(floor, job.id, input.title);
+      if (floor !== undefined) floorAdmission = await this.waitAtDiskFloor(
+        floor, job.id, input.title,
+        input.creationContinuation === undefined ? undefined : (reason) => input.creationContinuation!.queued('disk-floor', reason),
+      );
       assertAdmissible();
 
       // No registered agent exists yet while worktree/pacing/spawn awaits.
-      // Reserve that runtime side effect so a concurrent bin cannot close
-      // the lane then receive a late briefing.
-      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
+      // A continuation already reserved this same normal admission before
+      // its first await; an initial dispatch retains its existing order.
+      releaseAdmission ??= this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
 
-      // (3) One worktree per job, fresh head, own branch (ruling 18). A lane
-      // the floor admitted holds the next waiter back until it is made.
+      // (3) One worktree per job. Only a continuation enters the strict
+      // retained-receipt manager method; it can never resolve a fresh base.
       let worktree: WorktreeLane;
       try {
-        worktree = await this.opts.worktrees.createJobWorktree({
-          repoPath: input.repoPath,
-          jobId: job.id,
-        });
+        if (input.creationContinuation !== undefined) input.creationContinuation.custodyAttempted();
+        if (input.creationContinuation !== undefined) {
+          const createRetained = this.opts.worktrees.createRetainedJobWorktree;
+          if (createRetained === undefined) throw new Error('strict retained-creation manager path is not wired');
+          worktree = await createRetained.call(this.opts.worktrees, { repoPath: input.repoPath, jobId: job.id });
+          input.creationContinuation.custodyAdopted(worktree);
+        } else {
+          worktree = await this.opts.worktrees.createJobWorktree({ repoPath: input.repoPath, jobId: job.id });
+        }
       } finally {
         floorAdmission?.done();
       }
@@ -551,6 +841,7 @@ export class DispatchService {
           queued: (info) => {
             queuedReason = info.reason;
             this.opts.ledger.noteJob(job.id, info.reason);
+            input.creationContinuation?.queued('worker-pacing', info.reason);
           },
         });
         workerLease = lease;
@@ -614,11 +905,28 @@ export class DispatchService {
       if (handoffPhaseId !== null) {
         this.opts.ledger.bindPhaseHandoffMinion({ phaseId: handoffPhaseId, minionId: handle.id });
       }
-      this.opts.ledger.appendCustomEvent({
+      const spawned = this.opts.ledger.appendCustomEvent({
         kind: 'job.minion-spawned',
         jobId: job.id,
-        payload: { agentId: handle.id, worktree: worktree.path, branch: worktree.branch },
+        payload: {
+          agentId: handle.id, worktree: worktree.path, branch: worktree.branch,
+          ...(input.creationContinuation === undefined ? {} : {
+            creation_continuation_request_id: input.creationContinuation.timeline.identity.requestId,
+            creation_continuation_generation: input.creationContinuation.timeline.identity.generation,
+          }),
+        },
       });
+      if (input.creationContinuation !== undefined) {
+        this.opts.ledger.recordCreationContinuationState({
+          jobId: job.id, requestId: input.creationContinuation.timeline.identity.requestId,
+          generation: input.creationContinuation.timeline.identity.generation,
+          state: 'admitted', stage: 'minion-spawned', details: {
+            agent_id: handle.id, spawn_event_seq: spawned.seq, worktree_id: worktree.id,
+            path: worktree.path, branch: worktree.branch, sha: worktree.sha,
+            base_source: input.creationContinuation.timeline.identity.baseSource,
+          },
+        });
+      }
       this.log('info', 'minion dispatched', {
         job: job.id,
         agent: handle.id,
@@ -763,7 +1071,20 @@ export class DispatchService {
         // until a continuation carrying it delivers (owner rule 2).
         const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
           worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
+          ...(input.creationContinuation === undefined ? {} : {
+            requestId: input.creationContinuation.timeline.identity.requestId,
+            requestGeneration: input.creationContinuation.timeline.identity.generation,
+          }),
           ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}), workRevision: 0 });
+        if (input.creationContinuation !== undefined) {
+          this.opts.ledger.recordCreationContinuationState({
+            jobId: job.id, requestId: input.creationContinuation.timeline.identity.requestId,
+            generation: input.creationContinuation.timeline.identity.generation,
+            state: 'delivered', stage: 'job-delivered', details: {
+              delivery_event_seq: delivery.eventSeq, agent_id: handle.id, sha: delivery.sha,
+            },
+          });
+        }
         deliveredRecorded = true;
         if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
           job: job.id, note: delivery.note, lane: delivery.lanePath,
@@ -842,7 +1163,12 @@ export class DispatchService {
    * noted. The service's stop ends the wait, and so does the job leaving
    * the states a lane may still be made in (binned, parked, blocked,
    * finished). */
-  private async waitAtDiskFloor(floor: Pick<DiskFloorGate, 'admitLane'>, jobId: string, label: string): Promise<FloorAdmission> {
+  private async waitAtDiskFloor(
+    floor: Pick<DiskFloorGate, 'admitLane'>,
+    jobId: string,
+    label: string,
+    onQueued?: (reason: string) => void,
+  ): Promise<FloorAdmission> {
     const jobEnded = new AbortController();
     const unsubscribe = this.opts.bus?.subscribe((event) => {
       if (event.kind !== 'job.status' || event.jobId !== jobId) return;
@@ -859,6 +1185,7 @@ export class DispatchService {
         queued: (info) => {
           floorQueued = true;
           this.opts.ledger.noteJob(jobId, info.reason);
+          onQueued?.(info.reason);
         },
       });
       if (floorQueued) this.opts.ledger.noteJob(jobId, `disk floor: admitted after ${admitted.waitedMs} ms queue wait`);

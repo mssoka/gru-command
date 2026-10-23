@@ -583,6 +583,9 @@ export function recordFollowUpDelivery(input: {
    * delivery answers. When present the event can only settle THAT
    * request — a later unrelated delivery cannot clear an older marker. */
   readonly requestId?: string;
+  /** Initial-creation continuation generation; paired with requestId so
+   * durable readback distinguishes a new request from a retry. */
+  readonly requestGeneration?: number;
   /** Host-owned phase-handoff identity: present when the phase was
    * explicitly marked as owing a completion decision. The completion
    * observer matches on THIS id (never the event sequence). */
@@ -652,6 +655,7 @@ export function recordFollowUpDelivery(input: {
       source: input.source,
       sha,
       ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
+      ...(input.requestGeneration !== undefined ? { continuation_generation: input.requestGeneration } : {}),
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
       ...(input.rebriefMarker === undefined ? {} : { marker_id: input.rebriefMarker.id, payload_hash: input.rebriefMarker.payloadHash }),
       work_revision: input.workRevision,
