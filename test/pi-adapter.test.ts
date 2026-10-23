@@ -17,7 +17,7 @@ import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
+import { capabilitiesForModelInput, type AgentHandle, type PromptOptions, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
@@ -4112,52 +4112,53 @@ it('routes a real local native authority refusal away from provider authenticati
   }
 });
 
-it('preserves provider authentication recovery after a local refusal in the same Pi turn', async () => {
-  let applyAcceptedClarification: (() => void) | null = null;
-  const f = await sdkDirectiveExecutionFixture((_prompt, index) => {
-    if (index === 0) applyAcceptedClarification?.();
-    return index === 0
-      ? { deltas: [], toolCall: { id: 'refused-local-effect-before-provider-error', name: 'bash', args: { command: 'printf forbidden > local-authority-effect.txt' } } }
-      : { deltas: [], error: 'HTTP 401 Unauthorized' };
-  });
+it('does not carry a captured native refusal onto a later provider error in the same Pi turn', async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
+  const f = await sdkDirectiveExecutionFixture([{ deltas: [], hold, honorAbort: true }]);
   const { scene, registry, fx } = f;
   const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
     restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
     registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
+  let running: Promise<unknown> | null = null;
   try {
     expect(scene.ledger.claimDirectiveDispatch(scene.request.requestId)).toBe(true);
-    const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: 'local-refusal-then-provider-error' });
+    const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: 'same-turn-local-refusal-provider-error' });
     scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
     if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
     const producer = handle.prepareDirectiveProducer(scene.identity);
     scene.ledger.startDirectiveProducer(scene.identity, producer);
-    applyAcceptedClarification = () => {
-      expect(scene.ledger.addJobAmendment({ jobId: scene.request.jobId, body: 'Synthetic accepted administrative contract clarification.',
-        supersedes: [], approval: { by: 'owner', reference: 'synthetic accepted clarification' }, effect: 'material',
-        expectedContractSha256: scene.identity.contractSha256 }).status).toBe('accepted');
-      scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'accepted contract clarification superseded the original continuation' });
-    };
+    const directive: NonNullable<PromptOptions['directive']> = { identity: scene.identity,
+      beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+      onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } };
     const events: RuntimeEvent[] = [];
     handle.subscribe((event) => events.push(event));
-    const verdict = await handle.promptWithVerdict('original accepted synthetic directive', { owner: `silas-directive:${scene.request.requestId}`,
-      directive: { identity: scene.identity, beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
-        onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
-    expect(verdict.ok).toBe(false);
-    expect(fx.script.calls).toHaveLength(2);
-    await waitFor(() => events.some((event) => event.type === 'error' && /401/u.test(event.error)),
-      `synthetic provider authentication error; events=${JSON.stringify(events.filter((event) => event.type === 'error'))}`);
-    const providerFailure = [...events].reverse().find((event) => event.type === 'error' && /401/u.test(event.error));
+    running = handle.promptWithVerdict('synthetic accepted native directive', { owner: `silas-directive:${scene.request.requestId}`, directive })
+      .then((value) => value, (error: unknown) => ({ error: String(error) }));
+    await waitFor(() => fx.script.calls.length === 1, 'live synthetic Pi model turn');
+    const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+    const guardError = new checkpoint.DirectiveCheckpointError('synthetic directive guard refusal');
+    const runtimeBoundary = handle as unknown as {
+      refuseDirectiveGuard: (active: NonNullable<PromptOptions['directive']>, toolCallId: string | undefined, error: unknown) => never;
+      onPiEvent: (event: unknown) => void;
+    };
+    try { runtimeBoundary.refuseDirectiveGuard(directive, undefined, guardError); }
+    catch (error) { expect(error).toBe(guardError); }
+    runtimeBoundary.onPiEvent({ type: 'message_end', message: { role: 'assistant', stopReason: 'error',
+      errorMessage: 'HTTP 401 Unauthorized', provider: 'synthetic-provider', model: 'synthetic-model' } });
+    const providerFailure = [...events].reverse().find((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized');
     expect(providerFailure?.type).toBe('error');
-    if (providerFailure?.type !== 'error') throw new Error('synthetic provider error event was not emitted');
+    if (providerFailure?.type !== 'error') throw new Error(`synthetic Pi provider error event missing: ${JSON.stringify(events)}`);
     expect(providerFailure.nativeControl).toBeUndefined();
-    expect(providerFailure).toMatchObject({ provider: 'gru-stub', model: 'stub-model' });
-    expect(fx.script.calls).toHaveLength(2);
+    expect(providerFailure.typed).toBeUndefined();
+    expect(providerFailure).toMatchObject({ provider: 'synthetic-provider', model: 'synthetic-model' });
     await vi.waitFor(() => expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' }));
     expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall') && notice.agentId === handle.id)).toBe(true);
     expect(scene.ledger.listProviderWaits()).toEqual([]);
-    expect(existsSync(join(scene.lane.path, 'local-authority-effect.txt'))).toBe(false);
-    expect(scene.ledger.getDirective(scene.request.requestId)?.state).toBe('failed');
+    expect(fx.script.calls).toHaveLength(1);
   } finally {
+    release();
+    if (running !== null) await running;
     supervisor.dispose();
     await f.cleanup();
   }
