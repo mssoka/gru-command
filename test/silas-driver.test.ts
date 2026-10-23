@@ -4682,7 +4682,7 @@ describe('silas deterministic pass observation (issue #163)', () => {
     // regression in test/silas-autopilot.test.ts; this alarm only pins that
     // main.ts still wires both halves through that factory.
     expect(mainSource).toMatch(
-      /import\s*\{[^}]*\bcomposeDeterministicPass\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-autopilot-pass\.js'/, 
+      /import\s*\{[^}]*\bcomposeDeterministicPass\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-autopilot-pass\.js'/,
     );
     expect(mainSource).toMatch(/const autopilotHook = createSilasAutopilotHook\(\{/);
     expect(mainSource).toMatch(/onDeterministicPass:\s*composeDeterministicPass\(durablePass, autopilotHook\)/);

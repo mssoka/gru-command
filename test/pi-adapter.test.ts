@@ -4112,6 +4112,144 @@ it('routes a real local native authority refusal away from provider authenticati
   }
 });
 
+it('routes a synthesized next-turn native guard refusal locally and consumes its event provenance', async () => {
+  let applyAcceptedClarification: (() => void) | null = null;
+  let preparations = 0;
+  let clarificationApplied = false;
+  let injectedProviderError = false;
+  let localRefusalBeforeProvider: RuntimeEvent | null = null;
+  let supervisorViewBeforeProvider: ReturnType<Supervisor['viewFor']> | null = null;
+  let providerWallBeforeProvider = false;
+  let guardRefusalReceiptBeforeProvider = false;
+  let cessationReceiptBeforeProvider = false;
+  const events: RuntimeEvent[] = [];
+  let supervisor!: Supervisor;
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'authorized-before-next-turn-refusal', name: 'bash', args: { command: 'printf authorized-before-refusal' } } },
+    { deltas: ['must not resume after the local refusal'] },
+  ], (session, handle) => {
+    const prepare = session.agent.prepareNextTurnWithContext!.bind(session.agent);
+    session.agent.prepareNextTurnWithContext = async (turn, signal) => {
+      preparations += 1;
+      if (!clarificationApplied && f.fx.script.calls.length === 1) {
+        clarificationApplied = true;
+        applyAcceptedClarification?.();
+      }
+      return prepare(turn, signal);
+    };
+    const runtimeBoundary = handle as unknown as { onPiEvent: (event: unknown) => void };
+    session.subscribe((event) => {
+      if (injectedProviderError || event.type !== 'message_end' || event.message.role !== 'assistant' || event.message.stopReason !== 'error') return;
+      injectedProviderError = true;
+      localRefusalBeforeProvider = [...events].reverse().find((candidate) => candidate.type === 'error' && candidate.nativeControl === 'directive-refusal') ?? null;
+      supervisorViewBeforeProvider = supervisor.viewFor(handle.id);
+      providerWallBeforeProvider = f.scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall') && notice.agentId === handle.id);
+      const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line) as { state: string; boundary?: string });
+      guardRefusalReceiptBeforeProvider = receipts.some((receipt) => receipt.state === 'guard-refused' && receipt.boundary === 'authority');
+      cessationReceiptBeforeProvider = receipts.some((receipt) => receipt.state === 'ceased');
+      runtimeBoundary.onPiEvent({ type: 'message_end', message: { role: 'assistant', stopReason: 'error',
+        errorMessage: 'HTTP 401 Unauthorized', provider: 'synthetic-provider', model: 'synthetic-model' } });
+    });
+  });
+  const { scene, registry, fx } = f;
+  supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
+    restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+    registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
+  supervisor.start();
+  const spawn = vi.spyOn(registry, 'spawn');
+  try {
+    expect(scene.ledger.claimDirectiveDispatch(scene.request.requestId)).toBe(true);
+    const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: 'synthesized-next-turn-local-refusal' });
+    scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+    if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
+    const producer = handle.prepareDirectiveProducer(scene.identity);
+    expect(scene.ledger.startDirectiveProducer(scene.identity, producer)).toBeGreaterThan(0);
+    applyAcceptedClarification = () => {
+      expect(scene.ledger.addJobAmendment({ jobId: scene.request.jobId, body: 'Synthetic accepted administrative contract clarification.',
+        supersedes: [], approval: { by: 'owner', reference: 'synthetic accepted clarification' }, effect: 'administrative',
+        expectedContractSha256: scene.identity.contractSha256 }).status).toBe('accepted');
+      scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'accepted contract clarification superseded the original continuation' });
+    };
+    handle.subscribe((event) => events.push(event));
+    const verdict = await handle.promptWithVerdict('original accepted synthetic directive', { owner: `silas-directive:${scene.request.requestId}`,
+      directive: { identity: scene.identity, beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+        onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    expect(verdict.ok).toBe(false);
+    await waitFor(() => events.some((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized'), 'separate subsequent provider error event');
+    await vi.waitFor(() => expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall', restarts: 0 }));
+
+    expect(preparations).toBeGreaterThan(0);
+    expect(clarificationApplied).toBe(true);
+    expect(injectedProviderError).toBe(true);
+    expect(localRefusalBeforeProvider?.type).toBe('error');
+    expect(localRefusalBeforeProvider?.type === 'error' ? localRefusalBeforeProvider.error : '').toContain('directive authority is terminal, held or superseded — no work is authorized');
+    expect(localRefusalBeforeProvider).toMatchObject({ nativeControl: 'directive-refusal', fatal: false });
+    expect(localRefusalBeforeProvider?.type === 'error' ? localRefusalBeforeProvider.typed : undefined).toBeUndefined();
+    expect(supervisorViewBeforeProvider).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+    expect(providerWallBeforeProvider).toBe(false);
+    const providerFailure = events.find((event) => event.type === 'error' && event.error === 'HTTP 401 Unauthorized');
+    expect(providerFailure?.type).toBe('error');
+    if (providerFailure?.type !== 'error') throw new Error(`synthetic Pi provider error event missing: ${JSON.stringify(events)}`);
+    expect(providerFailure.nativeControl).toBeUndefined();
+    expect(providerFailure.typed).toBeUndefined();
+    expect(providerFailure).toMatchObject({ provider: 'synthetic-provider', model: 'synthetic-model' });
+    expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall') && notice.agentId === handle.id)).toBe(true);
+    expect(scene.ledger.listProviderWaits()).toEqual([]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(fx.script.calls).toHaveLength(1);
+    expect(readFileSync(handle.sessionFile!, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; content?: readonly { text?: string }[] } })
+      .filter((row) => row.message?.role === 'user' && row.message.content?.some((part) => part.text === 'original accepted synthetic directive'))).toHaveLength(1);
+    expect(existsSync(join(scene.lane.path, 'local-authority-effect.txt'))).toBe(false);
+    expect(guardRefusalReceiptBeforeProvider).toBe(true);
+    expect(cessationReceiptBeforeProvider).toBe(false);
+    const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity).state).toBe('unknown');
+    expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'failed', nativeBinding: { identity: scene.identity } });
+  } finally {
+    supervisor.dispose();
+    await f.cleanup();
+  }
+});
+
+it('typed provider terminal errors with local-authority words retain auth and quota routing', async () => {
+  for (const { status, bodyCode, stopReason } of [
+    { status: 401, bodyCode: '1002', stopReason: 'authentication_wall' as const },
+    { status: 429, bodyCode: '1302', stopReason: 'quota_wall' as const },
+  ]) {
+    const f = await sdkDirectiveExecutionFixture([{ deltas: ['no provider call is required for an injected terminal'] }]);
+    const { scene, registry } = f;
+    const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
+      restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+      registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
+    supervisor.start();
+    const spawn = vi.spyOn(registry, 'spawn');
+    try {
+      const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: `typed-provider-local-words-${status}` });
+      const events: RuntimeEvent[] = [];
+      handle.subscribe((event) => events.push(event));
+      const runtimeBoundary = handle as unknown as { onPiEvent: (event: unknown) => void };
+      const localControlWords = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+      const errorMessage = `${status}: ${JSON.stringify({ error: { code: bodyCode, message: localControlWords } })}`;
+      runtimeBoundary.onPiEvent({ type: 'message_end', message: { role: 'assistant', stopReason: 'error',
+        errorMessage, provider: 'zai-coding-cn', model: 'glm-5.3' } });
+      await vi.waitFor(() => expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason, restarts: 0 }));
+      const providerFailure = events.find((event) => event.type === 'error');
+      expect(providerFailure?.type).toBe('error');
+      if (providerFailure?.type !== 'error') throw new Error(`typed Pi provider error event missing: ${JSON.stringify(events)}`);
+      expect(providerFailure).toMatchObject({ provider: 'zai-coding-cn', model: 'glm-5.3', fatal: false,
+        typed: { origin: 'provider-message', status, bodyCode } });
+      expect(providerFailure).not.toHaveProperty('nativeControl');
+      expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall') && notice.agentId === handle.id)).toBe(true);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(scene.ledger.listProviderWaits()).toEqual([]);
+    } finally {
+      supervisor.dispose();
+      await f.cleanup();
+    }
+  }
+});
+
 it('does not carry a captured native refusal onto a later provider error in the same Pi turn', async () => {
   let release!: () => void;
   const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
