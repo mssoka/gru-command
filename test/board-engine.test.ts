@@ -7,6 +7,7 @@ import { BoardEngine, type BoardSnapshot } from '../src/board/engine.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { sweepPausedKind } from '../src/worktrees/sweep-card.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { Role } from '../src/config.js';
 import type { DecisionRuntimeStatus } from '../src/decisions/runtime.js';
@@ -1034,10 +1035,14 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(mainSource).toMatch(/notifications\.resolveExactKind\('port-squat', 'service-boot'\)/u);
     expect(mainSource).toMatch(/notifications\.resolveExactKind\('roll-port-squat', 'service-boot'\)/u);
     expect(mainSource).toMatch(/reconcileLegacyOwnerAttention\(\{/u);
-    expect(mainSource).toMatch(/notifications\.resolveIncidents\(`worktree-sweep-paused:\$\{worktree\.id\}:/u);
+    // #486: the completed sweep settles exactly its own lane's cards.
+    expect(mainSource).toMatch(/onSwept: \(\{ worktree \}\) => \{[\s\S]{0,600}settleSweptLaneCards\(\{ ledger, log: [^}]+\}, worktree\.id\);/u);
     // Both sides of the coupling: the posted kind template must carry the
-    // same `worktree-sweep-paused:<id>:<pause>` shape the resolver strips.
-    expect(mainSource).toMatch(/kind: `worktree-sweep-paused:\$\{worktree\.id\}:\$\{randomUUID\(\)\}`/u);
+    // same `worktree-sweep-paused:<id>:<pause>` shape the resolver strips
+    // (#486: the card is posted by postSweepPausedCard, named by its pause).
+    expect(mainSource).toMatch(/postSweepPausedCard\(\{ ledger, notifications, log: [^}]+\}, \{ worktree, pauseId, details \}\)/u);
+    expect(mainSource).toMatch(/new SweepDecisionFollower\(\{/u);
+    expect(sweepPausedKind('lane-a', 'pause-1')).toBe('worktree-sweep-paused:lane-a:pause-1');
   });
 
   it('bounds the snapshot to the newest receipt window while live rows stay complete (D3)', () => {

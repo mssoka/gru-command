@@ -85,6 +85,37 @@ describe('ledger db + migration runner', () => {
     upgraded.close();
   });
 
+  it('upgrades a v30 ledger giving every lane not yet swept its own token and admitting lane-token evidence (#486)', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 30) });
+    const lane = old.handle.prepare(`INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, status, created_at, updated_at)
+      VALUES (?, 'review', '/r', 'r', ?, NULL, 'abc', ?, 't', 't')`);
+    lane.run('wt-active', '/r/active', 'active');
+    lane.run('wt-paused', '/r/paused', 'paused');
+    lane.run('wt-swept', '/r/swept', 'swept');
+    old.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('wt-paused', 4242, 'node server.js', 'cwd', 'live', 't1', 't2')`).run();
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    const tokens = upgraded.handle.prepare('SELECT id, lane_token FROM worktrees ORDER BY id').all() as { id: string; lane_token: string | null }[];
+    expect(tokens.map((row) => [row.id, row.lane_token === null ? null : /^[0-9a-f]{32}$/u.test(row.lane_token)])).toEqual([
+      ['wt-active', true], ['wt-paused', true], ['wt-swept', null],
+    ]);
+    expect(tokens[0]!.lane_token).not.toBe(tokens[1]!.lane_token);
+    expect(upgraded.handle.prepare('SELECT worktree_id, pid, command, evidence, state FROM worktree_processes').all())
+      .toEqual([{ worktree_id: 'wt-paused', pid: 4242, command: 'node server.js', evidence: 'cwd', state: 'live' }]);
+    upgraded.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('wt-active', 65215, 'agent-browser', 'lane-token', 'killed', 't', 't')`).run();
+    expect(() => upgraded.handle.prepare("UPDATE worktree_processes SET evidence = 'guess' WHERE pid = 65215").run()).toThrow(/CHECK constraint/u);
+    expect(() => upgraded.handle.prepare("UPDATE worktrees SET lane_token = ? WHERE id = 'wt-swept'").run(tokens[0]!.lane_token)).toThrow(/UNIQUE constraint/u);
+    expect(upgraded.handle.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    const api = new LedgerApi(upgraded.handle);
+    expect(api.findWorktreeByLaneToken(tokens[1]!.lane_token!)?.id).toBe('wt-paused');
+    expect(api.findLiveWorktreeAtPath('/r/active')?.laneToken).toBe(tokens[0]!.lane_token);
+    expect(api.findLiveWorktreeAtPath('/r/swept')).toBeNull();
+    upgraded.close();
+  });
+
   it('upgrades a pre-retirement ledger keeping existing directive rows live and readable', () => {
     const dir = tmpDir();
     const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 22) });

@@ -1,7 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
@@ -26,6 +25,8 @@ import { TranscriptService } from './transcripts/service.js';
 import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
+import { postSweepPausedCard, settleSweptLaneCards, SweepDecisionFollower } from './worktrees/sweep-decisions.js';
+import { laneProvenanceFromLedger } from './worktrees/lane-provenance.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
@@ -417,6 +418,15 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
     // #464: review-owner cessation outlives the process that observed it.
     reviewOwnerCessation: ledgerReviewOwnerCessation(() => ledger),
+    // #486: a session spawned in a registered lane carries the lane's token,
+    // and once the lane's sessions have all settled, what they left running
+    // in it is reaped (the manager lands below).
+    laneProvenanceFor: (cwd) => laneProvenanceFromLedger(ledger, (level, msg, fields) => logger.log(level, msg, fields))(cwd),
+    // Not once the service stops: its shutdown disposes every session, and
+    // the ledger closes under a reap.
+    onLaneQuiet: (laneId) => {
+      if (!serviceStop.signal.aborted) void laneManager?.reapLaneAfterTurn(laneId, serviceStop.signal);
+    },
   }));
   const growth = registry.boot();
   state.store = store;
@@ -1164,29 +1174,32 @@ async function main(): Promise<number> {
           `lane ${worktreeId} branched from local HEAD ${sha}; its base may be stale until origin is reachable`,
       });
     },
-    onSweepPaused: ({ worktree, processes }) => {
-      // Destructive-op confirmation: the sweep waits for an operator to
-      // verify nothing live is rooted there (preserve-before-remove), so it
-      // is needs-owner — never a machine wake. One row per pause, with a
-      // worktree-scoped id so the completed sweep can resolve its own
-      // notice on positive evidence (owner release 2026-10-11); the legacy
-      // exact kind stays registered for rows written before the change.
-      notifications.post({
-        kind: `worktree-sweep-paused:${worktree.id}:${randomUUID()}`,
-        routing: 'needs-owner',
-        severity: 'info',
-        title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
-        detail:
-          `${processes.length} process(es) rooted in ${worktree.path} ` +
-          `(pids ${processes.map((p) => p.pid).join(', ')}) — confirm nothing live is rooted there before completing the sweep`,
-      });
+    onSweepPaused: ({ worktree, pauseId, details }) => {
+      // Destructive-op confirmation: what still runs in the lane is not
+      // provably the lane's (#486: its own token-carrying processes were
+      // already reaped), so stopping it is the owner's call — needs-owner,
+      // never a machine wake. One row per pause, with a worktree-scoped id
+      // so the completed sweep resolves its own card on positive evidence
+      // (owner release 2026-10-11); the card names what runs and offers the
+      // one action, carried out by the follower below. The legacy exact kind
+      // stays registered for rows written before the change.
+      postSweepPausedCard({ ledger, notifications, log: (level, msg, fields) => logger.log(level, msg, fields) }, { worktree, pauseId, details });
     },
     onSwept: ({ worktree }) => {
-      // A completed sweep IS the evidence its pause notice asked for, and
-      // the end of the lane's submodule-work and restore rows (#427).
-      notifications.resolveIncidents(`worktree-sweep-paused:${worktree.id}:`, 'sweep-completed');
+      // A completed sweep IS the evidence its pause cards asked for, and the
+      // end of the lane's submodule-work and restore rows (#427). Only this
+      // lane's cards, matched exactly (#486): an unanswered one is withdrawn
+      // (what it asked about ended), an answered one closes saying the lane
+      // was swept, and one Gru took over resolves.
+      try {
+        settleSweptLaneCards({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) }, worktree.id);
+      } catch (error) {
+        logger.log('error', 'a swept lane\'s sweep cards could not be settled; the next sweep of it, or the owner, closes them', { id: worktree.id, error: String(error) });
+      }
       laneHooks.onSwept({ worktree });
     },
+    // #486: a lane's token-carrying processes may be a busy session's own.
+    laneQuiet: (laneId) => registry.laneQuiet(laneId),
     // A release that saved a lane's work tells the owner where it is
     // (#427): one FYI board row per release, never FOR YOU. A release refused
     // over submodule work or a sparse checkout, and a restore without what
@@ -1218,6 +1231,18 @@ async function main(): Promise<number> {
   } catch (error) {
     logger.log('error', 'the moved-repository check failed at start; the hourly reconcile retries it', { error: String(error) });
   }
+  // #486: the owner's answer to a paused sweep's card is carried out here,
+  // once moved lanes are reconnected, and never after the service stops; an
+  // answer that waits is retried at the hourly reconcile (below).
+  const sweepAnswers = new SweepDecisionFollower({
+    ledger,
+    bus,
+    notifications,
+    release: (input) => worktreeManager.release(input),
+    stopSignal: serviceStop.signal,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  sweepAnswers.start();
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,
@@ -1773,7 +1798,14 @@ async function main(): Promise<number> {
     preserveRoot: config.worktrees.preserveRoot,
     // A job's review folders stay while a Perkins review owns it (#427 PR 3).
     reviewActive: (jobId) => wave.activeReview(jobId) !== null,
-    onReconcile: () => repoMoves.reconcile(),
+    onReconcile: async () => {
+      // A moved-repository check that fails never holds back the answers.
+      try {
+        await repoMoves.reconcile();
+      } finally {
+        await sweepAnswers.follow();
+      }
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The disk view, budget and floor (#427 PR 3): GC's usage by category;

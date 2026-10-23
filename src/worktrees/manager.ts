@@ -43,6 +43,7 @@ import { redactedText } from '../decisions/questions.js';
 import { boundedTail, recordedTail, redactCredentialWindow } from '../redaction.js';
 import { oneLineErrorText } from '../property/error-text.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
+import { readLaneTokens, readProcessFacts, type LaneTokenRead, type LaneTokenReader, type ProcessFacts } from './lane-provenance.js';
 import type { ManagedRepoPath } from '../repos/managed-names.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -59,10 +60,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *     silent stale base; owner incident 2026-09-23); sweeps match
  *     registry paths only — never id-proximity, never labels.
  * (c) Preserve-first ordered sweep — untracked deliverables preserved
- *     FIRST, processes rooted in the tree enumerated BEFORE removal; any
- *     live process PAUSES the sweep and asks (fail-loud escalation,
- *     never a silent kill); then worktree removal + containment-verified
- *     branch delete.
+ *     FIRST, processes rooted in the tree enumerated BEFORE removal; the
+ *     lane's own (GC's tracked services, and processes carrying the lane's
+ *     token, #486) are reaped, any other live process PAUSES the sweep and
+ *     asks (fail-loud escalation, never a silent kill); then worktree
+ *     removal + containment-verified branch delete.
  * (d) Detached-for-reviews, branch-for-jobs — review rounds check out
  *     detached worktrees; job minions run branches. No review-branch
  *     debris, ever.
@@ -77,6 +79,36 @@ export interface TreeProcess {
   readonly command: string;
   /** How the process was tied to the tree (the pause-and-ask evidence). */
   readonly evidence: 'argv' | 'cwd';
+  /** Its working directory, when the listing read it (#486: the owner's
+   * card names it). */
+  readonly cwd?: string;
+}
+
+/** #486: why GC did not stop a process a sweep paused on by itself. */
+export type PausedProcessProvenance =
+  /** It carries this lane's token, but a session GC runs in the lane was
+   * busy, or it outlived the stop. */
+  | 'this-lane'
+  /** It carries another lane's token. */
+  | 'other-lane'
+  /** GC read its environment, and it carries no lane token. */
+  | 'no-token'
+  /** GC cannot read its environment (a system binary such as `/bin/sh` on
+   * macOS, a non-dumpable process on Linux, another platform) or it is gone. */
+  | 'unreadable';
+
+/** #486: a process a sweep paused on, as the owner's card describes it. */
+export interface PausedProcess {
+  readonly pid: number;
+  readonly command: string;
+  /** The executable's name (`agent-browser`), else the command's first word. */
+  readonly name: string;
+  /** When it started (ISO), null when unknown. */
+  readonly startedAt: string | null;
+  readonly cwd: string | null;
+  readonly provenance: PausedProcessProvenance;
+  /** The lane whose token it carries (`other-lane`), else null. */
+  readonly otherLane: string | null;
 }
 
 /** Injectable process enumeration (default: `ps` argv boundary-match +
@@ -216,13 +248,14 @@ function treeProcesses(treePath: string, listed: readonly { readonly pid: number
   for (const { pid, command } of listed) {
     // Registry paths only: every match names the registered tree itself.
     if ([...candidates].some((candidate) => commandReferencesTree(command, candidate))) {
-      processes.push({ pid, command, evidence: 'argv' });
+      const cwd = cwds?.get(pid);
+      processes.push({ pid, command, evidence: 'argv', ...(cwd !== undefined ? { cwd } : {}) });
       continue;
     }
     if (cwds !== null) {
       const cwd = cwds.get(pid);
       if (cwd !== undefined && [...candidates].some((candidate) => cwdInsideTree(cwd, candidate))) {
-        processes.push({ pid, command, evidence: 'cwd' });
+        processes.push({ pid, command, evidence: 'cwd', cwd });
       }
     }
   }
@@ -562,6 +595,10 @@ export interface SweepRequest {
    * answers (the disk budget): no pause, no card, and no process is reaped
    * or killed, GC's own services included. */
   readonly onLiveProcess?: 'pause' | 'refuse';
+  /** #486: with `confirmKill`, the pids the owner acknowledged (the card
+   * they answered names them): only recorded live processes among them are
+   * killed. Omitted = every recorded live process. */
+  readonly confirmKillPids?: readonly number[];
   /** #427 PR 3: a release the disk budget starts (a timer drives it, and
    * nobody waits on it) never blocks the event loop on the network or on a
    * large tree:
@@ -645,10 +682,15 @@ export interface WorktreeManagerOptions {
     readonly sha: string;
     readonly detail: string;
   }) => void;
-  /** Escalation when a sweep pauses on live processes (fail-loud ask). */
+  /** Escalation when a sweep pauses on live processes (fail-loud ask).
+   * `pauseId` names this pause (its `worktree.paused` event carries it as
+   * `pause_id`); `details` say what each process is and why GC did not stop
+   * it on its own (#486). */
   readonly onSweepPaused?: (input: {
     readonly worktree: WorktreeRecord;
     readonly processes: readonly TreeProcess[];
+    readonly pauseId: string;
+    readonly details: readonly PausedProcess[];
   }) => void;
   /** Positive evidence that a lane tree is gone and its row is swept:
    * producer-side resolution for any pause notice about that worktree
@@ -688,6 +730,16 @@ export interface WorktreeManagerOptions {
   /** Seam: the processes' working directories a disk budget release's
    * listing reads (default `/proc` on Linux, `lsof` on macOS). */
   readonly listProcessCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
+  /** #486 seam: reads the lane tokens of listed processes (default
+   * {@link readLaneTokens}). */
+  readonly readLaneTokens?: LaneTokenReader;
+  /** #486 seam: the executable name and start time of the processes a pause
+   * names (default {@link readProcessFacts}). */
+  readonly readProcessFacts?: (pids: readonly number[]) => Promise<ReadonlyMap<number, ProcessFacts>>;
+  /** #486: no session GC runs in the lane is busy (the runtime registry's
+   * `laneQuiet`). While one is, the processes carrying the lane's token may
+   * be that session's own, and none is stopped. Omitted = quiet. */
+  readonly laneQuiet?: (laneId: string) => boolean;
   readonly log?: Log;
 }
 
@@ -979,6 +1031,8 @@ export class WorktreeManager {
   private readonly laneLocks = new Map<string, Promise<unknown>>();
   /** Set by finishSweep's tail guard; drained by recordSweepEvent. */
   private tailFailure: string | null = null;
+  /** #486: lanes with an after-turn reap waiting for the lane's lock. */
+  private readonly laneReapsWaiting = new Set<string>();
   /** Why each lane the moved-repository check could not judge was not
    * judged, logged once per change (#427 PR 2b). */
   private readonly moveNotes = new Map<string, string>();
@@ -2409,8 +2463,10 @@ export class WorktreeManager {
    *      before anything is copied or killed,
    *   1. preserve untracked deliverables (never lost; a submodule's
    *      untracked content too),
+   *   1.5 reap the lane's own processes: GC's tracked services, and those
+   *      carrying the lane's token (#486),
    *   2. enumerate processes rooted in the tree,
-   *   3. live process → PAUSE and ask (never a silent kill),
+   *   3. any other live process → PAUSE and ask (never a silent kill),
    *   4. snapshot the uncommitted tracked work (built, proven and
    *      committed; its ref is written last, after the records the removal
    *      depends on), remove the worktree, containment-verified branch
@@ -2424,6 +2480,49 @@ export class WorktreeManager {
    */
   async release(input: SweepRequest): Promise<SweepResult> {
     return this.withLaneLock(input.worktreeId, async () => this.releaseLane(input));
+  }
+
+  /**
+   * #486: every session GC runs in the lane has settled its turns (the
+   * runtime registry's `onLaneQuiet`): stop the processes rooted in the
+   * lane that carry its token now, not only at its sweep
+   * ({@link reapLaneTokenProcesses}). Skipped for a lane that is not active
+   * (a paused one waits on its ask, a swept one is gone), for one with no
+   * token, and while a verification run GC spawned owns the tree (a live
+   * `registry` process row: the run may use what the minion started).
+   * Under the lane's lock, so it never overlaps a release, a slim or a
+   * restore; at most one waits there per lane. The listing runs off the
+   * event loop. Once `stop` aborts (the service is stopping), nothing more
+   * is signalled. Never throws: a failure is logged, and the sweep reaps
+   * what is left.
+   */
+  async reapLaneAfterTurn(laneId: string, stop?: AbortSignal): Promise<readonly number[]> {
+    if (this.laneReapsWaiting.has(laneId) || stop?.aborted === true) return [];
+    this.laneReapsWaiting.add(laneId);
+    try {
+      return await this.withLaneLock(laneId, async () => {
+        this.laneReapsWaiting.delete(laneId);
+        const row = this.opts.ledger.getWorktree(laneId);
+        if (row === null || row.status !== 'active' || row.laneToken === null || !existsSync(row.path)) return [];
+        if (this.opts.ledger.listWorktreeProcesses(row.id).some((proc) => proc.state === 'live' && proc.evidence === 'registry')) return [];
+        if (!(this.opts.laneQuiet?.(row.id) ?? true)) return [];
+        return this.reapLaneTokenProcesses(row, () => this.enumerateListed(row.path), 'turn-settled', stop);
+      });
+    } catch (error) {
+      this.laneReapsWaiting.delete(laneId);
+      this.log('warn', 'the processes a lane\'s sessions left could not be reaped after their turns; its sweep reaps them', { id: laneId, error: String(error) });
+      return [];
+    }
+  }
+
+  /** The processes rooted in a tree, listed off the event loop; when the
+   * working directories cannot be read, the command-line matches still
+   * count, with a warn (what the listing missed waits for the sweep). */
+  private async enumerateListed(treePath: string): Promise<readonly TreeProcess[]> {
+    if (this.opts.enumerateProcesses !== undefined) return this.opts.enumerateProcesses(treePath);
+    return psEnumeratorAsync(treePath, {
+      onCwdError: (error) => this.log('warn', 'process working directories could not be listed; only command lines tie processes to the lane', { path: treePath, error: String(error) }),
+    });
   }
 
   private async releaseLane(input: SweepRequest): Promise<SweepResult> {
@@ -2605,7 +2704,13 @@ export class WorktreeManager {
     // so a recycled pid can never redirect it; foreign processes keep the
     // full pause-and-ask contract below.
     const refuse = input.onLiveProcess === 'refuse';
-    const reaped = refuse ? [] : await this.reapTrackedServiceProcesses(row);
+    const tracked = refuse ? [] : await this.reapTrackedServiceProcesses(row);
+    assertCleanup();
+    // (1.6) Reap what the lane's own sessions left (#486): a process rooted
+    // in the tree that carries the lane's token was started by a session GC
+    // spawned in the lane, however it detached. Never while one of those
+    // sessions is still busy there; anything else keeps the ask below.
+    const reaped = refuse ? tracked : [...tracked, ...await this.reapLaneTokenProcesses(row, () => this.enumerateListed(row.path), 'sweep')];
     assertCleanup();
 
     // (2) Enumerate processes rooted in the tree BEFORE removal (off the
@@ -2631,11 +2736,18 @@ export class WorktreeManager {
       // (ruling 18b rows from a prior pause), never a fresh enumeration
       // — pids that appeared since were never acknowledged by anyone.
       // No recorded pause → confirmKill is not honored; the ask comes first.
+      // #486: an answer from the owner's card covers only the pids it named,
+      // and an acknowledged pid is killed only while this enumeration still
+      // finds it rooted here running the command it was recorded with (an
+      // answer given late, or carried out after a restart, never reaches a
+      // recycled pid).
+      const named = input.confirmKillPids === undefined ? null : new Set(input.confirmKillPids);
+      const running = new Map(processes.map((proc) => [proc.pid, proc.command]));
       const acknowledged =
         input.confirmKill === true && row.status === 'paused'
           ? this.opts.ledger
               .listWorktreeProcesses(row.id)
-              .filter((proc) => proc.state === 'live')
+              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid)) && running.get(proc.pid) === proc.command)
               .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
           : [];
       if (input.confirmKill === true && acknowledged.length > 0) {
@@ -2658,13 +2770,7 @@ export class WorktreeManager {
         .map((p) => p.pid)
         .join(', ')}) — acknowledge to proceed`;
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-      this.opts.ledger.appendCustomEvent({
-        kind: 'worktree.paused',
-        jobId: row.jobId,
-        roundId: row.roundId,
-        payload: { id: row.id, path: row.path, processes },
-      });
-      this.opts.onSweepPaused?.({ worktree: row, processes });
+      await this.announcePause(row, processes, null, input.baseBranch);
       this.log('warn', 'worktree sweep paused on live processes', {
         id: row.id,
         pids: processes.map((p) => p.pid),
@@ -2742,6 +2848,127 @@ export class WorktreeManager {
     });
     this.log('info', 'tracked service processes reaped on sweep', { id: row.id, pids: killed });
     return killed;
+  }
+
+  /**
+   * #486: stop the processes rooted in the lane that carry its own token.
+   * Every session GC spawns in a lane carries it, and so does every process
+   * that session starts, a daemon that double-forked or was reparented to
+   * pid 1 included, so such a process is the lane's: it is reaped like a
+   * tracked service (process group SIGTERM, grace, SIGKILL), never asked
+   * about. Never while a session GC runs in the lane is busy there
+   * ({@link WorktreeManagerOptions.laneQuiet}): a busy session's own
+   * processes carry the token too. Dual-keyed like the registry reaper: a
+   * pid is signalled only when it was enumerated in the tree and its token,
+   * read again just before each signal, still matches, so a recycled pid is
+   * never signalled. Recorded `killed` with evidence `lane-token`, with a
+   * `worktree.lane-processes-reaped` event; a survivor stays to be asked
+   * about. A token that cannot be read stops nothing. `list` lists the
+   * processes rooted in the tree (only once the lane is known quiet).
+   * Returns the pids proven dead.
+   */
+  private async reapLaneTokenProcesses(row: WorktreeRecord, list: () => Promise<readonly TreeProcess[]>, trigger: 'sweep' | 'turn-settled', stop?: AbortSignal): Promise<readonly number[]> {
+    const token = row.laneToken;
+    const quiet = (): boolean => stop?.aborted !== true && (this.opts.laneQuiet?.(row.id) ?? true);
+    if (token === null || !quiet()) return [];
+    const carrying = async (procs: readonly TreeProcess[]): Promise<readonly TreeProcess[]> => {
+      if (procs.length === 0) return [];
+      const reads = await this.laneTokens(procs);
+      return procs.filter((proc) => { const read = reads.get(proc.pid); return read?.readable === true && read.token === token; });
+    };
+    const targets = await carrying(await list());
+    if (targets.length === 0) return [];
+    // Both keys again just before each signal, with nothing awaited between
+    // the checks and the signal: still the lane's, and the lane still quiet
+    // (a turn that started meanwhile may be using what it finds running).
+    const signalled = await carrying(targets);
+    if (signalled.length === 0 || !quiet()) return [];
+    for (const proc of signalled) {
+      if (!signalProcessGroup(proc.pid, 'SIGTERM')) this.log('warn', 'lane process SIGTERM failed (already gone?)', { id: row.id, pid: proc.pid });
+    }
+    await new Promise((resolve) => setTimeout(resolve, this.opts.killGraceMs ?? 1_500));
+    const stubborn = await carrying(signalled.filter((candidate) => pidAlive(candidate.pid)));
+    if (quiet()) {
+      for (const proc of stubborn) {
+        if (pidAlive(proc.pid)) signalProcessGroup(proc.pid, 'SIGKILL');
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(this.opts.killGraceMs ?? 1_500, 300)));
+    const killed = signalled.filter((proc) => !pidAlive(proc.pid));
+    const survivors = signalled.filter((proc) => pidAlive(proc.pid)).map((proc) => proc.pid);
+    this.opts.ledger.recordWorktreeProcesses({
+      worktreeId: row.id,
+      processes: killed.map((proc) => ({ pid: proc.pid, command: proc.command, evidence: 'lane-token' })),
+      state: 'killed',
+    });
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.lane-processes-reaped',
+      jobId: row.jobId,
+      roundId: row.roundId,
+      payload: { id: row.id, path: row.path, trigger, pids: killed.map((proc) => proc.pid), survivors },
+    });
+    this.log('info', 'lane processes carrying the lane token reaped', { id: row.id, trigger, pids: killed.map((proc) => proc.pid), survivors });
+    return killed.map((proc) => proc.pid);
+  }
+
+  /** The lane tokens of `procs`; a failed read reads as unreadable (it
+   * stops nothing). */
+  private async laneTokens(procs: readonly TreeProcess[]): Promise<ReadonlyMap<number, LaneTokenRead>> {
+    try {
+      return await (this.opts.readLaneTokens ?? readLaneTokens)(procs);
+    } catch (error) {
+      this.log('warn', 'lane tokens of the processes in a lane could not be read; none is stopped by its token', { error: String(error) });
+      return new Map();
+    }
+  }
+
+  /** Record a pause (its `worktree.paused` event, with this pause's id and
+   * the base branch its release named, which the owner's answer releases
+   * with) and tell the owner what each process is and why GC did not stop
+   * it (#486). */
+  private async announcePause(row: WorktreeRecord, processes: readonly TreeProcess[], reason: string | null, baseBranch: string | undefined): Promise<void> {
+    const pauseId = randomUUID();
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.paused',
+      jobId: row.jobId,
+      roundId: row.roundId,
+      payload: {
+        id: row.id, path: row.path, processes, pause_id: pauseId,
+        ...(reason !== null ? { reason } : {}), ...(baseBranch !== undefined ? { base_branch: baseBranch } : {}),
+      },
+    });
+    if (this.opts.onSweepPaused === undefined) return;
+    const details = await this.describePaused(row, processes);
+    this.opts.onSweepPaused({ worktree: row, processes, pauseId, details });
+  }
+
+  /** What each paused-on process is (best effort, display only). */
+  private async describePaused(row: WorktreeRecord, processes: readonly TreeProcess[]): Promise<readonly PausedProcess[]> {
+    const reads = await this.laneTokens(processes);
+    let facts: ReadonlyMap<number, ProcessFacts> = new Map();
+    try {
+      facts = await (this.opts.readProcessFacts ?? readProcessFacts)(processes.map((proc) => proc.pid));
+    } catch (error) {
+      this.log('warn', 'the names and start times of a paused lane\'s processes could not be read', { id: row.id, error: String(error) });
+    }
+    return processes.map((proc) => {
+      const read = reads.get(proc.pid);
+      const other = read?.readable === true && read.token !== null && read.token !== row.laneToken
+        ? this.opts.ledger.findWorktreeByLaneToken(read.token) : null;
+      const provenance: PausedProcessProvenance = read === undefined || !read.readable ? 'unreadable'
+        : read.token === null ? 'no-token'
+        : read.token === row.laneToken ? 'this-lane' : 'other-lane';
+      const fact = facts.get(proc.pid);
+      return {
+        pid: proc.pid,
+        command: proc.command,
+        name: fact?.name ?? basename(proc.command.split(' ')[0] ?? proc.command),
+        startedAt: fact?.startedAt ?? null,
+        cwd: proc.cwd ?? null,
+        provenance,
+        otherLane: provenance === 'other-lane' ? other?.id ?? 'an unknown lane' : null,
+      };
+    });
   }
 
   private creationCustody(branch: string | null, sha: string, lane: CreationIntentLane, baseSource: WorktreeBaseSource | null): CreationCustody {
@@ -3598,13 +3825,17 @@ export class WorktreeManager {
     const survivors = pids.filter((pid) => alive(pid) && fresh.some((proc) => proc.pid === pid));
     if (survivors.length > 0) {
       const note = `sweep paused: pids ${survivors.join(', ')} survived the acknowledged kill (SIGTERM + SIGKILL)`;
+      const surviving = fresh.filter((proc) => survivors.includes(proc.pid));
+      // #486: the answered card closes, so the survivors are asked about
+      // again with their own (and are on the record for that answer).
+      this.opts.ledger.recordWorktreeProcesses({
+        worktreeId: row.id,
+        processes: surviving.map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence })),
+        state: 'live',
+      });
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-      return {
-        status: 'paused',
-        processes: fresh.filter((proc) => survivors.includes(proc.pid)),
-        preserved,
-        note,
-      };
+      await this.announcePause(row, surviving, 'survived-acknowledged-kill', baseBranch);
+      return { status: 'paused', processes: surviving, preserved, note };
     }
     // NEW processes since the pause are NOT covered by this ask — they
     // get their own pause (their own ask), never a ride-along kill.
@@ -3619,17 +3850,11 @@ export class WorktreeManager {
         })),
         state: 'live',
       });
-      const note = `sweep paused: ${unacknowledged.length} NEW process(es) appeared after the acknowledged kill (pids ${unacknowledged
+      const note = `sweep paused: ${unacknowledged.length} process(es) the acknowledged kill did not cover (new since the pause, or not acknowledged by it; pids ${unacknowledged
         .map((p) => p.pid)
         .join(', ')}) — each kill needs its own acknowledgment`;
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-      this.opts.ledger.appendCustomEvent({
-        kind: 'worktree.paused',
-        jobId: row.jobId,
-        roundId: row.roundId,
-        payload: { id: row.id, path: row.path, processes: unacknowledged, reason: 'post-kill-new-processes' },
-      });
-      this.opts.onSweepPaused?.({ worktree: row, processes: unacknowledged });
+      await this.announcePause(row, unacknowledged, 'post-kill-new-processes', baseBranch);
       return { status: 'paused', processes: unacknowledged, preserved, note };
     }
     return this.finishSweep(row, preserved, baseBranch, assertCleanup, attempt);
