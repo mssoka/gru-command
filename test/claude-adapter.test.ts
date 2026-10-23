@@ -2600,7 +2600,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
 
     it('marks only a typed local directive authority refusal as native-control provenance, never a message lookalike', async () => {
-      const message = 'directive authority is terminal, held or superseded — no work is authorized';
+      const message = 'directive authority is terminal, held or superseded — no work may proceed';
       for (const typed of [true, false]) {
         const fx = fixture();
         const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
@@ -2641,7 +2641,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       let checks = 0;
       try {
         await expect(handle.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor('claude-refusal-then-process-failure'),
-          beforeAdmission: () => { if (++checks > 1) throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work is authorized'); }, onAdmitted: () => {} } }))
+          beforeAdmission: () => { if (++checks > 1) throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work may proceed'); }, onAdmitted: () => {} } }))
           .rejects.toThrow(/^claude process failed: Error: synthetic transport fault$/u);
         expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'claude process failed: Error: synthetic transport fault', fatal: false }]);
         expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
@@ -2686,7 +2686,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         claude: { binary: DOUBLE, killGraceMs: 100, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') } });
       const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
         registry, ledger, notifications, tickMs: 60_000 });
-      const refusal = 'directive authority is terminal, held or superseded — no work is authorized';
+      const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
       const retained = (agentId: string) => ledger.listEvents({ limit: 100 })
         .filter((event) => event.kind === 'supervision.native-refusal-retained' && event.agentId === agentId).map((event) => event.payload);
       try {

@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -231,16 +232,45 @@ describe('typed decision semantics', () => {
     expect(deterministicFailureClass('agent crashed on boot')).toBe('fatal_runtime');
   });
 
-  it('a bare "authorized" is no authentication wall; real credential rejections still are (#485)', () => {
-    expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized')).toBe('unknown');
-    expect(deterministicFailureClass('runtime error: the request was authorized')).toBe('unknown');
-    expect(deterministicFailureClass('the caller is not authorized for this model')).toBe('authentication_wall');
-    expect(deterministicFailureClass('Unauthorized')).toBe('authentication_wall');
-    expect(deterministicFailureClass('request failed: 401')).toBe('authentication_wall');
-    expect(deterministicFailureClass('authentication failed')).toBe('authentication_wall');
-    expect(deterministicFailureClass('invalid api key')).toBe('authentication_wall');
-    expect(deterministicFailureClass('authorization header rejected')).toBe('authentication_wall');
-    expect(deterministicFailureClass('auth-failure from upstream')).toBe('authentication_wall');
+  it('provider texts that say "authorized" stay authentication walls; GC\'s own refusal text names no wall (#485)', () => {
+    for (const text of [
+      'the key has not been authorized for this workspace',
+      'this organization is no longer authorized',
+      'the caller isn\'t authorized to use this model',
+      'the project is not yet authorized',
+      'you are not currently authorized to use this model',
+      'This credential is only authorized for use with Claude Code and cannot be used for other API requests.',
+      'Not-Authorized',
+      'request not  authorized',
+      'Unauthorized',
+      'request failed: 401',
+      'authentication failed',
+      'invalid api key',
+    ]) expect(deterministicFailureClass(text), text).toBe('authentication_wall');
+    expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed')).toBe('unknown');
+    // The old wording walled on its own: untagged text never protected a refusal; the tag does.
+    expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized')).toBe('authentication_wall');
+  });
+
+  it('no DirectiveCheckpointError text GC writes is blank or names a wall (#485)', () => {
+    const tick = '`';
+    const literal = String.raw`'(?:[^'\\]|\\.)*'|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
+    const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory() ? sources(join(dir, entry.name)) : entry.name.endsWith('.ts') ? [join(dir, entry.name)] : []);
+    const messages: string[] = [];
+    for (const file of sources(join(import.meta.dirname, '..', 'src'))) {
+      const source = readFileSync(file, 'utf-8');
+      for (const match of source.matchAll(new RegExp(String.raw`new DirectiveCheckpointError\(\s*(${literal})`, 'gu'))) messages.push(match[1]!);
+      // The checkpoint reader refuses through its local refuse()/refused() helpers.
+      if (file.endsWith('directive-checkpoint.ts')) {
+        for (const match of source.matchAll(new RegExp(String.raw`\brefused?\(\s*(${literal})`, 'gu'))) messages.push(match[1]!);
+      }
+    }
+    expect(messages.length).toBeGreaterThan(250);
+    // Interpolations are runtime detail; the text GC writes around them is what is classified.
+    const texts = messages.map((raw) => raw.slice(1, -1).replace(/\$\{[^}]*\}/gu, 'x'));
+    expect(texts.filter((text) => text.trim() === '')).toEqual([]);
+    expect(texts.filter((text) => !['unknown', 'fatal_runtime'].includes(deterministicFailureClass(text)))).toEqual([]);
   });
 
   it('bounds the redaction scan cost: the pre-slice order is load-bearing on hostile single-line blocks', () => {

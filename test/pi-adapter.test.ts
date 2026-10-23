@@ -4042,7 +4042,7 @@ function startLedgerDirective(f: Awaited<ReturnType<typeof nativeRefusalFixture>
   return { producer, options: { owner: `silas-directive:${scene.request.requestId}`, directive } };
 }
 
-const HELD_REFUSAL = 'directive authority is terminal, held or superseded — no work is authorized';
+const HELD_REFUSAL = 'directive authority is terminal, held or superseded — no work may proceed';
 
 it('a real tool-fence refusal surfaces as GC\'s own wrapper, tagged, and stays with directive recovery (#485)', async () => {
   let applyAcceptedClarification: (() => void) | null = null;
