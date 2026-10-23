@@ -29,7 +29,32 @@ const MAX_BRIDGE_CONNECTIONS = 16;
 /** Cap on bridge teardown during disposal. Exported so the service shutdown
  * force-exit budget can be reconciled with the bounded teardown (issue #341). */
 export const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
-export const PERKINS_MCP_SERVER_SHA256 = '06e42a2dfd7330c6b2a7377c0423371907956d52ba56baeb5227caf3e21e1618';
+/*
+ * What a review lead can read of one native-tool result.
+ *
+ * Claude Code hands the model an MCP tool result inline only up to two
+ * limits, and replaces a longer one with a pointer to a file the confined
+ * review lead cannot open (probed on 2.1.309): a per-tool size limit (about
+ * 50,000 characters unless the tool declares `anthropic/maxResultSizeChars`
+ * in its `_meta`) and an output-token cap (`MAX_MCP_OUTPUT_TOKENS`, 25,000 by
+ * default, estimated at about four characters a token). A tool ERROR is cut
+ * to about 10,000 characters, middle dropped. The bridge declares the size
+ * and review sessions run with the token cap set, so the host's own bounds
+ * decide what reaches the lead, on every runtime.
+ */
+/** Host bound on one model-facing tool result text, in UTF-8 bytes (which
+ * bound its characters from above). */
+export const REVIEW_TOOL_TEXT_MAX_BYTES = 192 * 1024;
+/** The per-tool inline size the bridge declares to Claude Code, above the
+ * host bound. */
+export const REVIEW_TOOL_RESULT_MAX_CHARS = 200_000;
+/** `MAX_MCP_OUTPUT_TOKENS` for review sessions: one token per two characters
+ * of the declared size, twice the room the CLI's four-characters-a-token
+ * estimate needs. */
+export const REVIEW_MCP_OUTPUT_TOKENS = 100_000;
+/** Host bound on a tool error message the lead must read whole. */
+export const REVIEW_TOOL_ERROR_MAX_BYTES = 9_000;
+export const PERKINS_MCP_SERVER_SHA256 = '8c87201f76d5b7d6950c3d0bbeb4ea006af97e84d0852618dfbdd41ee33cb5c3';
 
 interface BridgeRequest {
   readonly id: string;
@@ -82,10 +107,15 @@ function contained(base: string, candidate: string): boolean {
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
 }
 
-function writeLine(socket: Socket, value: unknown): void {
+/** Write one response line; `onFlushed` runs only when it was handed to a
+ * live peer's socket without error. Node also calls an end() callback on a
+ * write error (a peer gone before the bridge saw it), with the error. */
+function writeLine(socket: Socket, value: unknown, onFlushed?: () => void): void {
   if (socket.destroyed || !socket.writable) return;
   try {
-    socket.end(`${JSON.stringify(value)}\n`);
+    socket.end(`${JSON.stringify(value)}\n`, (error?: Error | null) => {
+      if (error == null) onFlushed?.();
+    });
   } catch {
     // A peer may disconnect between the writable check and end(). The
     // per-socket error listener below contains asynchronous write errors;
@@ -274,6 +304,9 @@ export class ReviewMcpBridge {
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
+            // Claude Code otherwise cuts a result over ~50,000 characters
+            // to a file pointer the confined lead cannot open.
+            _meta: { 'anthropic/maxResultSizeChars': REVIEW_TOOL_RESULT_MAX_CHARS },
           })),
         });
         return;
@@ -287,8 +320,15 @@ export class ReviewMcpBridge {
       // A repeated identical request joins the same execution: the tool
       // runs once, and every waiter receives its settled outcome.
       const outcome = await record.promise;
-      if (outcome.ok) writeLine(socket, { id: request.id, ok: true, result: outcome.result });
-      else writeLine(socket, { id: request.id, ok: false, error: outcome.error });
+      if (outcome.ok) {
+        // A success flushed to a live caller is not replayed: a later
+        // identical request (a retry, a collect) is new work. A success no
+        // live caller took — its transport wait ended — waits for the
+        // re-attach.
+        writeLine(socket, { id: request.id, ok: true, result: outcome.result }, () => this.releaseReceived(key, record));
+      } else {
+        writeLine(socket, { id: request.id, ok: false, error: outcome.error });
+      }
     } catch (error) {
       writeLine(socket, {
         id: requestId,
@@ -362,6 +402,17 @@ export class ReviewMcpBridge {
       this.evictRetainedExecutions();
     });
     return record;
+  }
+
+  /** Drop a settled success once its response was flushed to a caller. */
+  private releaseReceived(key: string, record: ExecutionRecord): void {
+    if (this.executions.get(key) !== record) return;
+    this.executions.delete(key);
+    if (record.retainedBytes > 0) {
+      this.retainedExecutionBytes -= record.retainedBytes;
+      this.retainedExecutionCount -= 1;
+      record.retainedBytes = 0;
+    }
   }
 
   /** Keep retained successes bounded by bytes AND entry count, evicting the

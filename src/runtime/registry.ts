@@ -20,6 +20,7 @@ import { disposePhases, type DisposableTarget } from './disposal.js';
 import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
 import { processTableAsync, type ProcessTable } from '../worktrees/manager.js';
+import type { LaneProvenance } from '../worktrees/lane-provenance.js';
 import {
   pidState, processIdentity, proveReviewHostExit,
   type ReviewHostExitEvidence, type ReviewHostExitInput, type ReviewHostExitResult,
@@ -167,12 +168,22 @@ export interface RuntimeRegistryOptions {
   readonly bmadRuntime?: (cwd: string) => ManagedSkillSet;
   /** Production GC-owned selection with an explicit registered assignment. */
   readonly workflowRuntime?: (options: SpawnOptions) => ManagedWorkflowSession;
+  /** #486: the registered lane a spawn's cwd is (null: none). Its token
+   * rides the session's environment ({@link SpawnOptions.laneProvenance}).
+   * The host wires the ledger; omitted = no lane provenance. */
+  readonly laneProvenanceFor?: (cwd: string) => LaneProvenance | null;
+  /** #486: every session on a lane has settled its turns (or is gone):
+   * no session's turn, compaction or spawn is in flight there
+   * ({@link RuntimeRegistry.laneQuiet}). The host reaps the processes left
+   * in the lane that carry its token. Called after a tracked call settles
+   * and when a session is disposed; a failure is logged, never thrown. */
+  readonly onLaneQuiet?: (laneId: string) => void;
 }
 
 /** New jobs use GC-owned resources; retained historical bindings keep their bytes.
  * The caller supplies ledger/registry authority, never a directory-name guess. */
 export function serviceRegistryOptions(
-  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log' | 'laneProvenanceFor' | 'onLaneQuiet'> & {
     /** Required (#464): a service registry without it loses review-owner
      * cessation on every restart. */
     readonly reviewOwnerCessation: ReviewOwnerCessationLedger;
@@ -242,6 +253,10 @@ export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
   private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
+  /** #486: the lane of each session spawned in one, and whether the
+   * session is busy there (a tracked call in flight, a turn streaming, a
+   * compaction or a disposal running). */
+  private readonly laneSessions = new Map<AgentHandle, { readonly laneId: string; readonly busy: () => boolean }>();
   private readonly unpublished = new Set<AgentHandle>();
   private readonly quarantined = new Set<AgentHandle>();
   /** Per unpublished handle: its held-frame count, and the refusal a
@@ -800,6 +815,8 @@ export class RuntimeRegistry {
     });
     const assertHandoff = options.cwd === undefined ? captureCwdHandoff(cwd) : beforeSpawn ?? captureCwdHandoff(cwd);
     assertHandoff();
+    // #486: a session in a registered lane carries the lane's token.
+    const laneProvenance = options.laneProvenance ?? (cwd === undefined ? undefined : this.opts.laneProvenanceFor?.(cwd) ?? undefined);
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       ...(options.directiveRecoveryProducer !== undefined ? { directiveRecoveryProducer: options.directiveRecoveryProducer } : {}),
@@ -813,12 +830,22 @@ export class RuntimeRegistry {
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
       ...(managedSkills !== undefined ? { managedSkills } : {}),
+      ...(laneProvenance !== undefined ? { laneProvenance } : {}),
       model: options.reviewModel !== undefined && this.runtimeIdFor(role) === 'pi'
         ? options.reviewModel.modelRef : policy.model,
       thinkingLevel,
     });
     let pending = 0;
     let completedPrompt = false;
+    // #486: the lane's sessions decide when the lane is quiet.
+    const laneSettled = (): void => {
+      if (laneProvenance !== undefined) this.noteLaneSettled(laneProvenance.laneId);
+    };
+    // A session gone (disposed, or its cessation proven) holds its lane no
+    // longer, whichever path saw it go first.
+    const laneLeft = (): void => {
+      if (this.forgetLaneSession(resident)) laneSettled();
+    };
     let disposing: Promise<void> | null = null;
     let disposingNow = false;
     let released = false;
@@ -844,6 +871,7 @@ export class RuntimeRegistry {
         }
       }
       this.handles.delete(resident);
+      laneLeft();
       this.unpublished.delete(resident);
       this.quarantined.delete(resident);
       this.publications.delete(resident);
@@ -876,6 +904,7 @@ export class RuntimeRegistry {
           // the adapter-evidence event path below if a late positive arrives.
           disposing = Promise.resolve().then(() => target.dispose()).then(
             () => {
+              laneLeft();
               notifyDisposalSettlement(resident, true);
               if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
             },
@@ -883,6 +912,7 @@ export class RuntimeRegistry {
               if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
               disposing = null;
               disposingNow = false;
+              laneSettled(); // the session stays; its lane may be quiet again
               notifyDisposalSettlement(resident, false);
               throw error;
             },
@@ -921,6 +951,7 @@ export class RuntimeRegistry {
                 // "as-yet-undelivered first prompt").
                 if (tracked === 'prompt' || tracked === 'promptWithVerdict') completedPrompt = true;
                 budget.changed();
+                laneSettled();
               });
             } catch (error) {
               pending -= 1;
@@ -936,6 +967,20 @@ export class RuntimeRegistry {
       },
     });
     this.handles.add(resident);
+    if (laneProvenance !== undefined) {
+      this.laneSessions.set(resident, {
+        laneId: laneProvenance.laneId,
+        busy: () => {
+          if (pending > 0 || disposingNow) return true;
+          try {
+            const { state } = handle.health();
+            return state === 'spawning' || state === 'streaming' || handle.isCompacting?.() === true;
+          } catch {
+            return true; // unknown is never quiet
+          }
+        },
+      });
+    }
     if (release !== null && role === 'minion') {
       this.residents.watch(resident, () =>
         completedPrompt && pending === 0 && !disposingNow && !released &&
@@ -1042,6 +1087,8 @@ export class RuntimeRegistry {
       });
       if (event.type === 'state' && event.state === 'disposed') {
         forward({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
+        // #486: a disposed session holds its lane no longer.
+        laneLeft();
         // REAL production traversal: the existing handle-event flow drives
         // registered cleanup-debt reconcilers (no watcher/timer). Observer
         // failure is contained; shutdown stops traversal without clearing
@@ -1072,6 +1119,32 @@ export class RuntimeRegistry {
 
   async disposeHandle(handle: AgentHandle): Promise<void> {
     await handle.dispose();
+  }
+
+  /** #486: no session spawned in the lane is busy there (a tracked call in
+   * flight, a turn streaming or being spawned, a compaction or a disposal
+   * running). A lane with no session is quiet. */
+  laneQuiet(laneId: string): boolean {
+    for (const session of this.laneSessions.values()) {
+      if (session.laneId === laneId && session.busy()) return false;
+    }
+    return true;
+  }
+
+  /** Drop a session's lane record; true when it had one. */
+  private forgetLaneSession(handle: AgentHandle): boolean {
+    return this.laneSessions.delete(handle);
+  }
+
+  /** A session on the lane settled a call or was disposed: tell the host
+   * once the whole lane is quiet. */
+  private noteLaneSettled(laneId: string): void {
+    if (this.opts.onLaneQuiet === undefined || !this.laneQuiet(laneId)) return;
+    try {
+      this.opts.onLaneQuiet(laneId);
+    } catch (error) {
+      this.log('error', 'lane-quiet hook failed; the lane\'s processes are reaped at its sweep instead', { lane: laneId, error: String(error) });
+    }
   }
 
   /** Live handle by agent id (E7 supervision feed), or null. */

@@ -1036,7 +1036,7 @@ describe('dispatch server (E8)', () => {
         return {
           computedAt: '2026-10-05T00:00:00.000Z',
           trigger: 'api',
-          deliveredWithoutPr: [{ jobId: 'job-api', repo: 'fixture-app', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null }],
+          deliveredWithoutPr: [{ jobId: 'job-api', repo: 'fixture-app', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 }],
           prWithoutReview: [],
           verdictsAwaitingDirective: [],
           stalledWorking: [],
