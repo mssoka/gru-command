@@ -6644,6 +6644,127 @@ describe('WaveRunner request guards', () => {
     expect(existsSync(outcome.reportFile)).toBe(true);
     expect(poster.post).not.toHaveBeenCalled();
   });
+
+  /** A delivered lane whose job carries NO PR link when its round starts,
+   * with a receipt-correct poster: the shape of a lane that opened its PR
+   * but never registered it. */
+  async function unlinkedPublicationLane(prefix: string): Promise<{
+    readonly ledger: LedgerApi;
+    readonly job: ReturnType<LedgerApi['addJob']>;
+    readonly target: string;
+    readonly branch: string;
+    readonly lanePath: string;
+    readonly escalations: string[];
+    readonly poster: VerdictPoster & { readonly post: ReturnType<typeof vi.fn> };
+    readonly wave: (extra: Partial<ConstructorParameters<typeof WaveRunner>[0]>) => WaveRunner;
+  }> {
+    const repo = makeFixtureRepo(`${prefix}-repo`);
+    repos.push(repo);
+    const branch = `feature/${prefix}`;
+    repo.git(['checkout', '-b', branch]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `${prefix}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `${prefix}-artifacts-`));
+    const sessions = mkdtempSync(join(tmpdir(), `${prefix}-sessions-`));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${prefix}-db-`)));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, branch, target, ledger);
+    const lane = await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${prefix}` });
+    const job = ledger.addJob({ id: `job-${prefix}`, repo: 'fixture', title: prefix, baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    attachOrigin(repo, branch, root);
+    const escalations: string[] = [];
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const wave = (extra: Partial<ConstructorParameters<typeof WaveRunner>[0]>): WaveRunner => new WaveRunner({
+      ledger, worktrees: port, reviewArtifactRoot: artifacts, poster, prHeadProbe: localHeadProbe(branch),
+      spawner: fakeWholeSpawner(sessions, { specialists: [], childAnswer: () => '[]' }).spawner,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      ...extra,
+    });
+    return { ledger, job, target, branch, lanePath: lane.path, escalations, poster, wave };
+  }
+
+  it('publishes a conclusive review to the one open PR at the reviewed head when the lane never registered it (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-one-pr');
+    const url = 'https://github.com/acme/fixture/pull/776';
+    const findOpenPullRequests = vi.fn(async () => [
+      { url, headSha: lane.target, state: 'open' },
+      { url: 'https://github.com/acme/fixture/pull/775', headSha: 'c'.repeat(40), state: 'open' },
+    ]);
+    const recordPr = vi.fn((jobId: string, prUrl: string) => { lane.ledger.setJobPr(jobId, prUrl); });
+    const outcome = asWave(await lane.wave({ findOpenPullRequests, recordPr }).runRound({ jobId: lane.job.id }));
+    // Before #488 this READY review aborted no_pr_link and was re-run in full.
+    expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
+    expect(outcome.posted).toBe(true);
+    expect(outcome.round.status).toBe('verdict-posted');
+    expect(findOpenPullRequests).toHaveBeenCalledWith({ repoPath: lane.lanePath, branch: lane.branch });
+    expect(recordPr).toHaveBeenCalledWith(lane.job.id, url);
+    expect(lane.ledger.getJob(lane.job.id)?.prUrl).toBe(url);
+    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')?.payload)
+      .toEqual({ url, branch: lane.branch, targetSha: lane.target });
+    expect(lane.poster.post).toHaveBeenCalledTimes(1);
+    expect(lane.escalations.some((line) => line.includes('NO pull request'))).toBe(false);
+  });
+
+  it('publishes to a PR link registered while the review ran, without a lookup (#488)', async () => {
+    const lane = await unlinkedPublicationLane('linked-mid-review');
+    const url = 'https://github.com/acme/fixture/pull/749';
+    const findOpenPullRequests = vi.fn(async () => []);
+    // The freeze runs after the round read the job: a registration landing
+    // here is one the round's start snapshot cannot see.
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests,
+      recordPr: () => { throw new Error('a registered link is never re-linked'); },
+      reviewFreezeObserver: () => { lane.ledger.setJobPr(lane.job.id, url); },
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.posted).toBe(true);
+    expect(outcome.round.status).toBe('verdict-posted');
+    expect(findOpenPullRequests).not.toHaveBeenCalled();
+    expect(lane.poster.post).toHaveBeenCalledTimes(1);
+    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')).toBeNull();
+  });
+
+  it('keeps no_pr_link when no open PR is at the reviewed head, naming what the lookup found (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-wrong-head');
+    const recordPr = vi.fn();
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests: async () => [
+        { url: 'https://github.com/acme/fixture/pull/1', headSha: 'c'.repeat(40), state: 'open' },
+        { url: 'https://github.com/acme/fixture/pull/2', headSha: lane.target, state: 'closed' },
+      ],
+      recordPr,
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.round.status).toBe('aborted');
+    expect((lane.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string }).reason)
+      .toBe('no_pr_link');
+    expect(recordPr).not.toHaveBeenCalled();
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.ledger.getJob(lane.job.id)?.prUrl).toBeNull();
+    expect(lane.escalations.some((line) => line.includes('NO pull request to publish to') &&
+      line.includes(`0 of the 1 open pull request(s) for branch ${lane.branch} have the reviewed head ${lane.target}`))).toBe(true);
+  });
+
+  it('keeps no_pr_link when the open PR lookup fails, and says so (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-lookup-fails');
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests: async () => { throw new Error('gh: not logged in'); },
+      recordPr: vi.fn(),
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.round.status).toBe('aborted');
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.escalations.some((line) => line.includes('NO pull request to publish to') &&
+      line.includes(`looking up open pull requests for branch ${lane.branch} failed: Error: gh: not logged in`))).toBe(true);
+  });
 });
 
 describe('poster transport negatives and fallback-gate terminals', () => {

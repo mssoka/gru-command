@@ -387,6 +387,14 @@ the lookup account and never proves absence. GitHub
 bundle is installed; with a bundle, github.com publication is App-authored
 while the review preflight still probes remotes through `gh` (see
 [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
+A conclusive review is published only to a linked PR. When the job had no
+link as its round started, publication first re-reads the job (a link
+registered during the review is used), then asks GitHub for the open PRs
+whose head is the job lane's branch. Exactly one at the reviewed head is
+linked to the job (`round.pr-discovered`) and receives the review. Anything
+else — none, several, a different head, a non-GitHub origin or a failed
+lookup — aborts the round `no_pr_link`, and the escalation names what the
+lookup found.
 
 Beside the four route-deciding legs, the same pass evaluates the
 **non-blocking advisory leg `verdict-publication-identity`** (issue #444):
