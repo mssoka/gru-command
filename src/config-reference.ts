@@ -65,6 +65,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   'data_dir',
   '[server]',
   '[auth]',
+  '[env]',
   '[runtimes]',
   '[runtimes.roles]',
   '[models]',
@@ -250,6 +251,26 @@ function runtimePolicyLines(
   return lines;
 }
 
+/** `[env]` (#494): active when the preserved config sets names (a re-run
+ * keeps them, values included, in this owner-only file), otherwise a
+ * commented example. */
+function envSection(preserved: GruCommandConfig | null | undefined): string[] {
+  const entries = preserved?.env.entries() ?? [];
+  return [
+    entries.length > 0 ? '[env]' : '# [env]',
+    '# Optional variables for the service and every process it starts, such as',
+    '# a token a CLI the service runs reads. The service unit\'s own environment',
+    '# wins for any name it sets (an empty value too); [env] fills the rest.',
+    '# Literal strings, no expansion; GRU_* names are reserved. Read once per',
+    '# boot: apply an edit with `gru restart`. Values are plaintext, so this',
+    '# file must stay private to you (chmod 600; [env] values in a file others',
+    '# can read are refused).',
+    ...(entries.length > 0
+      ? entries.map(([name, value]) => `${name} = ${tomlString(value)}`)
+      : ['# GITLAB_TOKEN = "replace-locally"']),
+  ];
+}
+
 /**
  * Render the complete config-as-reference. Values that have a concrete
  * runtime default are active; optional override keys ship as teaching
@@ -292,6 +313,8 @@ export function renderReferenceConfig(
     '[auth]',
     '# Pairing token for authenticated browser/WebSocket access. Keep this file private.',
     `token = ${tomlString(values.token)}`,
+    '',
+    ...envSection(preserved),
     '',
     '[runtimes]',
     '# Session host runtime: "claude-code" (default for new installs) or "pi".',

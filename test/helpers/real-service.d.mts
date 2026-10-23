@@ -58,6 +58,8 @@ export declare function startRealService(options?: {
    *  a review-enabled instance with no Perkins App bundle raises the
    *  owner-required boot notice, which rides the next chat turn. */
   reviewEnabled?: boolean;
+  /** Config lines appended after the generated tables (e.g. an [env] table). */
+  extraConfig?: readonly string[];
   /** Additional non-secret test controls for the child process. */
   extraEnv?: NodeJS.ProcessEnv;
 }): Promise<RealServiceHandle>;

@@ -98,9 +98,74 @@ host read `Not linked (unsupported code host)`. See [BOARD.md](./BOARD.md) for
 what each row shows.
 
 Perkins GitLab delivery is separate and unchanged: it still uses `GITLAB_TOKEN`
-with the `api` scope ([FLOW.md](./FLOW.md)). glab itself prefers a
-`GITLAB_TOKEN` set in the service's environment over its stored login, so when
-that variable is set the overview reads with it too.
+with the `api` scope ([FLOW.md](./FLOW.md)). Set it in the service's
+environment, for example through [`[env]`](#service-environment-env). glab
+itself prefers a `GITLAB_TOKEN` set in the service's environment over its
+stored login, so when that variable is set the overview reads with it too.
+
+## Service environment (`[env]`)
+
+The installer regenerates the service unit (the launchd plist or the systemd
+unit) on every update, so a variable you add to the unit by hand is lost the
+next time you run `gru update`. Put such variables in `config.toml` instead:
+
+```toml
+[env]
+GITLAB_TOKEN = "replace-locally"
+CUSTOM_SERVICE_OPTION = "enabled"
+```
+
+The section is optional. Without it, nothing changes.
+
+- **Who gets the values.** The service itself, and every process it starts
+  (agents, git, gh, glab, verification commands), as if the service unit had
+  set them. GC's usual child-process filtering still applies on top.
+- **Precedence.** The environment the service starts with wins. A name the
+  service unit (or whoever starts the service) already sets keeps that
+  value, even when the value is empty. `[env]` only supplies names that are
+  not set at all. The unit always sets `GRU_COMMAND_HOME`, `PATH`, and on
+  macOS `GRU_COMMAND_REVIEW_PYTHON`, so `[env]` cannot change those. The boot
+  log line lists the names `[env]` supplied and the names the inherited
+  environment kept (`config_env`). It shows names only, never values.
+- **Reserved names.** `GRU_*` names are refused, in any letter case. GC uses
+  them to select the instance and the port and to carry lane and review
+  authority, and those come only from the unit and from GC itself.
+  `[env]` can never move the service to another instance or config: the
+  config file is chosen before `[env]` is read.
+- **Decision provider keys.** `OPENROUTER_API_KEY` and `TYPESAFE_API_KEY`
+  in `[env]` reach Jev's credential lookup, exactly like the same variables
+  set in the service unit. They take precedence over the
+  `credentials/<slot>.key` files. They never reach a process the service
+  starts. `node dist/decisions/cli.js status` and `check` read them the
+  same way.
+- **When it applies.** The service reads `[env]` once, at boot, right after
+  it loads the config and before it starts any provider, client or child
+  process. Every boot reads it: `gru start`, `gru restart`, `gru update`,
+  login or reboot starts, the service manager restarting a crashed service,
+  and a direct `node dist/main.js`. An edit takes effect at the next start
+  or restart; there is no hot reload. Variables that Node.js reads before
+  any code runs (`NODE_OPTIONS`, for example) reach only the processes the
+  service starts, not the running service.
+- **Literal values.** Values are plain strings. There is no `$VAR`
+  expansion and no shell. Names must be valid environment variable names
+  (letters, digits and underscores, not starting with a digit). Values must
+  be strings without a NUL character; an empty string is allowed.
+- **Checked before starting.** `gru start` and `gru restart --now` load the
+  config first and refuse to touch the service when it is invalid, so a bad
+  edit never leaves the unit failing to start. The service runs the same
+  check when it boots.
+- **Plaintext secrets.** `[env]` is not an encrypted secret store. Values
+  sit in `config.toml` in plaintext, so the file must be private to you:
+  `chmod 600 ~/.gru-command/config.toml`. If the file holds `[env]` values
+  and its group or others have any access, GC refuses it. The setup wizard
+  writes the file `0600`. GC never prints the values. Validation errors name
+  the field, never its value. TOML syntax errors give the line and column
+  without quoting the file. Neither the API nor `gru status` shows them.
+- **Updates keep it.** `gru update` (`install.sh --update`) never rewrites
+  `config.toml`. Re-running the setup wizard writes `[env]` back, with its
+  values, and keeps a private backup of the previous file. A variable that a
+  past update already removed from the unit cannot be recovered by this
+  feature: add it to `[env]` again.
 
 ## Load & validation behavior
 
@@ -157,6 +222,16 @@ port = 7665
 [auth]
 # Pairing token for authenticated browser/WebSocket access. Keep this file private.
 token = "a-random-pairing-token"
+
+# [env]
+# Optional variables for the service and every process it starts, such as
+# a token a CLI the service runs reads. The service unit's own environment
+# wins for any name it sets (an empty value too); [env] fills the rest.
+# Literal strings, no expansion; GRU_* names are reserved. Read once per
+# boot: apply an edit with `gru restart`. Values are plaintext, so this
+# file must stay private to you (chmod 600; [env] values in a file others
+# can read are refused).
+# GITLAB_TOKEN = "replace-locally"
 
 [runtimes]
 # Session host runtime: "claude-code" (default for new installs) or "pi".
@@ -706,7 +781,7 @@ example.
 
 | Violation | Error shape |
 |---|---|
-| TOML syntax error | `failed to parse TOML: <detail> (file: …)` |
+| TOML syntax error | `failed to parse TOML: Invalid TOML document: <reason> (line 3, column 9) (file: …)` (never quotes the file) |
 | Unknown top-level key | `unknown top-level key \`x\` (valid keys: …)` |
 | Unknown key in a table | `unknown key \`x\` in [server] (valid keys: …)` |
 | Wrong type | `workspace_root must be a string, got number` |
@@ -728,6 +803,11 @@ example.
 | TOML date where a table is expected | `server must be a table` (dates never pass as empty tables) |
 | Non-positive supervision number | `supervision.turn_silence_ms must be a positive integer, got: 0` |
 | Unreadable config file | `cannot read config file: EACCES — check permissions` (distinct from a TOML parse error) |
+| `[env]` value not a string | `env.TOKEN must be a string, got number` |
+| Bad `[env]` name | `env name "1BAD" is not a valid environment variable name …` |
+| Reserved `[env]` name | `env.GRU_COMMAND_HOME is reserved: GRU_* variables are set by Gru Command and its service unit …` |
+| NUL in an `[env]` value | `env.TOKEN must not contain a NUL character` |
+| `[env]` values in a shared file | `[env] holds values, so the config must be private to its owner, but its mode is 0644 — run: chmod 600 …` |
 
 ## What reads the config today
 

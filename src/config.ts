@@ -1,7 +1,8 @@
 import { lstatSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { parse, type TomlPrimitive } from 'smol-toml';
+import { inspect } from 'node:util';
+import { parse, TomlError, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
 import { DECISION_SURFACES } from './decisions/questions.js';
@@ -726,6 +727,41 @@ export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
   },
 };
 
+/**
+ * `[env]` (#494): literal variables the service supplies to itself and to
+ * every process it starts, when its own environment does not already set
+ * them. The values are secrets by default: JSON and inspect show the names
+ * only, so a config object that reaches a log, an API or an error never
+ * carries a value.
+ */
+export class ConfiguredEnvironment {
+  readonly #values: ReadonlyMap<string, string>;
+
+  constructor(entries: Iterable<readonly [string, string]>) {
+    this.#values = new Map(entries);
+    Object.freeze(this);
+  }
+
+  /** The configured names, in file order. */
+  get names(): readonly string[] {
+    return [...this.#values.keys()];
+  }
+
+  /** Name/value pairs, in file order — for the code that applies or
+   * re-emits them, never for display. */
+  entries(): readonly (readonly [string, string])[] {
+    return [...this.#values];
+  }
+
+  toJSON(): { readonly names: readonly string[] } {
+    return { names: this.names };
+  }
+
+  [inspect.custom](): string {
+    return `ConfiguredEnvironment [${this.names.join(', ')}]`;
+  }
+}
+
 export interface GruCommandConfig {
   readonly workspaceRoot: string;
   /** Explicit direct-child repository names; absent in older files means none. */
@@ -752,6 +788,8 @@ export interface GruCommandConfig {
   readonly verify: VerifyConfig;
   readonly pacing: PacingConfig;
   readonly decisions: DecisionsConfig;
+  /** `[env]`: applied once at service boot (src/service-environment.ts). */
+  readonly env: ConfiguredEnvironment;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
   /** Absolute per-instance directory holding config, identity, logs, sessions. */
@@ -956,6 +994,7 @@ const TOP_LEVEL_KEYS = [
   'verify',
   'pacing',
   'decisions',
+  'env',
 ] as const;
 
 /** Sentinel meaning "the runtime harness's own configured default" (SPEC ruling 16). */
@@ -1256,6 +1295,7 @@ export function loadConfig(
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let pacing: PacingConfig = DEFAULT_PACING_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
+  let configuredEnv = new ConfiguredEnvironment([]);
   let sourceFile: string | null = null;
 
   if (configState(file) === 'present') {
@@ -1276,10 +1316,7 @@ export function loadConfig(
     try {
       raw = parse(text) as Record<string, TomlPrimitive>;
     } catch (error) {
-      throw new ConfigError(
-        `failed to parse TOML: ${(error as Error).message}`,
-        file,
-      );
+      throw new ConfigError(`failed to parse TOML: ${tomlErrorSummary(error)}`, file);
     }
     for (const key of Object.keys(raw)) {
       if (!(TOP_LEVEL_KEYS as readonly string[]).includes(key)) {
@@ -1867,6 +1904,9 @@ export function loadConfig(
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
+    if (raw['env'] !== undefined) {
+      configuredEnv = readEnvTable(raw['env'], file);
+    }
   }
 
   if (concurrency.maxWorkers > MAX_RESIDENT_WORKERS) {
@@ -1948,9 +1988,72 @@ export function loadConfig(
     verify,
     pacing,
     decisions,
+    env: configuredEnv,
     sourceFile,
     instanceDir,
   };
+}
+
+/** A parse failure without its source excerpt: smol-toml quotes the lines
+ * around the error, and those lines can hold an `[env]` or `[auth]` secret.
+ * The reason and the position are enough to find the mistake. */
+function tomlErrorSummary(error: unknown): string {
+  if (error instanceof TomlError) {
+    const reason = error.message.split('\n', 1)[0] ?? 'invalid TOML';
+    return `${reason} (line ${error.line}, column ${error.column})`;
+  }
+  return `${error instanceof Error ? error.name : 'error'} (the parser's message is withheld: it can quote config values)`;
+}
+
+/** Names `[env]` may set: what a POSIX shell can export. */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+
+/** GC's own variables select the instance, override the port and carry
+ * lane, review and verification authority. The environment the service
+ * manager or GC hands a process sets them, never config. */
+const RESERVED_ENV_PREFIX = 'GRU_';
+
+/**
+ * `[env]` (#494): a table of literal strings. Errors name the field and
+ * never the value. A file holding values must be private to its owner —
+ * `[env]` is plaintext, not a secret store.
+ */
+function readEnvTable(value: unknown, file: string): ConfiguredEnvironment {
+  const table = requireTable(value, file, 'env');
+  const entries: [string, string][] = [];
+  for (const [name, entry] of Object.entries(table)) {
+    if (!ENV_NAME.test(name)) {
+      throw new ConfigError(
+        `env name ${JSON.stringify(name)} is not a valid environment variable name (letters, digits and underscores, not starting with a digit)`,
+        file,
+        'env',
+      );
+    }
+    const field = `env.${name}`;
+    if (name.toUpperCase().startsWith(RESERVED_ENV_PREFIX)) {
+      throw new ConfigError(
+        `${field} is reserved: ${RESERVED_ENV_PREFIX}* variables are set by Gru Command and its service unit (instance, port, lane and review authority), never by [env]`,
+        file,
+        field,
+      );
+    }
+    const text = requireString(entry, file, field, { allowEmpty: true });
+    if (text.includes('\0')) {
+      throw new ConfigError(`${field} must not contain a NUL character`, file, field);
+    }
+    entries.push([name, text]);
+  }
+  if (entries.length > 0 && process.platform !== 'win32') {
+    const mode = statSync(file).mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      throw new ConfigError(
+        `[env] holds values, so the config must be private to its owner, but its mode is ${mode.toString(8).padStart(4, '0')} — run: chmod 600 ${file}`,
+        file,
+        'env',
+      );
+    }
+  }
+  return new ConfiguredEnvironment(entries);
 }
 
 const PACING_KEYS = [

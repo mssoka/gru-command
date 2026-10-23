@@ -1,8 +1,9 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { bootServiceEnvironment } from '../src/service-environment.js';
 import { markFixtureStep, OwnedCommandTimeoutError, runOwnedCommand } from './helpers/harness-diagnostics.mjs';
 
 /**
@@ -814,6 +815,42 @@ describe('install.sh setup mode (one-line path)', () => {
         '--user restart gru-command.service',
       ]);
     }
+  }, 120_000);
+
+  it('#494: an update regenerates the owned unit, keeps an [env] config.toml byte-for-byte, and the next boot still supplies it', async () => {
+    const canary = 'SYNTHETIC-UPDATE-CANARY-494';
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const config = join(instance, 'config.toml');
+    writeFileSync(config, `[env]\nSYNTH_ENV_SUPPLIED = "${canary}"\n`, { encoding: 'utf-8', mode: 0o600 });
+    chmodSync(config, 0o600);
+    const before = readFileSync(config);
+    const env = { HOME: home, GRU_COMMAND_HOME: instance, ...seam.env };
+    const rendered = await run(join(target, 'install.sh'), ['--print'], env);
+    expect(rendered.status, rendered.stderr).toBe(0);
+    mkdirSync(dirname(seam.unit), { recursive: true });
+    writeFileSync(seam.unit, rendered.stdout);
+
+    const result = await run(join(target, 'install.sh'), ['--update', '--no-interact'], env);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('restarting owned Gru Command service');
+    expect(result.stdout).toContain('update complete; existing config preserved');
+    expect(readFileSync(config).equals(before)).toBe(true);
+    expect(statSync(config).mode & 0o777).toBe(0o600);
+    // The regenerated unit, the manager's arguments and the installer's
+    // output never carry the value: config.toml is its one home.
+    const unit = readFileSync(seam.unit, 'utf-8');
+    for (const text of [unit, readFileSync(seam.managerLog, 'utf-8'), result.stdout, result.stderr]) {
+      expect(text).not.toContain(canary);
+    }
+    // The next boot, in the environment the regenerated unit hands the
+    // service, still supplies the value (the boot step main.ts runs).
+    const unitHome = process.platform === 'darwin'
+      ? unit.match(/<key>GRU_COMMAND_HOME<\/key>\s*<string>([^<]*)<\/string>/)?.[1]
+      : unit.match(/^Environment=GRU_COMMAND_HOME=(.*)$/m)?.[1]?.replaceAll('"', '');
+    expect(unitHome).toBe(instance);
+    const ambient: NodeJS.ProcessEnv = { GRU_COMMAND_HOME: unitHome, PATH: '/usr/bin:/bin' };
+    expect(bootServiceEnvironment(ambient, home).supplied).toEqual(['SYNTH_ENV_SUPPLIED']);
+    expect(ambient['SYNTH_ENV_SUPPLIED']).toBe(canary);
   }, 120_000);
 
   it.skipIf(process.platform !== 'linux')('systemd unit retains stable Node/npm PATH after a version-manager session expires', async () => {
