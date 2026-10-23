@@ -294,7 +294,15 @@ export type RuntimeEvent =
       readonly type: 'error';
       readonly error: string;
       readonly fatal: boolean;
-      /** In-process native-control provenance correlated with a typed refusal captured at the directive guard boundary; message text alone is insufficient. */
+      /** A native directive refusal (#485): the turn failed because GC itself
+       * raised a `DirectiveCheckpointError` for the live directive, directly
+       * or as GC's wrapper around an earlier GC-local failure. The
+       * directive's recovery path owns it, so supervision never routes it as
+       * a provider failure. The adapter correlates the failure with the
+       * refusal it recorded: by object identity while it still holds the
+       * thrown object, by exact non-empty message equality where the SDK
+       * reduced it to text, never by substring. A provider error never
+       * carries it, and a tagged event names no provider or model. */
       readonly nativeControl?: 'directive-refusal';
       readonly provider?: string;
       readonly model?: string;

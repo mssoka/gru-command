@@ -17,8 +17,8 @@ import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
-import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
+import { capabilitiesForModelInput, type AgentHandle, type PromptOptions, type RuntimeEvent } from '../src/runtime/types.js';
+import { makeIsolatedModelRuntime, makeStubModelRuntime, STUB_MODEL_ID, STUB_PROVIDER_ID, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
@@ -4005,50 +4005,69 @@ async function assertSdkToolAuthority(boundary: 'model-await' | 'prior-hook-awai
 it('real sequential SDK tools recheck revoked directive authority after model-await', () => assertSdkToolAuthority('model-await'));
 it('real sequential SDK tools recheck revoked directive authority after prior-hook-await', () => assertSdkToolAuthority('prior-hook-await'));
 
-it('routes a real local native authority refusal away from provider authentication recovery', async () => {
+/** A supervised real-SDK directive scene for native directive refusals (#485). */
+async function nativeRefusalFixture(turns: readonly StubTurn[] | StubResponder, configureSession?: Parameters<typeof sdkDirectiveExecutionFixture>[1]) {
+  const f = await sdkDirectiveExecutionFixture(turns, configureSession);
+  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
+    restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+    registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60_000 });
+  const handle = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'logical-minion' });
+  if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
+  const events = collect(handle);
+  const errors = () => events.filter((event): event is Extract<RuntimeEvent, { type: 'error' }> => event.type === 'error');
+  const retained = () => f.scene.ledger.listEvents({ limit: 100 })
+    .filter((event) => event.kind === 'supervision.native-refusal-retained' && event.agentId === handle.id).map((event) => event.payload);
+  /** Tagged with no provider identity, retained for directive recovery: no wall, no stop, one durable trace. */
+  const expectRetained = (event: RuntimeEvent | undefined, error: string) => {
+    expect(event).toEqual({ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' });
+    expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+    expect(f.scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
+    expect(retained()).toContainEqual({ error });
+    expect(handle.health().state).not.toBe('disposed');
+  };
+  const cleanup = async () => { supervisor.dispose(); await f.cleanup(); };
+  return { ...f, supervisor, handle, events, errors, retained, expectRetained, cleanup };
+}
+
+/** Starts the scene's one ledger directive on its minion. */
+function startLedgerDirective(f: Awaited<ReturnType<typeof nativeRefusalFixture>>) {
+  const { scene, handle } = f;
+  expect(scene.ledger.claimDirectiveDispatch(scene.request.requestId)).toBe(true);
+  scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+  const producer = handle.prepareDirectiveProducer!(scene.identity);
+  expect(scene.ledger.startDirectiveProducer(scene.identity, producer)).toBeGreaterThan(0);
+  const directive: NonNullable<PromptOptions['directive']> = { identity: scene.identity,
+    beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+    onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } };
+  return { producer, options: { owner: `silas-directive:${scene.request.requestId}`, directive } };
+}
+
+const HELD_REFUSAL = 'directive authority is terminal, held or superseded — no work is authorized';
+
+it('a real tool-fence refusal surfaces as GC\'s own wrapper, tagged, and stays with directive recovery (#485)', async () => {
   let applyAcceptedClarification: (() => void) | null = null;
-  const f = await sdkDirectiveExecutionFixture((_prompt, index) => {
+  const f = await nativeRefusalFixture((_prompt, index) => {
     if (index === 0) applyAcceptedClarification?.();
     return index === 0
       ? { deltas: [], toolCall: { id: 'refused-local-effect', name: 'bash', args: { command: 'printf forbidden > local-authority-effect.txt' } } }
       : { deltas: ['native refusal remains final'] };
   });
-  const { scene, registry, fx } = f;
-  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
-    restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
-    registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
-  const spawn = vi.spyOn(registry, 'spawn');
+  const { scene, handle } = f;
   try {
-    expect(scene.ledger.claimDirectiveDispatch(scene.request.requestId)).toBe(true);
-    const handle = await registry.spawn('minion', { cwd: scene.lane.path, agentId: 'logical-minion' });
-    scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
-    if (handle.prepareDirectiveProducer === undefined || handle.promptWithVerdict === undefined) throw new Error('real Pi directive producer surfaces are required');
-    const producer = handle.prepareDirectiveProducer(scene.identity);
-    const producerStartSeq = scene.ledger.startDirectiveProducer(scene.identity, producer);
-    expect(producerStartSeq).toBeGreaterThan(0);
+    const { producer, options } = startLedgerDirective(f);
     applyAcceptedClarification = () => {
       expect(scene.ledger.addJobAmendment({ jobId: scene.request.jobId, body: 'Synthetic accepted administrative contract clarification.',
         supersedes: [], approval: { by: 'owner', reference: 'synthetic accepted clarification' }, effect: 'material',
         expectedContractSha256: scene.identity.contractSha256 }).status).toBe('accepted');
       scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'accepted contract clarification superseded the original continuation' });
     };
-    const events: RuntimeEvent[] = [];
-    handle.subscribe((event) => events.push(event));
-    const verdict = await handle.promptWithVerdict('original accepted synthetic directive', { owner: `silas-directive:${scene.request.requestId}`,
-      directive: { identity: scene.identity, beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
-        onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    const verdict = await handle.promptWithVerdict!('original accepted synthetic directive', options);
     expect(verdict.ok).toBe(false);
-    await waitFor(() => events.some((event) => event.type === 'error'), 'real native refusal error event');
+    await waitFor(() => f.errors().length > 0, 'real native refusal error event');
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
-
-    const refusal = events.find((event) => event.type === 'error');
-    expect(refusal?.type).toBe('error');
-    expect(refusal?.type === 'error' ? refusal.error : '').toContain('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized');
-    expect(refusal, `real runtime error event: ${JSON.stringify(refusal)}`).toMatchObject({ nativeControl: 'directive-refusal' });
-    expect(supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
-    expect(scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall'))).toBe(false);
-    expect(scene.ledger.listProviderWaits()).toEqual([]);
-    expect(spawn).toHaveBeenCalledTimes(1);
+    // The tool fence refused the bare refusal; the next turn's fence refused with GC's wrapper around it.
+    expect(f.errors()).toHaveLength(1);
+    f.expectRetained(f.errors()[0], `native directive admission/guard failed; further tool effects refused: DirectiveCheckpointError: ${HELD_REFUSAL}`);
     expect(readFileSync(handle.sessionFile!, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; content?: readonly { text?: string }[] } })
       .filter((row) => row.message?.role === 'user' && row.message.content?.some((part) => part.text === 'original accepted synthetic directive'))).toHaveLength(1);
     expect(existsSync(join(scene.lane.path, 'local-authority-effect.txt'))).toBe(false);
@@ -4060,10 +4079,159 @@ it('routes a real local native authority refusal away from provider authenticati
     const { inspectDirectiveCheckpoint, inspectDirectiveProducers } = await import('../src/runtime/directive-checkpoint.js');
     expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity).state).toBe('unknown');
     expect(inspectDirectiveProducers(handle.sessionFile!, scene.identity)).toEqual([{ producer, evidence: 'unknown' }]);
-  } finally {
-    supervisor.dispose();
-    await f.cleanup();
-  }
+  } finally { await f.cleanup(); }
+});
+
+it('a refusal at Pi\'s prompt preflight rejects the prompt as itself, tagged, with no admission and no wall (#485)', async () => {
+  let revoke: (() => void) | null = null;
+  const f = await nativeRefusalFixture([{ deltas: ['directive reply that must never be requested'] }], (session) => {
+    // After runTurn's own authority check, before Pi's preflight re-check.
+    const nativePrompt = session.prompt.bind(session);
+    session.prompt = async (text, options) => { revoke?.(); return nativePrompt(text, options); };
+  });
+  const { scene, handle } = f;
+  try {
+    const { options } = startLedgerDirective(f);
+    revoke = () => { revoke = null; scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'owner held the job before admission' }); };
+    await expect(handle.promptWithVerdict!('original accepted synthetic directive', options)).rejects.toThrow(HELD_REFUSAL);
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    expect(f.errors()).toHaveLength(1);
+    f.expectRetained(f.errors()[0], `DirectiveCheckpointError: ${HELD_REFUSAL}`);
+    expect(f.fx.script.calls).toHaveLength(0);
+    expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'failed', nativeBinding: null });
+  } finally { await f.cleanup(); }
+});
+
+async function assertRefusalBetweenTurns(journal: 'recorded' | 'unrecorded') {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  let revoke: (() => void) | null = null;
+  const f = await nativeRefusalFixture([
+    { deltas: [], toolCall: { id: 'permitted-effect', name: 'bash', args: { command: 'printf ran > between-turns.txt' } } },
+    { deltas: ['directive reply that must never be requested'] },
+  ], (session) => {
+    // The tool ran; authority is revoked before the next model request.
+    const after = session.agent.afterToolCall;
+    session.agent.afterToolCall = async (input, signal) => { const result = await after?.(input, signal); revoke?.(); return result; };
+  });
+  const { scene, handle } = f;
+  const receipt = vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal');
+  if (journal === 'unrecorded') receipt.mockImplementation(() => { throw new Error('authority refusal journal unavailable'); });
+  try {
+    const { options } = startLedgerDirective(f);
+    revoke = () => { revoke = null; scene.ledger.failDirective({ requestId: scene.request.requestId, reason: 'owner held the job between turns' }); };
+    const verdict = await handle.promptWithVerdict!('original accepted synthetic directive', options);
+    expect(verdict.ok).toBe(false);
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    expect(readFileSync(join(scene.lane.path, 'between-turns.txt'), 'utf8')).toBe('ran');
+    expect(f.fx.script.calls).toHaveLength(1);
+    expect(receipt).toHaveBeenCalledTimes(1);
+    expect(f.errors()).toHaveLength(1);
+    // Pi's SDK reduced the thrown refusal to its message: the bare refusal, or the
+    // AggregateError that replaced it when its receipt could not be journaled.
+    f.expectRetained(f.errors()[0], journal === 'recorded' ? HELD_REFUSAL : 'native guard refusal could not be durably recorded; physical ownership retained');
+  } finally { receipt.mockRestore(); await f.cleanup(); }
+}
+it('authority revoked between turns: the next-turn fence\'s bare refusal is tagged and the minion keeps watching (#485)', () => assertRefusalBetweenTurns('recorded'));
+it('a between-turn refusal whose receipt cannot be journaled is still tagged as the AggregateError that replaced it (#485)', () => assertRefusalBetweenTurns('unrecorded'));
+
+it('each refused directive turn on one handle is tagged for itself; a look-alike text with no refusal in its turn stays a provider error (#485)', async () => {
+  const { DirectiveCheckpointError } = await import('../src/runtime/directive-checkpoint.js');
+  const preflightRefusal = 'synthetic native refusal at admission: the directive is held';
+  const nextTurnRefusal = 'synthetic native refusal before the next model request: the directive is superseded';
+  let toolsRun = 0;
+  const f = await nativeRefusalFixture((_prompt, index) => [
+    { deltas: [], error: HELD_REFUSAL },
+    { deltas: [], toolCall: { id: 'permitted-effect', name: 'bash', args: { command: 'printf ran > refused-turns.txt' } } },
+    { deltas: [], error: nextTurnRefusal },
+    { deltas: [], toolCall: { id: 'second-permitted-effect', name: 'bash', args: { command: 'printf again >> refused-turns.txt' } } },
+  ][index] ?? { deltas: ['unexpected model request'] }, (session) => {
+    const after = session.agent.afterToolCall;
+    session.agent.afterToolCall = async (input, signal) => { const result = await after?.(input, signal); toolsRun += 1; return result; };
+  });
+  const { handle } = f;
+  const directive = (requestId: string, beforeAdmission: () => void) => ({ identity: { requestId, payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+    jobId: 'refused-turns-job', workRevision: 0, authorityEpoch: 0 }, beforeAdmission, onAdmitted: () => {} });
+  try {
+    // 1. Nothing refused: the provider's in-band error is the provider's, even in GC's exact words.
+    expect(await handle.promptWithVerdict!('look-alike directive', { directive: directive('look-alike', () => {}) })).toMatchObject({ ok: false });
+    // 2. Refused at Pi's preflight (the second check), as itself.
+    let checks = 0;
+    await expect(handle.promptWithVerdict!('preflight-refused directive', { directive: directive('preflight-refused', () => {
+      if (++checks === 2) throw new DirectiveCheckpointError(preflightRefusal);
+    }) })).rejects.toThrow(preflightRefusal);
+    // 3. Refused at the next-turn fence after a tool ran, reduced to text by the SDK.
+    expect(await handle.promptWithVerdict!('next-turn-refused directive', { directive: directive('next-turn-refused', () => {
+      if (toolsRun === 1) throw new DirectiveCheckpointError(nextTurnRefusal);
+    }) })).toMatchObject({ ok: false });
+    // 4. Turn 3's exact words from the provider in a turn that refused nothing.
+    expect(await handle.promptWithVerdict!('second look-alike directive', { directive: directive('second-look-alike', () => {}) })).toMatchObject({ ok: false });
+    // 5. An empty message correlates with nothing: never matched, even for GC's own refusal.
+    expect(await handle.promptWithVerdict!('empty refusal directive', { directive: directive('empty-refusal', () => {
+      if (toolsRun === 2) throw new DirectiveCheckpointError('');
+    }) })).toMatchObject({ ok: false });
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    const [lookAlike, atPreflight, atNextTurn, secondLookAlike, empty] = f.errors();
+    expect(f.errors()).toHaveLength(5);
+    expect(lookAlike).toEqual({ type: 'error', error: HELD_REFUSAL, fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
+    expect(secondLookAlike).toEqual({ type: 'error', error: nextTurnRefusal, fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
+    expect(empty).toEqual({ type: 'error', error: '', fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
+    f.expectRetained(atPreflight, `DirectiveCheckpointError: ${preflightRefusal}`);
+    f.expectRetained(atNextTurn, nextTurnRefusal);
+    expect(f.retained()).toEqual([{ error: nextTurnRefusal }, { error: `DirectiveCheckpointError: ${preflightRefusal}` }]);
+    expect(readFileSync(join(f.scene.lane.path, 'refused-turns.txt'), 'utf8')).toBe('ranagain');
+  } finally { await f.cleanup(); }
+});
+
+it('an in-band error that only quotes a refusal recorded in its turn is not that refusal (#485)', async () => {
+  const { DirectiveCheckpointError } = await import('../src/runtime/directive-checkpoint.js');
+  const refusal = 'synthetic native refusal at admission: the directive is held';
+  const quoted = `upstream rejected the request: ${refusal}`;
+  const f = await nativeRefusalFixture([{ deltas: ['directive reply that must never be requested'] }], (session, handle) => {
+    // A provider-shaped failure lands in the turn after its refusal was recorded, before the turn settles.
+    const nativePrompt = session.prompt.bind(session);
+    session.prompt = async (text, options) => {
+      try { return await nativePrompt(text, options); } catch (error) {
+        (handle as unknown as { onPiEvent(event: unknown): void }).onPiEvent({ type: 'message_end',
+          message: { role: 'assistant', stopReason: 'error', errorMessage: quoted, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID } });
+        throw error;
+      }
+    };
+  });
+  const { handle } = f;
+  let checks = 0;
+  try {
+    await expect(handle.promptWithVerdict!('preflight-refused directive', { directive: { identity: { requestId: 'quoted-refusal', payloadHash: 'a'.repeat(64),
+      contractSha256: 'c'.repeat(64), jobId: 'quoted-refusal-job', workRevision: 0, authorityEpoch: 0 },
+      beforeAdmission: () => { if (++checks === 2) throw new DirectiveCheckpointError(refusal); }, onAdmitted: () => {} } })).rejects.toThrow(refusal);
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    expect(f.errors()).toHaveLength(2);
+    expect(f.errors()[0]).toEqual({ type: 'error', error: quoted, fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID });
+    f.expectRetained(f.errors()[1], `DirectiveCheckpointError: ${refusal}`);
+    expect(f.retained()).toEqual([{ error: `DirectiveCheckpointError: ${refusal}` }]);
+  } finally { await f.cleanup(); }
+});
+
+it('a provider authentication rejection in a directive turn is never tagged and still stops as authentication_wall (#485)', async () => {
+  const f = await nativeRefusalFixture([{ deltas: ['directive reply that must never be requested'] }], (session) => {
+    // Pi's own untyped rejection for an expired OAuth login.
+    const models = (session as unknown as { readonly _modelRuntime: ModelRuntime })._modelRuntime;
+    vi.spyOn(models, 'hasConfiguredAuth').mockReturnValue(false);
+    vi.spyOn(models, 'checkAuth').mockResolvedValue(undefined);
+    vi.spyOn(models, 'isUsingOAuth').mockReturnValue(true);
+  });
+  const { handle } = f;
+  try {
+    const { options } = startLedgerDirective(f);
+    await expect(handle.promptWithVerdict!('original accepted synthetic directive', options)).rejects.toThrow(`Authentication failed for "${STUB_PROVIDER_ID}"`);
+    await waitFor(() => handle.health().state === 'disposed', 'the authentication-wall stop');
+    expect(f.errors()).toHaveLength(1);
+    expect(f.errors()[0]).not.toHaveProperty('nativeControl');
+    expect(f.errors()[0]!.error).toContain(`Error: Authentication failed for "${STUB_PROVIDER_ID}"`);
+    expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    expect(f.scene.ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === `supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(f.retained()).toEqual([]);
+    expect(f.fx.script.calls).toHaveLength(0);
+  } finally { await f.cleanup(); }
 });
 
 it('cessation journal failure retains native lock and physical owner until an exact receipt retry succeeds', async () => {
@@ -5076,9 +5244,13 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed' | 'disposed-at
     const turn = handle.promptWithVerdict!('approved directive', { directive: { identity: scene.identity,
       beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
       onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
-    await expect(turn).rejects.toThrow(new DirectiveCheckpointError(by === 'withheld' ? 'native compaction terminal still withheld at directive admission'
-      : by === 'running' ? 'native compaction still running at directive admission' : 'native directive owner disposed during prompt preparation'));
+    const refusal = new DirectiveCheckpointError(by === 'withheld' ? 'native compaction terminal still withheld at directive admission'
+      : by === 'running' ? 'native compaction still running at directive admission' : 'native directive owner disposed during prompt preparation');
+    await expect(turn).rejects.toThrow(refusal);
     (clock as { mockRestore(): void } | null)?.mockRestore(); clock = null;
+    // GC's own refusal, never a provider's (#485); a disposed owner reports nothing.
+    expect(events.filter((event) => event.type === 'error')).toEqual(by === 'withheld' || by === 'running'
+      ? [{ type: 'error', error: String(refusal), fatal: false, nativeControl: 'directive-refusal' }] : []);
     // Not admitted: no receipt, no directive model request.
     const rows = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly message?: { readonly role: string } });
     expect(rows.filter((entry) => entry.message?.role === 'user')).toHaveLength(1);
