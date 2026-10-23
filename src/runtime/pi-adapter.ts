@@ -53,7 +53,7 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { isPublicModelToken } from './review-model-identity.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveRetryStart, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -1137,9 +1137,10 @@ export class PiAgentHandle implements AgentHandle {
   private directiveAdmissionError: unknown = null;
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
-   * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
-   * settle capture reads it before `drain()` starts a successor. */
-  private liveTurnStop: { stopReason: string | null; error: string | null } | null = null;
+   * positive completion proof (`stopReason: 'stop'` holding no tool calls).
+   * Reset per turn; the settle capture reads it before `drain()` starts a
+   * successor. */
+  private liveTurnStop: { stopReason: string | null; error: string | null; holdsCalls: boolean } | null = null;
   /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
   private readonly toolHeartbeat: ToolHeartbeat;
   private readonly queue: QueuedMessage[] = [];
@@ -1802,7 +1803,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveOwner = owner;
     this.livePromptText = text;
     this.livePromptImages = images;
-    this.liveTurnStop = { stopReason: null, error: null };
+    this.liveTurnStop = { stopReason: null, error: null, holdsCalls: false };
     this.liveDirective = directive;
     this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
@@ -1864,7 +1865,7 @@ export class PiAgentHandle implements AgentHandle {
           captured =
             this.state === 'error'
               ? { ok: false, error: this.stateError ?? terminal?.error ?? 'runtime settled the turn with an in-band error' }
-              : terminal?.stopReason === 'stop'
+              : terminal?.stopReason === 'stop' && !terminal.holdsCalls
                 ? { ok: true, error: null }
                 : {
                     ok: false,
@@ -1874,7 +1875,7 @@ export class PiAgentHandle implements AgentHandle {
                         ? this.disposed
                           ? 'session disposed before a terminal assistant message'
                           : 'no terminal assistant message'
-                        : `stopReason: ${terminal.stopReason}`) +
+                        : `stopReason: ${terminal.stopReason}${terminal.stopReason === 'stop' && terminal.holdsCalls ? ' holding tool calls' : ''}`) +
                       (terminal?.error == null ? ')' : `: ${terminal.error})`),
                   };
           if (directive !== undefined) {
@@ -2021,6 +2022,27 @@ export class PiAgentHandle implements AgentHandle {
       case 'agent_start':
         this.setState('streaming');
         return;
+      case 'auto_retry_start': {
+        const directive = this.liveDirective;
+        if (directive === undefined) return;
+        // Missing retry evidence is fail-closed at the native tool guard and
+        // checkpoint, so every way it goes unrecorded is logged by name.
+        const unrecorded = 'native SDK retry evidence not recorded; retry-history tool effects remain refused';
+        const requestId = directive.identity.requestId;
+        if (!(this.session instanceof AgentSession)) {
+          this.log('warn', unrecorded, { requestId, reason: 'session is not an SDK AgentSession' });
+          return;
+        }
+        const producer = this.directiveProducers.get(requestId);
+        try {
+          const reason = producer === undefined ? 'live directive has no physical producer'
+            : recordDirectiveRetryStart(producer, e, this.session.sessionManager.getBranch().at(-1));
+          if (reason !== null) this.log('warn', unrecorded, { requestId, reason });
+        } catch (error) {
+          this.log('warn', unrecorded, { requestId, error: String(error) });
+        }
+        return;
+      }
       case 'agent_end':
         if (e['willRetry'] === true) return; // retry keeps the turn live
         // All tool executions are done by now; forget any call whose
@@ -2050,7 +2072,11 @@ export class PiAgentHandle implements AgentHandle {
           });
         }
         if (msg !== undefined && msg['role'] === 'assistant') {
-          if (msg['stopReason'] === 'stop' && this.liveDirective !== undefined) {
+          // A stop row holding tool calls (providers that report `stop` with
+          // tool calls, e.g. OpenAI-compatible chat completions) is not
+          // completion: the SDK runs those calls next.
+          const holdsCalls = Array.isArray(msg['content']) && msg['content'].some((block) => (block as { type?: unknown } | null)?.type === 'toolCall');
+          if (msg['stopReason'] === 'stop' && !holdsCalls && this.liveDirective !== undefined) {
             const directive = this.liveDirective;
             // Completed original work may be historical after a park/hold or
             // material revision. Verify native authority, not today's candidacy.
@@ -2078,6 +2104,7 @@ export class PiAgentHandle implements AgentHandle {
             this.liveTurnStop = {
               stopReason: typeof msg['stopReason'] === 'string' ? msg['stopReason'] : null,
               error: typeof msg['errorMessage'] === 'string' ? msg['errorMessage'] : null,
+              holdsCalls,
             };
           }
           // pi reports in-band model errors as an assistant message with

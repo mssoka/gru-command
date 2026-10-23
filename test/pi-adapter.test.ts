@@ -3,7 +3,7 @@ import { ModelRuntime, createBashToolDefinition, defineTool, type ToolDefinition
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -5833,6 +5833,431 @@ it('a real SDK minion may go on calling tools after a failed command, and the di
 it('a later call in the same sequential batch still runs after a failed one, and the directive settles', () => assertSdkFailedCommandIsOrdinary([
   { deltas: [], toolCalls: [failingCommand, followingCommand] }, { deltas: ['both calls settled'] },
 ], [['failing-command', true], ['following-command', false]]));
+
+/*
+ * Pi retry history (#483). A retryable provider error (a truncated OpenAI
+ * Responses stream, read by the real pi-ai parser over a synthetic fetch)
+ * leaves its error row in the transcript, and the SDK retries from it. The
+ * live auto_retry_start is durably receipted, so the tool guard, the turn's
+ * checkpoint and settlement all walk past that row; nothing else does.
+ */
+type ResponsesEvent = Readonly<Record<string, unknown>>;
+const responsesUsage = { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
+  output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 };
+function responsesFunctionCall(ordinal: number, name: string, callId: string, args: Record<string, unknown>): readonly ResponsesEvent[] {
+  const json = JSON.stringify(args);
+  const item = { id: `item-${ordinal}`, type: 'function_call', call_id: callId, name, arguments: json, status: 'completed' };
+  return [
+    { type: 'response.created', response: { id: `response-${ordinal}`, status: 'in_progress' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: json },
+    { type: 'response.function_call_arguments.done', output_index: 0, arguments: json },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response: { id: `response-${ordinal}`, object: 'response', status: 'completed', output: [item], usage: responsesUsage } },
+  ];
+}
+function responsesAnswer(text: string): readonly ResponsesEvent[] {
+  const item = { id: 'answer-item', type: 'message', role: 'assistant', status: 'completed', phase: 'final_answer', content: [{ type: 'output_text', text }] };
+  return [
+    { type: 'response.created', response: { id: 'response-answer', status: 'in_progress' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, delta: text },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response: { id: 'response-answer', object: 'response', status: 'completed', output: [item], usage: responsesUsage } },
+  ];
+}
+/** A stream that ends before any terminal response event, having output nothing. */
+const responsesTruncated: readonly ResponsesEvent[] = [{ type: 'response.created', response: { id: 'truncated-response', status: 'in_progress' } }];
+/** The same end after a completed commentary message, which the parser signs. */
+function responsesTruncatedAfterCommentary(text: string): readonly ResponsesEvent[] {
+  const item = { id: 'commentary-item', type: 'message', role: 'assistant', status: 'completed', phase: 'commentary', content: [{ type: 'output_text', text }] };
+  return [...responsesTruncated,
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, delta: text },
+    { type: 'response.output_item.done', output_index: 0, item }];
+}
+/** The same end while a function call is still streaming its arguments. */
+function responsesTruncatedToolCall(name: string): readonly ResponsesEvent[] {
+  return [...responsesTruncated,
+    { type: 'response.output_item.added', output_index: 0, item: { id: 'partial-item', type: 'function_call', call_id: 'partial-call', name, arguments: '', status: 'in_progress' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"partial":' }];
+}
+/** Serves `providerId/modelId` through the real Responses parser: request n
+ * reads `bodies[n]`. Returns the count of requests made. */
+async function registerSyntheticResponses(modelRuntime: ModelRuntime, providerId: string, modelId: string, bodies: readonly (readonly ResponsesEvent[])[]): Promise<() => number> {
+  const { stream: streamOpenAIResponses } = await import('@earendil-works/pi-ai/api/openai-responses');
+  const model = { id: modelId, name: 'Synthetic Responses Model', api: 'openai-responses' as const, provider: providerId,
+    baseUrl: 'http://synthetic.invalid/v1', reasoning: false, input: ['text'] as ('text' | 'image')[],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_000, maxTokens: 1_024 };
+  let requests = 0;
+  const fakeFetch: typeof fetch = async () => {
+    const events = bodies[requests];
+    requests += 1;
+    if (events === undefined) throw new Error(`synthetic Responses provider has no body for request ${String(requests)}`);
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+  modelRuntime.registerNativeProvider({
+    id: providerId, name: 'Synthetic offline Responses',
+    auth: { apiKey: { name: 'synthetic key', resolve: async () => ({ auth: { apiKey: 'offline-only' }, source: 'test' }) } },
+    getModels: () => [model],
+    stream: (selectedModel, context, options) => streamOpenAIResponses(selectedModel as Parameters<typeof streamOpenAIResponses>[0], context,
+      { ...options, apiKey: 'offline-only', fetch: fakeFetch } as Parameters<typeof streamOpenAIResponses>[2]),
+    streamSimple: (selectedModel, context, options) => streamOpenAIResponses(selectedModel as Parameters<typeof streamOpenAIResponses>[0], context,
+      { ...options, apiKey: 'offline-only', fetch: fakeFetch } as Parameters<typeof streamOpenAIResponses>[2]),
+  });
+  await modelRuntime.refresh({ allowNetwork: false, providers: [providerId] });
+  return () => requests;
+}
+interface NativeRow {
+  readonly id: string; readonly parentId: string | null;
+  readonly message?: { readonly role?: string; readonly stopReason?: string; readonly errorMessage?: string; readonly toolCallId?: string; readonly isError?: boolean; readonly content?: readonly unknown[] };
+}
+function nativeRows(file: string): readonly NativeRow[] {
+  return readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as NativeRow);
+}
+function producerJournal(file: string): readonly Readonly<Record<string, unknown>>[] {
+  return readFileSync(`${file}.producers.jsonl`, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+const toolResultsOf = (rows: readonly NativeRow[]) => rows.filter((row) => row.message?.role === 'toolResult').map((row) => [row.message?.toolCallId, row.message?.isError]);
+
+it('a real SDK retry after a truncated Responses stream settles the directive once, and its checkpoint outlives the turn and the minion (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  let minion: AgentHandle | undefined;
+  const f = await sdkDirectiveExecutionFixture([], (_session, handle) => { minion = handle; });
+  // The fixture's default model, now read by the real Responses parser.
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesFunctionCall(1, 'bash', 'failing-call', { command: 'exit 3' }), responsesTruncated,
+    responsesFunctionCall(3, 'bash', 'following-call', { command: 'true' }), responsesAnswer('retried past the truncated stream'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    const answer = rows.filter((entry) => entry.message?.role === 'assistant' && entry.message.stopReason === 'stop').at(-1)!;
+    expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
+    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(toolResultsOf(rows)).toEqual([['failing-call|item-1', true], ['following-call|item-3', false]]);
+    expect(requests()).toBe(4);
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+    const journal = producerJournal(file);
+    expect(journal.filter((receipt) => receipt['state'] === 'retry-start')).toEqual([
+      expect.objectContaining({ entryId: error.id, errorMessage: error.message?.errorMessage })]);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    const identity = f.scene.ledger.directiveTurnIdentity(row.requestId);
+    const terminal = { state: 'terminal', ok: true, error: null, checkpointId: answer.id };
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject(terminal);
+    expect(minion?.id).toBe(row.nativeTarget!.agentId);
+    await minion!.dispose();
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject(terminal);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK retry of the directive\'s first request, after a fractional backoff, lets its next tool call run once and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const retryStarts: unknown[] = [];
+  const f = await sdkDirectiveExecutionFixture([], (session) => {
+    session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); });
+  });
+  // SDK delayMs is baseDelayMs·2^(attempt-1): a fractional base stays fractional.
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 0.5 } }));
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesTruncated, responsesFunctionCall(2, 'bash', 'once-call', { command: `printf ran >> ${JSON.stringify(effect)}` }),
+    responsesAnswer('ran once after the retried first request'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    const user = rows.find((entry) => entry.message?.role === 'user')!;
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    expect(error.parentId).toBe(user.id);
+    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 0.5, errorMessage: error.message?.errorMessage })]);
+    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(toolResultsOf(rows)).toEqual([['once-call|item-2', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(requests()).toBe(3);
+    const journal = producerJournal(file);
+    expect(journal.filter((receipt) => receipt['state'] === 'retry-start')).toEqual([
+      expect.objectContaining({ entryId: error.id, errorMessage: error.message?.errorMessage })]);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK retry after a stream that broke past signed commentary text lets the next tool call run and settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const retryStarts: unknown[] = [];
+  const f = await sdkDirectiveExecutionFixture([], (session) => { session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); }); });
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesTruncatedAfterCommentary('Checking the failing test first.'), responsesFunctionCall(2, 'bash', 'after-commentary', { command: 'true' }),
+    responsesAnswer('settled after the signed commentary'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const rows = nativeRows(row.nativeTarget!.sessionFile);
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expect(error.message?.content).toEqual([{ type: 'text', text: 'Checking the failing test first.', textSignature: expect.stringContaining('commentary-item') }]);
+    expect(toolResultsOf(rows)).toEqual([['after-commentary|item-2', false]]);
+    expect(requests()).toBe(3);
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK retry of a truncated stream holding a partial tool call continues: the half-written call never runs, the retried one runs once, and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const retryStarts: unknown[] = [];
+  const f = await sdkDirectiveExecutionFixture([], (session) => { session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); }); });
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
+    responsesTruncatedToolCall('bash'), responsesFunctionCall(2, 'bash', 'retried-call', { command: `printf ran >> ${JSON.stringify(effect)}` }),
+    responsesAnswer('the retried call ran once'),
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
+    // The real parser keeps the half-written call inside the persisted error row.
+    expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
+    expect(error.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', name: 'bash' }));
+    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1, errorMessage: error.message?.errorMessage })]);
+    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(toolResultsOf(rows)).toEqual([['retried-call|item-2', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(requests()).toBe(3);
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+    const journal = producerJournal(file);
+    expect(journal.filter((receipt) => receipt['state'] === 'retry-start')).toEqual([
+      expect.objectContaining({ entryId: error.id, errorMessage: error.message?.errorMessage })]);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('guard-refused');
+  } finally { await f.cleanup(); }
+});
+
+it('a real SDK tool call cut off by the output token limit is answered by the SDK, and the next tool call runs once and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-length-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'cut-off', name: 'bash', args: { command: `printf cut >> ${JSON.stringify(effect)}` } }, stopReason: 'length' },
+    { deltas: [], toolCall: { id: 'after-cut-off', name: 'bash', args: { command: `printf ran >> ${JSON.stringify(effect)}` } } },
+    { deltas: ['answered after the output token limit'] },
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    expect(rows.find((entry) => entry.message?.stopReason === 'length')?.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', id: 'cut-off' }));
+    // The SDK's own "not executed" result answers the cut-off call; only the next one ran.
+    expect(toolResultsOf(rows)).toEqual([['cut-off', true], ['after-cut-off', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(producerJournal(file).map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+// Providers that report `stop` with tool calls (e.g. OpenAI-compatible chat
+// completions): the stub drives the same SDK agent loop, not a real transport.
+it('a real SDK stop row holding a tool call (providers that report stop with tool calls) runs it once, and the directive settles (#483)', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-stop-call-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'stop-call', name: 'bash', args: { command: `printf ran >> ${JSON.stringify(effect)}` } }, stopReason: 'stop' },
+    { deltas: ['answered after the stop row\'s call'] },
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const file = row.nativeTarget!.sessionFile;
+    const rows = nativeRows(file);
+    expect(rows.find((entry) => entry.message?.role === 'assistant')?.message).toMatchObject({ stopReason: 'stop', content: [expect.objectContaining({ type: 'toolCall', id: 'stop-call' })] });
+    expect(toolResultsOf(rows)).toEqual([['stop-call', false]]);
+    expect(readFileSync(effect, 'utf8')).toBe('ran');
+    expect(producerJournal(file).map((receipt) => receipt['state'])).not.toContain('guard-refused');
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('an ordinary turn whose last row is a stop row holding a tool call is no successful completion, like a toolUse row (#483)', async () => {
+  for (const stopReason of ['stop', 'toolUse'] as const) {
+    let finished = 0;
+    const fx = await fixture([{ deltas: [], toolCall: { id: 'finish-call', name: 'finish_now', args: {} }, stopReason }]);
+    // Every call in the batch terminates, so the SDK ends the run on that row.
+    const nativeTools = [{ name: 'finish_now', description: 'End the run now.', inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      async execute() { finished += 1; return { text: 'finished', terminate: true }; } }];
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, nativeTools });
+    try {
+      const verdict = await handle.promptWithVerdict!('finish through the tool');
+      expect(finished, stopReason).toBe(1);
+      expect(verdict, stopReason).toEqual({ ok: false,
+        error: `turn settled without a successful completion (stopReason: ${stopReason === 'stop' ? 'stop holding tool calls' : 'toolUse'})` });
+    } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+  }
+});
+
+it('a real SDK row aborted while holding a tool call never runs it: the directive is a failed terminal (#483)', async () => {
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-aborted-call-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const fx = await fixture([{ deltas: [], toolCall: { id: 'aborted-call', name: 'bash', args: { command: `printf ran >> ${JSON.stringify(effect)}` } },
+    hold: new Promise<void>(() => {}), honorAbort: true }]);
+  const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+  const session = await actualDirectiveSdkSession(handle);
+  const identity = { requestId: 'aborted-call-directive', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'aborted-call-job', workRevision: 0, authorityEpoch: 0 };
+  try {
+    const turn = handle.promptWithVerdict!('call a tool, then be aborted', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+    await waitFor(() => fx.script.calls.length === 1, 'held native call');
+    await session.abort();
+    expect((await turn).ok).toBe(false);
+    const rows = nativeRows(handle.sessionFile!);
+    const aborted = rows.find((entry) => entry.message?.stopReason === 'aborted')!;
+    expect(aborted.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', id: 'aborted-call' }));
+    expect(toolResultsOf(rows)).toEqual([]);
+    expect(existsSync(effect)).toBe(false);
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: aborted.id });
+  } finally { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); }
+});
+
+const UNRECORDED_RETRY = 'native SDK retry evidence not recorded; retry-history tool effects remain refused';
+/** A directive minion on its own synthetic Responses model outside dispatch,
+ * with a 1 ms retry base, its adapter log and its SDK retry starts captured. */
+async function retryMinion(bodies: readonly (readonly ResponsesEvent[])[]) {
+  const logs: { readonly level: string; readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
+  const fx = await fixture([], ['text'], { log: (level, msg, fields) => logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }) });
+  writeFileSync(join(fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
+  const requests = await registerSyntheticResponses(fx.modelRuntime, 'gru-synthetic-responses', 'synthetic-model', bodies);
+  const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'gru-synthetic-responses/synthetic-model' });
+  const session = await actualDirectiveSdkSession(handle);
+  const retryStarts: unknown[] = [];
+  session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); });
+  const directive = (requestId: string) => ({ identity: { requestId, payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+    jobId: `${requestId}-job`, workRevision: 0, authorityEpoch: 0 }, beforeAdmission: () => {}, onAdmitted: () => {} });
+  const dispose = async () => { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); };
+  return { logs, requests, handle, session, retryStarts, directive, dispose };
+}
+
+it('a real SDK retry of an error row holding an unknown block records no evidence, says why, and refuses the next tool by the error row\'s own reason (#483)', async () => {
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'refused-call', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
+  // Before pi persists the error row, give it a block that is not retry history.
+  m.session.subscribe((event) => {
+    if (event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') {
+      (event.message.content as unknown[]).push({ type: 'image', data: 'AAAA', mimeType: 'image/png' });
+    }
+  });
+  const { directive } = m;
+  const request = directive('unknown-block-retry');
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    const file = m.handle.sessionFile!;
+    const rows = nativeRows(file);
+    expect(rows.find((entry) => entry.message?.stopReason === 'error')?.message?.content).toContainEqual(expect.objectContaining({ type: 'image' }));
+    expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY,
+      fields: { requestId: request.identity.requestId, reason: 'native branch tail is not an error row of retry-history content carrying this retry\'s error' } });
+    expect(toolResultsOf(rows)).toEqual([['refused-call|item-2', true]]);
+    expect(existsSync(effect)).toBe(false);
+    expect(verdict.ok).toBe(false);
+    expect(m.requests()).toBe(2);
+    const journal = producerJournal(file);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('retry-start');
+    expect(journal).toContainEqual(expect.objectContaining({ state: 'guard-refused', reason: expect.stringContaining('native error row has no matching live SDK retry-start receipt') }));
+  } finally { await m.dispose(); }
+});
+
+/** Tears `m`'s producer journal from the provider error row's end through
+ * the SDK's auto_retry_start, which the adapter sees first, and heals it
+ * before the retried request. `heal` removes only the torn fragment, never a
+ * line appended after it. */
+function tearJournalThroughRetryStart(m: Awaited<ReturnType<typeof retryMinion>>): () => void {
+  const journalPath = () => `${m.handle.sessionFile!}.producers.jsonl`;
+  const torn = '{"state":"torn-by-this-test"';
+  const heal = () => { if (existsSync(journalPath())) writeFileSync(journalPath(), readFileSync(journalPath(), 'utf8').replace(torn, '')); };
+  let tore = false;
+  m.session.subscribe((event) => {
+    if (!tore && event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') {
+      tore = true;
+      appendFileSync(journalPath(), torn);
+    }
+    if (event.type === 'auto_retry_start') heal();
+  });
+  return heal;
+}
+const expectUnreadableJournalWarn = (m: Awaited<ReturnType<typeof retryMinion>>, requestId: string) =>
+  expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY, fields: { requestId, error: expect.stringContaining('native producer journal has a partial write') } });
+
+it('a real SDK retry whose producer journal cannot be read logs the error, and the directive stays fail-closed at its next tool (#483)', async () => {
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-torn-journal', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
+  const request = m.directive('unreadable-journal-retry');
+  const heal = tearJournalThroughRetryStart(m);
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expectUnreadableJournalWarn(m, request.identity.requestId);
+    // Fail-closed: no receipt, so the guard refused the retried call, by name.
+    expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('native error row has no matching live SDK retry-start receipt') });
+    expect(existsSync(effect)).toBe(false);
+    const journal = producerJournal(m.handle.sessionFile!);
+    expect(journal.map((receipt) => receipt['state'])).not.toContain('retry-start');
+    expect(journal).toContainEqual(expect.objectContaining({ state: 'guard-refused', reason: expect.stringContaining('native error row has no matching live SDK retry-start receipt') }));
+    expect(m.requests()).toBe(2);
+  } finally {
+    heal(); // disposal records cessation in a readable journal
+    await m.dispose();
+  }
+});
+
+it('a real SDK retry whose producer journal cannot be read logs the error, and a plain retried answer still leaves the directive not ok (#483)', async () => {
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const m = await retryMinion([responsesTruncated, responsesAnswer('answered after the retry')]);
+  const request = m.directive('unreadable-journal-plain-retry');
+  const heal = tearJournalThroughRetryStart(m);
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expectUnreadableJournalWarn(m, request.identity.requestId);
+    // The answer's completion receipt found no terminal proof, and that error is the verdict's.
+    expect(verdict).toEqual({ ok: false, error: 'DirectiveCheckpointError: native completion checkpoint/producer unavailable' });
+    // The journal reads again; without a receipt the answer follows the error row's terminal.
+    expect(inspectDirectiveCheckpoint(m.handle.sessionFile!, request.identity)).toEqual({ state: 'unknown',
+      reason: 'native entries follow the correlated terminal checkpoint without a distinct bound request' });
+    expect(producerJournal(m.handle.sessionFile!).map((receipt) => receipt['state'])).not.toContain('retry-start');
+    expect(m.requests()).toBe(2);
+  } finally {
+    heal(); // disposal records cessation in a readable journal
+    await m.dispose();
+  }
+});
+
+it('a real SDK retry with no live directive writes no retry evidence (#483)', async () => {
+  const m = await retryMinion([responsesAnswer('the directive finished'), responsesTruncated, responsesAnswer('the plain turn finished')]);
+  try {
+    expect(await m.handle.promptWithVerdict!('a directive first', { directive: m.directive('before-plain-retry') })).toMatchObject({ ok: true });
+    expect(await m.handle.promptWithVerdict!('then an ordinary turn')).toMatchObject({ ok: true });
+    expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expect(m.requests()).toBe(3);
+    const states = producerJournal(m.handle.sessionFile!).map((receipt) => receipt['state']);
+    expect(states).toContain('started');
+    expect(states).not.toContain('retry-start');
+    expect(m.logs.filter((log) => log.msg === UNRECORDED_RETRY)).toEqual([]);
+  } finally { await m.dispose(); }
+});
 
 async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing' | 'missing-head' | 'parked-missing-head') {
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');

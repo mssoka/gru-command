@@ -95,10 +95,13 @@ single-operation queue.
   Pi also compacts automatically: before a prompt, between a completed tool
   round and the next model call, and after a run's final reply. After an
   error reply, or a truncated reply without tool calls, Pi may compact and
-  continue the turn; GC reads only that linked shape (an error or length
-  reply, a compaction linked on it, a reply continued from it), never Pi's
-  reason for it. The adapter publishes an automatic compaction's terminal at
-  Pi's settle point, as soon as Pi's compaction flag clears. Next-turn
+  continue the turn; GC reads only that linked shape (an error or call-less
+  length reply, a compaction linked on it, a reply continued from it), never
+  Pi's reason for it. A retryable provider error Pi auto-retries instead is
+  read by its live `retry-start` receipt
+  ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md)). The adapter
+  publishes an automatic compaction's terminal at Pi's settle point, as
+  soon as Pi's compaction flag clears. Next-turn
   preparation waits for it before a directive's authority check. A
   continued reply has no preparation and relies on that settle point, so it
   is ordered while Pi's own compaction holds the flag alone; another holder

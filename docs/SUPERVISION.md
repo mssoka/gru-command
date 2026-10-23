@@ -103,14 +103,20 @@ of four places:
   turn lost right there is resumable at the compaction;
 - **post-run:** directly after the final reply, which stays the turn's
   checkpoint;
-- **compact-and-retry:** an error or length reply, a compaction linked on
-  it, and a reply continued from that compaction. The failed reply is
-  history: tool calls in it never ran. A turn lost between that compaction
-  and the continued reply reads as the failed reply's terminal (not ok) and
-  is never resumed: the run ended on that error, and only Pi's compaction
-  ran after it. That holds when the failed reply has no tool calls: an error
-  reply holding tool calls reads UNKNOWN ('malformed native tool
-  identity').
+- **compact-and-retry:** an error reply, or a length reply without tool
+  calls, a compaction linked on it, and a reply continued from that
+  compaction. The failed reply is history: an error reply's tool calls
+  never ran, and it may hold only text, thinking and tool calls, as an
+  auto-retried one must; anything else is refused by name. A length reply
+  holding calls is never compacted and retried:
+  Pi answers its calls with its own "not executed" results and goes on
+  ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md) lists what Pi does with
+  each stop's calls). A turn lost between that compaction and the continued
+  reply reads as the failed reply's terminal (not ok), with or without tool
+  calls in it, and is never resumed: the run ended on that error, and only
+  Pi's compaction ran after it. An error reply that also carries a
+  `retry-start` receipt is refused by name: Pi auto-retries a reply or
+  compacts and retries it, never both.
 
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the
