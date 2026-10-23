@@ -231,10 +231,10 @@ export async function routeFixDirectiveToMinion(
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
   const blindReview = blindReviewFor(input.ledger, input.jobId);
-  const blindPackage = blindPackageFor(input.ledger, input.jobId, blindReview);
   const withBlindPackage = (text: string): string => {
-    if (blindPackage === null || text.includes('BLIND INPUT PACKAGE (')) return text;
-    return `${text}\n\n${renderBlindPackageBlock(blindPackage).join('\n')}`;
+    if (!blindReview || text.includes('BLIND INPUT PACKAGE (')) return text;
+    const blindPackage = blindPackageFor(input.ledger, input.jobId, blindReview);
+    return blindPackage === null ? text : `${text}\n\n${renderBlindPackageBlock(blindPackage).join('\n')}`;
   };
   const compose = (revisionText: string): string => appendWorkerRules(
     appendLessonPointers(
@@ -873,8 +873,10 @@ export async function rebriefFreshMinion(
       });
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
       const blindReview = blindReviewFor(input.ledger, input.jobId);
-      const blindPackage = blindPackageFor(input.ledger, input.jobId, blindReview);
-      const briefing = blindPackage === null || input.resumeFile != null || input.briefing?.includes('BLIND INPUT PACKAGE (')
+      const blindPackage = blindReview && input.resumeFile == null && !input.briefing?.includes('BLIND INPUT PACKAGE (')
+        ? blindPackageFor(input.ledger, input.jobId, blindReview)
+        : null;
+      const briefing = blindPackage === null
         ? input.briefing
         : [input.briefing, renderBlindPackageBlock(blindPackage).join('\n')].filter((part): part is string => part !== null && part !== undefined && part !== '').join('\n\n');
       prompt = renderRebriefPrompt({

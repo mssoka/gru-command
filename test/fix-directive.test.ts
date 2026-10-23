@@ -1388,13 +1388,13 @@ describe('directive continuation physical-tail observation (issue #339 D1 tail)'
     ledger.setJobStatus(jobId, 'working');
     ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
     if (opts.admit) {
+      const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
       const admission = admitBlindReview({
         ledger, jobId, title: 'review (blind)', deliverable: 'review',
-        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
-        inputPackage: { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture', inputPackage,
       });
       if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-      recordBlindAdmission(ledger, jobId, admission);
+      recordBlindAdmission(ledger, jobId, admission, inputPackage);
     }
     return { ledger, dispose: () => db.close() };
   }
