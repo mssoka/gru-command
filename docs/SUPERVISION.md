@@ -197,8 +197,10 @@ initialization), reports itself, untagged, as before #485; the owed refusal
 stays durable in its guard receipt, and the channel's own failure texts name
 no wall word.
 No tool is allowed once the turn has a failure: an allow is re-checked as it
-is written, and denied with a durable guard receipt. A thrown non-error value
-is named (`a directive step threw a non-error value: null`). On a directive turn the supervisor neither paces a tagged, nonfatal,
+is written, and denied with a durable guard receipt. GC's own texts name a
+thrown non-error value (`a directive step threw a non-error value: null`):
+verdicts, receipts and the events GC builds. On Pi, an event its SDK reduces
+from such a throw can still read a bare `null`. On a directive turn the supervisor neither paces a tagged, nonfatal,
 untyped error as a rate limit nor classifies it as a wall: the directive's
 recovery path owns it (it disposes the handle, fails or reconciles the
 directive, and surfaces the recovery to Gru). Each skipped refusal leaves a

@@ -4026,11 +4026,7 @@ async function nativeRefusalFixture(turns: readonly StubTurn[] | StubResponder, 
     expect(handle.health().state).not.toBe('disposed');
   };
   const cleanup = async () => { supervisor.dispose(); await f.cleanup(); };
-  // The handle's own log, kept for assertions.
-  const logs: { readonly level: string; readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
-  const handleLog = (handle as unknown as { log: (level: string, msg: string, fields?: Record<string, unknown>) => void }).log;
-  (handle as unknown as { log: typeof handleLog }).log = (level, msg, fields) => { logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); handleLog(level, msg, fields); };
-  return { ...f, supervisor, handle, events, errors, retained, expectRetained, logs, cleanup };
+  return { ...f, supervisor, handle, events, errors, retained, expectRetained, cleanup };
 }
 
 /** Starts the scene's one ledger directive on its minion. */
@@ -4358,9 +4354,9 @@ async function assertPiBookkeepingFault(site: PiBookkeepingCall) {
       expect(deterministicFailureClass(error), site).toBe('quota_wall');
     }
     if (fault !== null) expect(fault, site).toHaveBeenCalled();
-    // Every bookkeeping fault is logged with the fault it replaced, once.
+    // Every bookkeeping fault reaches the runtime log once, with the fault it replaced, stack included.
     expect(f.logs.filter((line) => line.msg === 'native directive bookkeeping failed; the directive is refused'), site)
-      .toEqual([expect.objectContaining({ level: 'error', fields: expect.objectContaining({ fault: expect.stringContaining('EDQUOT: disk quota exceeded, write') }) })]);
+      .toEqual([expect.objectContaining({ level: 'error', fields: expect.objectContaining({ fault: expect.stringMatching(/^Error: EDQUOT: disk quota exceeded, write\n\s+at /u) }) })]);
   } finally { fault?.mockRestore(); await f.cleanup(); }
 }
 it('an EDQUOT in the ledger\'s authority check at Pi\'s preflight is one tagged refusal (#485)', () => assertPiBookkeepingFault('authority check at preflight'));
@@ -4394,14 +4390,20 @@ async function assertNullishFailure(site: 'fence' | 'admission publication', thr
     (handle as unknown as { directiveAuthorityManifest: () => string | undefined }).directiveAuthorityManifest = () => (++reads === 3 ? nothing() : manifest?.());
   }
   try {
-    expect(await handle.promptWithVerdict!('nullish directive', { directive: { identity: { requestId: `nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`, payloadHash: 'a'.repeat(64),
+    const verdict = await handle.promptWithVerdict!('nullish directive', { directive: { identity: { requestId: `nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`, payloadHash: 'a'.repeat(64),
       contractSha256: 'c'.repeat(64), jobId: 'nullish-job', workRevision: 0, authorityEpoch: 0 }, beforeAdmission: () => {},
-      onAdmitted: () => { if (site === 'admission publication') nothing(); } } })).toMatchObject({ ok: false });
+      onAdmitted: () => { if (site === 'admission publication') nothing(); } } });
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
     // Neither tool ran: the failure refuses every later effect.
     expect(existsSync(join(f.scene.lane.path, 'nullish-fence.txt'))).toBe(false);
     expect(f.fx.script.calls).toHaveLength(1);
     const named = `a directive step threw a non-error value: ${String(thrown)}`;
+    // The turn's durable texts name the bare value: its verdict, and the first tool's refusal receipt.
+    const failure = site === 'fence' ? named : `DirectiveCheckpointError: directive bookkeeping failed: admission publication: ${named}`;
+    expect(verdict).toEqual({ ok: false, error: failure });
+    const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; reason?: string });
+    expect(receipts).toContainEqual(expect.objectContaining({ state: 'guard-refused', toolCallId: 'refused-first',
+      reason: site === 'fence' ? named : `DirectiveCheckpointError: native directive admission/guard failed; further tool effects refused: ${failure}` }));
     if (site === 'fence') {
       // GC's wrapper names a cause that is no refusal: untagged, with its provider identity.
       expect(f.errors()).toEqual([{ type: 'error', error: `native directive admission/guard failed; further tool effects refused: ${named}`,
@@ -4683,8 +4685,11 @@ async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[] | StubRes
   const fx = await fixture(turns);
   const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools', materialRevision, rebrief);
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
+  // Every runtime log line, kept for assertions.
+  const logs: { readonly level: string; readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
   const registry = new RuntimeRegistry({ config: fx.config, store: fx.store,
-    pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime } });
+    pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    log: (level, msg, fields) => { logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); } });
   const states: string[] = []; const toolStates: string[] = [];
   const sessions: InstanceType<typeof AgentSession>[] = [];
   registry.onAgentEvent((envelope) => {
@@ -4715,7 +4720,7 @@ async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[] | StubRes
   const deps = { ledger: scene.ledger, registry, worktrees: scene.worktrees, notifications: scene.notifications,
     signal: new AbortController().signal, pendingProducerBlockers: () => [] };
   const cleanup = async () => { await registry.dispose(); await fx.runtime.dispose(); fx.store.dispose(); scene.db.close(); scene.repo.cleanup(); };
-  return { fx, scene, registry, sessions, states, toolStates, deps, cleanup };
+  return { fx, scene, registry, sessions, states, toolStates, deps, logs, cleanup };
 }
 
 async function assertSdkOriginalCompletionHead(mode: 'known' | 'missing' | 'null' | 'conflicting' | 'malformed') {

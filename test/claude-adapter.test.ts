@@ -2996,37 +2996,54 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     it('a refusal at the first of two concurrent fences denies the second request too (#485)', () => assertConcurrentFenceRefusal('first'));
     it('a refusal at the second of two concurrent fences denies the first request\'s already-passed allow as it is written (#485)', () => assertConcurrentFenceRefusal('second'));
 
-    /** Two concurrent permission requests: the first fence throws a bare null or
-     * undefined, and the second is still refused, with no tool allowed (#485). */
-    async function assertNullishClaudeFence(site: 'authority check' | 'manifest', thrown: null | undefined) {
+    /** A bare null or undefined fails the turn closed (#485). At the first of two concurrent
+     * fences the second is still refused, with no tool allowed; at the completion the
+     * turn is refused, never a success. Its texts, durable ones included, name it. */
+    async function assertNullishClaudeFence(site: 'authority check' | 'manifest' | 'completion manifest', thrown: null | undefined) {
       const fx = fixture({ killGraceMs: 300 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const events = collect(handle);
-      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      // A fence's refusal ends a CLI that ignores SIGTERM; the completion's lets it exit on its own.
+      if (site !== 'completion manifest') process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
       const nothing = (): never => { const value: unknown = thrown; throw value; };
       let checks = 0;
-      if (site === 'manifest') {
+      if (site !== 'authority check') {
         // Outside GC's bookkeeping calls: the bare value is no refusal, and still fails the turn closed.
+        // Read 1 prepares the turn; read 2 is the first fence's, or the completion's.
         const manifest = (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest.bind(handle);
         let reads = 0;
         (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => (++reads === 2 ? nothing() : manifest());
       }
       const named = `a directive step threw a non-error value: ${String(thrown)}`;
-      const error = `directive refused: ${site === 'manifest' ? named : `directive bookkeeping failed: authority check: ${named}`}`;
+      const reason = site === 'authority check' ? `directive bookkeeping failed: authority check: ${named}` : named;
+      const error = `${site === 'completion manifest' ? 'directive turn refused' : 'directive refused'}: ${reason}`;
       try {
-        await expect(handle.prompt('tool-pair:Read follow it', { directive: { identity: identityFor(`claude-nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`),
+        await expect(handle.prompt(site === 'completion manifest' ? 'answer plainly' : 'tool-pair:Read follow it', { directive: { identity: identityFor(`claude-nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`),
           beforeAdmission: () => { if (site === 'authority check' && ++checks === 2) nothing(); }, onAdmitted: () => {} } })).rejects.toThrow(new Error(error));
-        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, ...(site === 'manifest' ? {} : { nativeControl: 'directive-refusal' }) }]);
-        // Both asks were denied: no tool was allowed after the failed fence.
-        const answers = frames(handle.sessionFile!).filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior"'));
-        expect(answers).toHaveLength(2);
-        expect(answers.every((frame) => JSON.stringify(frame).includes('"behavior":"deny"'))).toBe(true);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, ...(site === 'authority check' ? { nativeControl: 'directive-refusal' } : {}) }]);
+        const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; reason?: string });
+        if (site === 'completion manifest') {
+          // The reply settled, but no completion is recorded for a refused turn.
+          expect(receipts.some((receipt) => receipt.state === 'completed')).toBe(false);
+          return;
+        }
+        // Both asks were denied: no tool was allowed after the failed fence. The first's
+        // deny and its durable receipt name the bare value.
+        const answers = frames(handle.sessionFile!).filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior"'))
+          .map((frame) => ((frame['response'] as StreamFrame)['response'] as StreamFrame));
+        expect(answers).toEqual([
+          { behavior: 'deny', message: `Refused by the directive's authority fence: ${reason}` },
+          { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' },
+        ]);
+        expect(receipts).toContainEqual(expect.objectContaining({ state: 'guard-refused', toolCallId: 'toolu_pair_1', reason }));
       } finally { await handle.dispose(); }
     }
     it('a GC authority check that throws null at the first of two concurrent fences is a refusal, and both are denied (#485)', () => assertNullishClaudeFence('authority check', null));
     it('a GC authority check that throws undefined at the first of two concurrent fences is a refusal, and both are denied (#485)', () => assertNullishClaudeFence('authority check', undefined));
     it('a null thrown outside GC\'s bookkeeping at the first of two concurrent fences fails the turn closed, untagged (#485)', () => assertNullishClaudeFence('manifest', null));
     it('an undefined thrown outside GC\'s bookkeeping at the first of two concurrent fences fails the turn closed, untagged (#485)', () => assertNullishClaudeFence('manifest', undefined));
+    it('a null thrown outside GC\'s bookkeeping at the completion refuses the turn, never a success (#485)', () => assertNullishClaudeFence('completion manifest', null));
+    it('an undefined thrown outside GC\'s bookkeeping at the completion refuses the turn, never a success (#485)', () => assertNullishClaudeFence('completion manifest', undefined));
 
     it('the supervisor skips a tagged Claude refusal with a durable trace, and with decisions wired still stops on a wall reported after one (#485)', async () => {
       const { LedgerDb } = await import('../src/ledger/db.js');
@@ -3162,7 +3179,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       appendFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: handle.id })}\n${JSON.stringify(echo)}\n`);
       const admitted: unknown[] = [];
       const turn = { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding: unknown) => admitted.push(binding) },
-        producer: {}, content, settings: { file: '', dispose: () => {} }, admission: null as Promise<void> | null, admitted: null, failure: new Error('refused earlier') as unknown, completion: null };
+        producer: {}, content, settings: { file: '', dispose: () => {} }, admission: null as Promise<void> | null, admitted: null, failure: { error: new Error('refused earlier') } as { readonly error: unknown } | null, completion: null };
       const follow = (handle as unknown as { followDirectiveFrame(turn: unknown, frame: unknown, durable: Promise<void>, abort: (detail: string) => void): void }).followDirectiveFrame.bind(handle);
       follow(turn, echo, Promise.resolve(), () => {});
       await turn.admission;
