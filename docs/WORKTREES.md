@@ -73,6 +73,100 @@ or uncertain blocks require deliberate repair, never automatic cleanup. Existing
 jobs still resolve verification commands from their original manifests and keep
 their original runtime bindings and paths.
 
+## 1a. Guarded pre-bootstrap dependency patch
+
+A normal `POST /api/dispatch` has no pre-bootstrap edit and follows the existing
+path unchanged. A narrowly-scoped exception is available only when a fresh,
+top-level PR-owing job explicitly includes `prebootstrap_patch` and its
+immutable briefing contains exactly one line:
+
+```text
+GC PRE-BOOTSTRAP DEPENDENCY PATCH AUTHORIZATION: files=requirements.txt
+```
+
+The package must be staged by the trusted operator under the instance's private
+`<data_dir>/prebootstrap-patches/` directory (0700); its regular file must be
+owner-only. The bounded JSON package is at most 1 MiB and the UTF-8 dependency
+file at most 256 KiB. The request names only a plain `.json` basename and the
+SHA-256 of the exact package bytes:
+
+```json
+"prebootstrap_patch": {
+  "package_file": "repair-<request>.json",
+  "package_sha256": "<64 lowercase hex characters>"
+}
+```
+
+Package version 1 is a strict JSON object with no unknown keys:
+
+```json
+{
+  "version": 1,
+  "repository": { "path": "<canonical absolute repo path>", "origin_sha256": "<64 lowercase hex>" },
+  "base": { "commit": "<full fetched commit id>", "tree": "<full Git tree id>" },
+  "authority": {
+    "contract_sha256": "<exact briefing SHA-256>",
+    "work_revision": 0,
+    "authority_epoch": 0,
+    "request_sha256": "<normalized dispatch payload SHA-256>"
+  },
+  "allowlist": ["requirements.txt"],
+  "files": [{
+    "path": "requirements.txt",
+    "before_sha256": "<old content SHA-256>",
+    "after_sha256": "<new content SHA-256>",
+    "content": "<new UTF-8 text>"
+  }]
+}
+```
+
+`request_sha256` binds job id, original repo-path spelling, title, display name,
+deliverable, exact briefing hash, optional normalized completion-handoff intent
+and package basename. Report/review metadata is refused for this route. It excludes
+only the package SHA-256 field that would make the package hash self-referential; the
+admission receipt binds that request digest and exact package digest into one
+full intake identity. The source and package bytes are reread and rehashed at
+worktree application. Revision/epoch must be the initial 0/0 authority, and
+are rechecked at application and before worker admission.
+
+The supported file grammar is intentionally small: root `requirements.txt`,
+blank/comment lines and pinned `distribution==version` declarations only.
+Existing comment/blank lines must remain identical. No include/constraint files,
+URLs, VCS/path references, options, environment expansion, secrets, manifests,
+setup commands, configuration or other file paths are accepted. Package
+content is never interpreted as a shell command or diff. The patch binds the
+canonical repository path, origin fingerprint, fetched origin commit and tree,
+initial contract, request and old/new content. Local-head fallback is refused.
+
+With the existing per-repository creation lock, GC proves the exact source,
+base/tree, dependency blob, fresh branch/path and no retained creation receipt
+before writing. It applies the one file atomically in the new owned worktree,
+checks the actual changed-path set and records before/after Git tree identities.
+The committed `.gru-command/worktree.toml` cannot be changed by this control;
+the exact existing links/copies/setup flow then runs normally. The worker is not
+spawned until every configured setup step succeeds and current authority still
+matches. Disk floor, repository identity, lane custody and worker pacing remain
+in force. No package means no change to the normal path.
+
+The ledger records `job.prebootstrap-patch-admitted`, the one-time
+`worktree.prebootstrap-patch-creation-claimed` consumption receipt, patch
+start/applied/failure, per-command setup start/spawn/result and setup
+success/failure, and dispatch failure. A POST failure after job admission is
+returned as `409 prebootstrap_patch_dispatch_failed` with the job id and
+readback path, not as a pre-admission refusal. Admission/claim receipts bind
+the request, package, authority and intended source; producer receipts add the
+owned lane path, branch and creation-token hash. Failure receipts contain an
+error class/code and digest, not raw setup output. Read the authenticated
+`GET /api/dispatch/jobs/<job-id>/prebootstrap-patch` for durable event readback.
+Missing spawn/result receipts mean **unknown**, never process cessation or
+no-effects. A recorded child exit/result is not proof that the entire process
+group ceased; the readback keeps group state explicitly unknown. A consumed
+request is never replayed. Interrupted, partial or failed
+patch/setup retains the lane, creation receipt and evidence; do not retry it, rerun setup, clean
+the lane or infer that an unknown producer stopped. Inspect custody and process
+records; any future attempt requires a separately authorized fresh job and
+request. The endpoint offers no retry or cleanup action.
+
 ## 2. Registry (18b)
 
 The ledger is the authoritative map job → worktree → branch → **processes**:

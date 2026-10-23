@@ -1261,6 +1261,22 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
+  /** Bounded durable event readback for one job, oldest-first by default.
+   * Specialized control surfaces use this instead of scanning a moving
+   * global tail that could omit the job's creation/admission evidence. */
+  listJobEvents(jobId: string, opts: { readonly limit?: number; readonly kinds?: readonly string[]; readonly order?: 'asc' | 'desc' } = {}): readonly EventRecord[] {
+    if (jobId.trim() === '') throw new Error('listJobEvents requires a non-empty job id');
+    const limit = opts.limit ?? 1_000;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('listJobEvents limit must be an integer from 1 to 10000');
+    const order = opts.order === 'desc' ? 'DESC' : 'ASC';
+    const kinds = opts.kinds;
+    const where = kinds === undefined || kinds.length === 0
+      ? 'job_id = ?'
+      : `job_id = ? AND kind IN (${kinds.map(() => '?').join(', ')})`;
+    return (this.db.prepare(`SELECT * FROM events WHERE ${where} ORDER BY seq ${order} LIMIT ?`)
+      .all(jobId, ...(kinds ?? []), limit) as Row[]).map((row) => this.eventFromRow(row));
+  }
+
   /** Events strictly after `seq` (the awareness digest window), bounded and
    * ordered — oldest-first by default, newest-first with `order: 'desc'`.
    * `kinds` narrows to an explicit set (empty/omitted = every kind). */

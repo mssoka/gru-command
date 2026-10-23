@@ -67,6 +67,7 @@ export interface WorktreeSweepSwept {
 export type WorktreeSweepResult = WorktreeSweepPaused | WorktreeSweepSwept;
 
 import type { WorktreeBaseSource } from '../ledger/api.js';
+import type { LoadedPreBootstrapPatch } from '../worktrees/prebootstrap-patch.js';
 
 /** The worktree subsystem the dispatch flow rides on. */
 export interface WorktreePort {
@@ -85,6 +86,9 @@ export interface WorktreePort {
     readonly trackingRef: string | null;
   }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
+  /** Optional explicit capability: an implementation must apply the admitted
+   * package inside its owned lane and finish unchanged setup before returning. */
+  createJobWorktreeWithPreBootstrapPatch?(input: { repoPath: string; jobId: string; preBootstrapPatch: LoadedPreBootstrapPatch }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
     repoPath: string;
     roundId: string;
@@ -134,6 +138,9 @@ export class UnavailableWorktreePort implements WorktreePort {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createJobWorktree(): Promise<WorktreeLane> {
+    throw new Error(WORKTREE_PORT_UNAVAILABLE);
+  }
+  async createJobWorktreeWithPreBootstrapPatch(): Promise<WorktreeLane> {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createReviewWorktree(): Promise<WorktreeLane> {

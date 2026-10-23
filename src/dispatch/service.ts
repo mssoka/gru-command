@@ -1,5 +1,5 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
 import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
@@ -33,9 +33,6 @@ import {
   type ReviewSourcePackage,
   type ReviewSourcePreflight,
 } from './review-source.js';
-
-type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
-
 import {
   admitBlindReview,
   blindCoverageOf,
@@ -47,6 +44,36 @@ import {
   type BlindCoverage,
 } from './blind-review.js';
 import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
+import { assertPreBootstrapPatchDispatchBinding, preBootstrapIntakeIdentitySha256, readPreBootstrapDependencyPatchPackage, PreBootstrapPatchError, type LoadedPreBootstrapPatch, type PreBootstrapPatchReference } from '../worktrees/prebootstrap-patch.js';
+
+type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+function assertPreBootstrapAuthority(patch: LoadedPreBootstrapPatch, jobId: string, ledger: LedgerApi): void {
+  const expected = patch.package.authority;
+  const current = ledger.directiveCurrentAuthority(jobId);
+  if (current.contractSha256 !== expected.contractSha256 || current.workRevision !== expected.workRevision || current.authorityEpoch !== expected.authorityEpoch ||
+      ledger.getJob(jobId)?.status !== 'working') {
+    throw new PreBootstrapPatchError('authority_mismatch', `job "${jobId}": prebootstrap patch authority/status changed before worker admission`);
+  }
+}
+
+function assertPreBootstrapWorktreeReceipts(patch: LoadedPreBootstrapPatch, jobId: string, lane: WorktreeLane, ledger: LedgerApi): void {
+  const applied = ledger.latestJobEvent(jobId, 'worktree.prebootstrap-patch-applied');
+  const setup = ledger.latestJobEvent(jobId, 'worktree.prebootstrap-setup-succeeded');
+  const appliedPayload = applied?.payload as Record<string, unknown> | null | undefined;
+  const setupPayload = setup?.payload as Record<string, unknown> | null | undefined;
+  const identityMatches = (payload: Record<string, unknown> | null | undefined): payload is Record<string, unknown> =>
+    payload !== null && payload !== undefined && payload['package_sha256'] === patch.packageBytesSha256 &&
+    payload['request_payload_sha256'] === patch.requestPayloadSha256 && payload['intake_identity_sha256'] === patch.intakeIdentitySha256;
+  if (lane.id !== jobId || lane.kind !== 'job' || lane.jobId !== jobId || lane.status !== 'active' || lane.branch === null ||
+      lane.repoPath !== patch.package.repository.path || lane.sha !== patch.package.base.commit || applied === null || setup === null ||
+      applied.seq >= setup.seq || !identityMatches(appliedPayload) || !identityMatches(setupPayload) ||
+      appliedPayload['worktree_path'] !== lane.path || setupPayload['worktree_path'] !== lane.path ||
+      appliedPayload['branch'] !== lane.branch || setupPayload['branch'] !== lane.branch ||
+      appliedPayload['base_sha'] !== lane.sha || setupPayload['base_sha'] !== lane.sha) {
+    throw new PreBootstrapPatchError('setup_receipt_mismatch', `job "${jobId}" worktree manager did not prove the exact patched, setup-successful lane before admission`);
+  }
+}
 
 /** A file's lines as a diff counts them (a final newline ends the last). */
 function fileLines(text: string): readonly string[] {
@@ -177,6 +204,8 @@ export interface DispatchServiceOptions {
   /** #360 R5-B2: admit a blind input package with no preflight to bind it
    * against. Test harnesses only; production always wires the preflight. */
   readonly allowUnboundBlindPackages?: boolean;
+  /** Private, instance-owned hash-pinned pre-bootstrap dependency packages. */
+  readonly preBootstrapPatchRoot?: string;
   /** Issue #316: reads a finished blind reviewer's tool results from its
    * session file (default: the session jsonl on disk). null = unobservable. */
   readonly sessionToolResults?: (sessionFile: string | null) => readonly ObservedToolResult[] | null;
@@ -323,6 +352,8 @@ export class DispatchService {
      * validated completion owes the named decision durably. Omitted =
      * ordinary Silas completion. */
     completionHandoff?: CompletionHandoffIntent;
+    /** Optional initial-dispatch-only dependency patch package. */
+    preBootstrapPatch?: PreBootstrapPatchReference;
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
@@ -360,6 +391,37 @@ export class DispatchService {
     const targetRef = isReportKind ? input.targetRef?.trim() : undefined;
     const targetSha = isReportKind ? input.targetSha?.trim() : undefined;
     const repoName = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
+    let preBootstrapPatch: LoadedPreBootstrapPatch | null = null;
+    if (input.preBootstrapPatch !== undefined) {
+      if (input.deliverable !== undefined && input.deliverable !== 'pr') {
+        throw new PreBootstrapPatchError('lane_unsupported', `job "${input.jobId}": prebootstrap_patch is available only for an ordinary PR-owing implementation lane`);
+      }
+      if (input.parentJobId !== undefined) {
+        throw new PreBootstrapPatchError('lane_unsupported', `job "${input.jobId}": prebootstrap_patch requires a fresh top-level job lane`);
+      }
+      if (input.commissioner !== undefined || input.targetRef !== undefined || input.targetSha !== undefined || input.targetBase !== undefined ||
+          input.requiredInputs !== undefined || input.sourcePackage !== undefined || input.reviewRole !== undefined || input.inputPackage !== undefined ||
+          input.parentContractSha256 !== undefined) {
+        throw new PreBootstrapPatchError('lane_unsupported', `job "${input.jobId}": prebootstrap_patch does not compose with report/review metadata`);
+      }
+      if (this.opts.preBootstrapPatchRoot === undefined) {
+        throw new PreBootstrapPatchError('package_unavailable', `job "${input.jobId}": private prebootstrap package root is not wired — refusing to admit a package that cannot be verified`);
+      }
+      preBootstrapPatch = readPreBootstrapDependencyPatchPackage(this.opts.preBootstrapPatchRoot, input.preBootstrapPatch);
+      if (this.opts.worktrees.createJobWorktreeWithPreBootstrapPatch === undefined) {
+        throw new PreBootstrapPatchError('capability_unavailable', 'the selected worktree manager does not implement guarded prebootstrap dependency-patch custody');
+      }
+      assertPreBootstrapPatchDispatchBinding(preBootstrapPatch, {
+        jobId: input.jobId,
+        repoPath: input.repoPath,
+        title: input.title,
+        displayName: input.displayName ?? null,
+        deliverable: input.deliverable ?? 'pr',
+        briefing: input.briefing,
+        completionHandoff: input.completionHandoff ?? null,
+        packageFile: input.preBootstrapPatch.packageFile,
+      });
+    }
 
     // (0b) Issue #317: prove the ACTUAL selected object store holds the
     // review inputs BEFORE any job row, worktree or reviewer turn exists. A
@@ -485,6 +547,33 @@ export class DispatchService {
     };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
+      if (preBootstrapPatch !== null) {
+        const expected = preBootstrapPatch.package.authority;
+        const current = this.opts.ledger.directiveCurrentAuthority(job.id);
+        if (current.contractSha256 !== expected.contractSha256 || current.workRevision !== expected.workRevision || current.authorityEpoch !== expected.authorityEpoch) {
+          throw new PreBootstrapPatchError('authority_mismatch', `job "${job.id}": prebootstrap patch authority changed before worktree admission`);
+        }
+        this.opts.ledger.appendCustomEvent({
+          kind: 'job.prebootstrap-patch-admitted',
+          jobId: job.id,
+          payload: {
+            version: 1,
+            package_file: preBootstrapPatch.reference.packageFile,
+            package_sha256: preBootstrapPatch.packageBytesSha256,
+            request_payload_sha256: preBootstrapPatch.requestPayloadSha256,
+            intake_identity_sha256: preBootstrapIntakeIdentitySha256(preBootstrapPatch.requestPayloadSha256, preBootstrapPatch.packageBytesSha256),
+            repository_path: preBootstrapPatch.package.repository.path,
+            origin_sha256: preBootstrapPatch.package.repository.originSha256,
+            expected_base_sha: preBootstrapPatch.package.base.commit,
+            expected_base_tree: preBootstrapPatch.package.base.tree,
+            contract_sha256: expected.contractSha256,
+            work_revision: expected.workRevision,
+            authority_epoch: expected.authorityEpoch,
+            allowlist: [...preBootstrapPatch.package.allowlist],
+            request_path: input.repoPath,
+          },
+        });
+      }
 
       // (2b) Explicit completion intent BEFORE admission/side effects: the
       // durable guard row exists before any worktree or spawn, so a crash
@@ -518,12 +607,15 @@ export class DispatchService {
       // the floor admitted holds the next waiter back until it is made.
       let worktree: WorktreeLane;
       try {
-        worktree = await this.opts.worktrees.createJobWorktree({
-          repoPath: input.repoPath,
-          jobId: job.id,
-        });
+        worktree = preBootstrapPatch === null
+          ? await this.opts.worktrees.createJobWorktree({ repoPath: input.repoPath, jobId: job.id })
+          : await this.opts.worktrees.createJobWorktreeWithPreBootstrapPatch!({ repoPath: input.repoPath, jobId: job.id, preBootstrapPatch });
       } finally {
         floorAdmission?.done();
+      }
+      if (preBootstrapPatch !== null) {
+        assertPreBootstrapWorktreeReceipts(preBootstrapPatch, job.id, worktree, this.opts.ledger);
+        assertPreBootstrapAuthority(preBootstrapPatch, job.id, this.opts.ledger);
       }
       const assertHandoff = capturePortLaneHandoff(this.opts.worktrees, worktree);
       if (reviewSource !== null) {
@@ -568,6 +660,7 @@ export class DispatchService {
       try {
         assertHandoff();
         assertAdmissible();
+        if (preBootstrapPatch !== null) assertPreBootstrapAuthority(preBootstrapPatch, job.id, this.opts.ledger);
         const cwd = requireSpawnCwd('minion', worktree.path);
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
@@ -590,10 +683,12 @@ export class DispatchService {
           throw error;
         }
       } catch (error) {
-        // The lane cannot start — release the pacing slot, sweep the fresh
-        // worktree (preserve first, per ruling 18c) and block the job.
+        // The lane cannot start — release the pacing slot and block the job.
+        // A consumed pre-bootstrap package is never cleaned or replayed on an
+        // admission failure: retain its patched lane and custody for readback.
         releaseWorker();
-        await this.sweepQuietly(worktree.id);
+        if (preBootstrapPatch === null) await this.sweepQuietly(worktree.id);
+        else this.log('warn', 'prebootstrap lane retained after worker admission failure', { job: job.id, path: worktree.path });
         throw error;
       }
       // Register the minion lane binding OURSELVES (idempotent): the
@@ -826,13 +921,31 @@ export class DispatchService {
     } catch (error) {
       floorAdmission?.done();
       releaseWorker();
+      const rawError = error instanceof Error ? error.message : String(error);
+      const errorHash = createHash('sha256').update(rawError).digest('hex');
+      const failureDetail = preBootstrapPatch === null ? String(error)
+        : `pre-bootstrap dispatch failed (${error instanceof PreBootstrapPatchError ? error.code : error instanceof Error ? error.name : typeof error}; error_sha256=${errorHash}); use authenticated prebootstrap readback`;
+      if (preBootstrapPatch !== null && this.opts.ledger.latestJobEvent(job.id, 'job.minion-spawned') === null) {
+        try {
+          this.opts.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-dispatch-failed', jobId: job.id,
+            payload: { version: 1, package_sha256: preBootstrapPatch.packageBytesSha256,
+              request_payload_sha256: preBootstrapPatch.requestPayloadSha256,
+              intake_identity_sha256: preBootstrapPatch.intakeIdentitySha256,
+              error_class: error instanceof Error ? error.name : typeof error,
+              error_code: error instanceof PreBootstrapPatchError ? error.code : null,
+              error_sha256: errorHash } });
+        } catch (receiptError) {
+          this.log('error', 'prebootstrap dispatch failure receipt could not be recorded', { job: job.id, error: String(receiptError) });
+        }
+      }
       releaseJobAdmission();
       const current = this.opts.ledger.getJob(job.id);
       if (current !== null && !isJobTerminal(current.status) && current.status !== 'parked') {
         this.opts.ledger.setJobStatus(job.id, 'blocked');
-        this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+        this.opts.ledger.noteJob(job.id, `dispatch failed: ${failureDetail}`);
       }
-      this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
+      this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${failureDetail}`);
+      if (preBootstrapPatch !== null) throw new PreBootstrapPatchError('dispatch_failed', failureDetail, { cause: error });
       throw error;
     }
   }
