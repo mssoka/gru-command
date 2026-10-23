@@ -160,24 +160,36 @@ reset failure.
 the adapter contract already recovers on the next turn. Only hangs and
 fatal errors climb.
 
-**A native directive refusal is not provider-routed (#485).** When GC's own
-directive fence refuses a turn (the directive is held, superseded or
-terminal; a tool fence fails; on Pi, a compaction is still open at
-admission), the turn fails with GC's refusal: a `DirectiveCheckpointError`
-GC raised itself, GC's wrapper whose own cause is one, or the
-`AggregateError` that replaced one whose receipt could not be journaled. The
-adapter tags that error `nativeControl: 'directive-refusal'` (Pi by matching
-the failure to the refusal it recorded, Claude by the failure's cause). On a
-directive turn the supervisor neither paces a tagged, nonfatal, untyped
-error as a rate limit nor classifies it as a wall: the directive's recovery
-path owns it (it disposes the handle, fails or reconciles the directive, and
-surfaces the recovery to Gru). Each skipped refusal leaves a
+**A native directive refusal is not provider-routed (#485).** A directive
+turn can fail with GC's own refusal: a `DirectiveCheckpointError` GC raised
+over its own state. Those are:
+
+- its authority and fence checks (the directive is held, superseded or
+  terminal; a tool fence fails; on Pi, a compaction is still open at
+  admission);
+- its own transcript, binding and receipt I/O (a write or fsync that fails,
+  even with a wall word in the disk's text, such as `EDQUOT: disk quota
+  exceeded`);
+- its own protocol checks on Claude (an answer before the CLI's echo, a
+  second prompt, a lost frame, the permission channel's own deny);
+- the `AggregateError` that replaces one of these when its receipt cannot be
+  journaled.
+
+The adapter tags that error `nativeControl: 'directive-refusal'` (Pi by
+matching the failure to the refusal it recorded, Claude by the failure's
+cause). On a directive turn the supervisor neither paces a tagged, nonfatal,
+untyped error as a rate limit nor classifies it as a wall: the directive's
+recovery path owns it (it disposes the handle, fails or reconciles the
+directive, and surfaces the recovery to Gru). Each skipped refusal leaves a
 `supervision.native-refusal-retained` ledger event naming the agent, with
-`error` (at most 500 characters). A fatal or typed tagged error is still
-routed, and a tag on a turn that carries no directive is logged as a warning
-and routed. GC's wrapper around a plain error (a ledger fault, a Pi
-extension's throw) and any provider error are never tagged, and an error the
-CLI reports in the same turn as a refusal is emitted untagged and routed.
+`error` (at most 500 characters; a cut one adds `error_truncated: true` and
+the original `error_length`). A fatal or typed tagged error is still routed,
+and a tag on a turn that carries no directive is logged as a warning and
+routed. GC's wrapper around an error from code GC does not own (an extension
+hook, the SDK, the provider) is never tagged, and Pi's re-check wrapper is
+tagged only when its own cause is a refusal. A main-thread API error the CLI
+reports in the same turn as a refusal is emitted untagged and routed; a
+subagent's API error, or a result error GC's own abort caused, is not.
 
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent

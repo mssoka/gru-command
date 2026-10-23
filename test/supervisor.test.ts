@@ -3284,7 +3284,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     }
   });
 
-  it('a tagged refusal on a directive turn skips pacing and the decision service, and leaves a bounded durable trace (#485)', async () => {
+  it('a tagged refusal on a directive turn skips pacing and the decision service, and leaves a bounded, marked durable trace (#485)', async () => {
     const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
       deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
     const sleeper = new ManualSleeper();
@@ -3293,8 +3293,10 @@ describe('supervisor — decision-backed failure guidance', () => {
       const handle = new FakeHandle('minion', 'minion-native-refusal', null);
       handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
       h.registry.adopt(handle);
-      // Rate-limit-looking text: routed, it would start the automatic retry.
-      const error = `DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work may proceed; ${'detail '.repeat(100)}`;
+      // Rate-limit-looking text: routed, it would start the automatic retry. The
+      // bound falls inside an emoji's surrogate pair: the cut keeps whole code points.
+      const head = 'DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work may proceed; ';
+      const error = `${head.padEnd(MAX_PACING_ERROR_CHARS - 1, 'x')}😀${'detail '.repeat(10)}`;
       handle.emit({ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' });
       for (let i = 0; i < 16; i += 1) await Promise.resolve();
       expect(sleeper.delays).toEqual([]);
@@ -3303,7 +3305,8 @@ describe('supervisor — decision-backed failure guidance', () => {
       expect(events.some((event) => event.kind.startsWith('pacing.') || event.kind === 'supervision.guidance')).toBe(false);
       expect(error.length).toBeGreaterThan(MAX_PACING_ERROR_CHARS);
       expect(events.filter((event) => event.kind === 'supervision.native-refusal-retained')).toEqual([
-        expect.objectContaining({ agentId: handle.id, jobId: `job-${handle.id}`, payload: { error: error.slice(0, MAX_PACING_ERROR_CHARS) } }),
+        expect.objectContaining({ agentId: handle.id, jobId: `job-${handle.id}`,
+          payload: { error: error.slice(0, MAX_PACING_ERROR_CHARS - 1), error_truncated: true, error_length: error.length } }),
       ]);
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
       expect(handle.disposed).toBe(false);
@@ -3311,6 +3314,23 @@ describe('supervisor — decision-backed failure guidance', () => {
       // The same text untagged is routed: the automatic retry is scheduled.
       handle.emit({ type: 'error', error, fatal: false });
       expect(sleeper.delays).toEqual([100]);
+    } finally { h.dispose(); }
+  });
+
+  it('a tagged refusal whose pending turn cannot be read is logged loud and routed as an ordinary failure (#485)', async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const h = boot(undefined, { log: (level, msg) => logs.push({ level, msg }) });
+    try {
+      const handle = new FakeHandle('minion', 'minion-unreadable-turn', null);
+      handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+      Object.defineProperty(handle, 'pendingTurn', { value: () => { throw new Error('pending turn unreadable'); } });
+      h.registry.adopt(handle);
+      // Routed, GC's refusal text with the disk's words walls: the fallback is visible.
+      handle.emit({ type: 'error', error: 'directive refused: directive transcript write failed: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' });
+      expect(logs).toContainEqual({ level: 'warn', msg: 'pending-turn read failed — a native directive refusal is routed as an ordinary failure' });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
     } finally { h.dispose(); }
   });
 

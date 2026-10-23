@@ -203,8 +203,9 @@ export function deterministicFailureClass(reason: string): FailureClass {
   // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed)
   // so real walls keep their deterministic stop. "authorized" stays a signal:
   // providers say "no longer authorized" or "only authorized for use with
-  // Claude Code". GC's own refusal texts avoid wall words instead, and the
-  // native-refusal tag keeps them from walls whatever they say (#485).
+  // Claude Code". For GC's own refusals the tag, not the text, is the guard
+  // (#485); GC's literal refusal texts avoid wall words so an untagged one
+  // still reads `unknown`.
   if (
     /\b(?:unauthorized|oauth|auth(?:entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';

@@ -457,6 +457,16 @@ export type SupervisorRestartPolicy =
   | { readonly options: SpawnOptions }
   | { readonly refuse: string };
 
+/** The supervision.native-refusal-retained payload: the error, bounded at
+ * MAX_PACING_ERROR_CHARS on a code-point boundary, and marked when cut. */
+function retainedRefusalPayload(error: string): Record<string, unknown> {
+  if (error.length <= MAX_PACING_ERROR_CHARS) return { error };
+  const cut = error.slice(0, MAX_PACING_ERROR_CHARS);
+  const last = cut.charCodeAt(cut.length - 1);
+  const bounded = last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+  return { error: bounded, error_truncated: true, error_length: error.length };
+}
+
 export class Supervisor {
   private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
@@ -1017,7 +1027,7 @@ export class Supervisor {
                 agent_id: agent.agentId,
                 error: event.error,
               });
-              this.recordEvent('supervision.native-refusal-retained', agent.agentId, { error: event.error.slice(0, MAX_PACING_ERROR_CHARS) });
+              this.recordEvent('supervision.native-refusal-retained', agent.agentId, retainedRefusalPayload(event.error));
               break;
             }
             // Only a directive turn has a directive recovery path to own it.

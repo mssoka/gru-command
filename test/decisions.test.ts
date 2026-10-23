@@ -246,29 +246,52 @@ describe('typed decision semantics', () => {
       'request failed: 401',
       'authentication failed',
       'invalid api key',
+      'authorization header rejected',
+      'auth-failure from upstream',
     ]) expect(deterministicFailureClass(text), text).toBe('authentication_wall');
     expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed')).toBe('unknown');
     // The old wording walled on its own: untagged text never protected a refusal; the tag does.
     expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized')).toBe('authentication_wall');
   });
 
-  it('no DirectiveCheckpointError text GC writes is blank or names a wall (#485)', () => {
+  // Scanned below: every literal message of `new DirectiveCheckpointError(…)` and
+  // `new DirectiveRuntimeUnsupportedError(…)` (a `+`-joined chain of literals
+  // counts), the literal reasons of the local refuse()/refused() helpers in
+  // directive-checkpoint.ts and ledger/api.ts, the Claude permission channel's
+  // refusal and failure texts (claude-directive.ts), and the I/O names given to
+  // withOwnIo()/ownIoRefusal(). Not visible to it, checked by hand in #485 (the
+  // texts arrive in variables): directive-progress.ts's result.note, lockBlocker,
+  // proof.reason/proof.error and verdict.error (directive recovery only;
+  // verdict.error can carry a provider's own text); directive-checkpoint.ts's
+  // oversized, at, refusal and retry (fed by literals scanned here); the Claude
+  // channel's `new DirectiveCheckpointError(reason)` (its reasons are scanned
+  // here); and ownIoRefusal's fault text after GC's prefix, which is the
+  // disk's or the OS's words and is guarded by the tag, not by its text.
+  it('no refusal text GC writes is blank or names a wall (#485)', () => {
     const tick = '`';
     const literal = String.raw`'(?:[^'\\]|\\.)*'|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
+    const chain = String.raw`(?:${literal})(?:\s*\+\s*(?:${literal}))*`;
+    const scans: readonly (readonly [RegExp, (file: string) => boolean])[] = [
+      [new RegExp(String.raw`new Directive(?:CheckpointError|RuntimeUnsupportedError)\(\s*(${chain})`, 'gu'), () => true],
+      [new RegExp(String.raw`\brefused?\(\s*(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts') || file.endsWith(join('ledger', 'api.ts'))],
+      [new RegExp(String.raw`\bdeps\.(?:refused\([^,()]*,|fail\()\s*(${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
+      [new RegExp(String.raw`\bconst reason = (${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
+      [new RegExp(String.raw`\b(?:withOwnIo|ownIoRefusal)\(\s*(${chain})`, 'gu'), () => true],
+    ];
     const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
       entry.isDirectory() ? sources(join(dir, entry.name)) : entry.name.endsWith('.ts') ? [join(dir, entry.name)] : []);
-    const messages: string[] = [];
+    const texts: string[] = [];
     for (const file of sources(join(import.meta.dirname, '..', 'src'))) {
       const source = readFileSync(file, 'utf-8');
-      for (const match of source.matchAll(new RegExp(String.raw`new DirectiveCheckpointError\(\s*(${literal})`, 'gu'))) messages.push(match[1]!);
-      // The checkpoint reader refuses through its local refuse()/refused() helpers.
-      if (file.endsWith('directive-checkpoint.ts')) {
-        for (const match of source.matchAll(new RegExp(String.raw`\brefused?\(\s*(${literal})`, 'gu'))) messages.push(match[1]!);
+      for (const [pattern, applies] of scans) {
+        if (!applies(file)) continue;
+        // Interpolations are runtime detail; the text GC writes around them is what is classified.
+        for (const match of source.matchAll(pattern)) {
+          texts.push([...match[1]!.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('').replace(/\$\{[^}]*\}/gu, 'x'));
+        }
       }
     }
-    expect(messages.length).toBeGreaterThan(250);
-    // Interpolations are runtime detail; the text GC writes around them is what is classified.
-    const texts = messages.map((raw) => raw.slice(1, -1).replace(/\$\{[^}]*\}/gu, 'x'));
+    expect(texts.length).toBeGreaterThan(280);
     expect(texts.filter((text) => text.trim() === '')).toEqual([]);
     expect(texts.filter((text) => !['unknown', 'fatal_runtime'].includes(deterministicFailureClass(text)))).toEqual([]);
   });
