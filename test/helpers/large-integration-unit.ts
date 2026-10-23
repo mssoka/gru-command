@@ -43,7 +43,9 @@ export function commitManyPaths(repo: FixtureRepo, count: number, directory = 'm
     writeFileSync(join(repo.path, directory, `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
   }
   repo.git(['add', directory]);
-  repo.git(['commit', '-m', `touch ${String(count)} paths`]);
+  // An explicit identity: the CI runner has none, and a fixture repo may not
+  // configure one either.
+  repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', `touch ${String(count)} paths`]);
 }
 
 /** Generous for writing and committing thousands of files on a loaded runner. */
