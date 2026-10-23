@@ -2,8 +2,8 @@ import { PassThrough } from 'node:stream';
 import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { EventEmitter } from 'node:events';
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { EventEmitter, once } from 'node:events';
+import { appendFileSync, closeSync, constants as fsConstants, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -2876,10 +2876,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
      * Node hands each of them the same root error, deterministically. `sharedRoot`
      * counts, apart from the hold's own count, the write callbacks that received
      * that root error object itself: the failing write and every frame behind it.
-     * A permission request is never held: the CLI waits for its answer, so no
-     * frame would come to release the hold; the helper fails that write with a
-     * text naming the misuse instead. A held echo or result is released by the
-     * next frame or by the stream's end.
+     * Once the hold is released, a write made outside a callback that got the
+     * root error waits for that error to land, so exactly the frames queued
+     * before it share it; one made inside such a callback is queued at once, as
+     * Node queues it. A permission request is never held, and one queued behind
+     * a hold (written while it is open, or batched behind the held chunk) is
+     * failed: the CLI waits for its answer, so no frame would come to release
+     * the hold. The helper fails such a write with a text naming the misuse.
+     * Any other held frame is released by `holdUntil` frames behind it, or by
+     * the stream's end.
      * No adapter seam fails a transcript write: the stream comes straight from
      * node:fs createWriteStream, which only a file-wide vi.mock('node:fs') could
      * replace, and that would reach every test in this file. */
@@ -2898,6 +2903,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         const end = stream.end.bind(stream);
         let held: Callback | null = null;
         let released = false;
+        let insideRoot = 0;
+        const permissionRequest = (chunk: string): boolean => (JSON.parse(chunk) as Record<string, unknown>)['type'] === 'control_request';
+        const queuedRefusal = 'failTranscriptChunk refuses a permission request queued behind a held write: the CLI waits for its answer, so no frame comes to release the hold';
         const release = (): void => {
           if (held === null) return;
           const callback = held;
@@ -2912,7 +2920,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         const failing = (callback: Callback, behind: number, chunk: string): void => {
           state.broken = true;
           if (holdUntil === 0) { callback(root); return; }
-          if ((JSON.parse(chunk) as Record<string, unknown>)['type'] === 'control_request') {
+          if (permissionRequest(chunk)) {
             callback(new Error('failTranscriptChunk refuses holdUntil > 0 on a control_request: the CLI waits for its answer, so no frame comes to release the hold'));
             return;
           }
@@ -2926,6 +2934,12 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         };
         stream._writev = (chunks, callback) => {
           const at = state.broken ? -1 : chunks.findIndex(({ chunk }) => matches(chunk.toString()));
+          // A permission request already batched behind the chunk to hold.
+          if (at >= 0 && holdUntil > 0 && chunks.slice(at + 1).some(({ chunk }) => permissionRequest(chunk.toString()))) {
+            state.broken = true;
+            callback(new Error(queuedRefusal));
+            return;
+          }
           if (at >= 0) { failing(callback, chunks.length - 1 - at, chunks[at]!.chunk.toString()); return; }
           writev(chunks, callback);
         };
@@ -2934,12 +2948,21 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         stream.write = (...args) => {
           const at = args.findIndex((arg) => typeof arg === 'function');
           const callback = at < 0 ? undefined : args[at] as Callback;
-          const observed: Callback = (error) => { if (error === root) state.sharedRoot += 1; callback?.(error); };
+          const observed: Callback = (error) => {
+            if (error !== root) { callback?.(error); return; }
+            state.sharedRoot += 1;
+            insideRoot += 1;
+            try { callback?.(error); } finally { insideRoot -= 1; }
+          };
           if (at < 0) args.push(observed);
           else args[at] = observed;
+          if (held !== null && permissionRequest(String(args[0]))) {
+            process.nextTick(() => observed(new Error(queuedRefusal)));
+            return true;
+          }
           // A write made once the hold is released waits for the root error to
-          // land, so exactly the frames queued before it share that error.
-          if (released) { process.nextTick(() => queue(...args)); return true; }
+          // land, unless it is made inside a callback that got that error.
+          if (released && insideRoot === 0) { process.nextTick(() => queue(...args)); return true; }
           const behind = held !== null;
           const written = queue(...args);
           if (behind && held !== null && ++state.queuedBehind >= holdUntil) release();
@@ -2975,6 +2998,41 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           .rejects.toThrow(/failTranscriptChunk refuses holdUntil > 0 on a control_request: the CLI waits for its answer, so no frame comes to release the hold/u);
         expect(lost.broken).toBe(true);
         expect(lost.sharedRoot).toBe(0); // never held: the root error was never handed out
+      } finally { await handle.dispose(); }
+    });
+
+    it('the lost-write helper queues a write made inside a callback that got the root error at once, as Node does (#485)', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'gru-lost-write-'));
+      const stream = createWriteStream(join(dir, 'transcript.jsonl'));
+      try {
+        await once(stream, 'open');
+        stream.on('error', () => { /* the root error, as the adapter's own listener takes it */ });
+        const listeners: ((event: RuntimeEvent) => void)[] = [];
+        const handle = { liveTranscript: stream, subscribe: (listener: (event: RuntimeEvent) => void) => { listeners.push(listener); return () => {}; } };
+        const lost = failTranscriptChunk(handle as unknown as AgentHandle, (chunk) => chunk.includes('"held"'), 'EDQUOT: disk quota exceeded', 1);
+        for (const listener of listeners) listener({ type: 'turn_start' });
+        const inner = new Promise<Error | null | undefined>((resolve) => {
+          // The held write's own callback writes again: Node buffers that write behind the
+          // failure, and it gets the root error too.
+          stream.write(`${JSON.stringify({ type: 'held' })}\n`, () => { stream.write(`${JSON.stringify({ type: 'inner' })}\n`, resolve); });
+        });
+        stream.write(`${JSON.stringify({ type: 'behind' })}\n`);
+        expect(String(await inner)).toBe('Error: EDQUOT: disk quota exceeded');
+        expect(lost.sharedRoot).toBe(3);
+      } finally {
+        stream.destroy();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('the lost-write helper fails a permission request queued behind a held write, by name, instead of hanging the turn (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      // The tool_use frame is held; the CLI's permission request for it comes next.
+      failTranscriptChunk(handle, (chunk) => chunk.includes('"type":"assistant"') && chunk.includes('"tool_use"'), 'EDQUOT: disk quota exceeded', 50);
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-permission-queued'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/failTranscriptChunk refuses a permission request queued behind a held write: the CLI waits for its answer, so no frame comes to release the hold/u);
       } finally { await handle.dispose(); }
     });
 
@@ -3039,8 +3097,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     it('an EDQUOT in the completion receipt is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('completion receipt'));
     it('an EDQUOT in the spawn-time controller receipt is one tagged refusal, and no CLI starts (#485)', () => assertClaudeBookkeepingFault('controller receipt'));
 
-    /** Makes the handle's `recordDirectiveFailure` throw "EDQUOT: disk quota exceeded" on the
-     * permission channel's own refusal, once, or on every call (#485). */
+    /** Models a GC bug: the handle's `recordDirectiveFailure`, which only keeps the turn's
+     * failure in memory and cannot throw in production, throws a TypeError whose words name a
+     * wall, on the permission channel's own refusal, once, or on every call (#485). */
     const throwOnChannelRefusal = (handle: AgentHandle, times: 'once' | 'always') => {
       const target = handle as unknown as { recordDirectiveFailure(turn: unknown, error: unknown): unknown };
       const record = target.recordDirectiveFailure.bind(handle);
@@ -3048,15 +3107,14 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       return vi.spyOn(target, 'recordDirectiveFailure').mockImplementation((turn, error) => {
         if (times === 'always' || (!thrown && error instanceof DirectiveCheckpointError && error.message === 'malformed or foreign directive permission request')) {
           thrown = true;
-          throw new Error('EDQUOT: disk quota exceeded');
+          throw new TypeError("Cannot read properties of undefined (reading 'quota')");
         }
         return record(turn, error);
       });
     };
 
-    /** The channel's deny of a repeated ask whose refusal cannot be recorded, once or ever:
-     * its handling fails, which is GC's own directive control, so the turn is refused, tagged,
-     * by the channel's guard (#485). */
+    /** The channel's deny of a repeated ask, recorded by a buggy `recordDirectiveFailure`
+     * that throws once or every time: the channel's backstop refuses the turn, tagged (#485). */
     async function assertChannelHandlingRefused(times: 'once' | 'always') {
       const fx = fixture({ killGraceMs: 300 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
@@ -3064,7 +3122,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
       const unrecorded = throwOnChannelRefusal(handle, times);
-      const error = 'directive permission handling failed: EDQUOT: disk quota exceeded';
+      const error = 'directive permission handling failed: Cannot read properties of undefined (reading \'quota\')';
       try {
         await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor(`claude-channel-unrecorded-${times}`), beforeAdmission: () => {}, onAdmitted: () => {} } }))
           .rejects.toThrow(new Error(error));
@@ -3073,15 +3131,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // Its words alone would wall: the tag is what keeps it with directive recovery.
         expect(deterministicFailureClass(error)).toBe('quota_wall');
         expect(fx.logs, times).toContainEqual({ level: 'error', msg: 'claude directive permission handling threw; the turn is refused',
-          fields: { failure: 'malformed or foreign directive permission request', error: expect.stringMatching(/^Error: EDQUOT: disk quota exceeded\n/u) } });
+          fields: { failure: 'malformed or foreign directive permission request', error: expect.stringMatching(/^TypeError: Cannot read properties of undefined \(reading 'quota'\)\n/u) } });
         expect(fx.logs.some((line) => line.msg === 'claude directive refusal could not be recorded; the turn is refused regardless'), times).toBe(times === 'always');
       } finally {
         unrecorded.mockRestore();
         await handle.dispose();
       }
     }
-    it('a channel deny whose refusal cannot be recorded once is still a tagged refusal, by the channel\'s guard (#485)', () => assertChannelHandlingRefused('once'));
-    it('a channel deny whose refusal can never be recorded is still a tagged refusal, never only the CLI\'s close (#485)', () => assertChannelHandlingRefused('always'));
+    it('a GC bug that makes recordDirectiveFailure throw once at a channel deny still refuses the turn, tagged, through the channel\'s backstop (#485)', () => assertChannelHandlingRefused('once'));
+    it('a GC bug that makes recordDirectiveFailure throw on every call still refuses the turn, tagged, never only at the CLI\'s close (#485)', () => assertChannelHandlingRefused('always'));
 
     /** A failure still owed its report stays the turn's failure, with its own text and
      * as its own cause, through GC's own later failures (#485). The plain one is a GC bug
@@ -3093,7 +3151,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
       if (next === 'second prompt') process.env['CLAUDE_DOUBLE_REPLAY_AFTER_TOOL'] = '1';
       if (next === 'channel deny' || next === 'channel deny unrecorded') process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
-      // The channel's deny cannot be recorded once: its handling fails, and the owed failure still routes.
+      // A GC bug makes recording the channel's deny throw once: the owed failure still routes.
       const unrecorded = next === 'channel deny unrecorded' ? throwOnChannelRefusal(handle, 'once') : null;
       // The lost write waits until two more frames are queued behind it: Node hands each the same root
       // error. It is the double's echo of the fence's deny (Claude Code 2.1.306 echoes only its
@@ -3144,7 +3202,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         }
         if (next === 'channel deny unrecorded') {
           expect(fx.logs).toContainEqual({ level: 'error', msg: 'claude directive permission handling threw; the turn is refused',
-            fields: { failure: 'malformed or foreign directive permission request', error: expect.stringMatching(/^Error: EDQUOT: disk quota exceeded\n/u) } });
+            fields: { failure: 'malformed or foreign directive permission request', error: expect.stringMatching(/^TypeError: Cannot read properties of undefined \(reading 'quota'\)\n/u) } });
         }
       } finally {
         vi.useRealTimers();
@@ -3154,16 +3212,38 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     }
     it('an owed plain fence failure stays the turn\'s, routed with its own text, when a transcript write fails next (#485)', () => assertOwedFailureKept('plain', 'lost write'));
-    it('an owed plain fence failure stays the turn\'s, routed with its own text, when the channel\'s deny cannot be recorded next (#485)', () => assertOwedFailureKept('plain', 'channel deny unrecorded'));
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when a GC bug makes recording the channel\'s deny throw next (#485)', () => assertOwedFailureKept('plain', 'channel deny unrecorded'));
     it('an owed plain fence failure stays the turn\'s, routed with its own text, when a second prompt arrives next (#485)', () => assertOwedFailureKept('plain', 'second prompt'));
     it('an owed plain fence failure stays the turn\'s, routed with its own text, when the channel denies a repeated ask next (#485)', () => assertOwedFailureKept('plain', 'channel deny'));
     it('an owed refusal stays the turn\'s, tagged with its own text, when handling a lost write throws (#485)', () => assertOwedFailureKept('refusal', 'handler throws'));
     it('an owed bookkeeping fault and a later lost write are each logged once (#485)', () => assertOwedFailureKept('bookkeeping', 'lost write'));
 
+    /** A spawn that keeps the permission answers GC writes to the CLI's stdin: what the
+     * channel decided, whether or not the CLI echoes it before it is killed (#485). */
+    const recordingAnswers = () => {
+      const answers: StreamFrame[] = [];
+      const spawnProcess = ((binary: string, args: readonly string[], options: object) => {
+        const child = spawn(binary, args, options);
+        const stdin = child.stdin as unknown as { write: (...args: unknown[]) => boolean };
+        const write = stdin.write.bind(stdin);
+        stdin.write = (...written) => {
+          for (const line of String(written[0]).split('\n').filter((text) => text.trim() !== '')) {
+            const frame = JSON.parse(line) as StreamFrame;
+            const answer = frame['type'] === 'control_response' ? (frame['response'] as StreamFrame)['response'] as StreamFrame | undefined : undefined;
+            if (answer !== undefined && 'behavior' in answer) answers.push(answer);
+          }
+          return write(...written);
+        };
+        return child;
+      }) as unknown as typeof spawn;
+      return { spawnProcess, answers };
+    };
+
     /** Two concurrent permission requests, durable in one tick: once either fence has
      * failed, neither tool is allowed, even an allow its own fence already passed (#485). */
     async function assertConcurrentFenceRefusal(failing: 'first' | 'second') {
-      const fx = fixture({ killGraceMs: 300 });
+      const wire = recordingAnswers();
+      const fx = fixture({ killGraceMs: 300, spawnProcess: wire.spawnProcess });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const events = collect(handle);
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
@@ -3178,9 +3258,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // before any authority check of its own.
         expect(checks).toBe(failing === 'first' ? 2 : 3);
         expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: `directive refused: ${refusal}`, fatal: false, nativeControl: 'directive-refusal' }]);
-        const answers = frames(handle.sessionFile!).filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior"'));
-        expect(answers).toHaveLength(2);
-        expect(answers.every((frame) => JSON.stringify(frame).includes('"behavior":"deny"'))).toBe(true);
+        // Both answers the channel wrote to the CLI are denies.
+        expect(wire.answers.map((answer) => answer['behavior'])).toEqual(['deny', 'deny']);
         // The other request's deny is durable too: its own guard receipt.
         const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; reason?: string });
         expect(receipts.filter((receipt) => receipt.state === 'guard-refused').map((receipt) => receipt.toolCallId).sort()).toEqual(['toolu_pair_1', 'toolu_pair_2']);
@@ -3195,7 +3274,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
      * fences the second is still refused, with no tool allowed; at the completion the
      * turn is refused, never a success. Its texts, durable ones included, name it. */
     async function assertNullishClaudeFence(site: 'authority check' | 'manifest' | 'completion manifest', thrown: null | undefined) {
-      const fx = fixture({ killGraceMs: 300 });
+      const wire = recordingAnswers();
+      const fx = fixture({ killGraceMs: 300, spawnProcess: wire.spawnProcess });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const events = collect(handle);
       // A fence's refusal ends a CLI that ignores SIGTERM; the completion's lets it exit on its own.
@@ -3224,9 +3304,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         }
         // Both asks were denied: no tool was allowed after the failed fence. The first's
         // deny and its durable receipt name the bare value.
-        const answers = frames(handle.sessionFile!).filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior"'))
-          .map((frame) => ((frame['response'] as StreamFrame)['response'] as StreamFrame));
-        expect(answers).toEqual([
+        expect(wire.answers).toEqual([
           { behavior: 'deny', message: `Refused by the directive's authority fence: ${reason}` },
           { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' },
         ]);

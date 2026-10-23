@@ -69,10 +69,16 @@ export class ClaudeDirectivePermissionChannel {
        * transport or protocol failure names no report and reports itself. */
       readonly fail: (message: string, refused?: unknown) => void;
       /** Handling one of the channel's failures threw: the host's `refused()`
-       * or `fail()` (#485). That is GC's own directive control failing, so the
-       * host fails the turn with a refusal of `reason`, tagged, or with an
-       * earlier failure still owed (rule A), and does so even when it cannot
-       * record either. If this throws too, the channel ends the CLI itself. */
+       * or `fail()` (#485). The Claude host's don't throw in production (its
+       * logger swallows its own faults, the guard receipt's journal faults are
+       * caught and retried at cessation, the turn's failure is recorded in
+       * memory, and emit() isolates listeners), so this is a backstop for a GC
+       * bug. It is GC's own directive control failing: after `refused()`
+       * throws, the host fails the turn with a refusal of `reason`, tagged, or
+       * with the failure the turn already owes (a directive turn reports its
+       * first failure). After `fail()` throws, the turn's failure is already
+       * set (the text `fail()` was given), so this adds nothing but ending the
+       * CLI. If this throws too, the channel ends the CLI itself. */
       readonly failRefused: (reason: string) => void;
       /** A tool request this channel denied itself (malformed or foreign, or a
        * fence that failed), once the deny is handed to the CLI's stdin: the
@@ -191,9 +197,10 @@ export class ClaudeDirectivePermissionChannel {
     }
   }
 
-  /** Handling `failure` threw (the host's `refused()` or `fail()`; #485). The
-   * log names both; the host fails the turn as GC's own refusal; if that
-   * throws as well, the channel ends the CLI itself. Never throws. */
+  /** Handling `failure` threw (the host's `refused()` or `fail()`; #485): a
+   * backstop for a GC bug (see `failRefused`). The log names both; the host
+   * fails the turn as GC's own refusal; if that throws as well, the channel
+   * ends the CLI itself. Never throws. */
   private handlingThrew(failure: string, error: unknown): void {
     try {
       this.deps.log('claude directive permission handling threw; the turn is refused', { failure, error: thrownDetail(error) });

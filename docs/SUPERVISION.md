@@ -173,10 +173,15 @@ fatal errors climb.
   terminal; a tool fence fails; on Pi, a compaction is still open at
   admission);
 - its protocol checks (on Claude: an answer before the CLI's echo, a second
-  prompt, a lost frame, the permission channel's own deny, and a failure
-  while the channel hands one of its own failures to the turn: the turn is
-  refused even when that refusal cannot be recorded, and if the host cannot
-  end the turn the channel ends the CLI itself, SIGTERM then SIGKILL);
+  prompt, a lost frame, the permission channel's own deny). The channel also
+  guards its hand-off to the turn, as a backstop for a GC bug: the host's
+  refusal and turn-failure calls don't throw in production (the logger
+  swallows its own faults, a guard receipt's journal faults are caught and
+  retried at cessation, the turn's failure is kept in memory, and listeners
+  are isolated). If recording the channel's refusal throws anyway, the turn
+  fails as a tagged refusal, or with the failure it already owes; if ending
+  the turn throws, the turn's failure is already set and its CLI is still
+  ended (SIGTERM, then SIGKILL after the grace);
 - its directive bookkeeping I/O inside a turn: transcript, binding, receipt
   and producer-journal I/O, and the GC ledger calls made for the directive
   (`beforeAdmission`, `onAdmitted`). A fault there, even one whose text names

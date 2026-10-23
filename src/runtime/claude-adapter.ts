@@ -2394,14 +2394,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       /** A live directive child already reported an error (handled once). */
       let liveError = false;
       const abortTurn = (detail: string, cause?: unknown): void => {
-        try {
-          failTurn(detail, cause);
-        } finally {
-          // The CLI is ended even when failing the turn throws (#485).
-          endChild();
-        }
-      };
-      const endChild = (): void => {
+        failTurn(detail, cause);
         if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
         try { child.stdin?.end(); } catch { /* already closed */ }
         try { child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -2430,8 +2423,10 @@ export class ClaudeCodeHandle implements AgentHandle {
                   // earlier failure still owed its report stays the turn's.
                   const owed = this.recordDirectiveFailure(turn, failure);
                   this.log('error', 'directive failure handling threw after a lost transcript write', { error: thrownDetail(failure) });
-                  // abortTurn cannot throw: its signals are guarded and event
-                  // listeners are isolated by emit().
+                  // abortTurn cannot throw: failTurn cannot (emit() isolates
+                  // listeners and names what they throw through thrownText, and
+                  // the logger swallows its own faults), and its signals are
+                  // guarded.
                   abortTurn(owed === failure ? `directive failure handling threw: ${thrownText(failure)}` : `directive refused: ${thrownText(owed)}`, owed);
                 } finally {
                   resolveWritten();
@@ -2712,20 +2707,26 @@ export class ClaudeCodeHandle implements AgentHandle {
             const failure = this.recordDirectiveFailure(turn, refusal);
             return { failure, owed: failure !== refusal };
           },
-          // Handling the channel's own failure threw: GC's directive control
-          // failed, so the turn is refused, tagged, or fails with the failure
-          // it still owes, recorded or not (#485).
+          // Handling the channel's own failure threw (#485). refused() and
+          // fail() above don't throw in production (see the channel's
+          // contract), so this is a backstop for a GC bug: the turn is
+          // refused, tagged, or fails with the failure it already owes. The
+          // refusal stays on the turn and the CLI is ended before anything is
+          // logged, so no later effect or completion passes it.
           failRefused: (reason) => {
             const refusal = new DirectiveCheckpointError(reason);
+            let unrecorded: { readonly error: unknown } | null = null;
             try {
               this.recordDirectiveFailure(turn, refusal);
             } catch (error) {
-              this.log('error', 'claude directive refusal could not be recorded; the turn is refused regardless', { request: turn.directive.identity.requestId, error: thrownDetail(error) });
+              unrecorded = { error };
             }
-            // Kept by the turn even so: no later effect, and no completion, passes it.
             turn.failure ??= { error: refusal };
             const failure = turn.failure.error;
             abortTurn(failure === refusal ? reason : `directive refused: ${thrownText(failure)}`, failure);
+            if (unrecorded !== null) {
+              this.log('error', 'claude directive refusal could not be recorded; the turn is refused regardless', { request: turn.directive.identity.requestId, error: thrownDetail(unrecorded.error) });
+            }
           },
           decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
           confirm: (request) => this.confirmDirectiveTool(turn, request),

@@ -218,21 +218,27 @@ export function deterministicFailureClass(reason: string): FailureClass {
   // that name one match: authentication_failed, oauth_org_not_allowed,
   // verification_required, account_on_hold (a refused OAuth refresh) and
   // cloud_credential_error are authentication walls; billing_error and
-  // rate_limit are quota walls. A cloud_credential_error walls by its token: its
-  // detail is the first cause's text, and every one that reaches a user names a
-  // credential only a human restores (a refresh token, a client, a key file, the
-  // default chain, SSO); the CLI's own status table says "blocked, check or
-  // refresh". A transient hiccup there then needs a re-arm. A rate limit is
-  // paced first: pacing's bounded retry sees one (the CLI's statusless capacity
-  // off-switch, typed rate_limit, included). A quota-class text (rate limit,
-  // rate_limit, 429, …) then walls here with no pacing policy, or once the
-  // bounded budget is spent; pacing's other texts ("too many requests",
-  // "throttled", "rate limiting") read unknown then; and a rate limit with
-  // nothing to re-deliver walls at once even with pacing on. The other codes
-  // name no wall: model_not_found reads unknown (a restart, then the breaker if
-  // it persists). For GC's own refusals the tag, not the text, is the guard
-  // (#485); GC's literal refusal texts avoid wall words so an untagged one still
-  // reads `unknown`.
+  // rate_limit are quota walls.
+  //
+  // cloud_credential_error walls by its token. 2.1.309 marks it transient
+  // (apiErrorIsTransient) and its goal loop retries it, and its 60 s "AWS
+  // default-chain credential resolve timed out" can be a hiccup. GC walls it
+  // anyway: its detail is the first cause's text, and nearly every one that
+  // reaches a user names a credential only a human restores (a refresh token, a
+  // client, a key file, the default chain, SSO). A wall goes to Gru's decision
+  // (an auth failure stays machine attention), so a hiccup costs a Gru decision,
+  // not a lost lane.
+  //
+  // A rate limit is paced first: pacing's bounded retry sees one (the CLI's
+  // statusless capacity off-switch, typed rate_limit, included). A quota-class
+  // text (rate limit, rate_limit, 429, …) then walls here with no pacing policy,
+  // or once the bounded budget is spent, and it alone walls at once when there
+  // is nothing to re-deliver; pacing's other texts ("too many requests",
+  // "throttled", "rate limiting") read unknown and restart. The other codes name
+  // no wall: model_not_found reads unknown (a restart, then the breaker if it
+  // persists). For GC's own refusals the tag, not the text, is the guard (#485);
+  // GC's literal refusal texts avoid wall words so an untagged one still reads
+  // `unknown`.
   if (
     /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|cloud_credential_error|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';

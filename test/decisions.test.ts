@@ -292,11 +292,12 @@ describe('typed decision semantics', () => {
     const credentials = (cloud: string, detail: string): string =>
       `API Error: Could not load ${cloud} credentials · ${detail.trimEnd().replace(/[.!?…]+$/u, '')}. Check or refresh your ${cloud} credentials and try again. (cloud_credential_error)`;
     const environment = 'Unable to read the credential file specified by the GOOGLE_APPLICATION_CREDENTIALS environment variable: ';
-    // Every detail that reaches a user names a credential only a human restores. These read
+    // Nearly every detail that reaches a user names a credential only a human restores (the
+    // default-chain timeout can be a hiccup; a wall costs it a Gru decision). These read
     // unknown by their words alone; the token walls them.
     for (const text of [
       credentials('Google Cloud', `${environment}The file at /keys/sa.json does not exist, or it is not a file. ENOENT: no such file or directory, lstat '/keys/sa.json'`),
-      credentials('Google Cloud', "EACCES: permission denied, open '/home/u/.config/gcloud/application_default_credentials.json'"),
+      credentials('Google Cloud', "EACCES: permission denied, open '/home/tester/.config/gcloud/application_default_credentials.json'"),
       credentials('Google Cloud', 'Must pass in a JSON object containing the user refresh token'),
       credentials('Google Cloud', 'invalid_grant'),
       credentials('AWS', 'Could not load credentials from any providers'),
@@ -331,58 +332,69 @@ describe('typed decision semantics', () => {
     expect(thrownDetail(null)).toBe('a non-error value was thrown: null');
   });
 
-  // Scanned below: the message of `new DirectiveCheckpointError(…)` and
-  // `new DirectiveRuntimeUnsupportedError(…)`; in directive-checkpoint.ts the
-  // reasons of its local refuse()/refused() helpers, refuse's default reason,
-  // every unknown(…) reason (Claude's checkpoint refusal text quotes them) and
-  // what its *Refusal and *RetryCompaction helpers return as a text;
-  // ledger/api.ts's refuse() reasons; the Claude permission channel's refusal
-  // and failure texts (claude-directive.ts); the call names given to
-  // withOwnIo()/ownIoRefusal(); and the texts the refusal classes and
-  // thrownText write themselves. Each is read as an expression: every branch of
-  // a ternary (not its condition), both sides of a `??` or `||` fallback, a
-  // parenthesised or `as`-cast arm, and an arm's `+` chain of literals (single,
-  // double or backtick quoted) and constants (resolved to their literal in the
-  // same file; one that does not resolve fails the scan), with anything else
-  // in the chain as runtime detail. An arm with no literal or constant is one
-  // of KNOWN_UNSCANNED or fails the scan by name. Not visible to it either: the
-  // "current gate duty " prefix ledger/api.ts's refuse() puts before its
-  // reasons, and a bookkeeping refusal's fault text after GC's prefix, which is
-  // the disk's or the OS's words and is guarded by the tag, not by its text.
-  /** The arms the scan cannot read, each checked by hand in #485 (none names a wall). */
-  const KNOWN_UNSCANNED = [
+  // Scanned below: the message of `new DirectiveCheckpointError(…)` and `new
+  // DirectiveRuntimeUnsupportedError(…)`; in directive-checkpoint.ts the reasons
+  // of its local refuse()/refused() helpers, refuse's default reason, every
+  // unknown(…) reason (Claude's checkpoint refusal text quotes them) and what its
+  // *Refusal and *RetryCompaction helpers return as a text; ledger/api.ts's
+  // refuse() reasons; the Claude permission channel's texts (claude-directive.ts:
+  // what it hands this.fail(), this.refuse() and deps.failRefused(), and each
+  // `const reason`); the call names given to withOwnIo()/ownIoRefusal(); and the
+  // texts the refusal classes and thrownText write themselves. Each is read as an
+  // expression: every branch of a ternary (not its condition), both sides of a
+  // `??` or `||` fallback, a parenthesised or `as`-cast arm, and an arm's `+`
+  // chain of literals (single, double or backtick quoted) and constants, with
+  // anything else in the chain as runtime detail. A constant, a `+` operand or a
+  // template's `${…}`, is resolved to its literal in the same file, and one that
+  // is no literal fails the scan; a numeric bound interpolated into a template is
+  // runtime detail. A call to one of the helpers whose returns are scanned is
+  // exempt. An arm with no literal or constant must be one of KNOWN_UNSCANNED,
+  // counted per site, or it fails the scan by name. Not visible to it either: the
+  // "current gate duty " prefix ledger/api.ts's refuse() puts before its reasons,
+  // and a bookkeeping refusal's fault text after GC's prefix, which is the disk's
+  // or the OS's words and is guarded by the tag, not by its text.
+  /** The arms the scan cannot read, counted per site, each checked by hand in #485 (none names a wall). */
+  const KNOWN_UNSCANNED: Readonly<Record<string, number>> = {
     // Directive recovery's texts from its proofs and verdicts (verdict.error can carry a provider's own text).
-    'dispatch/directive-progress.ts: lockBlocker',
-    'dispatch/directive-progress.ts: proof.error',
-    'dispatch/directive-progress.ts: proof.reason',
-    'dispatch/directive-progress.ts: result.note',
-    'dispatch/directive-progress.ts: verdict.error',
-    // The Claude channel's reasons, scanned in claude-directive.ts.
-    'runtime/claude-adapter.ts: reason',
-    // Fed by texts scanned here: a checkpoint's position, its oversize, its helpers' refusals and retries.
-    'runtime/directive-checkpoint.ts: at',
-    'runtime/directive-checkpoint.ts: compaction',
-    'runtime/directive-checkpoint.ts: error.message',
-    'runtime/directive-checkpoint.ts: oversized',
-    'runtime/directive-checkpoint.ts: reason',
-    'runtime/directive-checkpoint.ts: refusal',
-    'runtime/directive-checkpoint.ts: retry',
-  ];
+    'dispatch/directive-progress.ts: lockBlocker': 1,
+    'dispatch/directive-progress.ts: proof.error': 1,
+    'dispatch/directive-progress.ts: proof.reason': 1,
+    'dispatch/directive-progress.ts: result.note': 1,
+    'dispatch/directive-progress.ts: verdict.error': 1,
+    // The Claude channel's reasons, built from texts scanned in claude-directive.ts: the host's
+    // refusal of a channel deny and of a failed hand-off, and the channel passing its own on.
+    'runtime/claude-adapter.ts: reason': 2,
+    'runtime/claude-directive.ts: reason': 3,
+    // Fed by texts scanned here: a checkpoint's position, its oversize, its helpers' refusals and
+    // retries, a claude header refusal's message, refuse()'s parameter, and withOwnIo's call name.
+    'runtime/directive-checkpoint.ts: at': 2,
+    'runtime/directive-checkpoint.ts: compaction': 1,
+    'runtime/directive-checkpoint.ts: error.message': 1,
+    'runtime/directive-checkpoint.ts: oversized': 1,
+    'runtime/directive-checkpoint.ts: reason': 3,
+    'runtime/directive-checkpoint.ts: refusal': 6,
+    'runtime/directive-checkpoint.ts: retry': 2,
+    'runtime/directive-checkpoint.ts: what': 1,
+  };
   it('no refusal text GC writes is blank or names a wall (#485)', () => {
     const tick = '`';
     const literal = String.raw`'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
     const chain = String.raw`(?:${literal})(?:\s*\+\s*(?:${literal}))*`;
-    const scans: readonly (readonly [RegExp, (file: string) => boolean])[] = [
-      [new RegExp(String.raw`\b(?:unknown\(\s*|reason = )(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts')],
-      [new RegExp(String.raw`\b(?:this\.fail\(|this\.refuse\([^,()]*,|deps\.failRefused\()\s*(${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
-      [new RegExp(String.raw`\bconst reason = (${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
-      [new RegExp(String.raw`\b(?:withOwnIo|ownIoRefusal)\(\s*(${chain})`, 'gu'), () => true],
-    ];
-    // The calls whose first argument is a refusal text, read as an expression.
-    const sinks: readonly (readonly [RegExp, (file: string) => boolean])[] = [
-      [/\bnew Directive(?:CheckpointError|RuntimeUnsupportedError)\(/gu, () => true],
-      [/\brefused?\(/gu, (file) => file.endsWith('directive-checkpoint.ts') || file.endsWith(join('ledger', 'api.ts'))],
-      [/\bunknown\(/gu, (file) => file.endsWith('directive-checkpoint.ts')],
+    // A default reason, scanned as written.
+    const defaults = new RegExp(String.raw`\breason = (${chain})`, 'gu');
+    const checkpoint = (file: string): boolean => file.endsWith('directive-checkpoint.ts');
+    const channel = (file: string): boolean => file.endsWith('claude-directive.ts');
+    // The calls whose argument (by index) is a refusal text, read as an expression;
+    // `const reason = ` in the channel is read up to its `;`.
+    const sinks: readonly (readonly [RegExp, (file: string) => boolean, number])[] = [
+      [/\bnew Directive(?:CheckpointError|RuntimeUnsupportedError)\(/gu, () => true, 0],
+      [/\brefused?\(/gu, (file) => checkpoint(file) || file.endsWith(join('ledger', 'api.ts')), 0],
+      [/\bunknown\(/gu, checkpoint, 0],
+      [/\bthis\.fail\(/gu, channel, 0],
+      [/\bthis\.refuse\(/gu, channel, 1],
+      [/\bdeps\.failRefused\(/gu, channel, 0],
+      [/(?<!function )\b(?:withOwnIo|ownIoRefusal)\(/gu, () => true, 0],
+      [/\bconst reason = /gu, channel, -1],
     ];
     // A small lexer: the index just past a literal (with its interpolations),
     // or past a bracket group (with the literals and comments inside it).
@@ -434,29 +446,44 @@ describe('typed decision semantics', () => {
     const texts: string[] = [];
     const resolved: string[] = [];
     const skipped: string[] = [];
-    // Interpolations are runtime detail; the text GC writes around them is what is classified.
-    const textOf = (literals: string): string => [...literals.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('').replace(/\$\{[^}]*\}/gu, 'x');
+    // A constant's own literal, from `source`; one that is no literal fails the scan.
+    const constant = (file: string, source: string, name: string): string => {
+      const definition = new RegExp(String.raw`\bconst ${name} = (${chain});`, 'u').exec(source);
+      expect(definition, `${file}: ${name} is no literal constant`).not.toBeNull();
+      resolved.push(name);
+      return textOf(file, source, definition![1]!);
+    };
+    // A constant interpolated into a template is resolved like a `+` operand, unless
+    // it is a number (a bound), which is runtime detail like any other
+    // interpolation; the text GC writes around them is what is classified.
+    const interpolated = (file: string, source: string, name: string): string =>
+      new RegExp(String.raw`\bconst ${name} = [\d_ *+-]+;`, 'u').test(source) ? 'x' : constant(file, source, name);
+    const textOf = (file: string, source: string, literals: string): string => [...literals.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('')
+      .replace(/\$\{\s*([A-Z][A-Z0-9_]*)\s*\}/gu, (_interpolation, name: string) => interpolated(file, source, name)).replace(/\$\{[^}]*\}/gu, 'x');
+    // The *Refusal and *RetryCompaction helpers whose returns are scanned below.
+    const helperPattern = /\bfunction (\w+(?:Refusal|RetryCompaction))\(/gu;
+    const helpers = (source: string): { readonly name: string; readonly body: string }[] => [...source.matchAll(helperPattern)].flatMap((match) => {
+      const parameters = pastGroup(source, match.index + match[0].length - 1);
+      const open = source.indexOf('{', parameters);
+      return /\bstring\b/u.test(source.slice(parameters, open)) ? [{ name: match[1]!, body: source.slice(open, pastGroup(source, open)) }] : [];
+    });
+    const scannedHelpers = new Set(sources(srcDir).filter(checkpoint).flatMap((file) => helpers(readFileSync(file, 'utf-8')).map(({ name }) => name)));
     // One arm, read as a `+` chain: its literals, and its constants resolved in
     // `source`, with anything else as runtime detail. An arm with neither is
     // skipped, by name.
     const scanArm = (file: string, source: string, raw: string): void => {
       const arm = raw.trim().replace(/\s+as\s+[\w.<>[\]| ]+$/u, '').replace(/!$/u, '');
-      // No argument (a default reason, scanned above), no text, or a helper whose returns are scanned.
-      if (arm === '' || arm === 'null' || arm === 'undefined' || arm.startsWith('{') || /^\w+Refusal\(/u.test(arm)) return;
+      // No argument (a default reason, scanned on its own), no text, or a helper whose returns are scanned.
+      if (arm === '' || arm === 'null' || arm === 'undefined' || arm.startsWith('{') || scannedHelpers.has(/^(\w+)\(/u.exec(arm)?.[1] ?? '')) return;
       if (arm.startsWith('(') && pastGroup(arm, 0) === arm.length) { scanExpression(file, source, arm.slice(1, -1)); return; }
       let text = '';
       let read = false;
       for (const [at, operand] of split(arm, ['+']).entries()) {
         if (at % 2 === 1) continue;
         const part = operand.trim();
-        if (new RegExp(String.raw`^(?:${literal})$`, 'u').test(part)) { text += textOf(part); read = true; }
-        else if (/^[A-Z][A-Z0-9_]*$/u.test(part)) {
-          const definition = new RegExp(String.raw`\bconst ${part} = (${chain});`, 'u').exec(source);
-          expect(definition, `${file}: ${part} is no literal constant`).not.toBeNull();
-          text += textOf(definition![1]!);
-          resolved.push(part);
-          read = true;
-        } else text += 'x';
+        if (new RegExp(String.raw`^(?:${literal})$`, 'u').test(part)) { text += textOf(file, source, part); read = true; }
+        else if (/^[A-Z][A-Z0-9_]*$/u.test(part)) { text += constant(file, source, part); read = true; }
+        else text += 'x';
       }
       if (read) texts.push(text);
       else skipped.push(`${relative(srcDir, file)}: ${arm.replace(/\s+/gu, ' ')}`);
@@ -470,34 +497,30 @@ describe('typed decision semantics', () => {
         for (const [at, arm] of split(parts[i]!, ['??', '||']).entries()) if (at % 2 === 0) scanArm(file, source, arm);
       }
     };
-    for (const file of sources(join(import.meta.dirname, '..', 'src'))) {
+    for (const file of sources(srcDir)) {
       const source = readFileSync(file, 'utf-8');
-      for (const [pattern, applies] of scans) {
-        if (!applies(file)) continue;
-        for (const match of source.matchAll(pattern)) texts.push(textOf(match[1]!));
-      }
-      for (const [pattern, applies] of sinks) {
+      if (checkpoint(file)) for (const match of source.matchAll(defaults)) texts.push(textOf(file, source, match[1]!));
+      for (const [pattern, applies, argument] of sinks) {
         if (!applies(file)) continue;
         for (const match of source.matchAll(pattern)) {
-          const open = match.index + match[0].length - 1;
-          scanExpression(file, source, split(source.slice(open + 1, pastGroup(source, open) - 1), [','])[0]!);
+          const end = match.index + match[0].length;
+          if (argument < 0) { scanExpression(file, source, split(source.slice(end), [';'])[0]!); continue; }
+          const args = split(source.slice(end, pastGroup(source, end - 1) - 1), [',']);
+          scanExpression(file, source, args[argument * 2] ?? '');
         }
       }
-      if (!file.endsWith('directive-checkpoint.ts')) continue;
       // What the refusal helpers that return a text return.
-      for (const match of source.matchAll(/\bfunction \w+(?:Refusal|RetryCompaction)\(/gu)) {
-        const parameters = pastGroup(source, match.index + match[0].length - 1);
-        const open = source.indexOf('{', parameters);
-        if (!/\bstring\b/u.test(source.slice(parameters, open))) continue;
-        const body = source.slice(open, pastGroup(source, open));
-        for (const statement of body.matchAll(/\breturn\b/gu)) {
-          const rest = body.slice(statement.index + statement[0].length);
-          scanExpression(file, source, split(rest, [';'])[0]!);
+      if (checkpoint(file)) {
+        for (const { body } of helpers(source)) {
+          for (const statement of body.matchAll(/\breturn\b/gu)) scanExpression(file, source, split(body.slice(statement.index + statement[0].length), [';'])[0]!);
         }
       }
     }
-    // Every arm the scan cannot read is one checked by hand: a new one fails here, by name.
-    expect([...new Set(skipped)].sort()).toEqual(KNOWN_UNSCANNED);
+    // Every arm the scan cannot read is one checked by hand, counted per site: a new
+    // one fails here by name, even one that reuses a listed name.
+    const unscanned: Record<string, number> = {};
+    for (const site of skipped) unscanned[site] = (unscanned[site] ?? 0) + 1;
+    expect(unscanned).toEqual(KNOWN_UNSCANNED);
     expect(texts.some((text) => text.startsWith('an earlier directive failure refused this turn'))).toBe(true);
     expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'MALFORMED', 'RETRIED_TWICE', 'UNBOUND_TAIL']));
     expect(texts).toEqual(expect.arrayContaining(['native error row has no matching live SDK retry-start receipt',
