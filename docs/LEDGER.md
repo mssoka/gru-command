@@ -683,7 +683,11 @@ the lane passes it on as `GRU_LANE_TOKEN` ([WORKTREES.md
 §3a](./WORKTREES.md#3a-lane-provenance-486)). The migration also rebuilds
 `worktree_processes` once more, to admit evidence `lane-token`: a process
 rooted in the lane that carried the lane's token and was reaped, recorded
-`killed` directly.
+`killed` directly. A pid already on the record takes `lane-token` when it is
+reaped by its token; a row recorded `live` again after it left `live` takes
+the evidence it is seen by then (a recycled pid never inherits a stale
+`registry` or `lane-token` proof); a live row keeps the evidence it was
+first found by.
 
 ### Exact directive/rebrief restart progress
 

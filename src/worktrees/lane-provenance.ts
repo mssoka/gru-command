@@ -180,7 +180,7 @@ export interface ProcessFacts {
  * bundle of its executable's path when it has one (its helpers then group
  * with it), else the executable's basename. */
 export function processName(executable: string): string {
-  const bundle = /(?:^|\/)([^/]+)\.app\//u.exec(executable)?.[1];
+  const bundle = /(?:^|\/)([^/]+)\.app\/Contents\//u.exec(executable)?.[1];
   if (bundle !== undefined) return bundle;
   return executable.slice(executable.lastIndexOf('/') + 1) || executable;
 }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1878,10 +1878,10 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
   };
   /** A daemon that double-forks: its launcher exits, so it is reparented,
    * with its cwd in the tree and the environment it was given. */
-  async function detachedDaemon(cwd: string, env: NodeJS.ProcessEnv): Promise<number> {
+  async function detachedDaemon(cwd: string, env: NodeJS.ProcessEnv, script = 'setTimeout(() => {}, 60000)'): Promise<number> {
     const launcher = spawn(process.execPath, ['-e', [
       "const { spawn } = require('node:child_process');",
-      `const daemon = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { cwd: ${JSON.stringify(cwd)}, detached: true, stdio: 'ignore' });`,
+      `const daemon = spawn(process.execPath, ['-e', ${JSON.stringify(script)}], { cwd: ${JSON.stringify(cwd)}, detached: true, stdio: 'ignore' });`,
       'daemon.unref();',
       'process.stdout.write(String(daemon.pid));',
     ].join('\n')], { env, stdio: ['ignore', 'pipe', 'inherit'] });
@@ -2010,6 +2010,52 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     expect(alive(second)).toBe(true);
   });
 
+  it('a session that turns busy just before the SIGTERM stops the reap: nothing is signalled', async () => {
+    let checks = 0;
+    const h = harness(true, { laneQuiet: () => (checks += 1) === 1 }); // quiet when the reap starts, busy at the signal
+    const repo = h.make();
+    ledgerJob(h, 'job-late-busy', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-late-busy' });
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-late-busy')!.laneToken! });
+    await rooted(row.path, [pid]);
+    const result = await h.manager.release({ worktreeId: 'job-late-busy' });
+    expect(checks).toBe(2);
+    expect(alive(pid)).toBe(true);
+    expect(result.status).toBe('paused');
+    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.lane-processes-reaped')).toBe(false);
+  });
+
+  it('a session that turns busy during the grace stops the SIGKILL: the survivor is asked about', async () => {
+    let checks = 0;
+    const h = harness(true, { killGraceMs: 300, laneQuiet: () => (checks += 1) <= 2 }); // quiet through the SIGTERM, busy at the SIGKILL
+    const repo = h.make();
+    ledgerJob(h, 'job-grace', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-grace' });
+    // A daemon that ignores SIGTERM: only a SIGKILL would stop it.
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-grace')!.laneToken! },
+      "process.on('SIGTERM', () => {}); setTimeout(() => {}, 60000)");
+    await rooted(row.path, [pid]);
+    const result = await h.manager.release({ worktreeId: 'job-grace' });
+    expect(checks).toBe(3);
+    expect(alive(pid)).toBe(true);
+    expect(result.status).toBe('paused');
+    const reaped = h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.lane-processes-reaped');
+    expect(reaped?.payload).toMatchObject({ pids: [], survivors: [pid] });
+  });
+
+  it('a reap the service\'s stop overtakes signals nothing', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-stopping', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-stopping' });
+    const pid = await detachedDaemon(row.path, { ...cleanEnv(), GRU_LANE_TOKEN: h.ledger.getWorktree('job-stopping')!.laneToken! });
+    await rooted(row.path, [pid]);
+    const stop = new AbortController();
+    stop.abort();
+    expect(await h.manager.reapLaneAfterTurn('job-stopping', stop.signal)).toEqual([]);
+    expect(alive(pid)).toBe(true);
+  });
+
   it('a release that does not pause (the disk budget\'s) reaps nothing, the lane\'s own processes included', async () => {
     const h = harness(true);
     const repo = h.make();
@@ -2078,6 +2124,11 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     let registry: RuntimeRegistry | null = null;
     const h = harness(true, { laneQuiet: (laneId) => registry!.laneQuiet(laneId) });
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-486-wiring-'));
+    onTestFinished(async () => {
+      finishTurn(); // a failed assertion never leaves the turn pending
+      await registry?.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
     registry = new TestRegistry({
       config: { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 4 } }, store: {} as SessionStore,
       laneProvenanceFor: laneProvenanceFromLedger(h.ledger, () => {}),
@@ -2100,11 +2151,10 @@ describe('#486: lane provenance — the lane\'s own processes are reaped, the re
     expect(reaps).toHaveLength(1);
     expect(await reaps[0]).toEqual([pid]);
     expect(alive(pid)).toBe(false);
-    rmSync(dir, { recursive: true, force: true });
     // main.ts binds the two sides exactly so (assembly alarm).
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(/laneQuiet: \(laneId\) => registry\.laneQuiet\(laneId\)/u);
-    expect(mainSource).toMatch(/onLaneQuiet: \(laneId\) => \{\s*if \(!serviceStop\.signal\.aborted\) void laneManager\?\.reapLaneAfterTurn\(laneId\);/u);
+    expect(mainSource).toMatch(/onLaneQuiet: \(laneId\) => \{\s*if \(!serviceStop\.signal\.aborted\) void laneManager\?\.reapLaneAfterTurn\(laneId, serviceStop\.signal\);/u);
     expect(mainSource).toMatch(/laneProvenanceFor: \(cwd\) => laneProvenanceFromLedger\(ledger, /u);
   });
 

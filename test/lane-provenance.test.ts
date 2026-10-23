@@ -107,12 +107,32 @@ describe('the lane token and its variables', () => {
     } finally { h.db.close(); }
   });
 
+  it('a process row keeps the evidence it was first found by while live; a reap records lane-token, and a pid recorded live again after leaving takes what it is seen by now', () => {
+    const h = ledgerHarness();
+    try {
+      const record = (evidence: string, state: 'live' | 'killed') => h.ledger.recordWorktreeProcesses({ worktreeId: 'job-b', processes: [{ pid: 4242, command: 'node x', evidence }], state });
+      const evidence = () => h.ledger.listWorktreeProcesses('job-b').find((proc) => proc.pid === 4242)?.evidence;
+      record('registry', 'live');
+      record('cwd', 'live');
+      expect(evidence()).toBe('registry'); // a live verification run stays GC's own
+      record('registry', 'killed');
+      record('cwd', 'live'); // the pid is another process now: no stale registry proof
+      expect(evidence()).toBe('cwd');
+      record('lane-token', 'killed');
+      expect(evidence()).toBe('lane-token');
+      record('argv', 'live');
+      expect(evidence()).toBe('argv');
+    } finally { h.db.close(); }
+  });
+
   it('groups a macOS app\'s helpers under its outermost bundle, and names any other process by its executable', () => {
     const app = '/Users/u/.cache/chrome/Google Chrome for Testing.app';
     expect(processName(`${app}/Contents/MacOS/Google Chrome for Testing`)).toBe('Google Chrome for Testing');
     expect(processName(`${app}/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/1/Helpers/Google Chrome for Testing Helper (Renderer).app/Contents/MacOS/Google Chrome for Testing Helper (Renderer)`)).toBe('Google Chrome for Testing');
     expect(processName(`${app}/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/1/Helpers/chrome_crashpad_handler`)).toBe('Google Chrome for Testing');
     expect(processName('/usr/local/bin/agent-browser')).toBe('agent-browser');
+    // A folder merely named like a bundle is no bundle.
+    expect(processName('/repos/site.app/target/debug/server')).toBe('server');
     expect(processName('node')).toBe('node');
   });
 
@@ -326,9 +346,16 @@ describe('the owner\'s card for a paused sweep', () => {
         return h.ledger.registerWorktree({ id, kind: 'job', repoPath: '/repos/repo', repoName: 'repo', path: `/lanes/repo/${id}`, branch: `gru/${id}`, sha: 'a'.repeat(40), jobId: id });
       };
       const upper = postSweepPausedCard(h, { worktree: lane('Job-B'), pauseId: 'p1', details });
+      const answered = postSweepPausedCard(h, { worktree: lane('JOB-B'), pauseId: 'p1', details });
+      h.notifications.decide(answered.id, STOP_AND_SWEEP_OPTION, 'owner');
       postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p1', details });
+      // A notice from before #486 that the owner-attention rules handed to Gru.
+      const legacy = h.notifications.post({ kind: 'worktree-sweep-paused:job-b:3f1c', routing: 'needs-owner', severity: 'info', title: 'Worktree sweep paused: live processes in repo' });
+      h.ledger.updateNotificationTriage(legacy.id, 'action-required', 'routed to Gru');
       settleSweptLaneCards(h, 'job-b');
       expect(h.ledger.getNotification(upper.id)?.resolvedAt).toBeNull();
+      expect(h.ledger.getNotification(answered.id)?.resolvedAt).toBeNull();
+      expect(h.ledger.getNotification(legacy.id)?.resolvedBy).toBe('sweep-completed');
     } finally { h.db.close(); }
   });
 
@@ -348,6 +375,7 @@ describe('the owner\'s card for a paused sweep', () => {
     const follower = new SweepDecisionFollower({
       ledger: h.ledger,
       bus: h.bus,
+      notifications: h.notifications,
       release: async (input): Promise<SweepResult> => {
         releases.push(input);
         return { status: 'paused', processes: [], preserved: null, note: 'sweep paused: pids 79503 survived the acknowledged kill (SIGTERM + SIGKILL)' };
@@ -369,6 +397,7 @@ describe('the owner\'s card for a paused sweep', () => {
     const follower = new SweepDecisionFollower({
       ledger: h.ledger,
       bus: h.bus,
+      notifications: h.notifications,
       // As the real release does: the sweep settles the lane's cards (main's onSwept) before it returns.
       release: async (): Promise<SweepResult> => {
         h.ledger.setWorktreeStatus('job-b', 'swept');
@@ -382,29 +411,55 @@ describe('the owner\'s card for a paused sweep', () => {
       h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
       follower.start();
       await vi.waitFor(() => expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull());
-      expect(resolution(h, card.id)).toMatchObject({ detail: 'lane job-b was swept after the answer "stop-and-sweep"', owner_decision: STOP_AND_SWEEP_OPTION });
+      expect(resolution(h, card.id)).toMatchObject({ detail: 'lane job-b was swept after the answer "Stop these 5 processes and finish the sweep"', owner_decision: STOP_AND_SWEEP_OPTION });
     } finally { follower.stop(); h.db.close(); }
   });
 
-  it('a release that fails leaves the answered card open for the next pass; a child worker still running stops nothing', async () => {
+  it('an answer that has to wait keeps its card open and answered, tells Gru once, and is tried again at the next pass', async () => {
     const h = ledgerHarness();
     const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>(async () => { throw new Error('sweep refused: a merge is in progress'); });
-    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, release });
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, release });
+    const waiting = (id: string) => h.ledger.getNotification(`worktree-sweep-answer-waiting:${id}`);
     try {
       const card = pausedLane(h, [65215]);
       h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
       follower.start();
       await vi.waitFor(() => expect(release).toHaveBeenCalledTimes(1));
-      expect(h.ledger.getNotification(card.id)).toMatchObject({ resolvedAt: null, decidedOption: STOP_AND_SWEEP_OPTION });
-      await follower.follow(); // the next pass retries the answer
+      await follower.follow(); // the next pass (an answer, a restart, the hourly reconcile) retries it
       expect(release).toHaveBeenCalledTimes(2);
-      // A pass that finds a child worker of the job that has not finished
-      // stops nothing, like an operator's release.
+      expect(h.ledger.getNotification(card.id)).toMatchObject({ resolvedAt: null, decidedOption: STOP_AND_SWEEP_OPTION });
+      expect(waiting(card.id)).toMatchObject({ routing: 'action-required', kind: 'worktree.sweep-answer-waiting', resolvedAt: null });
+      expect(waiting(card.id)?.detail).toContain('its release was refused: sweep refused: a merge is in progress');
+      expect(h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === 'worktree.sweep-answer-waiting')).toHaveLength(1);
+      // Like an operator's release, it never abandons a child worker that has
+      // not finished: nothing is released, and the card still waits.
       h.ledger.registerAgent({ id: 'parent-b', role: 'minion', jobId: 'job-b' });
       h.ledger.admitChildWorker({ id: 'child_b', parentAgentId: 'parent-b', jobId: 'job-b', purpose: 'check', authority: 'read-only', task: 't', idempotencyKey: 'k' });
       await follower.follow();
       expect(release).toHaveBeenCalledTimes(2);
-      expect(resolution(h, card.id)).toMatchObject({ detail: expect.stringContaining('child worker child_b of this lane has not finished') });
+      expect(h.ledger.getNotification(card.id)?.resolvedAt).toBeNull();
+      // Once the lane is swept, the card and Gru's row settle.
+      h.ledger.setWorktreeStatus('job-b', 'swept');
+      settleSweptLaneCards(h, 'job-b');
+      expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull();
+      expect(waiting(card.id)?.resolvedAt).not.toBeNull();
+    } finally { follower.stop(); h.db.close(); }
+  });
+
+  it('a child worker that has not finished holds the answer, and its card says which and how to cancel it', async () => {
+    const h = ledgerHarness();
+    const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>();
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, release });
+    try {
+      h.ledger.registerAgent({ id: 'parent-b', role: 'minion', jobId: 'job-b' });
+      h.ledger.admitChildWorker({ id: 'child_b', parentAgentId: 'parent-b', jobId: 'job-b', purpose: 'check', authority: 'read-only', task: 't', idempotencyKey: 'k' });
+      const card = pausedLane(h, [65215]);
+      h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
+      follower.start();
+      await follower.follow();
+      expect(release).not.toHaveBeenCalled();
+      expect(h.ledger.getNotification(`worktree-sweep-answer-waiting:${card.id}`)?.detail)
+        .toContain('child worker child_b of lane job-b has not finished, and a release never abandons one: cancel it (POST /api/dispatch/children/child_b/cancel)');
     } finally { follower.stop(); h.db.close(); }
   });
 
@@ -413,7 +468,7 @@ describe('the owner\'s card for a paused sweep', () => {
     const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>();
     const stop = new AbortController();
     stop.abort();
-    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, release, stopSignal: stop.signal });
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, release, stopSignal: stop.signal });
     try {
       const card = pausedLane(h, [65215]);
       h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
@@ -427,7 +482,7 @@ describe('the owner\'s card for a paused sweep', () => {
   it('stops nothing for a lane that is no longer paused, and closes the card saying so', async () => {
     const h = ledgerHarness();
     const release = vi.fn<(input: SweepRequest) => Promise<SweepResult>>();
-    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, release });
+    const follower = new SweepDecisionFollower({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, release });
     try {
       h.ledger.appendCustomEvent({ kind: 'worktree.paused', jobId: 'job-b', payload: { id: 'job-b', path: h.lane.path, pause_id: 'p1', processes: [{ pid: 65215 }] } });
       const card = postSweepPausedCard(h, { worktree: h.lane, pauseId: 'p1', details });

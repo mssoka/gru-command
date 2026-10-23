@@ -425,7 +425,7 @@ async function main(): Promise<number> {
     // Not once the service stops: its shutdown disposes every session, and
     // the ledger closes under a reap.
     onLaneQuiet: (laneId) => {
-      if (!serviceStop.signal.aborted) void laneManager?.reapLaneAfterTurn(laneId);
+      if (!serviceStop.signal.aborted) void laneManager?.reapLaneAfterTurn(laneId, serviceStop.signal);
     },
   }));
   const growth = registry.boot();
@@ -1186,12 +1186,12 @@ async function main(): Promise<number> {
       postSweepPausedCard({ ledger, notifications, log: (level, msg, fields) => logger.log(level, msg, fields) }, { worktree, pauseId, details });
     },
     onSwept: ({ worktree }) => {
-      // A completed sweep IS the evidence its pause notice asked for, and
-      // the end of the lane's submodule-work and restore rows (#427). An
-      // unanswered card is withdrawn (what it asked about ended), an answered
-      // one closes saying the lane was swept; rows Gru took over resolve.
+      // A completed sweep IS the evidence its pause cards asked for, and the
+      // end of the lane's submodule-work and restore rows (#427). Only this
+      // lane's cards, matched exactly (#486): an unanswered one is withdrawn
+      // (what it asked about ended), an answered one closes saying the lane
+      // was swept, and one Gru took over resolves.
       settleSweptLaneCards({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) }, worktree.id);
-      notifications.resolveIncidents(`worktree-sweep-paused:${worktree.id}:`, 'sweep-completed');
       laneHooks.onSwept({ worktree });
     },
     // #486: a lane's token-carrying processes may be a busy session's own.
@@ -1228,14 +1228,17 @@ async function main(): Promise<number> {
     logger.log('error', 'the moved-repository check failed at start; the hourly reconcile retries it', { error: String(error) });
   }
   // #486: the owner's answer to a paused sweep's card is carried out here,
-  // once moved lanes are reconnected, and never after the service stops.
-  new SweepDecisionFollower({
+  // once moved lanes are reconnected, and never after the service stops; an
+  // answer that waits is retried at the hourly reconcile (below).
+  const sweepAnswers = new SweepDecisionFollower({
     ledger,
     bus,
+    notifications,
     release: (input) => worktreeManager.release(input),
     stopSignal: serviceStop.signal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
-  }).start();
+  });
+  sweepAnswers.start();
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,
@@ -1788,7 +1791,10 @@ async function main(): Promise<number> {
     preserveRoot: config.worktrees.preserveRoot,
     // A job's review folders stay while a Perkins review owns it (#427 PR 3).
     reviewActive: (jobId) => wave.activeReview(jobId) !== null,
-    onReconcile: () => repoMoves.reconcile(),
+    onReconcile: async () => {
+      await repoMoves.reconcile();
+      await sweepAnswers.follow();
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The disk view, budget and floor (#427 PR 3): GC's usage by category;

@@ -2492,11 +2492,12 @@ export class WorktreeManager {
    * `registry` process row: the run may use what the minion started).
    * Under the lane's lock, so it never overlaps a release, a slim or a
    * restore; at most one waits there per lane. The listing runs off the
-   * event loop. Never throws: a failure is logged, and the sweep reaps
+   * event loop. Once `stop` aborts (the service is stopping), nothing more
+   * is signalled. Never throws: a failure is logged, and the sweep reaps
    * what is left.
    */
-  async reapLaneAfterTurn(laneId: string): Promise<readonly number[]> {
-    if (this.laneReapsWaiting.has(laneId)) return [];
+  async reapLaneAfterTurn(laneId: string, stop?: AbortSignal): Promise<readonly number[]> {
+    if (this.laneReapsWaiting.has(laneId) || stop?.aborted === true) return [];
     this.laneReapsWaiting.add(laneId);
     try {
       return await this.withLaneLock(laneId, async () => {
@@ -2505,7 +2506,7 @@ export class WorktreeManager {
         if (row === null || row.status !== 'active' || row.laneToken === null || !existsSync(row.path)) return [];
         if (this.opts.ledger.listWorktreeProcesses(row.id).some((proc) => proc.state === 'live' && proc.evidence === 'registry')) return [];
         if (!(this.opts.laneQuiet?.(row.id) ?? true)) return [];
-        return this.reapLaneTokenProcesses(row, () => this.enumerateListed(row.path), 'turn-settled');
+        return this.reapLaneTokenProcesses(row, () => this.enumerateListed(row.path), 'turn-settled', stop);
       });
     } catch (error) {
       this.laneReapsWaiting.delete(laneId);
@@ -2866,9 +2867,9 @@ export class WorktreeManager {
    * processes rooted in the tree (only once the lane is known quiet).
    * Returns the pids proven dead.
    */
-  private async reapLaneTokenProcesses(row: WorktreeRecord, list: () => Promise<readonly TreeProcess[]>, trigger: 'sweep' | 'turn-settled'): Promise<readonly number[]> {
+  private async reapLaneTokenProcesses(row: WorktreeRecord, list: () => Promise<readonly TreeProcess[]>, trigger: 'sweep' | 'turn-settled', stop?: AbortSignal): Promise<readonly number[]> {
     const token = row.laneToken;
-    const quiet = (): boolean => this.opts.laneQuiet?.(row.id) ?? true;
+    const quiet = (): boolean => stop?.aborted !== true && (this.opts.laneQuiet?.(row.id) ?? true);
     if (token === null || !quiet()) return [];
     const carrying = async (procs: readonly TreeProcess[]): Promise<readonly TreeProcess[]> => {
       if (procs.length === 0) return [];
@@ -3849,7 +3850,7 @@ export class WorktreeManager {
         })),
         state: 'live',
       });
-      const note = `sweep paused: ${unacknowledged.length} NEW process(es) appeared after the acknowledged kill (pids ${unacknowledged
+      const note = `sweep paused: ${unacknowledged.length} process(es) the acknowledged kill did not cover (new since the pause, or not acknowledged by it; pids ${unacknowledged
         .map((p) => p.pid)
         .join(', ')}) — each kill needs its own acknowledgment`;
       this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);

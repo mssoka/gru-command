@@ -304,7 +304,8 @@ carries it, and so does everything that session starts
    enumeration — later arrivals were never acknowledged), and only while
    the fresh enumeration still finds each rooted in the tree running the
    command it was recorded with (#486: an answer given late never reaches a
-   recycled pid), with a SIGTERM grace before SIGKILL. Survivors re-pause; newcomers get their own ask;
+   pid that now runs another command), with a SIGTERM grace before
+   SIGKILL. Survivors re-pause; newcomers get their own ask;
    `confirm_kill` without a recorded pause is not honored. Silent kills
    do not exist for processes nothing ties to the lane. The owner's card
    ([§3a](#3a-lane-provenance-486)) names what runs and offers that answer
@@ -491,14 +492,17 @@ owner about bare pids.
   disposal): its own processes carry the token too. That is checked again
   just before the SIGTERM and before the SIGKILL. A survivor stays for the
   ask. A pid already on the record keeps its row; the reap records it
-  with evidence `lane-token`.
+  with evidence `lane-token`. (A row recorded live again after it left
+  `live` takes the evidence it is seen by then: it is another process, or
+  one seen afresh.)
 - **When the turns end.** Once every session on a lane has settled its
   calls, or been disposed, the registry tells the manager, which reaps the
   same way right away (`trigger: "turn-settled"`), listing off the event
   loop and under the lane's lock. Skipped for a lane that is not active,
   while a verification run GC spawned owns the tree (a live `registry`
   row: the run may use what the minion started), and once the service is
-  stopping (its shutdown disposes every session). A review runs in its own
+  stopping (its shutdown disposes every session): a reap the stop
+  overtakes signals nothing more. A review runs in its own
   lane ([§4](#4-detached-for-reviews-branch-for-jobs-18d)), whose sessions
   decide when that lane is quiet. The worker rule blocks tell minions to
   stop what they start before their turn ends, and that GC stops what they
@@ -516,14 +520,18 @@ owner about bare pids.
   and finish the sweep**, is carried out as an operator's `confirm_kill`
   limited to the pids that card named, with that base branch, and, like an
   operator's release, never while a child worker of the lane has not
-  finished: a survivor or a newcomer pauses again with a new card, and the
-  answered card closes saying what happened (a sweep that finishes closes
-  it as swept). A release that fails leaves the card open and answered,
-  and the next pass (another answer, or a restart) tries again. A newer
-  pause of the lane withdraws its older unanswered cards (a notice from
-  before #486 too), and a sweep withdraws them. An answer a restart
-  interrupted is carried out at start, after moved lanes are reconnected;
-  none is carried out once the service is stopping.
+  finished: a survivor or a process the answer did not cover pauses again
+  with a new card, and the answered card closes saying what happened (a
+  sweep that finishes closes it as swept, naming the answer). An answer
+  that has to wait (a child worker that has not finished, or a release
+  that failed) leaves the card open and answered, Gru gets one
+  action-required row per card naming why (`worktree.sweep-answer-waiting`,
+  resolved once the answer is carried out or the lane is swept), and the
+  next pass tries again: passes run at each answer, at start, after moved
+  lanes are reconnected, and at the hourly reconcile. A newer pause of the
+  lane withdraws its older unanswered cards (a notice from before #486
+  too), and a sweep settles only that lane's cards, matched exactly. No
+  answer is started once the service is stopping.
 
 ## 4. Detached-for-reviews, branch-for-jobs (18d)
 

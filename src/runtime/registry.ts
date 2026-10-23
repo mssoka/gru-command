@@ -912,6 +912,7 @@ export class RuntimeRegistry {
               if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
               disposing = null;
               disposingNow = false;
+              laneSettled(); // the session stays; its lane may be quiet again
               notifyDisposalSettlement(resident, false);
               throw error;
             },

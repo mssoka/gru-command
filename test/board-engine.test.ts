@@ -1035,7 +1035,8 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(mainSource).toMatch(/notifications\.resolveExactKind\('port-squat', 'service-boot'\)/u);
     expect(mainSource).toMatch(/notifications\.resolveExactKind\('roll-port-squat', 'service-boot'\)/u);
     expect(mainSource).toMatch(/reconcileLegacyOwnerAttention\(\{/u);
-    expect(mainSource).toMatch(/notifications\.resolveIncidents\(`worktree-sweep-paused:\$\{worktree\.id\}:/u);
+    // #486: the completed sweep settles exactly its own lane's cards.
+    expect(mainSource).toMatch(/onSwept: \(\{ worktree \}\) => \{[\s\S]{0,600}settleSweptLaneCards\(\{ ledger, log: [^}]+\}, worktree\.id\);/u);
     // Both sides of the coupling: the posted kind template must carry the
     // same `worktree-sweep-paused:<id>:<pause>` shape the resolver strips
     // (#486: the card is posted by postSweepPausedCard, named by its pause).

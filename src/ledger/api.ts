@@ -3195,8 +3195,12 @@ export class LedgerApi {
            command = excluded.command,
            last_seen = excluded.last_seen,
            -- #486: a reap by the lane's token is the row's proof, whatever
-           -- first tied the pid to the tree; other evidence stays as found.
-           evidence = CASE WHEN excluded.evidence = 'lane-token' THEN excluded.evidence ELSE evidence END`,
+           -- first tied the pid to the tree; and a row that had left 'live'
+           -- (killed, exited) recorded live again is another process, or one
+           -- seen afresh, with the evidence it is seen by now (stale
+           -- 'registry' or 'lane-token' proof never carries over). A live row
+           -- keeps the evidence it was first found by.
+           evidence = CASE WHEN excluded.evidence = 'lane-token' OR (state <> 'live' AND excluded.state = 'live') THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
         upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
@@ -4095,6 +4099,20 @@ export class LedgerApi {
       .prepare('SELECT * FROM child_workers WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1')
       .get(agentId) as Row | undefined;
     return row === undefined ? null : this.childWorkerFromRow(row);
+  }
+
+  /** Issue #161: the child workers that have not finished and that a
+   * release of `lane` would abandon: a child lane's own child, or every one
+   * of a job lane's job. Every release an operator or the owner asks for
+   * refuses while any is left (#486: the owner's answer to a paused sweep's
+   * card too). */
+  unfinishedChildWorkersOf(lane: Pick<WorktreeLane, 'id' | 'kind' | 'jobId'>): readonly ChildWorkerRecord[] {
+    if (lane.kind === 'child') {
+      const child = this.getChildWorker(lane.id);
+      return child !== null && child.resultState === null ? [child] : [];
+    }
+    if (lane.kind !== 'job' || lane.jobId === null) return [];
+    return this.listChildWorkers({ jobId: lane.jobId }).filter((child) => child.resultState === null);
   }
 
   listChildWorkers(
