@@ -1827,13 +1827,18 @@ export class PiAgentHandle implements AgentHandle {
       // compaction terminal is published if Pi's gate has cleared. If one is
       // still withheld, or the handle was disposed (the reconcile bound
       // disposes), the directive is not admitted.
-      if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
-      if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
-      if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
-      if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
-      directive.beforeAdmission();
-      if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
-        throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
+      try {
+        if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
+        if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
+        if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
+        if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
+        directive.beforeAdmission();
+        if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
+          throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
+        }
+      } catch (error) {
+        if (error instanceof DirectiveCheckpointError) this.refuseDirectiveGuard(directive, undefined, error);
+        throw error;
       }
     };
     let captured: PromptTurnVerdict = { ok: true, error: null };
