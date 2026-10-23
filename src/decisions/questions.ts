@@ -216,20 +216,25 @@ export function deterministicFailureClass(reason: string): FailureClass {
   // Which failures wall is GC's judgment, not the CLI's: a wall is a failure
   // only a human clears. Claude Code's typed codes (its closed 2.1.309 enum)
   // that name one match: authentication_failed, oauth_org_not_allowed,
-  // verification_required and account_on_hold (a refused OAuth refresh) are
-  // authentication walls; billing_error and rate_limit are quota walls. A rate
-  // limit is paced first: pacing's bounded retry sees one (the CLI's statusless
-  // capacity off-switch, typed rate_limit, included) before this class does,
-  // which walls it with no pacing policy or once the bounded budget is spent.
-  // The other codes name no wall by their token: a cloud_credential_error takes
-  // the class of the CLI's own detail (a named OAuth or authentication failure
-  // walls, an unreachable metadata server reads network_failure, anything else
-  // unknown), and model_not_found reads unknown (a restart, then the breaker if
+  // verification_required, account_on_hold (a refused OAuth refresh) and
+  // cloud_credential_error are authentication walls; billing_error and
+  // rate_limit are quota walls. A cloud_credential_error walls by its token: its
+  // detail is the first cause's text, and every one that reaches a user names a
+  // credential only a human restores (a refresh token, a client, a key file, the
+  // default chain, SSO); the CLI's own status table says "blocked, check or
+  // refresh". A transient hiccup there then needs a re-arm. A rate limit is
+  // paced first: pacing's bounded retry sees one (the CLI's statusless capacity
+  // off-switch, typed rate_limit, included). A quota-class text (rate limit,
+  // rate_limit, 429, …) then walls here with no pacing policy, or once the
+  // bounded budget is spent; pacing's other texts ("too many requests",
+  // "throttled", "rate limiting") read unknown then; and a rate limit with
+  // nothing to re-deliver walls at once even with pacing on. The other codes
+  // name no wall: model_not_found reads unknown (a restart, then the breaker if
   // it persists). For GC's own refusals the tag, not the text, is the guard
   // (#485); GC's literal refusal texts avoid wall words so an untagged one still
   // reads `unknown`.
   if (
-    /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+    /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|cloud_credential_error|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';
   if (
     /\bquota\b|\brate[-_ ]?limit(?:ed)?\b|\bbilling_error\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)

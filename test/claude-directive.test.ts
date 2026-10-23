@@ -35,24 +35,41 @@ const request = (id: string, toolUseId: string, extra: Record<string, unknown> =
   ({ type: 'control_request', request_id: id, request: { subtype: 'can_use_tool', tool_name: 'Read', tool_use_id: toolUseId, input: { file_path: '/x' }, ...extra } });
 
 function channel(decide: (request: ClaudeToolRequest) => ClaudeToolDecision | Promise<ClaudeToolDecision> = () => ({ allow: true }), verification?: WorkerVerificationPolicy,
-  confirm: (request: ClaudeToolRequest) => ClaudeToolDecision = () => ({ allow: true }), host: { readonly refusedThrows?: boolean; readonly failThrows?: boolean } = {}) {
+  confirm: (request: ClaudeToolRequest) => ClaudeToolDecision = () => ({ allow: true }),
+  host: { readonly refusedThrows?: boolean; readonly failThrows?: boolean; readonly failRefusedThrows?: boolean; readonly logThrows?: boolean } = {}) {
   const { child, written, signals } = fakeChild();
   const failures: string[] = [];
+  const refusedFailures: string[] = [];
   const refusals: [string | undefined, string][] = [];
   const decided: ClaudeToolRequest[] = [];
   const logs: [string, Readonly<Record<string, unknown>>][] = [];
   const permissions = new ClaudeDirectivePermissionChannel(child, {
     fail: (message) => { failures.push(message); if (host.failThrows === true) throw new Error('turn failure handling broke'); },
+    failRefused: (reason) => { refusedFailures.push(reason); if (host.failRefusedThrows === true) throw new Error('turn refusal broke'); },
     refused: (toolUseId, reason) => { if (host.refusedThrows === true) throw new Error('refusal journal broke'); refusals.push([toolUseId, reason]); },
     decide: async (tool, durable) => { await durable; decided.push(tool); return decide(tool); },
     confirm,
-    log: (message, fields) => logs.push([message, fields]),
+    log: (message, fields) => { logs.push([message, fields]); if (host.logThrows === true) throw new Error('log sink broke'); },
+    killGraceMs: 20,
     ...(verification === undefined ? {} : { verification }),
   });
   permissions.start();
   const init = written()[0]!;
   const initialize = (): void => permissions.ingest({ type: 'control_response', response: { subtype: 'success', request_id: init['request_id'], response: {} } }, Promise.resolve());
-  return { permissions, child, written, signals, failures, refusals, decided, logs, initialize };
+  return { permissions, child, written, signals, failures, refusedFailures, refusals, decided, logs, initialize };
+}
+
+/** Collects unhandled rejections and uncaught exceptions while `run` runs. */
+async function escaped(run: () => Promise<void>): Promise<unknown[]> {
+  const caught: unknown[] = [];
+  const onEscape = (reason: unknown): void => { caught.push(reason); };
+  process.on('unhandledRejection', onEscape);
+  process.on('uncaughtException', onEscape);
+  try { await run(); } finally {
+    process.off('unhandledRejection', onEscape);
+    process.off('uncaughtException', onEscape);
+  }
+  return caught;
 }
 
 describe('the Claude directive permission channel (#424)', () => {
@@ -131,33 +148,66 @@ describe('the Claude directive permission channel (#424)', () => {
     } finally { process.off('unhandledRejection', onUnhandled); }
   });
 
-  /** A failed fence whose handling throws in the host's `refused()` or `fail()` (#485). */
-  async function assertHandlingThrowGuarded(site: 'refused' | 'fail'): Promise<void> {
-    const host = site === 'refused' ? { refusedThrows: true } : { failThrows: true };
-    const unhandled: unknown[] = [];
-    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
-    process.on('unhandledRejection', onUnhandled);
-    try {
-      const c = channel(() => { throw new Error('authority read broke'); }, undefined, undefined, host);
+  /** A failed fence whose handling throws in the host's `refused()` or `fail()`
+   * (#485): a refusal of GC's own, through the host's `failRefused()`. */
+  async function assertHandlingThrowRefused(site: 'refused' | 'fail' | 'log'): Promise<void> {
+    const host = site === 'refused' ? { refusedThrows: true } : site === 'fail' ? { failThrows: true } : { refusedThrows: true, logThrows: true };
+    const c = channel(() => { throw new Error('authority read broke'); }, undefined, undefined, host);
+    const caught = await escaped(async () => {
       c.initialize();
       c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
       await tick(); await tick(); await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(c.written().at(-1), site).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'r1',
-        response: { behavior: 'deny', message: 'The directive tool fence failed' } } });
-      const thrown = site === 'refused' ? 'refusal journal broke' : 'turn failure handling broke';
-      expect(c.logs, site).toEqual([['claude directive tool decision handling threw; the turn is failed',
-        { tool_use_id: 'toolu_1', error: expect.stringMatching(new RegExp(`^Error: ${thrown}\\n`, 'u')) }]]);
-      // A throwing refused() leaves fail() to the guard; a throwing fail() ends the CLI instead.
-      expect(c.failures, site).toEqual(site === 'refused'
-        ? [`directive tool decision handling failed: ${thrown}`]
-        : ['directive tool fence failed: authority read broke', `directive tool decision handling failed: ${thrown}`]);
-      expect(c.signals, site).toEqual(site === 'refused' ? [] : ['SIGTERM']);
-      expect(c.child.stdin!.writableEnded, site).toBe(site === 'fail');
-      expect(unhandled, site).toEqual([]);
-    } finally { process.off('unhandledRejection', onUnhandled); }
+    });
+    expect(c.written().at(-1), site).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'r1',
+      response: { behavior: 'deny', message: 'The directive tool fence failed' } } });
+    const thrown = site === 'fail' ? 'turn failure handling broke' : 'refusal journal broke';
+    // The log names the fence's own reason as well as the error that broke its handling.
+    expect(c.logs, site).toEqual([['claude directive permission handling threw; the turn is refused',
+      { failure: 'directive tool fence failed: authority read broke', error: expect.stringMatching(new RegExp(`^Error: ${thrown}\\n`, 'u')) }]]);
+    expect(c.failures, site).toEqual(site === 'fail' ? ['directive tool fence failed: authority read broke'] : []);
+    expect(c.refusedFailures, site).toEqual([`directive permission handling failed: ${thrown}`]);
+    // The host ends the turn and its CLI; the channel does so itself only when the host cannot.
+    expect(c.signals, site).toEqual([]);
+    expect(caught, site).toEqual([]);
   }
-  it('a host refused() that throws while a failed fence is handled still fails the turn, logged, never an unhandled rejection (#485)', () => assertHandlingThrowGuarded('refused'));
-  it('a host fail() that throws while a failed fence is handled ends the CLI, logged, never an unhandled rejection (#485)', () => assertHandlingThrowGuarded('fail'));
+  it('a host refused() that throws while a failed fence is handled is a refusal of GC\'s own, logged with the fence\'s reason (#485)', () => assertHandlingThrowRefused('refused'));
+  it('a host fail() that throws while a failed fence is handled is a refusal of GC\'s own, logged with the fence\'s reason (#485)', () => assertHandlingThrowRefused('fail'));
+  it('a host log that throws as well still refuses the turn, never an unhandled rejection (#485)', () => assertHandlingThrowRefused('log'));
+
+  it('a throwing fail() reached from the stdin error listener, with no host refusal left, ends the CLI: SIGTERM, then SIGKILL after the grace (#485)', async () => {
+    const c = channel(undefined, undefined, undefined, { failThrows: true, failRefusedThrows: true });
+    const caught = await escaped(async () => {
+      c.initialize();
+      c.child.stdin!.emit('error', new Error('write EPIPE'));
+      expect(c.signals).toEqual(['SIGTERM']);
+      expect(c.child.stdin!.writableEnded).toBe(true);
+      // The CLI ignores SIGTERM: it is killed after the grace.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    expect(c.failures).toEqual(['directive permission transport failed']);
+    expect(c.refusedFailures).toEqual(['directive permission handling failed: turn failure handling broke']);
+    expect(c.logs).toEqual([['claude directive permission handling threw; the turn is refused',
+      { failure: 'directive permission transport failed', error: expect.stringMatching(/^Error: turn failure handling broke\n/u) }]]);
+    expect(c.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(caught).toEqual([]);
+  });
+
+  it('a throwing fail() reached from a stdin write callback is a refusal of GC\'s own, never an uncaught exception (#485)', async () => {
+    const c = channel(undefined, undefined, undefined, { failThrows: true });
+    const caught = await escaped(async () => {
+      c.initialize();
+      // The allow's write fails on the CLI's stdin.
+      Object.assign(c.child.stdin!, { write: (_chunk: string, callback: (error?: Error | null) => void) => {
+        process.nextTick(() => callback(new Error('write EPIPE')));
+        return true;
+      } });
+      c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+      await tick(); await tick(); await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    expect(c.failures).toEqual(['directive permission transport failed']);
+    expect(c.refusedFailures).toEqual(['directive permission handling failed: turn failure handling broke']);
+    expect(caught).toEqual([]);
+  });
 
   it('denies a lane\'s verification producer before any fence, with the verification refusal', async () => {
     const policy: WorkerVerificationPolicy = { jobId: 'job', laneId: 'lane', cwd: '/lane', scopes: ['full'], producerPrefixes: [['npm', 'test']], helper: 'gc-verify', configFile: '/config.toml' };

@@ -1994,7 +1994,7 @@ export class PiAgentHandle implements AgentHandle {
       try {
         listener(event);
       } catch (error) {
-        this.log('warn', 'runtime event listener threw', { error: String(error) });
+        this.log('warn', 'runtime event listener threw', { error: thrownText(error, 'string') });
       }
     }
   }

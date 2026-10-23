@@ -173,7 +173,10 @@ fatal errors climb.
   terminal; a tool fence fails; on Pi, a compaction is still open at
   admission);
 - its protocol checks (on Claude: an answer before the CLI's echo, a second
-  prompt, a lost frame, the permission channel's own deny);
+  prompt, a lost frame, the permission channel's own deny, and a failure
+  while the channel hands one of its own failures to the turn: the turn is
+  refused even when that refusal cannot be recorded, and if the host cannot
+  end the turn the channel ends the CLI itself, SIGTERM then SIGKILL);
 - its directive bookkeeping I/O inside a turn: transcript, binding, receipt
   and producer-journal I/O, and the GC ledger calls made for the directive
   (`beforeAdmission`, `onAdmitted`). A fault there, even one whose text names

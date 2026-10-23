@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DirectiveBookkeepingError, DirectiveCheckpointError, thrownDetail, thrownText } from '../src/runtime/directive-checkpoint.js';
 import {
@@ -263,12 +263,13 @@ describe('typed decision semantics', () => {
 
   it('Claude Code 2.1.309\'s typed error codes that name a deterministic wall classify alone and as the in-band suffix (#485)', () => {
     // GC's judgment, not the CLI's: a wall is a failure only a human clears. The CLI
-    // stops on account_on_hold as an auth failure; a rate_limit goes to pacing's
-    // bounded retry first (see pacing.test.ts), and walls here.
+    // stops on account_on_hold as an auth failure; a cloud credential it cannot load
+    // is a human's to restore; a rate_limit goes to pacing's bounded retry first (see
+    // pacing.test.ts), and walls here.
     const walls = {
       authentication_failed: 'authentication_wall', oauth_org_not_allowed: 'authentication_wall',
       verification_required: 'authentication_wall', account_on_hold: 'authentication_wall',
-      billing_error: 'quota_wall', rate_limit: 'quota_wall',
+      cloud_credential_error: 'authentication_wall', billing_error: 'quota_wall', rate_limit: 'quota_wall',
     } as const;
     for (const [code, wall] of Object.entries(walls)) {
       expect(deterministicFailureClass(code), code).toBe(wall);
@@ -278,30 +279,35 @@ describe('typed decision semantics', () => {
     expect(deterministicFailureClass('Credit balance is too low (billing_error)')).toBe('quota_wall');
     // The rest of the closed enum names no wall by its token: model_not_found too
     // (a restart, then the breaker if it persists).
-    for (const code of ['cloud_credential_error', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
+    for (const code of ['overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
       expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe('unknown');
     }
     // A word boundary never falls at "_": a longer snake-case name is another word.
     expect(deterministicFailureClass('rate_limit_remaining: 0')).toBe('unknown');
   });
 
-  it('a cloud_credential_error is classified by the CLI\'s own detail, never by its token (#485)', () => {
+  it('a cloud_credential_error is an authentication wall by its token, whatever the cloud SDK\'s detail says (#485)', () => {
     // Claude Code 2.1.309's text for it (no HTTP status): "Could not load <cloud> credentials ·
-    // <the cloud SDK's own words>. Check or refresh your <cloud> credentials and try again."
+    // <the first cause's own words>. Check or refresh your <cloud> credentials and try again."
     const credentials = (cloud: string, detail: string): string =>
-      `API Error: Could not load ${cloud} credentials · ${detail}. Check or refresh your ${cloud} credentials and try again. (cloud_credential_error)`;
-    // A named OAuth or authentication failure walls: the CLI's own Google OAuth text, and the
-    // Google library's missing default credentials (its help link names authentication).
-    expect(deterministicFailureClass(credentials('Google Cloud', 'Failed to acquire Google OAuth credentials'))).toBe('authentication_wall');
+      `API Error: Could not load ${cloud} credentials · ${detail.trimEnd().replace(/[.!?…]+$/u, '')}. Check or refresh your ${cloud} credentials and try again. (cloud_credential_error)`;
+    const environment = 'Unable to read the credential file specified by the GOOGLE_APPLICATION_CREDENTIALS environment variable: ';
+    // Every detail that reaches a user names a credential only a human restores. These read
+    // unknown by their words alone; the token walls them.
+    for (const text of [
+      credentials('Google Cloud', `${environment}The file at /keys/sa.json does not exist, or it is not a file. ENOENT: no such file or directory, lstat '/keys/sa.json'`),
+      credentials('Google Cloud', "EACCES: permission denied, open '/home/u/.config/gcloud/application_default_credentials.json'"),
+      credentials('Google Cloud', 'Must pass in a JSON object containing the user refresh token'),
+      credentials('Google Cloud', 'invalid_grant'),
+      credentials('AWS', 'Could not load credentials from any providers'),
+      credentials('AWS', 'AWS default-chain credential resolve timed out'),
+      credentials('AWS', 'The SSO session associated with this profile has expired. To refresh this SSO session run aws sso login with the corresponding profile.'),
+      credentials('AWS', 'Failed to load a token for session s1, please re-authenticate using aws login'),
+      'cloud_credential_error',
+    ]) expect(deterministicFailureClass(text), text).toBe('authentication_wall');
+    // One its words walled already: the Google library's missing default credentials.
     expect(deterministicFailureClass(credentials('Google Cloud',
-      'Could not load the default credentials. Browse to https://cloud.google.com/docs/authentication/getting-started for more information'))).toBe('authentication_wall');
-    // A metadata server the AWS SDK cannot reach is the network's.
-    expect(deterministicFailureClass(credentials('AWS', 'Unable to connect to instance metadata service'))).toBe('network_failure');
-    // Anything else restarts, and ends at the breaker if it persists.
-    expect(deterministicFailureClass(credentials('AWS', 'Could not load credentials from any providers'))).toBe('unknown');
-    expect(deterministicFailureClass(credentials('AWS',
-      'The SSO session associated with this profile has expired. To refresh this SSO session run aws sso login with the corresponding profile'))).toBe('unknown');
-    expect(deterministicFailureClass('cloud_credential_error')).toBe('unknown');
+      'Could not load the default credentials. Browse to https://cloud.google.com/docs/authentication/getting-started for more information.'))).toBe('authentication_wall');
   });
 
   it('names every thrown value, any realm\'s error included, and never throws (#485)', () => {
@@ -325,34 +331,50 @@ describe('typed decision semantics', () => {
     expect(thrownDetail(null)).toBe('a non-error value was thrown: null');
   });
 
-  // Scanned below, wherever the text is a literal (a `+`-joined chain of
-  // literals counts), every literal arm of a ternary, or a constant passed by
-  // name (resolved to its literal in the same file; one that does not resolve
-  // fails the scan): the message of `new DirectiveCheckpointError(…)` and
+  // Scanned below: the message of `new DirectiveCheckpointError(…)` and
   // `new DirectiveRuntimeUnsupportedError(…)`; in directive-checkpoint.ts the
   // reasons of its local refuse()/refused() helpers, refuse's default reason,
   // every unknown(…) reason (Claude's checkpoint refusal text quotes them) and
-  // what its *Refusal and *RetryCompaction helpers return; ledger/api.ts's
-  // refuse() reasons; the Claude permission channel's refusal and failure texts
-  // (claude-directive.ts); the call names given to withOwnIo()/ownIoRefusal();
-  // and the texts the refusal classes and thrownText write themselves.
-  // Not visible to it, checked by hand in #485 (none names a wall): the texts
-  // that arrive in variables — directive-progress.ts's result.note,
-  // lockBlocker, proof.reason/proof.error and verdict.error (directive recovery
-  // only; verdict.error can carry a provider's own text),
-  // directive-checkpoint.ts's oversized, at, refusal and retry (fed by texts
-  // scanned here), and the Claude channel's `new DirectiveCheckpointError(reason)`
-  // (its reasons are scanned here); the "current gate duty " prefix
-  // ledger/api.ts's refuse() puts before its reasons; and a bookkeeping
-  // refusal's fault text after GC's prefix, which is the disk's or the OS's
-  // words and is guarded by the tag, not by its text.
+  // what its *Refusal and *RetryCompaction helpers return as a text;
+  // ledger/api.ts's refuse() reasons; the Claude permission channel's refusal
+  // and failure texts (claude-directive.ts); the call names given to
+  // withOwnIo()/ownIoRefusal(); and the texts the refusal classes and
+  // thrownText write themselves. Each is read as an expression: every branch of
+  // a ternary (not its condition), both sides of a `??` or `||` fallback, a
+  // parenthesised or `as`-cast arm, and an arm's `+` chain of literals (single,
+  // double or backtick quoted) and constants (resolved to their literal in the
+  // same file; one that does not resolve fails the scan), with anything else
+  // in the chain as runtime detail. An arm with no literal or constant is one
+  // of KNOWN_UNSCANNED or fails the scan by name. Not visible to it either: the
+  // "current gate duty " prefix ledger/api.ts's refuse() puts before its
+  // reasons, and a bookkeeping refusal's fault text after GC's prefix, which is
+  // the disk's or the OS's words and is guarded by the tag, not by its text.
+  /** The arms the scan cannot read, each checked by hand in #485 (none names a wall). */
+  const KNOWN_UNSCANNED = [
+    // Directive recovery's texts from its proofs and verdicts (verdict.error can carry a provider's own text).
+    'dispatch/directive-progress.ts: lockBlocker',
+    'dispatch/directive-progress.ts: proof.error',
+    'dispatch/directive-progress.ts: proof.reason',
+    'dispatch/directive-progress.ts: result.note',
+    'dispatch/directive-progress.ts: verdict.error',
+    // The Claude channel's reasons, scanned in claude-directive.ts.
+    'runtime/claude-adapter.ts: reason',
+    // Fed by texts scanned here: a checkpoint's position, its oversize, its helpers' refusals and retries.
+    'runtime/directive-checkpoint.ts: at',
+    'runtime/directive-checkpoint.ts: compaction',
+    'runtime/directive-checkpoint.ts: error.message',
+    'runtime/directive-checkpoint.ts: oversized',
+    'runtime/directive-checkpoint.ts: reason',
+    'runtime/directive-checkpoint.ts: refusal',
+    'runtime/directive-checkpoint.ts: retry',
+  ];
   it('no refusal text GC writes is blank or names a wall (#485)', () => {
     const tick = '`';
-    const literal = String.raw`'(?:[^'\\]|\\.)*'|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
+    const literal = String.raw`'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
     const chain = String.raw`(?:${literal})(?:\s*\+\s*(?:${literal}))*`;
     const scans: readonly (readonly [RegExp, (file: string) => boolean])[] = [
       [new RegExp(String.raw`\b(?:unknown\(\s*|reason = )(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts')],
-      [new RegExp(String.raw`\bdeps\.(?:refused\([^,()]*,|fail\()\s*(${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
+      [new RegExp(String.raw`\b(?:this\.fail\(|this\.refuse\([^,()]*,|deps\.failRefused\()\s*(${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
       [new RegExp(String.raw`\bconst reason = (${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
       [new RegExp(String.raw`\b(?:withOwnIo|ownIoRefusal)\(\s*(${chain})`, 'gu'), () => true],
     ];
@@ -388,17 +410,19 @@ describe('typed decision semantics', () => {
       } while (depth > 0 && i < source.length);
       return i;
     };
-    // An expression's top-level parts, split at `sep`; literals kept whole, groups kept whole.
-    const split = (expression: string, separators: string): string[] => {
+    // An expression's top-level parts and the separators between them; literals
+    // and bracket groups are kept whole, `?.` and anything in `skip` never split.
+    const split = (expression: string, separators: readonly string[], skip: readonly string[] = []): string[] => {
       const parts: string[] = [];
       let from = 0;
       for (let i = 0; i < expression.length;) {
         const c = expression[i]!;
         if (c === "'" || c === '"' || c === tick) { i = pastLiteral(expression, i); continue; }
         if ('([{'.includes(c)) { i = pastGroup(expression, i); continue; }
-        // `?.` and `??` are no ternary.
-        if (c === '?' && (expression[i + 1] === '.' || expression[i + 1] === '?' || expression[i - 1] === '?')) { i += 1; continue; }
-        if (separators.includes(c)) { parts.push(expression.slice(from, i), c); from = i + 1; }
+        const kept = ['?.', ...skip].find((token) => expression.startsWith(token, i));
+        if (kept !== undefined) { i += kept.length; continue; }
+        const separator = separators.find((token) => expression.startsWith(token, i));
+        if (separator !== undefined) { parts.push(expression.slice(from, i), separator); i += separator.length; from = i; continue; }
         i += 1;
       }
       parts.push(expression.slice(from));
@@ -406,24 +430,44 @@ describe('typed decision semantics', () => {
     };
     const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
       entry.isDirectory() ? sources(join(dir, entry.name)) : entry.name.endsWith('.ts') ? [join(dir, entry.name)] : []);
+    const srcDir = join(import.meta.dirname, '..', 'src');
     const texts: string[] = [];
     const resolved: string[] = [];
+    const skipped: string[] = [];
     // Interpolations are runtime detail; the text GC writes around them is what is classified.
     const textOf = (literals: string): string => [...literals.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('').replace(/\$\{[^}]*\}/gu, 'x');
-    // Every arm of the expression (each ternary's branches, not its conditions)
-    // that is a literal chain, or a constant resolved in `source`.
+    // One arm, read as a `+` chain: its literals, and its constants resolved in
+    // `source`, with anything else as runtime detail. An arm with neither is
+    // skipped, by name.
+    const scanArm = (file: string, source: string, raw: string): void => {
+      const arm = raw.trim().replace(/\s+as\s+[\w.<>[\]| ]+$/u, '').replace(/!$/u, '');
+      // No argument (a default reason, scanned above), no text, or a helper whose returns are scanned.
+      if (arm === '' || arm === 'null' || arm === 'undefined' || arm.startsWith('{') || /^\w+Refusal\(/u.test(arm)) return;
+      if (arm.startsWith('(') && pastGroup(arm, 0) === arm.length) { scanExpression(file, source, arm.slice(1, -1)); return; }
+      let text = '';
+      let read = false;
+      for (const [at, operand] of split(arm, ['+']).entries()) {
+        if (at % 2 === 1) continue;
+        const part = operand.trim();
+        if (new RegExp(String.raw`^(?:${literal})$`, 'u').test(part)) { text += textOf(part); read = true; }
+        else if (/^[A-Z][A-Z0-9_]*$/u.test(part)) {
+          const definition = new RegExp(String.raw`\bconst ${part} = (${chain});`, 'u').exec(source);
+          expect(definition, `${file}: ${part} is no literal constant`).not.toBeNull();
+          text += textOf(definition![1]!);
+          resolved.push(part);
+          read = true;
+        } else text += 'x';
+      }
+      if (read) texts.push(text);
+      else skipped.push(`${relative(srcDir, file)}: ${arm.replace(/\s+/gu, ' ')}`);
+    };
+    // Every arm of the expression: each ternary's branches (not its conditions),
+    // and both sides of a `??` or `||` fallback.
     const scanExpression = (file: string, source: string, expression: string): void => {
-      const parts = split(expression, '?:');
+      const parts = split(expression, ['?', ':'], ['??', '||']);
       for (let i = 0; i < parts.length; i += 2) {
         if (parts[i + 1] === '?') continue; // a condition
-        const arm = parts[i]!.trim();
-        if (new RegExp(String.raw`^(?:${chain})$`, 'u').test(arm)) texts.push(textOf(arm));
-        else if (/^[A-Z][A-Z0-9_]*$/u.test(arm)) {
-          const definition = new RegExp(String.raw`\bconst ${arm} = (${chain});`, 'u').exec(source);
-          expect(definition, `${file}: ${arm} is no literal constant`).not.toBeNull();
-          texts.push(textOf(definition![1]!));
-          resolved.push(arm);
-        }
+        for (const [at, arm] of split(parts[i]!, ['??', '||']).entries()) if (at % 2 === 0) scanArm(file, source, arm);
       }
     };
     for (const file of sources(join(import.meta.dirname, '..', 'src'))) {
@@ -436,20 +480,24 @@ describe('typed decision semantics', () => {
         if (!applies(file)) continue;
         for (const match of source.matchAll(pattern)) {
           const open = match.index + match[0].length - 1;
-          scanExpression(file, source, split(source.slice(open + 1, pastGroup(source, open) - 1), ',')[0]!);
+          scanExpression(file, source, split(source.slice(open + 1, pastGroup(source, open) - 1), [','])[0]!);
         }
       }
       if (!file.endsWith('directive-checkpoint.ts')) continue;
-      // What the refusal helpers return.
+      // What the refusal helpers that return a text return.
       for (const match of source.matchAll(/\bfunction \w+(?:Refusal|RetryCompaction)\(/gu)) {
-        const open = source.indexOf('{', pastGroup(source, match.index + match[0].length - 1));
+        const parameters = pastGroup(source, match.index + match[0].length - 1);
+        const open = source.indexOf('{', parameters);
+        if (!/\bstring\b/u.test(source.slice(parameters, open))) continue;
         const body = source.slice(open, pastGroup(source, open));
         for (const statement of body.matchAll(/\breturn\b/gu)) {
           const rest = body.slice(statement.index + statement[0].length);
-          scanExpression(file, source, split(rest, ';')[0]!);
+          scanExpression(file, source, split(rest, [';'])[0]!);
         }
       }
     }
+    // Every arm the scan cannot read is one checked by hand: a new one fails here, by name.
+    expect([...new Set(skipped)].sort()).toEqual(KNOWN_UNSCANNED);
     expect(texts.some((text) => text.startsWith('an earlier directive failure refused this turn'))).toBe(true);
     expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'MALFORMED', 'RETRIED_TWICE', 'UNBOUND_TAIL']));
     expect(texts).toEqual(expect.arrayContaining(['native error row has no matching live SDK retry-start receipt',

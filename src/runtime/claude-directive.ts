@@ -58,14 +58,22 @@ export class ClaudeDirectivePermissionChannel {
   private readonly echoes: StreamFrame[] = [];
   private initialized = false;
   private closed = false;
+  private escalation: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly child: ChildProcess,
     private readonly deps: {
       /** Ends the turn. `refused` is what `refused()` returned when this
        * failure follows the channel's own deny; the host reports the turn's
-       * failure from it (the deny, or an earlier failure still owed). */
+       * failure from it (the deny, or an earlier failure still owed). A
+       * transport or protocol failure names no report and reports itself. */
       readonly fail: (message: string, refused?: unknown) => void;
+      /** Handling one of the channel's failures threw: the host's `refused()`
+       * or `fail()` (#485). That is GC's own directive control failing, so the
+       * host fails the turn with a refusal of `reason`, tagged, or with an
+       * earlier failure still owed (rule A), and does so even when it cannot
+       * record either. If this throws too, the channel ends the CLI itself. */
+      readonly failRefused: (reason: string) => void;
       /** A tool request this channel denied itself (malformed or foreign, or a
        * fence that failed), once the deny is handed to the CLI's stdin: the
        * host keeps a durable refusal of it, and returns an opaque report the
@@ -78,12 +86,14 @@ export class ClaudeDirectivePermissionChannel {
       readonly confirm: (request: ClaudeToolRequest) => ClaudeToolDecision;
       /** An error-level log line (#485). */
       readonly log: (message: string, fields: Readonly<Record<string, unknown>>) => void;
+      /** How long a CLI the channel ends itself has after SIGTERM before SIGKILL. */
+      readonly killGraceMs: number;
       readonly verification?: WorkerVerificationPolicy;
     },
   ) {
     child.once('close', () => { this.closed = true; });
     child.once('error', () => { this.closed = true; });
-    child.stdin?.on('error', () => this.deps.fail('directive permission transport failed'));
+    child.stdin?.on('error', () => this.fail('directive permission transport failed'));
   }
 
   start(): void {
@@ -93,7 +103,7 @@ export class ClaudeDirectivePermissionChannel {
   /** `durable` settles once this frame is written and synced to the transcript. */
   ingest(frame: StreamFrame, durable: Promise<void>): void {
     if (frame['type'] === 'result' && (!this.initialized || this.closed)) {
-      this.deps.fail('directive permission initialization did not complete before result');
+      this.fail('directive permission initialization did not complete before result');
       return;
     }
     if (frame['type'] === 'control_response') {
@@ -104,7 +114,7 @@ export class ClaudeDirectivePermissionChannel {
       }
       const echo = this.echoes.findIndex((written) => isDeepStrictEqual(written, frame));
       if (echo >= 0) { this.echoes.splice(echo, 1); return; }
-      this.deps.fail('foreign or repeated directive permission response');
+      this.fail('foreign or repeated directive permission response');
       return;
     }
     if (frame['type'] !== 'control_request') return;
@@ -119,12 +129,10 @@ export class ClaudeDirectivePermissionChannel {
       input !== null && typeof input === 'object' && !Array.isArray(input);
     if (!valid) {
       // Only a deny handed to the CLI's stdin is a refusal.
-      let report: unknown;
       if (typeof id === 'string' && id !== '' && !this.closed &&
           this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' })) {
-        report = this.deps.refused(undefined, 'malformed or foreign directive permission request');
-      }
-      this.deps.fail('malformed or foreign directive permission request', report);
+        this.refuse(undefined, 'malformed or foreign directive permission request');
+      } else this.fail('malformed or foreign directive permission request');
       return;
     }
     this.requests.add(id as string);
@@ -150,32 +158,63 @@ export class ClaudeDirectivePermissionChannel {
         this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message });
       },
       (error: unknown) => this.fenceFailed(id as string, tool, error),
-    ).catch((error: unknown) => this.handlingFailed(tool, error));
-  }
-
-  /** The last guard of a tool request's chain (#485): handling its decision
-   * threw (the host's `refused()` or `fail()`). It logs, fails the turn, and
-   * never throws, so no channel promise ends in an unhandled rejection. When
-   * `fail()` itself throws, it ends the CLI, and the turn fails at its close. */
-  private handlingFailed(tool: ClaudeToolRequest, error: unknown): void {
-    const reason = `directive tool decision handling failed: ${thrownText(error)}`;
-    try { this.deps.log('claude directive tool decision handling threw; the turn is failed', { tool_use_id: tool.toolUseId, error: thrownDetail(error) }); } catch { /* the turn still fails */ }
-    try {
-      this.deps.fail(reason);
-    } catch {
-      try { this.child.stdin?.end(); } catch { /* already closed */ }
-      try { this.child.kill('SIGTERM'); } catch { /* already gone */ }
-    }
+      // The chain's last guard: no channel promise ends in an unhandled rejection (#485).
+    ).catch((error: unknown) => this.handlingThrew(`deciding tool request ${tool.toolUseId}`, error));
   }
 
   /** The fence could not decide: deny the tool, keep a durable refusal of it, and end the turn. */
   private fenceFailed(requestId: string, tool: ClaudeToolRequest, error: unknown): void {
     const reason = `directive tool fence failed: ${thrownText(error)}`;
+    if (!this.closed && this.respond(requestId, { behavior: 'deny', message: 'The directive tool fence failed' })) this.refuse(tool.toolUseId, reason);
+    else this.fail(reason);
+  }
+
+  /** A deny the channel handed to the CLI: the host keeps its refusal, then the turn ends. */
+  private refuse(toolUseId: string | undefined, reason: string): void {
     let report: unknown;
-    if (!this.closed && this.respond(requestId, { behavior: 'deny', message: 'The directive tool fence failed' })) {
-      report = this.deps.refused(tool.toolUseId, reason);
+    try {
+      report = this.deps.refused(toolUseId, reason);
+    } catch (error) {
+      this.handlingThrew(reason, error);
+      return;
     }
-    this.deps.fail(reason, report);
+    this.fail(reason, report);
+  }
+
+  /** Every failure the channel reports goes through here: no channel callback
+   * throws (#485). */
+  private fail(message: string, refused?: unknown): void {
+    try {
+      this.deps.fail(message, refused);
+    } catch (error) {
+      this.handlingThrew(message, error);
+    }
+  }
+
+  /** Handling `failure` threw (the host's `refused()` or `fail()`; #485). The
+   * log names both; the host fails the turn as GC's own refusal; if that
+   * throws as well, the channel ends the CLI itself. Never throws. */
+  private handlingThrew(failure: string, error: unknown): void {
+    try {
+      this.deps.log('claude directive permission handling threw; the turn is refused', { failure, error: thrownDetail(error) });
+    } catch { /* the turn still fails */ }
+    try {
+      this.deps.failRefused(`directive permission handling failed: ${thrownText(error)}`);
+    } catch {
+      this.endCli();
+    }
+  }
+
+  /** Ends the CLI when the host cannot, as the host's abort does: its stdin,
+   * SIGTERM, then SIGKILL after the grace (armed once). */
+  private endCli(): void {
+    try { this.child.stdin?.end(); } catch { /* already closed */ }
+    try { this.child.kill('SIGTERM'); } catch { /* already gone */ }
+    if (this.escalation !== null || this.closed) return;
+    const escalation = setTimeout(() => { try { this.child.kill('SIGKILL'); } catch { /* already gone */ } }, this.deps.killGraceMs);
+    escalation.unref();
+    this.escalation = escalation;
+    this.child.once('close', () => clearTimeout(escalation));
   }
 
   /** Whether the response was handed to the CLI. */
@@ -185,17 +224,17 @@ export class ClaudeDirectivePermissionChannel {
 
   private write(frame: StreamFrame, echoed: boolean): boolean {
     if (this.closed || this.child.stdin == null || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
-      this.deps.fail('directive permission transport is unavailable');
+      this.fail('directive permission transport is unavailable');
       return false;
     }
     if (echoed) this.echoes.push(frame);
     try {
       this.child.stdin.write(`${JSON.stringify(frame)}\n`, (error) => {
-        if (error != null) this.deps.fail('directive permission transport failed');
+        if (error != null) this.fail('directive permission transport failed');
       });
       return true;
     } catch {
-      this.deps.fail('directive permission transport failed');
+      this.fail('directive permission transport failed');
       return false;
     }
   }

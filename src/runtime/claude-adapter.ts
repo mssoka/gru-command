@@ -1723,7 +1723,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       try {
         listener(event);
       } catch (error) {
-        this.log('warn', 'runtime event listener threw', { error: String(error) });
+        this.log('warn', 'runtime event listener threw', { error: thrownText(error, 'string') });
       }
     }
   }
@@ -2394,7 +2394,14 @@ export class ClaudeCodeHandle implements AgentHandle {
       /** A live directive child already reported an error (handled once). */
       let liveError = false;
       const abortTurn = (detail: string, cause?: unknown): void => {
-        failTurn(detail, cause);
+        try {
+          failTurn(detail, cause);
+        } finally {
+          // The CLI is ended even when failing the turn throws (#485).
+          endChild();
+        }
+      };
+      const endChild = (): void => {
         if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
         try { child.stdin?.end(); } catch { /* already closed */ }
         try { child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -2705,9 +2712,25 @@ export class ClaudeCodeHandle implements AgentHandle {
             const failure = this.recordDirectiveFailure(turn, refusal);
             return { failure, owed: failure !== refusal };
           },
+          // Handling the channel's own failure threw: GC's directive control
+          // failed, so the turn is refused, tagged, or fails with the failure
+          // it still owes, recorded or not (#485).
+          failRefused: (reason) => {
+            const refusal = new DirectiveCheckpointError(reason);
+            try {
+              this.recordDirectiveFailure(turn, refusal);
+            } catch (error) {
+              this.log('error', 'claude directive refusal could not be recorded; the turn is refused regardless', { request: turn.directive.identity.requestId, error: thrownDetail(error) });
+            }
+            // Kept by the turn even so: no later effect, and no completion, passes it.
+            turn.failure ??= { error: refusal };
+            const failure = turn.failure.error;
+            abortTurn(failure === refusal ? reason : `directive refused: ${thrownText(failure)}`, failure);
+          },
           decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
           confirm: (request) => this.confirmDirectiveTool(turn, request),
           log: (message, fields) => this.log('error', message, fields),
+          killGraceMs: params.killGraceMs,
           ...(params.workerVerification !== undefined ? { verification: params.workerVerification } : {}),
         });
         directivePermissions.start();

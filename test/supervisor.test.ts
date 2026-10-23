@@ -3334,7 +3334,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     } finally { h.dispose(); }
   });
 
-  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall, and walls with no pacing policy or once its budget is spent (#485)', async () => {
+  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall; as a quota-class text it walls with no pacing policy or once its budget is spent (#485)', async () => {
     // 2.1.309's client-side capacity off-switch, as GC's adapter words it.
     const error = 'Opus is experiencing high load. Switch to Sonnet. (rate_limit)';
     const event = { type: 'error' as const, error, fatal: false, provider: 'anthropic-claude-native', model: 'claude-opus-5-5',

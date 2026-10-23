@@ -781,6 +781,21 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('a listener that throws a value that cannot be printed is isolated: emit never throws, and later listeners still run (#485)', async () => {
+    const logs: { readonly level: string; readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
+    const fx = await fixture([{ deltas: ['answered'] }], ['text'], { log: (level, msg, fields) => logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }) });
+    const handle = await fx.runtime.spawn('gru');
+    handle.subscribe(() => { const thrown: unknown = Object.create(null); throw thrown; });
+    const events = collect(handle);
+    try {
+      await handle.prompt('answer plainly');
+      expect(events.some((event) => event.type === 'turn_end')).toBe(true);
+      expect(logs).toContainEqual({ level: 'warn', msg: 'runtime event listener threw', fields: { error: 'a non-error value was thrown: an unprintable value' } });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('an ordinary task spawn asks the SDK for no step, turn, or tool-call cap (issue #158)', async () => {
     const fx = await fixture();
     const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
