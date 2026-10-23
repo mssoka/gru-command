@@ -1074,6 +1074,54 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(unreachable).toBe(CAPTURE_EXIT.unknown);
   });
 
+  it('sends the [auth] token, never a `token` key another table (an [env] secret) holds above it (#494)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-env-token-'));
+    dirs.push(root);
+    const configPath = join(root, 'config.toml');
+    writeFileSync(configPath, '[env]\ntoken = "SYNTHETIC-ENV-SECRET-494"\n[auth]\ntoken = "ops-token"\n');
+    let auth: string | null = null;
+    const code = await runCaptureCli(
+      ['status', '--request-id', 'req-env-token', '--url', 'http://ops', '--config', configPath],
+      {
+        fetchImpl: async (_input, init) => {
+          auth = new Headers(init?.headers).get('authorization');
+          return new Response('{"state":"running"}\n', { status: 200 });
+        },
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    expect(auth).toBe('Bearer ops-token');
+  });
+
+  it('names a config that fails to parse, by position, without quoting it or asking the service (#494)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-env-token-bad-'));
+    dirs.push(root);
+    const configPath = join(root, 'config.toml');
+    writeFileSync(configPath, '[auth]\ntoken = "ops-token"\n[env]\nWIN_PATH = "SYNTHETIC-ENV-SECRET-494 C:\\Users"\n');
+    const errors: string[] = [];
+    let asked = false;
+    const code = await runCaptureCli(
+      ['status', '--request-id', 'req-env-bad', '--url', 'http://ops', '--config', configPath],
+      {
+        fetchImpl: async () => {
+          asked = true;
+          return new Response('{}\n', { status: 200 });
+        },
+        stdout: () => {},
+        stderr: (text: string) => errors.push(text),
+      },
+    );
+    expect(code).toBe(CAPTURE_EXIT.usage);
+    expect(asked).toBe(false);
+    const message = errors.join('');
+    expect(message).toContain(`--config ${configPath} is not valid TOML (Invalid TOML document:`);
+    expect(message).toMatch(/at line 4, column \d+\), so its \[auth\] token cannot be read/);
+    expect(message).toContain('the operator must fix this file (do not open or edit it from a job)');
+    expect(message).not.toContain('SYNTHETIC-ENV-SECRET-494');
+  });
+
   it('runs the advertised authenticated status action from a relocated config path with literal $ and backtick (N11)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-$`instance-'));
     dirs.push(root);

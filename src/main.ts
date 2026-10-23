@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
+import { bootServiceEnvironment, type ServiceEnvironment } from './service-environment.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
 import { Logger } from './logger.js';
@@ -107,7 +108,6 @@ import { createOnboardingServer } from './onboarding/server.js';
 import { heistWorkWaiting as raidHeistWorkWaiting, VectorRaidRunner } from './vector/runner.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { DECISION_SURFACE_EVENT_TRIAGE } from './decisions/questions.js';
-import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
 import type { GruCommandConfig } from './config.js';
 import { defaultListenerProbe, foreignListener, type ListenerOwner } from './listener-probe.js';
@@ -250,11 +250,11 @@ function claudeSettingsOverridesPresent(): boolean {
 async function main(): Promise<number> {
   const bootHr = process.hrtime.bigint();
   // Capture once, then remove the provider key from the ambient process
-  // environment before probes, agents, setup hooks, git, or gh can spawn.
-  const decisionEnvironment = isolateDecisionEnvironment();
-  let config;
+  // environment before probes, agents, setup hooks, git, or gh can spawn;
+  // then load the config and supply its [env] (#494) the same way.
+  let boot: ServiceEnvironment;
   try {
-    config = loadConfig();
+    boot = bootServiceEnvironment();
   } catch (error) {
     if (error instanceof ConfigError) {
       process.stderr.write(
@@ -269,6 +269,7 @@ async function main(): Promise<number> {
     }
     throw error;
   }
+  const { config, decisionEnvironment } = boot;
 
   // Port-squat prevention (owner incident 2026-09-23): a service spawned
   // from a git worktree must never bind the instance port — macOS lets a
@@ -313,6 +314,8 @@ async function main(): Promise<number> {
     default_runtime: config.runtimes.default,
     install_id: identity.installId,
     build_sha: buildInfo.rev,
+    // [env] names only: its values are secrets and never reach the log.
+    ...(config.env.names.length > 0 ? { config_env: { supplied: boot.supplied, inherited: boot.inherited } } : {}),
   });
   // Self-roll adoption (issue #34): the previous process wrote the swap
   // marker and exited for relaunch; this boot consumes it — logs

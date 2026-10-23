@@ -5,6 +5,7 @@ import { readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { pathToFileURL } from 'node:url';
+import { parse, TomlError } from 'smol-toml';
 import { pidAlive } from './scheduler.js';
 import {
   CAPTURE_OWNER_VERSION,
@@ -351,8 +352,20 @@ function readTokenFromConfig(path: string): string | null {
   } catch {
     return null;
   }
-  const match = /^\s*token\s*=\s*"([^"]+)"/mu.exec(text);
-  return match?.[1] ?? null;
+  // The [auth] table's token, never a `token` key in another table (such
+  // as an [env] secret): a TOML read, not a line match.
+  let raw: { auth?: { token?: unknown } };
+  try {
+    raw = parse(text) as typeof raw;
+  } catch (error) {
+    // The reason and position only: the parser's excerpt quotes the file.
+    const where = error instanceof TomlError ? ` (${error.message.split('\n', 1)[0] ?? ''} at line ${error.line}, column ${error.column})` : '';
+    throw new UsageError(
+      `--config ${path} is not valid TOML${where}, so its [auth] token cannot be read. The running service keeps the config it loaded; the operator must fix this file (do not open or edit it from a job), then retry the same request`,
+    );
+  }
+  const token = raw.auth?.token;
+  return typeof token === 'string' && token !== '' ? token : null;
 }
 
 /** Resolve the ops base URL + pairing token (flags → env → config file). */

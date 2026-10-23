@@ -10,6 +10,7 @@ import type { RollState } from '../roll/state.js';
 import { runResetCli, type ResetCliDeps } from './reset.js';
 import { defaultPackageRoot } from '../build-info.js';
 import {
+  configCheckedInstaller,
   defaultTail,
   installerRunnerFor,
   isInstallerCommand,
@@ -308,8 +309,13 @@ export async function runServiceCli(
     deps.stderr(USAGE.trimEnd());
     return 0;
   }
-  if (isInstallerCommand(command)) return runInstallerCli(command, argv.slice(1), deps);
-  if (command === 'restart' && argv.includes('--now')) return runRestartNowCli(argv.slice(1), deps);
+  if (isInstallerCommand(command)) {
+    const runInstaller = command === 'start' ? configCheckedInstaller(deps, 'start') : deps.runInstaller;
+    return runInstallerCli(command, argv.slice(1), { ...deps, runInstaller });
+  }
+  if (command === 'restart' && argv.includes('--now')) {
+    return runRestartNowCli(argv.slice(1), { ...deps, runInstaller: configCheckedInstaller(deps, 'restart') });
+  }
   if (command === 'status') return runStatusCli(argv.slice(1), { ...deps, baseUrl: serviceBaseUrl });
   if (command === 'logs') return runLogsCli(argv.slice(1), deps);
   const parsed = parseServiceArgs(argv);
