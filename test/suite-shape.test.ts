@@ -223,7 +223,7 @@ const PINS: Record<string, number> = {
   'claude-directive.test.ts': 19,
   'claude-review-isolation.test.ts': 4,
   'config-env-service.test.ts': 2,
-  'config-env.test.ts': 24,
+  'config-env.test.ts': 25,
   'config-generate.test.ts': 26,
   'config.test.ts': 87,
   'decisions-backtest.test.ts': 20,
@@ -422,7 +422,7 @@ const PINS: Record<string, number> = {
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 10,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 46,
+  'verification-capture.test.ts': 47,
 
 };
 

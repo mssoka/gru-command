@@ -5,7 +5,7 @@ import { readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { pathToFileURL } from 'node:url';
-import { parse } from 'smol-toml';
+import { parse, TomlError } from 'smol-toml';
 import { pidAlive } from './scheduler.js';
 import {
   CAPTURE_OWNER_VERSION,
@@ -354,12 +354,18 @@ function readTokenFromConfig(path: string): string | null {
   }
   // The [auth] table's token, never a `token` key in another table (such
   // as an [env] secret): a TOML read, not a line match.
+  let raw: { auth?: { token?: unknown } };
   try {
-    const auth = (parse(text) as { auth?: { token?: unknown } }).auth;
-    return typeof auth?.token === 'string' && auth.token !== '' ? auth.token : null;
-  } catch {
-    return null;
+    raw = parse(text) as typeof raw;
+  } catch (error) {
+    // The reason and position only: the parser's excerpt quotes the file.
+    const where = error instanceof TomlError ? ` (${error.message.split('\n', 1)[0] ?? ''} at line ${error.line}, column ${error.column})` : '';
+    throw new UsageError(
+      `--config ${path} is not valid TOML${where}, so its [auth] token cannot be read — the running service keeps the config it loaded; fix the file, or pass --token`,
+    );
   }
+  const token = raw.auth?.token;
+  return typeof token === 'string' && token !== '' ? token : null;
 }
 
 /** Resolve the ops base URL + pairing token (flags → env → config file). */

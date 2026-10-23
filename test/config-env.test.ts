@@ -100,8 +100,12 @@ describe('[env] parsing', () => {
     const atLimit = fill(MAX_ENV_TABLE_BYTES - 'BIG='.length - 1);
     const home = instance(`[env]\nBIG = "${atLimit}"\n`);
     expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').env.names).toEqual(['BIG']);
-    const message = rejection(`[env]\nBIG = "${atLimit}"\nMORE = "x"\n`);
-    expect(message).toContain(`[env] holds ${MAX_ENV_TABLE_BYTES + 'MORE=x'.length + 1} bytes of names and values, over the ${MAX_ENV_TABLE_BYTES}-byte limit`);
+    // One byte over, counted in UTF-8 bytes as execve sees them: 32767
+    // two-byte characters are far under the limit in UTF-16 units.
+    const over = `${CANARY}${'é'.repeat((MAX_ENV_TABLE_BYTES - 'A='.length - CANARY.length) / 2)}`;
+    expect(Buffer.byteLength(`A=${over}`) + 1).toBe(MAX_ENV_TABLE_BYTES + 1);
+    const message = rejection(`[env]\nA = "${over}"\n`);
+    expect(message).toContain(`[env] holds ${MAX_ENV_TABLE_BYTES + 1} bytes of names and values, over the ${MAX_ENV_TABLE_BYTES}-byte limit`);
     expect(message).not.toContain(CANARY);
   });
 
@@ -238,6 +242,8 @@ describe('[env] at service boot', () => {
     const inherited: NodeJS.ProcessEnv = { KEEP: 'inherited' };
     expect(withConfiguredEnvironment(configured, inherited)).toEqual({ KEEP: 'inherited', SYNTH_SUPPLIED: CANARY });
     expect(inherited).toEqual({ KEEP: 'inherited' });
+    // `NAME: undefined` is the unset-for-a-child idiom: still unset.
+    expect(withConfiguredEnvironment(configured, { KEEP: undefined })).toEqual({ KEEP: 'from-config', SYNTH_SUPPLIED: CANARY });
   });
 });
 
@@ -251,6 +257,29 @@ describe('[env] and the processes the service starts', () => {
       `process.env.SYNTH_SUPPLIED = ${JSON.stringify(CANARY)};`,
       'const env = psEnvironment();',
       'process.stdout.write(JSON.stringify([env.OPENROUTER_API_KEY ?? null, env.SYNTH_SUPPLIED ?? null, env.TZ]));',
+    ].join('\n');
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      env: { PATH: process.env['PATH'], OPENROUTER_API_KEY: KEY_CANARY },
+      encoding: 'utf8',
+    });
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual([null, CANARY, 'UTC']);
+  });
+
+  it.skipIf(process.platform !== 'darwin')('the ps the service runs gets that environment, not one captured at import', () => {
+    const module = join(import.meta.dirname, '..', 'dist', 'runtime', 'review-host-exit.js');
+    const script = [
+      "import { createRequire, syncBuiltinESMExports } from 'node:module';",
+      "const childProcess = createRequire(import.meta.url)('node:child_process');",
+      'const run = childProcess.execFileSync;',
+      'let seen = null;',
+      'childProcess.execFileSync = (file, args, options) => { seen = options.env; return run(file, args, options); };',
+      'syncBuiltinESMExports();',
+      `const { thisProcessIdentity } = await import(${JSON.stringify(module)});`,
+      'delete process.env.OPENROUTER_API_KEY;',
+      `process.env.SYNTH_SUPPLIED = ${JSON.stringify(CANARY)};`,
+      'thisProcessIdentity();',
+      'process.stdout.write(JSON.stringify([seen?.OPENROUTER_API_KEY ?? null, seen?.SYNTH_SUPPLIED ?? null, seen?.TZ ?? null]));',
     ].join('\n');
     const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
       env: { PATH: process.env['PATH'], OPENROUTER_API_KEY: KEY_CANARY },

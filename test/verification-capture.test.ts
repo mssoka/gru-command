@@ -1095,6 +1095,32 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(auth).toBe('Bearer ops-token');
   });
 
+  it('names a config that fails to parse, by position, without quoting it or asking the service (#494)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-env-token-bad-'));
+    dirs.push(root);
+    const configPath = join(root, 'config.toml');
+    writeFileSync(configPath, '[auth]\ntoken = "ops-token"\n[env]\nWIN_PATH = "SYNTHETIC-ENV-SECRET-494 C:\\Users"\n');
+    const errors: string[] = [];
+    let asked = false;
+    const code = await runCaptureCli(
+      ['status', '--request-id', 'req-env-bad', '--url', 'http://ops', '--config', configPath],
+      {
+        fetchImpl: async () => {
+          asked = true;
+          return new Response('{}\n', { status: 200 });
+        },
+        stdout: () => {},
+        stderr: (text: string) => errors.push(text),
+      },
+    );
+    expect(code).toBe(CAPTURE_EXIT.usage);
+    expect(asked).toBe(false);
+    const message = errors.join('');
+    expect(message).toContain(`--config ${configPath} is not valid TOML (Invalid TOML document:`);
+    expect(message).toMatch(/at line 4, column \d+\), so its \[auth\] token cannot be read/);
+    expect(message).not.toContain('SYNTHETIC-ENV-SECRET-494');
+  });
+
   it('runs the advertised authenticated status action from a relocated config path with literal $ and backtick (N11)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-$`instance-'));
     dirs.push(root);

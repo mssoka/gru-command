@@ -139,8 +139,8 @@ describe('[env] in the compiled service boot (#494)', () => {
     mkdirSync(elsewhere);
     const workspace = join(root, 'workspace');
     mkdirSync(workspace);
-    // Jev on: a table that slipped through would start the provider probe
-    // and the fetch double would record it.
+    // Jev on, with a key the service unit set: a table that slipped through
+    // would start the provider probe and the fetch double would record it.
     const header = `workspace_root = "${workspace}"\n[server]\nhost = "127.0.0.1"\nport = 0\n[decisions.jev]\nenabled = true\n`;
     const cases = [
       { label: 'non-string', toml: `[env]\nTOKEN = 7\nOTHER = "${CANARY}"\n`, field: 'env.TOKEN must be a string' },
@@ -165,9 +165,9 @@ describe('[env] in the compiled service boot (#494)', () => {
         GRU_SERVICE_PORT: '0',
         JEV_FETCH_LOG: fetchLog,
         NODE_OPTIONS: `--import=${fetchDouble}`,
+        OPENROUTER_API_KEY: KEY_CANARY,
         PATH: `${join(root, `${label}-bin`)}:${process.env['PATH'] ?? ''}`,
       };
-      delete env['OPENROUTER_API_KEY'];
       const child = spawn(process.execPath, [mainJs], { env, stdio: ['ignore', 'pipe', 'pipe'] });
       let output = '';
       child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); });

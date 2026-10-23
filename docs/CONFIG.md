@@ -117,8 +117,8 @@ CUSTOM_SERVICE_OPTION = "enabled"
 
 The section is optional. Without it, nothing changes.
 
-- **Who gets the values.** The service itself, from the start of its boot,
-  and every process it starts (agents, git, gh, glab, verification
+- **Who gets the values.** The service itself, from its boot step on (right
+  after its modules load), and every process it starts (agents, git, gh, glab, verification
   commands). GC's usual child-process filtering still applies on top.
 - **Precedence.** The environment the service starts with wins. A name the
   service unit (or whoever starts the service) already sets keeps that
@@ -127,10 +127,10 @@ The section is optional. Without it, nothing changes.
   macOS `GRU_COMMAND_REVIEW_PYTHON`, so `[env]` cannot change those. The boot
   log line lists the names `[env]` supplied and the names the inherited
   environment kept (`config_env`). It shows names only, never values.
-  Precedence is per name: a program that reads one of several names (the
-  GitLab token as `GITLAB_TOKEN`, then `GL_TOKEN`; the Claude CLI preferring
-  `ANTHROPIC_API_KEY` over a login) can pick an `[env]` name over a
-  different name the unit sets.
+  Precedence is per name: a program that reads one of several names can
+  pick an `[env]` name over a different name the unit sets. Perkins reads
+  the GitLab token as `GITLAB_TOKEN`, then `GL_TOKEN`; gh prefers `GH_TOKEN`
+  to `GITHUB_TOKEN`; the Claude CLI prefers `ANTHROPIC_API_KEY` to a login.
 - **Reserved names.** `GRU_*` names and `HOME` are refused, in any letter
   case. GC uses them to select the instance, its config and the port and to
   carry lane and review authority, and those come only from the unit and
@@ -152,9 +152,9 @@ The section is optional. Without it, nothing changes.
   re-reads the whole file, and while it is invalid Jev (if enabled) falls
   back to deterministic routing with the reason `config_invalid`.
   Variables Node.js reads as it starts
-  (`NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS` or `UV_THREADPOOL_SIZE`, for
-  example) take effect only in the processes the service starts: `[env]` is
-  read after the running service's Node.js has started.
+  (`NODE_OPTIONS` or `NODE_EXTRA_CA_CERTS`, for example) take effect only in
+  the processes the service starts: `[env]` is read after the running
+  service's Node.js has started.
 - **Literal values.** Values are plain strings. There is no `$VAR`
   expansion and no shell. Names must be valid environment variable names
   (letters, digits and underscores, not starting with a digit). Values must
@@ -166,7 +166,9 @@ The section is optional. Without it, nothing changes.
   invalid, leaving the service as it is. The service runs the same check
   when it boots. `gru update` and a roll started from the board do not
   check first: with an invalid config the relaunched service refuses to
-  start until you fix the file and run `gru start`.
+  start. On macOS launchd retries every few seconds, so the service comes
+  back by itself once the file is fixed; on Linux systemd gives up after a
+  few tries, so run `gru start` once it is fixed.
 - **Plaintext secrets.** `[env]` is not an encrypted secret store. Values
   sit in `config.toml` in plaintext, so the file must be private to you:
   `chmod 600 ~/.gru-command/config.toml`. If the file holds `[env]` values
