@@ -8833,12 +8833,14 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     expect(existsSync(join(artifacts, outcome.round.id, 'perkins-report.publication-overflow.json'))).toBe(true);
   });
 
-  it('persists the NOT-delivered fact on the ledger lens note for an over-bound batch (R17/V2)', async () => {
+  it('persists the NOT-delivered fact on the ledger lens note for a withheld result the lead never collected (R17/V2, #487)', async () => {
     const repo = makeFixtureRepo('p3-ledger-undelivered');
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/p3-ledger-undelivered']);
     repo.commitFile('src/main.ts', 'export const before = 1;\n');
-    const target = repo.commitFile('src/main.ts', `export function answer(): number {\n  return 43; /*${'x'.repeat(3_950)}*/\n}\n`);
+    // Two lenses of ~105 KB each: each fits one lead-readable response, both do not.
+    const line = (n: number): string => `export const value${n} = '${'x'.repeat(3_500)}';`;
+    const target = repo.commitFile('src/big.ts', `${Array.from({ length: 30 }, (_unused, index) => line(index + 1)).join('\n')}\n`);
     const root = mkdtempSync(join(tmpdir(), 'p3-lu-port-'));
     const artifacts = mkdtempSync(join(tmpdir(), 'p3-lu-artifacts-'));
     const sessions = mkdtempSync(join(tmpdir(), 'p3-lu-sessions-'));
@@ -8854,10 +8856,10 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/79');
     attachOrigin(repo, 'feature/p3-ledger-undelivered', root);
     const bulk = (lens: string): string => JSON.stringify(
-      Array.from({ length: 200 }, (_unused, index) => ({
-        source: lens, severity: 'note', category: 'bulk', title: `${lens} bulk finding ${index}`,
-        location: 'src/main.ts:2', evidence: `  return 43; /*${'x'.repeat(3_800)}`,
-        detail: 'Bulk finding to exceed the response bound.', recommended_fix: 'None needed.',
+      Array.from({ length: 30 }, (_unused, index) => ({
+        source: lens, severity: 'note', category: 'bulk', title: `${lens} large finding ${index}`,
+        location: `src/big.ts:${index + 1}`, evidence: line(index + 1),
+        detail: 'Large finding to fill one response.', recommended_fix: 'None needed.',
       })),
     );
     const poster = {
@@ -8874,18 +8876,21 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
           const lens = /"source": "(security|codebase)"/u.exec(prompt)?.[1];
           return lens === undefined ? '[]' : bulk(lens);
         },
-        // Both lenses in ONE batch: the combined response exceeds the
-        // transport bound, so neither run's findings reach the lead.
+        // Both lenses in ONE batch: the response withholds the second, and
+        // this lead never collects it.
         specialists: ['security', 'codebase'],
+        ignoreWithheld: true,
       }).spawner,
       poster, reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe('feature/p3-ledger-undelivered'),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
     expect(outcome.posted).toBe(true);
-    const securityChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'security');
-    expect(securityChip?.state).toBe('done');
-    expect(securityChip?.note).toContain('findings for this lens were NOT delivered to the lead');
+    const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
+    const codebaseChip = chips.find((chip) => chip.lens === 'codebase');
+    expect(codebaseChip?.state).toBe('done');
+    expect(codebaseChip?.note).toContain('findings for this lens were NOT delivered to the lead');
+    expect(chips.find((chip) => chip.lens === 'security')?.note ?? '').not.toContain('NOT delivered');
   }, 120_000);
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* global Buffer, clearTimeout, process, setTimeout */
+/* global Buffer, clearTimeout, process, setImmediate, setTimeout */
 import { randomUUID } from 'node:crypto';
 import { createConnection } from 'node:net';
 
@@ -62,9 +62,16 @@ async function bridge(name, input, replyOnWait) {
       else reject(error);
     };
     const connectTimer = setTimeout(() => finish(new Error('review bridge connection timed out')), CONNECT_TIMEOUT_MS);
+    // The wait ends only on a quiet transport. The decision runs one turn
+    // later, after bytes already buffered are read, and a response already
+    // arriving is awaited to its end: the bridge keeps a result only while
+    // no caller took it, so a dropped arriving result would be run twice.
     const responseTimer = setTimeout(() => {
-      if (replyOnWait) finish(null, stillRunningResult(name));
-      else finish(new Error('review bridge response timed out'));
+      setImmediate(() => {
+        if (settled || bytes > 0) return;
+        if (replyOnWait) finish(null, stillRunningResult(name));
+        else finish(new Error('review bridge response timed out'));
+      });
     }, responseWaitMs);
     connectTimer.unref?.();
     responseTimer.unref?.();
@@ -166,9 +173,13 @@ function dispatch(raw) {
         if (result.terminate !== undefined && typeof result.terminate !== 'boolean') {
           throw new Error('native review tool returned invalid termination state');
         }
+        /* The text is the whole model-facing result. No structuredContent:
+         * Claude Code (2.1.309) hands the model the structuredContent JSON
+         * INSTEAD of the text when both are present, so the host's summary
+         * details would replace specialist findings, preflight errors and
+         * still-running guidance. The details the bridge sends stop here. */
         respond(request.id, {
           content: [{ type: 'text', text: result.text }],
-          structuredContent: result.details ?? {},
           ...(result.terminate === true ? { _meta: { terminate: true } } : {}),
         });
         return;

@@ -155,7 +155,9 @@ one real Perkins lead reviewing the complete frozen change. The pinned
 policy's catalog makes nine whole-change specialist lenses available (blind,
 edge, acceptance, security, architecture, codebase, tests, performance,
 operations) — eight when `no_spec: true` explicitly removes the
-spec-dependent acceptance lens. The lead SELECTS which specialists help the
+spec-dependent acceptance lens. The lead's system prompt lists each lens of
+its catalog with that lens's policy brief, and the lead
+SELECTS which specialists help the
 change: availability is never a mandatory coverage gate, and a subset (or
 none) is a valid review. Specialists run in explicit tool-call batches
 bounded by the round's admitted resident wave and provider pacing; the lead
@@ -164,6 +166,11 @@ inside the SAME round, frozen target and lead. A round is bounded to 16 real
 specialist runs (retries included), two attempts per lens, and two real
 terminal submissions (free preflight is distinct); failed attempts count and
 stay recorded, and a completed lens cannot be rerun for a second opinion.
+Every specialist result fits one tool response the lead can read (a larger
+one fails its attempt with feedback to report fewer, shorter findings); a
+response lists any result it could not carry whole as `withheld`, and the
+lead collects it by calling the tool again for that lens, which starts no
+child. A result never collected stays recorded as not delivered.
 Lenses the lead did not use are reported as `not used`, never as coverage.
 Immediately after the freeze (and before the run promise or any lead/child
 spawn), an **admission preflight** re-validates the complete frozen packet
