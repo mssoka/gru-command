@@ -3015,9 +3015,16 @@ export class WaveRunner {
       return { url: null, note: 'the job has no lane branch to look up an open pull request for' };
     }
     // An owner decision holding PR registration for this delivery holds
-    // here too: publication never links past what Silas may not.
-    const held = decisionHold(this.opts.ledger, jobId, deliveredPrRegisterHold(this.opts.ledger, jobId));
-    if (held !== null) return { url: null, note: `${held}, so no open pull request is linked` };
+    // here too: publication never links past what Silas may not. It is
+    // proved again after the awaited lookup, before the link.
+    const holdNote = (): string | null => {
+      const held = decisionHold(this.opts.ledger, jobId, deliveredPrRegisterHold(this.opts.ledger, jobId));
+      return held === null ? null : `${held}, so no open pull request is linked`;
+    };
+    const abortedNote = 'the review was aborted during the open pull request lookup';
+    const heldBefore = holdNote();
+    if (heldBefore !== null) return { url: null, note: heldBefore };
+    if (signal.aborted) return { url: null, note: abortedNote };
     // The lookup never holds an aborting round: the race settles on the
     // abort, and a late lookup result or failure is dropped.
     let onAbort = (): void => {};
@@ -3027,15 +3034,23 @@ export class WaveRunner {
     });
     const lookup = (async () => find({ repoPath: lane.path, branch }))();
     lookup.catch(() => {});
-    let pulls: readonly OpenPullRequest[] | null;
+    let pulls: readonly OpenPullRequest[] | null = null;
+    let lookupError: unknown = null;
     try {
-      pulls = signal.aborted ? null : await Promise.race([lookup, aborted]);
+      pulls = await Promise.race([lookup, aborted]);
     } catch (error) {
-      return { url: null, note: `looking up open pull requests for branch ${branch} failed: ${sanitizeErrorLog(error)}` };
+      lookupError = error;
     } finally {
       signal.removeEventListener('abort', onAbort);
     }
-    if (pulls === null || signal.aborted) return { url: null, note: 'the review was aborted during the open pull request lookup' };
+    if (signal.aborted) return { url: null, note: abortedNote };
+    // A link registered while the lookup was awaited wins, whatever the
+    // lookup found; it is never overwritten.
+    const raced = this.opts.ledger.getJob(jobId)?.prUrl ?? null;
+    if (raced !== null) return { url: raced, note: null };
+    if (lookupError !== null || pulls === null) {
+      return { url: null, note: `looking up open pull requests for branch ${branch} failed: ${sanitizeErrorLog(lookupError)}` };
+    }
     const open = pulls.filter((pull) => pull.state === 'open' && pull.url !== null);
     const matching = open.filter((pull) => pull.headSha === targetSha);
     if (matching.length !== 1) {
@@ -3044,9 +3059,8 @@ export class WaveRunner {
         note: `${matching.length} of the ${open.length} open pull request(s) for branch ${branch} have the reviewed head ${targetSha}`,
       };
     }
-    // A link registered while the lookup was awaited wins; never overwrite it.
-    const raced = this.opts.ledger.getJob(jobId)?.prUrl ?? null;
-    if (raced !== null) return { url: raced, note: null };
+    const heldAfter = holdNote();
+    if (heldAfter !== null) return { url: null, note: heldAfter };
     const url = matching[0]!.url!;
     try {
       record(jobId, url);

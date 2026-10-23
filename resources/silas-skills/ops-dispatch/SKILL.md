@@ -251,6 +251,11 @@ without a named rule is not yours to invent:
      -d '{"job_id":"<job>","by":"silas"}'
    ```
 
+   When the row's `abortedRounds` is above 0, a round already ran and
+   aborted before the PR was registered: register the PR only, and send no
+   review request. A clean service-restart abort then appears under step 2
+   with `cleanAbort`; any other abort stays held for Gru.
+
    If you cannot find a PR, note the job on the ledger (`noteJob` is not
    yours — post an escalation instead) and leave the lane untouched. Do not
    guess a URL; a wrong registration poisons the review.

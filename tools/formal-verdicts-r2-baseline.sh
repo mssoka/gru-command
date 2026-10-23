@@ -42,7 +42,7 @@ printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\
 ln -s "$root/node_modules" "$d/node_modules"
 printf '%s base=%s head=%s\n' "$d" "$base" "$headrev" > "$prep/formal-verdicts-r2-baseline.last-snapshot.txt"
 cd "$d"
-for pair in "perkins-builtin-wave.test.ts:290" "silas-driver.test.ts:176"; do
+for pair in "perkins-builtin-wave.test.ts:293" "silas-driver.test.ts:176"; do
   file=${pair%%:*}
   expected=${pair##*:}
   registered=$(grep -oE '\bit\(|\bit\.skipIf\(' "test/$file" | wc -l | tr -d ' ')

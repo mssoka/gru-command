@@ -696,7 +696,12 @@ describe('silas digest (the four actionable states)', () => {
       // It aborted (a restart, an INCOMPLETE lead): before #488 the job had
       // rounds, so nothing ever offered the registration the re-arm needs.
       h.ledger.setRoundStatus(round.id, 'aborted');
-      expect((await digestNow()).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-unlinked']);
+      // The row says a round already ran, and the skill tells Silas to
+      // register only: a non-clean abort warrants no new round.
+      expect((await digestNow()).deliveredWithoutPr.map((row) => [row.jobId, row.abortedRounds])).toEqual([['job-unlinked', 1]]);
+      const skill = readFileSync(join(import.meta.dirname, '..', 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf8');
+      expect(skill).toContain("When the row's `abortedRounds` is above 0");
+      expect(skill).toContain('register the PR only, and send no\n   review request');
     } finally {
       h.cleanup();
     }
@@ -862,6 +867,7 @@ describe('silas digest (the four actionable states)', () => {
           lanePath: '/lanes/job-lane',
           minionSessionFile: '/sessions/min-lane.jsonl',
           deliveredAt: expect.any(String),
+          abortedRounds: 0,
         },
       ]);
     } finally {
@@ -3699,7 +3705,7 @@ describe('silas digest fingerprint (issue #217)', () => {
     computedAt: '2026-10-05T00:00:00.000Z',
     trigger: 'sweep',
     deliveredWithoutPr: [
-      { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/lane', minionSessionFile: '/sess.json', deliveredAt: '2026-10-04T00:00:00.000Z' },
+      { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/lane', minionSessionFile: '/sess.json', deliveredAt: '2026-10-04T00:00:00.000Z', abortedRounds: 0 },
     ],
     prWithoutReview: [],
     verdictsAwaitingDirective: [
@@ -3734,7 +3740,7 @@ describe('silas digest fingerprint (issue #217)', () => {
       computedAt: '2026-10-06T12:00:00.000Z',
       trigger: 'job.delivered',
       deliveredWithoutPr: [
-        { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/other', minionSessionFile: '/other.json', deliveredAt: '2026-10-05T09:00:00.000Z' },
+        { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/other', minionSessionFile: '/other.json', deliveredAt: '2026-10-05T09:00:00.000Z', abortedRounds: 0 },
       ],
     });
     expect(digestFingerprint(volatile)).toBe(before);
@@ -3847,8 +3853,8 @@ describe('silas digest delta (issue #217)', () => {
       computedAt: '2026-10-05T00:00:00.000Z',
       trigger: 'sweep',
       deliveredWithoutPr: [
-        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
-        { jobId: 'job-gone', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 },
+        { jobId: 'job-gone', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 },
       ],
       prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/1', priorRounds: 1 }],
       verdictsAwaitingDirective: [],
@@ -3865,8 +3871,8 @@ describe('silas digest delta (issue #217)', () => {
       computedAt: '2026-10-05T00:05:00.000Z',
       deliveredWithoutPr: [
         // job-kept stays; job-gone resolved; job-new added
-        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: '2026-10-05T00:04:00.000Z' },
-        { jobId: 'job-new', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: '2026-10-05T00:04:00.000Z', abortedRounds: 0 },
+        { jobId: 'job-new', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null, abortedRounds: 0 },
       ],
       prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/1', priorRounds: 2 }],
     };

@@ -434,6 +434,9 @@ export interface DeliveredWithoutPrRow {
   readonly lanePath: string | null;
   readonly minionSessionFile: string | null;
   readonly deliveredAt: string | null;
+  /** Rounds that already ran on this job and aborted unlinked (#488): the
+   * PR is registered only; any review is the clean-abort row's call. */
+  readonly abortedRounds: number;
 }
 
 export interface PrWithoutReviewRow {
@@ -693,7 +696,7 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
   switch (category) {
     case 'deliveredWithoutPr': {
       const r = row as DeliveredWithoutPrRow;
-      return { jobId: r.jobId, repo: r.repo, branch: r.branch };
+      return { jobId: r.jobId, repo: r.repo, branch: r.branch, abortedRounds: r.abortedRounds };
     }
     case 'prWithoutReview': {
       const r = row as PrWithoutReviewRow;
@@ -1634,6 +1637,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         lanePath: lane?.path ?? null,
         minionSessionFile: minion?.sessionFile ?? null,
         deliveredAt: delivered.ts,
+        abortedRounds: rounds.length,
       });
     }
 

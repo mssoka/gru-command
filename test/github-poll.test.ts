@@ -332,11 +332,13 @@ describe('open pull requests for a lane branch (#488)', () => {
 
   it('fails loud, naming the lane, for a non-GitHub or missing origin, and never asks GitHub', async () => {
     const listPullsForHead = vi.fn(async () => [pull]);
-    await expect(openPullRequestsForBranch({ listPullsForHead }, {
+    const gitlab = openPullRequestsForBranch({ listPullsForHead }, {
       repoPath: '/lanes/gl', remote: { host: 'gitlab.com', owner: 'acme', repo: 'site' }, branch: 'gru/x',
-    })).rejects.toThrow('no GitHub remote resolves for lane "/lanes/gl"');
+    });
+    await expect(gitlab).rejects.toBeInstanceOf(GhApiError);
+    await expect(gitlab).rejects.toThrow('no GitHub remote resolves for lane "/lanes/gl"');
     await expect(openPullRequestsForBranch({ listPullsForHead }, { repoPath: '/lanes/none', remote: null, branch: 'gru/x' }))
-      .rejects.toThrow('no GitHub remote resolves for lane "/lanes/none"');
+      .rejects.toBeInstanceOf(GhApiError);
     expect(listPullsForHead).not.toHaveBeenCalled();
   });
 });

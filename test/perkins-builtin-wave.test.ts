@@ -6766,6 +6766,75 @@ describe('WaveRunner request guards', () => {
     expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.pr-discovered')).toBeNull();
   });
 
+  it('a link registered during the lookup wins even when the lookup then fails or is ambiguous (#488)', async () => {
+    for (const [prefix, lookup] of [
+      ['raced-then-fails', async (): Promise<never> => { throw new Error('gh: network stall'); }],
+      ['raced-then-ambiguous', async () => [
+        { url: 'https://github.com/acme/fixture/pull/31', headSha: 'TARGET', state: 'open' },
+        { url: 'https://github.com/acme/fixture/pull/32', headSha: 'TARGET', state: 'open' },
+      ]],
+    ] as const) {
+      const lane = await unlinkedPublicationLane(prefix);
+      const registered = `https://github.com/acme/fixture/pull/${prefix === 'raced-then-fails' ? 41 : 42}`;
+      const recordPr = vi.fn();
+      const outcome = asWave(await lane.wave({
+        findOpenPullRequests: async () => {
+          lane.ledger.setJobPr(lane.job.id, registered);
+          const pulls = await lookup();
+          return pulls.map((pull) => ({ ...pull, headSha: lane.target }));
+        },
+        recordPr,
+      }).runRound({ jobId: lane.job.id }));
+      expect(outcome.posted, prefix).toBe(true);
+      expect(recordPr, prefix).not.toHaveBeenCalled();
+      expect(lane.poster.post, prefix).toHaveBeenCalledWith(expect.objectContaining({ prUrl: registered }));
+      expect(lane.escalations.some((line) => line.includes('NO pull request')), prefix).toBe(false);
+    }
+  });
+
+  it('an owner hold recorded during the lookup stops the link (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-held-mid-lookup');
+    let decisionId = '';
+    const recordPr = vi.fn();
+    const outcome = asWave(await lane.wave({
+      findOpenPullRequests: async () => {
+        decisionId = lane.ledger.recordDecision({
+          subject: `job:${lane.job.id}`, decision: 'hold', covers: ['delivered-pr-register'], by: 'owner', reason: 'held mid-lookup',
+        }).id;
+        return [{ url: 'https://github.com/acme/fixture/pull/7', headSha: lane.target, state: 'open' }];
+      },
+      recordPr,
+    }).runRound({ jobId: lane.job.id }));
+    expect(outcome.round.status).toBe('aborted');
+    expect(recordPr).not.toHaveBeenCalled();
+    expect(lane.poster.post).not.toHaveBeenCalled();
+    expect(lane.escalations.some((line) =>
+      line.includes(`an active decision (${decisionId}) covers delivered-pr-register, so no open pull request is linked`))).toBe(true);
+  });
+
+  it('a lookup that fails after a shutdown is dropped without an unhandled rejection (#488)', async () => {
+    const lane = await unlinkedPublicationLane('unlinked-late-failure');
+    let lookupStarted!: () => void;
+    const started = new Promise<void>((resolve) => { lookupStarted = resolve; });
+    let rejected = false;
+    const wave = lane.wave({
+      findOpenPullRequests: () => {
+        lookupStarted();
+        return new Promise((_resolve, reject) => setTimeout(() => { rejected = true; reject(new Error('late gh failure')); }, 50));
+      },
+      recordPr: vi.fn(),
+    });
+    const running = wave.runRound({ jobId: lane.job.id });
+    await started;
+    await wave.shutdown();
+    const outcome = asWave(await running);
+    // Let the late failure land: vitest fails the run on an unhandled one.
+    await vi.waitFor(() => expect(rejected).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lane.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload)
+      .toMatchObject({ reason: 'service_restart' });
+  });
+
   it('two open PRs at the reviewed head are ambiguous: no_pr_link, nothing linked (#488)', async () => {
     const lane = await unlinkedPublicationLane('unlinked-two-prs');
     const recordPr = vi.fn();
