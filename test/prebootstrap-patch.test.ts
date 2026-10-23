@@ -193,7 +193,7 @@ describe('pre-bootstrap dependency patch package fences', () => {
   it('rejects an unapproved or mismatched contract before creating a job or lane', async () => {
     const f = makeFixture();
     const made = f.makePackage({ briefing: 'Missing the explicit authorization.' });
-    await expect(dispatch(f, 'job-no-authorization', made.reference, 'Missing the explicit authorization.')).rejects.toThrow(/authorization/u);
+    await expect(dispatch(f, 'job-no-authorization', made.reference, 'Missing the explicit authorization.')).rejects.toThrow(/work contract must contain exactly one/u);
     expect(f.ledger.getJob('job-no-authorization')).toBeNull();
     expect(f.ledger.getWorktree('job-no-authorization')).toBeNull();
     expect(f.spawns).toHaveLength(0);
@@ -259,7 +259,8 @@ describe('pre-bootstrap dependency patch package fences', () => {
   it('rejects command/config content before creating a branch or writing source', async () => {
     const f = makeFixture();
     const made = f.makePackage({ jobId: 'job-unapproved-content', content: '-e /tmp/foreign\n' });
-    await expect(dispatch(f, 'job-unapproved-content', made.reference)).rejects.toThrow(/pinned distribution/u);
+    await expect(dispatch(f, 'job-unapproved-content', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-unapproved-content', 'job.prebootstrap-patch-dispatch-failed')).not.toBeNull();
     expect(f.ledger.getWorktree('job-unapproved-content')).toBeNull();
     expect(f.repo.git(['branch', '--list', 'gru/job-unapproved-content'])).toBe('');
     expect(f.spawns).toHaveLength(0);
@@ -359,7 +360,7 @@ describe('pre-bootstrap dependency patch package fences', () => {
       const current = originalAuthority(jobId);
       return authorityChanged ? { ...current, workRevision: current.workRevision + 1 } : current;
     });
-    await expect(dispatch(f, 'job-authority-changed', made.reference)).rejects.toThrow(/authority_mismatch/u);
+    await expect(dispatch(f, 'job-authority-changed', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
     expect(f.spawns).toHaveLength(0);
     expect(f.ledger.latestJobEvent('job-authority-changed', 'worktree.prebootstrap-setup-succeeded')).not.toBeNull();
     expect(f.ledger.latestJobEvent('job-authority-changed', 'job.prebootstrap-patch-dispatch-failed')).not.toBeNull();

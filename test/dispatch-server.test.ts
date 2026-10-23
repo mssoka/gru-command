@@ -3269,7 +3269,7 @@ describe('prebootstrap dependency patch readback', () => {
         expected_base_sha: 'e'.repeat(40), expected_base_tree: 'f'.repeat(40),
       } });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-started', jobId: 'job-patch-readback', payload: {
-        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64),
+        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64),
         worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
       } });
       const unauthenticated = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch');
@@ -3281,18 +3281,18 @@ describe('prebootstrap dependency patch readback', () => {
       expect(field<readonly unknown[]>(response.json, 'setup_producers')).toHaveLength(0);
       expect(String(field(response.json, 'recovery'))).toMatch(/Do not replay/u);
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-applied', jobId: 'job-patch-readback', payload: {
-        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64),
+        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64),
         worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
         base_tree: 'f'.repeat(40),
       } });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-started', jobId: 'job-patch-readback', payload: {
         setup_index: 0, command_sha256: '2'.repeat(64), producer_host: 'fixture-host', producer_pid: 17,
-        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), worktree_path: '/tmp/lane',
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), worktree_path: '/tmp/lane',
         branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
       } });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-spawned', jobId: 'job-patch-readback', payload: {
         setup_index: 0, command_sha256: '2'.repeat(64), worktree_path: '/tmp/lane', pid: 19, process_group_id: 19, producer_host: 'fixture-host',
-        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
       } });
       const inProgress = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);
       expect(field(inProgress.json, 'state')).toBe('setup_in_progress_or_unknown');
@@ -3300,11 +3300,11 @@ describe('prebootstrap dependency patch readback', () => {
       expect(producers[0]).toMatchObject({ producer_state: 'unknown', setup_index: 0, spawn: { pid: 19, process_group_id: 19 }, outcome: null });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-process-settled', jobId: 'job-patch-readback', payload: {
         setup_index: 0, command_sha256: '2'.repeat(64), worktree_path: '/tmp/lane', exit_code: 9, signal: null, timed_out: false, stopped: false,
-        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
       } });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-failed', jobId: 'job-patch-readback', payload: {
         setup_index: 0, worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
-        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), error_sha256: '2'.repeat(64),
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), error_sha256: '2'.repeat(64),
       } });
       const failed = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);
       expect(field(failed.json, 'state')).toBe('setup_failed');
@@ -3312,7 +3312,7 @@ describe('prebootstrap dependency patch readback', () => {
       const failedProducers = field<readonly Record<string, unknown>[]>(failed.json, 'setup_producers');
       expect(failedProducers[0]).toMatchObject({ producer_state: 'child_exit_result_recorded_group_state_unknown', outcome: { exit_code: 9, timed_out: false } });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-succeeded', jobId: 'job-patch-readback', payload: {
-        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), worktree_path: '/tmp/lane',
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), worktree_path: '/tmp/lane',
         branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
       } });
       const contradictory = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);

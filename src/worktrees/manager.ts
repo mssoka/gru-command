@@ -1566,7 +1566,9 @@ export class WorktreeManager {
     let fileStat: Stats;
     try { fileStat = lstatSync(filePath); } catch (error) { throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt is unavailable', { cause: error }); }
     if (!fileStat.isFile() || fileStat.isSymbolicLink()) throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt is not a regular non-symlink file');
-    if (realpathSync(filePath) !== filePath) throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt escapes the owned worktree');
+    if (realpathSync(filePath) !== join(realpathSync(worktreePath), 'requirements.txt')) {
+      throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt escapes the owned worktree');
+    }
     const before = readFileSync(filePath);
     const entry = patch.package.files[0];
     if (preBootstrapSha256(before) !== entry.beforeSha256) throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt bytes do not match the package before_sha256');
