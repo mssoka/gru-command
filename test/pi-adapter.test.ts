@@ -4123,7 +4123,7 @@ it('routes a synthesized next-turn native guard refusal locally and consumes its
   let guardRefusalReceiptBeforeProvider = false;
   let cessationReceiptBeforeProvider = false;
   const events: RuntimeEvent[] = [];
-  let supervisor!: Supervisor;
+  const supervisorHolder: { current: Supervisor | null } = { current: null };
   const f = await sdkDirectiveExecutionFixture([
     { deltas: [], toolCall: { id: 'authorized-before-next-turn-refusal', name: 'bash', args: { command: 'printf authorized-before-refusal' } } },
     { deltas: ['must not resume after the local refusal'] },
@@ -4142,7 +4142,9 @@ it('routes a synthesized next-turn native guard refusal locally and consumes its
       if (injectedProviderError || event.type !== 'message_end' || event.message.role !== 'assistant' || event.message.stopReason !== 'error') return;
       injectedProviderError = true;
       localRefusalBeforeProvider = [...events].reverse().find((candidate) => candidate.type === 'error' && candidate.nativeControl === 'directive-refusal') ?? null;
-      supervisorViewBeforeProvider = supervisor.viewFor(handle.id);
+      const liveSupervisor = supervisorHolder.current;
+      if (liveSupervisor === null) throw new Error('supervisor must be constructed before the synthetic Pi session is spawned');
+      supervisorViewBeforeProvider = liveSupervisor.viewFor(handle.id);
       providerWallBeforeProvider = f.scene.ledger.listNotifications({ limit: 100 }).some((notice) => notice.kind.includes('provider-wall') && notice.agentId === handle.id);
       const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trim().split('\n')
         .map((line) => JSON.parse(line) as { state: string; boundary?: string });
@@ -4153,9 +4155,10 @@ it('routes a synthesized next-turn native guard refusal locally and consumes its
     });
   });
   const { scene, registry, fx } = f;
-  supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
+  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000,
     restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
     registry, ledger: scene.ledger, notifications: scene.notifications, tickMs: 5 });
+  supervisorHolder.current = supervisor;
   supervisor.start();
   const spawn = vi.spyOn(registry, 'spawn');
   try {
