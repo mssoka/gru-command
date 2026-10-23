@@ -66,7 +66,9 @@ branch on harness. The ADAPTER implements the declaration:
   preflight for the full list. The bridge keeps a settled success for a
   caller whose transport wait ended (it re-attaches with the same request)
   and drops it once its response is flushed to a live caller, so a retry or
-  a collect with the same arguments runs for real.
+  a collect with the same arguments runs for real. The MCP server's
+  15-minute wait answers still-running only on a quiet transport: a
+  response already arriving is read to its end, not dropped.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes

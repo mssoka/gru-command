@@ -78,7 +78,7 @@ const LEAD_VIEW_ERROR_MAX_CHARS = 2_000;
 
 /** A failed attempt's error as the lead reads it: whole, or cut with the
  * count of what was cut — never silently. */
-function leadViewError(error: string): string {
+export function leadViewError(error: string): string {
   if (error.length <= LEAD_VIEW_ERROR_MAX_CHARS) return error;
   const suffix = ` … (+${error.length - (LEAD_VIEW_ERROR_MAX_CHARS - 80)} characters cut; the full error is in the run record)`;
   return `${error.slice(0, LEAD_VIEW_ERROR_MAX_CHARS - 80)}${suffix}`;

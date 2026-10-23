@@ -26,7 +26,7 @@ import {
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
 import { REVIEW_TOOL_ERROR_MAX_BYTES, REVIEW_TOOL_TEXT_MAX_BYTES } from '../src/runtime/review-mcp-bridge.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
-import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
+import { leadViewError, PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -1046,6 +1046,16 @@ describe('Perkins whole-PR lead engine', () => {
     expect(Buffer.byteLength(message, 'utf8')).toBeLessThan(10_000);
     expect(Buffer.byteLength(message, 'utf8')).toBeLessThanOrEqual(REVIEW_TOOL_ERROR_MAX_BYTES);
     expect(message).toMatch(/further error\(s\) omitted; perkins_preflight_submission returns the full list/u);
+  });
+
+  it('cuts a failed attempt\'s error for the lead only with the count of what was cut (#487)', () => {
+    expect(leadViewError('e'.repeat(2_000))).toBe('e'.repeat(2_000));
+    const cut = leadViewError('e'.repeat(5_000));
+    expect(cut.length).toBeLessThanOrEqual(2_000);
+    expect(cut.startsWith('e'.repeat(1_920))).toBe(true);
+    expect(cut.endsWith(' … (+3080 characters cut; the full error is in the run record)')).toBe(true);
+    // One character over the bound still says exactly what was cut.
+    expect(leadViewError('e'.repeat(2_001)).endsWith('(+81 characters cut; the full error is in the run record)')).toBe(true);
   });
 
   it('a withheld result the lead never collects stays durably undelivered (#487, R17)', async () => {

@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { createConnection, type Socket } from 'node:net';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -503,6 +503,37 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
       ['perkins_probe', { 'anthropic/maxResultSizeChars': REVIEW_TOOL_RESULT_MAX_CHARS }],
       ['perkins_other', { 'anthropic/maxResultSizeChars': REVIEW_TOOL_RESULT_MAX_CHARS }],
     ]);
+  });
+
+  it('awaits a response already arriving when the wait ends, never answering still-running over it (#487)', async () => {
+    // A bridge that starts its reply before the 150 ms wait ends and
+    // finishes it after: the server must deliver the result, not drop it.
+    const directory = mkdtempSync(join(tmpdir(), 'gru-review-arriving-'));
+    temporaryDirectories.push(directory);
+    const socketPath = join(directory, 'bridge.sock');
+    const fakeBridge = createServer((socket) => {
+      let request = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk: string) => {
+        request += chunk;
+        if (!request.includes('\n')) return;
+        const { id } = JSON.parse(request) as { id: string };
+        const line = JSON.stringify({ id, ok: true, result: { text: 'arrived-whole' } });
+        socket.write(line.slice(0, 10));
+        setTimeout(() => socket.end(`${line.slice(10)}\n`), 400);
+      });
+    });
+    await new Promise<void>((resolve) => fakeBridge.listen(socketPath, resolve));
+    try {
+      const client = serverClient(spawnServer(socketPath, { GRU_REVIEW_RESPONSE_WAIT_MS: '150' }));
+      await client.call(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+      const response = (await client.call(2, 'tools/call', { name: 'perkins_probe', arguments: {} })) as {
+        result?: { content?: Array<{ text?: string }> };
+      };
+      expect(response.result?.content?.[0]?.text).toBe('arrived-whole');
+    } finally {
+      await new Promise<void>((resolve) => fakeBridge.close(() => resolve()));
+    }
   });
 
   it('reports a dead bridge as an accurate terminal error, never still-running', async () => {

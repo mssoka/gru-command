@@ -54,7 +54,7 @@ export const REVIEW_TOOL_RESULT_MAX_CHARS = 200_000;
 export const REVIEW_MCP_OUTPUT_TOKENS = 100_000;
 /** Host bound on a tool error message the lead must read whole. */
 export const REVIEW_TOOL_ERROR_MAX_BYTES = 9_000;
-export const PERKINS_MCP_SERVER_SHA256 = 'ae53ef1bf15f295c4118457585aff5708a323956278f97ba8c261e6de319a719';
+export const PERKINS_MCP_SERVER_SHA256 = '8c87201f76d5b7d6950c3d0bbeb4ea006af97e84d0852618dfbdd41ee33cb5c3';
 
 interface BridgeRequest {
   readonly id: string;
