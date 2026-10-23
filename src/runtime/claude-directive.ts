@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { privateClaudeAskSettings } from './claude-verification-settings.js';
-import { thrownText } from './directive-checkpoint.js';
+import { thrownDetail, thrownText } from './directive-checkpoint.js';
 import type { StreamFrame } from './stream-json.js';
 import { isVerificationProducer, workerVerificationRefusal, type WorkerVerificationPolicy } from './worker-verification-policy.js';
 
@@ -76,6 +76,8 @@ export class ClaudeDirectivePermissionChannel {
       /** Called as an allow is written: the decision written instead (#485).
        * A throw is a fence that failed. */
       readonly confirm: (request: ClaudeToolRequest) => ClaudeToolDecision;
+      /** An error-level log line (#485). */
+      readonly log: (message: string, fields: Readonly<Record<string, unknown>>) => void;
       readonly verification?: WorkerVerificationPolicy;
     },
   ) {
@@ -148,7 +150,22 @@ export class ClaudeDirectivePermissionChannel {
         this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message });
       },
       (error: unknown) => this.fenceFailed(id as string, tool, error),
-    );
+    ).catch((error: unknown) => this.handlingFailed(tool, error));
+  }
+
+  /** The last guard of a tool request's chain (#485): handling its decision
+   * threw (the host's `refused()` or `fail()`). It logs, fails the turn, and
+   * never throws, so no channel promise ends in an unhandled rejection. When
+   * `fail()` itself throws, it ends the CLI, and the turn fails at its close. */
+  private handlingFailed(tool: ClaudeToolRequest, error: unknown): void {
+    const reason = `directive tool decision handling failed: ${thrownText(error)}`;
+    try { this.deps.log('claude directive tool decision handling threw; the turn is failed', { tool_use_id: tool.toolUseId, error: thrownDetail(error) }); } catch { /* the turn still fails */ }
+    try {
+      this.deps.fail(reason);
+    } catch {
+      try { this.child.stdin?.end(); } catch { /* already closed */ }
+      try { this.child.kill('SIGTERM'); } catch { /* already gone */ }
+    }
   }
 
   /** The fence could not decide: deny the tool, keep a durable refusal of it, and end the turn. */

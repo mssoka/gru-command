@@ -262,8 +262,9 @@ describe('typed decision semantics', () => {
   });
 
   it('Claude Code 2.1.309\'s typed error codes that name a deterministic wall classify alone and as the in-band suffix (#485)', () => {
-    // By the CLI's own policy: it stops on account_on_hold as an auth failure, and
-    // retries cloud_credential_error (its only transient code), so that one walls nothing.
+    // GC's judgment, not the CLI's: a wall is a failure only a human clears. The CLI
+    // stops on account_on_hold as an auth failure; a rate_limit goes to pacing's
+    // bounded retry first (see pacing.test.ts), and walls here.
     const walls = {
       authentication_failed: 'authentication_wall', oauth_org_not_allowed: 'authentication_wall',
       verification_required: 'authentication_wall', account_on_hold: 'authentication_wall',
@@ -275,12 +276,32 @@ describe('typed decision semantics', () => {
       expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe(wall);
     }
     expect(deterministicFailureClass('Credit balance is too low (billing_error)')).toBe('quota_wall');
-    // The rest of the closed enum names no deterministic wall.
+    // The rest of the closed enum names no wall by its token: model_not_found too
+    // (a restart, then the breaker if it persists).
     for (const code of ['cloud_credential_error', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
       expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe('unknown');
     }
-    // A word boundary never falls at "_": only the listed spellings match.
+    // A word boundary never falls at "_": a longer snake-case name is another word.
     expect(deterministicFailureClass('rate_limit_remaining: 0')).toBe('unknown');
+  });
+
+  it('a cloud_credential_error is classified by the CLI\'s own detail, never by its token (#485)', () => {
+    // Claude Code 2.1.309's text for it (no HTTP status): "Could not load <cloud> credentials ·
+    // <the cloud SDK's own words>. Check or refresh your <cloud> credentials and try again."
+    const credentials = (cloud: string, detail: string): string =>
+      `API Error: Could not load ${cloud} credentials · ${detail}. Check or refresh your ${cloud} credentials and try again. (cloud_credential_error)`;
+    // A named OAuth or authentication failure walls: the CLI's own Google OAuth text, and the
+    // Google library's missing default credentials (its help link names authentication).
+    expect(deterministicFailureClass(credentials('Google Cloud', 'Failed to acquire Google OAuth credentials'))).toBe('authentication_wall');
+    expect(deterministicFailureClass(credentials('Google Cloud',
+      'Could not load the default credentials. Browse to https://cloud.google.com/docs/authentication/getting-started for more information'))).toBe('authentication_wall');
+    // A metadata server the AWS SDK cannot reach is the network's.
+    expect(deterministicFailureClass(credentials('AWS', 'Unable to connect to instance metadata service'))).toBe('network_failure');
+    // Anything else restarts, and ends at the breaker if it persists.
+    expect(deterministicFailureClass(credentials('AWS', 'Could not load credentials from any providers'))).toBe('unknown');
+    expect(deterministicFailureClass(credentials('AWS',
+      'The SSO session associated with this profile has expired. To refresh this SSO session run aws sso login with the corresponding profile'))).toBe('unknown');
+    expect(deterministicFailureClass('cloud_credential_error')).toBe('unknown');
   });
 
   it('names every thrown value, any realm\'s error included, and never throws (#485)', () => {
@@ -304,60 +325,141 @@ describe('typed decision semantics', () => {
     expect(thrownDetail(null)).toBe('a non-error value was thrown: null');
   });
 
-  // Scanned below: every literal message of `new DirectiveCheckpointError(…)` and
-  // `new DirectiveRuntimeUnsupportedError(…)` (a `+`-joined chain of literals
-  // counts); in directive-checkpoint.ts the literal reasons of its local
-  // refuse()/refused() helpers, refuse's default reason and every unknown('…')
-  // reason (Claude's checkpoint refusal text quotes them); ledger/api.ts's
+  // Scanned below, wherever the text is a literal (a `+`-joined chain of
+  // literals counts), every literal arm of a ternary, or a constant passed by
+  // name (resolved to its literal in the same file; one that does not resolve
+  // fails the scan): the message of `new DirectiveCheckpointError(…)` and
+  // `new DirectiveRuntimeUnsupportedError(…)`; in directive-checkpoint.ts the
+  // reasons of its local refuse()/refused() helpers, refuse's default reason,
+  // every unknown(…) reason (Claude's checkpoint refusal text quotes them) and
+  // what its *Refusal and *RetryCompaction helpers return; ledger/api.ts's
   // refuse() reasons; the Claude permission channel's refusal and failure texts
   // (claude-directive.ts); the call names given to withOwnIo()/ownIoRefusal();
-  // a constant passed to a refusal by name (EARLIER_DIRECTIVE_FAILURE), resolved
-  // to its literal; and the texts the refusal classes write themselves.
+  // and the texts the refusal classes and thrownText write themselves.
   // Not visible to it, checked by hand in #485 (none names a wall): the texts
   // that arrive in variables — directive-progress.ts's result.note,
   // lockBlocker, proof.reason/proof.error and verdict.error (directive recovery
   // only; verdict.error can carry a provider's own text),
-  // directive-checkpoint.ts's oversized, at, refusal and retry (fed by literals
+  // directive-checkpoint.ts's oversized, at, refusal and retry (fed by texts
   // scanned here), and the Claude channel's `new DirectiveCheckpointError(reason)`
-  // (its reasons are scanned here); the ledger's recovery-decision ternary of
-  // two literals ("request is …, not retired — …", "terminal work cannot be
-  // revived by recovery"); the "current gate duty " prefix ledger/api.ts's
-  // refuse() puts before its reasons; and a bookkeeping refusal's fault text
-  // after GC's prefix, which is the disk's or the OS's words and is guarded by
-  // the tag, not by its text.
+  // (its reasons are scanned here); the "current gate duty " prefix
+  // ledger/api.ts's refuse() puts before its reasons; and a bookkeeping
+  // refusal's fault text after GC's prefix, which is the disk's or the OS's
+  // words and is guarded by the tag, not by its text.
   it('no refusal text GC writes is blank or names a wall (#485)', () => {
     const tick = '`';
     const literal = String.raw`'(?:[^'\\]|\\.)*'|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
     const chain = String.raw`(?:${literal})(?:\s*\+\s*(?:${literal}))*`;
     const scans: readonly (readonly [RegExp, (file: string) => boolean])[] = [
-      [new RegExp(String.raw`new Directive(?:CheckpointError|RuntimeUnsupportedError)\(\s*(${chain})`, 'gu'), () => true],
-      [new RegExp(String.raw`\brefused?\(\s*(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts') || file.endsWith(join('ledger', 'api.ts'))],
       [new RegExp(String.raw`\b(?:unknown\(\s*|reason = )(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts')],
       [new RegExp(String.raw`\bdeps\.(?:refused\([^,()]*,|fail\()\s*(${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
       [new RegExp(String.raw`\bconst reason = (${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
       [new RegExp(String.raw`\b(?:withOwnIo|ownIoRefusal)\(\s*(${chain})`, 'gu'), () => true],
     ];
+    // The calls whose first argument is a refusal text, read as an expression.
+    const sinks: readonly (readonly [RegExp, (file: string) => boolean])[] = [
+      [/\bnew Directive(?:CheckpointError|RuntimeUnsupportedError)\(/gu, () => true],
+      [/\brefused?\(/gu, (file) => file.endsWith('directive-checkpoint.ts') || file.endsWith(join('ledger', 'api.ts'))],
+      [/\bunknown\(/gu, (file) => file.endsWith('directive-checkpoint.ts')],
+    ];
+    // A small lexer: the index just past a literal (with its interpolations),
+    // or past a bracket group (with the literals and comments inside it).
+    const pastLiteral = (source: string, at: number): number => {
+      const quote = source[at]!;
+      let i = at + 1;
+      while (i < source.length && source[i] !== quote) {
+        if (source[i] === '\\') i += 2;
+        else if (quote === tick && source.startsWith('${', i)) i = pastGroup(source, i + 1);
+        else i += 1;
+      }
+      return i + 1;
+    };
+    const pastGroup = (source: string, at: number): number => {
+      let depth = 0;
+      let i = at;
+      do {
+        const c = source[i]!;
+        if (c === "'" || c === '"' || c === tick) { i = pastLiteral(source, i); continue; }
+        if (source.startsWith('//', i)) { i = source.indexOf('\n', i); continue; }
+        if (source.startsWith('/*', i)) { i = source.indexOf('*/', i) + 2; continue; }
+        if ('([{'.includes(c)) depth += 1;
+        else if (')]}'.includes(c)) depth -= 1;
+        i += 1;
+      } while (depth > 0 && i < source.length);
+      return i;
+    };
+    // An expression's top-level parts, split at `sep`; literals kept whole, groups kept whole.
+    const split = (expression: string, separators: string): string[] => {
+      const parts: string[] = [];
+      let from = 0;
+      for (let i = 0; i < expression.length;) {
+        const c = expression[i]!;
+        if (c === "'" || c === '"' || c === tick) { i = pastLiteral(expression, i); continue; }
+        if ('([{'.includes(c)) { i = pastGroup(expression, i); continue; }
+        // `?.` and `??` are no ternary.
+        if (c === '?' && (expression[i + 1] === '.' || expression[i + 1] === '?' || expression[i - 1] === '?')) { i += 1; continue; }
+        if (separators.includes(c)) { parts.push(expression.slice(from, i), c); from = i + 1; }
+        i += 1;
+      }
+      parts.push(expression.slice(from));
+      return parts;
+    };
     const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
       entry.isDirectory() ? sources(join(dir, entry.name)) : entry.name.endsWith('.ts') ? [join(dir, entry.name)] : []);
     const texts: string[] = [];
+    const resolved: string[] = [];
     // Interpolations are runtime detail; the text GC writes around them is what is classified.
     const textOf = (literals: string): string => [...literals.matchAll(new RegExp(literal, 'gu'))].map((part) => part[0].slice(1, -1)).join('').replace(/\$\{[^}]*\}/gu, 'x');
+    // Every arm of the expression (each ternary's branches, not its conditions)
+    // that is a literal chain, or a constant resolved in `source`.
+    const scanExpression = (file: string, source: string, expression: string): void => {
+      const parts = split(expression, '?:');
+      for (let i = 0; i < parts.length; i += 2) {
+        if (parts[i + 1] === '?') continue; // a condition
+        const arm = parts[i]!.trim();
+        if (new RegExp(String.raw`^(?:${chain})$`, 'u').test(arm)) texts.push(textOf(arm));
+        else if (/^[A-Z][A-Z0-9_]*$/u.test(arm)) {
+          const definition = new RegExp(String.raw`\bconst ${arm} = (${chain});`, 'u').exec(source);
+          expect(definition, `${file}: ${arm} is no literal constant`).not.toBeNull();
+          texts.push(textOf(definition![1]!));
+          resolved.push(arm);
+        }
+      }
+    };
     for (const file of sources(join(import.meta.dirname, '..', 'src'))) {
       const source = readFileSync(file, 'utf-8');
       for (const [pattern, applies] of scans) {
         if (!applies(file)) continue;
         for (const match of source.matchAll(pattern)) texts.push(textOf(match[1]!));
       }
-      // A constant passed to a refusal by name is resolved to its own literal.
-      for (const match of source.matchAll(/new Directive(?:CheckpointError|RuntimeUnsupportedError)\(\s*([A-Z][A-Z0-9_]*)\s*\)/gu)) {
-        const definition = new RegExp(String.raw`\bconst ${match[1]!} = (${chain});`, 'u').exec(source);
-        expect(definition, `${file}: ${match[1]!}`).not.toBeNull();
-        texts.push(textOf(definition![1]!));
+      for (const [pattern, applies] of sinks) {
+        if (!applies(file)) continue;
+        for (const match of source.matchAll(pattern)) {
+          const open = match.index + match[0].length - 1;
+          scanExpression(file, source, split(source.slice(open + 1, pastGroup(source, open) - 1), ',')[0]!);
+        }
+      }
+      if (!file.endsWith('directive-checkpoint.ts')) continue;
+      // What the refusal helpers return.
+      for (const match of source.matchAll(/\bfunction \w+(?:Refusal|RetryCompaction)\(/gu)) {
+        const open = source.indexOf('{', pastGroup(source, match.index + match[0].length - 1));
+        const body = source.slice(open, pastGroup(source, open));
+        for (const statement of body.matchAll(/\breturn\b/gu)) {
+          const rest = body.slice(statement.index + statement[0].length);
+          scanExpression(file, source, split(rest, ';')[0]!);
+        }
       }
     }
     expect(texts.some((text) => text.startsWith('an earlier directive failure refused this turn'))).toBe(true);
-    // The refusal classes' own texts.
-    texts.push(new DirectiveCheckpointError(' ').message, new DirectiveBookkeepingError('x', new Error('x')).message, thrownText(null));
+    expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'MALFORMED', 'RETRIED_TWICE', 'UNBOUND_TAIL']));
+    expect(texts).toEqual(expect.arrayContaining(['native error row has no matching live SDK retry-start receipt',
+      'native receipted error row holds content that is not retry history', 'native receipted error row has no retried answer after it',
+      'native compaction follows another compaction', 'native compaction lacks a summary',
+      'terminal work cannot be revived by recovery']));
+    // The refusal classes' and thrownText's own texts, its fallbacks included.
+    const unreadable = new Proxy({}, { getPrototypeOf: () => { throw new Error('trap'); } });
+    texts.push(new DirectiveCheckpointError(' ').message, new DirectiveBookkeepingError('x', new Error('x')).message,
+      thrownText(null), thrownText(unreadable), thrownText(Object.create(null)));
     expect(texts.length).toBeGreaterThan(300);
     expect(texts.filter((text) => text.trim() === '')).toEqual([]);
     expect(texts.filter((text) => !['unknown', 'fatal_runtime'].includes(deterministicFailureClass(text)))).toEqual([]);

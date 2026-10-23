@@ -40,7 +40,7 @@ import {
   type StreamFrame,
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { DirectiveCheckpointError, inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveBookkeepingError, DirectiveCheckpointError, inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
@@ -2872,8 +2872,12 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     /** Fails one chunk of this handle's own transcript stream, written alone or in a
      * batch (a failed batch fails every chunk in it, as Node does). With `holdUntil`,
      * the failing write's callback waits until that many more frames are queued
-     * behind it (its batch-mates count), so Node hands each of them the same root
-     * error, deterministically; `releasedBehind` says how many were.
+     * behind it (its batch-mates, and the writes made after the hold began), so
+     * Node hands each of them the same root error, deterministically;
+     * `releasedBehind` says how many were. A gating frame (the echo, a permission
+     * request, the result) is never held: its durable write gates the turn's next
+     * frame, so no frame would come to release it; the helper fails that write
+     * with a text naming the misuse instead.
      * No adapter seam fails a transcript write: the stream comes straight from
      * node:fs createWriteStream, which only a file-wide vi.mock('node:fs') could
      * replace, and that would reach every test in this file. */
@@ -2901,25 +2905,32 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // The turn ends its stream once the CLI is gone: a hold still waiting fails then, never hangs.
         stream.end = (...args) => { release(); return end(...args); };
         // The chunks after the failing one in its own batch are queued behind it too.
-        const failing = (callback: Callback, behind: number): void => {
+        const failing = (callback: Callback, behind: number, chunk: string): void => {
           state.broken = true;
           if (holdUntil === 0) { callback(new Error(fault)); return; }
+          const frame = JSON.parse(chunk) as Record<string, unknown>;
+          const gating = frame['type'] === 'user' && frame['isReplay'] === true ? 'the echo' : frame['type'] === 'control_request' ? 'a permission request'
+            : frame['type'] === 'result' ? 'the result' : null;
+          if (gating !== null) { callback(new Error(`failTranscriptChunk refuses holdUntil > 0 on a gating frame (${gating})`)); return; }
           held = callback;
           state.queuedBehind = behind;
           if (behind >= holdUntil) release();
         };
         stream._write = (chunk, encoding, callback) => {
-          if (!state.broken && matches(chunk.toString())) { failing(callback, 0); return; }
+          if (!state.broken && matches(chunk.toString())) { failing(callback, 0, chunk.toString()); return; }
           write(chunk, encoding, callback);
         };
         stream._writev = (chunks, callback) => {
           const at = state.broken ? -1 : chunks.findIndex(({ chunk }) => matches(chunk.toString()));
-          if (at >= 0) { failing(callback, chunks.length - 1 - at); return; }
+          if (at >= 0) { failing(callback, chunks.length - 1 - at, chunks[at]!.chunk.toString()); return; }
           writev(chunks, callback);
         };
+        // Only a write made after the hold began is queued behind it: on an idle
+        // stream the failing chunk itself reaches _write inside its own write().
         stream.write = (...args) => {
+          const behind = held !== null;
           const written = queue(...args);
-          if (held !== null && ++state.queuedBehind >= holdUntil) release();
+          if (behind && held !== null && ++state.queuedBehind >= holdUntil) release();
           return written;
         };
       });
@@ -2940,6 +2951,17 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
         // Its words alone would wall: the tag is what keeps it with directive recovery.
         expect(deterministicFailureClass(error)).toBe('quota_wall');
+      } finally { await handle.dispose(); }
+    });
+
+    it('the lost-write helper refuses to hold a gating frame, by name, instead of hanging the turn (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const lost = failTranscriptChunk(handle, (chunk) => chunk.includes('"isReplay":true'), 'EDQUOT: disk quota exceeded', 1);
+      try {
+        await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-hold'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow('directive refused: directive bookkeeping failed: transcript write: failTranscriptChunk refuses holdUntil > 0 on a gating frame (the echo)');
+        expect(lost.releasedBehind).toBe(-1); // never held
       } finally { await handle.dispose(); }
     });
 
@@ -3014,8 +3036,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
       if (next === 'second prompt') process.env['CLAUDE_DOUBLE_REPLAY_AFTER_TOOL'] = '1';
       if (next === 'channel deny') process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
-      // The lost write waits until two more frames are queued behind it: Node hands each the same root error.
-      const lost = next !== 'lost write' && next !== 'handler throws' ? null : failTranscriptChunk(handle, (chunk) => chunk.includes('"tool_result"'), 'EDQUOT: disk quota exceeded', next === 'lost write' ? 2 : 0);
+      // The lost write waits until two more frames are queued behind it: Node hands each the same root
+      // error. It is the CLI's echo of the fence's deny, which the transcript writes alone: the
+      // permission request before it is durable, and the CLI says nothing else until the answer.
+      const lost = next === 'lost write' ? failTranscriptChunk(handle, (chunk) => chunk.includes('"behavior":"deny"'), 'EDQUOT: disk quota exceeded', 2)
+        : next === 'handler throws' ? failTranscriptChunk(handle, (chunk) => chunk.includes('"tool_result"'), 'EDQUOT: disk quota exceeded') : null;
       // Handling that lost write throws: the turn's recorded failure is still what it reports.
       const handling = next === 'handler throws'
         ? vi.spyOn(handle as unknown as { failDirective(): void }, 'failDirective').mockImplementation(() => { throw new Error('handler broke'); }) : null;
@@ -3359,6 +3384,41 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         await vi.waitFor(() => expect(existsSync(settings), mode).toBe(false));
         await handle.dispose();
       }
+    });
+
+    it('a bookkeeping fault whose code cannot be read is logged like any other, and recording it never throws (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      try {
+        const record = (handle as unknown as { recordDirectiveFailure(turn: unknown, error: unknown): unknown }).recordDirectiveFailure.bind(handle);
+        const turn = { failure: null, directive: { identity: identityFor('claude-hostile-fault') } };
+        const getter = Object.defineProperty(new Error('EIO: i/o error, write'), 'code', { get: () => { throw new Error('code getter broke'); } });
+        const trap = new Proxy({}, { get: () => { throw new Error('get trap broke'); }, getPrototypeOf: () => { throw new Error('prototype trap broke'); } });
+        const first = new DirectiveBookkeepingError('transcript write', getter);
+        const second = new DirectiveBookkeepingError('transcript write', trap);
+        expect(record(turn, first)).toBe(first);
+        expect(record(turn, second)).toBe(first); // the first failure stays the turn's
+        expect(fx.logs.filter((line) => line.msg === 'claude directive bookkeeping failed; the directive is refused').map((line) => line.fields)).toEqual([
+          { request: 'claude-hostile-fault', error: 'directive bookkeeping failed: transcript write: EIO: i/o error, write', fault: expect.stringMatching(/^Error: EIO: i\/o error, write\n/u) },
+          { request: 'claude-hostile-fault', error: 'directive bookkeeping failed: transcript write: a thrown value that cannot be read', fault: 'a thrown value that cannot be read' },
+        ]);
+      } finally { await handle.dispose(); }
+    });
+
+    it('a producer cessation receipt that throws a value that cannot be printed leaves the evidence unknown, logged by name, never a throw (#485)', async () => {
+      const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      handle.prepareDirectiveProducer!(identityFor('claude-cessation-unprintable'));
+      const receipt = vi.spyOn(checkpoint, 'recordDirectiveProducerCessation').mockImplementation(() => { const thrown: unknown = Object.create(null); throw thrown; });
+      try {
+        await handle.dispose();
+        expect(handle.cessationEvidence!()).toBe('unknown');
+        expect(fx.logs).toContainEqual(expect.objectContaining({ level: 'error', msg: 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written',
+          fields: { error: 'a non-error value was thrown: an unprintable value' } }));
+      } finally { receipt.mockRestore(); }
+      // Once the receipt can be written, the evidence settles.
+      expect(handle.cessationEvidence!()).toBe('ceased');
     });
 
     it('a spawn that throws a non-error value fails the turn with the value named, never a bare "null" (#485)', async () => {

@@ -199,23 +199,35 @@ export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
 export function deterministicFailureClass(reason: string): FailureClass {
   // Word-bounded signals: bare substrings wall-classified unrelated text
-  // ("author" hit `auth`; "port 13020" hit `1302`). A word boundary never falls
-  // at "_", so only the spellings listed here match: auth_error, auth-failure,
-  // auth_failure, rate_limit, rate-limit and RateLimited; others
-  // (authentication_error, rate_limit_error, rate_limit_exceeded,
-  // insufficient_quota, AuthenticationFailed, authError) read unknown. Claude
-  // Code's typed error codes (its closed 2.1.309 enum) that name a
-  // deterministic wall by the CLI's own policy are listed whole:
-  // authentication_failed, oauth_org_not_allowed, verification_required and
-  // account_on_hold (the CLI stops on it as an auth failure) are
-  // authentication walls; billing_error and rate_limit are quota walls. A
-  // statusless typed rate_limit is the CLI's capacity off-switch: pacing's
-  // bounded retry sees it first, and with no pacing policy it walls here.
-  // cloud_credential_error is transient (the CLI retries it) and reads
-  // unknown. "authorized" stays a signal: providers say "no longer
-  // authorized" or "only authorized for use with Claude Code". For GC's own
-  // refusals the tag, not the text, is the guard (#485); GC's literal refusal
-  // texts avoid wall words so an untagged one still reads `unknown`.
+  // ("author" hit `auth`; "port 13020" hit `1302`). The authentication patterns:
+  // the words unauthorized, oauth, auth, authn, authentication, authorization
+  // and authorized; auth joined to error or failure, and authentication to
+  // failed, by "_" or "-" (auth_error, auth-failure, authentication_failed);
+  // "invalid api key", with or without one character between api and key; a 401
+  // on its own. The quota patterns: quota; "rate limit" with or without one "-",
+  // "_" or space, and an optional "ed" (rate_limit, rate-limited, ratelimit,
+  // RateLimit); billing_error; insufficient balance or credit; a 402, 403, 429,
+  // 1302 or 1308 on its own. A word boundary never falls at "_", so a longer
+  // snake-case name is another word: authentication_error, rate_limit_error,
+  // rate_limit_exceeded and insufficient_quota read unknown, as do camel-case
+  // AuthenticationFailed and authError. "authorized" stays a signal: providers
+  // say "no longer authorized" or "only authorized for use with Claude Code".
+  //
+  // Which failures wall is GC's judgment, not the CLI's: a wall is a failure
+  // only a human clears. Claude Code's typed codes (its closed 2.1.309 enum)
+  // that name one match: authentication_failed, oauth_org_not_allowed,
+  // verification_required and account_on_hold (a refused OAuth refresh) are
+  // authentication walls; billing_error and rate_limit are quota walls. A rate
+  // limit is paced first: pacing's bounded retry sees one (the CLI's statusless
+  // capacity off-switch, typed rate_limit, included) before this class does,
+  // which walls it with no pacing policy or once the bounded budget is spent.
+  // The other codes name no wall by their token: a cloud_credential_error takes
+  // the class of the CLI's own detail (a named OAuth or authentication failure
+  // walls, an unreachable metadata server reads network_failure, anything else
+  // unknown), and model_not_found reads unknown (a restart, then the breaker if
+  // it persists). For GC's own refusals the tag, not the text, is the guard
+  // (#485); GC's literal refusal texts avoid wall words so an untagged one still
+  // reads `unknown`.
   if (
     /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';

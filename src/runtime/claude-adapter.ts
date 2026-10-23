@@ -732,9 +732,15 @@ export function backgroundStopNotice(tasks: readonly string[], reason: Backgroun
  * reports itself; this names no wall word (#485). */
 const EARLIER_DIRECTIVE_FAILURE = 'an earlier directive failure refused this turn\'s tool effects';
 
-/** A write to a transcript stream an earlier fault destroyed (#485). */
+/** A write to a transcript stream an earlier fault destroyed (#485). A fault
+ * whose `code` cannot be read (a throwing getter, a Proxy trap) is no such
+ * write: it is logged like any other. */
 function isDestroyedStreamWrite(fault: unknown): boolean {
-  return typeof fault === 'object' && fault !== null && (fault as NodeJS.ErrnoException).code === 'ERR_STREAM_DESTROYED';
+  try {
+    return typeof fault === 'object' && fault !== null && (fault as NodeJS.ErrnoException).code === 'ERR_STREAM_DESTROYED';
+  } catch {
+    return false;
+  }
 }
 
 /** One directive turn in flight (#424). */
@@ -1693,7 +1699,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       }
       for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
     } catch (error) {
-      this.log('error', 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written', { error: String(error) });
+      this.log('error', 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written', { error: thrownText(error, 'string') });
       return false;
     }
     this.producersCeased = true;
@@ -2701,6 +2707,7 @@ export class ClaudeCodeHandle implements AgentHandle {
           },
           decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
           confirm: (request) => this.confirmDirectiveTool(turn, request),
+          log: (message, fields) => this.log('error', message, fields),
           ...(params.workerVerification !== undefined ? { verification: params.workerVerification } : {}),
         });
         directivePermissions.start();

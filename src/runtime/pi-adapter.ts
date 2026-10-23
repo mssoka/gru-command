@@ -2105,7 +2105,7 @@ export class PiAgentHandle implements AgentHandle {
             : recordDirectiveRetryStart(producer, e, this.session.sessionManager.getBranch().at(-1));
           if (reason !== null) this.log('warn', unrecorded, { requestId, reason });
         } catch (error) {
-          this.log('warn', unrecorded, { requestId, error: String(error) });
+          this.log('warn', unrecorded, { requestId, error: thrownText(error, 'string') });
         }
         return;
       }

@@ -4315,12 +4315,14 @@ async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjo
       expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
       expect(f.scene.ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === `supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
       if (where === 'extension-unjournaled-persistent') {
-        // The stop's disposal cannot settle the owed receipts: it fails loud and named, and the
-        // handle keeps its physical ownership (registered, cessation unknown), never ceased silently.
+        // The stop's disposal cannot settle the owed receipts. Its rejection is the journal's raw
+        // fault; the supervisor's warn line is the named boundary that reports it. The handle keeps
+        // its physical ownership (registered, cessation unknown), never ceased silently.
         await waitFor(() => f.supervisorLogs.some((line) => line.msg === 'dispose after provider-wall escalation failed'), 'the failed disposal');
         expect(f.supervisorLogs).toContainEqual({ level: 'warn', msg: 'dispose after provider-wall escalation failed',
           fields: { agent_id: handle.id, error: 'Error: refusal journal unavailable' } });
-        expect(f.registry.getHandle(handle.id)).toBe(handle);
+        // By identity: a failing toBe would print the handle, whose SDK theme getter throws.
+        expect(f.registry.getHandle(handle.id) === handle).toBe(true);
         expect(handle.cessationEvidence!()).toBe('unknown');
         // Once the journal is back, the next disposal settles the receipts and the handle ceases.
         for (const journal of journals) journal.mockRestore();
@@ -6702,8 +6704,19 @@ it('a real SDK retry whose producer journal cannot be read logs the error, and t
   const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-torn-journal', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
   const request = m.directive('unreadable-journal-retry');
   const heal = tearJournalThroughRetryStart(m);
+  const events = collect(m.handle);
   try {
     const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    // The failed receipt routes nothing of its own: the errors and error states are the
+    // provider's retried truncation, then the guard's tagged refusal.
+    const truncated = 'OpenAI Responses stream ended before a terminal response event';
+    const refused = 'native directive admission/guard failed; further tool effects refused: DirectiveCheckpointError: native error row has no matching live SDK retry-start receipt';
+    expect(events.filter((event) => event.type === 'error' || (event.type === 'state' && event.state === 'error'))).toEqual([
+      { type: 'error', error: truncated, fatal: false, provider: 'gru-synthetic-responses', model: 'synthetic-model' },
+      { type: 'state', state: 'error', error: truncated },
+      { type: 'error', error: refused, fatal: false, nativeControl: 'directive-refusal' },
+      { type: 'state', state: 'error', error: refused },
+    ]);
     expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
     expectUnreadableJournalWarn(m, request.identity.requestId);
     // Fail-closed: no receipt, so the guard refused the retried call, by name.
@@ -6739,6 +6752,23 @@ it('a real SDK retry whose producer journal cannot be read logs the error, and a
     heal(); // disposal records cessation in a readable journal
     await m.dispose();
   }
+});
+
+it('a real SDK retry whose receipt write throws a value that cannot be printed logs it by name, and the directive stays fail-closed (#485)', async () => {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-unprintable-receipt', { command: `printf ran >> ${JSON.stringify(effect)}` })]);
+  const request = m.directive('unprintable-retry-receipt');
+  const receipt = vi.spyOn(checkpoint, 'recordDirectiveRetryStart').mockImplementation(() => { const thrown: unknown = Object.create(null); throw thrown; });
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    expect(m.retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1 })]);
+    expect(m.logs).toContainEqual({ level: 'warn', msg: UNRECORDED_RETRY,
+      fields: { requestId: request.identity.requestId, error: 'a non-error value was thrown: an unprintable value' } });
+    expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('native error row has no matching live SDK retry-start receipt') });
+    expect(existsSync(effect)).toBe(false);
+  } finally { receipt.mockRestore(); await m.dispose(); }
 });
 
 it('a real SDK retry with no live directive writes no retry evidence (#483)', async () => {

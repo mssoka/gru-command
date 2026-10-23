@@ -20,13 +20,14 @@ const dirs: string[] = [];
 afterAll(() => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); });
 
 /** A child whose stdin the test reads back, line by line. */
-function fakeChild(): { readonly child: ChildProcess; readonly written: () => Record<string, unknown>[] } {
+function fakeChild(): { readonly child: ChildProcess; readonly written: () => Record<string, unknown>[]; readonly signals: string[] } {
   const child = new EventEmitter() as ChildProcess;
   const stdin = new PassThrough();
+  const signals: string[] = [];
   let text = '';
   stdin.on('data', (chunk: Buffer) => { text += chunk.toString('utf8'); });
-  Object.assign(child, { stdin });
-  return { child, written: () => text.split('\n').filter((line) => line !== '').map((line) => JSON.parse(line) as Record<string, unknown>) };
+  Object.assign(child, { stdin, kill: (signal: string) => { signals.push(signal); return true; } });
+  return { child, signals, written: () => text.split('\n').filter((line) => line !== '').map((line) => JSON.parse(line) as Record<string, unknown>) };
 }
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
@@ -34,22 +35,24 @@ const request = (id: string, toolUseId: string, extra: Record<string, unknown> =
   ({ type: 'control_request', request_id: id, request: { subtype: 'can_use_tool', tool_name: 'Read', tool_use_id: toolUseId, input: { file_path: '/x' }, ...extra } });
 
 function channel(decide: (request: ClaudeToolRequest) => ClaudeToolDecision | Promise<ClaudeToolDecision> = () => ({ allow: true }), verification?: WorkerVerificationPolicy,
-  confirm: (request: ClaudeToolRequest) => ClaudeToolDecision = () => ({ allow: true })) {
-  const { child, written } = fakeChild();
+  confirm: (request: ClaudeToolRequest) => ClaudeToolDecision = () => ({ allow: true }), host: { readonly refusedThrows?: boolean; readonly failThrows?: boolean } = {}) {
+  const { child, written, signals } = fakeChild();
   const failures: string[] = [];
   const refusals: [string | undefined, string][] = [];
   const decided: ClaudeToolRequest[] = [];
+  const logs: [string, Readonly<Record<string, unknown>>][] = [];
   const permissions = new ClaudeDirectivePermissionChannel(child, {
-    fail: (message) => failures.push(message),
-    refused: (toolUseId, reason) => refusals.push([toolUseId, reason]),
+    fail: (message) => { failures.push(message); if (host.failThrows === true) throw new Error('turn failure handling broke'); },
+    refused: (toolUseId, reason) => { if (host.refusedThrows === true) throw new Error('refusal journal broke'); refusals.push([toolUseId, reason]); },
     decide: async (tool, durable) => { await durable; decided.push(tool); return decide(tool); },
     confirm,
+    log: (message, fields) => logs.push([message, fields]),
     ...(verification === undefined ? {} : { verification }),
   });
   permissions.start();
   const init = written()[0]!;
   const initialize = (): void => permissions.ingest({ type: 'control_response', response: { subtype: 'success', request_id: init['request_id'], response: {} } }, Promise.resolve());
-  return { permissions, child, written, failures, refusals, decided, initialize };
+  return { permissions, child, written, signals, failures, refusals, decided, logs, initialize };
 }
 
 describe('the Claude directive permission channel (#424)', () => {
@@ -127,6 +130,34 @@ describe('the Claude directive permission channel (#424)', () => {
       expect(unhandled).toEqual([]);
     } finally { process.off('unhandledRejection', onUnhandled); }
   });
+
+  /** A failed fence whose handling throws in the host's `refused()` or `fail()` (#485). */
+  async function assertHandlingThrowGuarded(site: 'refused' | 'fail'): Promise<void> {
+    const host = site === 'refused' ? { refusedThrows: true } : { failThrows: true };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const c = channel(() => { throw new Error('authority read broke'); }, undefined, undefined, host);
+      c.initialize();
+      c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+      await tick(); await tick(); await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(c.written().at(-1), site).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'r1',
+        response: { behavior: 'deny', message: 'The directive tool fence failed' } } });
+      const thrown = site === 'refused' ? 'refusal journal broke' : 'turn failure handling broke';
+      expect(c.logs, site).toEqual([['claude directive tool decision handling threw; the turn is failed',
+        { tool_use_id: 'toolu_1', error: expect.stringMatching(new RegExp(`^Error: ${thrown}\\n`, 'u')) }]]);
+      // A throwing refused() leaves fail() to the guard; a throwing fail() ends the CLI instead.
+      expect(c.failures, site).toEqual(site === 'refused'
+        ? [`directive tool decision handling failed: ${thrown}`]
+        : ['directive tool fence failed: authority read broke', `directive tool decision handling failed: ${thrown}`]);
+      expect(c.signals, site).toEqual(site === 'refused' ? [] : ['SIGTERM']);
+      expect(c.child.stdin!.writableEnded, site).toBe(site === 'fail');
+      expect(unhandled, site).toEqual([]);
+    } finally { process.off('unhandledRejection', onUnhandled); }
+  }
+  it('a host refused() that throws while a failed fence is handled still fails the turn, logged, never an unhandled rejection (#485)', () => assertHandlingThrowGuarded('refused'));
+  it('a host fail() that throws while a failed fence is handled ends the CLI, logged, never an unhandled rejection (#485)', () => assertHandlingThrowGuarded('fail'));
 
   it('denies a lane\'s verification producer before any fence, with the verification refusal', async () => {
     const policy: WorkerVerificationPolicy = { jobId: 'job', laneId: 'lane', cwd: '/lane', scopes: ['full'], producerPrefixes: [['npm', 'test']], helper: 'gc-verify', configFile: '/config.toml' };

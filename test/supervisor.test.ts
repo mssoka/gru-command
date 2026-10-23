@@ -3334,7 +3334,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     } finally { h.dispose(); }
   });
 
-  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall, and walls only with no pacing policy (#485)', async () => {
+  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall, and walls with no pacing policy or once its budget is spent (#485)', async () => {
     // 2.1.309's client-side capacity off-switch, as GC's adapter words it.
     const error = 'Opus is experiencing high load. Switch to Sonnet. (rate_limit)';
     const event = { type: 'error' as const, error, fatal: false, provider: 'anthropic-claude-native', model: 'claude-opus-5-5',
@@ -3350,6 +3350,20 @@ describe('supervisor — decision-backed failure guidance', () => {
       expect(paced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
       expect(handle.disposed).toBe(false);
     } finally { paced.dispose(); }
+    const spentSleeper = new ManualSleeper();
+    const spent = boot(undefined, { rateLimitBackoff: rateLimitPolicy({ maxRetries: 1 }), sleep: spentSleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-spent', null);
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-capacity' };
+      handle.promptHook = () => { handle.emit(event); };
+      spent.registry.adopt(handle);
+      handle.emit(event);
+      expect(spentSleeper.delays).toEqual([100]);
+      await spentSleeper.release(); // the one retry meets the off-switch again: the budget is spent
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(handle.promptCalls).toHaveLength(1);
+      expect(spent.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+    } finally { spent.dispose(); }
     const unpaced = boot();
     try {
       const handle = new FakeHandle('minion', 'minion-capacity-unpaced', null);
