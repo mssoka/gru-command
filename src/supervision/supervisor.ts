@@ -18,6 +18,7 @@ import {
 } from '../decisions/questions.js';
 import { supervisionGuidance } from '../decisions/effects.js';
 import {
+  MAX_PACING_ERROR_CHARS,
   backoffDelayMs,
   isRateLimitErrorText,
   pacingExhaustedPayload,
@@ -1007,16 +1008,23 @@ export class Supervisor {
             break;
           }
           if (!event.fatal && event.nativeControl === 'directive-refusal' && event.typed === undefined) {
-            // GC's own directive fence refused the turn (#485). That is no
-            // provider response, and the directive's recovery path owns it:
-            // do not pace, classify, stop as a wall, or hand its accepted
-            // prompt to restart/replay recovery here.
-            this.log('info', 'native directive refusal retained for directive recovery; provider failure routing skipped', {
+            if (this.onDirectiveTurn(agent)) {
+              // GC's own directive fence refused the turn (#485). That is no
+              // provider response, and the directive's recovery path owns it:
+              // do not pace, classify, stop as a wall, or hand its accepted
+              // prompt to restart/replay recovery here.
+              this.log('info', 'native directive refusal retained for directive recovery; provider failure routing skipped', {
+                agent_id: agent.agentId,
+                error: event.error,
+              });
+              this.recordEvent('supervision.native-refusal-retained', agent.agentId, { error: event.error.slice(0, MAX_PACING_ERROR_CHARS) });
+              break;
+            }
+            // Only a directive turn has a directive recovery path to own it.
+            this.log('warn', 'native directive refusal tag on a turn that carries no directive; routed as an ordinary failure', {
               agent_id: agent.agentId,
               error: event.error,
             });
-            this.recordEvent('supervision.native-refusal-retained', agent.agentId, { error: event.error });
-            break;
           }
           // Publication can replay a startup error while its owner is still
           // settling the rung. Defer that exact error, never another spawn.
@@ -2735,6 +2743,19 @@ export class Supervisor {
     adopted.pendingRecovery = old.pendingRecovery;
     this.agents.delete(old.agentId);
     return adopted;
+  }
+
+  /** Whether the agent's live turn carries a native directive (#485). */
+  private onDirectiveTurn(agent: SupervisedAgent): boolean {
+    try {
+      return agent.handle?.pendingTurn?.()?.directive !== undefined;
+    } catch (error) {
+      this.log('warn', 'pending-turn read failed — a native directive refusal is routed as an ordinary failure', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+      return false;
+    }
   }
 
   /** Snapshot an open turn before a restart kills it. */

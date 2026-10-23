@@ -30,7 +30,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
-import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { MAX_PACING_ERROR_CHARS, PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
@@ -388,6 +388,17 @@ function rateLimitPolicy(overrides: Partial<RateLimitBackoffPolicy> = {}): RateL
 /** Emit an adapter-style in-band failure event for the handle. */
 function emitFailure(handle: FakeHandle, text: string): void {
   handle.emit({ type: 'error', error: text, fatal: false });
+}
+
+/** A live native directive turn for `agentId`, on its own working job. */
+function directiveTurn(h: Harness, agentId: string): PendingTurn {
+  const jobId = `job-${agentId}`;
+  h.api.addJob({ id: jobId, repo: 'fixture', title: jobId }); h.api.setJobStatus(jobId, 'working');
+  h.api.registerAgent({ id: agentId, role: 'minion', jobId });
+  const request = h.api.beginDirectiveIntent({ jobId, requestId: `request-${agentId}`, directive: 'repair the lane', holder: 'gru' }).record;
+  return { text: 'repair the lane', owner: `silas-directive:${request.requestId}`, directive: {
+    identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+  } };
 }
 
 /** Hang a handle: open a turn, go streaming, then let silence accrue. */
@@ -3234,54 +3245,65 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
-  it('provider auth and unproven local-looking errors retain deterministic wall protections', async () => {
-    const localLooking = 'HTTP 401 provider rejection: DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
-    for (const { id, typed, localControl, fatal } of [
-      { id: 'provider-auth-local-words', typed: true, localControl: false, fatal: false },
-      { id: 'provider-auth-local-words-conflicting-origin', typed: true, localControl: true, fatal: false },
-      { id: 'untyped-local-words', typed: false, localControl: false, fatal: false },
+  it('a wall stays a wall on a directive turn, tagged or not, when typed or fatal; untagged, GC\'s refusal walls only in its old wording (#485)', async () => {
+    const providerAuth = 'HTTP 401 provider rejection: invalid x-api-key';
+    const oldRefusal = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+    const refusal = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed';
+    for (const { id, error, typed, tagged, fatal, walls } of [
+      { id: 'provider-auth', error: providerAuth, typed: true, tagged: false, fatal: false, walls: true },
+      // A typed provider response is never GC's refusal, whatever its tag says.
+      { id: 'provider-auth-tagged', error: providerAuth, typed: true, tagged: true, fatal: false, walls: true },
       // A fatal error is never skipped as a refusal, tag or not.
-      { id: 'fatal-local-words-tagged', typed: false, localControl: true, fatal: true },
+      { id: 'fatal-tagged', error: oldRefusal, typed: false, tagged: true, fatal: true, walls: true },
+      // Untagged, the old wording walled by itself: why GC's own text changed.
+      { id: 'old-refusal-untagged', error: oldRefusal, typed: false, tagged: false, fatal: false, walls: true },
+      { id: 'refusal-untagged', error: refusal, typed: false, tagged: false, fatal: false, walls: false },
     ] as const) {
       const h = boot();
-      const handle = new FakeHandle('minion', id, null);
-      h.registry.adopt(handle);
-      const spawns = h.registry.spawnCalls.length;
-      handle.emit({ type: 'error', error: localLooking, fatal,
-        ...(localControl ? { nativeControl: 'directive-refusal' as const } : {}), ...(typed ? {
+      try {
+        const handle = new FakeHandle('minion', id, null);
+        handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+        h.registry.adopt(handle);
+        const spawns = h.registry.spawnCalls.length;
+        handle.emit({ type: 'error', error, fatal, ...(tagged ? { nativeControl: 'directive-refusal' as const } : {}), ...(typed ? {
           provider: 'synthetic-provider', model: 'synthetic-model', typed: { origin: 'provider-message' as const, status: 401 },
         } : {}) });
-      await vi.waitFor(() => expect(handle.disposed).toBe(true));
-      expect(h.supervisor.viewFor(id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall', restarts: 0 });
-      expect(h.registry.spawnCalls).toHaveLength(spawns);
-      expect(h.notificationsOfKind(`supervision.provider-wall.${id}.authentication_wall`)).toHaveLength(1);
-      expect(h.api.listProviderWaits()).toEqual([]);
-      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
-      h.dispose();
+        if (walls) {
+          await vi.waitFor(() => expect(handle.disposed, id).toBe(true));
+          expect(h.supervisor.viewFor(id), id).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall', restarts: 0 });
+          expect(h.notificationsOfKind(`supervision.provider-wall.${id}.authentication_wall`), id).toHaveLength(1);
+        } else {
+          for (let i = 0; i < 16; i += 1) await Promise.resolve();
+          expect(handle.disposed, id).toBe(false);
+          expect(h.supervisor.viewFor(id), id).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+          expect(h.api.listNotifications({ limit: 100 }).some((row) => row.kind.includes('provider-wall')), id).toBe(false);
+        }
+        expect(h.registry.spawnCalls, id).toHaveLength(spawns);
+        expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained'), id).toBe(false);
+      } finally { h.dispose(); }
     }
   });
 
-  it('a tagged native directive refusal skips pacing and the decision service, and leaves a durable trace (#485)', async () => {
+  it('a tagged refusal on a directive turn skips pacing and the decision service, and leaves a bounded durable trace (#485)', async () => {
     const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
       deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
     const sleeper = new ManualSleeper();
     const h = boot({ decide } as unknown as DecisionService, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
     try {
-      h.api.addJob({ id: 'job-native-refusal', repo: 'fixture', title: 'job-native-refusal' });
       const handle = new FakeHandle('minion', 'minion-native-refusal', null);
-      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-native-refusal' });
-      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-native-refusal' };
+      handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
       h.registry.adopt(handle);
       // Rate-limit-looking text: routed, it would start the automatic retry.
-      const error = 'DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work is authorized';
+      const error = `DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work may proceed; ${'detail '.repeat(100)}`;
       handle.emit({ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' });
       for (let i = 0; i < 16; i += 1) await Promise.resolve();
       expect(sleeper.delays).toEqual([]);
       expect(decide).not.toHaveBeenCalled();
       const events = h.api.listEvents({ limit: 100 });
       expect(events.some((event) => event.kind.startsWith('pacing.') || event.kind === 'supervision.guidance')).toBe(false);
+      expect(error.length).toBeGreaterThan(MAX_PACING_ERROR_CHARS);
       expect(events.filter((event) => event.kind === 'supervision.native-refusal-retained')).toEqual([
-        expect.objectContaining({ agentId: handle.id, jobId: 'job-native-refusal', payload: { error } }),
+        expect.objectContaining({ agentId: handle.id, jobId: `job-${handle.id}`, payload: { error: error.slice(0, MAX_PACING_ERROR_CHARS) } }),
       ]);
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
       expect(handle.disposed).toBe(false);
@@ -3289,6 +3311,24 @@ describe('supervisor — decision-backed failure guidance', () => {
       // The same text untagged is routed: the automatic retry is scheduled.
       handle.emit({ type: 'error', error, fatal: false });
       expect(sleeper.delays).toEqual([100]);
+    } finally { h.dispose(); }
+  });
+
+  it('a refusal tag on a turn that carries no directive is logged loud and routed as an ordinary failure (#485)', async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0,
+      log: (level, msg) => logs.push({ level, msg }) });
+    try {
+      h.api.addJob({ id: 'job-dispatch-turn', repo: 'fixture', title: 'job-dispatch-turn' });
+      const handle = new FakeHandle('minion', 'minion-dispatch-turn', null);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-dispatch-turn' });
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-dispatch-turn' };
+      h.registry.adopt(handle);
+      handle.emit({ type: 'error', error: 'DirectiveCheckpointError: 429 rate limit — no work may proceed', fatal: false, nativeControl: 'directive-refusal' });
+      expect(sleeper.delays).toEqual([100]);
+      expect(logs).toContainEqual({ level: 'warn', msg: 'native directive refusal tag on a turn that carries no directive; routed as an ordinary failure' });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
     } finally { h.dispose(); }
   });
 

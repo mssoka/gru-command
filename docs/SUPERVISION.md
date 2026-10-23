@@ -162,16 +162,22 @@ fatal errors climb.
 
 **A native directive refusal is not provider-routed (#485).** When GC's own
 directive fence refuses a turn (the directive is held, superseded or
-terminal, a compaction is still open at admission, a tool fence fails), the
-turn fails with a `DirectiveCheckpointError` that GC raised for that
-directive, or with GC's wrapper around an earlier GC-local failure. The
-adapter tags that error `nativeControl: 'directive-refusal'`, and the
-supervisor neither paces it as a rate limit nor classifies it as a wall: the
-directive's recovery path owns it (it disposes the handle, fails or
-reconciles the directive, and surfaces the recovery to Gru). Each skipped
-refusal leaves a `supervision.native-refusal-retained` ledger event naming
-the agent, with `error`. A provider error is never tagged, and a provider
-wall the CLI reports in the same turn is still routed as a wall.
+terminal; a tool fence fails; on Pi, a compaction is still open at
+admission), the turn fails with GC's refusal: a `DirectiveCheckpointError`
+GC raised itself, GC's wrapper whose own cause is one, or the
+`AggregateError` that replaced one whose receipt could not be journaled. The
+adapter tags that error `nativeControl: 'directive-refusal'` (Pi by matching
+the failure to the refusal it recorded, Claude by the failure's cause). On a
+directive turn the supervisor neither paces a tagged, nonfatal, untyped
+error as a rate limit nor classifies it as a wall: the directive's recovery
+path owns it (it disposes the handle, fails or reconciles the directive, and
+surfaces the recovery to Gru). Each skipped refusal leaves a
+`supervision.native-refusal-retained` ledger event naming the agent, with
+`error` (at most 500 characters). A fatal or typed tagged error is still
+routed, and a tag on a turn that carries no directive is logged as a warning
+and routed. GC's wrapper around a plain error (a ledger fault, a Pi
+extension's throw) and any provider error are never tagged, and an error the
+CLI reports in the same turn as a refusal is emitted untagged and routed.
 
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent

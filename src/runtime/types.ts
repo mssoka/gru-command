@@ -294,15 +294,19 @@ export type RuntimeEvent =
       readonly type: 'error';
       readonly error: string;
       readonly fatal: boolean;
-      /** A native directive refusal (#485): the turn failed because GC itself
-       * raised a `DirectiveCheckpointError` for the live directive, directly
-       * or as GC's wrapper around an earlier GC-local failure. The
-       * directive's recovery path owns it, so supervision never routes it as
-       * a provider failure. The adapter correlates the failure with the
-       * refusal it recorded: by object identity while it still holds the
-       * thrown object, by exact non-empty message equality where the SDK
-       * reduced it to text, never by substring. A provider error never
-       * carries it, and a tagged event names no provider or model. */
+      /** A native directive refusal (#485): the turn failed with GC's own
+       * refusal for the live directive — a `DirectiveCheckpointError` GC
+       * raised itself, GC's wrapper whose own cause is one, or the
+       * `AggregateError` that replaced one whose receipt could not be
+       * journaled. GC's wrapper around a plain error, and any provider error,
+       * never carries it. Pi correlates the failure with the refusals it
+       * recorded: by object identity while it holds the thrown object, by
+       * exact message equality where its SDK reduced it to text (a refusal
+       * always states a reason), never by substring. Claude tags a failure
+       * whose named cause is such a refusal. A tagged event names no provider
+       * or model. Supervision skips only a nonfatal, untyped tagged error on
+       * a directive turn (the directive's recovery path owns it); a fatal or
+       * typed one is routed. */
       readonly nativeControl?: 'directive-refusal';
       readonly provider?: string;
       readonly model?: string;
