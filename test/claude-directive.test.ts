@@ -33,7 +33,8 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 const request = (id: string, toolUseId: string, extra: Record<string, unknown> = {}) =>
   ({ type: 'control_request', request_id: id, request: { subtype: 'can_use_tool', tool_name: 'Read', tool_use_id: toolUseId, input: { file_path: '/x' }, ...extra } });
 
-function channel(decide: (request: ClaudeToolRequest) => ClaudeToolDecision | Promise<ClaudeToolDecision> = () => ({ allow: true }), verification?: WorkerVerificationPolicy) {
+function channel(decide: (request: ClaudeToolRequest) => ClaudeToolDecision | Promise<ClaudeToolDecision> = () => ({ allow: true }), verification?: WorkerVerificationPolicy,
+  confirm: (request: ClaudeToolRequest) => ClaudeToolDecision = () => ({ allow: true })) {
   const { child, written } = fakeChild();
   const failures: string[] = [];
   const refusals: [string | undefined, string][] = [];
@@ -42,6 +43,7 @@ function channel(decide: (request: ClaudeToolRequest) => ClaudeToolDecision | Pr
     fail: (message) => failures.push(message),
     refused: (toolUseId, reason) => refusals.push([toolUseId, reason]),
     decide: async (tool, durable) => { await durable; decided.push(tool); return decide(tool); },
+    confirm,
     ...(verification === undefined ? {} : { verification }),
   });
   permissions.start();
@@ -93,6 +95,20 @@ describe('the Claude directive permission channel (#424)', () => {
       expect(c.refusals, label).toEqual(label === 'foreign response' ? [] : [[undefined, 'malformed or foreign directive permission request']]);
     }
     expect(early.refusals).toEqual([]);
+  });
+
+  it('re-checks an allow as it is written: a deny returned then is what the CLI reads (#485)', async () => {
+    const confirmed: string[] = [];
+    const c = channel(() => ({ allow: true }), undefined, (tool) => {
+      confirmed.push(tool.toolUseId);
+      return { allow: false, message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' };
+    });
+    c.initialize();
+    c.permissions.ingest(request('r1', 'toolu_1'), Promise.resolve());
+    await tick(); await tick();
+    expect(confirmed).toEqual(['toolu_1']);
+    expect(c.written().at(-1)).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'r1',
+      response: { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' } } });
   });
 
   it('denies a lane\'s verification producer before any fence, with the verification refusal', async () => {

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { runInNewContext } from 'node:vm';
 import {
   chmodSync,
   lstatSync,
@@ -253,9 +254,40 @@ describe('typed decision semantics', () => {
       // Claude Code 2.1.309's failed login: no HTTP status, only its typed code.
       'Not logged in · Please run /login (authentication_failed)',
     ]) expect(deterministicFailureClass(text), text).toBe('authentication_wall');
+    // Camel-case spellings are not claimed.
+    expect(deterministicFailureClass('AuthenticationFailed')).toBe('unknown');
     expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed')).toBe('unknown');
     // The old wording walled on its own: untagged text never protected a refusal; the tag does.
     expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized')).toBe('authentication_wall');
+  });
+
+  it('Claude Code 2.1.309\'s typed error codes that name a deterministic wall classify alone and as the in-band suffix (#485)', () => {
+    const walls = {
+      authentication_failed: 'authentication_wall', oauth_org_not_allowed: 'authentication_wall',
+      cloud_credential_error: 'authentication_wall', verification_required: 'authentication_wall',
+      billing_error: 'quota_wall', account_on_hold: 'quota_wall', rate_limit: 'quota_wall',
+    } as const;
+    for (const [code, wall] of Object.entries(walls)) {
+      expect(deterministicFailureClass(code), code).toBe(wall);
+      // The in-band error's facts suffix; HTTP 400 alone names no wall.
+      expect(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`), code).toBe(wall);
+    }
+    expect(deterministicFailureClass('Credit balance is too low (billing_error)')).toBe('quota_wall');
+    // The rest of the closed enum names no deterministic wall.
+    for (const code of ['overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens']) {
+      expect(['unknown', 'network_failure'], code).toContain(deterministicFailureClass(`the CLI reported an API error (HTTP 400, ${code})`));
+    }
+  });
+
+  it('names every thrown value, any realm\'s error included, and never throws (#485)', () => {
+    expect(thrownText(new TypeError('bad'))).toBe('bad');
+    expect(thrownText(new TypeError('bad'), 'string')).toBe('TypeError: bad');
+    expect(thrownText(runInNewContext('new Error("from another realm")') as unknown)).toBe('from another realm');
+    expect(thrownText(null)).toBe('a directive step threw a non-error value: null');
+    expect(thrownText(Object.create(null) as unknown)).toBe('a directive step threw a non-error value: an unprintable value');
+    expect(thrownText({ toString: () => { throw new Error('no text'); } })).toBe('a directive step threw a non-error value: an unprintable value');
+    expect(new DirectiveBookkeepingError('admission publication', Object.create(null) as unknown).message)
+      .toBe('directive bookkeeping failed: admission publication: a directive step threw a non-error value: an unprintable value');
   });
 
   // Scanned below: every literal message of `new DirectiveCheckpointError(…)` and
@@ -272,8 +304,9 @@ describe('typed decision semantics', () => {
   // verdict.error can carry a provider's own text), directive-checkpoint.ts's
   // oversized, at, refusal and retry (fed by literals scanned here), and the
   // Claude channel's `new DirectiveCheckpointError(reason)` (its reasons are
-  // scanned here); ledger/api.ts:9395's ternary of two literals ("request is …,
-  // not retired — …", "terminal work cannot be revived by recovery"); the
+  // scanned here); the ledger's recovery-decision ternary of two literals
+  // ("request is …, not retired — …", "terminal work cannot be revived by
+  // recovery"); the
   // "current gate duty " prefix ledger/api.ts's refuse() puts before its
   // reasons; and a bookkeeping refusal's fault text after GC's prefix, which is
   // the disk's or the OS's words and is guarded by the tag, not by its text.

@@ -1115,6 +1115,8 @@ export class PiAgentHandle implements AgentHandle {
    * replaced one whose receipt could not be journaled. Reset per turn. See
    * RuntimeEvent `nativeControl`. */
   private readonly nativeDirectiveRefusals = new Set<Error>();
+  /** Bookkeeping faults already logged: each is logged once, first failure or not. */
+  private readonly loggedBookkeepingFaults = new WeakSet<DirectiveBookkeepingError>();
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
@@ -1323,9 +1325,12 @@ export class PiAgentHandle implements AgentHandle {
           else recordDirectiveToolRefusal(producer, toolCallId, refusal.reason);
           this.pendingGuardRefusals.delete(key);
         } catch (journalError) {
-          const unrecorded = new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained');
-          // Still the refusal: the turn now fails with this object instead.
-          if (isNativeDirectiveRefusal(error)) this.nativeDirectiveRefusals.add(unrecorded);
+          // Still the refusal: the turn now fails with this object instead. A
+          // foreign error keeps its own words, so it is still classified by them.
+          const refusalError = isNativeDirectiveRefusal(error);
+          const unrecorded = new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained' +
+            (refusalError ? '' : `: ${thrownText(error, 'string')}`));
+          if (refusalError) this.nativeDirectiveRefusals.add(unrecorded);
           throw unrecorded;
         }
       }
@@ -1336,13 +1341,17 @@ export class PiAgentHandle implements AgentHandle {
   /** Fails the live directive's admission/guard once: the first failure stays
    * the turn's, and a bookkeeping fault is logged with the fault it replaced. */
   private failDirectiveAdmission(error: unknown): void {
-    if (this.directiveAdmissionFailure !== null) return;
-    this.directiveAdmissionFailure = { error };
-    if (error instanceof DirectiveBookkeepingError) {
-      this.log('error', 'native directive bookkeeping failed; the directive is refused', {
-        error: error.message, fault: error.fault instanceof Error ? error.fault.stack ?? error.fault.message : thrownText(error.fault),
-      });
-    }
+    this.directiveAdmissionFailure ??= { error };
+    this.logBookkeepingFault(error);
+  }
+
+  /** Every bookkeeping fault is logged, first failure or not, and once. */
+  private logBookkeepingFault(error: unknown): void {
+    if (!(error instanceof DirectiveBookkeepingError) || this.loggedBookkeepingFaults.has(error)) return;
+    this.loggedBookkeepingFaults.add(error);
+    this.log('error', 'native directive bookkeeping failed; the directive is refused', {
+      error: error.message, fault: error.fault instanceof Error ? error.fault.stack ?? error.fault.message : thrownText(error.fault),
+    });
   }
 
   /** Keeps a refusal GC raised for the live directive; a plain error, or GC's
@@ -1848,6 +1857,7 @@ export class PiAgentHandle implements AgentHandle {
       } catch (error) {
         // Pi calls this outside its own try: the prompt rejects with this very object.
         this.recordDirectiveRefusal(error);
+        this.logBookkeepingFault(error);
         throw error;
       }
     };
@@ -1857,7 +1867,7 @@ export class PiAgentHandle implements AgentHandle {
         // A turn rejected by dispose() must not overwrite the terminal
         // 'disposed' state with 'error'.
         if (!this.disposed) {
-          this.setState('error', String(error));
+          this.setState('error', thrownText(error, 'string'));
           // Typed provenance (r1 #13): ONLY a real SDK provider error
           // (numeric status) carries provider identity + typed fields.
           // Arbitrary exceptions stay anonymous — the sensor can never
@@ -1865,7 +1875,7 @@ export class PiAgentHandle implements AgentHandle {
           const typed = typedFromSdkError(error);
           this.emit({
             type: 'error',
-            error: String(error),
+            error: thrownText(error, 'string'),
             fatal: false,
             // A refusal rejects the prompt as the very object recorded.
             ...(typed === null && error instanceof Error && this.nativeDirectiveRefusals.has(error) ? { nativeControl: 'directive-refusal' as const } : {}),

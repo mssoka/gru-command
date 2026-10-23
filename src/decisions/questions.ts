@@ -199,19 +199,23 @@ export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
 export function deterministicFailureClass(reason: string): FailureClass {
   // Word-bounded signals: bare substrings wall-classified unrelated text
-  // ("author" hit `auth`; "port 13020" hit `1302`). The stems still admit
-  // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed,
-  // and Claude Code's failed-login code authentication_failed)
-  // so real walls keep their deterministic stop. "authorized" stays a signal:
-  // providers say "no longer authorized" or "only authorized for use with
-  // Claude Code". For GC's own refusals the tag, not the text, is the guard
-  // (#485); GC's literal refusal texts avoid wall words so an untagged one
-  // still reads `unknown`.
+  // ("author" hit `auth`; "port 13020" hit `1302`). The stems admit the
+  // snake-case spellings real errors use (auth_error, auth-failure,
+  // rate_limit) and RateLimited; other camel-case spellings
+  // (AuthenticationFailed, authError) do not match. Claude Code's typed error
+  // codes (its closed 2.1.309 enum) that name a deterministic wall are listed
+  // whole: authentication_failed, oauth_org_not_allowed,
+  // cloud_credential_error and verification_required are authentication
+  // walls; billing_error, account_on_hold and rate_limit are quota walls.
+  // "authorized" stays a signal: providers say "no longer authorized" or "only
+  // authorized for use with Claude Code". For GC's own refusals the tag, not
+  // the text, is the guard (#485); GC's literal refusal texts avoid wall words
+  // so an untagged one still reads `unknown`.
   if (
-    /\b(?:unauthorized|oauth|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+    /\b(?:unauthorized|oauth|oauth_org_not_allowed|cloud_credential_error|verification_required|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';
   if (
-    /\bquota\b|\brate[- ]?limit(?:ed)?\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
+    /\bquota\b|\brate[-_ ]?limit(?:ed)?\b|\bbilling_error\b|\baccount_on_hold\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
   ) return 'quota_wall';
   if (/network|connect|dns|socket|econn|fetch failed/i.test(reason)) return 'network_failure';
   if (/turn hang|compaction hang|silence|watchdog/i.test(reason)) return 'turn_hang';

@@ -1,7 +1,7 @@
 import { hostname } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, writeFileSync } from 'node:fs';
-import { isDeepStrictEqual } from 'node:util';
+import { isDeepStrictEqual, types } from 'node:util';
 import { dirname } from 'node:path';
 import type { ModelThinkingLevel } from '@earendil-works/pi-ai';
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
@@ -44,11 +44,15 @@ export class DirectiveCheckpointError extends Error {
 
 /** A native directive refusal (#485) is a DirectiveCheckpointError GC raises
  * for its own directive control: its fences and authority checks, its
- * protocol checks, and every GC directive bookkeeping I/O call (transcript,
- * binding, receipt, producer journal, and the GC ledger calls made for the
- * directive: `beforeAdmission`, `onAdmitted`), a GC bug inside those calls
- * included. An error from code GC does not own (an extension hook, the SDK,
- * the provider), or GC's wrapper around one, is never a refusal and always
+ * protocol checks, and its directive bookkeeping I/O inside a turn
+ * (transcript, binding, receipt, producer journal, and the GC ledger calls
+ * made for the directive: `beforeAdmission`, `onAdmitted`), a GC bug inside
+ * those calls included. Two kinds of bookkeeping are not converted: the
+ * pre-turn checks (Claude's prepareDirectiveTurn; Pi's runTurn opening and
+ * resumeDirective) reject the prompt before any event and reach no
+ * supervision, and Pi's executeBash controller receipt runs outside any
+ * turn. An error from code GC does not own (an extension hook, the SDK, the
+ * provider), or GC's wrapper around one, is never a refusal and always
  * routes. A wrapper names its cause, even null or undefined: it is a refusal
  * only when that cause is one. */
 export function isNativeDirectiveRefusal(error: unknown): error is DirectiveCheckpointError {
@@ -56,11 +60,20 @@ export function isNativeDirectiveRefusal(error: unknown): error is DirectiveChec
 }
 
 /** The text GC records for a thrown value: an error's own text (`message`,
- * or `string` for String(error)), and a non-error throw named, never a bare
- * "null" (#485). */
+ * or `string` for String(error)), any realm's error included, and a non-error
+ * throw named, never a bare "null" (#485). It never throws itself: it runs in
+ * failure handlers. */
 export function thrownText(value: unknown, form: 'message' | 'string' = 'message'): string {
-  if (value instanceof Error) return form === 'string' ? String(value) : value.message;
-  return `a directive check threw a non-error value: ${String(value)}`;
+  if (types.isNativeError(value) || value instanceof Error) {
+    return form === 'string' ? printable(value) : printable((value as Error).message);
+  }
+  return `a directive step threw a non-error value: ${printable(value)}`;
+}
+
+/** String(value), or a named stand-in when the value cannot be printed (a
+ * null-prototype object, a throwing toString). */
+function printable(value: unknown): string {
+  try { return String(value); } catch { return 'an unprintable value'; }
 }
 
 /** A fault inside one of GC's own directive bookkeeping calls (#485): GC's

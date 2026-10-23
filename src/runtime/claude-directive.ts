@@ -73,6 +73,8 @@ export class ClaudeDirectivePermissionChannel {
       readonly refused: (toolUseId: string | undefined, reason: string) => unknown;
       /** Called once per tool request, after the request frame is durable. */
       readonly decide: (request: ClaudeToolRequest, durable: Promise<void>) => Promise<ClaudeToolDecision>;
+      /** Called as an allow is written: the decision written instead (#485). */
+      readonly confirm: (request: ClaudeToolRequest) => ClaudeToolDecision;
       readonly verification?: WorkerVerificationPolicy;
     },
   ) {
@@ -132,7 +134,11 @@ export class ClaudeDirectivePermissionChannel {
       return;
     }
     this.deps.decide(tool, durable).then(
-      (decision) => this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message }),
+      (decided) => {
+        // A failure recorded since the fence passed still denies the allow.
+        const decision = decided.allow ? this.deps.confirm(tool) : decided;
+        this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message });
+      },
       (error: unknown) => {
         const reason = `directive tool fence failed: ${thrownText(error)}`;
         let report: unknown;

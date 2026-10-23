@@ -744,6 +744,22 @@ describe('worker-turn preparation and per-job turn knowledge (#427 lane slimming
     lease.release();
   });
 
+  it('records a failed preparation\'s error bounded like every ledger payload (#485)', async () => {
+    const events: Array<{ kind: string; payload?: unknown }> = [];
+    const verbose = `setup exploded: ${'detail '.repeat(100)}`;
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, payload: event.payload }),
+      prepareWorkerTurn: async () => { throw new Error(verbose); },
+    });
+    const lease = await gate.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' });
+    expect(events).toEqual([{ kind: 'pacing.prepare-failed', payload: { id: 'job-a', label: 'Job A', pool: 'worker', ...boundedErrorText(`Error: ${verbose}`) } }]);
+    expect(events[0]!.payload).toMatchObject({ error_truncated: true });
+    lease.release();
+  });
+
   it('resolvePacingPolicy forwards prepareWorkerTurn to the gate it builds: the hook gets the job id and the turn\'s own signal, and the lease waits for it, queued or not', async () => {
     const calls: Array<{ jobId: string; signal: AbortSignal | undefined }> = [];
     const finishers: Array<() => void> = [];

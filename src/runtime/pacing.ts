@@ -594,7 +594,7 @@ export class PacingGate {
       (error: unknown) => {
         // Never blocks the turn: the failure is on the record and it proceeds.
         try {
-          this.recordEvent('pacing.prepare-failed', waiter, { pool: kind, error: String(error) });
+          this.recordEvent('pacing.prepare-failed', waiter, { pool: kind, ...boundedErrorText(String(error)) });
         } catch {
           // best-effort: the turn still proceeds
         }

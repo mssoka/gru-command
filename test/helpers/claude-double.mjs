@@ -26,6 +26,7 @@
  *   "textonly-api-fault" — an API-error message with text only, no result
  *   "status-only-result" — an answer, then a result with api_error_status 500
  *   "divergent-api-fault" — API-error message and result with different texts
+ *   "limit-then-reply" — a usage-limit API-error message, then a successful result
  *   "tool-pair:<name>" — two tool uses asked of the host concurrently
  *   "answer-hold"      — an answer, then no result until it is ended
  *   "usage-limit"      — the same shape for a claude.ai usage-limit wall
@@ -970,6 +971,12 @@ async function run() {
     // No API-error message: only the result names the HTTP status.
     await emitTextTurn('working on it');
     out({ ...resultFrame('API Error: 500 Internal server error', true), subtype: 'success', api_error_status: 500 });
+    return;
+  }
+  if (prompt.includes('limit-then-reply')) {
+    // A usage-limit API error, then a successful result with the CLI's own reply text.
+    out({ ...assistantFrame([{ type: 'text', text: "You've hit your limit · resets 3pm (UTC)" }]), error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
+    out(resultFrame('No response requested.', false));
     return;
   }
   if (prompt.includes('divergent-api-fault')) {
