@@ -107,10 +107,12 @@ function contained(base: string, candidate: string): boolean {
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
 }
 
-function writeLine(socket: Socket, value: unknown): void {
+/** Write one response line; `onFlushed` runs only once it reached a live
+ * peer's socket (a write to a closed peer errors and never flushes). */
+function writeLine(socket: Socket, value: unknown, onFlushed?: () => void): void {
   if (socket.destroyed || !socket.writable) return;
   try {
-    socket.end(`${JSON.stringify(value)}\n`);
+    socket.end(`${JSON.stringify(value)}\n`, onFlushed);
   } catch {
     // A peer may disconnect between the writable check and end(). The
     // per-socket error listener below contains asynchronous write errors;
@@ -315,8 +317,14 @@ export class ReviewMcpBridge {
       // A repeated identical request joins the same execution: the tool
       // runs once, and every waiter receives its settled outcome.
       const outcome = await record.promise;
-      if (outcome.ok) writeLine(socket, { id: request.id, ok: true, result: outcome.result });
-      else writeLine(socket, { id: request.id, ok: false, error: outcome.error });
+      if (outcome.ok) {
+        // A success someone received is not replayed: a later identical
+        // request (a retry, a collect) is new work. Only a success no caller
+        // received — its transport wait ended — waits for the re-attach.
+        writeLine(socket, { id: request.id, ok: true, result: outcome.result }, () => this.releaseReceived(key, record));
+      } else {
+        writeLine(socket, { id: request.id, ok: false, error: outcome.error });
+      }
     } catch (error) {
       writeLine(socket, {
         id: requestId,
@@ -390,6 +398,16 @@ export class ReviewMcpBridge {
       this.evictRetainedExecutions();
     });
     return record;
+  }
+
+  /** Drop a settled success once a caller received it. */
+  private releaseReceived(key: string, record: ExecutionRecord): void {
+    if (this.executions.get(key) !== record) return;
+    this.executions.delete(key);
+    if (record.retainedBytes > 0) {
+      this.retainedExecutionBytes -= record.retainedBytes;
+      this.retainedExecutionCount -= 1;
+    }
   }
 
   /** Keep retained successes bounded by bytes AND entry count, evicting the

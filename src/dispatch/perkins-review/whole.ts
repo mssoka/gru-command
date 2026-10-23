@@ -73,6 +73,22 @@ function assertToolResponseFits(text: string, details: Readonly<Record<string, u
 const LENS_RESULT_MAX_BYTES = REVIEW_TOOL_TEXT_MAX_BYTES - 8 * 1024;
 /** Room kept in a specialist batch response for its withheld list. */
 const WITHHELD_RESERVE_BYTES = 4 * 1024;
+/** Bound on a failed attempt's error text in the lead's view. */
+const LEAD_VIEW_ERROR_MAX_CHARS = 2_000;
+
+/** What the lead reads of one specialist result: the review content, never
+ * host bookkeeping (delivery stamps, recording errors). The child-side size
+ * bound and the batch packing both measure exactly this view. */
+function leadView(result: {
+  readonly resultId: string; readonly lens: string; readonly attempt: number; readonly status: string;
+  readonly findings: readonly unknown[]; readonly failureKind?: string; readonly error?: string;
+}): Record<string, unknown> {
+  return {
+    resultId: result.resultId, lens: result.lens, attempt: result.attempt, status: result.status, findings: result.findings,
+    ...(result.failureKind !== undefined ? { failureKind: result.failureKind } : {}),
+    ...(result.error !== undefined ? { error: result.error.slice(0, LEAD_VIEW_ERROR_MAX_CHARS) } : {}),
+  };
+}
 /** Bound for the aggregated submission-validation rejection: it reaches
  * the lead as a tool ERROR, which Claude Code cuts past ~10,000 characters. */
 const MAX_VALIDATION_MESSAGE_BYTES = REVIEW_TOOL_ERROR_MAX_BYTES;
@@ -1677,9 +1693,9 @@ export class PerkinsWholeReview {
         const resultId = `${lens}-a${attempt}-${hash(handle.id).slice(0, 16)}`;
         // A valid result the lead could never read whole is no result: the
         // attempt fails with feedback a retry can act on.
-        const leadBytes = Buffer.byteLength(JSON.stringify({
-          resultId, agentId: handle.id, lens, attempt, status: 'valid', findings: reviewFindings,
-        }), 'utf8');
+        const leadBytes = Buffer.byteLength(JSON.stringify(leadView({
+          resultId, lens, attempt, status: 'valid', findings: reviewFindings,
+        })), 'utf8');
         if (leadBytes > LENS_RESULT_MAX_BYTES) {
           outputRejected = true;
           throw new Error(
@@ -1916,13 +1932,18 @@ export class PerkinsWholeReview {
       const withheld: SpecialistResult[] = [];
       const ordered = [...candidates.filter((result) => result.status !== 'valid'), ...candidates.filter((result) => result.status === 'valid')];
       for (const result of ordered) {
-        const fits = Buffer.byteLength(JSON.stringify({ results: [...delivered, result] }), 'utf8') <=
+        const fits = Buffer.byteLength(JSON.stringify({ results: [...delivered, result].map(leadView) }), 'utf8') <=
           REVIEW_TOOL_TEXT_MAX_BYTES - WITHHELD_RESERVE_BYTES;
         if (fits) delivered.push(result);
         else withheld.push(result);
       }
+      // Each view fits alone by construction; a response that could carry
+      // none would be a collect the lead repeats forever.
+      if (delivered.length === 0 && withheld.length > 0) {
+        throw new Error(`specialist result ${withheld[0]!.lens} does not fit one tool result the lead can read`);
+      }
       const payload = JSON.stringify({
-        results: delivered,
+        results: delivered.map(leadView),
         ...(withheld.length === 0 ? {} : {
           withheld: withheld.map((result) => ({ lens: result.lens, findingCount: result.findings.length })),
           collect: `These results did not fit in this response whole. Call perkins_run_specialists with runs ${JSON.stringify(withheld.map((result) => ({ lens: result.lens })))} to collect them; no child is started.`,
@@ -1985,8 +2006,8 @@ export class PerkinsWholeReview {
             throw new Error(`collect withheld results (${lensesRun.filter((lens) => collectable(lens) !== undefined).join(', ')}) in a call of their own, without new lenses`);
           }
           const packed = packForLead(toCollect as SpecialistResult[]);
-          deliverPacked(packed);
           assertToolResponseFits(packed.payload, { resultCount: packed.delivered.length }, 'withheld specialist results');
+          deliverPacked(packed);
           return {
             text: packed.payload,
             details: { resultCount: packed.delivered.length, withheldCount: packed.withheld.length, collected: true },
@@ -2135,11 +2156,6 @@ export class PerkinsWholeReview {
         /** Runs of THIS batch whose findings never reached the lead (R17):
          * commitResults stamps them undelivered even on the error path. */
         const undeliveredRuns = new Set<string>();
-        // Whole results only, up to what the lead can read; the rest wait,
-        // undelivered, until the lead collects them.
-        const packed = packForLead(childResults);
-        for (const result of packed.withheld) undeliveredRuns.add(result.resultId);
-        const payload = packed.payload;
         const commitResults = (): void => {
           // Real executed children are committed to the durable run record
           // and the lens state, whatever happens to the response: their
@@ -2163,8 +2179,13 @@ export class PerkinsWholeReview {
           commitResults();
           throw new Error('review already has an accepted terminal submission');
         }
+        // Whole results only, up to what the lead can read; the rest wait,
+        // undelivered, until the lead collects them.
+        let packed: ReturnType<typeof packForLead>;
         try {
-          assertToolResponseFits(payload, { resultCount: childResults.length }, 'specialist result batch');
+          packed = packForLead(childResults);
+          assertToolResponseFits(packed.payload, { resultCount: childResults.length }, 'specialist result batch');
+          for (const result of packed.withheld) undeliveredRuns.add(result.resultId);
         } catch (error) {
           // The children really ran: their envelopes/artifacts/run records
           // stay committed (never restored or hidden) — only the response
@@ -2194,7 +2215,7 @@ export class PerkinsWholeReview {
         commitResults();
         for (const result of packed.withheld) withheldForSize.add(result.resultId);
         return {
-          text: payload,
+          text: packed.payload,
           details: {
             resultCount: packed.delivered.length,
             findingCount: packed.delivered.reduce((sum, result) => sum + result.findings.length, 0),

@@ -948,13 +948,13 @@ describe('Perkins whole-PR lead engine', () => {
 
   /** Two lenses whose ~105 KB results each fit one lead-readable response,
    * but not both together. */
-  const twoLargeLenses = (extra: Partial<WholeLeadOptions> = {}): WholeHarness => {
+  const largeLenses = (lenses: readonly string[], extra: Partial<WholeLeadOptions> = {}): WholeHarness => {
     const line = (n: number): string => `export const value${n} = '${'x'.repeat(3_500)}';`;
     return wholeHarness({
-      specialists: ['security', 'tests'],
+      specialists: lenses,
       childAnswer: (prompt) => {
-        const source = /"source": "(security|tests)"/u.exec(prompt)?.[1];
-        if (source === undefined) return '[]';
+        const source = /"source": "([a-z]+)"/u.exec(prompt)?.[1];
+        if (source === undefined || !lenses.includes(source)) return '[]';
         return JSON.stringify(Array.from({ length: 30 }, (_, index) => groundedFinding(source, 'note', {
           title: `${source} large finding ${index}`, location: `src/big.ts:${index + 1}`, evidence: line(index + 1),
         })));
@@ -966,6 +966,7 @@ describe('Perkins whole-PR lead engine', () => {
       },
     });
   };
+  const twoLargeLenses = (extra: Partial<WholeLeadOptions> = {}): WholeHarness => largeLenses(['security', 'tests'], extra);
 
   it('a batch too large for one response delivers whole results and the lead collects the rest, with no new child (#487)', async () => {
     const h = twoLargeLenses();
@@ -976,6 +977,42 @@ describe('Perkins whole-PR lead engine', () => {
     expect(h.childCalls).toHaveLength(2);
     expect(result.specialistRuns.filter((run) => run.status === 'valid').map((run) => [run.lens, run.findingsDelivered]))
       .toEqual(expect.arrayContaining([['security', undefined], ['tests', undefined]]));
+    // The collected findings reached the lead (it retained them all), and
+    // the durable record agrees they were delivered.
+    expect(result.findings.filter((finding) => finding.source === 'tests')).toHaveLength(30);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      specialistRuns: Array<{ lens: string; status: string; findingsDelivered?: boolean }>;
+    };
+    expect(consolidated.specialistRuns.find((run) => run.lens === 'tests' && run.status === 'valid')?.findingsDelivered).toBeUndefined();
+  });
+
+  it('a collect whose own response withholds more is collected again, one call at a time (#487)', async () => {
+    const h = largeLenses(['security', 'tests', 'codebase']);
+    const result = await h.run();
+    expect(h.toolErrors).toEqual([]);
+    expect(h.collectBatches).toEqual([['tests', 'codebase'], ['codebase']]);
+    expect(h.childCalls).toHaveLength(3);
+    for (const lens of ['security', 'tests', 'codebase']) {
+      expect(result.findings.filter((finding) => finding.source === lens), lens).toHaveLength(30);
+    }
+  });
+
+  it('refuses a call mixing a withheld lens with a new one, starting no child and charging nothing (#487)', async () => {
+    const h = largeLenses(['security', 'tests'], { ignoreWithheld: true, neverSubmit: true });
+    await expect(h.run()).rejects.toThrow(/without an accepted terminal submission/u);
+    const runTool = h.leadCalls[0]!.options.reviewLead!.nativeTools.find((entry) => entry.name === 'perkins_run_specialists')!;
+    const children = h.childCalls.length;
+    await expect(runTool.execute({ runs: [{ lens: 'tests' }, { lens: 'edge' }] }))
+      .rejects.toThrow('collect withheld results (tests) in a call of their own, without new lenses');
+    expect(h.childCalls).toHaveLength(children);
+    // The withheld lens alone is collected, still without a child.
+    const collected = JSON.parse((await runTool.execute({ runs: [{ lens: 'tests' }] })).text) as {
+      results: Array<{ lens: string; status: string; findings: unknown[]; findingsDelivered?: unknown }>;
+    };
+    expect(collected.results.map((entry) => [entry.lens, entry.status, entry.findings.length])).toEqual([['tests', 'valid', 30]]);
+    // The lead's view carries no host bookkeeping.
+    expect(collected.results[0]).not.toHaveProperty('findingsDelivered');
+    expect(h.childCalls).toHaveLength(children);
   });
 
   it('a preflight error list larger than the lead can read is cut by whole errors with the exact omitted count (#487)', async () => {
@@ -990,6 +1027,8 @@ describe('Perkins whole-PR lead engine', () => {
     const body = JSON.parse(text) as { ok: boolean; errorCount: number; errors: unknown[]; omittedErrorCount?: number; fullList?: string };
     expect(body.ok).toBe(false);
     expect(body.omittedErrorCount).toBeGreaterThan(0);
+    // It carries as much as fits: within one error of the bound.
+    expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(REVIEW_TOOL_TEXT_MAX_BYTES - 2_048);
     expect(body.errors.length + body.omittedErrorCount!).toBe(body.errorCount);
     expect(body.fullList).toBe('lead/preflight-attempt-1.json');
   });
@@ -2172,6 +2211,8 @@ describe('whole-PR engine: independent-review repairs', () => {
     expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(REVIEW_TOOL_TEXT_MAX_BYTES);
     const listing = JSON.parse(text) as { changes: unknown[]; omittedChangeCount?: number; note?: string };
     expect(listing.omittedChangeCount).toBeGreaterThan(0);
+    // It lists as much as fits: within one entry of the bound.
+    expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(REVIEW_TOOL_TEXT_MAX_BYTES - 512);
     expect(listing.changes.length + listing.omittedChangeCount!).toBe(2_000);
     expect(listing.note).toContain('read any changed path with {"path": ...}');
   }, LARGE_UNIT_TIMEOUT_MS);

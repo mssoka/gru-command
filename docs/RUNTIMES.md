@@ -63,7 +63,10 @@ branch on harness. The ADAPTER implements the declaration:
   preflight error list and the prior-revision listing carry what fits plus
   an exact omitted count. A tool error is cut by Claude Code past ~10,000
   characters, so a submission rejection stays under that and points at
-  preflight for the full list.
+  preflight for the full list. The bridge keeps a settled success only for a
+  caller whose transport wait ended (it re-attaches with the same request);
+  a result a caller received is never replayed, so a retry or a collect
+  with the same arguments runs for real.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes

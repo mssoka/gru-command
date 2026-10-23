@@ -826,9 +826,14 @@ async function run() {
       // the real model would. The host owns the lens id, so the input omits
       // `source` — the same shape the prompt demands.
       const bulkCount = Number(process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] ?? '0');
+      // CLAUDE_DOUBLE_BULK_LONG=1 pads each finding (~760 bytes) so the batch
+      // passes the CLI's default token cap as well as its size limit.
+      const long = process.env['CLAUDE_DOUBLE_BULK_LONG'] === '1';
       const bulk = Array.from({ length: lens === 'security' ? bulkCount : 0 }, (_, index) => ({
-        severity: 'note', category: 'bulk', title: `Bulk delivery finding ${index}`, location: 'src/main.ts:2', evidence: '  return 43;',
-        detail: 'One of many findings that must reach the lead inline.', recommended_fix: 'No change needed for this delivery probe.',
+        severity: 'note', category: 'bulk',
+        title: `Bulk delivery finding ${index}${long ? ` ${'t'.repeat(100)}` : ''}`, location: 'src/main.ts:2', evidence: '  return 43;',
+        detail: long ? `One of many findings that must reach the lead inline ${'d'.repeat(190)}` : 'One of many findings that must reach the lead inline.',
+        recommended_fix: long ? `No change needed for this delivery probe ${'f'.repeat(200)}` : 'No change needed for this delivery probe.',
       }));
       const findings = lens === 'security'
         ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }, ...bulk]

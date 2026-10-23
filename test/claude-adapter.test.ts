@@ -98,6 +98,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_COMPACT_HOLD_FILE',
   'CLAUDE_DOUBLE_WORKFLOW_CANDIDATE',
   'CLAUDE_DOUBLE_BULK_FINDINGS',
+  'CLAUDE_DOUBLE_BULK_LONG',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
   'CLAUDE_DOUBLE_REPLAY',
@@ -1597,20 +1598,21 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('hands the lead a specialist batch over Claude Code\'s default inline limit whole (#487)', async () => {
-    // 199 findings (the child cap is 200) make a ~70,000-character batch: without the declared
-    // size (or the review token cap) the CLI would hand the lead a file
-    // pointer, and the double's lead fails to parse its results.
+  /** Runs a whole-PR lead whose security lens returns 199 bulk findings, and
+   * proves every one reached the lead inline (the double's lead throws
+   * otherwise). */
+  const bulkLeadRound = async (name: string, long: boolean): Promise<void> => {
     const fx = fixture();
-    const repo = makeFixtureRepo('claude-perkins-bulk');
+    const repo = makeFixtureRepo(name);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/review']);
     const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] = '1';
     process.env['CLAUDE_DOUBLE_BULK_FINDINGS'] = '199';
+    if (long) process.env['CLAUDE_DOUBLE_BULK_LONG'] = '1';
     try {
       const frozen = freezeReviewInputs({
-        roundId: 'claude-bulk-round', repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
+        roundId: `${name}-round`, repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
         baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'Acceptance: answer returns 43.',
       });
       const engine = new PerkinsWholeReview({
@@ -1618,7 +1620,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         policy: loadPerkinsPolicy(),
       });
       const result = await engine.run({
-        roundId: 'claude-bulk-round', roundNumber: 1, frozenReview: frozen,
+        roundId: `${name}-round`, roundNumber: 1, frozenReview: frozen,
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
@@ -1628,6 +1630,18 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await fx.runtime.dispose();
       repo.cleanup();
     }
+  };
+
+  it('hands the lead a specialist batch over Claude Code\'s default inline size limit whole (#487)', async () => {
+    // 199 findings (the child cap is 200) make a ~70,000-character batch:
+    // without the declared size the CLI would hand the lead a file pointer.
+    await bulkLeadRound('claude-perkins-bulk', false);
+  });
+
+  it('hands the lead a batch over Claude Code\'s default output-token cap whole (#487)', async () => {
+    // ~150,000 characters: past the default 25,000-token cap too, so it
+    // arrives whole only with the review sessions' MAX_MCP_OUTPUT_TOKENS.
+    await bulkLeadRound('claude-perkins-bulk-long', true);
   });
 
   it('gives an isolated child its own scoped bridge exposing exactly its declared native tools', async () => {
