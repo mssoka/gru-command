@@ -735,7 +735,9 @@ export function renderRebriefPrompt(input: {
       ? 'CONTRACT (the original briefing plus any accepted amendments):'
       : `CONTRACT — revision ${input.workRevision} (the original briefing plus every accepted amendment; ` +
         `the service records this turn's delivery as contract revision ${input.workRevision} — name it in your completion report):`,
-    input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
+    input.briefing ?? (input.reviewRole === 'blind'
+      ? '(no additional briefing text is attached)'
+      : '(the job row carries no stored briefing — read the job note on the board)'),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',

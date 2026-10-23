@@ -203,6 +203,11 @@ describe('progressive-disclosure injection', () => {
     });
     expect(blind).not.toContain('RELEVANT LESSONS');
     expect(blind).not.toContain('/tmp/gru-bible/chapters/ops-restarts.md');
+    const blindWithoutBriefing = renderRebriefPrompt({
+      jobId: 'review-blind', briefing: null, note: 'continue from the package', reviewRole: 'blind',
+    });
+    expect(blindWithoutBriefing).toContain('(no additional briefing text is attached)');
+    expect(blindWithoutBriefing).not.toContain('read the job note on the board');
   });
 
   it('re-briefs from the original contract when an evicted minion transcript cannot resume', async () => {
