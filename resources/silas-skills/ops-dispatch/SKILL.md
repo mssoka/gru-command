@@ -253,10 +253,9 @@ without a named rule is not yours to invent:
 
    When the row's `abortedRounds` is above 0, a round already ran and
    aborted before the PR was registered: register the PR only, and send no
-   review request. Any review still owed then appears under step 2 — with
-   `cleanAbort` for a clean service-restart abort, or as a plain re-review
-   when a newer head was delivered; a non-clean abort on the unchanged
-   delivered head stays held for Gru.
+   review request. Step 2 then lists any review still owed (with
+   `cleanAbort` for a clean service-restart abort); an abort it does not
+   list stays held for Gru.
 
    If you cannot find a PR, note the job on the ledger (`noteJob` is not
    yours — post an escalation instead) and leave the lane untouched. Do not
