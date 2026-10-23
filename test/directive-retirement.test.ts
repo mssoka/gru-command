@@ -532,7 +532,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     const binned = h.ledger.setJobStatus(row.jobId, 'binned');
     expect(binned.status).toBe('binned');
     expect(h.ledger.getDirective(row.requestId)?.state).toBe('retired');
-    expect(countEvents(h, 'job.status')).toBe(1);
+    expect(countEvents(h, 'job.status')).toBe(2); // working was recorded before the separate binned transition
   });
 
   it('retires an admitted-without-terminal request preserving its admission evidence', async () => {
@@ -1590,9 +1590,9 @@ describe('directive retirement — continuation boundary and consumers', () => {
       reason: 'owner stop holds until the owner says otherwise',
       by: 'owner',
     });
-    h.ledger.setJobStatus('job-ae', 'binned');
     const result = await retire(h, 'req-ae', laneHead(lane));
     expect(result.status).toBe(200);
+    h.ledger.setJobStatus('job-ae', 'binned');
     expect(h.ledger.getJob('job-ae')?.status).toBe('binned');
     // A hold on a terminal job is inert and is never projected as board
     // debt (terminal lanes can never accept the releasing request).
@@ -1912,8 +1912,8 @@ describe('directive retirement — continuation boundary and consumers', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-terminal-provider', 'req-terminal-provider');
-    h.ledger.setJobStatus('job-terminal-provider', 'binned');
     expect((await retire(h, 'req-terminal-provider', laneHead(lane))).status).toBe(200);
+    h.ledger.setJobStatus('job-terminal-provider', 'binned');
     h.ledger.recordProviderWait({ id: 'wait-terminal-provider', routeKey: 'route-terminal-provider', provider: 'p', model: 'm', endpoint: 'e',
       credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId: 'job-terminal-provider', agentId: null, slotId: null,
       sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working', lineageKey: null,
