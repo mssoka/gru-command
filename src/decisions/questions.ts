@@ -200,14 +200,15 @@ export type FailureClass = (typeof FAILURE_CLASSES)[number];
 export function deterministicFailureClass(reason: string): FailureClass {
   // Word-bounded signals: bare substrings wall-classified unrelated text
   // ("author" hit `auth`; "port 13020" hit `1302`). The stems still admit
-  // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed)
+  // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed,
+  // and Claude Code's failed-login code authentication_failed)
   // so real walls keep their deterministic stop. "authorized" stays a signal:
   // providers say "no longer authorized" or "only authorized for use with
   // Claude Code". For GC's own refusals the tag, not the text, is the guard
   // (#485); GC's literal refusal texts avoid wall words so an untagged one
   // still reads `unknown`.
   if (
-    /\b(?:unauthorized|oauth|auth(?:entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+    /\b(?:unauthorized|oauth|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';
   if (
     /\bquota\b|\brate[- ]?limit(?:ed)?\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)

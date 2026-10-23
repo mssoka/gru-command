@@ -42,25 +42,44 @@ export class DirectiveCheckpointError extends Error {
   }
 }
 
-/** A native directive refusal (#485): a DirectiveCheckpointError GC raised
- * over its own state, or GC's wrapper whose own cause is one. A wrapper
- * names its cause even when that is null or undefined; one around an error
- * from code GC does not own (an extension hook, the SDK, the provider) is no
- * refusal. */
+/** A native directive refusal (#485) is a DirectiveCheckpointError GC raises
+ * for its own directive control: its fences and authority checks, its
+ * protocol checks, and every GC directive bookkeeping I/O call (transcript,
+ * binding, receipt, producer journal, and the GC ledger calls made for the
+ * directive: `beforeAdmission`, `onAdmitted`), a GC bug inside those calls
+ * included. An error from code GC does not own (an extension hook, the SDK,
+ * the provider), or GC's wrapper around one, is never a refusal and always
+ * routes. A wrapper names its cause, even null or undefined: it is a refusal
+ * only when that cause is one. */
 export function isNativeDirectiveRefusal(error: unknown): error is DirectiveCheckpointError {
   return error instanceof DirectiveCheckpointError && (!Object.hasOwn(error, 'cause') || isNativeDirectiveRefusal(error.cause));
 }
 
-/** A fault in GC's own transcript, binding or receipt I/O is GC's refusal
- * (#485). It keeps the fault's text and names no cause, so supervision never
- * routes the disk's words ("EDQUOT: disk quota exceeded" reads as a quota
- * wall). A refusal passes through as itself. */
-export function ownIoRefusal(what: string, error: unknown): DirectiveCheckpointError {
-  if (error instanceof DirectiveCheckpointError) return error;
-  return new DirectiveCheckpointError(`${what} failed: ${error instanceof Error ? error.message : String(error)}`);
+/** The text GC records for a thrown value: an error's own text (`message`,
+ * or `string` for String(error)), and a non-error throw named, never a bare
+ * "null" (#485). */
+export function thrownText(value: unknown, form: 'message' | 'string' = 'message'): string {
+  if (value instanceof Error) return form === 'string' ? String(value) : value.message;
+  return `a directive check threw a non-error value: ${String(value)}`;
 }
 
-/** Runs GC's own directive I/O; a fault there is GC's refusal (see ownIoRefusal). */
+/** A fault inside one of GC's own directive bookkeeping calls (#485): GC's
+ * refusal, named for the call. It keeps the fault it replaced for the log, as
+ * `fault`, never as `cause`, so supervision never routes the fault's words
+ * ("EDQUOT: disk quota exceeded" reads as a quota wall). */
+export class DirectiveBookkeepingError extends DirectiveCheckpointError {
+  constructor(what: string, readonly fault: unknown) {
+    super(`directive bookkeeping failed: ${what}: ${thrownText(fault)}`);
+  }
+}
+
+/** A refusal passes through as itself; any other fault becomes a DirectiveBookkeepingError. */
+export function ownIoRefusal(what: string, error: unknown): DirectiveCheckpointError {
+  return error instanceof DirectiveCheckpointError ? error : new DirectiveBookkeepingError(what, error);
+}
+
+/** Runs one GC directive bookkeeping call by itself, never together with an
+ * extension hook: a fault there is converted at its source (see ownIoRefusal). */
 export function withOwnIo<T>(what: string, run: () => T): T {
   try { return run(); } catch (error) { throw ownIoRefusal(what, error); }
 }

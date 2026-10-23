@@ -4211,20 +4211,22 @@ it('an in-band error that only quotes a refusal recorded in its turn is not that
   } finally { await f.cleanup(); }
 });
 
-const SQLITE_BUSY = 'ledger read failed: SQLITE_BUSY';
 const EXTENSION_AUTH = '401 Unauthorized: invalid x-api-key';
 
-/** A plain (non-refusal) error in a directive turn, and GC's wrapper around one, are routed as the failures they are (#485). */
-async function assertPlainErrorRouted(where: 'preflight' | 'next-turn' | 'unjournaled' | 'extension-tool-fence') {
+/** An error from code GC does not own (an extension hook, the SDK) in a directive
+ * turn, and GC's wrapper around one, are routed as the failures they are (#485). */
+async function assertForeignErrorRouted(where: 'sdk-next-turn' | 'extension-unjournaled' | 'extension-tool-fence') {
   const checkpoint = await import('../src/runtime/directive-checkpoint.js');
-  let toolsRun = 0;
   const f = await nativeRefusalFixture([
-    { deltas: [], toolCall: { id: 'permitted-effect', name: 'bash', args: { command: 'printf ran > plain-error.txt' } } },
+    { deltas: [], toolCall: { id: 'permitted-effect', name: 'bash', args: { command: 'printf ran > foreign-error.txt' } } },
     { deltas: ['directive reply that must never be requested'] },
   ], (session) => {
-    const after = session.agent.afterToolCall;
-    session.agent.afterToolCall = async (input, signal) => { const result = await after?.(input, signal); toolsRun += 1; return result; };
-    if (where !== 'extension-tool-fence') return;
+    if (where === 'sdk-next-turn') {
+      // The SDK's own next-turn preparation fails after the tool ran.
+      vi.spyOn(session as unknown as { _compactBeforeNextAssistantResponse(context: unknown): Promise<unknown> }, '_compactBeforeNextAssistantResponse')
+        .mockRejectedValueOnce(new Error('SDK next-turn preparation failed'));
+      return;
+    }
     // A third-party Pi extension's tool_call handler throws inside the native fence.
     const runner = (session as unknown as { readonly _extensionRunner: { hasHandlers(type: string): boolean; emitToolCall(event: unknown): Promise<unknown> } })._extensionRunner;
     const handles = runner.hasHandlers.bind(runner);
@@ -4232,70 +4234,110 @@ async function assertPlainErrorRouted(where: 'preflight' | 'next-turn' | 'unjour
     vi.spyOn(runner, 'emitToolCall').mockRejectedValue(new Error(EXTENSION_AUTH));
   });
   const { handle } = f;
-  const receipt = vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal');
-  if (where === 'unjournaled') receipt.mockImplementation(() => { throw new Error('authority refusal journal unavailable'); });
-  const { options } = startLedgerDirective(f);
-  let checks = 0;
-  const directive = { ...options.directive, beforeAdmission: () => {
-    checks += 1;
-    if ((where === 'preflight' && checks === 2) || ((where === 'next-turn' || where === 'unjournaled') && toolsRun === 1)) throw new Error(SQLITE_BUSY);
-    options.directive.beforeAdmission();
-  } };
-  try {
-    const turn = handle.promptWithVerdict!('original accepted synthetic directive', { ...options, directive });
-    if (where === 'preflight') await expect(turn).rejects.toThrow(SQLITE_BUSY);
-    else expect(await turn).toMatchObject({ ok: false });
-    for (let i = 0; i < 16; i += 1) await Promise.resolve();
-    const routed = { fatal: false, ...(where === 'preflight' ? {} : { provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID }) };
-    expect(f.errors()).toEqual([{ type: 'error', ...routed, error: {
-      preflight: `Error: ${SQLITE_BUSY}`,
-      'next-turn': SQLITE_BUSY,
-      unjournaled: 'native guard refusal could not be durably recorded; physical ownership retained',
-      // GC's wrapper names its plain cause: still the extension's failure, never a refusal.
-      'extension-tool-fence': `native directive admission/guard failed; further tool effects refused: Error: ${EXTENSION_AUTH}`,
-    }[where] }]);
-    expect(f.retained()).toEqual([]);
-    if (where === 'extension-tool-fence') {
-      expect(existsSync(join(f.scene.lane.path, 'plain-error.txt'))).toBe(false);
-      await waitFor(() => handle.health().state === 'disposed', 'the authentication-wall stop');
-      expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
-    } else {
-      expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
-    }
-  } finally { receipt.mockRestore(); await f.cleanup(); }
-}
-it('a plain error at Pi\'s preflight rejects the prompt untagged (#485)', () => assertPlainErrorRouted('preflight'));
-it('a plain error at the next-turn fence stays untagged with its provider identity (#485)', () => assertPlainErrorRouted('next-turn'));
-it('a plain error whose receipt cannot be journaled stays untagged as its AggregateError (#485)', () => assertPlainErrorRouted('unjournaled'));
-it('a Pi extension\'s 401 at a tool fence, wrapped by GC at the next fence, stays untagged and stops as authentication_wall (#485)', () => assertPlainErrorRouted('extension-tool-fence'));
-
-it('GC\'s own admission receipt I/O fault (EDQUOT) is a tagged refusal at every later fence, never a quota wall (#485)', async () => {
-  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
-  const f = await nativeRefusalFixture([
-    { deltas: [], toolCall: { id: 'unadmitted-effect', name: 'bash', args: { command: 'printf forbidden > receipt-fault.txt' } } },
-    { deltas: ['directive reply that must never be requested'] },
-  ]);
-  const { handle } = f;
-  const fault = vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(() => {
-    throw Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
-  });
+  const journals = where === 'extension-unjournaled'
+    ? [vi.spyOn(checkpoint, 'recordDirectiveToolRefusal'), vi.spyOn(checkpoint, 'recordDirectiveAuthorityRefusal')]
+      .map((journal) => journal.mockImplementation(() => { throw new Error('refusal journal unavailable'); }))
+    : [];
   try {
     const { options } = startLedgerDirective(f);
     expect(await handle.promptWithVerdict!('original accepted synthetic directive', options)).toMatchObject({ ok: false });
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
-    expect(fault).toHaveBeenCalledTimes(1);
-    expect(existsSync(join(f.scene.lane.path, 'receipt-fault.txt'))).toBe(false);
-    const error = 'native directive admission/guard failed; further tool effects refused: DirectiveCheckpointError: directive receipt I/O failed: EDQUOT: disk quota exceeded, write';
-    expect(f.errors()).toHaveLength(1);
-    f.expectRetained(f.errors()[0], error);
-    // Its words alone would wall: the tag is what keeps it with directive recovery.
-    const { deterministicFailureClass } = await import('../src/decisions/questions.js');
-    expect(deterministicFailureClass(error)).toBe('quota_wall');
-  } finally { fault.mockRestore(); await f.cleanup(); }
-});
+    expect(f.errors()).toEqual([{ type: 'error', fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID, error: {
+      'sdk-next-turn': 'SDK next-turn preparation failed',
+      // Its receipt journal failed too: the AggregateError replacing a foreign error is no refusal either.
+      'extension-unjournaled': 'native guard refusal could not be durably recorded; physical ownership retained',
+      // GC's wrapper names its foreign cause: still the extension's failure, never a refusal.
+      'extension-tool-fence': `native directive admission/guard failed; further tool effects refused: Error: ${EXTENSION_AUTH}`,
+    }[where] }]);
+    expect(f.retained()).toEqual([]);
+    expect(existsSync(join(f.scene.lane.path, 'foreign-error.txt'))).toBe(where === 'sdk-next-turn');
+    if (where === 'extension-tool-fence') {
+      // The extension's 401 is classified by its own words: an authentication wall.
+      await waitFor(() => handle.health().state === 'disposed', 'the authentication-wall stop');
+      expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    } else {
+      // Routed, and classified by words that name no wall.
+      expect(f.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    }
+  } finally { for (const journal of journals) journal.mockRestore(); await f.cleanup(); }
+}
+it('the SDK\'s own next-turn failure in a directive turn stays untagged with its provider identity (#485)', () => assertForeignErrorRouted('sdk-next-turn'));
+it('a Pi extension\'s error whose refusal receipts cannot be journaled stays untagged as its AggregateError (#485)', () => assertForeignErrorRouted('extension-unjournaled'));
+it('a Pi extension\'s 401 at a tool fence, wrapped by GC at the next fence, stays untagged and stops as authentication_wall (#485)', () => assertForeignErrorRouted('extension-tool-fence'));
 
-/** A fence that throws a bare null or undefined still fails the directive closed (#485, on main too). */
-async function assertNullishFenceFailure(thrown: null | undefined) {
+type PiBookkeepingCall = 'authority check at preflight' | 'binding read at preflight' | 'authority check' | 'tool intent journal' | 'binding read'
+  | 'admission receipt' | 'admission publication' | 'checkpoint read' | 'completion receipt';
+
+/** An EDQUOT inside one GC bookkeeping call is one tagged refusal and no quota-wall stop (#485). */
+async function assertPiBookkeepingFault(site: PiBookkeepingCall) {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  const { deterministicFailureClass } = await import('../src/decisions/questions.js');
+  const completion = site === 'checkpoint read' || site === 'completion receipt';
+  const f = await nativeRefusalFixture(completion ? [{ deltas: ['done'] }] : [
+    { deltas: [], toolCall: { id: 'refused-effect', name: 'bash', args: { command: 'printf forbidden > bookkeeping-fault.txt' } } },
+    { deltas: ['directive reply that must never be requested'] },
+  ]);
+  const { handle } = f;
+  const quota = Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
+  const raise = (): never => { throw quota; };
+  const call = site.replace(/ at preflight$/u, '');
+  // The preflight reads the binding first; the tool fence reads it next.
+  const readBinding = checkpoint.readDirectiveBinding;
+  let reads = 0;
+  const fault = site === 'binding read at preflight' || site === 'binding read'
+    ? vi.spyOn(checkpoint, 'readDirectiveBinding').mockImplementation((...args) => (++reads === (site === 'binding read' ? 2 : 1) ? raise() : readBinding(...args)))
+    : site === 'tool intent journal' ? vi.spyOn(checkpoint, 'flushDirectiveToolIntent').mockImplementationOnce(raise)
+      : site === 'admission receipt' ? vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(raise)
+        : site === 'checkpoint read' ? vi.spyOn(checkpoint, 'inspectDirectiveCheckpoint').mockImplementationOnce(raise)
+          : site === 'completion receipt' ? vi.spyOn(checkpoint, 'recordDirectiveCompletion').mockImplementationOnce(raise) : null;
+  let checks = 0;
+  try {
+    const { options } = startLedgerDirective(f);
+    const directive: NonNullable<PromptOptions['directive']> = { ...options.directive,
+      // Check 1 is the turn's own, 2 Pi's preflight, 3 the tool fence.
+      beforeAdmission: () => { checks += 1; if ((site === 'authority check at preflight' && checks === 2) || (site === 'authority check' && checks === 3)) raise(); options.directive.beforeAdmission(); },
+      onAdmitted: (binding) => { if (site === 'admission publication') raise(); options.directive.onAdmitted(binding); } };
+    const refusal = `DirectiveCheckpointError: directive bookkeeping failed: ${call}: EDQUOT: disk quota exceeded, write`;
+    const turn = handle.promptWithVerdict!('original accepted synthetic directive', { ...options, directive });
+    if (site.endsWith('at preflight')) {
+      await expect(turn, site).rejects.toThrow(refusal.replace('DirectiveCheckpointError: ', ''));
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+      expect(f.errors(), site).toHaveLength(1);
+      f.expectRetained(f.errors()[0], refusal);
+    } else if (completion) {
+      // The reply settled the turn: no fence follows, and the verdict carries the refusal.
+      expect(await turn, site).toEqual({ ok: false, error: refusal });
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+      expect(f.errors(), site).toEqual([]);
+      expect(f.supervisor.viewFor(handle.id), site).toMatchObject({ state: 'watching', breakerOpen: false });
+    } else {
+      expect(await turn, site).toMatchObject({ ok: false });
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+      expect(existsSync(join(f.scene.lane.path, 'bookkeeping-fault.txt')), site).toBe(false);
+      const error = `native directive admission/guard failed; further tool effects refused: ${refusal}`;
+      expect(f.errors(), site).toHaveLength(1);
+      f.expectRetained(f.errors()[0], error);
+      // Its words alone would wall: the tag is what keeps it with directive recovery.
+      expect(deterministicFailureClass(error), site).toBe('quota_wall');
+    }
+    if (fault !== null) expect(fault, site).toHaveBeenCalled();
+  } finally { fault?.mockRestore(); await f.cleanup(); }
+}
+it('an EDQUOT in the ledger\'s authority check at Pi\'s preflight is one tagged refusal (#485)', () => assertPiBookkeepingFault('authority check at preflight'));
+it('an EDQUOT in the binding read at Pi\'s preflight is one tagged refusal (#485)', () => assertPiBookkeepingFault('binding read at preflight'));
+it('an EDQUOT in the ledger\'s authority check at the tool fence is a tagged refusal at the next fence, never a quota wall (#485)', () => assertPiBookkeepingFault('authority check'));
+it('an EDQUOT in the tool intent journal is a tagged refusal at the next fence, never a quota wall (#485)', () => assertPiBookkeepingFault('tool intent journal'));
+it('an EDQUOT in the tool fence\'s binding read is a tagged refusal at the next fence, never a quota wall (#485)', () => assertPiBookkeepingFault('binding read'));
+it('an EDQUOT in the admission readback is a tagged refusal at the next fence, never a quota wall (#485)', () => assertPiBookkeepingFault('admission receipt'));
+it('an EDQUOT in the ledger\'s admission publication is a tagged refusal at the next fence, never a quota wall (#485)', () => assertPiBookkeepingFault('admission publication'));
+it('an EDQUOT in the completion\'s checkpoint read refuses the verdict and routes nothing (#485)', () => assertPiBookkeepingFault('checkpoint read'));
+it('an EDQUOT in the completion receipt refuses the verdict and routes nothing (#485)', () => assertPiBookkeepingFault('completion receipt'));
+
+/** A bare null or undefined thrown in a directive turn still fails it closed (#485, on
+ * main too). Thrown outside GC's bookkeeping calls (the tool fence's authority
+ * manifest) it is no refusal; thrown by GC's own ledger publication it is converted
+ * where it happens, and is one. */
+async function assertNullishFailure(site: 'fence' | 'admission publication', thrown: null | undefined) {
   const f = await nativeRefusalFixture([
     { deltas: [], toolCalls: [
       { id: 'refused-first', name: 'bash', args: { command: 'printf first > nullish-fence.txt' } },
@@ -4304,25 +4346,37 @@ async function assertNullishFenceFailure(thrown: null | undefined) {
     { deltas: ['directive reply that must never be requested'] },
   ]);
   const { handle } = f;
-  let checks = 0;
+  const nothing = (): never => { const value: unknown = thrown; throw value; };
+  if (site === 'fence') {
+    // Reads 1 and 2 admit the turn (its own binding, Pi's preflight); 3 is the first tool's fence.
+    const manifest = (handle as unknown as { directiveAuthorityManifest?: () => string }).directiveAuthorityManifest;
+    let reads = 0;
+    (handle as unknown as { directiveAuthorityManifest: () => string | undefined }).directiveAuthorityManifest = () => (++reads === 3 ? nothing() : manifest?.());
+  }
   try {
-    // Checks 1 and 2 admit the turn (its own check, Pi's preflight); 3 is the first tool's fence.
-    expect(await handle.promptWithVerdict!('nullish fence directive', { directive: { identity: { requestId: `nullish-${String(thrown)}`, payloadHash: 'a'.repeat(64),
-      contractSha256: 'c'.repeat(64), jobId: 'nullish-job', workRevision: 0, authorityEpoch: 0 }, beforeAdmission: () => {
-      if (++checks === 3) { const nothing: unknown = thrown; throw nothing; }
-    }, onAdmitted: () => {} } })).toMatchObject({ ok: false });
+    expect(await handle.promptWithVerdict!('nullish directive', { directive: { identity: { requestId: `nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`, payloadHash: 'a'.repeat(64),
+      contractSha256: 'c'.repeat(64), jobId: 'nullish-job', workRevision: 0, authorityEpoch: 0 }, beforeAdmission: () => {},
+      onAdmitted: () => { if (site === 'admission publication') nothing(); } } })).toMatchObject({ ok: false });
     for (let i = 0; i < 16; i += 1) await Promise.resolve();
-    // Neither tool ran: the first was refused, and the failure refuses every later effect.
+    // Neither tool ran: the failure refuses every later effect.
     expect(existsSync(join(f.scene.lane.path, 'nullish-fence.txt'))).toBe(false);
     expect(f.fx.script.calls).toHaveLength(1);
-    // GC's wrapper names a cause that is no refusal: untagged, with its provider identity.
-    expect(f.errors()).toEqual([{ type: 'error', error: `native directive admission/guard failed; further tool effects refused: ${String(thrown)}`,
-      fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID }]);
-    expect(f.retained()).toEqual([]);
+    const named = `a directive check threw a non-error value: ${String(thrown)}`;
+    if (site === 'fence') {
+      // GC's wrapper names a cause that is no refusal: untagged, with its provider identity.
+      expect(f.errors()).toEqual([{ type: 'error', error: `native directive admission/guard failed; further tool effects refused: ${named}`,
+        fatal: false, provider: STUB_PROVIDER_ID, model: STUB_MODEL_ID }]);
+      expect(f.retained()).toEqual([]);
+    } else {
+      expect(f.errors()).toHaveLength(1);
+      f.expectRetained(f.errors()[0], `native directive admission/guard failed; further tool effects refused: DirectiveCheckpointError: directive bookkeeping failed: admission publication: ${named}`);
+    }
   } finally { await f.cleanup(); }
 }
-it('a fence that throws null refuses every later effect, and its wrapper is untagged (#485)', () => assertNullishFenceFailure(null));
-it('a fence that throws undefined refuses every later effect, and its wrapper is untagged (#485)', () => assertNullishFenceFailure(undefined));
+it('a null thrown at a tool fence outside GC\'s bookkeeping refuses every later effect, and its wrapper is untagged (#485)', () => assertNullishFailure('fence', null));
+it('an undefined thrown at a tool fence outside GC\'s bookkeeping refuses every later effect, and its wrapper is untagged (#485)', () => assertNullishFailure('fence', undefined));
+it('a null thrown by the ledger\'s admission publication is a tagged refusal that refuses every later effect (#485)', () => assertNullishFailure('admission publication', null));
+it('an undefined thrown by the ledger\'s admission publication is a tagged refusal that refuses every later effect (#485)', () => assertNullishFailure('admission publication', undefined));
 
 it('a provider authentication rejection in a directive turn is never tagged and still stops as authentication_wall (#485)', async () => {
   const f = await nativeRefusalFixture([{ deltas: ['directive reply that must never be requested'] }], (session) => {

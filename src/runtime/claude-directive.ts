@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { privateClaudeAskSettings } from './claude-verification-settings.js';
+import { thrownText } from './directive-checkpoint.js';
 import type { StreamFrame } from './stream-json.js';
 import { isVerificationProducer, workerVerificationRefusal, type WorkerVerificationPolicy } from './worker-verification-policy.js';
 
@@ -61,12 +62,14 @@ export class ClaudeDirectivePermissionChannel {
   constructor(
     private readonly child: ChildProcess,
     private readonly deps: {
-      /** Ends the turn; `refusal` is the refusal this failure reports, when it
-       * reports one. */
-      readonly fail: (message: string, refusal?: unknown) => void;
+      /** Ends the turn. `refused` is what `refused()` returned when this
+       * failure follows the channel's own deny; the host reports the turn's
+       * failure from it (the deny, or an earlier failure still owed). */
+      readonly fail: (message: string, refused?: unknown) => void;
       /** A tool request this channel denied itself (malformed or foreign, or a
        * fence that failed), once the deny is handed to the CLI's stdin: the
-       * host keeps a durable refusal of it and returns it. */
+       * host keeps a durable refusal of it, and returns an opaque report the
+       * channel hands back to `fail()`. */
       readonly refused: (toolUseId: string | undefined, reason: string) => unknown;
       /** Called once per tool request, after the request frame is durable. */
       readonly decide: (request: ClaudeToolRequest, durable: Promise<void>) => Promise<ClaudeToolDecision>;
@@ -111,12 +114,12 @@ export class ClaudeDirectivePermissionChannel {
       input !== null && typeof input === 'object' && !Array.isArray(input);
     if (!valid) {
       // Only a deny handed to the CLI's stdin is a refusal.
-      let refusal: unknown;
+      let report: unknown;
       if (typeof id === 'string' && id !== '' && !this.closed &&
           this.respond(id, { behavior: 'deny', message: 'Malformed or foreign directive permission request' })) {
-        refusal = this.deps.refused(undefined, 'malformed or foreign directive permission request');
+        report = this.deps.refused(undefined, 'malformed or foreign directive permission request');
       }
-      this.deps.fail('malformed or foreign directive permission request', refusal);
+      this.deps.fail('malformed or foreign directive permission request', report);
       return;
     }
     this.requests.add(id as string);
@@ -131,12 +134,12 @@ export class ClaudeDirectivePermissionChannel {
     this.deps.decide(tool, durable).then(
       (decision) => this.respond(id as string, decision.allow ? { behavior: 'allow', updatedInput: tool.input } : { behavior: 'deny', message: decision.message }),
       (error: unknown) => {
-        const reason = `directive tool fence failed: ${error instanceof Error ? error.message : String(error)}`;
-        let refusal: unknown;
+        const reason = `directive tool fence failed: ${thrownText(error)}`;
+        let report: unknown;
         if (!this.closed && this.respond(id as string, { behavior: 'deny', message: 'The directive tool fence failed' })) {
-          refusal = this.deps.refused(tool.toolUseId, reason);
+          report = this.deps.refused(tool.toolUseId, reason);
         }
-        this.deps.fail(reason, refusal);
+        this.deps.fail(reason, report);
       },
     );
   }

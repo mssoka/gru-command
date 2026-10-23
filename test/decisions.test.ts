@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DirectiveBookkeepingError, DirectiveCheckpointError, thrownText } from '../src/runtime/directive-checkpoint.js';
 import {
   DEFAULT_DECISIONS_CONFIG,
   effectiveDecisionProviders,
@@ -248,6 +249,9 @@ describe('typed decision semantics', () => {
       'invalid api key',
       'authorization header rejected',
       'auth-failure from upstream',
+      'auth_failure from upstream',
+      // Claude Code 2.1.309's failed login: no HTTP status, only its typed code.
+      'Not logged in · Please run /login (authentication_failed)',
     ]) expect(deterministicFailureClass(text), text).toBe('authentication_wall');
     expect(deterministicFailureClass('DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed')).toBe('unknown');
     // The old wording walled on its own: untagged text never protected a refusal; the tag does.
@@ -256,17 +260,23 @@ describe('typed decision semantics', () => {
 
   // Scanned below: every literal message of `new DirectiveCheckpointError(…)` and
   // `new DirectiveRuntimeUnsupportedError(…)` (a `+`-joined chain of literals
-  // counts), the literal reasons of the local refuse()/refused() helpers in
-  // directive-checkpoint.ts and ledger/api.ts, the Claude permission channel's
-  // refusal and failure texts (claude-directive.ts), and the I/O names given to
-  // withOwnIo()/ownIoRefusal(). Not visible to it, checked by hand in #485 (the
-  // texts arrive in variables): directive-progress.ts's result.note, lockBlocker,
+  // counts); in directive-checkpoint.ts the literal reasons of its local
+  // refuse()/refused() helpers, refuse's default reason and every unknown('…')
+  // reason (Claude's checkpoint refusal text quotes them); ledger/api.ts's
+  // refuse() reasons; the Claude permission channel's refusal and failure texts
+  // (claude-directive.ts); the call names given to withOwnIo()/ownIoRefusal();
+  // and the texts the refusal classes write themselves. Not visible to it,
+  // checked by hand in #485 (none names a wall): the texts that arrive in
+  // variables — directive-progress.ts's result.note, lockBlocker,
   // proof.reason/proof.error and verdict.error (directive recovery only;
-  // verdict.error can carry a provider's own text); directive-checkpoint.ts's
-  // oversized, at, refusal and retry (fed by literals scanned here); the Claude
-  // channel's `new DirectiveCheckpointError(reason)` (its reasons are scanned
-  // here); and ownIoRefusal's fault text after GC's prefix, which is the
-  // disk's or the OS's words and is guarded by the tag, not by its text.
+  // verdict.error can carry a provider's own text), directive-checkpoint.ts's
+  // oversized, at, refusal and retry (fed by literals scanned here), and the
+  // Claude channel's `new DirectiveCheckpointError(reason)` (its reasons are
+  // scanned here); ledger/api.ts:9395's ternary of two literals ("request is …,
+  // not retired — …", "terminal work cannot be revived by recovery"); the
+  // "current gate duty " prefix ledger/api.ts's refuse() puts before its
+  // reasons; and a bookkeeping refusal's fault text after GC's prefix, which is
+  // the disk's or the OS's words and is guarded by the tag, not by its text.
   it('no refusal text GC writes is blank or names a wall (#485)', () => {
     const tick = '`';
     const literal = String.raw`'(?:[^'\\]|\\.)*'|${tick}(?:[^${tick}\\]|\\.)*${tick}`;
@@ -274,6 +284,7 @@ describe('typed decision semantics', () => {
     const scans: readonly (readonly [RegExp, (file: string) => boolean])[] = [
       [new RegExp(String.raw`new Directive(?:CheckpointError|RuntimeUnsupportedError)\(\s*(${chain})`, 'gu'), () => true],
       [new RegExp(String.raw`\brefused?\(\s*(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts') || file.endsWith(join('ledger', 'api.ts'))],
+      [new RegExp(String.raw`\b(?:unknown\(\s*|reason = )(${chain})`, 'gu'), (file) => file.endsWith('directive-checkpoint.ts')],
       [new RegExp(String.raw`\bdeps\.(?:refused\([^,()]*,|fail\()\s*(${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
       [new RegExp(String.raw`\bconst reason = (${chain})`, 'gu'), (file) => file.endsWith('claude-directive.ts')],
       [new RegExp(String.raw`\b(?:withOwnIo|ownIoRefusal)\(\s*(${chain})`, 'gu'), () => true],
@@ -291,7 +302,9 @@ describe('typed decision semantics', () => {
         }
       }
     }
-    expect(texts.length).toBeGreaterThan(280);
+    // The refusal classes' own texts.
+    texts.push(new DirectiveCheckpointError(' ').message, new DirectiveBookkeepingError('x', new Error('x')).message, thrownText(null));
+    expect(texts.length).toBeGreaterThan(300);
     expect(texts.filter((text) => text.trim() === '')).toEqual([]);
     expect(texts.filter((text) => !['unknown', 'fatal_runtime'].includes(deterministicFailureClass(text)))).toEqual([]);
   });

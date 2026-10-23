@@ -102,6 +102,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_REPLAY',
   'CLAUDE_DOUBLE_API_ERROR_HOLD',
   'CLAUDE_DOUBLE_TERM_RESULT',
+  'CLAUDE_DOUBLE_REPLAY_AFTER_TOOL',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -2601,7 +2602,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
-    it('marks only a typed local directive authority refusal as native-control provenance, never a message lookalike', async () => {
+    it('a tool-fence refusal is tagged whether GC\'s authority check refuses or faults (#485)', async () => {
       const message = 'directive authority is terminal, held or superseded — no work may proceed';
       for (const typed of [true, false]) {
         const fx = fixture();
@@ -2614,10 +2615,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           await expect(handle.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor(`claude-local-control-${String(typed)}`),
             beforeAdmission: () => { if (++checks > 1) throw refusal; }, onAdmitted: () => {} } }))
             .rejects.toThrow(/directive refused/u);
-          const runtimeError = events.find((event) => event.type === 'error');
-          expect(runtimeError?.type === 'error' ? runtimeError.error : '').toContain(message);
-          if (typed) expect(runtimeError).toMatchObject({ type: 'error', nativeControl: 'directive-refusal' });
-          else expect(runtimeError).not.toHaveProperty('nativeControl');
+          // The authority check is GC's own ledger call: its fault is a refusal too, named for the call.
+          expect(events.filter((event) => event.type === 'error'), String(typed)).toEqual([{ type: 'error',
+            error: `directive refused: ${typed ? '' : 'directive bookkeeping failed: authority check: '}${message}`, fatal: false, nativeControl: 'directive-refusal' }]);
           expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
         } finally { await handle.dispose(); }
       }
@@ -2663,8 +2663,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       } finally { await handle.dispose(); }
     };
     const beforeEchoRefusal = { type: 'error', error: expect.stringMatching(/^directive refused: the Claude CLI began answering without echoing/u), fatal: false, nativeControl: 'directive-refusal' };
-    const usageWall = { type: 'error', error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)", fatal: false, provider: 'anthropic-claude-native',
-      model: 'claude-opus-5-5', typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } };
+    const native = { provider: 'anthropic-claude-native', model: 'claude-opus-5-5' };
+    const usageWall = { type: 'error', error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)", fatal: false, ...native,
+      typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } };
 
     it('after a refusal, a typed wall in the CLI\'s result is emitted untagged, as an ordinary turn would emit it (#485)', async () => {
       // The usage-limit wall arrives in the result before the abort lands.
@@ -2672,13 +2673,49 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(errors).toEqual([beforeEchoRefusal, usageWall]);
     });
 
-    it('after a refusal, a failed login (an API error with no HTTP status) is emitted untagged, so its text reaches the classifier (#485)', async () => {
+    it('after a refusal, Claude Code 2.1.309\'s failed login (an API error with no HTTP status) is emitted untagged and classifies as authentication_wall (#485)', async () => {
       const { errors, file } = await answeredBeforeEcho('auth-error now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
-      const login = { type: 'error', error: 'Invalid API key · Please run /login (authentication_failed)', fatal: false, provider: 'anthropic-claude-native',
-        model: 'claude-opus-5-5', typed: { origin: 'provider-message', bodyCode: 'authentication_failed' } };
+      const login = { type: 'error', error: 'Not logged in · Please run /login (authentication_failed)', fatal: false, ...native,
+        typed: { origin: 'provider-message', bodyCode: 'authentication_failed' } };
       expect(errors).toEqual([beforeEchoRefusal, login]);
       expect(deterministicFailureClass(login.error)).toBe('authentication_wall');
       expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'assistant', is_api_error_message: true, error: 'authentication_failed' }));
+    });
+
+    it('after a refusal, a text-only API error is emitted untagged, untyped (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('textonly-api-fault now', {});
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'Something went wrong talking to the API', fatal: false }]);
+    });
+
+    it('after a refusal, Claude Code 2.1.309\'s textless API error is emitted by its result\'s status, with a named text (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('textless-api-fault now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'the CLI reported an API error (HTTP 529)', fatal: false, ...native,
+        typed: { origin: 'provider-message', status: 529 } }]);
+    });
+
+    it('after a refusal, a result that alone carries an API status is emitted (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('status-only-result now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'API Error: 500 Internal server error (HTTP 500)', fatal: false, ...native,
+        typed: { origin: 'provider-message', status: 500 } }]);
+    });
+
+    it('after a refusal, a blank API-error frame with no result status emits nothing more (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('blank-api-frame now', {});
+      expect(errors).toEqual([beforeEchoRefusal]);
+      expect(frames(file)).toContainEqual(expect.objectContaining({ is_api_error_message: true }));
+    });
+
+    it('the refused and the ordinary path word the CLI\'s API error the same, when its result and its API-error frame differ (#485)', async () => {
+      const wall = { type: 'error', error: 'the result words (HTTP 429, rate_limit)', fatal: false, ...native, typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } };
+      const { errors } = await answeredBeforeEcho('divergent-api-fault now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, wall]);
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { model: 'claude-opus-5-5' });
+      const events = collect(handle);
+      try {
+        await handle.prompt('divergent-api-fault now');
+        expect(events.filter((event) => event.type === 'error')).toEqual([wall]);
+      } finally { await handle.dispose(); }
     });
 
     it('after a refusal, a subagent\'s API error is the subagent\'s: no wall is emitted (#485)', async () => {
@@ -2695,26 +2732,28 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'result', subtype: 'error_during_execution', is_error: true }));
     });
 
-    it('after a refusal, an API error with a failure code but no text is emitted with a named text, never an empty one (#485)', async () => {
-      const { errors } = await answeredBeforeEcho('textless-api-fault now', {});
-      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'the CLI reported an API error (overloaded)', fatal: false,
-        provider: 'anthropic-claude-native', model: 'claude-opus-5-5', typed: { origin: 'provider-message', bodyCode: 'overloaded' } }]);
-    });
-
-    it('the translator keeps only a main-thread API error, and drops it once the main thread replies again (#485)', () => {
+    it('the translator keeps only a main-thread API error, until a real main-thread call goes past it (#485)', () => {
       const apiErrorFrame = (parent: string | null): StreamFrame => ({ type: 'assistant', parent_tool_use_id: parent, is_api_error_message: true, error: 'rate_limit', api_error_status: 429,
         message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your limit" }] } });
+      const reply = (parent: string | null, model: string, tokens: number): StreamFrame => ({ type: 'assistant', parent_tool_use_id: parent,
+        message: { role: 'assistant', model, usage: { input_tokens: tokens, output_tokens: 0 }, content: [{ type: 'text', text: 'words' }] } });
       const subagent = new ClaudeTurnTranslator();
-      subagent.ingest(apiErrorFrame('toolu_subagent'));
+      expect(subagent.ingest(apiErrorFrame('toolu_subagent'))).toEqual([]);
       expect(subagent.apiError).toBeNull();
       const main = new ClaudeTurnTranslator();
-      main.ingest(apiErrorFrame(null));
+      expect(main.ingest(apiErrorFrame(null))).toEqual([]);
       expect(main.apiError).toEqual({ text: "You've hit your limit", code: 'rate_limit', status: 429 });
-      // A subagent's reply leaves the main thread's failure standing; the main thread's own reply ends it.
-      main.ingest({ type: 'assistant', parent_tool_use_id: 'toolu_subagent', message: { role: 'assistant', content: [{ type: 'text', text: 'subagent words' }] } });
+      // A subagent's reply, and the CLI's own <synthetic> zero-usage reply, leave it standing.
+      main.ingest(reply('toolu_subagent', 'claude-opus-5-5', 12));
+      main.ingest(reply(null, '<synthetic>', 0));
       expect(main.apiError).not.toBeNull();
-      main.ingest({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [{ type: 'text', text: 'retried past it' }] } });
+      // A real main-thread call goes past it.
+      main.ingest(reply(null, 'claude-opus-5-5', 12));
       expect(main.apiError).toBeNull();
+      // Claude Code 2.1.309 writes "(no content)" for a textless API error: no text.
+      const textless = new ClaudeTurnTranslator();
+      textless.ingest({ type: 'assistant', parent_tool_use_id: null, is_api_error_message: true, message: { role: 'assistant', content: [{ type: 'text', text: '(no content)' }] } });
+      expect(textless.apiError).toEqual({ text: '', code: null, status: null });
     });
 
     it('after a refusal, an API error whose result the abort cut off is still emitted as the wall it reported (#485)', async () => {
@@ -2768,14 +2807,12 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       } finally { await handle.dispose(); }
     });
 
-    it('a gating frame the transcript cannot write is GC\'s refusal, never the disk\'s quota wall (#485)', async () => {
-      const fx = fixture();
-      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
-      const events = collect(handle);
-      let broken = false;
-      // No adapter seam fails a transcript write: the stream comes straight from
-      // node:fs createWriteStream, which an ESM import cannot spy on. This fails
-      // one chunk of this handle's own stream instead.
+    /** Fails one chunk of this handle's own transcript stream. No adapter seam
+     * fails a transcript write: the stream comes straight from node:fs
+     * createWriteStream, which only a file-wide vi.mock('node:fs') could
+     * replace, and that would reach every test in this file. */
+    const failTranscriptChunk = (handle: AgentHandle, matches: (chunk: string) => boolean, fault: string) => {
+      const state = { broken: false };
       handle.subscribe((event) => {
         if (event.type !== 'turn_start') return;
         type Chunk = { toString(): string };
@@ -2783,19 +2820,27 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         const write = stream._write.bind(stream);
         stream._writev = null;
         stream._write = (chunk, encoding, callback) => {
-          // The echo gates admission: it is written and synced before it is read back.
-          if (!broken && chunk.toString().includes('"isReplay":true')) { broken = true; callback(new Error('EDQUOT: disk quota exceeded')); return; }
+          if (!state.broken && matches(chunk.toString())) { state.broken = true; callback(new Error(fault)); return; }
           write(chunk, encoding, callback);
         };
       });
+      return state;
+    };
+
+    it('a gating frame the transcript cannot write is GC\'s refusal, never the disk\'s quota wall (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      // The echo gates admission: it is written and synced before it is read back.
+      const lost = failTranscriptChunk(handle, (chunk) => chunk.includes('"isReplay":true'), 'EDQUOT: disk quota exceeded');
+      const error = 'directive refused: directive bookkeeping failed: transcript write: EDQUOT: disk quota exceeded';
       try {
         await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-edquot'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
-          .rejects.toThrow(/^directive refused: directive transcript write failed: EDQUOT: disk quota exceeded$/u);
-        expect(broken).toBe(true);
-        const errors = events.filter((event) => event.type === 'error');
-        expect(errors).toEqual([{ type: 'error', error: 'directive refused: directive transcript write failed: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' }]);
+          .rejects.toThrow(error);
+        expect(lost.broken).toBe(true);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
         // Its words alone would wall: the tag is what keeps it with directive recovery.
-        expect(deterministicFailureClass(errors[0]!.type === 'error' ? errors[0]!.error : '')).toBe('quota_wall');
+        expect(deterministicFailureClass(error)).toBe('quota_wall');
       } finally { await handle.dispose(); }
     });
 
@@ -2807,58 +2852,114 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       handle.subscribe((event) => { if (event.type === 'turn_start') rmSync(handle.sessionFile!); });
       try {
         await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-fsync'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
-          .rejects.toThrow(/^directive refused: directive transcript write failed: ENOENT/u);
+          .rejects.toThrow(/^directive refused: directive bookkeeping failed: transcript write: ENOENT/u);
         expect(events.filter((event) => event.type === 'error')).toEqual([
-          { type: 'error', error: expect.stringMatching(/^directive refused: directive transcript write failed: ENOENT/u), fatal: false, nativeControl: 'directive-refusal' },
+          { type: 'error', error: expect.stringMatching(/^directive refused: directive bookkeeping failed: transcript write: ENOENT/u), fatal: false, nativeControl: 'directive-refusal' },
         ]);
       } finally { await handle.dispose(); }
     });
 
-    it('GC\'s own receipt I/O faults are tagged refusals, never the disk\'s quota wall: the admission binding and the completion receipt (#485)', async () => {
+    /** An EDQUOT inside one GC bookkeeping call is one tagged refusal, never a quota wall (#485). */
+    async function assertClaudeBookkeepingFault(call: 'admission receipt' | 'admission publication' | 'authority check' | 'binding read' | 'tool intent read' | 'completion receipt' | 'controller receipt') {
       const checkpoint = await import('../src/runtime/directive-checkpoint.js');
-      for (const write of ['admission', 'completion'] as const) {
-        const fx = fixture();
-        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
-        const events = collect(handle);
-        const quota = Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
-        const fault = write === 'admission'
-          ? vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(() => { throw quota; })
-          : vi.spyOn(checkpoint, 'recordDirectiveCompletion').mockImplementationOnce(() => { throw quota; });
-        const error = `${write === 'admission' ? 'directive refused' : 'directive turn refused'}: directive receipt I/O failed: EDQUOT: disk quota exceeded, write`;
-        try {
-          await expect(handle.prompt('answer plainly', { directive: { identity: identityFor(`claude-receipt-edquot-${write}`), beforeAdmission: () => {}, onAdmitted: () => {} } }), write)
-            .rejects.toThrow(error);
-          expect(fault, write).toHaveBeenCalledTimes(1);
-          expect(events.filter((event) => event.type === 'error'), write).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
-          // Its words alone would wall: the tag is what keeps it with directive recovery.
-          expect(deterministicFailureClass(error), write).toBe('quota_wall');
-        } finally { fault.mockRestore(); await handle.dispose(); }
-      }
-    });
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      const quota = Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
+      const raise = () => { throw quota; };
+      const fault = call === 'admission receipt' ? vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(raise)
+        : call === 'binding read' ? vi.spyOn(checkpoint, 'readDirectiveBinding').mockImplementationOnce(raise)
+          : call === 'tool intent read' ? vi.spyOn(checkpoint, 'assertClaudeDirectiveToolIntent').mockImplementationOnce(raise)
+            : call === 'completion receipt' ? vi.spyOn(checkpoint, 'recordDirectiveCompletion').mockImplementationOnce(raise)
+              : call === 'controller receipt' ? vi.spyOn(checkpoint, 'recordDirectiveIndependentController').mockImplementationOnce(raise) : null;
+      let checks = 0;
+      const tool = call === 'authority check' || call === 'binding read' || call === 'tool intent read';
+      const error = `${call === 'completion receipt' ? 'directive turn refused' : 'directive refused'}: directive bookkeeping failed: ${call}: EDQUOT: disk quota exceeded, write`;
+      try {
+        await expect(handle.prompt(tool ? 'tool:Read follow it' : 'answer plainly', { directive: { identity: identityFor(`claude-bookkeeping-${call.replace(/\W+/gu, '-')}`),
+          beforeAdmission: () => { if (call === 'authority check' && ++checks > 1) raise(); },
+          onAdmitted: () => { if (call === 'admission publication') raise(); } } }), call).rejects.toThrow(error);
+        if (fault !== null) expect(fault, call).toHaveBeenCalledTimes(1);
+        expect(events.filter((event) => event.type === 'error'), call).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
+        // Its words alone would wall: the tag is what keeps it with directive recovery.
+        expect(deterministicFailureClass(error), call).toBe('quota_wall');
+        expect(fx.logs.some((line) => line.msg === 'claude directive bookkeeping failed; the directive is refused' && String(line.fields?.['fault']).includes('EDQUOT')), call).toBe(true);
+      } finally { fault?.mockRestore(); await handle.dispose(); }
+    }
+    it('an EDQUOT in the admission readback is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('admission receipt'));
+    it('an EDQUOT in the ledger\'s admission publication is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('admission publication'));
+    it('an EDQUOT in the ledger\'s authority check at the tool fence is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('authority check'));
+    it('an EDQUOT in the tool fence\'s binding read is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('binding read'));
+    it('an EDQUOT in the tool fence\'s intent read is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('tool intent read'));
+    it('an EDQUOT in the completion receipt is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('completion receipt'));
+    it('an EDQUOT in the spawn-time controller receipt is one tagged refusal, and no CLI starts (#485)', () => assertClaudeBookkeepingFault('controller receipt'));
 
-    it('a channel deny while an earlier plain fence failure awaits its report leaves that failure the turn\'s, routed (#485)', async () => {
+    /** A plain failure still owed its report (a GC bug outside its bookkeeping
+     * calls) stays the turn's failure, with its own text, whatever fails next (#485). */
+    async function assertOwedFailureKept(next: 'lost write' | 'second prompt' | 'channel deny') {
       const fx = fixture({ killGraceMs: 300 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const events = collect(handle);
-      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
-      // The fence reports its failure on setImmediate; hold that report so the
-      // CLI's repeated ask, and the channel's own deny of it, land first.
+      if (next === 'second prompt') process.env['CLAUDE_DOUBLE_REPLAY_AFTER_TOOL'] = '1';
+      if (next === 'channel deny') process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      if (next === 'lost write') failTranscriptChunk(handle, (chunk) => chunk.includes('"tool_result"'), 'EDQUOT: disk quota exceeded');
+      // The first manifest read prepares the turn; the tool fence's throws.
+      const manifest = (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest.bind(handle);
+      let reads = 0;
+      (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => {
+        if (++reads === 2) throw new TypeError('authority manifest computation failed');
+        return manifest();
+      };
+      // The fence reports its failure on setImmediate; hold that report so the next failure lands first.
       vi.useFakeTimers({ toFake: ['setImmediate'] });
-      let checks = 0;
+      const error = 'directive refused: authority manifest computation failed';
       try {
-        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-deny-after-plain'),
-          beforeAdmission: () => { if (++checks > 1) throw new Error('ledger read failed: SQLITE_BUSY'); }, onAdmitted: () => {} } }))
-          .rejects.toThrow(/^malformed or foreign directive permission request$/u);
-        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'malformed or foreign directive permission request', fatal: false }]);
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor(`claude-owed-${next.replace(/\W+/gu, '-')}`), beforeAdmission: () => {}, onAdmitted: () => {} } }), next)
+          .rejects.toThrow(new Error(error));
+        expect(events.filter((event) => event.type === 'error'), next).toEqual([{ type: 'error', error, fatal: false }]);
         const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8');
-        expect(receipts).toContain('ledger read failed: SQLITE_BUSY');
-        expect(receipts).toContain('"reason":"malformed or foreign directive permission request"');
+        expect(receipts, next).toContain('authority manifest computation failed');
       } finally {
         vi.useRealTimers();
         await handle.dispose();
       }
-    });
+    }
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when a transcript write fails next (#485)', () => assertOwedFailureKept('lost write'));
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when a second prompt arrives next (#485)', () => assertOwedFailureKept('second prompt'));
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when the channel denies a repeated ask next (#485)', () => assertOwedFailureKept('channel deny'));
+
+    /** Two concurrent permission requests: the first fence throws a bare null or
+     * undefined, and the second is still refused, with no tool allowed (#485). */
+    async function assertNullishClaudeFence(site: 'authority check' | 'manifest', thrown: null | undefined) {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      const nothing = (): never => { const value: unknown = thrown; throw value; };
+      let checks = 0;
+      if (site === 'manifest') {
+        // Outside GC's bookkeeping calls: the bare value is no refusal, and still fails the turn closed.
+        const manifest = (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest.bind(handle);
+        let reads = 0;
+        (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => (++reads === 2 ? nothing() : manifest());
+      }
+      const named = `a directive check threw a non-error value: ${String(thrown)}`;
+      const error = `directive refused: ${site === 'manifest' ? named : `directive bookkeeping failed: authority check: ${named}`}`;
+      try {
+        await expect(handle.prompt('tool-pair:Read follow it', { directive: { identity: identityFor(`claude-nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`),
+          beforeAdmission: () => { if (site === 'authority check' && ++checks === 2) nothing(); }, onAdmitted: () => {} } })).rejects.toThrow(new Error(error));
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, ...(site === 'manifest' ? {} : { nativeControl: 'directive-refusal' }) }]);
+        // Both asks were denied: no tool was allowed after the failed fence.
+        const answers = frames(handle.sessionFile!).filter((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior"'));
+        expect(answers).toHaveLength(2);
+        expect(answers.every((frame) => JSON.stringify(frame).includes('"behavior":"deny"'))).toBe(true);
+      } finally { await handle.dispose(); }
+    }
+    it('a GC authority check that throws null at the first of two concurrent fences is a refusal, and both are denied (#485)', () => assertNullishClaudeFence('authority check', null));
+    it('a GC authority check that throws undefined at the first of two concurrent fences is a refusal, and both are denied (#485)', () => assertNullishClaudeFence('authority check', undefined));
+    it('a null thrown outside GC\'s bookkeeping at the first of two concurrent fences fails the turn closed, untagged (#485)', () => assertNullishClaudeFence('manifest', null));
+    it('an undefined thrown outside GC\'s bookkeeping at the first of two concurrent fences fails the turn closed, untagged (#485)', () => assertNullishClaudeFence('manifest', undefined));
 
     it('the supervisor skips a tagged Claude refusal with a durable trace, and with decisions wired still stops on a wall reported after one (#485)', async () => {
       const { LedgerDb } = await import('../src/ledger/db.js');
@@ -2977,7 +3078,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         };
       });
       await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-disk'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
-        .rejects.toThrow(/directive transcript write failed: ENOSPC/u);
+        .rejects.toThrow(/directive bookkeeping failed: transcript write: ENOSPC/u);
       expect(broken).toBe(true);
       await handle.dispose();
     });

@@ -119,6 +119,11 @@ export interface ApiErrorInfo {
   readonly status: number | null;
 }
 
+/** The placeholder text Claude Code writes for an empty message (2.1.309). */
+export const CLAUDE_NO_CONTENT = '(no content)';
+/** The model Claude Code stamps on its own replies, which are no API call. */
+const CLAUDE_SYNTHETIC_MODEL = '<synthetic>';
+
 /** A finite HTTP status, or null. */
 function httpStatus(value: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
@@ -360,9 +365,11 @@ export class ClaudeTurnTranslator {
       // stream as the agent's words. The turn's error event carries it. A
       // subagent's API failure is the subagent's, never the turn's (#485).
       if (!mainThread) return [];
-      const text = content
+      // A textless API error reads "(no content)" (Claude Code 2.1.309): no text.
+      const joined = content
         .map((block) => (typeof block === 'object' && block !== null && typeof (block as StreamFrame)['text'] === 'string' ? (block as StreamFrame)['text'] as string : ''))
         .join('');
+      const text = joined.trim() === CLAUDE_NO_CONTENT ? '' : joined;
       const code = frame['error'];
       this.apiErrorInfo = {
         text,
@@ -371,8 +378,12 @@ export class ClaudeTurnTranslator {
       };
       return [];
     }
-    // A later main-thread reply means the turn went on past that API failure.
-    if (mainThread) this.apiErrorInfo = null;
+    // A later real main-thread call means the turn went on past that API
+    // failure; the CLI's own `<synthetic>` zero-usage reply is no call.
+    if (mainThread) {
+      const call = promptOccupancy(message as StreamFrame);
+      if ((message as StreamFrame)['model'] !== CLAUDE_SYNTHETIC_MODEL || (call !== null && call.tokens > 0)) this.apiErrorInfo = null;
+    }
     // Context occupancy (#461): each content block of one API message repeats
     // that call's usage, so the latest main-thread frame replaces, never adds.
     // Subagent frames (a parent tool call) measure another context, and a

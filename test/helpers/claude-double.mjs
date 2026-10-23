@@ -20,8 +20,13 @@
  *   "auth-error"       — the real CLI's failed-login API-error message
  *                        (error "authentication_failed", no status) + result
  *   "subagent-limit"   — a subagent's usage-limit API-error message, no result
- *   "textless-api-fault" — an API-error message with a code and no text,
- *                        no result
+ *   "textless-api-fault" — the real textless API-error message ("(no
+ *                        content)") + a result with only api_error_status 529
+ *   "blank-api-frame"  — a textless API-error message alone, no result
+ *   "textonly-api-fault" — an API-error message with text only, no result
+ *   "status-only-result" — an answer, then a result with api_error_status 500
+ *   "divergent-api-fault" — API-error message and result with different texts
+ *   "tool-pair:<name>" — two tool uses asked of the host concurrently
  *   "answer-hold"      — an answer, then no result until it is ended
  *   "usage-limit"      — the same shape for a claude.ai usage-limit wall
  *                        (error "rate_limit", api_error_status 429)
@@ -85,6 +90,7 @@
  *   CLAUDE_DOUBLE_PRE_ECHO=1    a request status and a keepalive ping between init and the echo
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
  *   CLAUDE_DOUBLE_API_ERROR_HOLD=1 "usage-limit" sends its API-error frame, then no result: it waits to be ended
+ *   CLAUDE_DOUBLE_REPLAY_AFTER_TOOL=1 a second prompt echoed once the host answers a tool
  *   CLAUDE_DOUBLE_TERM_RESULT=1 on SIGTERM, an abort's error_during_execution result (no text), then exit 143
  *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string|string-false  the tool_use carries
  *                               run_in_background: true, or the string "true" or
@@ -314,6 +320,10 @@ async function askHost(toolName, callId, input) {
     responses.set(requestId, resolve);
     out({ type: 'control_request', request_id: requestId, request: { subtype: 'can_use_tool', tool_name: toolName, tool_use_id: callId, input: asked } });
   });
+  if (process.env.CLAUDE_DOUBLE_REPLAY_AFTER_TOOL === '1') {
+    // A second prompt echoed into the turn once the host answered.
+    out({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'a later prompt' }] }, session_id: sessionId, parent_tool_use_id: null, uuid: randomUUID(), timestamp: new Date().toISOString(), isReplay: true });
+  }
   if (process.env.CLAUDE_DOUBLE_PERMISSION_REPEAT === '1') {
     // A CLI that asks again for a tool use it was already allowed, and acts on the first answer.
     const again = `perm-${randomUUID()}`;
@@ -321,6 +331,27 @@ async function askHost(toolName, callId, input) {
     out({ type: 'control_request', request_id: again, request: { subtype: 'can_use_tool', tool_name: toolName, tool_use_id: callId, input: asked } });
   }
   return decision;
+}
+
+/** Two tool uses in one reply, both asked of the host before either answer
+ * arrives (the CLI's concurrent permission requests). */
+async function emitToolPair(toolName) {
+  const calls = [['toolu_pair_1', { command: 'ls' }], ['toolu_pair_2', { command: 'pwd' }]];
+  out(assistantFrame(calls.map(([id, input]) => ({ type: 'tool_use', id, name: toolName, input }))));
+  const decisions = await Promise.all(calls.map(([id, input]) => askHost(toolName, id, input)));
+  out({
+    type: 'user',
+    uuid: randomUUID(),
+    session_id: sessionId,
+    message: {
+      role: 'user',
+      content: calls.map(([id], index) => {
+        const denied = decisions[index]?.behavior !== 'allow';
+        return { type: 'tool_result', tool_use_id: id, content: denied ? (decisions[index]?.message ?? 'denied') : 'ok', is_error: denied };
+      }),
+    },
+  });
+  await emitTextTurn('tools answered');
 }
 
 async function emitToolTurn(toolName, toolError = false, callId = 'toolu_double_1', answer = true) {
@@ -873,6 +904,11 @@ async function run() {
     out(resultFrame('thought about it', false));
     return;
   }
+  if (prompt.includes('tool-pair:')) {
+    await emitToolPair(prompt.split('tool-pair:')[1].split(/\s/)[0] || 'Bash');
+    out(resultFrame('tools done', false));
+    return;
+  }
   if (prompt.includes('tool-error:')) {
     const name = prompt.split('tool-error:')[1].split(/\s/)[0] || 'Bash';
     // The minion may go straight on to another tool after the failure, with no text between.
@@ -899,7 +935,7 @@ async function run() {
     // The real CLI's shape (2.1.309): a failed login is a main-thread API-error
     // message with error "authentication_failed" and no HTTP status, then an
     // is_error result carrying the same text.
-    const text = 'Invalid API key · Please run /login';
+    const text = 'Not logged in · Please run /login';
     out({ ...assistantFrame([{ type: 'text', text }]), error: 'authentication_failed', is_api_error_message: true });
     out({ ...resultFrame(text, true), subtype: 'success' });
     return;
@@ -912,9 +948,34 @@ async function run() {
     return;
   }
   if (prompt.includes('textless-api-fault')) {
-    // An API-error message with a failure code but no text, then no result.
-    out({ ...assistantFrame([{ type: 'text', text: '' }]), error: 'overloaded', is_api_error_message: true });
+    // The real CLI's textless API error (2.1.309): "(no content)" with no code
+    // or status; only the result carries the HTTP status.
+    out({ ...assistantFrame([{ type: 'text', text: '(no content)' }]), is_api_error_message: true });
+    out({ ...resultFrame('(no content)', true), subtype: 'success', api_error_status: 529 });
+    return;
+  }
+  if (prompt.includes('blank-api-frame')) {
+    // A textless API-error message with nothing else, then no result.
+    out({ ...assistantFrame([{ type: 'text', text: '(no content)' }]), is_api_error_message: true });
     setInterval(() => {}, 60_000);
+    return;
+  }
+  if (prompt.includes('textonly-api-fault')) {
+    // An API-error message with text but no code or status, then no result.
+    out({ ...assistantFrame([{ type: 'text', text: 'Something went wrong talking to the API' }]), is_api_error_message: true });
+    setInterval(() => {}, 60_000);
+    return;
+  }
+  if (prompt.includes('status-only-result')) {
+    // No API-error message: only the result names the HTTP status.
+    await emitTextTurn('working on it');
+    out({ ...resultFrame('API Error: 500 Internal server error', true), subtype: 'success', api_error_status: 500 });
+    return;
+  }
+  if (prompt.includes('divergent-api-fault')) {
+    // The API-error message and the result word the same failure differently.
+    out({ ...assistantFrame([{ type: 'text', text: 'the API-error message words' }]), error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
+    out({ ...resultFrame('the result words', true), subtype: 'success', api_error_status: 429 });
     return;
   }
   if (prompt.includes('answer-hold')) {
