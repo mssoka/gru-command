@@ -506,7 +506,7 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
   });
 
   it('awaits a response already arriving when the wait ends, never answering still-running over it (#487)', async () => {
-    // A bridge that starts its reply before the 150 ms wait ends and
+    // A bridge that starts its reply before the 500 ms wait ends and
     // finishes it after: the server must deliver the result, not drop it.
     const directory = mkdtempSync(join(tmpdir(), 'gru-review-arriving-'));
     temporaryDirectories.push(directory);
@@ -520,12 +520,12 @@ describe('review MCP server: still-running wait slice and re-attach', () => {
         const { id } = JSON.parse(request) as { id: string };
         const line = JSON.stringify({ id, ok: true, result: { text: 'arrived-whole' } });
         socket.write(line.slice(0, 10));
-        setTimeout(() => socket.end(`${line.slice(10)}\n`), 400);
+        setTimeout(() => socket.end(`${line.slice(10)}\n`), 1_200);
       });
     });
     await new Promise<void>((resolve) => fakeBridge.listen(socketPath, resolve));
     try {
-      const client = serverClient(spawnServer(socketPath, { GRU_REVIEW_RESPONSE_WAIT_MS: '150' }));
+      const client = serverClient(spawnServer(socketPath, { GRU_REVIEW_RESPONSE_WAIT_MS: '500' }));
       await client.call(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
       const response = (await client.call(2, 'tools/call', { name: 'perkins_probe', arguments: {} })) as {
         result?: { content?: Array<{ text?: string }> };
