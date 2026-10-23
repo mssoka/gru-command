@@ -7,6 +7,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DispatchService } from '../src/dispatch/service.js';
+import type { Role } from '../src/config.js';
 import { WorktreeManager } from '../src/worktrees/manager.js';
 import { readCreationIntent } from '../src/worktrees/creation-intent.js';
 import { repositoryCommonDirectory } from '../src/worktrees/handoff.js';
@@ -21,7 +22,7 @@ import {
   readPreBootstrapDependencyPatchPackage,
 } from '../src/worktrees/prebootstrap-patch.js';
 import type { LoadedPreBootstrapPatch, PreBootstrapDependencyPatchPackage } from '../src/worktrees/prebootstrap-patch.js';
-import type { AgentCapabilities, AgentHandle, Role, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 const CAPABILITIES: AgentCapabilities = {
