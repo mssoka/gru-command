@@ -107,12 +107,15 @@ function contained(base: string, candidate: string): boolean {
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
 }
 
-/** Write one response line; `onFlushed` runs only once it reached a live
- * peer's socket (a write to a closed peer errors and never flushes). */
+/** Write one response line; `onFlushed` runs only when it was handed to a
+ * live peer's socket without error. Node also calls an end() callback on a
+ * write error (a peer gone before the bridge saw it), with the error. */
 function writeLine(socket: Socket, value: unknown, onFlushed?: () => void): void {
   if (socket.destroyed || !socket.writable) return;
   try {
-    socket.end(`${JSON.stringify(value)}\n`, onFlushed);
+    socket.end(`${JSON.stringify(value)}\n`, (error?: Error | null) => {
+      if (error == null) onFlushed?.();
+    });
   } catch {
     // A peer may disconnect between the writable check and end(). The
     // per-socket error listener below contains asynchronous write errors;
@@ -318,9 +321,10 @@ export class ReviewMcpBridge {
       // runs once, and every waiter receives its settled outcome.
       const outcome = await record.promise;
       if (outcome.ok) {
-        // A success someone received is not replayed: a later identical
-        // request (a retry, a collect) is new work. Only a success no caller
-        // received — its transport wait ended — waits for the re-attach.
+        // A success flushed to a live caller is not replayed: a later
+        // identical request (a retry, a collect) is new work. A success no
+        // live caller took — its transport wait ended — waits for the
+        // re-attach.
         writeLine(socket, { id: request.id, ok: true, result: outcome.result }, () => this.releaseReceived(key, record));
       } else {
         writeLine(socket, { id: request.id, ok: false, error: outcome.error });
@@ -400,13 +404,14 @@ export class ReviewMcpBridge {
     return record;
   }
 
-  /** Drop a settled success once a caller received it. */
+  /** Drop a settled success once its response was flushed to a caller. */
   private releaseReceived(key: string, record: ExecutionRecord): void {
     if (this.executions.get(key) !== record) return;
     this.executions.delete(key);
     if (record.retainedBytes > 0) {
       this.retainedExecutionBytes -= record.retainedBytes;
       this.retainedExecutionCount -= 1;
+      record.retainedBytes = 0;
     }
   }
 

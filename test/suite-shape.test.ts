@@ -332,7 +332,7 @@ const PINS: Record<string, number> = {
   'review-evidence-intake.test.ts': 11,
   'review-inputs-handoff.test.ts': 10,
   'review-inputs-wave.test.ts': 1,
-  'review-mcp-transport.test.ts': 15,
+  'review-mcp-transport.test.ts': 17,
   'stage1-baseline-scope.test.ts': 11,
   'review-runtime-swap.test.ts': 22,
   'review-source-preflight.test.ts': 13,

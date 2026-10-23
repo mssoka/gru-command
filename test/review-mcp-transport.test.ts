@@ -244,6 +244,53 @@ describe('review MCP bridge: join, retention and explicit abort', () => {
     expect(executions).toBe(2);
   });
 
+  it('keeps a success whose caller died unseen: a failed write never releases it (#487)', async () => {
+    let executions = 0;
+    const gate = deferred();
+    const tool: NativeAgentTool = {
+      name: 'perkins_probe',
+      description: 'probe',
+      inputSchema: { type: 'object' },
+      execute: async () => {
+        executions += 1;
+        await gate.promise;
+        return { text: `result-${executions}` };
+      },
+    };
+    const bridge = await ReviewMcpBridge.start([tool]);
+    bridges.push(bridge);
+    const call = callBridge(bridge.socketPath, { id: 'lost', name: 'perkins_probe', input: { runs: [{ lens: 'tests' }] } });
+    void call.promise.catch(() => {});
+    await vi.waitFor(() => expect(executions).toBe(1));
+    // The caller dies and the result settles in the same tick: the bridge has
+    // not seen the close, so its write fails rather than flushing.
+    call.socket.destroy();
+    gate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(callBridge(bridge.socketPath, { id: 'reattach', name: 'perkins_probe', input: { runs: [{ lens: 'tests' }] } }).promise)
+      .resolves.toMatchObject({ ok: true, result: { text: 'result-1' } });
+    expect(executions).toBe(1);
+  });
+
+  it('frees the retention budget when a received success is released (#487)', async () => {
+    const executions = new Map<number, number>();
+    const probe = holdableProbe((input) => {
+      const n = Number(input['n']);
+      executions.set(n, (executions.get(n) ?? 0) + 1);
+      return { text: '' };
+    });
+    const bridge = await ReviewMcpBridge.start([probe.tool], { retention: { maxBytes: 1024 * 1024, maxEntries: 2 } });
+    bridges.push(bridge);
+    const call = (id: string, n: number) =>
+      callBridge(bridge.socketPath, { id, name: 'perkins_probe', input: { n } }).promise;
+    // Two received successes are released: they hold no retention slot...
+    for (const n of [1, 2]) await expect(call(`received-${n}`, n)).resolves.toMatchObject({ ok: true });
+    // ...so two unreceived ones both fit the two-entry budget.
+    for (const n of [3, 4]) await probe.settleUnreceived(bridge, `lost-${n}`, { n });
+    for (const n of [3, 4]) await expect(call(`reattach-${n}`, n)).resolves.toMatchObject({ ok: true });
+    expect([3, 4].map((n) => executions.get(n))).toEqual([1, 1]);
+  });
+
   it('evicts by settlement age: a long-held wave that settles last is still re-attachable after pressure (#174)', async () => {
     const executions = new Map<string, number>();
     // Default retention (16 MiB): four 5 MiB successes cannot all fit.

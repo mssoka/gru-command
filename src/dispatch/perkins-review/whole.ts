@@ -76,6 +76,14 @@ const WITHHELD_RESERVE_BYTES = 4 * 1024;
 /** Bound on a failed attempt's error text in the lead's view. */
 const LEAD_VIEW_ERROR_MAX_CHARS = 2_000;
 
+/** A failed attempt's error as the lead reads it: whole, or cut with the
+ * count of what was cut — never silently. */
+function leadViewError(error: string): string {
+  if (error.length <= LEAD_VIEW_ERROR_MAX_CHARS) return error;
+  const suffix = ` … (+${error.length - (LEAD_VIEW_ERROR_MAX_CHARS - 80)} characters cut; the full error is in the run record)`;
+  return `${error.slice(0, LEAD_VIEW_ERROR_MAX_CHARS - 80)}${suffix}`;
+}
+
 /** What the lead reads of one specialist result: the review content, never
  * host bookkeeping (delivery stamps, recording errors). The child-side size
  * bound and the batch packing both measure exactly this view. */
@@ -86,7 +94,7 @@ function leadView(result: {
   return {
     resultId: result.resultId, lens: result.lens, attempt: result.attempt, status: result.status, findings: result.findings,
     ...(result.failureKind !== undefined ? { failureKind: result.failureKind } : {}),
-    ...(result.error !== undefined ? { error: result.error.slice(0, LEAD_VIEW_ERROR_MAX_CHARS) } : {}),
+    ...(result.error !== undefined ? { error: leadViewError(result.error) } : {}),
   };
 }
 /** Bound for the aggregated submission-validation rejection: it reaches

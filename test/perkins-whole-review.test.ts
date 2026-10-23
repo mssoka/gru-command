@@ -997,7 +997,7 @@ describe('Perkins whole-PR lead engine', () => {
     }
   });
 
-  it('refuses a call mixing a withheld lens with a new one, starting no child and charging nothing (#487)', async () => {
+  it('refuses a call mixing a withheld lens with a new one, starting no child (#487)', async () => {
     const h = largeLenses(['security', 'tests'], { ignoreWithheld: true, neverSubmit: true });
     await expect(h.run()).rejects.toThrow(/without an accepted terminal submission/u);
     const runTool = h.leadCalls[0]!.options.reviewLead!.nativeTools.find((entry) => entry.name === 'perkins_run_specialists')!;
