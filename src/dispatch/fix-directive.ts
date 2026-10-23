@@ -65,8 +65,8 @@ export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
   readonly ledger: Pick<
     LedgerApi,
-    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent' | 'latestJobEvent'
-  >;
+    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'
+  > & Partial<Pick<LedgerApi, 'latestJobEvent'>>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
@@ -89,10 +89,20 @@ export interface DirectiveRoutingDeps {
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
-function blindReviewFor(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): boolean {
+function blindReviewFor(ledger: Pick<LedgerApi, 'latestJobEvent'> | Partial<Pick<LedgerApi, 'latestJobEvent'>>, jobId: string): boolean {
   // Some narrow routing test doubles predate admission-aware context assembly;
   // the production LedgerApi always supplies this durable role lookup.
-  return typeof ledger.latestJobEvent === 'function' && isAdmittedBlind(ledger, jobId);
+  return typeof ledger.latestJobEvent === 'function' && isAdmittedBlind(ledger as Pick<LedgerApi, 'latestJobEvent'>, jobId);
+}
+
+function blindPackageFor(
+  ledger: Partial<Pick<LedgerApi, 'latestJobEvent'>>,
+  jobId: string,
+  blindReview: boolean,
+): ReturnType<typeof admittedBlindPackage> {
+  return blindReview && typeof ledger.latestJobEvent === 'function'
+    ? admittedBlindPackage(ledger as Pick<LedgerApi, 'latestJobEvent'>, jobId)
+    : null;
 }
 
 function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
@@ -221,7 +231,7 @@ export async function routeFixDirectiveToMinion(
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
   const blindReview = blindReviewFor(input.ledger, input.jobId);
-  const blindPackage = blindReview ? admittedBlindPackage(input.ledger, input.jobId) : null;
+  const blindPackage = blindPackageFor(input.ledger, input.jobId, blindReview);
   const withBlindPackage = (text: string): string => {
     if (blindPackage === null || text.includes('BLIND INPUT PACKAGE (')) return text;
     return `${text}\n\n${renderBlindPackageBlock(blindPackage).join('\n')}`;
@@ -863,7 +873,7 @@ export async function rebriefFreshMinion(
       });
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
       const blindReview = blindReviewFor(input.ledger, input.jobId);
-      const blindPackage = blindReview ? admittedBlindPackage(input.ledger, input.jobId) : null;
+      const blindPackage = blindPackageFor(input.ledger, input.jobId, blindReview);
       const briefing = blindPackage === null || input.briefing?.includes('BLIND INPUT PACKAGE (')
         ? input.briefing
         : [input.briefing, renderBlindPackageBlock(blindPackage).join('\n')].filter((part): part is string => part !== null && part !== undefined && part !== '').join('\n\n');
