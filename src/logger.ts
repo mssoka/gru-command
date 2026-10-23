@@ -160,8 +160,8 @@ export class Logger {
  * toJSON field that would otherwise replace the whole line (undefined keys
  * never reach the output). A field that cannot be serialized (a BigInt, a
  * cycle, a throwing getter or toJSON) is dropped and named with its reason
- * under `fields_unserializable`; the other fields still land. If even that
- * fails, the line keeps ts/level/msg alone.
+ * under `fields_unserializable`; the other fields still land. If the
+ * salvaged record still fails as a whole, the line keeps ts/level/msg alone.
  */
 function serializeRecord(level: LogLevel, msg: string, fields: Record<string, unknown>): string {
   const ts = new Date().toISOString();
@@ -172,15 +172,16 @@ function serializeRecord(level: LogLevel, msg: string, fields: Record<string, un
     /* salvage field by field below */
   }
   try {
-    const kept: Record<string, unknown> = {};
-    const unserializable: Record<string, string> = {};
+    // Prototype-free, so an own `__proto__` field is a key, not the setter.
+    const kept: Record<string, unknown> = Object.create(null);
+    const unserializable: Record<string, string> = Object.create(null);
     for (const key of Object.keys(fields)) {
       try {
         const value = fields[key];
         JSON.stringify(value);
         kept[key] = value;
       } catch (error) {
-        unserializable[key] = error instanceof Error ? error.message : String(error);
+        unserializable[key] = describeFailure(error);
       }
     }
     const record: LogRecord = { ...kept, toJSON: undefined, ts, level, msg, fields_unserializable: unserializable };
@@ -188,5 +189,15 @@ function serializeRecord(level: LogLevel, msg: string, fields: Record<string, un
   } catch {
     const lastResort: LogRecord = { ts, level, msg, fields_unserializable: 'unknown' };
     return JSON.stringify(lastResort);
+  }
+}
+
+/** The reason a field failed, as a string; never throws itself. */
+function describeFailure(error: unknown): string {
+  try {
+    const reason = error instanceof Error ? error.message : error;
+    return typeof reason === 'string' ? reason : String(reason);
+  } catch {
+    return 'unknown';
   }
 }

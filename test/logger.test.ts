@@ -85,10 +85,12 @@ describe('logger size-based rotation (E7)', () => {
     // A rotation that throws outright is guarded apart from the append.
     const throwing = tempDir('gru-command-logger-rot-throws-');
     const throwingLogger = new Logger(throwing, false);
-    Reflect.set(throwingLogger, 'rotateIfNeeded', () => {
+    const rotate = vi.fn(() => {
       throw new Error('rotation exploded');
     });
+    Reflect.set(throwingLogger, 'rotateIfNeeded', rotate);
     expect(() => throwingLogger.info('rotation-threw')).not.toThrow();
+    expect(rotate).toHaveBeenCalledTimes(1);
     expect(serviceRecords(throwing).map((record) => record['msg'])).toEqual(['rotation-threw']);
   });
 });
@@ -113,6 +115,38 @@ describe('logger never throws (#496)', () => {
         'boom',
         /^getter exploded$/,
       ],
+      [
+        'unserializable-reason',
+        {
+          lane: 'L-42',
+          get worse(): unknown {
+            throw Object.assign(new Error('placeholder'), { message: 10n });
+          },
+        },
+        'worse',
+        /^10$/,
+      ],
+      [
+        'undescribable-reason',
+        {
+          lane: 'L-42',
+          get odd(): unknown {
+            throw Object.create(null);
+          },
+        },
+        'odd',
+        /^unknown$/,
+      ],
+      // The salvaged record keeps the reserved-keys-last order and the
+      // toJSON disarm.
+      [
+        'spoof-and-hijack',
+        { lane: 'L-42', count: 10n, level: 'fake', msg: 'spoofed', toJSON: () => ({ hijacked: true }) },
+        'count',
+        /BigInt/,
+      ],
+      // An own __proto__ field (JSON.parse makes one) stays a field.
+      ['own-proto', Object.assign(JSON.parse('{"__proto__":{"x":1},"lane":"L-42"}'), { count: 10n }), 'count', /BigInt/],
     ];
     for (const [name, fields] of cases) {
       expect(() => logger.error(`unserializable-${name}`, fields), name).not.toThrow();
@@ -125,24 +159,30 @@ describe('logger never throws (#496)', () => {
       expect(record['level'], name).toBe('error');
       expect(typeof record['ts'], name).toBe('string');
       expect(record['lane'], name).toBe('L-42');
+      expect(record['hijacked'], name).toBeUndefined();
       const unserializable = record['fields_unserializable'] as Record<string, unknown>;
       expect(Object.keys(unserializable), name).toEqual([badKey]);
       expect(unserializable[badKey], name).toMatch(reason);
     }
+    const ownProto = records.at(-1) ?? {};
+    expect(Object.hasOwn(ownProto, '__proto__')).toBe(true);
+    expect(ownProto['__proto__']).toEqual({ x: 1 });
   });
 
-  it('a field whose failure cannot itself be described still writes a last-resort line', () => {
+  it('a record that fails again after salvage still writes a last-resort ts/level/msg line', () => {
     const dir = tempDir('gru-command-logger-last-resort-');
     const logger = new Logger(dir, false);
-    expect(() =>
-      logger.error('last-resort', {
-        lane: 'L-42',
-        get worse(): unknown {
-          // The reason itself is unserializable.
-          throw Object.assign(new Error('placeholder'), { message: 10n });
-        },
-      }),
-    ).not.toThrow();
+    // Serializes alone (second call) but not in the first or the salvaged record.
+    let calls = 0;
+    const flaky = {
+      toJSON(): string {
+        calls += 1;
+        if (calls === 2) return 'ok';
+        throw new Error('flaky toJSON');
+      },
+    };
+    expect(() => logger.error('last-resort', { lane: 'L-42', flaky })).not.toThrow();
+    expect(calls).toBe(3);
     const [record] = serviceRecords(dir);
     expect(record?.['msg']).toBe('last-resort');
     expect(record?.['level']).toBe('error');
@@ -190,7 +230,8 @@ describe('logger never throws (#496)', () => {
     const dir = tempDir('gru-command-logger-stderr-event-');
     // A fresh module instance and a listener-free stderr, so only this
     // test's loggers can install the guard.
-    const existing = process.stderr.listeners('error') as Array<(error: Error) => void>;
+    // rawListeners keeps once-wrappers one-shot when they are put back.
+    const existing = process.stderr.rawListeners('error') as Array<(error: Error) => void>;
     process.stderr.removeAllListeners('error');
     try {
       vi.resetModules();
