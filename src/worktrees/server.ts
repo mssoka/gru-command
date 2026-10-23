@@ -174,17 +174,7 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     // prove an in-process child ceased, so the durable record decides.
     const lane = manager.getWorktree(worktreeId);
     if (lane !== null && options.ledger !== undefined) {
-      const outstanding =
-        lane.kind === 'child'
-          ? [options.ledger.getChildWorker(lane.id)].filter(
-              (child): child is NonNullable<typeof child> =>
-                child !== null && child.resultState === null,
-            )
-          : lane.kind === 'job' && lane.jobId !== null
-            ? options.ledger
-                .listChildWorkers({ jobId: lane.jobId })
-                .filter((child) => child.resultState === null)
-            : [];
+      const outstanding = options.ledger.unfinishedChildWorkersOf(lane);
       if (outstanding.length > 0) {
         json(res, 409, {
           error: 'active_child_workers',

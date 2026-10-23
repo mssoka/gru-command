@@ -199,7 +199,8 @@ function recordInvocation(prompt, images) {
   if (!logFile) return;
   appendFileSync(
     logFile,
-    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: resolvedBackgroundSwitch() })}\n`,
+    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: resolvedBackgroundSwitch(),
+      laneToken: process.env['GRU_LANE_TOKEN'] ?? null, laneJob: process.env['GRU_LANE_JOB'] ?? null })}\n`,
     'utf8',
   );
 }

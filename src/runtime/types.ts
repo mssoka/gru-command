@@ -3,6 +3,7 @@ import type { WorkerVerificationPolicy } from './worker-verification-policy.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import type { DirectiveCheckpoint, DirectiveNativeBinding, DirectiveProducer, DirectiveTurnIdentity } from './directive-checkpoint.js';
 import type { WorkflowContext, WorkflowInvocation } from '../workflows/runtime.js';
+import type { LaneProvenance } from '../worktrees/lane-provenance.js';
 
 /**
  * Runtime adapter interface (EPICS E2 story 1; SPEC ruling 4).
@@ -243,6 +244,14 @@ export interface SpawnOptions {
    * the binding in the system prompt. Never applied to review sessions.
    */
   readonly managedSkills?: ManagedSkillSet;
+  /**
+   * #486: the registered lane the session's cwd is. The adapter puts the
+   * lane's GRU_LANE_TOKEN (and GRU_LANE_JOB) in the environment of every
+   * process the session starts (claude-code: the CLI's; pi: its bash tool's),
+   * so a process that detaches from the session is still known as the
+   * lane's. The registry fills it from the cwd; omitted = no lane.
+   */
+  readonly laneProvenance?: LaneProvenance;
 }
 
 /**
