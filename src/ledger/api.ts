@@ -1481,9 +1481,7 @@ export class LedgerApi {
    * Evidence surfaces may narrow kinds, cap the rows and request oldest-first
    * without scanning a moving global tail that can omit the job's receipts. */
   listJobEvents(jobId: string, opts: { readonly limit?: number; readonly kinds?: readonly string[]; readonly order?: 'asc' | 'desc' } = {}): readonly EventRecord[] {
-    if (jobId.trim() === '') throw new Error('listJobEvents requires a non-empty job id');
     const limit = opts.limit ?? 200;
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('listJobEvents limit must be an integer from 1 to 10000');
     const order = opts.order === 'asc' ? 'ASC' : 'DESC';
     const kinds = opts.kinds;
     const where = kinds === undefined || kinds.length === 0
