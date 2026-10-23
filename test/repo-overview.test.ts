@@ -266,20 +266,21 @@ describe('managed repo overview tracker — registry and identity', () => {
     expect(h.api.calls).toEqual([]);
   });
 
-  it('classifies missing/non-GitHub/unrecognized remotes as unlinked with a reason and spends no calls', async () => {
+  it('classifies missing/unsupported-host/unrecognized remotes as unlinked with a reason and spends no calls', async () => {
     const h = harness({
-      names: ['missing', 'gitlab', 'weird'],
+      names: ['missing', 'bitbucket', 'weird'],
       refs: new Map<string, RepoRef | null>([
         ['missing', null],
-        ['gitlab', { host: 'gitlab.example.com', owner: 'acme', repo: 'gitlab' }],
+        ['bitbucket', { host: 'bitbucket.org', owner: 'acme', repo: 'bitbucket' }],
         ['weird', { host: 'github.com', owner: 'acme/evil', repo: 'weird' }],
       ]),
     });
     const view = await h.tracker.refresh();
     expect(h.api.calls).toEqual([]);
-    for (const key of ['missing', 'gitlab', 'weird']) {
+    for (const key of ['missing', 'bitbucket', 'weird']) {
       const entry = row(view, key);
       expect(entry.linked).toBe(false);
+      expect(entry.provider).toBeNull();
       expect(entry.link).toBeNull();
       expect(entry.linkReason).not.toBeNull();
       expect(entry.openPrs).toBeNull();
@@ -289,7 +290,7 @@ describe('managed repo overview tracker — registry and identity', () => {
       expect(entry.freshness).toBe('unchecked');
     }
     expect(row(view, 'missing').linkReason).toBe('no usable origin remote');
-    expect(row(view, 'gitlab').linkReason).toBe('non-GitHub remote');
+    expect(row(view, 'bitbucket').linkReason).toBe('unsupported code host');
     expect(row(view, 'weird').linkReason).toBe('unrecognized remote');
   });
 
@@ -298,6 +299,7 @@ describe('managed repo overview tracker — registry and identity', () => {
     const view = await h.tracker.refresh();
     const entry = row(view, 'alpha');
     expect(entry.linked).toBe(true);
+    expect(entry.provider).toBe('github');
     expect(entry.link).toBe('https://github.com/acme/alpha');
     expect(entry.linkReason).toBeNull();
     expect(entry.fullName).toBe('acme/alpha');
@@ -701,12 +703,16 @@ describe('managed repo overview — pure helpers', () => {
   it('classifies remote reasons without guessing an identity', () => {
     const resolver = (value: RepoRef | null) => () => value;
     expect(classifyRemote('/ws/a', resolver(null)).kind).toBe('unlinked');
-    expect(classifyRemote('/ws/a', resolver({ host: 'gitlab.com', owner: 'o', repo: 'r' }))).toEqual({
+    expect(classifyRemote('/ws/a', resolver({ host: 'bitbucket.org', owner: 'o', repo: 'r' }))).toEqual({
       kind: 'unlinked',
-      reason: 'non-GitHub remote',
+      reason: 'unsupported code host',
     });
     expect(classifyRemote('/ws/a', resolver({ host: 'github.com', owner: '..', repo: 'r' })).kind).toBe('unlinked');
-    expect(classifyRemote('/ws/a', resolver(githubRef('alpha')))).toEqual({ kind: 'linked', ref: githubRef('alpha') });
+    expect(classifyRemote('/ws/a', resolver(githubRef('alpha')))).toEqual({
+      kind: 'linked',
+      ref: githubRef('alpha'),
+      provider: 'github',
+    });
   });
 
   it('builds safe https links only for safe GitHub identities', () => {
@@ -1137,8 +1143,8 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       execFileSync('git', ['init', '-q', join(root, 'alpha')]);
       execFileSync('git', ['-C', join(root, 'alpha'), 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
       execFileSync('git', ['init', '-q', join(root, 'no-origin')]);
-      execFileSync('git', ['init', '-q', join(root, 'gitlab-repo')]);
-      execFileSync('git', ['-C', join(root, 'gitlab-repo'), 'remote', 'add', 'origin', 'https://gitlab.com/acme/gl.git']);
+      execFileSync('git', ['init', '-q', join(root, 'other-host')]);
+      execFileSync('git', ['-C', join(root, 'other-host'), 'remote', 'add', 'origin', 'https://bitbucket.org/acme/bb.git']);
       mkdirSync(join(root, 'broken'));
       writeFileSync(join(root, 'broken', '.git'), 'gitdir: /nonexistent/gru-repo-overview-test\n');
       execFileSync('git', ['init', '-q', join(root, 'unselected')]);
@@ -1146,13 +1152,13 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       const api = new FakeApi().set('alpha', { openPrs: 1, openIssues: 2, workflows: { kind: 'ok', value: 0 } });
       const tracker = new ManagedRepoOverviewTracker({
         workspaceRoot: root,
-        managedRepos: ['alpha', 'broken', 'gitlab-repo', 'no-origin'],
+        managedRepos: ['alpha', 'broken', 'no-origin', 'other-host'],
         api,
         now: () => T0,
         sleep: async () => {},
       });
       const view = await tracker.refresh();
-      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'broken', 'gitlab-repo', 'no-origin']);
+      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'broken', 'no-origin', 'other-host']);
       expect(view?.rows.some((entry) => entry.key === 'unselected')).toBe(false);
       const entry = row(view, 'alpha');
       expect(entry.linked).toBe(true);
@@ -1162,7 +1168,7 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       expect(entry.run?.state).toBe('no-workflow');
       // The default resolver's failure paths through the REAL seam:
       expect(row(view, 'no-origin').linkReason).toBe('no usable origin remote');
-      expect(row(view, 'gitlab-repo').linkReason).toBe('non-GitHub remote');
+      expect(row(view, 'other-host').linkReason).toBe('unsupported code host');
       // A stale worktree pointer is unavailable, never an origin-read failure
       // that could preserve or classify a remote identity.
       expect(row(view, 'broken').linkReason).toBe('selected repository is unavailable under workspace_root');

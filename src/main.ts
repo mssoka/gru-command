@@ -50,6 +50,7 @@ import {
 } from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
+import { GitLabRepoOverviewApi } from './repos/gitlab-overview.js';
 import { GhRepoOverviewApi } from './repos/overview.js';
 import { DefaultBranchCiWatch } from './repos/default-branch-ci.js';
 import { createManagedRepoOverviewTracker } from './repos/runtime.js';
@@ -489,15 +490,17 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // Managed repository overview (owner-approved compact rows A): the
-  // read-only GitHub projection of the configured managed-repo registry.
-  // Own bounded cadence (never per-render, never per-tab), coalesced,
-  // server-side through the existing gh auth seam; the snapshot carries
-  // the cached view. Rows are absent (null) until the first pass runs.
-  // Each committed observation also feeds the default-branch CI alert
-  // (#446), built once the notification center exists below — the tracker
-  // starts only after that, so no first pass is lost.
+  // read-only GitHub/GitLab projection of the configured managed-repo
+  // registry. Own bounded cadence (never per-render, never per-tab),
+  // coalesced, server-side through the user's gh and glab CLI logins
+  // (#480); the snapshot carries the cached view. Rows are
+  // absent (null) until the first pass runs. Each committed GitHub
+  // observation also feeds the default-branch CI alert (#446), built once
+  // the notification center exists below — the tracker starts only after
+  // that, so no first pass is lost.
   const repoOverview = createManagedRepoOverviewTracker(config, {
     api: new GhRepoOverviewApi(),
+    gitlabApi: new GitLabRepoOverviewApi(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
     onDefaultBranchRuns: (observation) => defaultBranchCi.observe(observation),
   });

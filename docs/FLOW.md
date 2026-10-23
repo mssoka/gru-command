@@ -871,8 +871,10 @@ the judgment; the dispatch surface is the mechanical hand.
   `POST /api/decisions` (issue #218) with a matching basis defers the
   wake to the hold's recheck instead.
 - **The default-branch CI alert (#446)** rides the managed repository
-  overview pass, not the lane poll: each committed observation hands its
-  default-branch run page (20 runs, the same single call) to a watch. Per
+  overview pass, not the lane poll: each committed GitHub observation hands
+  its default-branch run page (20 runs, the same single call) to a watch.
+  GitLab rows (#480) are overview-only: their pipelines never reach the
+  watch, so a red GitLab pipeline shows on its row without waking Gru. Per
   `workflow_id`, the newest decisive run (passed, failed, timed-out,
   startup-failure) is the verdict; queued (incl. waiting/pending/
   requested), running, cancelled, skipped, neutral, action-required,

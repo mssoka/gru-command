@@ -3,15 +3,15 @@ import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { createWorkflowSessionBinder } from '../../src/workflows/session.js';
 import { configPathFor, loadConfig } from '../../src/config.js';
-import { makeWorkflowLane } from './workflow-lane.js';
+import { makeWorkflowLane, makeWorkflowLaneFromTemplate, type WorkflowLaneTemplate } from './workflow-lane.js';
 
 export const WEB_INCIDENT = 'cd web && npx vitest run --config vitest.config.ts src/lib/board-client.test.ts src/ui/board.test.ts';
 export const FULL_INCIDENT = 'npm test';
 export const BUILD_INCIDENT = 'npm run lint && npm run typecheck && npm run build && npm run build:web';
 
 /** Real assigned Git lane and offline executables: any backend start is durable. */
-export function verificationLane(quality = false) {
-  const f = makeWorkflowLane();
+export function verificationLane(quality = false, template?: WorkflowLaneTemplate) {
+  const f = template === undefined ? makeWorkflowLane() : makeWorkflowLaneFromTemplate(template);
   mkdirSync(join(f.lane.path, '.gru-command'));
   mkdirSync(join(f.lane.path, 'web'));
   writeFileSync(join(f.lane.path, '.gru-command/worktree.toml'), '[verify]\nfull = "npm test"\nfocused = "npx vitest run"\n' + (quality ? 'quality = "CI=1 npm run quality"\nunit = "npm run test.unit"\ncheck = "npm run check/unit"\n' : ''));

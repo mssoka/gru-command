@@ -68,14 +68,19 @@ here before the v1.0.0 tag)*
 - **Node.js ≥ 22.19** — the service runtime and build toolchain.
 - **Python 3 ≥ 3.8 on macOS** — required for descriptor-bound installed-code fingerprinting and Perkins review recovery; `install.sh` verifies inherited-directory-FD support before setup, update, or service registration.
 - **git** — per-job worktree lanes and branch inspection.
-- **GitHub CLI (`gh`), authenticated for every managed repo** — the
-  GitHub signal poll and the round's code-host preflight always ride
-  `gh`. SHA-bound Perkins verdict delivery also rides `gh` unless a
-  Perkins App bundle is installed, in which case github.com publication
-  is App-authored while the preflight still uses `gh`
-  ([PERKINS-APP-PUBLICATION.md](docs/PERKINS-APP-PUBLICATION.md)). Run
-  `gh auth login` with a token that can read the repositories (`repo`
-  scope for private repos) and confirm with `gh auth status`.
+- **GitHub CLI (`gh`) and/or GitLab CLI (`glab`), authenticated for the
+  hosts your managed repos use.**
+  - `gh` — the GitHub signal poll and the round's code-host preflight
+    always ride `gh`. SHA-bound Perkins verdict delivery also rides `gh`
+    unless a Perkins App bundle is installed, in which case github.com
+    publication is App-authored while the preflight still uses `gh`
+    ([PERKINS-APP-PUBLICATION.md](docs/PERKINS-APP-PUBLICATION.md)). Run
+    `gh auth login` with a token that can read the repositories (`repo`
+    scope for private repos) and confirm with `gh auth status`.
+  - `glab` — `glab auth login [--hostname <host>]` with a `read_api` or
+    `api` token, confirm with `glab auth status`; the Managed Repos
+    overview reads GitLab repositories through it. Perkins review on
+    GitLab still uses `GITLAB_TOKEN`; see [FLOW.md](docs/FLOW.md).
 - **Perkins App bundle — install prerequisite for review verdicts.** On
   github.com, Perkins publishes its verdicts as the installed GitHub App
   (`perkins-review[bot]`), never your personal `gh` account (owner ruling

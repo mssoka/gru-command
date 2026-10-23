@@ -65,7 +65,7 @@ a fallback for relocated deployments — see
 
 `workspace_root` is a shared project directory and may contain unrelated
 repositories. `managed_repos` is the explicit subset Gru Command treats as
-managed (including GitHub overview membership and intake root validation);
+managed (including overview membership and intake root validation);
 names are exact direct-child directory names relative to `workspace_root`,
 for example:
 
@@ -84,6 +84,23 @@ inferred or written for you, and there is no hot reload. A selected but
 unavailable directory stays selected and is shown as unavailable rather than
 being replaced by another workspace child. Existing jobs and history are not
 removed when the overview list changes.
+
+The overview reads GitHub origins through the `gh` login and GitLab origins
+(`gitlab.com`, or a self-hosted host whose first label is `gitlab`) through the
+`glab` login; GC never reads or handles a GitLab token. Run `glab auth login`
+(add `--hostname <host>` for a self-hosted host) with a token that has the
+`read_api` or `api` scope, and confirm with `glab auth status`. No environment
+variable and no `gru restart` are needed. A row on a host glab is not logged in
+to, or with glab not installed, reads unavailable and names `glab auth login
+--hostname <host>`; a login without `read_api` or `api` fails that host's rows
+as an auth failure. GitHub rows are unaffected either way. Origins on any other
+host read `Not linked (unsupported code host)`. See [BOARD.md](./BOARD.md) for
+what each row shows.
+
+Perkins GitLab delivery is separate and unchanged: it still uses `GITLAB_TOKEN`
+with the `api` scope ([FLOW.md](./FLOW.md)). glab itself prefers a
+`GITLAB_TOKEN` set in the service's environment over its stored login, so when
+that variable is set the overview reads with it too.
 
 ## Load & validation behavior
 

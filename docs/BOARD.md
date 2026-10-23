@@ -225,8 +225,9 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   may contain unrelated repositories; installer discovery offers candidates
   but never enrolls siblings at runtime. An absent/empty list produces an
   empty overview with setup guidance. Each compact row shows the repository identity (an https
-  link only when the origin remote proves a safe GitHub identity,
-  otherwise an explicit not-linked reason), exact repo-wide open-PR and
+  link only when the origin remote proves a safe GitHub or GitLab
+  identity, otherwise `Not linked (<reason>)` — `unsupported code host`
+  for an origin on any other host), exact repo-wide open-PR and
   open-issue counts (issues EXCLUDING PRs, via GitHub's aggregate search;
   zero is a real count and unknown is never shown as zero), and the newest
   Actions run on the repository's discovered default branch as
@@ -247,6 +248,42 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   independent scroll; the module follows the CREW tab and disappears with
   it on TRANSCRIPTS. Reads and disclosures are display-only — nothing
   here acks, executes or changes GitHub state.
+  **GitLab repositories (#480):** an origin on a GitLab host —
+  `gitlab.com`, or a self-hosted host whose first label is `gitlab` (the
+  same `isGitLabRemote` rule Perkins delivery uses; no config key) — over
+  SSH or HTTPS, nested groups included, is a linked GitLab row. The
+  tracker reads it through the user's `glab` login, as GitHub rows use
+  `gh` (`glab api --hostname <host> --include`, 15 s and bounded output
+  per call; GC never reads or handles a GitLab token). The overview needs
+  a login with the `read_api` or `api` scope; Perkins GitLab delivery
+  still uses `GITLAB_TOKEN` with `api`, unchanged. See
+  [CONFIG.md](./CONFIG.md#managed-repositories) to log in and check it.
+  The tracker reads the project's default branch, exact open
+  merge-request and open-issue counts (the list endpoints' `X-Total`;
+  GitLab omits it above 10,000 results, and the observation then fails
+  as "count not exact" instead of guessing), and the newest
+  default-branch pipeline by (created, id) among the 20 newest, skipping
+  merge-request and child (`parent_pipeline`) pipelines. The row reads
+  `OPEN MRs` / `excl. MRs` (an unlinked row, whatever its host, reads the
+  neutral `OPEN PRs/MRs` / `excl. PRs/MRs`), links `on GitLab`, labels an
+  unnamed pipeline `pipeline #N`, reads `NO RUNS` with no default-branch
+  pipeline on that page (GitLab never claims no-workflow), `UNAVAILABLE`
+  when the project turns CI/CD off, and no-branch for an empty
+  repository; the module's sub-heading reads `CI = default-branch only ·
+  not deployment health` for both hosts. With glab not installed, or not
+  logged in to the host, the row is unavailable and names the fix (`glab
+  auth login --hostname <host>`); a rejected login (HTTP 401) names the
+  same fix and notes that a `GITLAB_TOKEN` in the service environment
+  overrides the glab login. A missing glab, a missing or rejected glab
+  login, a 403 `insufficient_scope` (no `read_api` or `api`) or a 429
+  aborts that GitLab host for the pass — its later rows read `refresh
+  aborted before this repository was checked` — while GitHub rows and
+  other GitLab hosts are still observed; a GitHub rate limit or `gh` auth
+  failure likewise never stops GitLab rows. Other 403s, 404, 5xx, network
+  failures, timeouts, oversized output and transient spawn failures are
+  per-repository, and cached data renders `STALE · last …` like any other
+  row. GitLab pipelines never feed the default-branch CI alert below: a
+  red GitLab pipeline shows on its row without waking Gru.
   **Default-branch CI alert (#446):** the one runs call reads the 20
   newest default-branch runs; the chip shows the newest of them that tested
   the branch itself — `pull_request*` and fork runs that merely share its

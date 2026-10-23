@@ -3,6 +3,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname } from 'node:path';
+import type { ModelThinkingLevel } from '@earendil-works/pi-ai';
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
+import { PI_THINKING_LEVELS } from '../config.js';
 import { withSessionLockCoordination } from '../sessions/lock-coordination.js';
 
 /** Accepted authority, not a prompt or a claim lease. */
@@ -107,15 +110,21 @@ interface NativeEntry {
   readonly provider?: unknown;
   readonly modelId?: unknown;
   readonly thinkingLevel?: unknown;
+  readonly summary?: unknown;
+  readonly firstKeptEntryId?: unknown;
+  readonly tokensBefore?: unknown;
+  readonly fromHook?: unknown;
+  readonly timestamp?: unknown;
 }
 /*
  * Native transcripts grow for a session's whole life (#469), so inspection
  * never holds one whole. The header is its first line. The session before a
- * directive's baseline is streamed past: pi keeps only its entry ids, Claude
- * re-hashes its exact bytes. The directive's own turn after the baseline is
- * read only as far as an inspection walks, and only the lines read count
- * against the transcript byte and entry limits, so a session's later work
- * never refuses an earlier directive.
+ * directive's baseline is streamed past: pi keeps each entry's id and parent
+ * id, never its content, for duplicate and ancestry checks (memory grows with
+ * the session's entry count); Claude re-hashes its exact bytes. The directive's
+ * own turn after the baseline is read only as far as an inspection walks, and
+ * only the lines read count against transcript byte and entry limits, so a
+ * session's later work never refuses an earlier directive.
  */
 const HEADER_OVERSIZED = `native session header exceeds the ${MAX_NATIVE_HEADER_BYTES}-byte inspection limit`;
 const ENTRY_OVERSIZED = `native transcript entry exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`;
@@ -183,11 +192,27 @@ class NativeTurn {
   private readonly lines: NativeLines;
   private count = 0;
   private scope = 'native directive turn';
+  private ended: { readonly start: number; readonly count: number } | null = null;
   constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
-   * nor refused as, this turn. */
-  end(): void { this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn'; }
+   * nor refused as, this turn. Idempotent until resume(): a chained retry
+   * ends, resumes and ends again. */
+  end(): void {
+    if (this.ended !== null) return;
+    this.ended = { start: this.start, count: this.count };
+    this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn';
+  }
+  /** Takes back end(): what was read since belongs to the turn after all,
+   * and is charged to it under the turn's own bound and name. A line too
+   * large to read at all was refused before its role was known, under the
+   * lookahead's name: it is past both bounds. */
+  resume(): void {
+    if (this.ended === null) throw new DirectiveCheckpointError('native directive turn resumed without having ended');
+    this.start = this.ended.start; this.count += this.ended.count; this.ended = null; this.scope = 'native directive turn';
+    if (this.lines.end - this.start > MAX_NATIVE_TRANSCRIPT_BYTES) throw new DirectiveCheckpointError(`${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
+    if (this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError(`${this.scope} exceeds the entry inspection limit`);
+  }
   /** The turn's next line, or undefined at its end. */
   next(): string | undefined {
     const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, `${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
@@ -203,27 +228,29 @@ class NativeTurn {
  * id; undefined past the turn's end. */
 type PiTurn = (index: number) => NativeEntry | 'malformed' | undefined;
 /** A pi transcript split after its `baseline` entry (after the header when
- * null). Entries through the split are kept only as their ids. */
+ * null). Entries through the split are kept only as their ids and parent ids. */
 interface PiTranscript {
   readonly header: NativeEntry | null;
-  /** Every id through the baseline, the header's included. */
-  readonly ids: ReadonlySet<string>;
+  /** Every id through the baseline, the header's included, to its parent id. */
+  readonly parentIds: ReadonlyMap<string, string | null>;
   /** An entry through the baseline has no unique, non-empty id. */
   readonly malformed: boolean;
   /** Null without the baseline. */
   readonly turn: PiTurn | null;
   /** The turn ended at the last entry read (see NativeTurn.end). */
   readonly endTurn: () => void;
+  /** Takes back endTurn (see NativeTurn.resume). */
+  readonly resumeTurn: () => void;
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
     const lines = new NativeLines(fd, 0);
     const first = lines.nextEntry();
     const header = first === null ? null : JSON.parse(first) as NativeEntry | null;
-    const ids = new Set<string>();
-    if (typeof header?.id === 'string') ids.add(header.id);
+    const parentIds = new Map<string, string | null>();
+    if (typeof header?.id === 'string') parentIds.set(header.id, null);
     const fresh = (entry: NativeEntry | null, seen?: ReadonlySet<string>): entry is NativeEntry =>
-      !!entry && typeof entry.id === 'string' && entry.id !== '' && !ids.has(entry.id) && !seen?.has(entry.id);
+      !!entry && typeof entry.id === 'string' && entry.id !== '' && !parentIds.has(entry.id) && !seen?.has(entry.id);
     let malformed = false;
     let found = first !== null && baseline === null;
     while (!found) {
@@ -231,12 +258,12 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       if (line === null) break;
       const entry = JSON.parse(line) as NativeEntry | null;
       if (!fresh(entry)) { malformed = true; continue; }
-      ids.add(entry.id);
+      parentIds.set(entry.id, entry.parentId ?? null);
       found = entry.id === baseline;
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, ids, malformed, turn: null, endTurn: () => {} });
+      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {} });
     }
     const after = new NativeTurn(fd, lines.end, tail);
     const seen = new Set<string>();
@@ -250,8 +277,121 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       }
       return entries[index];
     };
-    return inspect({ header, ids, malformed, turn, endTurn: () => after.end() });
+    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume() });
   });
+}
+/** One inspection's parent links: the turn entries it has walked, over the
+ * prefix's links, which are shared and never copied. */
+class PiAncestry {
+  private readonly turn = new Map<string, string | null>();
+  /** The walked compactions; the prefix keeps no entry types. */
+  private readonly compactions = new Set<string>();
+  private readonly prefix: ReadonlyMap<string, string | null>;
+  private readonly headerId: string | undefined;
+  constructor({ header, parentIds }: Pick<PiTranscript, 'header' | 'parentIds'>) { this.prefix = parentIds; this.headerId = header?.id; }
+  link(entry: NativeEntry): void {
+    this.turn.set(entry.id, entry.parentId ?? null);
+    if (entry.type === 'compaction') this.compactions.add(entry.id);
+  }
+  isCompaction(id: string): boolean { return this.compactions.has(id); }
+  /** True only when `candidateId` is on the parent chain active at `parentId`.
+   * Known sibling entries and the session header are not checkpoint ancestry. */
+  isActiveAncestor(candidateId: string, parentId: string): boolean {
+    if (candidateId === this.headerId) return false;
+    const visited = new Set<string>();
+    for (let current: string | null | undefined = parentId; typeof current === 'string' && !visited.has(current);
+      current = this.turn.has(current) ? this.turn.get(current) : this.prefix.get(current)) {
+      if (current === candidateId) return true;
+      visited.add(current);
+    }
+    return false;
+  }
+}
+/**
+ * Pi compacts a long session automatically (#481): before a prompt, between a
+ * completed tool round and the next model call, and after a run's final
+ * assistant. It appends a `compaction` entry whose summary stands in for older
+ * context in the model's next request. It runs no tool and sends no message,
+ * so one linked directly on the active chain is walked past, not refused as a
+ * branch. Its kept entry may lie after the directive's own user entry: the
+ * directive text then leaves the model's context but stays in the transcript,
+ * and GC correlates effects, never model context. `fromHook: false` marks a
+ * Pi-authored summary: automatic, or a manual compact, which GC runs only on
+ * an idle session and so never inside a live turn; it does not by itself
+ * prove "automatic". Returns why `entry` is not such a compaction, or null
+ * when it is.
+ */
+function linkedCompactionRefusal(entry: NativeEntry, parentId: string | null, ancestry: PiAncestry): string | null {
+  if (parentId === null || entry.parentId !== parentId) return 'native compaction is not linked to the active checkpoint';
+  // The SDK GC ships (^0.85.1) always writes fromHook; without it, refused.
+  if (entry.fromHook === true) return 'native compaction summary was authored by an extension hook';
+  if (entry.fromHook !== false) return 'native compaction hook marker is malformed';
+  if (typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '') return 'native compaction lacks a timestamp';
+  if (typeof entry.summary !== 'string' || entry.summary.trim() === '') return 'native compaction lacks a summary';
+  if (typeof entry.tokensBefore !== 'number' || !Number.isFinite(entry.tokensBefore) || entry.tokensBefore < 0) return 'native compaction token count is malformed';
+  if (typeof entry.firstKeptEntryId !== 'string' || !ancestry.isActiveAncestor(entry.firstKeptEntryId, parentId)) return 'native compaction keeps an entry off the active chain';
+  // Only the compactions this inspection linked are known: the prefix keeps no entry types.
+  if (ancestry.isCompaction(entry.firstKeptEntryId)) return 'native compaction keeps another compaction, not a message';
+  return null;
+}
+/** Inside a directive's turn Pi compacts only after a completed tool round,
+ * before the next model call: never inside a round or before the first call. */
+function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openToolCalls: number, ancestry: PiAncestry): string | null {
+  if (openToolCalls > 0) return 'native compaction interrupts an open tool round';
+  if (previous.type !== 'message' || previous.message?.role !== 'toolResult') return 'native compaction does not follow a completed tool round';
+  return linkedCompactionRefusal(entry, previous.id, ancestry);
+}
+/** Pi's compact-and-retry: an `error` or `length` reply, a compaction linked
+ * on it, and a reply continued from that compaction (`agent.continue()`, no
+ * prompt). The failed reply ran no tool: tool calls in it never executed and
+ * are inert history, never pending. `after(1)` and `after(2)` are the entries
+ * that follow `reply`, read only for such a reply. Returns that compaction;
+ * the named refusal when the compaction on such a reply is not Pi's; null
+ * when nothing continued `reply`. */
+function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
+  if (reply.message?.role !== 'assistant' || !['error', 'length'].includes(String(reply.message.stopReason))) return null;
+  const compaction = after(1);
+  if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
+  const refusal = linkedCompactionRefusal(compaction, reply.id, ancestry);
+  if (refusal !== null) return refusal;
+  const retried = after(2);
+  if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
+  return compaction;
+}
+/** The level Pi's session records in a thinking_level_change: what
+ * setThinkingLevel was given, or clamped to (through Pi's own nested copies). */
+type PiRecordedThinkingLevel = Parameters<AgentSession['setThinkingLevel']>[0];
+/** Every level a Pi thinking_level_change can record: GC's own, and off.
+ * Typecheck proves it is both pi-ai's ModelThinkingLevel and the level Pi
+ * records, each both ways, so a Pi upgrade that adds a level fails the build
+ * instead of stranding directives UNKNOWN: `satisfies` refuses a level
+ * either lacks, and the declared type below turns to never while either has
+ * one the list lacks. */
+const PI_THINKING_CONTROL_LEVEL_LIST = ['off', ...PI_THINKING_LEVELS] as const satisfies readonly (ModelThinkingLevel & PiRecordedThinkingLevel)[];
+const PI_THINKING_CONTROL_LEVELS: [Exclude<ModelThinkingLevel | PiRecordedThinkingLevel, (typeof PI_THINKING_CONTROL_LEVEL_LIST)[number]>] extends [never]
+  ? readonly string[] : never = PI_THINKING_CONTROL_LEVEL_LIST;
+/** Why `control`, after a completed checkpoint, is not one Pi links on `tip`:
+ * a model or thinking-level change, or an automatic compaction that does not
+ * follow another. Null when it is. */
+function controlRefusal(control: NativeEntry, tip: NativeEntry, ancestry: PiAncestry): string | null {
+  if (control.type === 'compaction') return tip.type === 'compaction' ? 'native compaction follows another compaction' : linkedCompactionRefusal(control, tip.id, ancestry);
+  if (control.parentId !== tip.id) return 'native control is not linked to the completed checkpoint';
+  if (control.type === 'model_change' &&
+      (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim())) return 'native model control is malformed';
+  if (control.type === 'thinking_level_change' &&
+      (typeof control.thinkingLevel !== 'string' || !PI_THINKING_CONTROL_LEVELS.includes(control.thinkingLevel))) return 'native thinking-level control is malformed';
+  return null;
+}
+/** Where a directive's user receipt is: directly after its baseline, or after
+ * Pi's pre-prompt compaction linked on the baseline. A compaction there that
+ * is not that evidence is refused by its reason. */
+function piReceiptAt(turn: PiTurn, baseline: string | null, ancestry: PiAncestry): { readonly index: number; readonly parentId: string | null } | string {
+  const first = turn(0);
+  if (typeof first !== 'object' || first.type !== 'compaction') return { index: 0, parentId: baseline };
+  const refusal = linkedCompactionRefusal(first, baseline, ancestry);
+  if (refusal !== null) return refusal;
+  ancestry.link(first);
+  return { index: 1, parentId: first.id };
 }
 /** Header facts come from the first line alone. They identify a session/cwd,
  * never admission, completion or work authority. */
@@ -327,39 +467,45 @@ function readDirectiveBindings(file: string): readonly DirectiveNativeBinding[] 
 export function readDirectiveBinding(file: string, requestId: string): DirectiveNativeBinding | null {
   return readDirectiveBindings(file).find((row) => row.identity.requestId === requestId) ?? null;
 }
-/** Reads only the few entries after the checkpoint (#469); a read refusal
- * propagates, a binding that does not read back is no later request. */
-function hasLaterBoundRequest(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number): boolean {
+const UNBOUND_TAIL = 'native entries follow the correlated terminal checkpoint without a distinct bound request';
+/** Why the entries after a completed checkpoint are not a later request's own
+ * durably bound admission, or null when they are. Reads only the few entries
+ * after the checkpoint (#469); a read refusal propagates, a binding that does
+ * not read back is no later request. */
+function laterBoundRequestRefusal(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): string | null {
   const checkpoint = native(checkpointIndex);
-  if (typeof checkpoint !== 'object') return false;
-  let baseline = checkpoint.id;
+  if (typeof checkpoint !== 'object') return UNBOUND_TAIL;
+  let tip = checkpoint;
   let nextIndex = checkpointIndex + 1;
-  // These controls change the NEXT request's model, not the completed
-  // request's ancestry. No branch, compaction or unbound effect is skipped.
-  for (let control = native(nextIndex); typeof control === 'object' && (control.type === 'model_change' || control.type === 'thinking_level_change'); control = native(nextIndex)) {
-    if (control.parentId !== baseline || control.type === 'model_change' &&
-        (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim()) ||
-        control.type === 'thinking_level_change' && (typeof control.thinkingLevel !== 'string' ||
-          !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return false;
-    baseline = control.id;
+  // These controls change the NEXT request's model, or compact the model's
+  // context (Pi's post-run and pre-prompt compaction), not the completed
+  // request's ancestry. No branch or unbound effect is skipped.
+  for (let control = native(nextIndex); typeof control === 'object' && ['model_change', 'thinking_level_change', 'compaction'].includes(control.type); control = native(nextIndex)) {
+    const refusal = controlRefusal(control, tip, ancestry);
+    if (refusal !== null) return refusal;
+    ancestry.link(control);
+    tip = control;
     nextIndex += 1;
   }
   const immediate = native(nextIndex);
-  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== baseline || !Array.isArray(immediate.message.content)) return false;
+  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== tip.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
+  // The later binding's baseline is the receipt's parent, or the entry Pi
+  // compacted on before that prompt (see piReceiptAt).
+  const baselines = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];
   try {
     const hash = contentHash(immediate.message.content);
     const matching = readDirectiveBindings(file).filter((candidate) => candidate.identity.requestId !== identity.requestId &&
-      candidate.identity.jobId === identity.jobId && candidate.baseline === baseline && candidate.promptHash === hash &&
+      candidate.identity.jobId === identity.jobId && baselines.includes(candidate.baseline) && candidate.promptHash === hash &&
       (candidate.userEntryId === null || candidate.userEntryId === immediate.id));
     const named = matching.filter((candidate) => candidate.userEntryId === immediate.id);
     // Prefer the real published native association. Without one, only a
     // unique exact preparation can be read back; identical rejected/later
     // preparations are ambiguous, never fabricated into another admission.
     const candidate = named.length === 1 ? named[0] : named.length === 0 && matching.length === 1 ? matching[0] : undefined;
-    if (candidate === undefined) return false;
+    if (candidate === undefined) return UNBOUND_TAIL;
     const admitted = inspectDirectiveAdmission(file, candidate.identity);
-    return admitted.userEntryId === immediate.id && isDeepStrictEqual(admitted, { ...candidate, userEntryId: immediate.id });
-  } catch { return false; }
+    return admitted.userEntryId === immediate.id && isDeepStrictEqual(admitted, { ...candidate, userEntryId: immediate.id }) ? null : UNBOUND_TAIL;
+  } catch { return UNBOUND_TAIL; }
 }
 /** Admission is a prefix fact, independent of later unfinished/unknown effects.
  * Read only through the exact user receipt, never infer admission from a shape. */
@@ -369,29 +515,36 @@ export function inspectDirectiveAdmission(file: string, identity: DirectiveTurnI
   if (binding === null || !isDeepStrictEqual(binding.identity, identity)) throw new DirectiveCheckpointError('exact native admission association unavailable');
   if (binding.runtime === 'claude-code') return inspectClaudeDirectiveAdmission(file, binding);
   if (binding.runtime !== 'pi') throw new DirectiveCheckpointError('exact native admission association unavailable');
-  return withPiTranscript(file, binding.baseline, 'accepted', (transcript) => admitPiDirective(file, binding, transcript));
+  return withPiTranscript(file, binding.baseline, 'accepted', (transcript) => admitPiDirective(file, binding, transcript).admitted);
 }
-/** Pi admission: the exact user receipt directly after the baseline, the
- * turn's first entry and the only one read. */
-function admitPiDirective(file: string, binding: DirectiveNativeBinding, { header, malformed, turn }: PiTranscript): DirectiveNativeBinding {
+/** Pi admission: the exact user receipt directly after the baseline, or
+ * after Pi's pre-prompt compaction linked on it; the last entry read.
+ * `receipt` is its index in the turn. */
+function admitPiDirective(file: string, binding: DirectiveNativeBinding, transcript: PiTranscript, ancestry = new PiAncestry(transcript)): { readonly admitted: DirectiveNativeBinding; readonly receipt: number } {
+  const { header, malformed, turn } = transcript;
   if (header?.type !== 'session' || header.id !== binding.sessionId) throw new DirectiveCheckpointError('native admission session identity mismatch');
   if (malformed) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
-  const entry = turn?.(0);
+  if (turn === null) throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
+  const at = piReceiptAt(turn, binding.baseline, ancestry);
+  if (typeof at === 'string') throw new DirectiveCheckpointError(at);
+  const entry = turn(at.index);
   if (entry === undefined) throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
   if (entry === 'malformed') throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
-  if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== binding.baseline || !Array.isArray(entry.message.content) ||
+  if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== at.parentId || !Array.isArray(entry.message.content) ||
       contentHash(entry.message.content) !== binding.promptHash || binding.userEntryId !== null && binding.userEntryId !== entry.id) {
     throw new DirectiveCheckpointError('actual native admission user receipt unavailable/changed');
   }
   syncFile(file);
   const admitted = { ...binding, userEntryId: entry.id };
   if (binding.userEntryId === null) appendBinding(admitted);
-  return admitted;
+  return { admitted, receipt: at.index };
 }
 
 /** Native transcript readback owns proof. Pi entries are tree-linked: only
- * the exact direct user child of the prepared baseline is admitted. A
- * missing result, branch/compaction or another prompt refuses continuation. */
+ * the exact user child of the prepared baseline, or of Pi's compaction linked
+ * on it, is admitted. Each linked Pi compaction (see linkedCompactionRefusal)
+ * is walked past; a missing result, a branch, another control, an unlinked or
+ * malformed compaction, or another prompt refuses continuation. */
 export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurnIdentity): DirectiveCheckpoint {
   validateDirectiveIdentity(identity);
   const binding = readDirectiveBinding(file, identity.requestId);
@@ -403,16 +556,20 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
 }
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
-function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
+function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, transcript: PiTranscript): DirectiveCheckpoint {
+  const { header, malformed, turn: native, endTurn, resumeTurn } = transcript;
   const { identity } = binding;
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
   const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
   if (header?.type !== 'session' || header.id !== binding.sessionId) return unknown('native session identity mismatch');
   if (malformed) return unknown(MALFORMED);
   if (native === null) return unknown('native baseline unavailable');
-  const user = native(0);
+  const ancestry = new PiAncestry(transcript);
+  const at = piReceiptAt(native, binding.baseline, ancestry);
+  if (typeof at === 'string') return unknown(at);
+  const user = native(at.index);
   if (user === 'malformed') return unknown(MALFORMED);
-  if (user?.type !== 'message' || user.message?.role !== 'user' || user.parentId !== binding.baseline ||
+  if (user?.type !== 'message' || user.message?.role !== 'user' || user.parentId !== at.parentId ||
       contentHash(user.message.content) !== binding.promptHash || !user.id) return unknown('actual native request receipt unavailable');
   if (binding.userEntryId !== null && user.id !== binding.userEntryId) return unknown('native request receipt changed');
   // The native receipt is durably flushed before the product admission callback.
@@ -420,36 +577,68 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
   const admitted = { ...binding, userEntryId: user.id };
   if (binding.userEntryId === null) appendBinding(admitted);
   if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
-  let parent = user.id;
+  ancestry.link(user);
+  let previous: NativeEntry = user;
   const pending = new Map<string, string>();
   let lastMessage = user.message;
-  let terminal = false;
+  let terminal: { readonly index: number; readonly id: string } | null = null;
+  const completed = ({ id }: { readonly id: string }): DirectiveCheckpoint => {
+    const ok = lastMessage.stopReason === 'stop';
+    return { state: 'terminal', binding: admitted, checkpointId: id, ok,
+      error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
+  };
   // A tool error the turn went on to answer is ordinary work (a failing test,
   // a grep with no match). One it never answered may be an interrupted effect.
   let unanswered = false;
-  for (let index = 1; ; index += 1) {
+  for (let index = at.index + 1; ; index += 1) {
     const entry = native(index);
     if (entry === undefined) break;
     if (entry === 'malformed') return unknown(MALFORMED);
-    if (terminal) {
+    if (terminal !== null) {
+      // Pi's post-run compaction follows the final assistant directly. It is
+      // lookahead: the terminal it follows stays this turn's checkpoint.
+      if (index === terminal.index + 1 && entry.type === 'compaction') {
+        const refusal = linkedCompactionRefusal(entry, previous.id, ancestry);
+        if (refusal !== null) return unknown(refusal);
+        ancestry.link(entry);
+        previous = entry;
+        continue;
+      }
       // A later user entry is not part of this completed turn when its own
       // distinct, durably read-back admission binds it. Keep the earlier
       // checkpoint readable without treating an unbound/replayed user tail
       // as proof that the old request completed.
-      if (hasLaterBoundRequest(file, native, identity, index - 1)) {
-        const ok = lastMessage.stopReason === 'stop';
-        return { state: 'terminal', binding: admitted, checkpointId: parent, ok,
-          error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
-      }
-      return unknown('native entries follow the correlated terminal checkpoint without a distinct bound request');
+      const refusal = laterBoundRequestRefusal(file, native, identity, terminal.index, ancestry);
+      return refusal === null ? completed(terminal) : unknown(refusal);
     }
-    if (entry.type !== 'message' || entry.parentId !== parent || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
-    parent = entry.id;
+    if (entry.type === 'compaction') {
+      const refusal = turnCompactionRefusal(entry, previous, pending.size, ancestry);
+      if (refusal !== null) return unknown(refusal);
+      ancestry.link(entry);
+      previous = entry;
+      continue;
+    }
+    if (entry.type !== 'message' || entry.parentId !== previous.id || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
+    ancestry.link(entry);
+    previous = entry;
     const message = entry.message;
     if (message.role === 'assistant') {
       if (pending.size > 0) return unknown('assistant advanced without complete native tool results');
       unanswered = false;
       if (!Array.isArray(message.content)) return unknown('malformed native assistant');
+      // Unless Pi continued it, an error or length reply is the terminal: what
+      // follows is read as lookahead, and taken back into the turn if it is.
+      const retry = compactAndRetryCompaction(entry, (offset) => { endTurn(); return native(index + offset); }, ancestry);
+      if (typeof retry === 'string') return unknown(retry);
+      if (retry !== null) {
+        resumeTurn();
+        // The failed reply is history; the turn continues on the compaction.
+        ancestry.link(retry);
+        previous = retry;
+        index += 1;
+        lastMessage = message;
+        continue;
+      }
       for (const block of message.content as Record<string, unknown>[]) {
         if (block.type !== 'toolCall') continue;
         if (message.stopReason !== 'toolUse' || typeof block.id !== 'string' || block.id === '' || typeof block.name !== 'string' || typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) return unknown('malformed native tool identity');
@@ -457,7 +646,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       }
       if (pending.size === 0) {
         if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
-        terminal = true;
+        terminal = { index, id: entry.id };
         // Whatever follows (a later request, its controls) is lookahead.
         endTurn();
       }
@@ -470,13 +659,9 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
     lastMessage = message;
   }
   if (pending.size > 0) return unknown('native tool effects/results are incomplete');
-  if (lastMessage.role === 'assistant') {
-    const ok = lastMessage.stopReason === 'stop';
-    return { state: 'terminal', binding: admitted, checkpointId: parent, ok,
-      error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
-  }
+  if (terminal !== null) return completed(terminal);
   if (unanswered) return unknown('native tool error the turn never answered requires a recovery judgment');
-  return { state: 'resumable', binding: admitted, checkpointId: parent };
+  return { state: 'resumable', binding: admitted, checkpointId: previous.id };
 }
 
 /**
@@ -921,17 +1106,18 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   if (prepared === null || !isDeepStrictEqual(prepared.identity, identity) || prepared.runtime !== 'pi') {
     throw new DirectiveCheckpointError('exact native admission association unavailable');
   }
-  const refuse = (): never => { throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'); };
-  // One read (#469): the admission and the live turn, receipt first, every
-  // entry with its own unique id.
-  const { binding, native } = withPiTranscript(file, prepared.baseline, 'whole', (transcript) => {
-    const admitted = admitPiDirective(file, prepared, transcript);
+  const refuse = (reason = 'native tool intent is not persisted before execution or its invocation/results changed'): never => { throw new DirectiveCheckpointError(reason); };
+  // One read (#469): the admission and the live turn, receipt first (after
+  // Pi's pre-prompt compaction, if any), every entry with its own unique id.
+  const { binding, native, receipt, ancestry } = withPiTranscript(file, prepared.baseline, 'whole', (transcript) => {
+    const ancestry = new PiAncestry(transcript);
+    const { admitted, receipt } = admitPiDirective(file, prepared, transcript, ancestry);
     const entries: NativeEntry[] = [];
     for (let entry = transcript.turn!(0); entry !== undefined; entry = transcript.turn!(entries.length)) {
       if (entry === 'malformed') refuse();
       entries.push(entry as NativeEntry);
     }
-    return { binding: admitted, native: entries };
+    return { binding: admitted, native: entries, receipt, ancestry };
   });
   let index = native.length - 1;
   // Sequential batches persist results between preparations; the pinned SDK
@@ -959,15 +1145,34 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     pending.delete(id as string);
     parent = result.id;
   }
-  if (native[0]?.id !== binding.userEntryId || index < 1) refuse();
-  let ancestor = binding.userEntryId;
+  if (native[receipt]?.id !== binding.userEntryId || index <= receipt) refuse();
+  let previous = native[receipt]!;
+  ancestry.link(previous);
   const chainPending = new Map<string, string>();
-  for (const entry of native.slice(1)) {
+  for (let at = receipt + 1; at < native.length; at += 1) {
+    const entry = native[at]!;
     const message = entry.message;
-    if (entry.type !== 'message' || entry.parentId !== ancestor || !message) refuse();
-    ancestor = entry.id;
+    if (entry.type === 'compaction') {
+      const refusal = turnCompactionRefusal(entry, previous, chainPending.size, ancestry);
+      if (refusal !== null) refuse(refusal);
+      ancestry.link(entry);
+      previous = entry;
+      continue;
+    }
+    if (entry.type !== 'message' || entry.parentId !== previous.id || !message) refuse();
+    ancestry.link(entry);
+    previous = entry;
     if (message!.role === 'assistant') {
-      if (chainPending.size > 0 || message!.stopReason !== 'toolUse' || !Array.isArray(message!.content)) refuse();
+      if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
+      const retry = compactAndRetryCompaction(entry, (offset) => native[at + offset], ancestry);
+      if (typeof retry === 'string') refuse(retry);
+      else if (retry !== null) {
+        ancestry.link(retry);
+        previous = retry;
+        at += 1;
+        continue;
+      }
+      if (message!.stopReason !== 'toolUse') refuse();
       for (const block of message!.content as Record<string, unknown>[]) {
         if (block.type !== 'toolCall') continue;
         if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();

@@ -1105,6 +1105,9 @@ describe('board engine — managed repository overview wiring', () => {
     // production tracker stayed green without this pin.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(/createManagedRepoOverviewTracker\(config,/);
+    // GitLab rows (#480) are observed only through the wired glab port;
+    // without it every production GitLab row reads "not wired".
+    expect(mainSource).toContain('gitlabApi: new GitLabRepoOverviewApi(),');
     expect(mainSource).toContain(
       'const resolveIntakeRepos = createManagedRepoIntakeResolver(config.workspaceRoot, config.managedRepos);',
     );
