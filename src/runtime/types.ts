@@ -296,12 +296,13 @@ export type RuntimeEvent =
       readonly fatal: boolean;
       /** A native directive refusal (#485): the turn failed with a
        * DirectiveCheckpointError GC raised for its own directive control —
-       * its fences and authority checks, its protocol checks, and every GC
-       * directive bookkeeping I/O call (transcript, binding, receipt,
-       * producer journal, and the GC ledger calls `beforeAdmission` and
-       * `onAdmitted`), a GC bug inside those calls included — or with the
+       * its fences and authority checks, its protocol checks, and its
+       * directive bookkeeping I/O inside a turn (transcript, binding,
+       * receipt, producer journal, and the GC ledger calls `beforeAdmission`
+       * and `onAdmitted`), a GC bug inside those calls included — or with the
        * AggregateError that replaced one whose receipt could not be
-       * journaled. An error from code GC does not own (an extension hook, the
+       * journaled. The pre-turn checks reject the prompt before any event,
+       * so they carry no tag (see `isNativeDirectiveRefusal`). An error from code GC does not own (an extension hook, the
        * SDK, the provider), or GC's wrapper around one, never carries it (see
        * `isNativeDirectiveRefusal`). Pi correlates the failure with the
        * refusals it recorded: by object identity while it holds the thrown
