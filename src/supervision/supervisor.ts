@@ -1793,7 +1793,7 @@ export class Supervisor {
    * authoritative: Jev classifies the signature only and can never grant a
    * restart past these guards — an `act`-band restart_advised with requireConfirm
    * still stops for a human, and known auth/quota walls always stop without
-   * burning rungs, whatever the model answers. */
+   * burning rungs: a known wall stops before any decision is asked (#492). */
   private async evaluateRecovery(
     agent: SupervisedAgent,
     reason: string,
@@ -1825,6 +1825,26 @@ export class Supervisor {
       } else if (allowRestart) {
         await this.restartRung(agent, reason);
       }
+      return;
+    }
+    if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
+      // A known wall stops now, before any decision is awaited (#492): no
+      // answer can change its action (supervisionGuidance stops on a wall
+      // unconditionally), and a directive's recovery can dispose the handle
+      // while one is pending, which left the stale answer to void the stop.
+      this.ledger.appendCustomEvent({
+        kind: 'supervision.guidance',
+        agentId: agent.agentId,
+        payload: {
+          class: deterministicClass,
+          restart_advised: false,
+          restart_authorized: false,
+          source: 'deterministic_guard',
+          route: 'fallback',
+          requires_confirm: false,
+        },
+      });
+      this.stopForGuidance(agent, deterministicClass, source, recovery);
       return;
     }
     if (agent.decisionPending) {

@@ -126,6 +126,7 @@ function renderDecisions(
     '#                         off or shadow today: no registered backtest, so enforce rejects every',
     '#                         Jev ask (the deterministic answer still serves) and opens an owner incident',
     '#   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)',
+    '#                         a known auth or quota wall stops at once, without asking',
     '#                         off or shadow today: no registered backtest, so enforce rejects every',
     '#                         Jev ask (the deterministic answer still serves) and opens an owner incident',
     '#                         (its host asks even with the master switch off, so this incident opens then too)',

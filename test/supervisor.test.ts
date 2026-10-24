@@ -2637,11 +2637,13 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
           return;
         }
         answers[0]!(); await flushMicrotasks();
-        if (kind === 'queued' || kind === 'stop') {
+        if (kind === 'queued') {
           expect(answers).toHaveLength(2);
           expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
           answers[1]!(); await flushMicrotasks();
         }
+        // A known wall stops without a decision of its own (#492).
+        if (kind === 'stop') expect(answers).toHaveLength(1);
       }
       if (kind === 'stop') {
         expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
@@ -2758,9 +2760,10 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
           return;
         }
         answers[0]!(); await flushMicrotasks();
-        expect(answers).toHaveLength(2);
+        // A known wall stops without a decision of its own (#492).
+        expect(answers).toHaveLength(kind === 'stop' ? 1 : 2);
         expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
-        answers[1]!(); await flushMicrotasks();
+        answers[1]?.(); await flushMicrotasks();
       }
       if (kind === 'stop' || kind === 'exhausted' || kind === 'internal') {
         const wall = kind === 'stop' ? 'authentication_wall' : 'quota_wall';
@@ -3181,21 +3184,46 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
-  it('does not let the adapter error -> state:error -> turn_end sequence stale its pending wall classification', async () => {
-    let release!: () => void;
+  it('a wall on a directive turn still stops when directive recovery disposes the handle while a decision would be pending (#492)', async () => {
+    const answers: (() => void)[] = [];
     const decide = vi.fn((request: Parameters<DecisionService['decide']>[0]) =>
       new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
-        release = () => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+        answers.push(() => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled')));
       }));
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-directive-wall', null);
+    handle.pendingTurnSnapshot = { text: 'directive prompt', owner: 'silas-directive:wall-request' };
+    h.registry.adopt(handle);
+    handle.emit({ type: 'turn_start' });
+    handle.emit({ type: 'error', error: 'API Error: 401 Invalid authentication credentials', fatal: false });
+    // The directive's prompt rejected: its recovery disposes the handle at once.
+    await h.registry.disposeHandle(handle);
+    for (const answer of answers) answer();
+    await flushMicrotasks();
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    const kinds = h.api.listEvents({ limit: 50 }).filter((row) => row.agentId === handle.id).map((row) => row.kind);
+    expect(kinds).toEqual(expect.arrayContaining(['supervision.guidance', 'supervision.escalated']));
+    expect(h.api.listEvents({ limit: 50 }).find((row) => row.kind === 'supervision.guidance')?.payload).toEqual({
+      class: 'authentication_wall', restart_advised: false, restart_authorized: false,
+      source: 'deterministic_guard', route: 'fallback', requires_confirm: false,
+    });
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(decide).not.toHaveBeenCalled();
+    h.dispose();
+  });
+
+  it('a known wall stops before any decision, and the adapter error -> state:error -> turn_end sequence cannot stale it (#492)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
     const h = boot({ decide } as unknown as DecisionService);
     const handle = new FakeHandle('perkins', 'perkins-error-state-pair', null);
     h.registry.adopt(handle);
     handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
-    await vi.waitFor(() => expect(decide).toHaveBeenCalledOnce());
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
     handle.setState('error', 'HTTP 401 unauthorized');
     handle.emit({ type: 'turn_end' });
-    release();
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(decide).not.toHaveBeenCalled();
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
     h.dispose();
   });
@@ -3286,8 +3314,9 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.registry.adopt(handle);
     const spawns = h.registry.spawnCalls.length;
     handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
-    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    // The known wall is decided by code: the unsafe advice is never even asked for (#492).
+    expect(decide).not.toHaveBeenCalled();
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
     const guidance = h.api.listEvents({ limit: 50 }).find((row) => row.kind === 'supervision.guidance');
