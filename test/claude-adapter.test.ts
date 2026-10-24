@@ -2,8 +2,8 @@ import { PassThrough } from 'node:stream';
 import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { EventEmitter } from 'node:events';
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { EventEmitter, once } from 'node:events';
+import { appendFileSync, closeSync, constants as fsConstants, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -40,7 +40,7 @@ import {
   type StreamFrame,
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveBookkeepingError, DirectiveCheckpointError, inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
@@ -103,6 +103,9 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
   'CLAUDE_DOUBLE_REPLAY',
+  'CLAUDE_DOUBLE_API_ERROR_HOLD',
+  'CLAUDE_DOUBLE_TERM_RESULT',
+  'CLAUDE_DOUBLE_REPLAY_AFTER_TOOL',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -1532,9 +1535,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const sessionDir = fx.store.sessionDirFor('perkins', fx.workspace);
     mkdirSync(dirname(sessionDir), { recursive: true });
     writeFileSync(sessionDir, 'not a directory');
-    // Confine bridge temp dirs to this test's own TMPDIR: the assertion can
-    // never observe a concurrent worker's live bridge.
-    const bridgeTmp = mkdtempSync(join(tmpdir(), 'claude-bridge-tmp-'));
+    // Confine bridge temp dirs to this test's own directory. On Unix the
+    // bridge uses an AF_UNIX socket whose path limit is short; the hosted
+    // worker's default TMPDIR plus its private subdirectory can exceed it.
+    const bridgeTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
+    const bridgeTmp = mkdtempSync(join(bridgeTmpRoot, 'claude-bridge-tmp-'));
     cleanupDirs.push(bridgeTmp);
     const previousTmpdir = process.env['TMPDIR'];
     process.env['TMPDIR'] = bridgeTmp;
@@ -2652,6 +2657,813 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
+    it('a tool-fence refusal is tagged whether GC\'s authority check refuses or faults (#485)', async () => {
+      const message = 'directive authority is terminal, held or superseded — no work may proceed';
+      for (const typed of [true, false]) {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const events: RuntimeEvent[] = [];
+        handle.subscribe((event) => events.push(event));
+        let checks = 0;
+        const refusal = typed ? new DirectiveCheckpointError(message) : new Error(message);
+        try {
+          await expect(handle.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor(`claude-local-control-${String(typed)}`),
+            beforeAdmission: () => { if (++checks > 1) throw refusal; }, onAdmitted: () => {} } }))
+            .rejects.toThrow(/directive refused/u);
+          // The authority check is GC's own ledger call: its fault is a refusal too, named for the call.
+          expect(events.filter((event) => event.type === 'error'), String(typed)).toEqual([{ type: 'error',
+            error: `directive refused: ${typed ? '' : 'directive bookkeeping failed: authority check: '}${message}`, fatal: false, nativeControl: 'directive-refusal' }]);
+          expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+        } finally { await handle.dispose(); }
+      }
+    });
+
+    it('a process failure reported while a refusal is still pending is the process\'s own failure, never tagged (#485)', async () => {
+      const spawnProcess = ((binary: string, args: readonly string[], options: object) => {
+        const child = spawn(binary, args, options);
+        const stdin = child.stdin as unknown as { write: (chunk: unknown, ...rest: unknown[]) => boolean };
+        const write = stdin.write.bind(stdin);
+        let faulted = false;
+        stdin.write = (chunk, ...rest) => {
+          const written = write(chunk, ...rest);
+          // The fence's deny is written; the refusal's own failure is still queued behind it.
+          if (!faulted && String(chunk).includes('"behavior":"deny"')) { faulted = true; child.emit('error', new Error('synthetic transport fault')); }
+          return written;
+        };
+        return child;
+      }) as unknown as typeof spawn;
+      const fx = fixture({ spawnProcess, killGraceMs: 50 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      let checks = 0;
+      try {
+        await expect(handle.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor('claude-refusal-then-process-failure'),
+          beforeAdmission: () => { if (++checks > 1) throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work may proceed'); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^claude process failed: Error: synthetic transport fault$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'claude process failed: Error: synthetic transport fault', fatal: false }]);
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+      } finally { await handle.dispose(); }
+    });
+
+    /** A directive the double answers before its echo: GC refuses it at that first answer (#485). */
+    const answeredBeforeEcho = async (prompt: string, knobs: Readonly<Record<string, string>>, killGraceMs = 100) => {
+      const fx = fixture({ killGraceMs });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'claude-opus-5-5' });
+      const events = collect(handle);
+      Object.assign(process.env, { CLAUDE_DOUBLE_ECHO: 'skip', ...knobs });
+      try {
+        await expect(handle.prompt(prompt, { directive: { identity: identityFor(`claude-before-echo-${prompt.replace(/\W+/gu, '-')}`), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused: the Claude CLI began answering without echoing the directive instruction/u);
+        return { errors: events.filter((event) => event.type === 'error'), file: handle.sessionFile! };
+      } finally { await handle.dispose(); }
+    };
+    const beforeEchoRefusal = { type: 'error', error: expect.stringMatching(/^directive refused: the Claude CLI began answering without echoing/u), fatal: false, nativeControl: 'directive-refusal' };
+    const native = { provider: 'anthropic-claude-native', model: 'claude-opus-5-5' };
+    const usageWall = { type: 'error', error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)", fatal: false, ...native,
+      typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } };
+
+    it('after a refusal, a typed wall in the CLI\'s result is emitted untagged, as an ordinary turn would emit it (#485)', async () => {
+      // The usage-limit wall arrives in the result before the abort lands.
+      const { errors } = await answeredBeforeEcho('usage-limit now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, usageWall]);
+    });
+
+    it('after a refusal, Claude Code 2.1.309\'s failed login (an API error with no HTTP status) is emitted untagged and classifies as authentication_wall (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('auth-error now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      const login = { type: 'error', error: 'Not logged in · Please run /login (authentication_failed)', fatal: false, ...native,
+        typed: { origin: 'provider-message', bodyCode: 'authentication_failed' } };
+      expect(errors).toEqual([beforeEchoRefusal, login]);
+      expect(deterministicFailureClass(login.error)).toBe('authentication_wall');
+      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'assistant', is_api_error_message: true, error: 'authentication_failed' }));
+    });
+
+    it('after a refusal, a text-only API error is emitted untagged, untyped (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('textonly-api-fault now', {});
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'Something went wrong talking to the API', fatal: false }]);
+    });
+
+    it('after a refusal, Claude Code 2.1.309\'s textless API error is emitted by its result\'s status, with a named text (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('textless-api-fault now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'the CLI reported an API error (HTTP 529)', fatal: false, ...native,
+        typed: { origin: 'provider-message', status: 529 } }]);
+    });
+
+    it('after a refusal, a result that alone carries an API status is emitted (#485)', async () => {
+      const { errors } = await answeredBeforeEcho('status-only-result now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, { type: 'error', error: 'API Error: 500 Internal server error (HTTP 500)', fatal: false, ...native,
+        typed: { origin: 'provider-message', status: 500 } }]);
+    });
+
+    it('after a refusal, a blank API-error frame with no result status emits nothing more (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('blank-api-frame now', {});
+      expect(errors).toEqual([beforeEchoRefusal]);
+      expect(frames(file)).toContainEqual(expect.objectContaining({ is_api_error_message: true }));
+    });
+
+    it('when both emit the CLI\'s API error, the refused and the ordinary path word it the same, though its result and its API-error frame differ (#485)', async () => {
+      const wall = { type: 'error', error: 'the result words (HTTP 429, rate_limit)', fatal: false, ...native, typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' } };
+      const { errors } = await answeredBeforeEcho('divergent-api-fault now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, wall]);
+      // The ordinary half runs with the double's own echo and SIGTERM again.
+      delete process.env['CLAUDE_DOUBLE_ECHO'];
+      delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { model: 'claude-opus-5-5' });
+      const events = collect(handle);
+      try {
+        await handle.prompt('divergent-api-fault now');
+        expect(events.filter((event) => event.type === 'error')).toEqual([wall]);
+      } finally { await handle.dispose(); }
+    });
+
+    it('after a refusal, a successful result never lends its text to the API error GC reports (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('limit-then-reply now', { CLAUDE_DOUBLE_IGNORE_TERM: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, usageWall]);
+      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'result', is_error: false, result: 'No response requested.' }));
+    });
+
+    it('after a refusal, a subagent\'s API error is the subagent\'s: no wall is emitted (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('subagent-limit now', {});
+      expect(errors).toEqual([beforeEchoRefusal]);
+      // Not vacuous: the subagent did report its usage-limit API error.
+      expect(frames(file)).toContainEqual(expect.objectContaining({ is_api_error_message: true, parent_tool_use_id: 'toolu_double_task', api_error_status: 429 }));
+    });
+
+    it('after a refusal, the result error GC\'s own abort caused is not re-emitted (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('answer-hold now', { CLAUDE_DOUBLE_TERM_RESULT: '1' });
+      expect(errors).toEqual([beforeEchoRefusal]);
+      // Not vacuous: the CLI did end the aborted turn with an error result.
+      expect(frames(file)).toContainEqual(expect.objectContaining({ type: 'result', subtype: 'error_during_execution', is_error: true }));
+    });
+
+    it('the translator keeps only a main-thread API error, until a real main-thread call goes past it (#485)', () => {
+      const apiErrorFrame = (parent: string | null): StreamFrame => ({ type: 'assistant', parent_tool_use_id: parent, is_api_error_message: true, error: 'rate_limit', api_error_status: 429,
+        message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your limit" }] } });
+      const reply = (parent: string | null, model: string, tokens: number): StreamFrame => ({ type: 'assistant', parent_tool_use_id: parent,
+        message: { role: 'assistant', model, usage: { input_tokens: tokens, output_tokens: 0 }, content: [{ type: 'text', text: 'words' }] } });
+      const subagent = new ClaudeTurnTranslator();
+      expect(subagent.ingest(apiErrorFrame('toolu_subagent'))).toEqual([]);
+      expect(subagent.apiError).toBeNull();
+      const main = new ClaudeTurnTranslator();
+      expect(main.ingest(apiErrorFrame(null))).toEqual([]);
+      expect(main.apiError).toEqual({ text: "You've hit your limit", code: 'rate_limit', status: 429 });
+      // A subagent's reply, and the CLI's own <synthetic> zero-usage reply, leave it standing.
+      main.ingest(reply('toolu_subagent', 'claude-opus-5-5', 12));
+      main.ingest(reply(null, '<synthetic>', 0));
+      expect(main.apiError).not.toBeNull();
+      // A real main-thread call goes past it.
+      main.ingest(reply(null, 'claude-opus-5-5', 12));
+      expect(main.apiError).toBeNull();
+      // Claude Code 2.1.309 writes "(no content)" for a textless API error: no text.
+      const textless = new ClaudeTurnTranslator();
+      textless.ingest({ type: 'assistant', parent_tool_use_id: null, is_api_error_message: true, message: { role: 'assistant', content: [{ type: 'text', text: '(no content)' }] } });
+      expect(textless.apiError).toEqual({ text: '', code: null, status: null });
+    });
+
+    it('after a refusal, an API error whose result the abort cut off is still emitted as the wall it reported (#485)', async () => {
+      const { errors, file } = await answeredBeforeEcho('usage-limit now', { CLAUDE_DOUBLE_API_ERROR_HOLD: '1' });
+      expect(errors).toEqual([beforeEchoRefusal, usageWall]);
+      expect(frames(file)).not.toContainEqual(expect.objectContaining({ type: 'result' }));
+    });
+
+    it('a failed turn that is no refusal reports only its own failure, even when its CLI then reports a wall (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, model: 'claude-opus-5-5' });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_MISMATCH'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('usage-limit now', { directive: { identity: identityFor('claude-foreign-then-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/session id mismatch/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: expect.stringMatching(/^session id mismatch/u), fatal: false }]);
+        // Not vacuous: the CLI did report its typed usage-limit result.
+        expect(readFileSync(handle.sessionFile!, 'utf-8')).toContain('"api_error_status":429');
+      } finally { await handle.dispose(); }
+    });
+
+    it('a refusal recorded at the turn\'s completion is the failure the turn reports, and is tagged (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      try {
+        await expect(handle.prompt('follow it', { directive: { identity: identityFor('claude-completion-authority'), beforeAdmission: () => {},
+          // Authority moves after admission: only the completion step re-checks it.
+          onAdmitted: () => { (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => 'changed manifest'; } } }))
+          .rejects.toThrow(/^directive turn refused: live native directive role\/tools\/model authority changed before completion$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error',
+          error: 'directive turn refused: live native directive role/tools/model authority changed before completion', fatal: false, nativeControl: 'directive-refusal' }]);
+      } finally { await handle.dispose(); }
+    });
+
+    it('the permission channel\'s own deny of a repeated ask is a tagged refusal (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-channel-deny'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^malformed or foreign directive permission request$/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([
+          { type: 'error', error: 'malformed or foreign directive permission request', fatal: false, nativeControl: 'directive-refusal' },
+        ]);
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"reason":"malformed or foreign directive permission request"');
+      } finally { await handle.dispose(); }
+    });
+
+    /** Fails one chunk of this handle's own transcript stream, written alone or in a
+     * batch (a failed batch fails every chunk in it, as Node does). With `holdUntil`,
+     * the failing write's callback waits until a write made after the hold began
+     * finds at least that many frames queued behind it (its batch-mates count, so
+     * a hold whose batch-mates already number that many waits for one more
+     * write), and Node hands each of them the same root error. `sharedRoot`
+     * counts, apart from the hold's own count, the write callbacks that received
+     * that root error object itself: the failing write and every frame behind it.
+     * Once the hold is released, a write made outside a callback that got the
+     * root error waits for that error to land, so exactly the frames queued
+     * before it share it; one made inside such a callback is queued at once, as
+     * Node queues it. A permission request is never held, and one queued with
+     * a hold (written while it is open, or in the held chunk's batch) is
+     * failed: the CLI waits for its answer, so no frame would come to release
+     * the hold. The helper fails such a write with a text naming the misuse,
+     * and the turn that fails on it ends its stream, which releases the hold.
+     * No adapter seam fails a transcript write: the stream comes straight from
+     * node:fs createWriteStream, which only a file-wide vi.mock('node:fs') could
+     * replace, and that would reach every test in this file. */
+    const failTranscriptChunk = (handle: AgentHandle, matches: (chunk: string) => boolean, fault: string, holdUntil = 0) => {
+      const state = { broken: false, queuedBehind: 0, sharedRoot: 0 };
+      const root = new Error(fault);
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        type Chunk = { toString(): string };
+        type Callback = (error?: Error | null) => void;
+        const stream = (handle as unknown as { liveTranscript: { write: (...args: unknown[]) => boolean; end: (...args: unknown[]) => unknown;
+          _writev: (chunks: readonly { chunk: Chunk }[], callback: Callback) => void; _write: (chunk: Chunk, encoding: unknown, callback: Callback) => void } }).liveTranscript;
+        const write = stream._write.bind(stream);
+        const writev = stream._writev.bind(stream);
+        const queue = stream.write.bind(stream);
+        const end = stream.end.bind(stream);
+        let held: Callback | null = null;
+        let released = false;
+        let insideRoot = 0;
+        const permissionRequest = (chunk: string): boolean => (JSON.parse(chunk) as Record<string, unknown>)['type'] === 'control_request';
+        const queuedRefusal = 'failTranscriptChunk refuses a permission request queued behind a held write: the CLI waits for its answer, so no frame comes to release the hold';
+        const release = (): void => {
+          if (held === null) return;
+          const callback = held;
+          held = null;
+          released = true;
+          // Not on setImmediate: some callers hold it with fake timers.
+          process.nextTick(() => callback(root));
+        };
+        // A turn that fails while a hold is open ends its stream: the hold fails then, never hangs.
+        stream.end = (...args) => { release(); return end(...args); };
+        // The chunks after the failing one in its own batch are queued behind it too.
+        const failing = (callback: Callback, behind: number, chunk: string): void => {
+          state.broken = true;
+          if (holdUntil === 0) { callback(root); return; }
+          if (permissionRequest(chunk)) {
+            callback(new Error('failTranscriptChunk refuses holdUntil > 0 on a control_request: the CLI waits for its answer, so no frame comes to release the hold'));
+            return;
+          }
+          held = callback;
+          state.queuedBehind = behind;
+        };
+        stream._write = (chunk, encoding, callback) => {
+          if (!state.broken && matches(chunk.toString())) { failing(callback, 0, chunk.toString()); return; }
+          write(chunk, encoding, callback);
+        };
+        stream._writev = (chunks, callback) => {
+          const at = state.broken ? -1 : chunks.findIndex(({ chunk }) => matches(chunk.toString()));
+          // A permission request in the batch of the chunk to hold, ahead of it or behind.
+          if (at >= 0 && holdUntil > 0 && chunks.some(({ chunk }, index) => index !== at && permissionRequest(chunk.toString()))) {
+            state.broken = true;
+            callback(new Error(queuedRefusal));
+            return;
+          }
+          if (at >= 0) { failing(callback, chunks.length - 1 - at, chunks[at]!.chunk.toString()); return; }
+          writev(chunks, callback);
+        };
+        // Only a write made after the hold began is queued behind it: on an idle
+        // stream the failing chunk itself reaches _write inside its own write().
+        stream.write = (...args) => {
+          const at = args.findIndex((arg) => typeof arg === 'function');
+          const callback = at < 0 ? undefined : args[at] as Callback;
+          const observed: Callback = (error) => {
+            if (error !== root) { callback?.(error); return; }
+            state.sharedRoot += 1;
+            insideRoot += 1;
+            try { callback?.(error); } finally { insideRoot -= 1; }
+          };
+          if (at < 0) args.push(observed);
+          else args[at] = observed;
+          if (held !== null && permissionRequest(String(args[0]))) {
+            process.nextTick(() => observed(new Error(queuedRefusal)));
+            return true;
+          }
+          // A write made once the hold is released waits for the root error to
+          // land, unless it is made inside a callback that got that error.
+          if (released && insideRoot === 0) { process.nextTick(() => queue(...args)); return true; }
+          const behind = held !== null;
+          const written = queue(...args);
+          if (behind && held !== null && ++state.queuedBehind >= holdUntil) release();
+          return written;
+        };
+      });
+      return state;
+    };
+
+    it('a gating frame the transcript cannot write is GC\'s refusal, never the disk\'s quota wall (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      // The echo gates admission: it is written and synced before it is read back.
+      const lost = failTranscriptChunk(handle, (chunk) => chunk.includes('"isReplay":true'), 'EDQUOT: disk quota exceeded');
+      const error = 'directive refused: directive bookkeeping failed: transcript write: EDQUOT: disk quota exceeded';
+      try {
+        await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-edquot'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(error);
+        expect(lost.broken).toBe(true);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
+        // Its words alone would wall: the tag is what keeps it with directive recovery.
+        expect(deterministicFailureClass(error)).toBe('quota_wall');
+      } finally { await handle.dispose(); }
+    });
+
+    it('the lost-write helper refuses to hold a permission request, by name, instead of hanging the turn (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const lost = failTranscriptChunk(handle, (chunk) => chunk.includes('"subtype":"can_use_tool"'), 'EDQUOT: disk quota exceeded', 1);
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-permission-hold'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/failTranscriptChunk refuses holdUntil > 0 on a control_request: the CLI waits for its answer, so no frame comes to release the hold/u);
+        expect(lost.broken).toBe(true);
+        expect(lost.sharedRoot).toBe(0); // never held: the root error was never handed out
+      } finally { await handle.dispose(); }
+    });
+
+    /** Drives the lost-write helper on a real file stream: holds `"held"` and writes a
+     * permission request with it, in one corked batch (ahead of it or behind) or after it.
+     * Returns what the request's write got, or "hung" after 500 ms (#485). */
+    async function queuedPermission(placement: 'after' | 'batched ahead' | 'batched behind'): Promise<string> {
+      const dir = mkdtempSync(join(tmpdir(), 'gru-lost-write-'));
+      const stream = createWriteStream(join(dir, 'transcript.jsonl'));
+      try {
+        await once(stream, 'open');
+        stream.on('error', () => { /* the root error, as the adapter's own listener takes it */ });
+        const listeners: ((event: RuntimeEvent) => void)[] = [];
+        const handle = { liveTranscript: stream, subscribe: (listener: (event: RuntimeEvent) => void) => { listeners.push(listener); return () => {}; } };
+        failTranscriptChunk(handle as unknown as AgentHandle, (chunk) => chunk.includes('"held"'), 'EDQUOT: disk quota exceeded', 5);
+        for (const listener of listeners) listener({ type: 'turn_start' });
+        if (placement !== 'after') stream.cork();
+        const request = (): Promise<string> => new Promise<string>((resolve) => {
+          stream.write(`${JSON.stringify({ type: 'control_request', request_id: 'r1' })}\n`, (error?: Error | null) => resolve(String(error)));
+        });
+        const answer = placement === 'batched ahead' ? request() : null;
+        stream.write(`${JSON.stringify({ type: 'held' })}\n`);
+        const answered = answer ?? request();
+        if (placement !== 'after') stream.uncork();
+        const hung = new Promise<string>((resolve) => { setTimeout(() => resolve('hung'), 500).unref(); });
+        return await Promise.race([answered, hung]);
+      } finally {
+        stream.destroy();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    const queuedRefusal = /^Error: failTranscriptChunk refuses a permission request queued behind a held write/u;
+    it('the lost-write helper fails a permission request written while a hold is open, by name (#485)', async () => {
+      expect(await queuedPermission('after')).toMatch(queuedRefusal);
+    });
+    it('the lost-write helper fails a permission request batched with the held chunk, ahead of it or behind, by name (#485)', async () => {
+      expect(await queuedPermission('batched behind')).toMatch(queuedRefusal);
+      expect(await queuedPermission('batched ahead')).toMatch(queuedRefusal);
+    });
+
+    it('the lost-write helper queues a write made inside a callback that got the root error at once, as Node does (#485)', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'gru-lost-write-'));
+      const stream = createWriteStream(join(dir, 'transcript.jsonl'));
+      try {
+        await once(stream, 'open');
+        stream.on('error', () => { /* the root error, as the adapter's own listener takes it */ });
+        const listeners: ((event: RuntimeEvent) => void)[] = [];
+        const handle = { liveTranscript: stream, subscribe: (listener: (event: RuntimeEvent) => void) => { listeners.push(listener); return () => {}; } };
+        const lost = failTranscriptChunk(handle as unknown as AgentHandle, (chunk) => chunk.includes('"held"'), 'EDQUOT: disk quota exceeded', 1);
+        for (const listener of listeners) listener({ type: 'turn_start' });
+        const inner = new Promise<Error | null | undefined>((resolve) => {
+          // The held write's own callback writes again: Node buffers that write behind the
+          // failure, and it gets the root error too.
+          stream.write(`${JSON.stringify({ type: 'held' })}\n`, () => { stream.write(`${JSON.stringify({ type: 'inner' })}\n`, resolve); });
+        });
+        stream.write(`${JSON.stringify({ type: 'behind' })}\n`);
+        expect(String(await inner)).toBe('Error: EDQUOT: disk quota exceeded');
+        expect(lost.sharedRoot).toBe(3);
+      } finally {
+        stream.destroy();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('the lost-write helper fails a permission request queued behind a held write, by name, instead of hanging the turn (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      // The tool_use frame is held; the CLI's permission request for it comes next.
+      failTranscriptChunk(handle, (chunk) => chunk.includes('"type":"assistant"') && chunk.includes('"tool_use"'), 'EDQUOT: disk quota exceeded', 50);
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-permission-queued'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/failTranscriptChunk refuses a permission request queued behind a held write: the CLI waits for its answer, so no frame comes to release the hold/u);
+      } finally { await handle.dispose(); }
+    });
+
+    it('a gating frame that is written but cannot be synced is one tagged refusal (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      // The stream keeps writing to its open file; the sync reopens the path, which is gone.
+      handle.subscribe((event) => { if (event.type === 'turn_start') rmSync(handle.sessionFile!); });
+      try {
+        await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-gating-fsync'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused: directive bookkeeping failed: transcript write: ENOENT/u);
+        expect(events.filter((event) => event.type === 'error')).toEqual([
+          { type: 'error', error: expect.stringMatching(/^directive refused: directive bookkeeping failed: transcript write: ENOENT/u), fatal: false, nativeControl: 'directive-refusal' },
+        ]);
+      } finally { await handle.dispose(); }
+    });
+
+    type ClaudeBookkeepingSite = 'admission receipt' | 'admission publication' | 'authority check' | 'binding read' | 'tool intent read'
+      | 'binding read at completion' | 'checkpoint read' | 'completion receipt' | 'controller receipt';
+    /** An EDQUOT inside one GC bookkeeping call is one tagged refusal, never a quota wall (#485). */
+    async function assertClaudeBookkeepingFault(site: ClaudeBookkeepingSite) {
+      const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+      const spawnProcess = vi.fn(spawn);
+      const fx = fixture({ spawnProcess: spawnProcess as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      const quota = Object.assign(new Error('EDQUOT: disk quota exceeded, write'), { code: 'EDQUOT' });
+      const raise = () => { throw quota; };
+      const call = site.replace(/ at completion$/u, '');
+      const fault = site === 'admission receipt' ? vi.spyOn(checkpoint, 'inspectDirectiveAdmission').mockImplementationOnce(raise)
+        : call === 'binding read' ? vi.spyOn(checkpoint, 'readDirectiveBinding').mockImplementationOnce(raise)
+          : site === 'tool intent read' ? vi.spyOn(checkpoint, 'assertClaudeDirectiveToolIntent').mockImplementationOnce(raise)
+            : site === 'checkpoint read' ? vi.spyOn(checkpoint, 'inspectDirectiveCheckpoint').mockImplementationOnce(raise)
+              : site === 'completion receipt' ? vi.spyOn(checkpoint, 'recordDirectiveCompletion').mockImplementationOnce(raise)
+                : site === 'controller receipt' ? vi.spyOn(checkpoint, 'recordDirectiveIndependentController').mockImplementationOnce(raise) : null;
+      let checks = 0;
+      const tool = site === 'authority check' || site === 'binding read' || site === 'tool intent read';
+      const completion = site === 'binding read at completion' || site === 'checkpoint read' || site === 'completion receipt';
+      const error = `${completion ? 'directive turn refused' : 'directive refused'}: directive bookkeeping failed: ${call}: EDQUOT: disk quota exceeded, write`;
+      try {
+        await expect(handle.prompt(tool ? 'tool:Read follow it' : 'answer plainly', { directive: { identity: identityFor(`claude-bookkeeping-${site.replace(/\W+/gu, '-')}`),
+          beforeAdmission: () => { if (site === 'authority check' && ++checks > 1) raise(); },
+          onAdmitted: () => { if (site === 'admission publication') raise(); } } }), site).rejects.toThrow(error);
+        if (fault !== null) expect(fault, site).toHaveBeenCalledTimes(1);
+        expect(events.filter((event) => event.type === 'error'), site).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
+        // Its words alone would wall: the tag is what keeps it with directive recovery.
+        expect(deterministicFailureClass(error), site).toBe('quota_wall');
+        expect(fx.logs.filter((line) => line.msg === 'claude directive bookkeeping failed; the directive is refused'), site)
+          .toEqual([expect.objectContaining({ fields: expect.objectContaining({ fault: expect.stringContaining('EDQUOT: disk quota exceeded, write') }) })]);
+        // A refused controller receipt starts no CLI.
+        expect(spawnProcess, site).toHaveBeenCalledTimes(site === 'controller receipt' ? 0 : 1);
+      } finally { fault?.mockRestore(); await handle.dispose(); }
+    }
+    it('an EDQUOT in the admission readback is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('admission receipt'));
+    it('an EDQUOT in the ledger\'s admission publication is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('admission publication'));
+    it('an EDQUOT in the ledger\'s authority check at the tool fence is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('authority check'));
+    it('an EDQUOT in the tool fence\'s binding read is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('binding read'));
+    it('an EDQUOT in the tool fence\'s intent read is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('tool intent read'));
+    it('an EDQUOT in the completion\'s binding read is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('binding read at completion'));
+    it('an EDQUOT in the completion\'s checkpoint read is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('checkpoint read'));
+    it('an EDQUOT in the completion receipt is one tagged refusal (#485)', () => assertClaudeBookkeepingFault('completion receipt'));
+    it('an EDQUOT in the spawn-time controller receipt is one tagged refusal, and no CLI starts (#485)', () => assertClaudeBookkeepingFault('controller receipt'));
+
+    it('a permission channel transport failure reports itself, untagged (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        (handle as unknown as { live: ChildProcess }).live.stdin!.emit('error', new Error('write EPIPE'));
+      });
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-transport-untagged'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(new Error('directive permission transport failed'));
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: 'directive permission transport failed', fatal: false }]);
+      } finally { await handle.dispose(); }
+    });
+
+    /** Models a GC bug: the handle's `recordDirectiveFailure`, which only keeps the turn's
+     * failure in memory and cannot throw in production, throws a TypeError whose words name a
+     * wall, on the permission channel's own refusal, once, or on every call (#485). */
+    const throwOnChannelRefusal = (handle: AgentHandle, times: 'once' | 'always') => {
+      const target = handle as unknown as { recordDirectiveFailure(turn: unknown, error: unknown): unknown };
+      const record = target.recordDirectiveFailure.bind(handle);
+      let thrown = false;
+      return vi.spyOn(target, 'recordDirectiveFailure').mockImplementation((turn, error) => {
+        if (times === 'always' || (!thrown && error instanceof DirectiveCheckpointError && error.message === 'malformed or foreign directive permission request')) {
+          thrown = true;
+          throw new TypeError("Cannot read properties of undefined (reading 'quota')");
+        }
+        return record(turn, error);
+      });
+    };
+
+    /** The channel's deny of a repeated ask, recorded by a buggy `recordDirectiveFailure`
+     * that throws once or every time: the channel's backstop refuses the turn, tagged (#485). */
+    async function assertChannelHandlingRefused(times: 'once' | 'always') {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      const unrecorded = throwOnChannelRefusal(handle, times);
+      // The turn itself, to read the failure it keeps.
+      const target = handle as unknown as { prepareDirectiveTurn(...args: unknown[]): { readonly failure: { readonly error: unknown } | null } };
+      const prepare = target.prepareDirectiveTurn.bind(handle);
+      let turn: { readonly failure: { readonly error: unknown } | null } | null = null;
+      const prepared = vi.spyOn(target, 'prepareDirectiveTurn').mockImplementation((...args) => (turn = prepare(...args)));
+      const error = 'directive permission handling failed: Cannot read properties of undefined (reading \'quota\')';
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor(`claude-channel-unrecorded-${times}`), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(new Error(error));
+        // The refusal is kept on the turn even when recording it threw, so no later effect,
+        // and no completion, passes it.
+        expect(turn!.failure?.error, times).toEqual(new DirectiveCheckpointError(error));
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8'), times).not.toContain('"state":"completed"');
+        // Reported by the guard's own abort, never merely at the CLI's close.
+        expect(events.filter((event) => event.type === 'error'), times).toEqual([{ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' }]);
+        // Its words alone would wall: the tag is what keeps it with directive recovery.
+        expect(deterministicFailureClass(error)).toBe('quota_wall');
+        expect(fx.logs, times).toContainEqual({ level: 'error', msg: 'claude directive permission handling threw; the turn is refused',
+          fields: { failure: 'malformed or foreign directive permission request', error: expect.stringMatching(/^TypeError: Cannot read properties of undefined \(reading 'quota'\)\n/u) } });
+        expect(fx.logs.some((line) => line.msg === 'claude directive refusal could not be recorded; the turn is refused regardless'), times).toBe(times === 'always');
+      } finally {
+        unrecorded.mockRestore();
+        prepared.mockRestore();
+        await handle.dispose();
+      }
+    }
+    it('a GC bug that makes recordDirectiveFailure throw once at a channel deny still refuses the turn, tagged, through the channel\'s backstop (#485)', () => assertChannelHandlingRefused('once'));
+    it('a GC bug that makes recordDirectiveFailure throw on every call still refuses the turn, tagged, never only at the CLI\'s close (#485)', () => assertChannelHandlingRefused('always'));
+
+    /** A failure still owed its report stays the turn's failure, with its own text and
+     * as its own cause, through GC's own later failures (#485). The plain one is a GC bug
+     * outside its bookkeeping calls; the refusal is GC's authority check refusing. */
+    async function assertOwedFailureKept(owed: 'plain' | 'refusal' | 'bookkeeping', next: 'lost write' | 'second prompt' | 'channel deny' | 'channel deny unrecorded' | 'handler throws') {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      if (next === 'second prompt') process.env['CLAUDE_DOUBLE_REPLAY_AFTER_TOOL'] = '1';
+      if (next === 'channel deny' || next === 'channel deny unrecorded') process.env['CLAUDE_DOUBLE_PERMISSION_REPEAT'] = '1';
+      // A GC bug makes recording the channel's deny throw once: the owed failure still routes.
+      const unrecorded = next === 'channel deny unrecorded' ? throwOnChannelRefusal(handle, 'once') : null;
+      // The lost write waits until two more frames are queued behind it: Node hands each the same root
+      // error. It is the double's echo of the fence's deny (Claude Code 2.1.306 echoes only its
+      // initialize response, never an allow or a deny), chosen because it reaches _write alone on an
+      // idle stream: the permission request before it is durable, and nothing else is written until
+      // the answer. Every non-gating frame takes this same write path.
+      const lost = next === 'lost write' ? failTranscriptChunk(handle, (chunk) => chunk.includes('"behavior":"deny"'), 'EDQUOT: disk quota exceeded', 2)
+        : next === 'handler throws' ? failTranscriptChunk(handle, (chunk) => chunk.includes('"tool_result"'), 'EDQUOT: disk quota exceeded') : null;
+      // Handling that lost write throws: the turn's recorded failure is still what it reports.
+      const handling = next === 'handler throws'
+        ? vi.spyOn(handle as unknown as { failDirective(): void }, 'failDirective').mockImplementation(() => { throw new Error('handler broke'); }) : null;
+      // The first manifest read (or authority check) prepares the turn; the tool fence's throws.
+      const manifest = (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest.bind(handle);
+      let reads = 0;
+      if (owed === 'plain') {
+        (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => {
+          if (++reads === 2) throw new TypeError('authority manifest computation failed');
+          return manifest();
+        };
+      }
+      const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
+      const authorityFault = 'directive bookkeeping failed: authority check: EDQUOT: disk quota exceeded, write';
+      // The fence reports its failure on setImmediate; hold that report so the next failure lands first.
+      vi.useFakeTimers({ toFake: ['setImmediate'] });
+      const error = `directive refused: ${owed === 'plain' ? 'authority manifest computation failed' : owed === 'refusal' ? refusal : authorityFault}`;
+      let checks = 0;
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor(`claude-owed-${owed}-${next.replace(/\W+/gu, '-')}`),
+          beforeAdmission: () => {
+            if (owed === 'plain' || ++checks !== 2) return;
+            throw owed === 'refusal' ? new DirectiveCheckpointError(refusal) : new Error('EDQUOT: disk quota exceeded, write');
+          }, onAdmitted: () => {} } }), next)
+          .rejects.toThrow(new Error(error));
+        expect(events.filter((event) => event.type === 'error'), next).toEqual([{ type: 'error', error, fatal: false, ...(owed === 'plain' ? {} : { nativeControl: 'directive-refusal' }) }]);
+        const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8');
+        expect(receipts, next).toContain(owed === 'plain' ? 'authority manifest computation failed' : owed === 'refusal' ? refusal : authorityFault);
+        // The later lost write is a bookkeeping fault of its own: logged, though not the turn's
+        // first, and once, though Node hands every frame queued behind it the same root. The
+        // writes the destroyed stream refuses after it restate that root, unlogged. An owed
+        // bookkeeping fault is logged too: one line per distinct fault.
+        if (next === 'lost write') {
+          // Exactly two frames were queued behind the lost write: three callbacks got its root error.
+          expect(lost!.sharedRoot, owed).toBe(3);
+          expect(fx.logs.filter((line) => line.msg === 'claude directive bookkeeping failed; the directive is refused'), owed).toEqual([
+            ...(owed === 'bookkeeping' ? [expect.objectContaining({ fields: expect.objectContaining({ fault: expect.stringMatching(/^Error: EDQUOT: disk quota exceeded, write\n/u) }) })] : []),
+            expect.objectContaining({ fields: expect.objectContaining({ fault: expect.stringMatching(/^Error: EDQUOT: disk quota exceeded\n/u) }) }),
+          ]);
+        }
+        if (next === 'channel deny unrecorded') {
+          expect(fx.logs).toContainEqual({ level: 'error', msg: 'claude directive permission handling threw; the turn is refused',
+            fields: { failure: 'malformed or foreign directive permission request', error: expect.stringMatching(/^TypeError: Cannot read properties of undefined \(reading 'quota'\)\n/u) } });
+        }
+      } finally {
+        vi.useRealTimers();
+        handling?.mockRestore();
+        unrecorded?.mockRestore();
+        await handle.dispose();
+      }
+    }
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when a transcript write fails next (#485)', () => assertOwedFailureKept('plain', 'lost write'));
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when a GC bug makes recording the channel\'s deny throw next (#485)', () => assertOwedFailureKept('plain', 'channel deny unrecorded'));
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when a second prompt arrives next (#485)', () => assertOwedFailureKept('plain', 'second prompt'));
+    it('an owed plain fence failure stays the turn\'s, routed with its own text, when the channel denies a repeated ask next (#485)', () => assertOwedFailureKept('plain', 'channel deny'));
+    it('an owed refusal stays the turn\'s, tagged with its own text, when handling a lost write throws (#485)', () => assertOwedFailureKept('refusal', 'handler throws'));
+    it('an owed bookkeeping fault and a later lost write are each logged once (#485)', () => assertOwedFailureKept('bookkeeping', 'lost write'));
+
+    /** A spawn that keeps the permission answers GC writes to the CLI's stdin: what the
+     * channel decided, whether or not the CLI echoes it before it is killed (#485). */
+    const recordingAnswers = () => {
+      const answers: StreamFrame[] = [];
+      const spawnProcess = ((binary: string, args: readonly string[], options: object) => {
+        const child = spawn(binary, args, options);
+        const stdin = child.stdin as unknown as { write: (...args: unknown[]) => boolean };
+        const write = stdin.write.bind(stdin);
+        stdin.write = (...written) => {
+          for (const line of String(written[0]).split('\n').filter((text) => text.trim() !== '')) {
+            const frame = JSON.parse(line) as StreamFrame;
+            const answer = frame['type'] === 'control_response' ? (frame['response'] as StreamFrame)['response'] as StreamFrame | undefined : undefined;
+            if (answer !== undefined && 'behavior' in answer) answers.push(answer);
+          }
+          return write(...written);
+        };
+        return child;
+      }) as unknown as typeof spawn;
+      return { spawnProcess, answers };
+    };
+
+    /** Makes the tool pair's two permission requests durable in one tick, as the
+     * concurrent-fence tests assume: the transcript is corked from the tool_use frame
+     * until the second request is queued, so their writes share one `_writev` batch
+     * (Node batches them only when a write is in flight; #485). */
+    const batchPermissionRequests = (handle: AgentHandle): void => {
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        const stream = (handle as unknown as { liveTranscript: { write: (...args: unknown[]) => boolean; cork(): void; uncork(): void } }).liveTranscript;
+        const write = stream.write.bind(stream);
+        stream.write = (...args) => {
+          const chunk = String(args[0]);
+          if (chunk.includes('"type":"assistant"') && chunk.includes('toolu_pair_1')) stream.cork();
+          const written = write(...args);
+          if (chunk.includes('"can_use_tool"') && chunk.includes('toolu_pair_2')) stream.uncork();
+          return written;
+        };
+      });
+    };
+
+    /** Two concurrent permission requests, durable in one tick: once either fence has
+     * failed, neither tool is allowed, even an allow its own fence already passed (#485). */
+    async function assertConcurrentFenceRefusal(failing: 'first' | 'second') {
+      const wire = recordingAnswers();
+      const fx = fixture({ killGraceMs: 300, spawnProcess: wire.spawnProcess });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      batchPermissionRequests(handle);
+      const events = collect(handle);
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
+      // Check 1 prepares the turn; check 2 is the first request's fence, check 3 the second's.
+      let checks = 0;
+      try {
+        await expect(handle.prompt('tool-pair:Read follow it', { directive: { identity: identityFor(`claude-concurrent-${failing}`),
+          beforeAdmission: () => { if (++checks === (failing === 'first' ? 2 : 3)) throw new DirectiveCheckpointError(refusal); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(new Error(`directive refused: ${refusal}`));
+        // A failure is recorded before its fence yields: the later fence refuses at once,
+        // before any authority check of its own.
+        expect(checks).toBe(failing === 'first' ? 2 : 3);
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: `directive refused: ${refusal}`, fatal: false, nativeControl: 'directive-refusal' }]);
+        // Both answers the channel wrote to the CLI are denies: the failing fence's own, and
+        // the other request's, refused by the earlier failure (the first's allow is re-checked
+        // as it is written, so it goes out first).
+        const fenceDeny = { behavior: 'deny', message: `Refused by the directive's authority fence: ${refusal}` };
+        const earlierDeny = { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' };
+        expect(wire.answers).toEqual(failing === 'first' ? [fenceDeny, earlierDeny] : [earlierDeny, fenceDeny]);
+        // The other request's deny is durable too: its own guard receipt.
+        const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; reason?: string });
+        expect(receipts.filter((receipt) => receipt.state === 'guard-refused').map((receipt) => receipt.toolCallId).sort()).toEqual(['toolu_pair_1', 'toolu_pair_2']);
+        expect(receipts).toContainEqual(expect.objectContaining({ state: 'guard-refused', toolCallId: failing === 'first' ? 'toolu_pair_2' : 'toolu_pair_1',
+          reason: 'an earlier directive failure refused this turn\'s tool effects' }));
+      } finally { await handle.dispose(); }
+    }
+    it('a refusal at the first of two concurrent fences denies the second request too (#485)', () => assertConcurrentFenceRefusal('first'));
+    it('a refusal at the second of two concurrent fences denies the first request\'s already-passed allow as it is written (#485)', () => assertConcurrentFenceRefusal('second'));
+
+    /** A bare null or undefined fails the turn closed (#485). At the first of two concurrent
+     * fences the second is still refused, with no tool allowed; at the completion the
+     * turn is refused, never a success. Its texts, durable ones included, name it. */
+    async function assertNullishClaudeFence(site: 'authority check' | 'manifest' | 'completion manifest', thrown: null | undefined) {
+      const wire = recordingAnswers();
+      const fx = fixture({ killGraceMs: 300, spawnProcess: wire.spawnProcess });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      batchPermissionRequests(handle);
+      const events = collect(handle);
+      // A fence's refusal ends a CLI that ignores SIGTERM; the completion's lets it exit on its own.
+      if (site !== 'completion manifest') process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      const nothing = (): never => { const value: unknown = thrown; throw value; };
+      let checks = 0;
+      if (site !== 'authority check') {
+        // Outside GC's bookkeeping calls: the bare value is no refusal, and still fails the turn closed.
+        // Read 1 prepares the turn; read 2 is the first fence's, or the completion's.
+        const manifest = (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest.bind(handle);
+        let reads = 0;
+        (handle as unknown as { directiveAuthorityManifest: () => string }).directiveAuthorityManifest = () => (++reads === 2 ? nothing() : manifest());
+      }
+      const named = `a non-error value was thrown: ${String(thrown)}`;
+      const reason = site === 'authority check' ? `directive bookkeeping failed: authority check: ${named}` : named;
+      const error = `${site === 'completion manifest' ? 'directive turn refused' : 'directive refused'}: ${reason}`;
+      try {
+        await expect(handle.prompt(site === 'completion manifest' ? 'answer plainly' : 'tool-pair:Read follow it', { directive: { identity: identityFor(`claude-nullish-${site.replace(/\W+/gu, '-')}-${String(thrown)}`),
+          beforeAdmission: () => { if (site === 'authority check' && ++checks === 2) nothing(); }, onAdmitted: () => {} } })).rejects.toThrow(new Error(error));
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false, ...(site === 'authority check' ? { nativeControl: 'directive-refusal' } : {}) }]);
+        const receipts = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; reason?: string });
+        if (site === 'completion manifest') {
+          // The reply settled, but no completion is recorded for a refused turn.
+          expect(receipts.some((receipt) => receipt.state === 'completed')).toBe(false);
+          return;
+        }
+        // Both asks were denied: no tool was allowed after the failed fence. The first's
+        // deny and its durable receipt name the bare value.
+        expect(wire.answers).toEqual([
+          { behavior: 'deny', message: `Refused by the directive's authority fence: ${reason}` },
+          { behavior: 'deny', message: 'Refused by the directive\'s authority fence: an earlier directive failure refused this turn\'s tool effects' },
+        ]);
+        expect(receipts).toContainEqual(expect.objectContaining({ state: 'guard-refused', toolCallId: 'toolu_pair_1', reason }));
+      } finally { await handle.dispose(); }
+    }
+    it('a GC authority check that throws null at the first of two concurrent fences is a refusal, and both are denied (#485)', () => assertNullishClaudeFence('authority check', null));
+    it('a GC authority check that throws undefined at the first of two concurrent fences is a refusal, and both are denied (#485)', () => assertNullishClaudeFence('authority check', undefined));
+    it('a null thrown outside GC\'s bookkeeping at the first of two concurrent fences fails the turn closed, untagged (#485)', () => assertNullishClaudeFence('manifest', null));
+    it('an undefined thrown outside GC\'s bookkeeping at the first of two concurrent fences fails the turn closed, untagged (#485)', () => assertNullishClaudeFence('manifest', undefined));
+    it('a null thrown outside GC\'s bookkeeping at the completion refuses the turn, never a success (#485)', () => assertNullishClaudeFence('completion manifest', null));
+    it('an undefined thrown outside GC\'s bookkeeping at the completion refuses the turn, never a success (#485)', () => assertNullishClaudeFence('completion manifest', undefined));
+
+    it('the supervisor skips a tagged Claude refusal with a durable trace, and with decisions wired still stops on a wall reported after one (#485)', async () => {
+      const { LedgerDb } = await import('../src/ledger/db.js');
+      const { LedgerApi } = await import('../src/ledger/api.js');
+      const { EventBus } = await import('../src/events/bus.js');
+      const { NotificationCenter } = await import('../src/notifications/center.js');
+      const { Supervisor } = await import('../src/supervision/supervisor.js');
+      const { DecisionRuntime } = await import('../src/decisions/runtime.js');
+      const fx = fixture();
+      writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[runtimes.roles]\nminion = "claude-code"\n`);
+      const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-claude-refusal-ledger-')));
+      const bus = new EventBus({});
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      // The decision service as main.ts wires it: the supervisor awaits it before any stop.
+      const decisions = new DecisionRuntime(config.decisions, { instanceDir: config.instanceDir, env: {}, dataDir: config.dataDir, notifications, watchConfig: false });
+      await decisions.start();
+      const registry = new RuntimeRegistry({ config, store: fx.store,
+        claude: { binary: DOUBLE, killGraceMs: 100, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') } });
+      const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+        registry, ledger, notifications, decisions, tickMs: 60_000 });
+      const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
+      const retained = (agentId: string) => ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'supervision.native-refusal-retained' && event.agentId === agentId).map((event) => event.payload);
+      try {
+        // A refusal alone: no wall, no stop, one durable trace.
+        const refused = await registry.spawn('minion', { cwd: fx.workspace, agentId: 'claude-refused-minion' });
+        let checks = 0;
+        await expect(refused.prompt('tool:Read follow the approved correction', { directive: { identity: identityFor('claude-supervised-refusal'),
+          beforeAdmission: () => { if (++checks > 1) throw new DirectiveCheckpointError(refusal); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(`directive refused: ${refusal}`);
+        for (let i = 0; i < 16; i += 1) await Promise.resolve();
+        expect(supervisor.viewFor(refused.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+        expect(retained(refused.id)).toEqual([{ error: `directive refused: ${refusal}` }]);
+        expect(refused.health().state).not.toBe('disposed');
+        expect(ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.guidance' && event.agentId === refused.id)).toBe(false);
+        // A wall after a refusal: the refusal is kept, the wall stops the minion, though the
+        // directive's recovery disposes the handle as soon as its prompt rejects.
+        const walled = await registry.spawn('minion', { cwd: fx.workspace, agentId: 'claude-walled-minion' });
+        process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
+        process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+        await expect(walled.prompt('usage-limit now', { directive: { identity: identityFor('claude-supervised-wall'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/^directive refused/u);
+        await registry.disposeHandle(walled);
+        await vi.waitFor(() => expect(supervisor.viewFor(walled.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' }));
+        expect(retained(walled.id)).toHaveLength(1);
+        expect(ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === `supervision.provider-wall.${walled.id}.quota_wall`)).toHaveLength(1);
+        // The stop came through the decision service's guidance, not around it.
+        expect(ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.guidance' && event.agentId === walled.id).map((event) => event.payload))
+          .toEqual([expect.objectContaining({ class: 'quota_wall' })]);
+      } finally {
+        supervisor.dispose();
+        await registry.dispose();
+        decisions.dispose();
+        db.close();
+      }
+    });
+
     it('a refused tool\'s deny is written before the turn ends, and a CLI that ignores SIGTERM is killed after the grace period', async () => {
       const fx = fixture({ killGraceMs: 1500 });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
@@ -2711,7 +3523,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         };
       });
       await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-disk'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
-        .rejects.toThrow(/directive transcript write failed: ENOSPC/u);
+        .rejects.toThrow(/directive bookkeeping failed: transcript write: ENOSPC/u);
       expect(broken).toBe(true);
       await handle.dispose();
     });
@@ -2728,7 +3540,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       appendFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: handle.id })}\n${JSON.stringify(echo)}\n`);
       const admitted: unknown[] = [];
       const turn = { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding: unknown) => admitted.push(binding) },
-        producer: {}, content, settings: { file: '', dispose: () => {} }, admission: null as Promise<void> | null, admitted: null, failure: new Error('refused earlier') as unknown, completion: null };
+        producer: {}, content, settings: { file: '', dispose: () => {} }, admission: null as Promise<void> | null, admitted: null, failure: { error: new Error('refused earlier') } as { readonly error: unknown } | null, completion: null };
       const follow = (handle as unknown as { followDirectiveFrame(turn: unknown, frame: unknown, durable: Promise<void>, abort: (detail: string) => void): void }).followDirectiveFrame.bind(handle);
       follow(turn, echo, Promise.resolve(), () => {});
       await turn.admission;
@@ -2805,6 +3617,68 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         await vi.waitFor(() => expect(existsSync(settings), mode).toBe(false));
         await handle.dispose();
       }
+    });
+
+    it('a hostile fault inside a bookkeeping error (a throwing code getter, a Proxy trap) is logged like any other, and recording that error never throws (#485)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      try {
+        const record = (handle as unknown as { recordDirectiveFailure(turn: unknown, error: unknown): unknown }).recordDirectiveFailure.bind(handle);
+        const turn = { failure: null, directive: { identity: identityFor('claude-hostile-fault') } };
+        const getter = Object.defineProperty(new Error('EIO: i/o error, write'), 'code', { get: () => { throw new Error('code getter broke'); } });
+        const trap = new Proxy({}, { get: () => { throw new Error('get trap broke'); }, getPrototypeOf: () => { throw new Error('prototype trap broke'); } });
+        const first = new DirectiveBookkeepingError('transcript write', getter);
+        const second = new DirectiveBookkeepingError('transcript write', trap);
+        expect(record(turn, first)).toBe(first);
+        expect(record(turn, second)).toBe(first); // the first failure stays the turn's
+        expect(fx.logs.filter((line) => line.msg === 'claude directive bookkeeping failed; the directive is refused').map((line) => line.fields)).toEqual([
+          { request: 'claude-hostile-fault', error: 'directive bookkeeping failed: transcript write: EIO: i/o error, write', fault: expect.stringMatching(/^Error: EIO: i\/o error, write\n/u) },
+          { request: 'claude-hostile-fault', error: 'directive bookkeeping failed: transcript write: a thrown value that cannot be read', fault: 'a thrown value that cannot be read' },
+        ]);
+      } finally { await handle.dispose(); }
+    });
+
+    it('a producer cessation receipt that throws a value that cannot be printed leaves the evidence unknown, logged by name, never a throw (#485)', async () => {
+      const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      handle.prepareDirectiveProducer!(identityFor('claude-cessation-unprintable'));
+      const receipt = vi.spyOn(checkpoint, 'recordDirectiveProducerCessation').mockImplementation(() => { const thrown: unknown = Object.create(null); throw thrown; });
+      try {
+        await handle.dispose();
+        expect(handle.cessationEvidence!()).toBe('unknown');
+        expect(fx.logs).toContainEqual(expect.objectContaining({ level: 'error', msg: 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written',
+          fields: { error: 'a non-error value was thrown: an unprintable value' } }));
+      } finally { receipt.mockRestore(); }
+      // Once the receipt can be written, the evidence settles.
+      expect(handle.cessationEvidence!()).toBe('ceased');
+    });
+
+    it('a listener that throws a value that cannot be printed is isolated: emit never throws, later listeners still run, and the abort completes (#485)', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      handle.subscribe((event) => { if (event.type === 'error') { const thrown: unknown = Object.create(null); throw thrown; } });
+      const events = collect(handle);
+      const refusal = 'directive authority is terminal, held or superseded — no work may proceed';
+      let checks = 0;
+      try {
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity: identityFor('claude-listener-unprintable'),
+          beforeAdmission: () => { if (++checks === 2) throw new DirectiveCheckpointError(refusal); }, onAdmitted: () => {} } }))
+          .rejects.toThrow(new Error(`directive refused: ${refusal}`));
+        expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error: `directive refused: ${refusal}`, fatal: false, nativeControl: 'directive-refusal' }]);
+        expect(fx.logs).toContainEqual({ level: 'warn', msg: 'runtime event listener threw', fields: { error: 'a non-error value was thrown: an unprintable value' } });
+      } finally { await handle.dispose(); }
+    });
+
+    it('a spawn that throws a non-error value fails the turn with the value named, never a bare "null" (#485)', async () => {
+      const thrown: unknown = null;
+      const fx = fixture({ spawnProcess: (() => { throw thrown; }) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const events = collect(handle);
+      const error = 'claude process failed to spawn: a non-error value was thrown: null';
+      await expect(handle.prompt('answer plainly')).rejects.toThrow(new Error(error));
+      expect(events.filter((event) => event.type === 'error')).toEqual([{ type: 'error', error, fatal: false }]);
+      await handle.dispose();
     });
 
     it('a CLI that closes stdin under the prompt write fails the turn instead of crashing the service', async () => {

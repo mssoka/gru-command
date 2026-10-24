@@ -197,16 +197,67 @@ export const FAILURE_CLASSES = [
 ] as const;
 export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
-export function deterministicFailureClass(reason: string): FailureClass {
-  // Word-bounded signals: bare substrings wall-classified unrelated text
-  // ("author" hit `auth`; "port 13020" hit `1302`). The stems still admit
-  // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed)
-  // so real walls keep their deterministic stop.
+export function deterministicFailureClass(
+  reason: string,
+  typed?: { readonly status?: number; readonly bodyCode?: string } | null,
+): FailureClass {
+  // Structured provider rejection evidence wins over conflicting prose:
+  // local directive language such as "no work is authorized" must not
+  // turn a typed quota response into an authentication wall.
+  if (typed?.status === 401) return 'authentication_wall';
+  if (typed?.status === 429) return 'quota_wall';
   if (
-    /\b(?:unauthorized|oauth|auth(?:entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+    typed?.status !== 402 &&
+    typed?.status !== 403 &&
+    (typed?.bodyCode === '1302' || typed?.bodyCode === '1308')
+  ) return 'quota_wall';
+  // Word-bounded signals: bare substrings wall-classified unrelated text
+  // ("author" hit `auth`; "port 13020" hit `1302`). The authentication patterns:
+  // the words unauthorized, oauth, auth, authn, authentication, authorization
+  // and authorized; auth joined to error or failure, and authentication to
+  // failed, by "_" or "-" (auth_error, auth-failure, authentication_failed);
+  // "invalid api key", with or without one character between api and key; a 401
+  // on its own. The quota patterns: quota; "rate limit" with or without one "-",
+  // "_" or space, and an optional "ed" (rate_limit, rate-limited, ratelimit,
+  // RateLimit); billing_error; insufficient balance or credit; a 402, 403, 429,
+  // 1302 or 1308 on its own. A word boundary never falls at "_", so a longer
+  // snake-case name is another word: authentication_error, rate_limit_error,
+  // rate_limit_exceeded and insufficient_quota read unknown, as do camel-case
+  // AuthenticationFailed and authError. "authorized" stays a signal: providers
+  // say "no longer authorized" or "only authorized for use with Claude Code".
+  //
+  // Which failures wall is GC's judgment, not the CLI's: a wall is a failure
+  // only a human clears. Claude Code's typed codes (its closed 2.1.309 enum)
+  // that name one match: authentication_failed, oauth_org_not_allowed,
+  // verification_required, account_on_hold (a refused OAuth refresh) and
+  // cloud_credential_error are authentication walls; billing_error and
+  // rate_limit are quota walls.
+  //
+  // cloud_credential_error walls by its token. 2.1.309 marks it transient
+  // (apiErrorIsTransient) and its goal loop retries it, and its 60 s "AWS
+  // default-chain credential resolve timed out" can be a hiccup. GC walls it
+  // anyway: its detail is the first cause's text, and nearly every one that
+  // reaches a user names a credential only a human restores (a refresh token, a
+  // client, a key file, the default chain, SSO). A wall goes to Gru's decision
+  // (an auth failure stays machine attention), so a hiccup costs a Gru decision,
+  // not a lost lane.
+  //
+  // A rate limit is paced first: pacing's bounded retry sees one (the CLI's
+  // statusless capacity off-switch, typed rate_limit, included). A quota-class
+  // text (rate limit, rate_limit, 429, …) then walls here with no pacing policy,
+  // or once the bounded budget is spent, and it alone walls at once when there
+  // is nothing to re-deliver; pacing's other texts ("too many requests",
+  // "throttled", "rate limiting") read unknown. The other codes name no wall:
+  // model_not_found reads unknown. An unknown in-band error neither walls nor
+  // restarts (in-band failures never restart): the turn fails, and only the
+  // decision service's guidance can stop the minion. For GC's own refusals the
+  // tag, not the text, is the guard (#485); GC's literal refusal texts avoid
+  // wall words so an untagged one still reads `unknown`.
+  if (
+    /\b(?:unauthorized|oauth|oauth_org_not_allowed|verification_required|account_on_hold|cloud_credential_error|auth(?:entication[_-]failed|entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
   ) return 'authentication_wall';
   if (
-    /\bquota\b|\brate[- ]?limit(?:ed)?\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
+    /\bquota\b|\brate[-_ ]?limit(?:ed)?\b|\bbilling_error\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
   ) return 'quota_wall';
   if (/network|connect|dns|socket|econn|fetch failed/i.test(reason)) return 'network_failure';
   if (/turn hang|compaction hang|silence|watchdog/i.test(reason)) return 'turn_hang';
@@ -250,12 +301,13 @@ export const SUPERVISION_RISKS: Readonly<Record<keyof SupervisionQuestions, Risk
 
 export function supervisionDecisionRequest(input: {
   readonly reason: string;
+  readonly typed?: { readonly status?: number; readonly bodyCode?: string } | null;
   readonly agentId: string;
   readonly role: string;
   readonly restartCount: number;
   readonly breakerLimit: number;
 }): DecisionRequest<typeof SUPERVISION_QUESTIONS> {
-  const failureClass = deterministicFailureClass(input.reason);
+  const failureClass = deterministicFailureClass(input.reason, input.typed);
   const restart = failureClass !== 'authentication_wall' && failureClass !== 'quota_wall';
   return {
     state: filteredState(input),
