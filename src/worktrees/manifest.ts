@@ -313,7 +313,8 @@ export interface ApplyManifestOptions {
   readonly onSpawn?: (pid: number, index: number, command: string) => void;
   /** Durable setup-owner receipt before a configured command can run. */
   readonly onCommandStart?: (index: number, command: string) => void;
-  /** Durable process-group result, when a configured command was spawned. */
+  /** The shell child's exit (code, signal, timeout, stop) once it closed;
+   * not proof that its process group ended. */
   readonly onCommandOutcome?: (index: number, command: string, result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
 }
 

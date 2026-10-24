@@ -120,14 +120,24 @@ Package version 1 is a strict JSON object with no unknown keys:
 }
 ```
 
-`request_sha256` binds job id, original repo-path spelling, title, display name,
-deliverable, exact briefing hash, optional normalized completion-handoff intent
-and package basename. Report/review metadata is refused for this route. It excludes
-only the package SHA-256 field that would make the package hash self-referential; the
-admission receipt binds that request digest and exact package digest into one
-full intake identity. The source and package bytes are reread and rehashed at
-worktree application. Revision/epoch must be the initial 0/0 authority, and
-are rechecked at application and before worker admission.
+`origin_sha256` is the SHA-256 of `git remote get-url origin` (so after any
+`insteadOf` rewrite) with surrounding whitespace trimmed. `request_sha256` is
+the SHA-256 of this exact JSON, keys in this order and no whitespace:
+
+```text
+{"version":1,"job_id":…,"repo_path":…,"title":…,"display_name":…,"deliverable":…,"briefing_sha256":…,"completion_handoff":…,"prebootstrap_package_file":…}
+```
+
+`repo_path` and `title` are as posted, `display_name` is the trimmed name or
+`null`, `deliverable` defaults to `"pr"`, `briefing_sha256` is the SHA-256 of
+the briefing, and `completion_handoff` is `{"kind":…,"decision":…}` or `null`.
+Report/review metadata is refused for this route. The digest leaves out only the
+package's own SHA-256, which would make it self-referential; the admission
+receipt joins the two digests as `intake_identity_sha256`, the SHA-256 of
+`{"version":1,"request_payload_sha256":…,"package_sha256":…}`. The source and
+package bytes are reread and rehashed at worktree application. Revision/epoch
+must be the initial 0/0 authority; the contract, revision, epoch and the job's
+`working` status are rechecked through setup and up to the briefing.
 
 The supported file grammar is intentionally small: root `requirements.txt`,
 blank/comment lines and pinned `distribution==version` declarations only.
@@ -152,13 +162,16 @@ in force. No package means no change to the normal path.
 
 The ledger records `job.prebootstrap-patch-admitted`, the one-time
 `worktree.prebootstrap-patch-creation-claimed` consumption receipt, patch
-start/applied/failure, per-command setup start/spawn/result and setup
-success/failure, and dispatch failure. A POST failure after job admission is
-returned as `409 prebootstrap_patch_dispatch_failed` with the job id and
-readback path, not as a pre-admission refusal. Admission/claim receipts bind
-the request, package, authority and intended source; producer receipts add the
-owned lane path, branch and creation-token hash. Failure receipts contain an
-error class/code and digest, not raw setup output. Read the authenticated
+start/applied/failure, per-command setup start/spawn/result, setup
+success/failure, `worktree.prebootstrap-publication-failed` and dispatch
+failure. A POST failure after job admission is returned as
+`409 prebootstrap_patch_dispatch_failed` with the job id and readback path, not
+as a pre-admission refusal. Admission/claim receipts bind the request, package,
+authority and intended source; producer receipts add the owned lane path,
+branch and creation-token hash. A lane's failure receipt carries its `stage`,
+`error_class` and `error_sha256`; the dispatch failure receipt carries
+`error_class`, `error_code` and `error_sha256`. The ledger never stores the raw
+message or setup output. Read the authenticated
 `GET /api/dispatch/jobs/<job-id>/prebootstrap-patch` for durable event readback.
 Missing spawn/result receipts mean **unknown**, never process cessation or
 no-effects. A recorded child exit/result is not proof that the entire process
@@ -166,10 +179,10 @@ group ceased; the readback keeps group state explicitly unknown. A consumed
 request is never replayed. A patched lane keeps its creation receipt until its
 worker is admitted (`job.minion-spawned`, then the last pre-briefing check), so
 any earlier failure, including one after setup succeeded, retains the lane, the
-receipt and the evidence; do not retry it, rerun setup, clean
-the lane or infer that an unknown producer stopped. Inspect custody and process
-records; any future attempt requires a separately authorized fresh job and
-request. The endpoint offers no retry or cleanup action.
+receipt and the evidence; do not retry it, rerun setup, clean the lane or infer
+that an unknown producer stopped. Inspect custody and process records; any
+future attempt requires a separately authorized fresh job and request. The
+endpoint offers no retry or cleanup action.
 
 ## 2. Registry (18b)
 
