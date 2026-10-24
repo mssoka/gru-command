@@ -27,7 +27,7 @@
 import { createServer } from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { get as httpGet } from 'node:http';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -137,6 +137,8 @@ export async function startRealService({
   notifyWake,
   reviewEnabled = true,
   extraEnv = {},
+  extraConfig = [],
+  captureOutput = false,
 } = {}) {
   // Port-squat prevention: ephemeral or an explicit high-range override —
   // never the instance port, never privileged.
@@ -190,10 +192,14 @@ export async function startRealService({
         : []),
       '[review]',
       `enabled = ${reviewEnabled}`,
+      ...extraConfig,
       '',
     ].join('\n'),
     'utf-8',
   );
+  // Owner-only like the wizard writes it: the file holds the pairing token,
+  // and the service refuses [env] values in a file others can read.
+  chmodSync(join(home, 'config.toml'), 0o600);
 
   if (decisionKey !== undefined) {
     const provisionEnv = { ...process.env, GRU_COMMAND_HOME: home };
@@ -235,7 +241,13 @@ export async function startRealService({
     spawnError = error instanceof Error ? error : new Error(String(error));
   });
   let stderrTail = '';
-  child.stdout.on('data', () => {}); // drain: the service log must never wedge the pipe
+  // Full stdout + stderr only on request (what launchd keeps as
+  // launchd.{out,err}.log); otherwise drained so the pipe never wedges.
+  let captured = '';
+  child.stdout.on('data', (chunk) => {
+    if (captureOutput) captured += chunk;
+  });
+  if (captureOutput) child.stderr.on('data', (chunk) => { captured += chunk; });
   child.stderr.on('data', (chunk) => {
     stderrTail = `${stderrTail}${chunk}`.slice(-4000);
   });
@@ -324,7 +336,12 @@ export async function startRealService({
     cleanup();
   }
 
-  return { child, home, workspace, port, token, baseUrl, stop };
+  const output = () => {
+    if (!captureOutput) failLoud('output() needs startRealService({ captureOutput: true })');
+    return captured;
+  };
+
+  return { child, home, workspace, port, token, baseUrl, stop, output };
 }
 
 // ---------------------------------------------------------------------------

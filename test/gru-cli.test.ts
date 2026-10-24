@@ -108,6 +108,53 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
     expect(h.installer).toEqual([['--update'], ['--update', '--no-interact'], ['--stop'], ['--start'], ['--restart']]);
   });
 
+  it('gru start and restart --now check config.toml first and never start a service its [env] would stop (#494)', async () => {
+    const canary = 'SYNTHETIC-START-CANARY-494';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-gru-cli-env-'));
+    cleanupDirs.push(dir);
+    const file = join(dir, 'config.toml');
+    const base = '[server]\nhost = "127.0.0.1"\nport = 7666\n[auth]\ntoken = "gru-cli-token"\n';
+    const h = harness();
+    const deps = { ...h.deps, loadConfig: () => loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester') };
+    const invalid = [
+      [`[env]\nTOKEN = 42\n`, 'env.TOKEN must be a string'],
+      [`[env]\nGRU_COMMAND_HOME = "${canary}"\n`, 'env.GRU_COMMAND_HOME is reserved'],
+      [`[env]\nTOKEN = "${canary}" junk\n`, 'failed to parse TOML'],
+    ] as const;
+    for (const [table, named] of invalid) {
+      writeFileSync(file, `${base}${table}`, { encoding: 'utf-8', mode: 0o600 });
+      expect(await runServiceCli(['start'], deps)).toBe(1);
+      expect(await runServiceCli(['restart', '--now'], deps)).toBe(1);
+      const errors = h.stderr.splice(0).join('\n');
+      expect(errors).toContain('gru: not starting the service: config.toml is invalid');
+      expect(errors).toContain('gru: not restarting the service: config.toml is invalid');
+      expect(errors).toContain(named);
+      expect(errors).not.toContain(canary);
+      // The graceful restart and the roll load the same config before they
+      // ask the service for anything.
+      expect(await runServiceCli(['restart'], deps)).toBe(1);
+      expect(await runServiceCli(['roll'], deps)).toBe(1);
+      const refused = h.stderr.splice(0).join('\n');
+      expect(refused).toContain('gru: cannot load instance config');
+      expect(refused).toContain(named);
+      expect(refused).not.toContain(canary);
+    }
+    expect(h.installer).toEqual([]);
+    expect(h.urls).toEqual([]);
+    // Stopping (and updating) never depend on the config: a service its
+    // broken config keeps failing must stay stoppable.
+    expect(await runServiceCli(['stop'], deps)).toBe(0);
+    expect(await runServiceCli(['update'], deps)).toBe(0);
+    expect(h.installer.splice(0)).toEqual([['--stop'], ['--update']]);
+
+    writeFileSync(file, `${base}[env]\nTOKEN = "${canary}"\n`, { encoding: 'utf-8', mode: 0o600 });
+    expect(await runServiceCli(['start'], deps)).toBe(0);
+    expect(await runServiceCli(['restart', '--now'], deps)).toBe(0);
+    // Argument errors still come first, before the config is read.
+    expect(await runServiceCli(['start', '--bogus'], deps)).toBe(2);
+    expect(h.installer).toEqual([['--start'], ['--restart']]);
+  });
+
   it('refuses unknown options before install.sh runs', async () => {
     const h = harness();
     expect(await runServiceCli(['update', '--force'], h.deps)).toBe(2);

@@ -17,6 +17,7 @@ import {
 } from './credentials.js';
 import { CREDENTIAL_SLOTS, KEYLESS_CREDENTIAL, type CredentialSlot } from './profile.js';
 import { checkDecisionProfile, DecisionRuntime } from './runtime.js';
+import { withConfiguredEnvironment } from '../service-environment.js';
 import {
   backtestRecordFromReport,
   defaultCasesPath,
@@ -58,12 +59,14 @@ async function readStdin(maxBytes = 16_384): Promise<string> {
  * No key material ever leaves. */
 function offlineStatus(): number {
   const config = loadConfig();
+  // The service supplies [env] keys the same way (src/service-environment.ts).
+  const env = withConfiguredEnvironment(config.env, process.env);
   const effective = effectiveDecisionProviders(config.decisions);
   const defaultSlot = effective[DEFAULT_DECISION_PROFILE]?.credential ?? 'openrouter';
   const credential =
     defaultSlot === KEYLESS_CREDENTIAL
       ? { state: 'present' as const, source: 'none' as const }
-      : resolveCredential(config.instanceDir, process.env, defaultSlot);
+      : resolveCredential(config.instanceDir, env, defaultSlot);
   const profiles = Object.entries(effective).map(([name, profile]) => {
     if (profile.credential === KEYLESS_CREDENTIAL) {
       return {
@@ -76,7 +79,7 @@ function offlineStatus(): number {
         credential_source: 'none',
       };
     }
-    const resolved = resolveCredential(config.instanceDir, process.env, profile.credential);
+    const resolved = resolveCredential(config.instanceDir, env, profile.credential);
     return {
       name,
       protocol: profile.protocol,
@@ -109,6 +112,7 @@ async function check(profileName: string | null, asJson: boolean): Promise<numbe
     }
     const runtime = new DecisionRuntime(config.decisions, {
       instanceDir: config.instanceDir,
+      env: withConfiguredEnvironment(config.env, process.env),
       watchConfig: false,
     });
     try {
@@ -125,7 +129,7 @@ async function check(profileName: string | null, asJson: boolean): Promise<numbe
   // check of a misspelled profile is a failed check, not a clean disabled.
   const result = await checkDecisionProfile(config.decisions, name, {
     instanceDir: config.instanceDir,
-    env: process.env,
+    env: withConfiguredEnvironment(config.env, process.env),
   });
   if (asJson) json({ ok: result.ok, status: result.status, reason: result.reason, profile: result.profile });
   else {
@@ -278,7 +282,7 @@ async function backtest(args: BacktestArgs): Promise<number> {
     cases,
     config: config.decisions,
     instanceDir: config.instanceDir,
-    env: process.env,
+    env: withConfiguredEnvironment(config.env, process.env),
     ...(args.record !== null ? { recordDir: args.record } : {}),
     ...(args.replay !== null ? { replayDir: args.replay } : {}),
   });

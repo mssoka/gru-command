@@ -81,6 +81,31 @@ export function runInstallerCli(command: InstallerCommand, args: readonly string
   return deps.runInstaller([flag, ...args]);
 }
 
+/**
+ * `gru start` and `gru restart --now` (#494): the service loads config.toml
+ * when it boots and refuses an invalid one, leaving the unit failing to
+ * start (and an immediate restart stops the running service first). The
+ * installer runs only once the same check passes here.
+ */
+export function configCheckedInstaller(
+  deps: InstallerCliDeps & { readonly loadConfig: () => GruCommandConfig },
+  action: 'start' | 'restart',
+): InstallerRunner {
+  return (args) => {
+    try {
+      deps.loadConfig();
+    } catch (error) {
+      deps.stderr(
+        action === 'start'
+          ? `gru: not starting the service: config.toml is invalid and the service would refuse it (a service already running keeps the config it loaded) — ${String((error as Error).message)}`
+          : `gru: not restarting the service: config.toml is invalid and the service would refuse it; the running service keeps the config it loaded — ${String((error as Error).message)}`,
+      );
+      return 1;
+    }
+    return deps.runInstaller(args);
+  };
+}
+
 /** `gru restart --now`: an immediate service-manager restart. */
 export function runRestartNowCli(args: readonly string[], deps: InstallerCliDeps): number {
   const others = args.filter((arg) => arg !== '--now');
