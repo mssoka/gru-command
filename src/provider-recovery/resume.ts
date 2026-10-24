@@ -5,7 +5,7 @@ import type {
   ProviderWaitRecord,
 } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
-import { freshReviewInput, rebriefFreshMinion, ReviewInputUnavailableError } from '../dispatch/fix-directive.js';
+import { freshReviewInput, holdsConversation, rebriefFreshMinion, ReviewInputUnavailableError } from '../dispatch/fix-directive.js';
 import { renderRevisionContinuation, withRevisionContinuation } from '../dispatch/work-revision.js';
 import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
@@ -259,11 +259,14 @@ async function claimJobMinion(
 
   capturePortLaneHandoff(deps.worktrees, lane)();
   // One continuation: resume the interrupted session when it still exists,
-  // otherwise a fresh worker on the same lane (rebrief machinery).
-  const resumeFile =
+  // otherwise a fresh worker on the same lane (rebrief machinery). A review
+  // job's session is resumed only when its transcript holds a conversation:
+  // an empty or header-only file opens as a new, empty session.
+  const recordedSession =
     wait.sessionFile !== null && wait.sessionFile !== '' && existsSync(wait.sessionFile)
       ? wait.sessionFile
       : null;
+  const resumeFile = recordedSession !== null && job.deliverable === 'review' && !holdsConversation(recordedSession) ? null : recordedSession;
   // A fresh reviewer's recorded input is resolved before the claim: one that
   // cannot be re-delivered cancels the wait by name, with nothing claimed,
   // re-opened or spawned. Any other fault (git unreadable) leaves the wait

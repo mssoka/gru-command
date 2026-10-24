@@ -314,7 +314,7 @@ const PINS: Record<string, number> = {
   'provider-recovery-composition.test.ts': 9,
   'provider-recovery-ledger.test.ts': 18,
   'provider-recovery-metadata.test.ts': 24,
-  'provider-recovery-resume.test.ts': 29,
+  'provider-recovery-resume.test.ts': 30,
   'provider-recovery-seam.test.ts': 17,
   'provider-recovery-sensor.test.ts': 92,
   'restart-recovery-progress.test.ts': 234,

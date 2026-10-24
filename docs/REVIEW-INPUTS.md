@@ -474,13 +474,13 @@ lifecycle fact — so a settled report read as independent coverage.
   `"` counts as "any other", so a leading quote always marks the escaped form.
   The package bytes are kept (`review.blind-input-package`, written before the
   admission), so a fresh replacement reviewer (provider recovery, a Silas
-  re-brief, or a directive whose session cannot resume or whose transcript is
-  missing, empty or holds no conversation) gets the package block again, once,
-  even when its carried-over prompt already held it; a resumed session already
-  holds it. Any review job whose dispatch recorded `job.review-source-verified`
-  gets its REVIEW SOURCE block back the same way, after checking that the lane
-  can still read the verified target, base and input objects (a moved and
-  repaired repository still can). A package that was not kept (one admitted
+  re-brief, or a directive whose session cannot resume, including a session
+  whose transcript is missing, empty or holds no conversation) gets the
+  package block again, once, even when its carried-over prompt already held
+  it; a resumed session already holds it. Any review job whose dispatch
+  recorded `job.review-source-verified` gets its REVIEW SOURCE block back the
+  same way, after checking that the lane can still read the verified target,
+  base and input objects (a moved and repaired repository still can). A package that was not kept (one admitted
   before packages were kept), a malformed record or objects the lane cannot read
   are refused by name before the lane is cleared, any session is stopped or
   spawned, or a provider wait is claimed (that wait is cancelled) — never a

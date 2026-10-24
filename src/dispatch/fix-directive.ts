@@ -204,7 +204,7 @@ export function freshReviewInput(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobI
  * assistant entry). A missing, empty or header-only file opens as a new,
  * empty session. Reads only as far as the first such entry; a read fault
  * other than a missing file propagates. */
-function holdsConversation(sessionFile: string): boolean {
+export function holdsConversation(sessionFile: string): boolean {
   let fd: number;
   try { fd = openSync(sessionFile, 'r'); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
