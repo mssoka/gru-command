@@ -22,7 +22,6 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
 import { admittedBlindPackage, BlindPackageRecordError, isAdmittedBlind, renderBlindPackageBlock } from './blind-review.js';
 import { laneMissingObjects, renderReviewSourceBlock, ReviewSourceRecordError, verifiedReviewSource } from './review-source.js';
 import type { ReviewRole } from './blind-input.js';
-import { parseTranscriptContent } from '../transcripts/service.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -200,6 +199,19 @@ export function freshReviewInput(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobI
   }
 }
 
+/** One transcript line that is a user or assistant message: a Pi `message`
+ * entry or a claude-code `user`/`assistant` frame. A torn or foreign line is
+ * none. Parsed here, without the Pi SDK, so routing stays dependency-light. */
+function conversationLine(line: string): boolean {
+  let entry: unknown;
+  try { entry = JSON.parse(line); } catch { return false; }
+  if (typeof entry !== 'object' || entry === null) return false;
+  const { type, message } = entry as { readonly type?: unknown; readonly message?: unknown };
+  if (typeof message !== 'object' || message === null) return false;
+  if (type === 'message') { const role = (message as { readonly role?: unknown }).role; return role === 'user' || role === 'assistant'; }
+  return type === 'user' || type === 'assistant';
+}
+
 /** Whether a recorded session transcript holds a conversation (a user or
  * assistant entry). A missing, empty or header-only file opens as a new,
  * empty session. Reads only as far as the first such entry; a read fault
@@ -210,8 +222,7 @@ export function holdsConversation(sessionFile: string): boolean {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw error;
   }
-  const conversation = (lines: string): boolean =>
-    parseTranscriptContent(lines).entries.some((entry) => entry.kind === 'user' || entry.kind === 'assistant');
+  const conversation = (lines: string): boolean => lines.split('\n').some(conversationLine);
   try {
     const decoder = new StringDecoder('utf8');
     const chunk = Buffer.alloc(64 * 1024);
