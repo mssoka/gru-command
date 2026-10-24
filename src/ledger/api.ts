@@ -2,6 +2,7 @@ import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
 import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt, type MailboxDisposition } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
@@ -255,6 +256,80 @@ export interface JobRecord {
   readonly briefing: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export type CreationContinuationState =
+  | 'accepted'
+  | 'queued'
+  | 'admitted'
+  | 'delivered'
+  | 'failed'
+  | 'refused'
+  | 'custody-unknown';
+
+function isCreationContinuationState(value: unknown): value is CreationContinuationState {
+  return value === 'accepted' || value === 'queued' || value === 'admitted' || value === 'delivered' ||
+    value === 'failed' || value === 'refused' || value === 'custody-unknown';
+}
+
+/** Immutable identity of one same-job retained initial-creation request. */
+export interface CreationContinuationIdentity {
+  readonly jobId: string;
+  readonly requestId: string;
+  readonly generation: number;
+  readonly payloadSha256: string;
+  readonly handoffSeq: number | null;
+  readonly briefingSha256: string | null;
+  readonly handoffRepoPath: string | null;
+  readonly repoPath: string | null;
+  readonly branch: string | null;
+  readonly baseSha: string | null;
+  readonly baseSource: WorktreeBaseSource | null;
+  readonly producerSettlementSeq: number | null;
+  readonly receiptTokenSha256: string | null;
+}
+
+export interface CreationContinuationTimeline {
+  readonly identity: CreationContinuationIdentity;
+  readonly events: readonly EventRecord[];
+  readonly state: CreationContinuationState;
+}
+
+export class CreationContinuationConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CreationContinuationConflictError';
+  }
+}
+
+/** The job-level scope of a creation continuation, the route's and the
+ * ledger's alike. Returns the refusal, or null. */
+export function creationContinuationJobRefusal(job: JobRecord): string | null {
+  if (job.status !== 'blocked') return `job "${job.id}" is ${job.status}, not blocked`;
+  if (job.deliverable !== null && job.deliverable !== 'pr') return `job "${job.id}" is not a PR-owing initial dispatch`;
+  if (job.prUrl !== null || job.targetRef !== null || job.targetSha !== null) {
+    return `job "${job.id}" has report or pull-request state incompatible with initial-creation continuation`;
+  }
+  if (job.briefing === null || job.briefing.trim() === '') return `job "${job.id}" has no original briefing to reuse`;
+  return null;
+}
+
+/** The one repository rule for a creation continuation, the route's and
+ * the ledger's alike: the handoff path's own leaf is the job's recorded
+ * repository (dispatch derived it so, a symlinked path included), and the
+ * path resolves to the inspected repository (`repoPath`; null before
+ * inspection). Returns the refusal, or null. */
+export function creationContinuationRepoMismatch(job: Pick<JobRecord, 'id' | 'repo'>, handoffRepoPath: string, repoPath: string | null): string | null {
+  const leaf = handoffRepoPath.split('/').filter(Boolean).at(-1) ?? '';
+  if (leaf !== job.repo) return `job "${job.id}" records repository "${job.repo}", but its handoff path ${handoffRepoPath} names "${leaf}"`;
+  if (repoPath === null) return null;
+  let canonical: string;
+  try {
+    canonical = realpathSync(handoffRepoPath);
+  } catch (error) {
+    return `job "${job.id}" handoff path ${handoffRepoPath} cannot be resolved: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return canonical === repoPath ? null : `job "${job.id}" handoff path ${handoffRepoPath} resolves to ${canonical}, not the inspected repository ${repoPath}`;
 }
 
 /** Why an amendment write was refused (each refusal is audited as a
@@ -1668,6 +1743,295 @@ export class LedgerApi {
         .prepare(`SELECT * FROM events WHERE job_id = ? AND kind IN (${placeholders}) ORDER BY seq DESC LIMIT ?`)
         .all(jobId, ...(kinds as string[]), limit) as Row[]
     ).map((row) => this.eventFromRow(row));
+  }
+
+  private creationContinuationEvents(jobId: string, requestId?: string): readonly EventRecord[] {
+    return (this.db.prepare(
+      `SELECT * FROM events WHERE job_id = ? AND kind = 'job.creation-continuation'${requestId === undefined ? '' : " AND json_extract(payload, '$.request_id') = ?"} ORDER BY seq ASC`,
+    ).all(...(requestId === undefined ? [jobId] : [jobId, requestId]) as string[]) as Row[]).map((row) => this.eventFromRow(row));
+  }
+
+  getCreationContinuation(jobId: string, requestId: string): CreationContinuationTimeline | null {
+    const events = this.creationContinuationEvents(jobId, requestId);
+    const first = events[0];
+    if (first === undefined) return null;
+    const firstPayload = first.payload as Record<string, unknown>;
+    const stateEvent = events.at(-1)!;
+    const latest = stateEvent.payload as Record<string, unknown>;
+    const baseSource = firstPayload['base_source'];
+    if (!(baseSource === null || baseSource === 'origin' || baseSource === 'local-head-fallback')) {
+      throw new Error(`creation continuation ${requestId} has an invalid recorded base provenance`);
+    }
+    const identity: CreationContinuationIdentity = {
+      jobId,
+      requestId,
+      generation: Number(firstPayload['generation']),
+      payloadSha256: String(firstPayload['payload_sha256']),
+      handoffSeq: typeof firstPayload['handoff_seq'] === 'number' ? firstPayload['handoff_seq'] : null,
+      briefingSha256: typeof firstPayload['briefing_sha256'] === 'string' ? firstPayload['briefing_sha256'] : null,
+      handoffRepoPath: typeof firstPayload['handoff_repo_path'] === 'string' ? firstPayload['handoff_repo_path'] : null,
+      repoPath: typeof firstPayload['repo_path'] === 'string' ? firstPayload['repo_path'] : null,
+      branch: typeof firstPayload['branch'] === 'string' ? firstPayload['branch'] : null,
+      baseSha: typeof firstPayload['base_sha'] === 'string' ? firstPayload['base_sha'] : null,
+      baseSource,
+      producerSettlementSeq: typeof firstPayload['producer_settlement_seq'] === 'number' ? firstPayload['producer_settlement_seq'] : null,
+      receiptTokenSha256: typeof firstPayload['receipt_token_sha256'] === 'string' ? firstPayload['receipt_token_sha256'] : null,
+    };
+    const state = latest['state'];
+    if (!isCreationContinuationState(state)) throw new Error(`creation continuation ${requestId} has an invalid state`);
+    return { identity, events, state };
+  }
+
+  getCreationContinuationDispatchEvidence(jobId: string, requestId: string, generation: number): {
+    readonly spawned: EventRecord | null;
+    readonly delivery: EventRecord | null;
+  } {
+    const spawned = this.db.prepare(
+      "SELECT * FROM events WHERE job_id = ? AND kind = 'job.minion-spawned' AND json_extract(payload, '$.creation_continuation_request_id') = ? AND json_extract(payload, '$.creation_continuation_generation') = ? ORDER BY seq DESC LIMIT 1",
+    ).get(jobId, requestId, generation) as Row | undefined;
+    const delivery = this.db.prepare(
+      "SELECT * FROM events WHERE job_id = ? AND kind = 'job.delivered' AND json_extract(payload, '$.source') = 'dispatch' AND json_extract(payload, '$.creation_continuation_request_id') = ? AND json_extract(payload, '$.creation_continuation_generation') = ? ORDER BY seq DESC LIMIT 1",
+    ).get(jobId, requestId, generation) as Row | undefined;
+    return {
+      spawned: spawned === undefined ? null : this.eventFromRow(spawned),
+      delivery: delivery === undefined ? null : this.eventFromRow(delivery),
+    };
+  }
+
+  /** Read the exact producer close receipt bound to this retained branch.
+   * Ref commitment, PID absence and receipt-writer identity are deliberately
+   * not accepted as cessation evidence. */
+  hasSettledCreationProducer(input: {
+    readonly jobId: string;
+    readonly branch: string;
+    readonly sha: string;
+    readonly tokenSha256: string;
+  }): EventRecord | null {
+    const row = this.db.prepare(
+      `SELECT * FROM events WHERE job_id = ? AND kind = 'job.creation-producer-settled'
+       AND json_extract(payload, '$.branch') = ? AND json_extract(payload, '$.sha') = ?
+       AND json_extract(payload, '$.token_sha256') = ? AND json_extract(payload, '$.close_observed') = 1
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(input.jobId, input.branch, input.sha, input.tokenSha256) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** WorktreeManager's exact child-handle close observation. This method is
+   * the only typed writer of creation-producer cessation evidence; the
+   * receipt token's digest correlates it, so one receipt settles once. */
+  recordCreationProducerSettlement(input: {
+    readonly jobId: string;
+    readonly branch: string;
+    readonly sha: string;
+    readonly tokenSha256: string;
+    readonly pid: number;
+    readonly exitCode: number | null;
+    readonly signal: string | null;
+  }): EventRecord {
+    if (input.jobId === '' || input.branch !== `gru/${input.jobId}` || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(input.sha) ||
+        !/^[a-f0-9]{64}$/u.test(input.tokenSha256) || !Number.isSafeInteger(input.pid) || input.pid <= 0 ||
+        !(input.exitCode === null || Number.isSafeInteger(input.exitCode)) ||
+        !(input.signal === null || typeof input.signal === 'string' && input.signal !== '')) {
+      throw new Error('creation producer settlement requires exact job, branch, base, token digest and child close identity');
+    }
+    return this.transaction(() => {
+      const prior = this.db.prepare(
+        "SELECT * FROM events WHERE kind = 'job.creation-producer-settled' AND json_extract(payload, '$.token_sha256') = ? ORDER BY seq ASC LIMIT 1",
+      ).get(input.tokenSha256) as Row | undefined;
+      if (prior !== undefined) {
+        const event = this.eventFromRow(prior);
+        const payload = event.payload as Record<string, unknown>;
+        if (event.jobId !== input.jobId || payload['branch'] !== input.branch || payload['sha'] !== input.sha) {
+          throw new Error(`creation receipt ${input.tokenSha256} is already settled for job "${event.jobId ?? ''}" ${String(payload['branch'])} at ${String(payload['sha'])}`);
+        }
+        return event;
+      }
+      return this.appendEvent({ kind: 'job.creation-producer-settled', jobId: input.jobId, payload: {
+        branch: input.branch, sha: input.sha, token_sha256: input.tokenSha256, pid: input.pid,
+        close_observed: true, exit_code: input.exitCode, signal: input.signal,
+      } });
+    });
+  }
+
+  /** Atomically persist one request identity/generation, or return its prior
+   * receipt. A competing in-flight request is recorded as refused; it never
+   * gets a second admission claim. */
+  acceptCreationContinuation(input: {
+    readonly jobId: string;
+    readonly requestId: string;
+    readonly payloadSha256: string;
+    readonly handoffSeq: number | null;
+    readonly briefingSha256: string | null;
+    readonly handoffRepoPath: string | null;
+    readonly repoPath: string | null;
+    readonly branch: string | null;
+    readonly baseSha: string | null;
+    readonly baseSource: WorktreeBaseSource | null;
+    readonly producerSettlementSeq: number | null;
+    readonly receiptTokenSha256: string | null;
+    readonly refusalReason?: string;
+  }): { readonly created: boolean; readonly timeline: CreationContinuationTimeline } {
+    if (input.jobId.trim() === '' || input.requestId.trim() === '' || !/^[a-f0-9]{64}$/u.test(input.payloadSha256)) {
+      throw new Error('creation continuation requires a job, request id and SHA-256 payload identity');
+    }
+    return this.transaction(() => {
+      const history = this.creationContinuationEvents(input.jobId);
+      const byRequest = new Map<string, EventRecord[]>();
+      for (const event of history) {
+        const payload = event.payload as Record<string, unknown>;
+        const id = payload['request_id'];
+        if (typeof id !== 'string') throw new Error(`creation continuation event ${event.seq} has no request id`);
+        byRequest.set(id, [...(byRequest.get(id) ?? []), event]);
+      }
+      const prior = byRequest.get(input.requestId);
+      if (prior !== undefined) {
+        const payload = prior[0]!.payload as Record<string, unknown>;
+        if (payload['payload_sha256'] !== input.payloadSha256) {
+          throw new CreationContinuationConflictError(`request id ${input.requestId} was already used with a different payload`);
+        }
+        const timeline = this.getCreationContinuation(input.jobId, input.requestId);
+        if (timeline === null) throw new Error(`creation continuation ${input.requestId} disappeared during readback`);
+        return { created: false, timeline };
+      }
+      const maxGeneration = history.reduce((max, event) => Math.max(max, Number((event.payload as Record<string, unknown>)['generation']) || 0), 0);
+      const generation = maxGeneration + 1;
+      const latest = (events: readonly EventRecord[]): CreationContinuationState => {
+        const state = (events.at(-1)?.payload as Record<string, unknown> | undefined)?.['state'];
+        return isCreationContinuationState(state) ? state : 'custody-unknown';
+      };
+      const unresolved = [...byRequest.entries()].find(([, events]) => {
+        const state = latest(events);
+        return state === 'accepted' || state === 'queued' || state === 'admitted' || state === 'custody-unknown';
+      });
+      const job = this.getJob(input.jobId);
+      const handoffRows = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'job.handoff' ORDER BY seq ASC").all(input.jobId) as Row[];
+      const handoff = handoffRows.length === 1 ? this.eventFromRow(handoffRows[0]!) : null;
+      const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
+      const briefingMatches = job?.briefing !== null && job?.briefing !== undefined &&
+        createHash('sha256').update(job.briefing, 'utf8').digest('hex') === input.briefingSha256;
+      const producer = input.producerSettlementSeq === null ? null : this.getEvent(input.producerSettlementSeq);
+      const producerPayload = producer?.payload as Record<string, unknown> | undefined;
+      const producerMatches = producer?.kind === 'job.creation-producer-settled' && producer.jobId === input.jobId &&
+        producerPayload?.['branch'] === input.branch && producerPayload?.['sha'] === input.baseSha &&
+        producerPayload?.['token_sha256'] === input.receiptTokenSha256 && producerPayload?.['close_observed'] === true;
+      const scope = (): string | null => {
+        if (unresolved !== undefined) return `another continuation request ${unresolved[0]} owns this job's continuation fence`;
+        if (this.getDirective(input.requestId) !== null) return `request id ${input.requestId} names a directive request; a continuation needs its own id`;
+        if (job === null) return `job "${input.jobId}" does not exist`;
+        const jobRefusal = creationContinuationJobRefusal(job);
+        if (jobRefusal !== null) return jobRefusal;
+        if (!briefingMatches) return `job "${input.jobId}" has no unchanged original briefing`;
+        if (this.listJobAmendments(input.jobId).length > 0) return `job "${input.jobId}" has an amended contract outside initial-dispatch continuation`;
+        if (handoff === null || handoff.seq !== input.handoffSeq || input.handoffRepoPath === null || handoffPayload?.['repoPath'] !== input.handoffRepoPath) {
+          return `job "${input.jobId}" has no unique matching original handoff`;
+        }
+        if (input.repoPath === null) return `job "${input.jobId}" has no inspected repository`;
+        const repoMismatch = creationContinuationRepoMismatch(job, input.handoffRepoPath, input.repoPath);
+        if (repoMismatch !== null) return repoMismatch;
+        if (input.branch !== `gru/${input.jobId}` || input.baseSha === null ||
+            !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(input.baseSha) || input.baseSource === null ||
+            !/^[a-f0-9]{64}$/u.test(input.receiptTokenSha256 ?? '') || !producerMatches) {
+          return `job "${input.jobId}" has no exact positive retained-creation producer settlement`;
+        }
+        if (this.getWorktree(input.jobId) !== null) return `job "${input.jobId}" already has a registered worktree`;
+        if (this.listAgents().some((agent) => agent.jobId === input.jobId)) return `job "${input.jobId}" already has an agent record`;
+        if (this.listJobAdmissions(input.jobId).length > 0) return `job "${input.jobId}" already has a live admission`;
+        const owner = this.creationContinuationLaneOwner(input.jobId);
+        if (owner !== null) return owner;
+        if (this.listPhaseHandoffs({ jobId: input.jobId, limit: 1000 }).length > 0) {
+          return `job "${input.jobId}" has a prior phase-handoff contract that this continuation does not rewrite`;
+        }
+        if (this.db.prepare("SELECT 1 FROM events WHERE job_id = ? AND kind IN ('job.minion-spawned', 'job.delivered', 'agent.attached') LIMIT 1").get(input.jobId) !== undefined) {
+          return `job "${input.jobId}" already has worker or delivery history`;
+        }
+        return null;
+      };
+      const scopeProblem = input.refusalReason ?? scope();
+      const identity: CreationContinuationIdentity = {
+        jobId: input.jobId, requestId: input.requestId, generation, payloadSha256: input.payloadSha256,
+        handoffSeq: input.handoffSeq, briefingSha256: input.briefingSha256, handoffRepoPath: input.handoffRepoPath,
+        repoPath: input.repoPath,
+        branch: input.branch, baseSha: input.baseSha, baseSource: input.baseSource,
+        producerSettlementSeq: input.producerSettlementSeq, receiptTokenSha256: input.receiptTokenSha256,
+      };
+      const initialState: CreationContinuationState = scopeProblem === null ? 'accepted' : 'refused';
+      this.appendEvent({ kind: 'job.creation-continuation', jobId: identity.jobId, payload: {
+        request_id: identity.requestId, generation: identity.generation, payload_sha256: identity.payloadSha256, state: initialState,
+        stage: initialState, handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256,
+        handoff_repo_path: identity.handoffRepoPath, repo_path: identity.repoPath, branch: identity.branch, base_sha: identity.baseSha,
+        base_source: identity.baseSource, producer_settlement_seq: identity.producerSettlementSeq,
+        ...(identity.receiptTokenSha256 !== null ? { receipt_token_sha256: identity.receiptTokenSha256 } : {}),
+        ...(scopeProblem !== null ? { reason: scopeProblem.slice(0, 1000) } : {}),
+      } });
+      const timeline = this.getCreationContinuation(input.jobId, input.requestId);
+      if (timeline === null) throw new Error(`creation continuation ${input.requestId} could not be read after recording`);
+      return { created: true, timeline };
+    });
+  }
+
+  /** The lane owners a creation continuation never starts beside, at
+   * acceptance and again once it holds the job admission: a live directive
+   * request or a pending re-brief. Returns the refusal, or null. */
+  creationContinuationLaneOwner(jobId: string): string | null {
+    const directive = this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+    if (directive !== undefined) return `job "${jobId}" has a live directive request (${directive.requestId}, ${directive.state}) that owns the lane`;
+    if (this.listPendingRebriefs({ jobId }).length > 0) return `job "${jobId}" has a pending re-brief that owns the lane`;
+    return null;
+  }
+
+  /** Persist queue, actual custody, actual admission, delivery or a named
+   * outcome against the exact accepted request. Delivered/admitted states
+   * require their ordinary dispatch event to have landed first. */
+  recordCreationContinuationState(input: {
+    readonly jobId: string;
+    readonly requestId: string;
+    readonly generation: number;
+    readonly state?: CreationContinuationState;
+    readonly stage: string;
+    readonly details?: Readonly<Record<string, unknown>>;
+  }): CreationContinuationTimeline {
+    return this.transaction(() => {
+      const prior = this.getCreationContinuation(input.jobId, input.requestId);
+      if (prior === null || prior.identity.generation !== input.generation) throw new CreationContinuationConflictError('creation continuation identity/generation changed');
+      const terminal = prior.state === 'delivered' || prior.state === 'failed' || prior.state === 'refused' || prior.state === 'custody-unknown';
+      if (terminal) {
+        if (input.state === prior.state && prior.events.some((event) => (event.payload as Record<string, unknown>)['stage'] === input.stage)) return prior;
+        throw new CreationContinuationConflictError(`creation continuation ${input.requestId} is already ${prior.state}`);
+      }
+      const state = input.state ?? prior.state;
+      const allowed: Readonly<Record<CreationContinuationState, readonly CreationContinuationState[]>> = {
+        accepted: ['accepted', 'queued', 'admitted', 'delivered', 'failed', 'refused', 'custody-unknown'],
+        queued: ['queued', 'admitted', 'delivered', 'failed', 'refused', 'custody-unknown'],
+        admitted: ['admitted', 'delivered', 'failed', 'custody-unknown'],
+        delivered: [], failed: [], refused: [], 'custody-unknown': [],
+      };
+      if (!allowed[prior.state].includes(state)) throw new CreationContinuationConflictError(`creation continuation cannot move ${prior.state} → ${state}`);
+      if (input.stage.trim() === '') throw new Error('creation continuation stage must be non-empty');
+      const details = input.details ?? {};
+      if (input.stage === 'custody-adopted') {
+        const lane = this.getWorktree(input.jobId);
+        if (lane === null || lane.branch !== prior.identity.branch || lane.sha !== prior.identity.baseSha || lane.baseSource !== prior.identity.baseSource || lane.repoPath !== prior.identity.repoPath) {
+          throw new CreationContinuationConflictError('registered worktree does not match the retained continuation identity');
+        }
+      }
+      if (state === 'admitted') {
+        const spawned = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'job.minion-spawned' AND json_extract(payload, '$.creation_continuation_request_id') = ? AND json_extract(payload, '$.creation_continuation_generation') = ? ORDER BY seq DESC LIMIT 1").get(input.jobId, input.requestId, input.generation) as Row | undefined;
+        if (spawned === undefined || (details['agent_id'] !== undefined && (this.eventFromRow(spawned).payload as Record<string, unknown>)['agentId'] !== details['agent_id'])) {
+          throw new CreationContinuationConflictError('actual continuation admission has no matching job.minion-spawned receipt');
+        }
+      }
+      if (state === 'delivered') {
+        const delivered = this.db.prepare("SELECT 1 FROM events WHERE job_id = ? AND kind = 'job.delivered' AND json_extract(payload, '$.source') = 'dispatch' AND json_extract(payload, '$.creation_continuation_request_id') = ? AND json_extract(payload, '$.creation_continuation_generation') = ? LIMIT 1").get(input.jobId, input.requestId, input.generation);
+        if (delivered === undefined) throw new CreationContinuationConflictError('delivery state requires the exact correlated job.delivered receipt');
+      }
+      this.appendEvent({ kind: 'job.creation-continuation', jobId: input.jobId, payload: {
+        request_id: input.requestId, generation: input.generation, payload_sha256: prior.identity.payloadSha256,
+        state, stage: input.stage, ...details,
+      } });
+      const timeline = this.getCreationContinuation(input.jobId, input.requestId);
+      if (timeline === null) throw new Error('creation continuation disappeared after state write');
+      return timeline;
+    });
   }
 
   /** A job's lifetime counters for one event kind: how many such events
@@ -4300,6 +4664,9 @@ export class LedgerApi {
     }
     if (fields.kind === REVIEW_OWNER_CEASED_KIND) {
       throw new Error(`${fields.kind} is recorded only through recordReviewOwnerCessation, which binds it to the round's owner marker, never as a custom event`);
+    }
+    if (fields.kind === 'job.creation-producer-settled' || fields.kind === 'job.creation-continuation') {
+      throw new Error(`${fields.kind} is recorded only through its typed creation-continuation method`);
     }
     return this.transaction(() => {
       if (fields.kind === 'silas.directive-producer-ceased' || fields.kind === 'silas.directive-producer-unknown') {

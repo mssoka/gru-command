@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -60,6 +60,17 @@ describe('creation receipt (#453)', () => {
     // Another branch has its own receipt.
     writeCreationIntent(dir, receipt({ lane: { id: 'job-2', kind: 'job', jobId: 'job-2', roundId: null, path: '/lanes/repo/job-job-2' }, branch: 'gru/job-2' }));
     expect(readdirSync(join(dir, 'gru-creation')).filter((entry) => entry.endsWith('.json'))).toHaveLength(2);
+  });
+
+  it('names a temporary receipt it cannot remove by its branch, never by its token', () => {
+    const dir = common();
+    const intent = receipt();
+    const tail = intent.token.slice('gru-creation:'.length);
+    // A directory at the temporary name: the exclusive open and the unlink both fail.
+    mkdirSync(join(dir, 'gru-creation', `.${tail}.tmp`), { recursive: true });
+    const error = (() => { try { writeCreationIntent(dir, intent); return null; } catch (failure) { return failure as Error; } })();
+    expect(error?.message).toBe('the temporary creation receipt for branch gru/job-1 could not be removed');
+    expect(error?.message).not.toContain(tail);
   });
 
   it('refuses a token the handoff receipt reader would reject', () => {

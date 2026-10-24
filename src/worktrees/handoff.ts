@@ -592,7 +592,7 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   const removeTemp = (failure: unknown): void => {
     try { unlinkSync(temp); } catch (cleanupError) {
       if (errnoOf(cleanupError) === 'ENOENT') return;
-      throw new Error(`lane administration ${admin} ${failure === null ? 'published its handoff receipt' : `cannot take a handoff receipt (${errnoOf(failure)})`} and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
+      throw new Error(`lane administration ${admin} ${failure === null ? 'published its handoff receipt' : `cannot take a handoff receipt (${errnoOf(failure)})`} and its temporary receipt could not be removed (${errnoOf(cleanupError)})`,
         { cause: failure === null ? cleanupError : new AggregateError([failure, cleanupError], 'handoff receipt and its cleanup failed') });
     }
   };
@@ -641,7 +641,7 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   const notDurable = `lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(undurable)})`;
   try { unlinkSync(temp); } catch (cleanupError) {
     if (errnoOf(cleanupError) !== 'ENOENT') {
-      throw new Error(`${notDurable}, and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
+      throw new Error(`${notDurable}, and its temporary receipt could not be removed (${errnoOf(cleanupError)})`,
         { cause: new AggregateError([cause, cleanupError], 'handoff receipt durability and its cleanup failed') });
     }
   }
