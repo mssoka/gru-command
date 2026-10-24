@@ -186,7 +186,7 @@ export function writeCreationIntent(commonDir: string, intent: Omit<CreationInte
   try { unlinkSync(temp); } catch (error) {
     // Our own temporary name is absent when the exclusive open never ran.
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new CreationIntentError(`temporary creation receipt ${temp} could not be removed`,
+      throw new CreationIntentError(`the temporary creation receipt for branch ${intent.branch} could not be removed`,
         { cause: failed === undefined ? error : new AggregateError([failed, error], 'receipt publication and its temporary name both failed') });
     }
   }

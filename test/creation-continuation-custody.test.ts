@@ -3,12 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { DispatchService } from '../src/dispatch/service.js';
+import { JobExecutionStop } from '../src/dispatch/job-stop.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { clearCreationIntent, readCreationIntent, writeCreationIntent } from '../src/worktrees/creation-intent.js';
 import type { LogLevel } from '../src/logger.js';
 import {
-  acceptDirectly, cleanupContinuationFixtures, committedExitWithoutClose, directory, fakeHandle, git, hasRawCreationToken, httpHarness,
-  managerFixture, processGone, receiptFiles, request, retainedFixture, sha256, syntheticRetained, waitForState, type RetainedFixture,
+  acceptDirectly, cleanupContinuationFixtures, committedExitWithoutClose, committedStall, directory, fakeHandle, git, hasRawCreationToken, httpHarness,
+  managerFixture, processGone, receiptFiles, request, retainedFixture, sha256, syntheticRetained, TOKEN, waitForState, type RetainedFixture,
 } from './helpers/creation-continuation.js';
 
 afterEach(cleanupContinuationFixtures);
@@ -36,29 +37,34 @@ function jobRecordText(h: Pick<RetainedFixture, 'ledger'>, jobId: string): strin
   return JSON.stringify({ note: h.ledger.getJob(jobId)?.note ?? null, events: h.ledger.listJobEvents(jobId, { limit: 1000 }).map((event) => [event.kind, event.payload]) });
 }
 
-/** A job dispatched once whose Git child exited while a descendant holds its pipes. */
-async function exitedWithoutClose(h: ReturnType<typeof managerFixture>, jobId: string, holdSeconds: number) {
+/** A job dispatched once whose Git child exited while a descendant holds
+ * its pipes; `release` lets the descendant exit. */
+async function exitedWithoutClose(h: ReturnType<typeof managerFixture>, jobId: string) {
   const job = h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Original briefing ${jobId}` });
   h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: job.repo, repoPath: h.repo.path } });
   h.ledger.setJobStatus(jobId, 'working');
-  const pidFile = join(directory(), 'holder.pid');
-  const restore = committedExitWithoutClose(pidFile, holdSeconds);
+  const signals = directory();
+  const pidFile = join(signals, 'holder.pid');
+  const releaseFile = join(signals, 'release');
+  const restore = committedExitWithoutClose(pidFile, releaseFile);
   await expect(h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId })).rejects.toThrow(/did not close within 1000ms/u);
   vi.stubEnv('PATH', restore);
   h.ledger.setJobStatus(jobId, 'blocked');
-  return Number(readFileSync(pidFile, 'utf8'));
+  const holder = Number(readFileSync(pidFile, 'utf8'));
+  return { holder, release: () => { writeFileSync(releaseFile, ''); } };
 }
 
 const settlements = (h: Pick<RetainedFixture, 'ledger'>, jobId: string) => h.ledger.listJobEventsByKinds(jobId, ['job.creation-producer-settled']);
 
 describe('retained-creation continuation custody', () => {
-  it('settles an exited Git producer once, only after the descendant holding its pipes stops, and the continuation is then admissible', async () => {
+  it('settles an exited Git producer once, only after the holder of its pipes releases them, and the continuation is then admissible', async () => {
     const h = managerFixture('late-close');
     const jobId = 'late-close';
-    const holder = await exitedWithoutClose(h, jobId, 5);
+    const { holder, release } = await exitedWithoutClose(h, jobId);
     expect(processGone(holder)).toBe(false);
     expect(settlements(h, jobId)).toHaveLength(0);
     await expect(h.worktrees.inspectRetainedJobCreation({ repoPath: h.repo.path, jobId })).rejects.toThrow(/cessation is UNKNOWN/u);
+    release();
     await vi.waitFor(() => { expect(processGone(holder)).toBe(true); }, { timeout: 10_000 });
     await vi.waitFor(() => { expect(settlements(h, jobId)).toHaveLength(1); });
     const inspection = await h.worktrees.inspectRetainedJobCreation({ repoPath: h.repo.path, jobId });
@@ -73,7 +79,11 @@ describe('retained-creation continuation custody', () => {
   it('never counts the close its own released pipes cause as producer settlement', async () => {
     const h = managerFixture('released-close', { creationCloseWindowMs: 100 });
     const jobId = 'released-close';
-    const holder = await exitedWithoutClose(h, jobId, 3);
+    const { holder, release } = await exitedWithoutClose(h, jobId);
+    // A timer due after the 100 ms window: the window has released the pipes.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(processGone(holder)).toBe(false);
+    release();
     await vi.waitFor(() => { expect(processGone(holder)).toBe(true); }, { timeout: 10_000 });
     expect(settlements(h, jobId)).toHaveLength(0);
     await expect(h.worktrees.inspectRetainedJobCreation({ repoPath: h.repo.path, jobId })).rejects.toThrow(/cessation is UNKNOWN/u);
@@ -117,21 +127,75 @@ describe('retained-creation continuation custody', () => {
     expect(api.ledger.listJobEventsByKinds(api.jobId, ['worktree.bootstrapped'])).toHaveLength(1);
   });
 
-  it('keeps the retained ref and receipt when the configured setup fails after adoption and reads back failed with custody retained', async () => {
-    const h = await retainedFixture('setup-fails', { prepare: (repo) => { repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "exit 7"\n', 'failing setup manifest'); } });
+  it('rolls the checkout back under its token after a setup failure, keeps the ref and receipt, and a later request adopts them', async () => {
+    const flag = join(directory(), 'setup-may-pass');
+    const h = await retainedFixture('setup-fails', {
+      prepare: (repo) => { repo.commitFile('.gru-command/worktree.toml', `[[setup]]\ncommand = "test -e ${flag}"\n`, 'flaky setup manifest'); },
+    });
     const api = await httpHarness(h);
     expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'setup-fails' })).status).toBe(202);
     const failed = await waitForState(api.base, api.jobId, 'setup-fails', 'failed');
-    expect(failed).toMatchObject({ active: false, custody: null, admission: null, delivery: null });
-    expect(failed['reason']).toMatch(/^retained creation of branch gru\/setup-fails failed after adoption; its ref and receipt are kept: worktree setup command exited 7/u);
+    expect(failed).toMatchObject({
+      active: false, admission: null, delivery: null,
+      custody: { worktree_id: null, path: null, branch: `gru/${api.jobId}`, sha: h.inspection.sha, base_source: h.inspection.baseSource, status: 'retained', evidence: 'retained-receipt' },
+    });
+    expect(failed['reason']).toMatch(/^retained creation of branch gru\/setup-fails failed after adoption; its checkout was rolled back and its ref and receipt are kept: worktree setup command exited 1/u);
     expect((failed['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'failed', stage: 'retained-custody-kept' });
     expect(git(api.repo, ['rev-parse', `refs/heads/gru/${api.jobId}`])).toBe(h.inspection.sha);
     expect(receiptFiles(api.repo)).toHaveLength(1);
+    expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`))).toBe(false);
+    expect(git(api.repo, ['worktree', 'list', '--porcelain']).match(/^worktree /gmu)).toHaveLength(1);
     expect(api.spawns).toHaveLength(0);
     expect(api.ledger.getJob(api.jobId)?.status).toBe('blocked');
+
+    writeFileSync(flag, '');
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'setup-passes' })).status).toBe(202);
+    await waitForState(api.base, api.jobId, 'setup-passes', 'delivered');
+    expect(api.ledger.getWorktree(api.jobId)).toMatchObject({ status: 'active', sha: h.inspection.sha });
+    expect(receiptFiles(api.repo)).toHaveLength(0);
+    expect(api.spawns).toHaveLength(1);
   });
 
-  it('disposes the spawned minion and its agent row when a write after the spawn throws', async () => {
+  it('keeps everything and reads custody-unknown when setup processes outlive a setup timeout', async () => {
+    const h = await retainedFixture('setup-survivor', {
+      manager: { setupTimeoutMs: 300 },
+      prepare: (repo) => { repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "(trap \'\' TERM; exec sleep 3) >/dev/null 2>&1 & sleep 30"\n', 'setup with a survivor'); },
+    });
+    const api = await httpHarness(h);
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'setup-survivor' })).status).toBe(202);
+    const unknown = await waitForState(api.base, api.jobId, 'setup-survivor', 'custody-unknown');
+    expect(unknown['reason']).toMatch(/worktree setup command timed out after 300ms/u);
+    expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`))).toBe(true);
+    expect(receiptFiles(api.repo)).toHaveLength(1);
+    expect(api.spawns).toHaveLength(0);
+  });
+
+  it('reads back refused, with everything retained, when a custody guard refuses after adoption', async () => {
+    const h = await retainedFixture('guard-after-adoption');
+    const manager = h.worktrees as unknown as { assertCreationIdentity: (...args: unknown[]) => void };
+    manager.assertCreationIdentity = () => { throw new Error('worktree creation target changed: synthetic foreign change'); };
+    const api = await httpHarness(h);
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'guard' })).status).toBe(202);
+    const refused = await waitForState(api.base, api.jobId, 'guard', 'refused');
+    expect((refused['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'refused', stage: 'manager-guard-refused' });
+    expect(refused['reason']).toMatch(/worktree creation target changed/u);
+    expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`))).toBe(true);
+    expect(receiptFiles(api.repo)).toHaveLength(1);
+    expect(api.spawns).toHaveLength(0);
+  });
+
+  it('reads back custody-unknown when the creation fails after registering the lane', async () => {
+    const h = await retainedFixture('after-registration');
+    (h.worktrees as unknown as { handoffLane: () => void }).handoffLane = () => { throw new Error('worktree creation custody handoff failed (synthetic)'); };
+    const api = await httpHarness(h);
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'after-registration' })).status).toBe(202);
+    const unknown = await waitForState(api.base, api.jobId, 'after-registration', 'custody-unknown');
+    expect((unknown['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'custody-unknown', stage: 'registered-unsettled' });
+    expect(unknown['custody']).toMatchObject({ status: 'active', evidence: 'ledger-registry-only' });
+    expect(api.spawns).toHaveLength(0);
+  });
+
+  it('disposes the spawned minion, sweeps its lane and reads failed before the prompt when a write after the spawn throws', async () => {
     const h = await retainedFixture('admitted-write');
     const original = h.ledger.recordCreationContinuationState.bind(h.ledger);
     h.ledger.recordCreationContinuationState = (input) => {
@@ -140,12 +204,37 @@ describe('retained-creation continuation custody', () => {
     };
     const api = await httpHarness(h);
     expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'admitted-write' })).status).toBe(202);
-    await waitForState(api.base, api.jobId, 'admitted-write', 'custody-unknown');
+    const failed = await waitForState(api.base, api.jobId, 'admitted-write', 'failed');
+    expect((failed['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'failed', stage: 'failed-before-prompt' });
+    expect(failed).toMatchObject({ reason: 'synthetic admitted-state write failure', custody: { status: 'swept' }, delivery: null });
     expect(api.spawns).toEqual(['fixture-minion-1']);
     expect(api.disposed).toEqual(['fixture-minion-1']);
     expect(api.prompts).toHaveLength(0);
     expect(api.ledger.getAgent('fixture-minion-1')?.state).toBe('disposed');
     expect(api.ledger.getJob(api.jobId)?.status).toBe('blocked');
+    // The known outcome leaves no continuation fence: a later request is
+    // judged on the job itself, where registration already spent the receipt.
+    const later = await request(api.base, 'POST', { job_id: api.jobId, request_id: 'later' });
+    expect((later.body['readback'] as Record<string, unknown>)['reason']).toMatch(/^retained creation receipt for branch gru\/admitted-write is absent/u);
+  });
+
+  it('keeps the original post-spawn error and marks the agent disposed when the disposal itself fails', async () => {
+    const h = managerFixture('dispose-fails');
+    const original = h.ledger.appendCustomEvent.bind(h.ledger);
+    h.ledger.appendCustomEvent = ((input: Parameters<typeof original>[0]) => {
+      if (input.kind === 'job.minion-spawned') throw new Error('synthetic spawn-event write failure');
+      return original(input);
+    }) as typeof original;
+    const handle = fakeHandle('dispose-fails-minion', []);
+    handle.dispose = async () => { throw new Error('synthetic dispose failure'); };
+    const dispatch = new DispatchService({ ledger: h.ledger, worktrees: h.worktrees, spawner: async () => handle });
+    const error = await dispatch.dispatch({ jobId: 'dispose-fails', repoPath: h.repo.path, title: 'dispose', briefing: 'dispose briefing' }).then(() => null, (failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map(String)).toEqual(['Error: synthetic spawn-event write failure', 'Error: synthetic dispose failure']);
+    expect(h.ledger.getAgent('dispose-fails-minion')?.state).toBe('disposed');
+    // The minion may still run: its lane is not swept.
+    expect(h.ledger.getWorktree('dispose-fails')?.status).toBe('active');
+    expect(h.ledger.getJob('dispose-fails')?.note).toMatch(/^dispatch failed: AggregateError: Error: synthetic spawn-event write failure/u);
   });
 
   it('settles the job delivered when only the continuation delivered-state write fails', async () => {
@@ -171,17 +260,25 @@ describe('retained-creation continuation custody', () => {
     mkdirSync(parent, { recursive: true });
     chmodSync(parent, 0o555);
     try {
-      const api = await httpHarness(h);
+      const sink = logSink();
+      const api = await httpHarness(h, { serverLog: sink.log });
       expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'token-worktree-add' })).status).toBe(202);
       const failed = await waitForState(api.base, api.jobId, 'token-worktree-add', 'failed');
       expect(failed['reason']).toMatch(/<redacted-creation-token>/u);
       expect(api.ledger.getJob(api.jobId)?.note).toMatch(/^dispatch failed: .*<redacted-creation-token>/u);
       expect(hasRawCreationToken(jobRecordText(api, api.jobId))).toBe(false);
 
-      // Ordinary dispatch writes its failure note through the same redaction.
-      const prompts: string[] = [];
-      const dispatch = new DispatchService({ ledger: h.ledger, worktrees: h.worktrees, spawner: async () => fakeHandle('ordinary-minion', prompts) });
-      await expect(dispatch.dispatch({ jobId: 'token-ordinary', repoPath: h.repo.path, title: 'ordinary', briefing: 'ordinary briefing' })).rejects.toThrow(/gru-creation:/u);
+      // Ordinary dispatch redacts it the same way: the HTTP detail, the
+      // handler's log line and the job note.
+      const response = await fetch(`${api.base}/api/dispatch`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+        body: JSON.stringify({ job_id: 'token-ordinary', repo_path: h.repo.path, title: 'ordinary', briefing: 'ordinary briefing' }),
+      });
+      const body = await response.json() as Record<string, unknown>;
+      expect(response.status).toBe(400);
+      expect(body['detail']).toMatch(/git worktree add --lock --reason <redacted-creation-token>/u);
+      expect(sink.entries.filter((entry) => entry.msg === 'dispatch api handler failed')).toHaveLength(1);
+      expect(hasRawCreationToken(JSON.stringify({ body, logs: sink.entries }))).toBe(false);
       expect(h.ledger.getJob('token-ordinary')?.note).toMatch(/^dispatch failed: .*<redacted-creation-token>/u);
       expect(hasRawCreationToken(jobRecordText(h, 'token-ordinary'))).toBe(false);
     } finally {
@@ -223,19 +320,58 @@ describe('retained-creation continuation custody', () => {
     expect((unknown['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'custody-unknown', stage: 'turn-outcome-unknown' });
   });
 
-  it('takes the job admission after the disk floor, so the owner can bin a continuation queued there', async () => {
-    const h = await retainedFixture('bin-at-floor');
+  it('reads back custody-unknown for a turn that fails, rejected or in-band, while the service is stopping', async () => {
+    for (const ending of ['rejected', 'in-band'] as const) {
+      const h = await retainedFixture(`shutdown-${ending}`);
+      const stop = new AbortController();
+      const api = await httpHarness(h, {
+        // Shutdown, then the registry's disposal ends the running turn.
+        prompt: async () => { stop.abort(); if (ending === 'rejected') throw new Error('session disposed: service shutting down'); },
+        health: () => ({ state: 'error', error: 'session disposed: service shutting down', lastActivity: null, sessionFile: null }),
+        service: { stopSignal: stop.signal, retrySettlement: async () => 'none' },
+      });
+      expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: ending })).status, ending).toBe(202);
+      const unknown = await waitForState(api.base, api.jobId, ending, 'custody-unknown');
+      expect((unknown['timeline'] as readonly Record<string, unknown>[]).at(-1), ending).toMatchObject({ state: 'custody-unknown', stage: 'turn-outcome-unknown' });
+      expect(unknown['reason'], ending).toMatch(/session disposed: service shutting down/u);
+      expect(api.prompts, ending).toHaveLength(1);
+    }
+  });
+
+  it('takes the job admission after the disk floor, so the owner can stop and bin a continuation queued there', async () => {
+    const h = await retainedFixture('stop-at-floor');
     const held = heldFloor();
-    const api = await httpHarness(h, { service: { diskFloor: held.floor, bus: h.bus } });
-    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'bin-at-floor' })).status).toBe(202);
-    await waitForState(api.base, api.jobId, 'bin-at-floor', 'queued');
-    expect(api.ledger.listJobAdmissions(api.jobId)).toEqual([]);
+    const api = await httpHarness(h, { service: { diskFloor: held.floor } });
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'stop-at-floor' })).status).toBe(202);
+    await waitForState(api.base, api.jobId, 'stop-at-floor', 'queued');
+    api.ledger.setJobStatus(api.jobId, 'parked');
+    const stop = new JobExecutionStop({ ledger: api.ledger, handles: { list: () => [] }, children: null, reviews: null, log: () => {} });
+    const outcome = await stop.stop({ jobId: api.jobId, by: 'fixture-owner', reason: 'stop the queued continuation' });
+    expect(outcome).toMatchObject({ state: 'stopped', outstanding: [] });
     api.ledger.setJobStatus(api.jobId, 'binned');
-    const failed = await waitForState(api.base, api.jobId, 'bin-at-floor', 'failed');
+    held.release();
+    const failed = await waitForState(api.base, api.jobId, 'stop-at-floor', 'failed');
     expect((failed['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'failed', stage: 'failed-before-manager' });
     expect(api.ledger.getJob(api.jobId)?.status).toBe('binned');
     expect(api.ledger.getWorktree(api.jobId)).toBeNull();
     expect(git(api.repo, ['rev-parse', `refs/heads/gru/${api.jobId}`])).toBe(h.inspection.sha);
+    expect(receiptFiles(api.repo)).toHaveLength(1);
+    expect(api.spawns).toHaveLength(0);
+  });
+
+  it('refuses by name a directive that started while the continuation waited at the floor', async () => {
+    const h = await retainedFixture('directive-at-floor');
+    const held = heldFloor();
+    const api = await httpHarness(h, { service: { diskFloor: held.floor } });
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'directive-at-floor' })).status).toBe(202);
+    await waitForState(api.base, api.jobId, 'directive-at-floor', 'queued');
+    const directive = api.ledger.beginDirectiveIntent({ jobId: api.jobId, directive: 'fixture directive', holder: 'silas-ops' }).record;
+    held.release();
+    const refused = await waitForState(api.base, api.jobId, 'directive-at-floor', 'refused');
+    expect((refused['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'refused', stage: 'admission-refused' });
+    expect(refused['reason']).toBe(`job "${api.jobId}" has a live directive request (${directive.requestId}, dispatching) that owns the lane`);
+    expect(api.ledger.listJobAdmissions(api.jobId)).toEqual([]);
+    expect(api.ledger.getWorktree(api.jobId)).toBeNull();
     expect(receiptFiles(api.repo)).toHaveLength(1);
     expect(api.spawns).toHaveLength(0);
   });
@@ -285,29 +421,61 @@ describe('retained-creation continuation custody', () => {
     expect(api.spawns).toHaveLength(0);
   });
 
-  it('applies one canonical repository rule in the service and the ledger and names a symlinked mismatch', async () => {
-    const h = managerFixture('canonical-repository');
-    const alias = join(directory(), 'alias-name');
+  it('continues a job dispatched through a symlinked repository path, and the ledger ties the path to its realpath', async () => {
+    const h = managerFixture('symlinked-repository');
+    const alias = join(directory(), 'linked-checkout');
     symlinkSync(h.repo.path, alias);
-    const jobId = 'canonical-repository';
-    // Dispatch through the alias records its leaf as the job's repository.
-    const job = h.ledger.addJob({ id: jobId, repo: 'alias-name', title: 'alias', baseBranch: 'main', briefing: 'Original briefing alias' });
-    const handoff = h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: 'alias-name', repoPath: alias } });
-    h.ledger.setJobStatus(jobId, 'working');
-    h.ledger.setJobStatus(jobId, 'blocked');
-    const api = await httpHarness({ ...h, job });
-    const response = await request(api.base, 'POST', { job_id: jobId, request_id: 'alias' });
-    expect(response.status).toBe(409);
-    const reason = (response.body['readback'] as Record<string, unknown>)['reason'];
+    const jobId = 'symlinked-repository';
+    // Ordinary dispatch through the alias records its leaf as the job's repository.
+    const original = new DispatchService({ ledger: h.ledger, worktrees: h.worktrees, spawner: async () => fakeHandle('never-spawned', []) });
+    const restore = committedStall();
+    await expect(original.dispatch({ jobId, repoPath: alias, title: 'alias', briefing: 'Original briefing alias' })).rejects.toThrow(/did not close within 1000ms/u);
+    vi.stubEnv('PATH', restore);
+    const job = h.ledger.getJob(jobId)!;
+    expect(job).toMatchObject({ status: 'blocked', repo: 'linked-checkout' });
+    const inspection = await h.worktrees.inspectRetainedJobCreation({ repoPath: alias, jobId });
     const canonical = realpathSync(h.repo.path);
-    expect(reason).toBe(`job "${jobId}" records repository "alias-name", but its handoff path resolves to "${basename(canonical)}" (${canonical})`);
+
+    // The ledger refuses a path whose leaf matches but that resolves elsewhere.
+    const handoff = h.ledger.listJobEventsByKinds(jobId, ['job.handoff'])[0]!;
+    const elsewhere = join(directory(), 'linked-checkout');
     const direct = h.ledger.acceptCreationContinuation({
-      jobId, requestId: 'direct', payloadSha256: sha256('direct'), handoffSeq: handoff.seq, briefingSha256: sha256(job.briefing!),
-      handoffRepoPath: alias, repoPath: canonical, branch: `gru/${jobId}`, baseSha: git(h.repo, ['rev-parse', 'HEAD']),
-      baseSource: 'local-head-fallback', producerSettlementSeq: null, receiptTokenSha256: null,
+      jobId, requestId: 'elsewhere', payloadSha256: sha256('elsewhere'), handoffSeq: handoff.seq, briefingSha256: sha256(job.briefing!),
+      handoffRepoPath: alias, repoPath: elsewhere, branch: inspection.branch, baseSha: inspection.sha, baseSource: inspection.baseSource,
+      producerSettlementSeq: inspection.producerSettlementSeq, receiptTokenSha256: inspection.receiptTokenSha256,
     });
-    expect(direct.timeline).toMatchObject({ state: 'refused' });
-    expect((direct.timeline.events[0]!.payload as Record<string, unknown>)['reason']).toBe(reason);
+    expect(direct.timeline.state).toBe('refused');
+    expect((direct.timeline.events[0]!.payload as Record<string, unknown>)['reason']).toBe(
+      `job "${jobId}" handoff path ${alias} resolves to ${canonical}, not the inspected repository ${elsewhere}`);
+
+    const api = await httpHarness({ ...h, job, inspection });
+    expect((await request(api.base, 'POST', { job_id: jobId, request_id: 'alias' })).status).toBe(202);
+    const delivered = await waitForState(api.base, jobId, 'alias', 'delivered');
+    expect(delivered['original']).toMatchObject({ handoff_repo_path: alias, repo_path: canonical });
+    expect(api.prompts[0]).toContain('Repo: linked-checkout');
+    expect(api.ledger.getWorktree(jobId)).toMatchObject({ repoPath: canonical, sha: inspection.sha });
+  });
+
+  it('carries the route\'s job-level refusals into the ledger', async () => {
+    const h = managerFixture('ledger-job-scope');
+    for (const [guard, change, reason] of [
+      ['target-ref', 'UPDATE jobs SET target_ref = \'refs/heads/fixture\' WHERE id = ?', /report or pull-request state/u],
+      ['target-sha', 'UPDATE jobs SET target_sha = \'0123456789012345678901234567890123456789\' WHERE id = ?', /report or pull-request state/u],
+      ['blank-briefing', 'UPDATE jobs SET briefing = \'   \' WHERE id = ?', /no original briefing to reuse/u],
+    ] as const) {
+      const jobId = `ledger-job-scope-${guard}`;
+      const retained = syntheticRetained(h, jobId);
+      // A legacy row may carry what the route never writes.
+      h.db.handle.prepare(change).run(jobId);
+      const job = h.ledger.getJob(jobId)!;
+      const accepted = h.ledger.acceptCreationContinuation({
+        jobId, requestId: guard, payloadSha256: sha256(guard), handoffSeq: h.ledger.listJobEventsByKinds(jobId, ['job.handoff'])[0]!.seq,
+        briefingSha256: sha256(job.briefing!), handoffRepoPath: h.repo.path, repoPath: realpathSync(h.repo.path), branch: retained.branch,
+        baseSha: retained.sha, baseSource: 'local-head-fallback', producerSettlementSeq: settlements(h, jobId)[0]!.seq, receiptTokenSha256: sha256(retained.token),
+      });
+      expect(accepted.timeline.state, guard).toBe('refused');
+      expect((accepted.timeline.events[0]!.payload as Record<string, unknown>)['reason'], guard).toMatch(reason);
+    }
   });
 
   it('starts one owner for concurrent identical requests (a client timeout retry)', async () => {

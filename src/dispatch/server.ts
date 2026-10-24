@@ -18,6 +18,7 @@ import type { CreationContinuationRequestResult, DispatchService } from './servi
 import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
+import { redactCreationTokens } from '../worktrees/creation-intent.js';
 import type { DirectiveRegistry } from './fix-directive.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
@@ -2134,7 +2135,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           }
         })
         .catch((error: unknown) => {
-          const message = String(error instanceof Error ? error.message : error);
+          const message = redactCreationTokens(String(error instanceof Error ? error.message : error));
           log('error', 'dispatch api handler failed', { path, error: message });
           if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message });
         });

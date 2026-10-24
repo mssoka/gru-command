@@ -14,6 +14,7 @@ import { DispatchService, type DispatchServiceOptions } from '../../src/dispatch
 import { createDispatchServer } from '../../src/dispatch/server.js';
 import type { WaveRunner } from '../../src/dispatch/perkins.js';
 import type { AgentHandle } from '../../src/runtime/types.js';
+import type { LogLevel } from '../../src/logger.js';
 import { repositoryGitEnv } from '../../src/dispatch/perkins-review/artifacts.js';
 import { WorktreeManager, type WorktreeManagerOptions } from '../../src/worktrees/manager.js';
 import { writeCreationIntent } from '../../src/worktrees/creation-intent.js';
@@ -107,10 +108,12 @@ export function committedStall(): string {
 }
 
 /** The wrapper commits and exits, but a detached descendant keeps the
- * service's pipes open for `holdSeconds`; its pid is written to `pidFile`. */
-export function committedExitWithoutClose(pidFile: string, holdSeconds: number): string {
+ * service's pipes open until `releaseFile` exists; its pid is written to
+ * `pidFile`. */
+export function committedExitWithoutClose(pidFile: string, releaseFile: string): string {
+  const hold = `while [ ! -e ${JSON.stringify(releaseFile)} ]; do sleep 0.05; done`;
   return gitWrapper([
-    `child.on("close", code => { const holder = cp.spawn("sleep", ["${holdSeconds}"], {stdio:["ignore","inherit","inherit"], detached:true}); fs.writeFileSync(${JSON.stringify(pidFile)}, String(holder.pid)); holder.unref(); process.exit(code ?? 1); });`,
+    `child.on("close", code => { const holder = cp.spawn("/bin/sh", ["-c", ${JSON.stringify(hold)}], {stdio:["ignore","inherit","inherit"], detached:true}); fs.writeFileSync(${JSON.stringify(pidFile)}, String(holder.pid)); holder.unref(); process.exit(code ?? 1); });`,
   ]);
 }
 
@@ -163,7 +166,9 @@ export function syntheticRetained(h: ReturnType<typeof managerFixture>, jobId: s
   return { job: h.ledger.getJob(jobId)!, token, branch, sha };
 }
 
-export function fakeHandle(id: string, prompts: string[], options: { readonly prompt?: (text: string) => Promise<void>; readonly disposed?: string[] } = {}): AgentHandle {
+export function fakeHandle(id: string, prompts: string[], options: {
+  readonly prompt?: (text: string) => Promise<void>; readonly disposed?: string[]; readonly health?: AgentHandle['health'];
+} = {}): AgentHandle {
   const capabilities = {
     streaming: true, steer: 'native' as const, resume: 'file' as const,
     images: false, thinking: false, thinkingLevelControl: false, followUp: false,
@@ -172,7 +177,7 @@ export function fakeHandle(id: string, prompts: string[], options: { readonly pr
     role: 'minion', id, sessionFile: null, capabilities,
     async prompt(text) { prompts.push(text); await options.prompt?.(text); },
     async steer() {}, async followUp() {}, subscribe() { return () => {}; },
-    health() { return { state: 'idle', lastActivity: null, sessionFile: null }; },
+    health: options.health ?? (() => ({ state: 'idle', lastActivity: null, sessionFile: null })),
     async dispose() { options.disposed?.push(id); },
   };
 }
@@ -181,7 +186,9 @@ export interface HarnessOptions {
   readonly spawnFailure?: Error;
   /** Runs after each prompt is recorded: hold it, or reject the turn. */
   readonly prompt?: (text: string) => Promise<void>;
+  readonly health?: AgentHandle['health'];
   readonly service?: Partial<Omit<DispatchServiceOptions, 'ledger' | 'worktrees' | 'spawner'>>;
+  readonly serverLog?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 }
 
 type HarnessSource = Pick<RetainedFixture, 'ledger' | 'worktrees' | 'repo' | 'job'> & { readonly inspection?: RetainedFixture['inspection'] };
@@ -201,10 +208,13 @@ export async function httpHarness(h: HarnessSource, options: HarnessOptions = {}
       if (options.spawnFailure !== undefined) throw options.spawnFailure;
       const id = `fixture-minion-${spawns.length + 1}`;
       spawns.push(id);
-      return fakeHandle(id, prompts, { disposed, ...(options.prompt === undefined ? {} : { prompt: options.prompt }) });
+      return fakeHandle(id, prompts, {
+        disposed, ...(options.prompt === undefined ? {} : { prompt: options.prompt }), ...(options.health === undefined ? {} : { health: options.health }),
+      });
     },
   });
-  const api = createDispatchServer({ config, dispatch, wave: {} as WaveRunner, ledger: h.ledger, pendingProducerBlockers: () => [] });
+  const api = createDispatchServer({ config, dispatch, wave: {} as WaveRunner, ledger: h.ledger, pendingProducerBlockers: () => [],
+    ...(options.serverLog === undefined ? {} : { log: options.serverLog }) });
   const server = createServer((req, res) => {
     const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
     if (!api.requestHook(req, res, path)) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); }

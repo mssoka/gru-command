@@ -185,7 +185,7 @@ describe('same-job retained initial-creation continuation', () => {
           'worker-history': /worker or delivery history/u,
           'delivery-history': /worker or delivery history/u,
           'duplicate-handoff': /no unique original job.handoff/u,
-          'mismatched-handoff': /records repository ".+", but its handoff path resolves to "another-repository"/u,
+          'mismatched-handoff': /records repository "continuation-scope", but its handoff path .*another-repository names "another-repository"$/u,
           'live-directive': /live directive request .* owns the lane/u,
           'pending-rebrief': /pending re-brief that owns the lane/u,
           'directive-request-id': /names a directive request/u,

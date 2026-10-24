@@ -1,10 +1,9 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
 import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
 import type { CreationContinuationState, CreationContinuationTimeline, JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
-import { LaneWriterConflictError, RecordNotFound, creationContinuationRepoMismatch, requireSafeRecordId } from '../ledger/api.js';
+import { LaneWriterConflictError, RecordNotFound, creationContinuationJobRefusal, creationContinuationRepoMismatch, requireSafeRecordId } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobStatus, isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
@@ -56,14 +55,16 @@ export interface CreationContinuationReadback {
     readonly base_source: string | null;
     readonly producer_settlement_seq: number | null;
   };
+  /** The registered lane, or (`retained-receipt`) the ref and receipt a
+   * failed continuation kept after rolling its checkout back. */
   readonly custody: {
-    readonly worktree_id: string;
-    readonly path: string;
+    readonly worktree_id: string | null;
+    readonly path: string | null;
     readonly branch: string | null;
-    readonly sha: string;
+    readonly sha: string | null;
     readonly base_source: string | null;
     readonly status: string;
-    readonly evidence: 'manager-reconciliation' | 'ledger-registry-only';
+    readonly evidence: 'manager-reconciliation' | 'ledger-registry-only' | 'retained-receipt';
   } | null;
   readonly queue: { readonly gate: string; readonly reason: string | null } | null;
   readonly admission: { readonly agent_id: string; readonly event_seq: number } | null;
@@ -180,8 +181,8 @@ export interface DispatchOutcome {
   readonly worktree: WorktreeLane;
   readonly agentId: string;
   /** Resolves when the minion's briefing turn settles (ok | error).
-   * `outcomeUnknown`: shutdown cancelled the automatic retries, so whether
-   * the sent prompt delivered is not known. */
+   * `outcomeUnknown`: the turn failed while the service was stopping, so
+   * whether the sent prompt delivered is not known. */
   readonly settled: Promise<{ readonly ok: boolean; readonly error?: string; readonly outcomeUnknown?: boolean }>;
 }
 
@@ -349,28 +350,23 @@ export class DispatchService {
     const briefingSha256 = typeof job.briefing === 'string'
       ? createHash('sha256').update(job.briefing, 'utf8').digest('hex') : null;
     let inspection: RetainedJobCreationInspection | null = null;
-    let refusalReason: string | undefined;
-    if (job.status !== 'blocked') refusalReason = `job "${job.id}" is ${job.status}, not blocked`;
-    else if (job.deliverable !== null && job.deliverable !== 'pr') refusalReason = `job "${job.id}" is not a PR-owing initial dispatch`;
-    else if (job.prUrl !== null || job.targetRef !== null || job.targetSha !== null) refusalReason = `job "${job.id}" has report or pull-request state incompatible with initial-creation continuation`;
-    else if (job.briefing === null || job.briefing.trim() === '') refusalReason = `job "${job.id}" has no original briefing to reuse`;
-    else if (handoff === null || handoffRepoPath === null) refusalReason = `job "${job.id}" has no unique original job.handoff with its repository path`;
+    let refusalReason = creationContinuationJobRefusal(job) ?? undefined;
+    if (refusalReason !== undefined) {
+      // Refused at job scope; nothing else is read.
+    } else if (handoff === null || handoffRepoPath === null) refusalReason = `job "${job.id}" has no unique original job.handoff with its repository path`;
     else if (this.opts.ledger.listJobAmendments(input.jobId).length > 0) refusalReason = `job "${job.id}" has an amended contract outside initial-dispatch continuation`;
     else if (this.opts.worktrees.inspectRetainedJobCreation === undefined || this.opts.worktrees.createRetainedJobWorktree === undefined) {
       refusalReason = 'retained-creation inspection and strict manager continuation are not wired';
     } else {
       try {
-        const canonicalRepoPath = realpathSync(handoffRepoPath);
-        refusalReason = creationContinuationRepoMismatch(job, canonicalRepoPath) ?? undefined;
+        refusalReason = creationContinuationRepoMismatch(job, handoffRepoPath, null) ?? undefined;
         if (refusalReason === undefined) {
           inspection = await this.opts.worktrees.inspectRetainedJobCreation({ repoPath: handoffRepoPath, jobId: input.jobId });
-          if (inspection.jobId !== input.jobId || inspection.repoPath !== canonicalRepoPath || inspection.branch !== `gru/${input.jobId}` ||
-              inspection.sha.length < 40 || inspection.baseSource === null) {
-            refusalReason = 'WorktreeManager returned a retained-creation identity that does not match the original job handoff';
-            inspection = null;
-          } else {
-            repoPath = inspection.repoPath;
-          }
+          refusalReason = creationContinuationRepoMismatch(job, handoffRepoPath, inspection.repoPath) ?? (
+            inspection.jobId !== input.jobId || inspection.branch !== `gru/${input.jobId}` || inspection.sha.length < 40 || inspection.baseSource === null
+              ? 'WorktreeManager returned a retained-creation identity that does not match the original job handoff' : undefined);
+          if (refusalReason === undefined) repoPath = inspection.repoPath;
+          else inspection = null;
         }
       } catch (error) {
         refusalReason = this.safeContinuationReason(error);
@@ -407,6 +403,7 @@ export class DispatchService {
     this.activeCreationContinuations.add(key);
     let custodyAttempted = false;
     let custodyAdopted = false;
+    let disposedBeforePrompt = false;
     const execution: CreationContinuationExecution = {
       job, timeline: accepted.timeline,
       expected: { receiptTokenSha256: identity.receiptTokenSha256!, producerSettlementSeq: identity.producerSettlementSeq! },
@@ -424,9 +421,12 @@ export class DispatchService {
             });
           },
           queued: (gate: string, reason: string) => record('queued', 'queued', { gate, reason }),
+          disposedBeforePrompt: () => { disposedBeforePrompt = true; },
         };
+        // The handoff path, as the original dispatch had it: its leaf is
+        // the job's repository name, a symlinked path included.
         const outcome = await this.dispatch({
-          jobId: job.id, repoPath: repoPath!, title: job.title,
+          jobId: job.id, repoPath: handoffRepoPath!, title: job.title,
           ...(job.displayName !== null ? { displayName: job.displayName } : {}),
           ...(job.deliverable !== null ? { deliverable: job.deliverable } : {}),
           ...(job.parentJobId !== null ? { parentJobId: job.parentJobId } : {}),
@@ -453,8 +453,12 @@ export class DispatchService {
         } else {
           const lane = this.opts.ledger.getWorktree(input.jobId);
           const admitted = this.opts.ledger.getCreationContinuationDispatchEvidence(input.jobId, input.requestId, identity.generation).spawned;
-          if (custodyAdopted && lane?.status === 'swept' && admitted === null) {
-            record('failed', 'known-swept-failure', { reason, worktree_status: lane.status });
+          if (custodyAdopted && lane?.status === 'swept' && (admitted === null || disposedBeforePrompt)) {
+            record('failed', admitted === null ? 'known-swept-failure' : 'failed-before-prompt', { reason, worktree_status: lane.status });
+          } else if (!custodyAdopted && lane !== null) {
+            // Registered, then failed: the registry row holds the lane and
+            // the receipt may already be spent.
+            record('custody-unknown', 'registered-unsettled', { reason, worktree_status: lane.status });
           } else {
             record('custody-unknown', 'unsettled-failure', {
               reason, manager_attempted: true, custody_adopted: custodyAdopted,
@@ -503,11 +507,14 @@ export class DispatchService {
         branch: identity.branch, base_sha: identity.baseSha, base_source: identity.baseSource,
         producer_settlement_seq: identity.producerSettlementSeq,
       },
-      custody: lane === null ? null : {
+      custody: lane !== null ? {
         worktree_id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha,
         base_source: lane.baseSource, status: lane.status,
         evidence: managerCustodyRecorded ? 'manager-reconciliation' : 'ledger-registry-only',
-      },
+      } : latestPayload['custody'] === 'retained' ? {
+        worktree_id: null, path: null, branch: identity.branch, sha: identity.baseSha,
+        base_source: identity.baseSource, status: 'retained', evidence: 'retained-receipt',
+      } : null,
       queue: queuePayload === undefined ? null : {
         gate: typeof queuePayload['gate'] === 'string' ? queuePayload['gate'] : 'unknown',
         reason: typeof queuePayload['reason'] === 'string' ? queuePayload['reason'] : null,
@@ -586,6 +593,7 @@ export class DispatchService {
       readonly custodyAttempted: () => void;
       readonly custodyAdopted: (lane: WorktreeLane) => void;
       readonly queued: (gate: string, reason: string) => void;
+      readonly disposedBeforePrompt: () => void;
     };
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
@@ -785,6 +793,12 @@ export class DispatchService {
       // the lane then receive a late briefing.
       releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, input.creationContinuation === undefined
         ? 'initial dispatch' : `initial creation continuation ${input.creationContinuation.timeline.identity.requestId}`);
+      // A lane owner may have started while the continuation waited at the
+      // floor; the admission now fences any later one.
+      if (input.creationContinuation !== undefined) {
+        const owner = this.opts.ledger.creationContinuationLaneOwner(job.id);
+        if (owner !== null) throw new LaneWriterConflictError(owner);
+      }
 
       // (3) One worktree per job. Only a continuation enters the strict
       // retained-receipt manager method; it can never resolve a fresh base.
@@ -920,8 +934,22 @@ export class DispatchService {
           });
         }
       } catch (error) {
-        await handle.dispose();
-        if (registered) this.opts.ledger.setAgentState(handle.id, 'disposed');
+        let disposeFailure: unknown = null;
+        try {
+          await handle.dispose();
+        } catch (failure) {
+          disposeFailure = failure;
+        } finally {
+          if (registered) this.opts.ledger.setAgentState(handle.id, 'disposed');
+        }
+        if (disposeFailure !== null) {
+          this.log('error', 'minion disposal after a failed post-spawn write also failed', { job: job.id, agent: handle.id, error: String(disposeFailure) });
+          throw new AggregateError([error, disposeFailure], `${String(error)}; disposing the spawned minion also failed: ${String(disposeFailure)}`);
+        }
+        // Disposed before any prompt: release the lane as a refused spawn does.
+        input.creationContinuation?.disposedBeforePrompt();
+        releaseWorker();
+        await this.sweepQuietly(worktree.id);
         throw error;
       }
       this.log('info', 'minion dispatched', {
@@ -936,6 +964,10 @@ export class DispatchService {
       // path concludes — never recorded as delivered while a retry could
       // still carry it, never disposed out from under that retry.
       const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      // A failure that settles while the service is stopping leaves the sent
+      // prompt's outcome unknown, whichever branch settles it.
+      const unlessStopping = (result: { readonly ok: false; readonly error: string }) =>
+        this.opts.stopSignal?.aborted === true ? { ...result, outcomeUnknown: true } : result;
       const settleTurn = async (
         failure: unknown | null,
         verdict: PromptTurnVerdict | null,
@@ -981,7 +1013,7 @@ export class DispatchService {
             handoffPhaseId,
             `dispatch turn failed: pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`,
           );
-          return { ok: false as const, error: detail };
+          return unlessStopping({ ok: false as const, error: detail });
         }
         const disposition = settlement.value;
         if (disposition === 'cancelled') {
@@ -1022,7 +1054,7 @@ export class DispatchService {
           if (!deliveredRecorded) {
             this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
           }
-          return { ok: false as const, error };
+          return unlessStopping({ ok: false as const, error });
         }
         if (retryFailed) {
           const error = `automatic rate-limit retry ${disposition} — the briefing turn did not deliver`;
@@ -1038,7 +1070,7 @@ export class DispatchService {
             disposition,
           });
           this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
-          return { ok: false as const, error };
+          return unlessStopping({ ok: false as const, error });
         }
         // Terminal/error correlation (r4 blocker 1): a resolved prompt is
         // not success — both adapters settle fulfilled prompts that ended in
@@ -1055,13 +1087,13 @@ export class DispatchService {
             ? ({ ok: true, error: null } as const)
             : (verdict ?? promptVerdictFromHealth(handle));
         if (!evidence.ok) {
-          return this.recordTurnFailure(
+          return unlessStopping(this.recordTurnFailure(
             job.id,
             handle.id,
             handoffPhaseId,
             deliveredRecorded,
             evidence.error ?? 'runtime settled the briefing turn with an in-band error',
-          );
+          ));
         }
         // The initial briefing carries the original contract only — revision
         // 0. A material amendment accepted while this turn ran stays pending

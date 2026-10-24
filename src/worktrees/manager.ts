@@ -666,8 +666,8 @@ export interface WorktreeManagerOptions {
   readonly setupTimeoutMs: number;
   /** Grace between the acknowledged SIGTERM and the SIGKILL (ms). */
   readonly killGraceMs?: number;
-  /** How long an exited branch-creation Git child's pipes are still read
-   * for their own close, the producer's settlement (default 10 min). */
+  /** How long an exited job branch-creation Git child's pipes are still
+   * read for their own close, the producer's settlement (default 10 min). */
   readonly creationCloseWindowMs?: number;
   /** Fetch budget for origin base resolution (default 30 s) — a network
    * op degrades to the declared local fallback, it never hangs the lane. */
@@ -1464,6 +1464,13 @@ export class WorktreeManager {
       const branch = `gru/${input.jobId}`;
       const path = join(this.opts.root, repo.repoName, `job-${input.jobId}`);
       const lane = { id: input.jobId, kind: 'job' as const, jobId: input.jobId, roundId: null, path };
+      // A continuation's guard refusals are named, before adoption and
+      // after it: they stop with every resource retained.
+      const asRefusal = (error: unknown): unknown => !requireRetained ? error
+        : new RetainedCreationRefusalError(error instanceof Error ? error.message : String(error), { cause: error });
+      const guarded = <T>(check: () => T): T => {
+        try { return check(); } catch (error) { throw asRefusal(error); }
+      };
       // Issue #453: an interrupted earlier attempt may have committed the ref
       // without its checkout. Only its own retained receipt may be adopted; a
       // ref nobody can attribute stays a refusal. Continuations require it.
@@ -1471,8 +1478,7 @@ export class WorktreeManager {
       try {
         retained = await this.reconcileInterruptedCreation(repo.repoPath, lane, branch, { requireRetained, ...(expected === null ? {} : { expected }) });
       } catch (error) {
-        if (!requireRetained) throw error;
-        throw new RetainedCreationRefusalError(error instanceof Error ? error.message : String(error), { cause: error });
+        throw asRefusal(error);
       }
       if (requireRetained && retained === null) throw new RetainedCreationRefusalError(`retained creation receipt for branch ${branch} is absent — new-base creation is forbidden for a continuation`);
       if (retained === null) {
@@ -1495,12 +1501,12 @@ export class WorktreeManager {
       let record;
       let bootstrapped: LaneBootstrap | null;
       try {
-        await this.addLane(repo.repoPath, path, custody);
+        await this.addLane(repo.repoPath, path, custody, undefined, asRefusal);
         bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha);
-        this.assertCreationIdentity(path, custody);
-        this.assertCreationCustody(repo.repoPath, path, custody);
+        guarded(() => this.assertCreationIdentity(path, custody));
+        guarded(() => this.assertCreationCustody(repo.repoPath, path, custody));
         beginLaneHandoff({ id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
-          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
+          guarded(() => this.assertCreationCustody(repo.repoPath, path, custody)), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
           kind: 'job',
@@ -1514,11 +1520,17 @@ export class WorktreeManager {
         });
         this.clearCreationIntent(repo.repoPath, custody);
       } catch (error) {
-        if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error; // committed publication retains unresolved custody
-        // A continuation never spends the retained custody it adopted: the
-        // ref, receipt and any partial checkout stay for inspection.
+        // Committed publication retains unresolved custody: the registry row
+        // holds the lane and the receipt may already be spent.
+        if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error;
         if (requireRetained) {
-          throw new RetainedCreationFailedError(`retained creation of branch ${branch} failed after adoption; its ref and receipt are kept: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+          // A refusal, or setup processes still running in the checkout,
+          // retain everything. Any other failure rolls the checkout back
+          // under the receipt's own token and keeps the ref and receipt, so
+          // a later continuation adopts them again.
+          if (error instanceof RetainedCreationRefusalError || (error instanceof WorktreeSetupError && error.processesRemain)) throw error;
+          await this.rollbackPartialLane(repo.repoPath, path, custody, error, { keepRef: true });
+          throw new RetainedCreationFailedError(`retained creation of branch ${branch} failed after adoption; its checkout was rolled back and its ref and receipt are kept: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
         }
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         // Only a proven ownership is spent with the rollback. An unproven
@@ -3161,10 +3173,11 @@ export class WorktreeManager {
     return retained;
   }
 
-  private async addLane(repoPath: string, path: string, custody: CreationCustody, assertSource?: () => void): Promise<void> {
+  private async addLane(repoPath: string, path: string, custody: CreationCustody, assertSource?: () => void,
+    asRefusal: (error: unknown) => unknown = (error) => error): Promise<void> {
     if (custody.branch !== null) {
       if (custody.branchCreated) {
-        await this.assertRetainedCreation(repoPath, custody);
+        try { await this.assertRetainedCreation(repoPath, custody); } catch (error) { throw asRefusal(error); }
       } else {
         this.recordCreationIntent(repoPath, custody);
         await this.updateDirectCreationRef(repoPath, custody, 'create');
@@ -3176,7 +3189,7 @@ export class WorktreeManager {
     runGit(repoPath, ['worktree', 'add', '--lock', '--reason', custody.token,
       ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
     assertSource?.();
-    this.assertCreationIdentity(path, custody);
+    try { this.assertCreationIdentity(path, custody); } catch (error) { throw asRefusal(error); }
     await this.disableSparseCheckout(path);
   }
 
@@ -3299,11 +3312,12 @@ export class WorktreeManager {
       `git update-ref ${operation} ${ref}: ${detail} — transaction authority unconfirmed; resources retained`,
     );
     // A job branch creation journals its producer's settlement when the
-    // child's own close shows it and every descendant holding its pipes
-    // stopped. The receipt token correlates it; a failed write is logged
-    // and never fails the creation.
+    // child's own close shows it exited and every holder released its
+    // pipes. The receipt token correlates it; a failed write is logged and
+    // never fails the creation.
+    const settles = operation === 'create' && custody.lane.kind === 'job' && custody.branch === `gru/${custody.lane.id}`;
     const settle = (): void => {
-      if (released || operation !== 'create' || custody.lane.kind !== 'job' || custody.branch !== `gru/${custody.lane.id}` || child.pid === undefined) return;
+      if (released || !settles || child.pid === undefined) return;
       try {
         this.opts.ledger.recordCreationProducerSettlement({
           jobId: custody.lane.id, branch: custody.branch, sha: custody.sha,
@@ -3438,14 +3452,11 @@ export class WorktreeManager {
         }
       }
       child.stdin.destroy();
-      if (closed) {
-        child.stdout.destroy();
-        child.stderr.destroy();
-      } else {
-        if (!exited) stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} termination unconfirmed`);
-        // A descendant may still hold our pipes. Keep reading them, without
-        // holding the service open, until their own close settles the
-        // producer or the window ends; then release them, proving nothing.
+      if (!closed && exited && settles) {
+        // The child exited but something still holds our pipes. Keep reading
+        // them, without holding the service open, until their own close
+        // settles the producer or the window ends; then release them,
+        // proving nothing.
         child.unref();
         (child.stdout as Socket).unref();
         (child.stderr as Socket).unref();
@@ -3454,6 +3465,14 @@ export class WorktreeManager {
           child.stdout.destroy();
           child.stderr.destroy();
         }, this.opts.creationCloseWindowMs ?? 10 * 60_000).unref();
+      } else {
+        released = true;
+        child.stdout.destroy();
+        child.stderr.destroy();
+        if (!closed && !exited) {
+          stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} termination unconfirmed`);
+          child.unref();
+        }
       }
     }
     if (stopFailure !== undefined) {
@@ -3631,7 +3650,8 @@ export class WorktreeManager {
   /** Only matching Git-native invocation receipts permit destructive
    * rollback. Check ALL custody before any cleanup; uncertainty retains the
    * resources and reports both the original failure and the missing proof. */
-  private async rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): Promise<void> {
+  private async rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown,
+    options: { readonly keepRef?: boolean } = {}): Promise<void> {
     try {
       const common = this.creationCommonDirectory(repoPath);
       const present = custody.addAttempted && existsSync(path);
@@ -3645,7 +3665,7 @@ export class WorktreeManager {
       assertResources();
       await this.assertBranchCreationCustody(repoPath, custody, ownedPath, common, assertResources);
       assertResources();
-      if (custody.branchCreated && custody.branch !== null) {
+      if (custody.branchCreated && custody.branch !== null && options.keepRef !== true) {
         // Keep the invocation-owned checkout holding this branch until its
         // compare-and-delete finishes. Dropping the checkout first opens a
         // window for an ordinary external worktree to adopt the same tip.

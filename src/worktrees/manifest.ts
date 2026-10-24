@@ -424,7 +424,12 @@ export interface SetupStreamTail {
  * with a short output tail; `output` keeps each stream's bounded raw tail
  * for a caller that redacts before it records (#427 onboarding proof). */
 export class WorktreeSetupError extends Error {
-  constructor(message: string, readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail }) {
+  constructor(
+    message: string,
+    readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail },
+    /** A stopped or timed-out command's process group still had a member. */
+    readonly processesRemain = false,
+  ) {
     super(message);
     this.name = 'WorktreeSetupError';
   }
@@ -520,7 +525,8 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
 
   const output = { stdout: stdout.stream(), stderr: stderr.stream() };
   const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
-  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);
+  const failed = (what: string): WorktreeSetupError =>
+    new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output, (stopped || timedOut) && groupAlive());
   if (stopped) throw failed('worktree setup command was stopped (its caller aborted)');
   if (timedOut) throw failed(`worktree setup command timed out after ${timeoutMs}ms`);
   if (outcome.code === null) throw failed(`worktree setup command was killed by ${String(outcome.signal)}`);

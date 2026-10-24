@@ -2,6 +2,7 @@ import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
 import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt, type MailboxDisposition } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
@@ -301,14 +302,34 @@ export class CreationContinuationConflictError extends Error {
   }
 }
 
-/** The one repository rule for a creation continuation, in the service and
- * the ledger alike: the handoff path's canonical realpath names the job's
- * recorded repository. Returns the refusal, or null. */
-export function creationContinuationRepoMismatch(job: Pick<JobRecord, 'id' | 'repo'>, canonicalRepoPath: string | null): string | null {
-  const name = canonicalRepoPath?.split('/').filter(Boolean).at(-1) ?? null;
-  if (name === job.repo) return null;
-  return `job "${job.id}" records repository "${job.repo}", but its handoff path resolves to ` +
-    (canonicalRepoPath === null ? 'no repository' : `"${name ?? ''}" (${canonicalRepoPath})`);
+/** The job-level scope of a creation continuation, the route's and the
+ * ledger's alike. Returns the refusal, or null. */
+export function creationContinuationJobRefusal(job: JobRecord): string | null {
+  if (job.status !== 'blocked') return `job "${job.id}" is ${job.status}, not blocked`;
+  if (job.deliverable !== null && job.deliverable !== 'pr') return `job "${job.id}" is not a PR-owing initial dispatch`;
+  if (job.prUrl !== null || job.targetRef !== null || job.targetSha !== null) {
+    return `job "${job.id}" has report or pull-request state incompatible with initial-creation continuation`;
+  }
+  if (job.briefing === null || job.briefing.trim() === '') return `job "${job.id}" has no original briefing to reuse`;
+  return null;
+}
+
+/** The one repository rule for a creation continuation, the route's and
+ * the ledger's alike: the handoff path's own leaf is the job's recorded
+ * repository (dispatch derived it so, a symlinked path included), and the
+ * path resolves to the inspected repository (`repoPath`; null before
+ * inspection). Returns the refusal, or null. */
+export function creationContinuationRepoMismatch(job: Pick<JobRecord, 'id' | 'repo'>, handoffRepoPath: string, repoPath: string | null): string | null {
+  const leaf = handoffRepoPath.split('/').filter(Boolean).at(-1) ?? '';
+  if (leaf !== job.repo) return `job "${job.id}" records repository "${job.repo}", but its handoff path ${handoffRepoPath} names "${leaf}"`;
+  if (repoPath === null) return null;
+  let canonical: string;
+  try {
+    canonical = realpathSync(handoffRepoPath);
+  } catch (error) {
+    return `job "${job.id}" handoff path ${handoffRepoPath} cannot be resolved: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return canonical === repoPath ? null : `job "${job.id}" handoff path ${handoffRepoPath} resolves to ${canonical}, not the inspected repository ${repoPath}`;
 }
 
 /** Why an amendment write was refused (each refusal is audited as a
@@ -1897,15 +1918,15 @@ export class LedgerApi {
         if (unresolved !== undefined) return `another continuation request ${unresolved[0]} owns this job's continuation fence`;
         if (this.getDirective(input.requestId) !== null) return `request id ${input.requestId} names a directive request; a continuation needs its own id`;
         if (job === null) return `job "${input.jobId}" does not exist`;
-        if (job.status !== 'blocked') return `job "${input.jobId}" is ${job.status}, not blocked`;
-        if (job.deliverable !== null && job.deliverable !== 'pr') return `job "${input.jobId}" is not a PR-owing initial dispatch`;
-        if (job.prUrl !== null) return `job "${input.jobId}" already has a pull request`;
+        const jobRefusal = creationContinuationJobRefusal(job);
+        if (jobRefusal !== null) return jobRefusal;
         if (!briefingMatches) return `job "${input.jobId}" has no unchanged original briefing`;
         if (this.listJobAmendments(input.jobId).length > 0) return `job "${input.jobId}" has an amended contract outside initial-dispatch continuation`;
-        if (handoff === null || handoff.seq !== input.handoffSeq || handoffPayload?.['repoPath'] !== input.handoffRepoPath) {
+        if (handoff === null || handoff.seq !== input.handoffSeq || input.handoffRepoPath === null || handoffPayload?.['repoPath'] !== input.handoffRepoPath) {
           return `job "${input.jobId}" has no unique matching original handoff`;
         }
-        const repoMismatch = creationContinuationRepoMismatch(job, input.repoPath);
+        if (input.repoPath === null) return `job "${input.jobId}" has no inspected repository`;
+        const repoMismatch = creationContinuationRepoMismatch(job, input.handoffRepoPath, input.repoPath);
         if (repoMismatch !== null) return repoMismatch;
         if (input.branch !== `gru/${input.jobId}` || input.baseSha === null ||
             !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(input.baseSha) || input.baseSource === null ||
@@ -1915,9 +1936,8 @@ export class LedgerApi {
         if (this.getWorktree(input.jobId) !== null) return `job "${input.jobId}" already has a registered worktree`;
         if (this.listAgents().some((agent) => agent.jobId === input.jobId)) return `job "${input.jobId}" already has an agent record`;
         if (this.listJobAdmissions(input.jobId).length > 0) return `job "${input.jobId}" already has a live admission`;
-        const directive = this.listPendingDirectives({ jobId: input.jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
-        if (directive !== undefined) return `job "${input.jobId}" has a live directive request (${directive.requestId}, ${directive.state}) that owns the lane`;
-        if (this.listPendingRebriefs({ jobId: input.jobId }).length > 0) return `job "${input.jobId}" has a pending re-brief that owns the lane`;
+        const owner = this.creationContinuationLaneOwner(input.jobId);
+        if (owner !== null) return owner;
         if (this.listPhaseHandoffs({ jobId: input.jobId, limit: 1000 }).length > 0) {
           return `job "${input.jobId}" has a prior phase-handoff contract that this continuation does not rewrite`;
         }
@@ -1947,6 +1967,16 @@ export class LedgerApi {
       if (timeline === null) throw new Error(`creation continuation ${input.requestId} could not be read after recording`);
       return { created: true, timeline };
     });
+  }
+
+  /** The lane owners a creation continuation never starts beside, at
+   * acceptance and again once it holds the job admission: a live directive
+   * request or a pending re-brief. Returns the refusal, or null. */
+  creationContinuationLaneOwner(jobId: string): string | null {
+    const directive = this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+    if (directive !== undefined) return `job "${jobId}" has a live directive request (${directive.requestId}, ${directive.state}) that owns the lane`;
+    if (this.listPendingRebriefs({ jobId }).length > 0) return `job "${jobId}" has a pending re-brief that owns the lane`;
+    return null;
   }
 
   /** Persist queue, actual custody, actual admission, delivery or a named
