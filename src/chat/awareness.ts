@@ -1038,7 +1038,20 @@ export class GruAwareness {
       renderedRows.set(id, row);
       if (this.mailbox?.captureRow(row) != null) {
         const item = JSON.parse(row.detail!) as MailboxItem;
-        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify(promptSafeDeep({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map(({ signal, label }) => ({ signal, label })), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }))}` });
+        // #503: the id, subject, basis and signals are copied verbatim into a
+        // decision or disposition. A redaction would make an identifier that
+        // never resolves, so a changed one renders null; free text stays redacted.
+        const exact = (value: string): string | null => (promptSafe(value) === value ? value : null);
+        const reasons = item.reasons.map(({ signal, label }) => ({ signal: exact(signal), label: promptSafe(label) }));
+        const identifiers = { id: exact(item.id), subject: exact(item.subject), basis: exact(item.basis) };
+        const withheld = Object.values(identifiers).includes(null) || reasons.some((reason) => reason.signal === null);
+        const rest = promptSafeDeep({ title: item.title, notificationIds: item.notificationIds, state: item.state, owner: item.owner,
+          dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references,
+          restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }) as Record<string, unknown>;
+        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify({ id: identifiers.id, subject: identifiers.subject,
+          title: rest['title'], notificationIds: rest['notificationIds'], basis: identifiers.basis, reasons, state: rest['state'], owner: rest['owner'],
+          dependency: rest['dependency'], recheckAt: rest['recheckAt'], receipt: rest['receipt'], references: rest['references'], restrictions: rest['restrictions'],
+          ...(withheld ? { exactIdentifiers: 'null identifiers are withheld here; read their exact values from GET /api/mailbox' } : {}) })}` });
         return;
       }
       notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})` });

@@ -1770,11 +1770,16 @@ describe('board server — id-bearing incident signal families (issue #503)', ()
 
   it('decisions show their covers scheme; a pre-family client_key replay and a retired instance token are refused by name', async () => {
     const harness = await boot(token, { seed: (dir) => {
-      seedPreFamilyDecisions(dir, [{ subject: 'job:held-job', covers: ['pr-conflict'], reason: 'owner rebases by hand', by: 'silas', clientKey: 'hold-held-job' }]);
+      seedPreFamilyDecisions(dir, [
+        { subject: 'job:held-job', covers: ['pr-conflict'], reason: 'owner rebases by hand', by: 'silas', clientKey: 'hold-held-job' },
+        { subject: 'job:held-job', covers: ['phase-handback'], reason: 'phase hand-backs wait for the owner', by: 'gru' },
+        { subject: 'job:held-job', covers: ['ci-failed', 'supervision.turn-orphaned.minion-2'], reason: 'lane minion-2 is parked', by: 'gru' },
+      ]);
     } });
     try {
       const listed = await getJson(harness.port, `/api/decisions?subject=${encodeURIComponent('job:held-job')}`, token);
-      expect(listed.body).toMatchObject({ decisions: [{ subject: 'job:held-job', covers: ['pr-conflict'], coversScheme: 'pre-family' }] });
+      expect((listed.body as { decisions: DecisionRecord[] }).decisions.map((row) => [row.covers, row.coversScheme])).toEqual([
+        [['ci-failed', 'supervision.turn-orphaned.minion-2'], 'pre-family'], [['phase-handback'], 'pre-family'], [['pr-conflict'], 'pre-family']]);
       const hold = { subject: 'job:held-job', decision: 'hold', covers: ['pr-conflict'], reason: 'owner rebases by hand', by: 'silas' };
       const replay = await postJson(harness.port, '/api/decisions', token, { ...hold, client_key: 'hold-held-job' });
       expect(replay.status).toBe(409);
@@ -1785,13 +1790,18 @@ describe('board server — id-bearing incident signal families (issue #503)', ()
       const retired = await postJson(harness.port, '/api/decisions', token, { ...hold, covers: ['supervision.turn-orphaned.minion-2'], client_key: 'retired' });
       expect(retired.status).toBe(400);
       expect(retired.body).toMatchObject({ error: 'bad_request', detail: expect.stringContaining('cover "supervision.turn-orphaned"') });
-      // The pre-family hold reads as such on its mailbox item.
+      // A pre-family hold reads as such only when a covers token changed
+      // meaning; one on unchanged tokens binds as written.
       harness.api.addJob({ id: 'held-job', repo: 'r', title: 'held' });
       harness.api.setJobStatus('held-job', 'blocked');
       const page = await getJson(harness.port, '/api/mailbox', token);
       const item = (page.body as { items: MailboxItem[] }).items.find((row) => row.subject === 'job:held-job')!;
-      expect(item.restrictions).toContain('silas (pre-family hold: covers only pre-#503 signals): owner rebases by hand');
-      expect(item.restrictions).toContain('silas: owner rebases by hand');
+      expect([...item.restrictions].sort()).toEqual([
+        'gru (pre-family hold: covers only pre-#503 signals): lane minion-2 is parked',
+        'gru (pre-family hold: covers only pre-#503 signals): phase hand-backs wait for the owner',
+        'silas: owner rebases by hand',
+        'silas: owner rebases by hand',
+      ]);
     } finally { await harness.close(); }
   });
 

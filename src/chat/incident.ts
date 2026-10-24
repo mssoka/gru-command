@@ -188,6 +188,24 @@ export function retiredSignalFamily(token: string): string | null {
   return segments.length >= 3 ? segments.slice(0, 2).join('.') : null;
 }
 
+/** The families whose kinds raised an instance-bearing signal before #503
+ * (`supervision.turn-orphaned.<agent>`, `directive-unreconciled.<request>`):
+ * as a token, each now covers every instance. A frozen historical list —
+ * no family introduced after #503 had another meaning. */
+const FAMILIES_WITH_PRE_503_INSTANCES: readonly string[] = [
+  'directive-unreconciled', 'phase-handback', 'recovery-owner-transfer', 'supervision.provider-wall', 'supervision.turn-orphaned',
+  'provider.false-recovery', 'provider.waiting', 'provider-recovery.recovery-off', 'gru.wake-failed-escalation', 'gru.attention-unresolved',
+  'decisions.degraded', 'decisions.enforce-gate',
+];
+
+/** #503: whether a covers token reads differently since signal families —
+ * a retired instance token, or a family that now has instances. A
+ * pre-family decision naming only unchanged tokens (`pr-conflict`,
+ * `ci-failed`, `sweep-ack`) binds exactly as it did. */
+export function signalChangedMeaning(token: string): boolean {
+  return retiredSignalFamily(token) !== null || FAMILIES_WITH_PRE_503_INSTANCES.includes(token);
+}
+
 /** The pre-#503 derivation, verbatim: the default branch and the re-brief
  * producer were families already; every other kind kept its instance. */
 function preFamilySignalOf(kind: string): string {

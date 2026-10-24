@@ -5,7 +5,7 @@ import { producerResolvedBy } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDeliverable } from '../ledger/obligations.js';
 import type { MailboxDisposition, MailboxItem, MailboxReason, MailboxReference } from '../ledger/mailbox.js';
-import { incidentSignalOf, incidentSubjectOf } from '../chat/incident.js';
+import { incidentSignalOf, incidentSubjectOf, signalChangedMeaning } from '../chat/incident.js';
 
 function reportHandbackJobId(kind: string): string | null {
   return /^silas\.report-handback\.(.+)$/u.exec(kind)?.[1] ?? null;
@@ -33,10 +33,11 @@ function notificationBasis(ledger: LedgerApi, row: NotificationRecord, reportSou
     delivery === null ? null : [delivery.seq, delivery.payload]]);
 }
 
-/** A hold as the restriction it is on an item; a pre-family hold (#503)
- * says that it covers only pre-#503 signals, so it never reads as current. */
+/** A hold as the restriction it is on an item. A pre-family hold (#503)
+ * whose covers changed meaning says that it covers only pre-#503 signals,
+ * so it never reads as current; one on unchanged tokens binds as written. */
 function holdRestriction(decision: DecisionRecord): string {
-  return decision.coversScheme === 'pre-family'
+  return decision.coversScheme === 'pre-family' && decision.covers.some(signalChangedMeaning)
     ? `${decision.by} (pre-family hold: covers only pre-#503 signals): ${decision.reason}` : `${decision.by}: ${decision.reason}`;
 }
 

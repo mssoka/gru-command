@@ -12,7 +12,7 @@ import {
   type GruAwarenessLedger,
 } from '../src/chat/awareness.js';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../src/config.js';
-import { DECISION_SURFACE_ESCALATION_TRIAGE } from '../src/decisions/questions.js';
+import { DECISION_SURFACE_ESCALATION_TRIAGE, redactedText } from '../src/decisions/questions.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -2770,12 +2770,43 @@ describe('GH-305 awareness repair regressions', () => {
       const line = r.awareness.prepare()!.text.split('\n').find((text) => text.includes('"subject":"job:walled"'))!;
       const note = JSON.parse(line.slice(line.indexOf('{'))) as { id: string; subject: string; basis: string; reasons: readonly { signal: string; label: string }[] };
       expect(note.reasons).toEqual([{ signal: 'supervision.provider-wall', label: 'action-required' }]);
+      expect(note).not.toHaveProperty('exactIdentifiers');
       const decision = r.api.recordDecision({ subject: note.subject, decision: 'acted', covers: note.reasons.map((reason) => reason.signal),
         basisFingerprint: note.basis, reason: 'covers copied from the wake note', by: 'gru' });
       r.mailbox.disposition(note.id, { state: 'resolved', basis: note.basis, owner: 'gru', detail: 'wall attention accounted',
         references: [{ kind: 'decision', id: decision.id }] });
       expect(r.mailbox.snapshot().items.find((item) => item.id === note.id)?.state).toBe('resolved');
     } finally { r.close(); }
+  });
+
+  /** #503: an identifier the note's redaction would rewrite renders null, and
+   * the GET readback (the mailbox snapshot) still resolves the item exactly. */
+  function assertWithheldIdentifier(kind: string, title: string): void {
+    const r = rig('never');
+    try {
+      r.api.recordNotification({ id: 'card', kind, title, routing: 'action-required', severity: 'error' });
+      const exact = r.mailbox.snapshot().items.find((item) => item.notificationIds.includes('card'))!;
+      expect(redactedText(exact.subject, 2_000)).not.toBe(exact.subject);
+      const line = r.awareness.prepare()!.text.split('\n').find((text) => text.includes('"notificationIds":["card"]'))!;
+      const note = JSON.parse(line.slice(line.indexOf('{'))) as Record<string, unknown> & { reasons: readonly { signal: string | null }[] };
+      expect(note).toMatchObject({ id: exact.id, subject: null, basis: exact.basis, exactIdentifiers: expect.stringContaining('GET /api/mailbox') });
+      expect(note.reasons.map((reason) => reason.signal)).toEqual(exact.reasons.map((reason) => reason.signal));
+      // Free text (the title, the reason label) stays redacted; no identifier is.
+      expect(JSON.stringify([note['id'], note['subject'], note['basis'], note.reasons.map((reason) => reason.signal)])).not.toContain('redacted');
+      expect(note['title']).toContain('[redacted]');
+      // Gru's copy path: the exact values from the readback.
+      const decision = r.api.recordDecision({ subject: exact.subject, decision: 'acted', covers: exact.reasons.map((reason) => reason.signal),
+        basisFingerprint: exact.basis, reason: 'covers read back from GET /api/mailbox', by: 'gru' });
+      r.mailbox.disposition(exact.id, { state: 'resolved', basis: exact.basis, owner: 'gru', detail: 'attention accounted',
+        references: [{ kind: 'decision', id: decision.id }] });
+      expect(r.mailbox.snapshot().items.find((item) => item.id === exact.id)?.state).toBe('resolved');
+    } finally { r.close(); }
+  }
+  it('#503 a subject the note would redact (a cookie in the request id) renders null; the readback resolves it', () =>
+    assertWithheldIdentifier('silas.directive-unreconciled.rebrief:rt-cookie-banner:rev2', 'Directive rebrief:rt-cookie-banner:rev2: concrete Gru recovery decision owed'));
+  it('#503 a fitted subject the note would redact (its digest tail) renders null; the readback resolves it', () => {
+    const request = `rebrief:fix-token-expiry:${'r'.repeat(220)}`;
+    assertWithheldIdentifier(`silas.directive-unreconciled.${request}`, `Directive ${request}: recovery owed`);
   });
 
   it('F02 parks accepted captures before unrelated malformed source reconciliation', () => assertUnavailableAcceptanceRecovery(false));

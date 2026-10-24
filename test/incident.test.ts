@@ -7,6 +7,7 @@ import {
   isHardFloorRow,
   preFamilyIncidentSignalOf,
   retiredSignalFamily,
+  signalChangedMeaning,
   normalizeIncidentTitle,
 } from '../src/chat/incident.js';
 import { validateDecisionSignal, validateDecisionSubject } from '../src/ledger/decision-memory.js';
@@ -228,9 +229,15 @@ describe('incident identity — signal families (issue #503)', () => {
       const old = preFamilyIncidentSignalOf(row(kind));
       // Every storable old token the family replaced is retired, naming its family.
       if (old !== null && old !== family) expect(retiredSignalFamily(old), kind).toBe(family);
+      // A family changed meaning exactly when its kind raised another token before.
+      expect(signalChangedMeaning(family), kind).toBe(old !== family);
+      if (old !== null && old !== family) expect(signalChangedMeaning(old), kind).toBe(true);
     }
-    for (const signal of ['blocked', 'worker-error', 'obligation', 'sweep-ack', 'delivered-pr-register', 'verdict-rung-directive', 'verification-failure']) {
+    expect(signalChangedMeaning('gru.attention-unresolved')).toBe(incidentSignalOf(row('gru.attention-unresolved.n-1')) !== preFamilyIncidentSignalOf(row('gru.attention-unresolved.n-1')));
+    for (const signal of ['blocked', 'worker-error', 'obligation', 'sweep-ack', 'delivered-pr-register', 'verdict-rung-directive', 'verification-failure',
+      'pr-conflict', 'ci-failed', 'minion-error']) {
       expect(retiredSignalFamily(signal), signal).toBeNull();
+      expect(signalChangedMeaning(signal), signal).toBe(false);
     }
   });
 
