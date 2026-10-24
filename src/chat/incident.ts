@@ -143,16 +143,20 @@ export function incidentSignalOf(row: IncidentRow): string {
 const NAMESPACED_INSTANCE_FAMILIES: readonly string[] = ['directive-unreconciled', 'phase-handback', 'rebrief-unreconciled', 'recovery-owner-transfer'];
 
 /**
- * #503: the family to name instead, when `token` is an instance-bearing
- * signal the current derivation can no longer produce — a namespaced
- * family with an instance (`directive-unreconciled.<request>`), or any
- * token of three or more dot segments (`supervision.turn-orphaned.<agent>`),
- * which no family has. Null for every token a row can raise today; the
+ * #503: the family to name instead, when `token` is a signal the current
+ * derivation can no longer produce — a namespaced spelling
+ * (`silas.directive-unreconciled.<request>`), an instance of a namespaced
+ * family (`directive-unreconciled.<request>`), or any token of three or
+ * more dot segments (`supervision.turn-orphaned.<agent>`), which no family
+ * has. Null for every token a row can raise today; the
  * report handback's exact job identity (#314) stays. A decision naming a
  * retired token would be stored and never match: the write boundary
  * refuses it instead.
  */
 export function retiredSignalFamily(token: string): string | null {
+  // A namespaced spelling is never raised (the namespace is dropped): name
+  // the token the derivation gives it, e.g. the bare `directive-unreconciled`.
+  if (SIGNAL_NAMESPACE.test(token)) return incidentSignalOf({ kind: token, title: '', routing: 'fyi' });
   if (token.startsWith(REPORT_HANDBACK_KIND_PREFIX.slice('silas.'.length))) return null;
   const segments = token.split('.');
   if (segments.length >= 2 && NAMESPACED_INSTANCE_FAMILIES.includes(segments[0]!)) return segments[0]!;

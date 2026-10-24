@@ -223,9 +223,11 @@ again.
 New directives and rebriefs receive durable request IDs before dispatch;
 202 is acceptance, not native admission. A `request_id` you choose is 1-128
 characters of `[A-Za-z0-9._-]` starting with a letter or digit, with no `:`;
-anything else, or a blank one, is a 400. Derive it deterministically from the
-ledger record the row answers (`<rule_id>-<its seq or id>`) so a retry
-re-derives it; a job id can push it past the 128-character bound. Read their exact request/session/
+anything else, or a blank one, is a 400. Derive it from the digest row as
+`<rule_id>-<triggerSeq>-<n>`, with `n` the row's `failedAttempts` plus 1
+(ledger-wide, so never a job id or per-job number, which can also push it past
+the 128-character bound): a retry after a timeout replays, a retry after a
+failure is a new request. Read their exact request/session/
 checkpoint/approved-revision/authority-epoch evidence through
 `GET /api/silas/directives/<request_id>`. The service inspects correlated
 completion first and safely continues only a proven native checkpoint on

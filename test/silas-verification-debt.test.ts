@@ -101,6 +101,18 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
       .toEqual([second, first]);
   });
 
+  it('#503 a failure row seeds its repair id with the failed event seq and counts failed repairs', async () => {
+    const ledger = fixture();
+    correctiveDelivery(ledger);
+    const failure = completed(ledger, 'corrective-job', 'full', 'product-failure');
+    const row = async () => (await digest(ledger)).verificationFailures[0];
+    expect(await row()).toMatchObject({ runId: 'product-failure', triggerSeq: failure.seq, failedAttempts: 0 });
+    const repair = ledger.beginDirectiveIntent({ jobId: 'corrective-job', requestId: `verification-repair-${failure.seq}-1`, directive: 'repair the failure',
+      blockerFingerprint: 'verification-failure:full@product-failure', sourceContext: { ruleId: 'verification-repair' }, holder: 'silas-ops' }).record;
+    ledger.failDirective({ requestId: repair.requestId, reason: 'refused before any prompt' });
+    expect(await row()).toMatchObject({ runId: 'product-failure', triggerSeq: failure.seq, failedAttempts: 1 });
+  });
+
   it('routes an unresolved genuine same-head failure to repair, not unchanged verification', async () => {
     const ledger = fixture();
     correctiveDelivery(ledger);
@@ -532,7 +544,8 @@ describe('a historical-only delivery owes a current inspection (#361)', () => {
     historicalOnly(owned, 'owned-job', true);
     const ownedDigest = await digest(owned);
     expect(ownedDigest.currentInspections).toEqual([]);
-    expect(ownedDigest.revisionContinuations).toEqual([{ jobId: 'owned-job', repo: 'fixture-app', requiredRevision: 2, deliveredRevision: 0, pendingVersions: [1, 2] }]);
+    expect(ownedDigest.revisionContinuations).toEqual([{ jobId: 'owned-job', repo: 'fixture-app', requiredRevision: 2, deliveredRevision: 0, pendingVersions: [1, 2],
+      triggerSeq: expect.any(Number), failedAttempts: 0 }]);
     // A job with only proven deliveries owes no inspection.
     const quiet = fixture();
     quiet.addJob({ id: 'quiet-job', repo: 'fixture-app', title: 'quiet', briefing: 'Ship it.' });

@@ -184,6 +184,8 @@ function digestJson(jobIdsByCategory: Partial<Record<(typeof DIGEST_CATEGORY_KEY
       prUrl: null,
       headSha: 'sha',
       firstSeenAt: null,
+      triggerSeq: 1,
+      failedAttempts: 0,
     })),
   };
   return JSON.stringify(digest, null, 2);

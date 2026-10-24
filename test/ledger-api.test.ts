@@ -1267,7 +1267,10 @@ describe('decision memory (issue #218)', () => {
   it('GH-503 a new decision naming one instance of a family is refused, naming the family', () => {
     const ledger = fresh();
     for (const [signal, family] of [['supervision.turn-orphaned.minion-2', 'supervision.turn-orphaned'], ['directive-unreconciled.req-1', 'directive-unreconciled'],
-      ['phase-handback.phase-handoff', 'phase-handback'], ['provider.waiting.route-a', 'provider.waiting']] as const) {
+      ['phase-handback.phase-handoff', 'phase-handback'], ['provider.waiting.route-a', 'provider.waiting'],
+      // A namespaced spelling names the bare family a row raises, never its own namespaced form.
+      ['silas.directive-unreconciled.req-1', 'directive-unreconciled'], ['silas.phase-handback.phase-handoff', 'phase-handback'],
+      ['github.pr-conflict.j-1', 'pr-conflict']] as const) {
       expect(() => ledger.recordDecision({ ...base, covers: ['pr-conflict', signal] }), signal).toThrow(RetiredDecisionSignalError);
       expect(() => ledger.recordDecision({ ...base, covers: [signal] }), signal).toThrow(`cover "${family}"`);
     }

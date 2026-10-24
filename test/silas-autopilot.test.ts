@@ -284,6 +284,8 @@ function verdictRow(overrides: Partial<VerdictAwaitingDirectiveRow> = {}): Verdi
     repo: 'gru-command',
     roundId: 'round-1',
     roundSeq: 1,
+    triggerSeq: 1,
+    failedAttempts: 0,
     verdict: 'changes-requested',
     blockerCount: 1,
     blockersNote: null,
@@ -301,6 +303,8 @@ function verificationRow(overrides: Partial<VerificationFailureRow> = {}): Verif
     head: 'a'.repeat(40),
     at: '2026-10-13T00:00:00.000Z',
     detail: 'exit status 1',
+    triggerSeq: 1,
+    failedAttempts: 0,
     ...overrides,
   };
 }
@@ -314,6 +318,8 @@ function conflictRow(overrides: Partial<ConflictingPrRow> = {}): ConflictingPrRo
     prUrl: 'https://github.com/mssoka/gru-command/pull/42',
     headSha: 'b'.repeat(40),
     firstSeenAt: '2026-10-13T00:00:00.000Z',
+    triggerSeq: 1,
+    failedAttempts: 0,
     ...overrides,
   };
 }

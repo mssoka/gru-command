@@ -244,12 +244,12 @@ continuation, call `POST /api/silas/directives/<request_id>/recover` with
 `by: "gru"`, `expected_generation`, `expected_payload_hash`, `expected_head`
 (the actual checkout HEAD), `expected_epoch`, current `expected_work_revision` and
 `expected_contract_sha256` for a successor, a reason, and either
-`decision: { "kind": "successor", "request_id": "<fresh unused id>",
+`decision: { "kind": "successor", "request_id": "recover-<firstOriginSeq>-<generation>",
 "directive": "<explicit approved follow-through>" }` or
 `decision: { "kind": "owner-decision", "obligation_id": "<real outstanding
 owner decision>" }`. When the work can only be finished in a fresh session
 (the old session cannot be resumed), use `decision: { "kind":
-"rebrief-successor", "request_id": "<fresh unused id>", "note": "<explicit
+"rebrief-successor", "request_id": "recover-<firstOriginSeq>-<generation>", "note": "<explicit
 approved follow-through>" }`; it takes the same fences as a successor.
 A new `request_id` (successor, rebrief-successor or `inspection_request_id`)
 is 1-128 characters of `[A-Za-z0-9._-]` starting with a letter or digit, with

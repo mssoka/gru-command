@@ -298,6 +298,8 @@ export interface DigestLedger {
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestCandidateDelivery(jobId: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
+  /** Failed requests answering one row (#503): its attempt ordinal. */
+  countFailedDirectiveRequests(jobId: string, answering: { readonly blockerFingerprint: string } | { readonly sourceRoundId: string }): number;
   listAgents(): readonly AgentRecord[];
   /** Implementer minions only (Gru ruling 2026-09-29): review-only
    * sessions never win a digest pick. */
@@ -453,6 +455,11 @@ export interface VerdictAwaitingDirectiveRow {
   readonly repo: string;
   readonly roundId: string;
   readonly roundSeq: number;
+  /** The verdict event's ledger seq, the row's request-id seed (#503);
+   * null when the ledger holds no verdict event for the round. */
+  readonly triggerSeq: number | null;
+  /** Failed requests answering this round: the next id's ordinal - 1. */
+  readonly failedAttempts: number;
   readonly verdict: string;
   readonly blockerCount: number;
   readonly blockersNote: string | null;
@@ -488,6 +495,10 @@ export interface VerificationFailureRow {
   readonly head: string | null;
   readonly at: string | null;
   readonly detail: string;
+  /** The failed verification event's ledger seq (#503 request-id seed). */
+  readonly triggerSeq: number;
+  /** Failed repair requests carrying this failure's fingerprint. */
+  readonly failedAttempts: number;
 }
 
 /** A verification submission whose queue wait timed out (issue #163):
@@ -537,6 +548,11 @@ export interface ConflictingPrRow {
    * `github.pr-conflict` transition (it fires once per clean→dirty
    * change), falling back to the dirty cursor itself. */
   readonly firstSeenAt: string | null;
+  /** The ledger seq of the observation that opened this conflict stretch
+   * (the row's retirement watermark; #503 request-id seed). */
+  readonly triggerSeq: number;
+  /** Failed integration requests carrying `pr-conflict:<headSha>`. */
+  readonly failedAttempts: number;
 }
 
 /** A terminal job (merged/done/binned) still holding its own lane worktree
@@ -571,6 +587,11 @@ export interface RevisionContinuationRow {
   readonly deliveredRevision: number;
   /** The material amendment versions the continuation will carry. */
   readonly pendingVersions: readonly number[];
+  /** The ledger seq of the newest pending material amendment's acceptance
+   * (#503 request-id seed; a revision number repeats across jobs). */
+  readonly triggerSeq: number;
+  /** Failed continuation requests carrying `contract-revision:<required>`. */
+  readonly failedAttempts: number;
 }
 
 /** A CORRECTIVE delivery (the first carrying a new work revision) that
@@ -715,6 +736,8 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
         repo: r.repo,
         roundId: r.roundId,
         roundSeq: r.roundSeq,
+        triggerSeq: r.triggerSeq,
+        failedAttempts: r.failedAttempts,
         verdict: r.verdict,
         blockerCount: r.blockerCount,
         // The loud note (e.g. "consolidated report unreadable") is
@@ -736,7 +759,7 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
     }
     case 'verificationFailures': {
       const r = row as VerificationFailureRow;
-      return { jobId: r.jobId, repo: r.repo, scope: r.scope, runId: r.runId, head: r.head, detail: r.detail };
+      return { jobId: r.jobId, repo: r.repo, scope: r.scope, runId: r.runId, head: r.head, detail: r.detail, triggerSeq: r.triggerSeq, failedAttempts: r.failedAttempts };
     }
     case 'verificationWaits': {
       const r = row as VerificationWaitingRow;
@@ -758,6 +781,8 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
         prUrl: r.prUrl,
         headSha: r.headSha,
         firstSeenAt: r.firstSeenAt,
+        triggerSeq: r.triggerSeq,
+        failedAttempts: r.failedAttempts,
       };
     }
     case 'releaseEligible': {
@@ -776,6 +801,8 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
         requiredRevision: r.requiredRevision,
         deliveredRevision: r.deliveredRevision,
         pendingVersions: [...r.pendingVersions],
+        triggerSeq: r.triggerSeq,
+        failedAttempts: r.failedAttempts,
       };
     }
     case 'verificationsOwed': {
@@ -1580,15 +1607,23 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const revision = pendingWorkRevision(input.ledger, job);
     if (revision !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
         currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      const pendingVersions = input.ledger.listJobAmendments(job.id)
+        .filter((amendment) => amendment.effect === 'material' &&
+          amendment.version > revision.delivered && amendment.version <= revision.required)
+        .map((amendment) => amendment.version);
+      // The required revision is the version of the material amendment that
+      // set it; its acceptance is written with the amendment, in one transaction.
+      const accepted = input.ledger.listJobEventsByKinds(job.id, ['job.amendment-accepted'])
+        .find((event) => payloadNumber(event, 'version') === revision.required);
+      if (accepted === undefined) throw new Error(`revision continuation for ${job.id}: no acceptance event for amendment version ${revision.required}`);
       digest.revisionContinuations.push({
         jobId: job.id,
         repo: job.repo,
         requiredRevision: revision.required,
         deliveredRevision: revision.delivered,
-        pendingVersions: input.ledger.listJobAmendments(job.id)
-          .filter((amendment) => amendment.effect === 'material' &&
-            amendment.version > revision.delivered && amendment.version <= revision.required)
-          .map((amendment) => amendment.version),
+        pendingVersions,
+        triggerSeq: accepted.seq,
+        failedAttempts: input.ledger.countFailedDirectiveRequests(job.id, { blockerFingerprint: `contract-revision:${revision.required}` }),
       });
     }
     // Option A (owner, 2026-10-09): a corrective delivery is reviewed only
@@ -1751,6 +1786,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           repo: job.repo,
           roundId: newestRound.id,
           roundSeq: newestRound.seq,
+          triggerSeq: input.ledger.latestRoundEvent(newestRound.id, 'round.verdict')?.seq ?? null,
+          failedAttempts: input.ledger.countFailedDirectiveRequests(job.id, { sourceRoundId: newestRound.id }),
           verdict: newestRound.verdict,
           blockerCount: latest.length,
           blockersNote,
@@ -1979,6 +2016,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           head,
           at: completed.ts,
           detail: verificationFailureDetail(completed),
+          triggerSeq: completed.seq,
+          failedAttempts: fingerprints.reduce((total, fingerprint) =>
+            total + input.ledger.countFailedDirectiveRequests(job.id, { blockerFingerprint: fingerprint }), 0),
         });
       }
       for (const [scopeKey, timeout] of latestTimeout) {
@@ -2055,6 +2095,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
               prUrl: payloadString(branchState, 'pr_url'),
               headSha,
               firstSeenAt: firstDirtyCursorForHead(input.ledger, job.id, headSha) ?? branchState.ts,
+              triggerSeq: conflict !== null ? conflict.seq : branchState.seq,
+              failedAttempts: input.ledger.countFailedDirectiveRequests(job.id, { blockerFingerprint: `pr-conflict:${headSha}` }),
             });
           }
         }

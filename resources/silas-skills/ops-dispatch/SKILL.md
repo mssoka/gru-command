@@ -316,7 +316,7 @@ retrying. When the answer is `409` with
    round's blockers with `consecutive_rounds` and the advised rung:
    - `directive`: send a fix directive naming each blocker with its
      evidence, via `POST /api/silas/directive`
-     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"...","rule_id":"verdict-rung-directive","source_round_id":"<round>","request_id":"<stable-id>"}`.
+     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"...","rule_id":"verdict-rung-directive","source_round_id":"<round>","request_id":"verdict-rung-directive-<triggerSeq>-<n>"}`.
      The call answers **202** with the stable `request_id` once the durable
      intent is accepted — accepted is not admitted; read the durable state
      back with `GET /api/silas/directives/{request_id}`. Retry only with the
@@ -326,12 +326,14 @@ retrying. When the answer is `409` with
      must never get a second turn. A new `request_id` is 1-128 characters
      of `[A-Za-z0-9._-]` starting with a letter or digit, with no `:`; any
      other new id, or a blank, whitespace, null or non-string `request_id`,
-     is refused with a 400. Derive it deterministically from the ledger
-     record the row answers, `<rule_id>-<its seq or id>`
-     (`verdict-rung-directive-<source_round_id>`, `current-inspection-<seq>`),
-     so a retry after a timeout re-derives the same id; a job id can push an
-     id past the 128-character bound. A stored id, even one from before this
-     rule, still replays.
+     is refused with a 400. Derive it from the row as
+     `<rule_id>-<triggerSeq>-<n>`: `triggerSeq` is the ledger-wide seq of
+     the event the row answers, and `<n>` is the row's `failedAttempts`
+     plus 1. A retry after a timeout re-derives the same id and replays; a
+     retry after a failure is a new request. Never put a per-job number (a
+     revision, a round id) or a job id in an id: ids are ledger-wide, and a
+     job id can push one past the 128-character bound. A stored id, even one
+     from before this rule, still replays.
      A NEW blocker gets this rung too — it is the first fix directive, and
      without it the lane can never re-open. The service routes the
      directive to the live minion (or a fresh one on the lane), flips the
@@ -339,7 +341,7 @@ retrying. When the answer is `409` with
      settles; that delivery, against the lane head it produced, is what
      re-arms the re-review.
    - `rebrief`: same endpoint philosophy, but the lane needs a fresh
-     worker: `POST /api/silas/rebrief {"job_id":"<job>","note":"...","rule_id":"verdict-rung-rebrief","source_round_id":"<round>"}`.
+     worker: `POST /api/silas/rebrief {"job_id":"<job>","note":"...","rule_id":"verdict-rung-rebrief","source_round_id":"<round>","request_id":"verdict-rung-rebrief-<triggerSeq>-<n>"}`.
      The note must carry what stalled and what to do differently.
    - `escalate`: `POST /api/silas/escalate` with title, detail, job_id,
      `rule_id:"verdict-rung-escalate"` and `source_round_id:"<round>"`.
@@ -394,7 +396,7 @@ work inside your mandate — it routes `fyi` and never wakes the chief:
 
 - Arm ONE conflict-integration directive per conflicting head to the
   lane's minion via `POST /api/silas/directive`
-  `{"job_id":"<job>","directive":"merge the PR base into your task branch and resolve the conflicts in your own worktree: keep the base's established changes and the agreed feature, record the actual input SHAs, then verify and push normally — never rebase, reset or force-push, and never move a head under an active review freeze","blocker_fingerprint":"pr-conflict:<head_sha>","rule_id":"pr-conflict-rebase","request_id":"<stable-id>"}`.
+  `{"job_id":"<job>","directive":"merge the PR base into your task branch and resolve the conflicts in your own worktree: keep the base's established changes and the agreed feature, record the actual input SHAs, then verify and push normally — never rebase, reset or force-push, and never move a head under an active review freeze","blocker_fingerprint":"pr-conflict:<head_sha>","rule_id":"pr-conflict-rebase","request_id":"pr-conflict-rebase-<triggerSeq>-<n>"}`.
   The rule id is historical (`pr-conflict-rebase`); the remediation is
   branch integration, never history rewriting. The exact fingerprint is
   what retires this row when your rung lands; a new dirty head re-arms it
@@ -404,7 +406,8 @@ work inside your mandate — it routes `fyi` and never wakes the chief:
   unresolved re-brief, a live directive request, or an in-flight
   verification — the digest already withholds those rows, so a missing
   row means hands off.
-- Escalate only after the integration directive fails twice. A merged PR,
+- Escalate only after the integration directive fails twice (the row's
+  `failedAttempts` reaches 2). A merged PR,
   a closed PR, or a clean head retires the row on its own.
 
 ## Contract revisions and review supersession (owner rules 2026-10-08)
@@ -424,7 +427,7 @@ service enforces the rest — you never decide it from a status:
 - **`revision-continuation`.** A `revisionContinuations` row (job, required
   and delivered revision, the pending material versions) owes ONE
   continuation directive:
-  `POST /api/silas/directive {"job_id":"<job>","directive":"Implement contract revision <N> ...","blocker_fingerprint":"contract-revision:<N>","rule_id":"revision-continuation","request_id":"<stable-id>"}`.
+  `POST /api/silas/directive {"job_id":"<job>","directive":"Implement contract revision <N> ...","blocker_fingerprint":"contract-revision:<N>","rule_id":"revision-continuation","request_id":"revision-continuation-<triggerSeq>-<n>"}`.
   The service attaches every pending material amendment's canonical text
   ONCE, in version order, and stamps the request with the revision — do not
   paste or paraphrase amendment bodies, and never send one continuation per
@@ -452,8 +455,8 @@ service enforces the rest — you never decide it from a status:
   directive asking the minion to deliver its current candidate:
   `POST /api/silas/directive {"job_id":"<job>","directive":"Deliver your current candidate ...","blocker_fingerprint":"current-inspection:<job>:<seq>","rule_id":"current-inspection","request_id":"current-inspection-<seq>"}`
   (`<seq>` is the row's `historicalDeliverySeq`, a ledger-wide event seq: one
-  request per historical delivery; a later one is a new inspection). The
-  service refuses a second request with the same `blocker_fingerprint`
+  request per historical delivery, so it takes no attempt ordinal; a later
+  delivery is a new inspection). The service refuses a second request with the same `blocker_fingerprint`
   (409 `inspection_exists`, naming the stored request, which may predate
   #503 under another id). A live stored request is retried verbatim with
   the directive and fingerprint its `GET /api/silas/directives/{request_id}`

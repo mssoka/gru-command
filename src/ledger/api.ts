@@ -10311,6 +10311,18 @@ export class LedgerApi {
   }
 
   /** True while an unreleased retirement hold fences the job's automation. */
+  /** #503: failed requests on `jobId` answering one digest row — those
+   * carrying its `blockerFingerprint`, or (a verdict rung) its
+   * `sourceRoundId`. The attempt ordinal of the row's next request id is
+   * this count plus one. */
+  countFailedDirectiveRequests(jobId: string, answering: { readonly blockerFingerprint: string } | { readonly sourceRoundId: string }): number {
+    const [column, value] = 'blockerFingerprint' in answering
+      ? ["json_extract(payload, '$.blocker_fingerprint')", answering.blockerFingerprint]
+      : ["json_extract(source_context, '$.sourceRoundId')", answering.sourceRoundId];
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM pending_directives WHERE job_id = ? AND state = 'failed' AND ${column} = ?`).get(jobId, value) as Row;
+    return Number(row.n);
+  }
+
   hasOpenDirectiveRecoveryHold(jobId: string): boolean {
     const row = this.db
       .prepare("SELECT 1 AS open FROM pending_directives WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL LIMIT 1")

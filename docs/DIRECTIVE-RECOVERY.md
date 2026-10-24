@@ -479,10 +479,14 @@ or a newly reserved `inspection_request_id` — is 1-128 characters of
 `[A-Za-z0-9._-]` starting with a letter or digit, with no `:` (the safe
 record-id rule, #503). Anything else is refused by name
 (`DirectiveRequestIdError`, HTTP 400 `invalid_request_id` naming the rule).
-Callers derive ids deterministically from the ledger record they answer
-(`<kind>-<seq or id>`, as `current-inspection-<seq>`), so a retry after a
-timeout re-derives the same id; a job id can push an id past the
-128-character bound. The id check is the first write-side check: it runs
+Callers derive ids deterministically: Silas uses `<rule_id>-<triggerSeq>-<n>`
+from the digest row, where `triggerSeq` is the ledger-wide seq of the event
+the row answers and `n` is the row's `failedAttempts` plus 1
+(`current-inspection-<seq>` for an inspection, one per delivery); Gru uses
+`recover-<firstOriginSeq>-<generation>` from the recovery readback. A retry
+after a timeout re-derives the same id and replays, a retry after a failure
+is a new request, and no job id or per-job number (revision, round id) can
+collide across jobs or push an id past the 128-character bound. The id check is the first write-side check: it runs
 before any lane gate, review writer clearance or recovery decision is
 written, but a read-only refusal can answer first: `/recover` answers 409
 `recovery_refused` when a successor's producer cessation is unproven

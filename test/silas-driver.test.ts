@@ -285,6 +285,95 @@ describe('re-review freshness predicate', () => {
 // Conflicting PR rows (issue #215)
 // ------------------------------------------------------------------
 
+describe('digest request-id seeds: ledger-wide trigger seq and attempt ordinal (#503)', () => {
+  const digestOf = (h: Harness) => computeSilasDigest({
+    ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+  });
+  /** The skill's id: `<rule_id>-<triggerSeq>-<failedAttempts + 1>`. */
+  const derive = (rule: string, row: { readonly triggerSeq: number | null; readonly failedAttempts: number }): string =>
+    `${rule}-${String(row.triggerSeq)}-${String(row.failedAttempts + 1)}`;
+  const continuationJob = (h: Harness, jobId: string): void => {
+    h.ledger.addJob({ id: jobId, repo: 'acme/app', title: jobId, briefing: 'Ship it.' });
+    h.ledger.setJobStatus(jobId, 'working');
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'a'.repeat(40) } });
+    h.ledger.setJobPr(jobId, `https://github.com/acme/app/pull/${jobId}`);
+    h.ledger.setJobStatus(jobId, 'in-review');
+    const added = h.ledger.addJobAmendment({ jobId, body: 'Material correction.', approval: { by: 'gru', reference: `${jobId} revision 1` },
+      expectedContractSha256: h.ledger.effectiveContract(jobId)!.contractSha256, effect: 'material' });
+    if (added.status !== 'accepted') throw new Error(`fixture amendment for ${jobId} was ${added.status}`);
+  };
+
+  it('two jobs owing the same revision derive different ids, and both are accepted', async () => {
+    const h = makeLedger();
+    try {
+      continuationJob(h, 'job-a');
+      continuationJob(h, 'job-b');
+      const rows = (await digestOf(h)).revisionContinuations;
+      expect(rows.map((row) => [row.jobId, row.requiredRevision]).sort()).toEqual([['job-a', 1], ['job-b', 1]]);
+      const ids = rows.map((row) => derive('revision-continuation', row));
+      expect(new Set(ids).size).toBe(2);
+      for (const [index, row] of rows.entries()) {
+        expect(row.triggerSeq).toBe(h.ledger.latestJobEvent(row.jobId, 'job.amendment-accepted')!.seq);
+        expect(h.ledger.beginDirectiveIntent({ jobId: row.jobId, requestId: ids[index]!, directive: 'Implement contract revision 1',
+          blockerFingerprint: 'contract-revision:1', sourceContext: { ruleId: 'revision-continuation' }, holder: 'silas-ops' }).created).toBe(true);
+      }
+    } finally { h.cleanup(); }
+  });
+
+  it('a verdict row seeds its rung id with the verdict event seq and counts failed rungs on its round', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-verdict', { prUrl: 'https://git.example.invalid/o/r/pull/9' });
+      const round = h.ledger.addRound({ jobId: 'job-verdict', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-verdict', 'in-review');
+      const verdict = h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-verdict', roundId: round.id, payload: { verdict: 'changes-requested' } });
+      const row = async () => (await computeSilasDigest({ ledger: h.ledger, config: DEFAULT_SILAS_CONFIG, trigger: 'round.verdict',
+        blockersForRound: async () => ({ blockers: [{ title: 'leak', location: 'src/a.ts', category: 'correctness' }], note: null }) })).verdictsAwaitingDirective[0]!;
+      const first = await row();
+      expect(first).toMatchObject({ roundId: round.id, triggerSeq: verdict.seq, failedAttempts: 0 });
+      const rung = h.ledger.beginDirectiveIntent({ jobId: 'job-verdict', requestId: derive('verdict-rung-directive', first), directive: 'fix the leak',
+        blockerFingerprint: 'correctness::src/a.ts::leak', sourceContext: { ruleId: 'verdict-rung-directive', sourceRoundId: round.id }, holder: 'silas-ops' }).record;
+      expect(h.ledger.countFailedDirectiveRequests('job-verdict', { sourceRoundId: round.id })).toBe(0);
+      h.ledger.failDirective({ requestId: rung.requestId, reason: 'refused before any prompt' });
+      expect(await row()).toMatchObject({ triggerSeq: verdict.seq, failedAttempts: 1 });
+    } finally { h.cleanup(); }
+  });
+
+  it('a retry after a timeout replays; each failure makes the next id a new request; two failures reach the escalation', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-conf', repo: 'acme/app', title: 'conflicting', briefing: 'b' });
+      h.ledger.setJobStatus('job-conf', 'working');
+      h.ledger.setJobPr('job-conf', 'https://github.com/acme/app/pull/11');
+      h.ledger.appendCustomEvent({ kind: BRANCH_STATE_EVENT, jobId: 'job-conf', payload: { repo: 'acme/app', branch: 'gru/job-conf', sha: 'sha-11',
+        merged: false, pr_open: true, mergeable_state: 'dirty', pr_number: 11, pr_url: 'https://github.com/acme/app/pull/11' } });
+      const integrate = (requestId: string) => h.ledger.beginDirectiveIntent({ jobId: 'job-conf', requestId, directive: 'merge the PR base',
+        blockerFingerprint: 'pr-conflict:sha-11', sourceContext: { ruleId: 'pr-conflict-rebase' }, holder: 'silas-ops' });
+      const row = async () => (await digestOf(h)).conflictingPrs[0]!;
+      const first = await row();
+      expect(first).toMatchObject({ headSha: 'sha-11', failedAttempts: 0 });
+      const firstId = derive('pr-conflict-rebase', first);
+      expect(integrate(firstId).created).toBe(true);
+      // Only failures count: a live or settled request is no failed attempt.
+      expect(h.ledger.countFailedDirectiveRequests('job-conf', { blockerFingerprint: 'pr-conflict:sha-11' })).toBe(0);
+      // A retry after a timeout, no failure recorded: the same id, a replay.
+      expect(integrate(firstId)).toMatchObject({ created: false, record: { requestId: firstId } });
+      h.ledger.failDirective({ requestId: firstId, reason: 'refused before any prompt' });
+      const second = await row();
+      expect(second).toMatchObject({ triggerSeq: first.triggerSeq, failedAttempts: 1 });
+      const secondId = derive('pr-conflict-rebase', second);
+      expect(secondId).not.toBe(firstId);
+      expect(integrate(secondId).created).toBe(true);
+      h.ledger.failDirective({ requestId: secondId, reason: 'refused before any prompt' });
+      // Failed twice: the skill's escalation condition is reachable.
+      expect(await row()).toMatchObject({ triggerSeq: first.triggerSeq, failedAttempts: 2 });
+    } finally { h.cleanup(); }
+  });
+});
+
 describe('silas digest conflictingPrs rows (issue #215)', () => {
   const dirtyCursor = (sha: string, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
     repo: 'acme/app',
@@ -3714,6 +3803,8 @@ describe('silas digest fingerprint (issue #217)', () => {
         repo: 'r',
         roundId: 'job-v-r1',
         roundSeq: 1,
+        triggerSeq: 1,
+        failedAttempts: 0,
         verdict: 'NEEDS CHANGES',
         blockerCount: 1,
         blockersNote: null,
@@ -3777,6 +3868,8 @@ describe('silas digest fingerprint (issue #217)', () => {
               repo: 'r',
               roundId: 'job-v-r1',
               roundSeq: 1,
+              triggerSeq: 1,
+              failedAttempts: 0,
               verdict: 'APPROVED',
               blockerCount: 0,
               blockersNote: null,
@@ -3796,6 +3889,8 @@ describe('silas digest fingerprint (issue #217)', () => {
               repo: 'r',
               roundId: 'job-v-r1',
               roundSeq: 1,
+              triggerSeq: 1,
+              failedAttempts: 0,
               verdict: 'NEEDS CHANGES',
               blockerCount: 1,
               blockersNote: null,
@@ -3824,6 +3919,8 @@ describe('silas digest fingerprint (issue #217)', () => {
             repo: 'r',
             roundId: 'job-v-r1',
             roundSeq: 1,
+            triggerSeq: 1,
+            failedAttempts: 0,
             verdict: 'NEEDS CHANGES',
             blockerCount: 1,
             blockersNote,
@@ -3842,7 +3939,7 @@ describe('silas digest fingerprint (issue #217)', () => {
   it('every conflictingPrs field participates; a new conflict stretch is a new fingerprint', () => {
     const row = (firstSeenAt: string, headSha: string) =>
       baseDigest({
-        conflictingPrs: [{ jobId: 'job-c', repo: 'r', branch: 'gru/x', prNumber: 7, prUrl: 'https://example.invalid/7', headSha, firstSeenAt }],
+        conflictingPrs: [{ jobId: 'job-c', repo: 'r', branch: 'gru/x', prNumber: 7, prUrl: 'https://example.invalid/7', headSha, firstSeenAt, triggerSeq: 1, failedAttempts: 0 }],
       });
     expect(digestFingerprint(row('2026-10-01T00:00:00.000Z', 'aaa'))).not.toBe(
       digestFingerprint(row('2026-10-02T00:00:00.000Z', 'aaa')),
