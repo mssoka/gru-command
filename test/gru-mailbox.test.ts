@@ -674,4 +674,29 @@ describe('GH-305 canonical durable mailbox', () => {
     expect(ledger.getJob('j')?.status).toBe('working');
   });
 
+  it('GH-503 a job-bound provider wall past 64 characters resolves by family without touching its owner stop', () => {
+    const { ledger, mailbox } = fixture();
+    // The production minion id shape: the pre-#503 signal was 89 characters.
+    const agent = 'minion_8889b879-0000-4000-8000-000000000503';
+    const kind = `supervision.provider-wall.${agent}.authentication_wall`;
+    ledger.addJob({ id: 'walled', repo: 'r', title: 'walled' });
+    ledger.registerAgent({ id: agent, role: 'minion', jobId: 'walled' });
+    ledger.appendCustomEvent({ kind: 'supervision.breaker', agentId: agent, jobId: 'walled', payload: { reason: 'owner restart approval', restarts: 3 } });
+    ledger.recordNotification({ id: 'wall', kind, title: `Agent ${agent} stopped: authentication wall`, routing: 'action-required', severity: 'error', agentId: agent });
+    ledger.recordNotification({ id: 'owner-stop', kind: 'supervision.escalated', title: 'Owner restart approval', routing: 'needs-owner', severity: 'error', agentId: agent });
+    const item = mailbox.snapshot().items.find((row) => row.jobId === 'walled')!;
+    expect(item.reasons.map((reason) => reason.signal)).toEqual(['supervision.provider-wall']);
+    expect(item.restrictions.join(' ')).toMatch(/owner stop on .*fresh owner authorization required/);
+    const decision = ledger.recordDecision({ subject: item.subject, decision: 'acted', covers: item.reasons.map((reason) => reason.signal),
+      basisFingerprint: item.basis, reason: 'wall triaged; the restart stays the owner’s', by: 'gru' });
+    const stops = ledger.durableSupervisionStops();
+    mailbox.disposition(item.id, { state: 'resolved', basis: item.basis, owner: 'gru', detail: 'attention accounted; owner stop untouched',
+      references: [{ kind: 'decision', id: decision.id }] });
+    expect(mailbox.snapshot().items.find((row) => row.id === item.id)?.state).toBe('resolved');
+    expect(ledger.getNotification('wall')).toMatchObject({ kind, ackedAt: null, resolvedAt: null });
+    expect(ledger.getNotification('owner-stop')).toMatchObject({ ackedAt: null, resolvedAt: null });
+    expect(ledger.durableSupervisionStops()).toEqual(stops);
+    expect(ledger.durableSupervisionStops().has(agent)).toBe(true);
+  });
+
 });

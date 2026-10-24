@@ -177,7 +177,10 @@ use this role and the owner's direct messages for authority:
   applies with `POST /api/decisions/<id>/clear` and a reason — never leave
   a stale hold silently covering fresh incidents. A hold without a
   recorded decision does not exist: the next wake will re-derive it and
-  burn a turn.
+  burn a turn. `covers` names signal families (`directive-unreconciled`,
+  `supervision.provider-wall`), not request or agent ids: for a mailbox
+  item copy each `reasons[].signal` verbatim (only a report handback's
+  carries its job id); the subject and basis pin the exact instance.
 - **Settle report handbacks with a disposition (issue #220).** A delivered
   report-type job (review, artifact, investigation) owes its commissioner
   ONE decision, tracked as a durable `report:<jobId>` obligation — a

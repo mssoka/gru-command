@@ -430,6 +430,15 @@ the first reconciliation at or after that bound; restart preserves the bound.
 Waiting/delegated/resolved exact-basis dispositions stay quiet until changed
 head/round/control/failure evidence or a due follow-up restores attention.
 Unresolved items remain visible in passive context and on the board.
+Each reason names a signal family (`directive-unreconciled`,
+`supervision.provider-wall`, `ci-failed`; #503), never an instance id: the
+item's subject and basis carry the exact instance. An attention-only
+`resolved` disposition references an `acted`/`dismissed`/`superseded`
+decision on the item's subject, pinned to its exact basis, whose `covers`
+name every reason's signal. It records mailbox metadata only: it never
+settles, retires, replays or authorizes the original control, clears
+producer uncertainty, or acknowledges an owner-only stop, and a changed
+basis reopens the item.
 Report-handback custody (GH-313) follows the producer's report/job identity and
 actual report/obligation evidence, not replacement notification IDs. Re-posting
 an unchanged `silas.report-handback.<job>` card preserves its recorded owner,

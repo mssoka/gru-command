@@ -11167,20 +11167,24 @@ export class LedgerApi {
    * - its `basis_fingerprint` is null or equals `basis` (a changed basis
    *   re-opens the subject);
    * - its `recheck_at` is null or later than `now` (a passed recheck
-   *   re-opens the subject). */
-  coveringDecision(opts: { subject: string; signal: string; basis: string; now?: string }): DecisionRecord | null {
+   *   re-opens the subject).
+   * `legacySignals` (#503) are the pre-family exact tokens a decision
+   * recorded before signal families may name for this same row; a decision
+   * listing one competes in the same newest-first scan as the family. */
+  coveringDecision(opts: { subject: string; signal: string; basis: string; now?: string; legacySignals?: readonly string[] }): DecisionRecord | null {
     if (opts.signal.length === 0) throw new Error('coveringDecision "signal" must be non-empty');
     if (opts.basis.length === 0) throw new Error('coveringDecision "basis" must be non-empty');
     const nowMs = Date.parse(opts.now ?? nowIso());
     if (!Number.isFinite(nowMs)) throw new Error(`coveringDecision "now" must be a parseable timestamp, got "${String(opts.now)}"`);
-    validateDecisionSignal(opts.signal);
+    const signals = [opts.signal, ...(opts.legacySignals ?? [])];
+    for (const signal of signals) validateDecisionSignal(signal);
     // Page to exhaustion: a hold older than any single listing window
     // must still be found (bounded per subject, newest first).
     const pageSize = 500;
     for (let offset = 0; ; offset += pageSize) {
       const page = this.listDecisions({ subject: opts.subject, activeOnly: true, limit: pageSize, offset });
       for (const row of page) {
-        if (!row.covers.includes(opts.signal)) continue;
+        if (!signals.some((signal) => row.covers.includes(signal))) continue;
         if (row.basisFingerprint !== null && row.basisFingerprint !== opts.basis) return null;
         if (row.recheckAt !== null) {
           const recheckMs = Date.parse(row.recheckAt);

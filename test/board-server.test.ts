@@ -24,6 +24,9 @@ import type { RepoOverviewView } from '../src/repos/overview.js';
 import type { DecisionRecord } from '../src/ledger/decision-memory.js';
 import type { MailboxItem } from '../src/ledger/mailbox.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
+import { surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { incidentSubjectOf } from '../src/chat/incident.js';
+import type { NotificationRecord } from '../src/ledger/api.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1613,6 +1616,106 @@ describe('board server — report-handback decision signals (issue #314)', () =>
       }
       expect(harness.api.listDecisions()).toHaveLength(0);
       expect((await reportItem(harness, item.notificationIds[0]!)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
+  });
+});
+
+describe('board server — id-bearing incident signal families (issue #503)', () => {
+  const token = 'signal-family-token';
+  // A caller-chosen request id: the pre-#503 signal `directive-unreconciled.<id>`
+  // was 92 characters, past the 64-character write boundary.
+  const requestId = (tag: string) => `rt-655-fix-reviews-${tag}-${'r'.repeat(40)}-20261024`;
+
+  function surface(harness: Awaited<ReturnType<typeof boot>>, jobId: string, request: string, reason: string): NotificationRecord {
+    if (harness.api.getJob(jobId) === null) {
+      harness.api.addJob({ id: jobId, repo: 'r', title: 'recovering lane' });
+      harness.api.setJobStatus(jobId, 'working');
+      harness.api.beginDirectiveIntent({ jobId, requestId: request, directive: 'approved correction', holder: 'gru' });
+    }
+    surfaceDirectiveRecovery({ ledger: harness.api, notifications: harness.notifications }, request, reason);
+    return harness.api.findNotificationByKind(`silas.directive-unreconciled.${request}`, 'active')!;
+  }
+
+  async function itemFor(harness: Awaited<ReturnType<typeof boot>>, notificationId: string): Promise<MailboxItem> {
+    const page = await getJson(harness.port, '/api/mailbox', token);
+    expect(page.status).toBe(200);
+    const item = (page.body as { items: MailboxItem[] }).items.find((row) => row.notificationIds.includes(notificationId));
+    expect(item).toBeDefined();
+    return item!;
+  }
+
+  function acted(item: MailboxItem, clientKey: string) {
+    return { subject: item.subject, decision: 'acted', covers: item.reasons.map((reason) => reason.signal), basis_fingerprint: item.basis,
+      reason: 'duplicate attention; the recovery endpoint owns the debt', by: 'gru', client_key: clientKey };
+  }
+
+  function resolution(item: MailboxItem, decision: DecisionRecord) {
+    return { basis: item.basis, state: 'resolved', owner: 'gru', detail: 'attention accounted; recovery stays owed',
+      references: [{ kind: 'decision', id: decision.id }] };
+  }
+
+  it('an exact-basis attention-only disposition of a long native directive reason leaves its control and debt alone', async () => {
+    const harness = await boot(token);
+    try {
+      const request = requestId('a');
+      const card = surface(harness, 'recovery-job', request, 'native admission unproven after restart');
+      const item = await itemFor(harness, card.id);
+      expect(item.subject).toBe(incidentSubjectOf(card));
+      expect(item.subject).toContain(request);
+      expect(item.reasons.map((reason) => reason.signal)).toEqual(['directive-unreconciled']);
+      // The pre-family exact token is still not decision vocabulary.
+      const legacy = await postJson(harness.port, '/api/decisions', token, { ...acted(item, 'legacy'), covers: [`directive-unreconciled.${request}`] });
+      expect(legacy.status).toBe(400);
+      const directive = harness.api.getDirective(request);
+      const debts = harness.api.listObligations({ jobId: 'recovery-job' });
+      expect(debts.map((debt) => debt.state)).toEqual(['open']);
+      const written = await postJson(harness.port, '/api/decisions', token, acted(item, 'directive-attention'));
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision.covers).toEqual(['directive-unreconciled']);
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, token, resolution(item, decision));
+      expect(resolved.status).toBe(200);
+      expect(await itemFor(harness, card.id)).toMatchObject({ basis: item.basis, state: 'resolved' });
+      // Attention metadata only: no settlement, retirement, replay or ack.
+      expect(harness.api.getDirective(request)).toEqual(directive);
+      expect(harness.api.listObligations({ jobId: 'recovery-job' })).toEqual(debts);
+      expect(harness.api.getNotification(card.id)).toEqual(card);
+      // The producer refreshes the card for a new blocker: a changed basis reopens it.
+      const refreshed = surface(harness, 'recovery-job', request, 'producer ownership unknown');
+      expect(refreshed.id).toBe(card.id);
+      const reopened = await itemFor(harness, card.id);
+      expect(reopened.basis).not.toBe(item.basis);
+      expect(reopened.state).toBe('needs-gru');
+      const stale = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, token,
+        { ...resolution(reopened, decision) });
+      expect(stale.status).toBe(409);
+      expect(harness.api.getDirective(request)).toEqual(directive);
+    } finally { await harness.close(); }
+  });
+
+  it('a family decision for one directive never resolves another instance of the family', async () => {
+    const harness = await boot(token);
+    try {
+      const first = surface(harness, 'first-job', requestId('a'), 'native admission unproven after restart');
+      const second = surface(harness, 'second-job', requestId('b'), 'native admission unproven after restart');
+      const firstItem = await itemFor(harness, first.id);
+      const secondItem = await itemFor(harness, second.id);
+      expect(secondItem.reasons.map((reason) => reason.signal)).toEqual(firstItem.reasons.map((reason) => reason.signal));
+      expect(secondItem.subject).not.toBe(firstItem.subject);
+      const written = await postJson(harness.port, '/api/decisions', token, acted(firstItem, 'first-attention'));
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const crossed = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(secondItem.id)}/disposition`, token, resolution(secondItem, decision));
+      expect(crossed.status).toBe(409);
+      expect(crossed.body).toMatchObject({ detail: expect.stringContaining('belongs to another subject') });
+      // Same subject, the other instance's basis: still no exact-basis support.
+      const misbased = await postJson(harness.port, '/api/decisions', token, { ...acted(secondItem, 'second-misbased'), basis_fingerprint: firstItem.basis });
+      expect(misbased.status).toBe(201);
+      const refused = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(secondItem.id)}/disposition`, token,
+        resolution(secondItem, misbased.body as DecisionRecord));
+      expect(refused.status).toBe(409);
+      expect((await itemFor(harness, second.id)).state).toBe('needs-gru');
+      expect((await itemFor(harness, first.id)).state).toBe('needs-gru');
     } finally { await harness.close(); }
   });
 });

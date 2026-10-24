@@ -107,8 +107,10 @@ export function validateDecisionSubject(value: string): string {
 }
 
 /** Signal families are canonical lowercase tokens (`pr-conflict`,
- * `ci-failed`). The report-handback suffix is an exact, case-sensitive
- * job identity, not a family to lowercase or truncate. */
+ * `ci-failed`, `directive-unreconciled`); since #503 no derived family
+ * carries an instance id (`incidentSignalOf`). The report-handback suffix
+ * is an exact, case-sensitive job identity, not a family to lowercase or
+ * truncate. */
 export function validateDecisionSignal(value: string): string {
   const reportHandback = value.startsWith(REPORT_HANDBACK_SIGNAL_PREFIX);
   const maxLength = reportHandback ? REPORT_HANDBACK_SIGNAL_MAX_LENGTH : DECISION_SIGNAL_MAX_LENGTH;
@@ -126,6 +128,17 @@ export function validateDecisionSignal(value: string): string {
     throw new Error(`decision signal must be a lowercase token of [a-z0-9._-], got "${value}"`);
   }
   return value;
+}
+
+/** Whether `value` passes validateDecisionSignal: the write boundary, and so
+ * every stored `covers` entry (reads re-validate). */
+export function isDecisionSignal(value: string): boolean {
+  try {
+    validateDecisionSignal(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Canonical `covers`: non-empty, bounded, deduped, sorted — so an

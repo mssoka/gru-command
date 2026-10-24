@@ -1221,6 +1221,22 @@ describe('decision memory (issue #218)', () => {
     by: 'gru' as const,
   };
 
+  it('GH-503 legacy exact tokens join the family in one newest-first coverage scan', () => {
+    const ledger = fresh();
+    const subject = 'incident:supervision.turn-orphaned.a2:interrupted-turn';
+    const query = { subject, signal: 'supervision.turn-orphaned', basis: 'supervision.turn-orphaned.a2:interrupted-turn',
+      legacySignals: ['supervision.turn-orphaned.a2'] };
+    const legacy = ledger.recordDecision({ ...base, subject, covers: ['supervision.turn-orphaned.a2'], basisFingerprint: null });
+    expect(ledger.coveringDecision(query)?.id).toBe(legacy.id);
+    // Without the alias the family alone never finds a pre-#503 hold.
+    expect(ledger.coveringDecision({ subject, signal: query.signal, basis: query.basis })).toBeNull();
+    // A newer family decision on another basis re-opens the row: the older
+    // legacy hold must not shadow it.
+    ledger.recordDecision({ ...base, subject, covers: ['supervision.turn-orphaned'], basisFingerprint: 'moved' });
+    expect(ledger.coveringDecision(query)).toBeNull();
+    expect(() => ledger.coveringDecision({ ...query, legacySignals: ['Turn-Orphaned.A2'] })).toThrow(/lowercase token/);
+  });
+
   it('GH-314 preserves long and legacy short signal decisions across ledger restart', () => {
     const dir = tmpDir();
     let db = new LedgerDb(dir);

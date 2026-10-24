@@ -481,8 +481,9 @@ POST /api/decisions
   "recheck_at": "<ISO timestamp or omitted>" }
 ```
 
-- `covers` names the signal kinds the hold suppresses (e.g. `pr-conflict`,
-  `ci-failed`); anything not listed stays loud.
+- `covers` names the signal families the hold suppresses (e.g. `pr-conflict`,
+  `ci-failed`, `directive-unreconciled`), not request or agent ids — the
+  subject and basis pin the instance; anything not listed stays loud.
 - `basis_fingerprint` pins the hold to the state you judged (head SHA,
   incident hash); omit it only for holds that stand on ANY basis.
 - `recheck_at` schedules your own re-look; once it passes the subject

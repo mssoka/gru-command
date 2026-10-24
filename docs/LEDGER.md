@@ -607,7 +607,7 @@ table makes the hold queryable:
 | `id` | uuid |
 | `subject` | `'job:<id>'` \| `'pr:<repo>#<n>'` \| `'incident:<kind>:<key>'` — a kind-prefixed stable key |
 | `decision` | `hold` \| `dismissed` \| `acted` \| `superseded` \| `covered` |
-| `covers` | JSON array of signal kinds, e.g. `["pr-conflict","ci-failed"]` (canonical: deduped, sorted) |
+| `covers` | JSON array of signal families, e.g. `["pr-conflict","ci-failed"]` (canonical: deduped, sorted; 1-64 lowercase `[a-z0-9._-]` characters, or the exact `report-handback.<job id>`) |
 | `basis_fingerprint` | state hash at decision time (head SHA / incident hash); `NULL` = any basis |
 | `reason` | non-empty, bounded (2000) |
 | `by` | `gru` \| `silas` \| `owner` \| `code` — a CLAIM, never identity proof (#99: the bearer token is shared) |
@@ -625,6 +625,31 @@ signal is the candidate: when it fails, the subject re-opens even if an
 older, broader hold on the same subject still matches — a replacement
 hold should mark its predecessor `superseded` or clear it. The scan is
 exhaustive for the subject (pages past any listing window).
+
+**Signal families (#503).** `incidentSignalOf` (`src/chat/incident.ts`)
+derives the signal from an alert kind. Kinds are `<namespace>.<family>`,
+scoped to an instance by `:` (`github.ci-failed:<job>:<sha>`) or by more
+`.` segments (`silas.directive-unreconciled.<request id>`,
+`silas.phase-handback.<job>@<seq>`,
+`supervision.provider-wall.<agent>.<class>`). The family is the first two
+dot segments before any `:`, with the `github.`/`silas.` namespace dropped:
+`ci-failed`, `directive-unreconciled`, `phase-handback`,
+`supervision.provider-wall`, `supervision.turn-orphaned`. No instance id
+enters a signal, so a caller-chosen id can never overrun the 64-character
+bound and make an exact disposition unrecordable. Exactness lives in the
+subject (`incident:<kind>:<title>` keeps the whole kind) and the basis; a
+family decision on one instance's subject never covers another instance.
+Two rulings stand apart: a red default branch is `ci-failed` (#446), and a
+report handback keeps the exact `report-handback.<job id>` (#314). Hard
+floors (`isHardFloorRow`) match kinds, not signals, so a family hold still
+never defers them. Decisions recorded before #503 can name the old exact
+token (`supervision.turn-orphaned.<lane>`); `coveringDecision` takes it as
+`legacySignals` in the same newest-first scan, so such a hold keeps
+covering. Mailbox items need no such alias: an item's basis hashes its
+reason signals, so an item carrying a family reason has a new basis and no
+pre-#503 exact-basis decision matches it. A live item with such a reason
+reopens once as `needs-gru` after the upgrade; its decisions stay listed
+and clearable.
 
 **Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
 each appending a `decision.recorded` / `decision.cleared` event in the

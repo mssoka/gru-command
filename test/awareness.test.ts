@@ -1878,6 +1878,69 @@ describe('gru awareness — wake rework (issue #219)', () => {
     }
   });
 
+  it('#503 a family hold covers its exact incident only; another instance of the family wakes', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const hold = rig.api.recordDecision({
+        subject: 'incident:supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
+        decision: 'hold', covers: ['supervision.turn-orphaned'], basisFingerprint: null,
+        reason: 'lane-a owner is re-briefing it', by: 'gru', clientKey: 'hold-lane-a',
+      });
+      rig.notifications.post({ kind: 'supervision.turn-orphaned.lane-a', routing: 'action-required', severity: 'error', title: 'Interrupted turn on lane-a' });
+      expect(rig.woke).toHaveLength(0);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered', decision_id: hold.id });
+      rig.notifications.post({ kind: 'supervision.turn-orphaned.lane-b', routing: 'action-required', severity: 'error', title: 'Interrupted turn on lane-b' });
+      expect(rig.woke).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#503 hard floors still wake under a family hold on their exact subject', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const request = `fix-reviews-${'r'.repeat(60)}`;
+      rig.api.recordDecision({
+        subject: 'incident:supervision.provider-wall.a1.quota_wall:agent-a1-stopped-quota-wall',
+        decision: 'hold', covers: ['supervision.provider-wall'], basisFingerprint: null,
+        reason: 'known provider condition', by: 'owner', clientKey: 'hold-wall-family',
+      });
+      rig.api.recordDecision({
+        subject: `incident:silas.directive-unreconciled.${request}:recovery-owed`,
+        decision: 'hold', covers: ['directive-unreconciled'], basisFingerprint: null,
+        reason: 'generic Ops hold', by: 'silas', clientKey: 'hold-directive-family',
+      });
+      rig.notifications.post({ kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent a1 stopped: quota wall' });
+      rig.notifications.post({ kind: `silas.directive-unreconciled.${request}`, routing: 'action-required', severity: 'error', title: 'Recovery owed' });
+      expect(rig.woke).toHaveLength(2);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#503 a stored hold naming the pre-family exact token keeps covering its row', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const hold = rig.api.recordDecision({
+        subject: 'incident:supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
+        decision: 'hold', covers: ['supervision.turn-orphaned.lane-a'], basisFingerprint: 'supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
+        reason: 'recorded before signal families', by: 'gru', clientKey: 'legacy-hold-lane-a',
+      });
+      rig.notifications.post({ kind: 'supervision.turn-orphaned.lane-a', routing: 'action-required', severity: 'error', title: 'Interrupted turn on lane-a' });
+      expect(rig.woke).toHaveLength(0);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered', decision_id: hold.id });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('wake_defer_covered = false restores pre-#219 behavior (kill switch)', () => {
     vi.useFakeTimers();
     try {

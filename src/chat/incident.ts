@@ -1,4 +1,5 @@
 import type { NotificationRecord } from '../ledger/api.js';
+import { isDecisionSignal } from '../ledger/decision-memory.js';
 
 /**
  * Incident identity for the wake policy (issue #219): one wake per
@@ -96,22 +97,66 @@ export function incidentSubjectOf(row: IncidentRow): string {
   return `incident:${row.kind}:${normalizeIncidentTitle(row.title)}`;
 }
 
+/** Producer namespaces the signal vocabulary drops (`github.ci-failed` →
+ * `ci-failed`, `silas.directive-unreconciled` → `directive-unreconciled`). */
+const SIGNAL_NAMESPACE = /^(github|silas)\./;
+
+/** The report producer (#314): its signal is the exact, case-preserved job
+ * identity, never a family. */
+const REPORT_HANDBACK_KIND_PREFIX = 'silas.report-handback.';
+
+/** Namespace stripped and `:` scope dropped, every `.` segment kept —
+ * instance ids included. */
+function exactSignalOf(kind: string): string {
+  const withoutNamespace = kind.replace(SIGNAL_NAMESPACE, '');
+  const colon = withoutNamespace.indexOf(':');
+  const signal = colon > 0 ? withoutNamespace.slice(0, colon) : withoutNamespace;
+  return signal === '' ? kind : signal;
+}
+
 /**
  * The signal family the row raises — the token a decision's `covers` list
- * names (`pr-conflict`, `ci-failed`, …). Producer namespacing
- * (`github.`, `silas.`) is stripped and the scope suffix dropped;
- * unscoped kinds are their own signal. The dot-scoped rebrief producer
- * maps to its family token like the colon-scoped ones; a red default
- * branch is the `ci-failed` family.
+ * names (`pr-conflict`, `ci-failed`, `directive-unreconciled`, …). Producer
+ * kinds are `<namespace>.<family>`, scoped to an instance by `:`
+ * (`github.ci-failed:<job>:<sha>`) or by further `.` segments
+ * (`silas.directive-unreconciled.<request>`,
+ * `supervision.provider-wall.<agent>.<class>`). The family is the first two
+ * dot segments of the unscoped head with the `github.`/`silas.` namespace
+ * dropped, so no instance id enters the signal (issue #503: a caller-chosen
+ * id overran the decision write boundary and made the exact disposition
+ * unrecordable). Exactness comes from the subject and the basis, which keep
+ * the whole kind. Two rulings stand apart: a red default branch is the
+ * `ci-failed` family (#446), and a report handback keeps its exact job
+ * identity (#314).
  */
 export function incidentSignalOf(row: IncidentRow): string {
   if (defaultBranchCiScope(row.kind) !== null) return 'ci-failed';
-  const rebrief = /^silas\.rebrief-unreconciled\./.exec(row.kind);
-  if (rebrief !== null) return 'rebrief-unreconciled';
-  const withoutNamespace = row.kind.replace(/^(github|silas)\./, '');
-  const colon = withoutNamespace.indexOf(':');
-  const family = colon > 0 ? withoutNamespace.slice(0, colon) : withoutNamespace;
+  if (row.kind.startsWith(REPORT_HANDBACK_KIND_PREFIX)) return exactSignalOf(row.kind);
+  const head = row.kind.split(':', 1)[0] ?? '';
+  const family = head.split('.').slice(0, 2).join('.').replace(SIGNAL_NAMESPACE, '');
   return family === '' ? row.kind : family;
+}
+
+/** The pre-#503 derivation, verbatim: the default branch and the re-brief
+ * producer were families already; every other kind kept its instance. */
+function preFamilySignalOf(kind: string): string {
+  if (defaultBranchCiScope(kind) !== null) return 'ci-failed';
+  if (kind.startsWith('silas.rebrief-unreconciled.')) return 'rebrief-unreconciled';
+  return exactSignalOf(kind);
+}
+
+/**
+ * Compatibility (#503): the pre-family token a decision recorded before
+ * #503 may name for this row. Null when the family is that same token, or
+ * when the token is no decision signal (over 64 characters, mixed case,
+ * `@`): the write boundary never accepted one and every read re-validates
+ * stored `covers`, so no decision row holds it. Only the hold-coverage query
+ * needs it — a mailbox item's basis hashes its reason signals, so no
+ * decision pinned to a pre-#503 basis can match a current item anyway.
+ */
+export function legacyIncidentSignalOf(row: IncidentRow): string | null {
+  const legacy = preFamilySignalOf(row.kind);
+  return legacy !== incidentSignalOf(row) && isDecisionSignal(legacy) ? legacy : null;
 }
 
 /**

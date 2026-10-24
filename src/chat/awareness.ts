@@ -17,6 +17,7 @@ import {
   incidentSignalOf,
   incidentSubjectOf,
   isHardFloorRow,
+  legacyIncidentSignalOf,
 } from './incident.js';
 import { redactedText } from '../decisions/questions.js';
 import { WakePolicy, type WakeCandidate, type WakeDecision } from './wake-policy.js';
@@ -110,7 +111,8 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'subject the wake path consults: for job-scoped alert kinds that is "job:<job id>" — for those ' +
   'job-scoped kinds use the head SHA as basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>); ' +
   'omit basis_fingerprint entirely for kinds without a SHA (github.pr-conflict:<job>), and name ' +
-  'covers with the signal family ("ci-failed", "pr-conflict", "rebrief-unreconciled"). ' +
+  'covers with the signal family ("ci-failed", "pr-conflict", "rebrief-unreconciled", "directive-unreconciled"); ' +
+  'for a mailbox item copy each reasons[].signal verbatim. ' +
   'A red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>) has no lane: diagnose ' +
   'the run, open a fix heist from the current head, and hold "incident:github.default-branch-ci-failed:<owner>/<repo>" ' +
   '(covers "ci-failed") with no basis_fingerprint, so the hold reaches every later head and later red heads of that ' +
@@ -2154,11 +2156,14 @@ export class GruAwareness {
     if (this.mailbox?.captureRow(row) != null) return null; // exact-basis mailbox dispositions own admission, wildcard holds remain restrictions
     if (!this.coveredDeferralEnabled) return null;
     if (isHardFloorRow(row)) return null;
+    const legacy = legacyIncidentSignalOf(row);
     try {
       return this.ledger.coveringDecision({
         subject: incidentSubjectOf(row),
         signal: incidentSignalOf(row),
         basis: incidentBasisOf(row),
+        // #503: a hold recorded before signal families keeps covering.
+        ...(legacy === null ? {} : { legacySignals: [legacy] }),
       });
     } catch (error) {
       // A malformed decision row must not take the wake path down: treat

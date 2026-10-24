@@ -5,6 +5,7 @@ import {
   incidentSignalOf,
   incidentSubjectOf,
   isHardFloorRow,
+  legacyIncidentSignalOf,
   normalizeIncidentTitle,
 } from '../src/chat/incident.js';
 import { validateDecisionSignal, validateDecisionSubject } from '../src/ledger/decision-memory.js';
@@ -53,8 +54,9 @@ describe('incident identity (issue #219)', () => {
   it('derives the signal family: namespace and scope stripped', () => {
     expect(incidentSignalOf({ kind: 'github.ci-failed:j-1:abc123', title: 'CI failed', routing: 'action-required' })).toBe('ci-failed');
     expect(incidentSignalOf({ kind: 'github.pr-conflict:j-7', title: 'PR conflicts', routing: 'fyi' })).toBe('pr-conflict');
+    // Issue #503: the dot-scoped lane id is instance identity, not family.
     expect(incidentSignalOf({ kind: 'supervision.turn-orphaned.a2', title: 'Interrupted turn', routing: 'action-required' })).toBe(
-      'supervision.turn-orphaned.a2',
+      'supervision.turn-orphaned',
     );
   });
 
@@ -134,5 +136,89 @@ describe('incident identity — red default branch (#446)', () => {
     const kind = defaultBranchCiFailedKind({ host: 'github.com', owner: 'Acme-Org', repo: 'right.tenantry' }, 123456789, sha);
     expect(validateDecisionSubject(incidentSubjectOf(row(kind)))).toBe('incident:github.default-branch-ci-failed:Acme-Org/right.tenantry');
     expect(validateDecisionSignal(incidentSignalOf(row(kind)))).toBe('ci-failed');
+  });
+});
+
+describe('incident identity — signal families (issue #503)', () => {
+  const row = (kind: string, title = 'Recovery owed') => ({ kind, title, routing: 'action-required' as const });
+  // Caller-chosen ids: long, mixed case and punctuated. The pre-#503 signal
+  // embedded them whole and overran the decision write boundary.
+  const request = `Fix-Reviews-${'r'.repeat(60)}.v2`;
+  const agent = `minion_${'8889b879'.repeat(5)}`;
+
+  function expectFamily(kind: string, family: string): void {
+    const incident = row(kind);
+    expect(incidentSignalOf(incident), kind).toBe(family);
+    expect(validateDecisionSignal(incidentSignalOf(incident)), kind).toBe(family);
+    // The instance stays exact in the subject and basis the queries pin.
+    expect(incidentSubjectOf(incident), kind).toBe(`incident:${kind}:recovery-owed`);
+    expect(incidentBasisOf(incident), kind).toBe(`${kind}:recovery-owed`);
+  }
+
+  it('silas recovery kinds drop the request, phase and transfer ids', () => {
+    expectFamily(`silas.directive-unreconciled.${request}`, 'directive-unreconciled');
+    expectFamily(`silas.phase-handback.${request}@4831`, 'phase-handback');
+    expectFamily(`silas.phase-handback.${request}`, 'phase-handback');
+    expectFamily(`silas.recovery-owner-transfer.directive.${request}.3`, 'recovery-owner-transfer');
+  });
+
+  it('supervision, provider, wake and decisions kinds keep their namespace and drop the instance', () => {
+    expectFamily(`supervision.provider-wall.${agent}.authentication_wall`, 'supervision.provider-wall');
+    expectFamily(`supervision.turn-orphaned.${agent}`, 'supervision.turn-orphaned');
+    expectFamily('provider.false-recovery.anthropic/claude-opus', 'provider.false-recovery');
+    expectFamily(`provider-recovery.recovery-off.${request}`, 'provider-recovery.recovery-off');
+    expectFamily('provider.waiting.anthropic/claude-opus', 'provider.waiting');
+    expectFamily(`gru.wake-failed-escalation.${request}`, 'gru.wake-failed-escalation');
+    expectFamily('decisions.degraded.provider-unreachable', 'decisions.degraded');
+    expectFamily('decisions.enforce-gate.escalation-triage', 'decisions.enforce-gate');
+  });
+
+  it('short stable kinds keep the signal they always had', () => {
+    expect(incidentSignalOf(row('github.ci-failed:j-1:abc123'))).toBe('ci-failed');
+    expect(incidentSignalOf(row('github.pr-conflict:j-7'))).toBe('pr-conflict');
+    expect(incidentSignalOf(row('github.default-branch-ci-failed:acme/alpha:7:abc'))).toBe('ci-failed');
+    expect(incidentSignalOf(row('silas.rebrief-unreconciled.j-42'))).toBe('rebrief-unreconciled');
+    expect(incidentSignalOf(row('silas.escalation'))).toBe('escalation');
+    expect(incidentSignalOf(row('silas.escalated:j-1'))).toBe('escalated');
+    expect(incidentSignalOf(row('supervision.breaker'))).toBe('supervision.breaker');
+    expect(incidentSignalOf(row('supervision.rearm-fenced'))).toBe('supervision.rearm-fenced');
+    expect(incidentSignalOf(row('lessons.dream-failed'))).toBe('lessons.dream-failed');
+    expect(incidentSignalOf(row('worktree.sweep-answer-waiting'))).toBe('worktree.sweep-answer-waiting');
+    expect(incidentSignalOf(row('review-escalation'))).toBe('review-escalation');
+    expect(incidentSignalOf(row('job-stop-unproven:j-1'))).toBe('job-stop-unproven');
+    // #314: a report's signal is its exact, case-preserved job identity.
+    const job = `Review-${'A'.repeat(121)}`;
+    expect(incidentSignalOf(row(`silas.report-handback.${job}`))).toBe(`report-handback.${job}`);
+    expect(validateDecisionSignal(incidentSignalOf(row(`silas.report-handback.${job}`)))).toBe(`report-handback.${job}`);
+  });
+
+  it('names the storable pre-family token only where the family replaced it', () => {
+    // A stored decision could name these: each was a valid decision signal.
+    expect(legacyIncidentSignalOf(row('supervision.turn-orphaned.a2'))).toBe('supervision.turn-orphaned.a2');
+    expect(legacyIncidentSignalOf(row('silas.directive-unreconciled.0b1c2d3e-0000-4000-8000-000000000000')))
+      .toBe('directive-unreconciled.0b1c2d3e-0000-4000-8000-000000000000');
+    expect(legacyIncidentSignalOf(row('provider.waiting.route-x'))).toBe('provider.waiting.route-x');
+    // The write boundary never accepted these, and reads re-validate every
+    // stored token, so no decision row can hold them.
+    expect(legacyIncidentSignalOf(row(`silas.directive-unreconciled.${request}`))).toBeNull();
+    expect(legacyIncidentSignalOf(row('silas.phase-handback.j-1@17'))).toBeNull();
+    expect(legacyIncidentSignalOf(row(`supervision.provider-wall.${agent}.authentication_wall`))).toBeNull();
+    // Unchanged signals have no alias, and re-briefs were a family already.
+    expect(legacyIncidentSignalOf(row('github.ci-failed:j-1:abc123'))).toBeNull();
+    expect(legacyIncidentSignalOf(row('github.default-branch-ci-failed:acme/alpha:7:abc'))).toBeNull();
+    expect(legacyIncidentSignalOf(row('silas.rebrief-unreconciled.j-42'))).toBeNull();
+    expect(legacyIncidentSignalOf(row('silas.report-handback.review-old'))).toBeNull();
+    expect(legacyIncidentSignalOf(row('supervision.breaker'))).toBeNull();
+  });
+
+  it('a family never widens hard floors or merges two instances', () => {
+    for (const kind of [`silas.directive-unreconciled.${request}`, `supervision.provider-wall.${agent}.quota_wall`, 'provider.false-recovery.route-x']) {
+      expect(isHardFloorRow(row(kind)), kind).toBe(true);
+    }
+    const first = row('supervision.turn-orphaned.lane-a', 'Interrupted turn on lane-a');
+    const second = row('supervision.turn-orphaned.lane-b', 'Interrupted turn on lane-b');
+    expect(incidentSignalOf(first)).toBe(incidentSignalOf(second));
+    expect(incidentSubjectOf(first)).not.toBe(incidentSubjectOf(second));
+    expect(incidentBasisOf(first)).not.toBe(incidentBasisOf(second));
   });
 });
