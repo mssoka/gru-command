@@ -1698,20 +1698,31 @@ describe('board server — id-bearing incident signal families (issue #503)', ()
     } finally { await harness.close(); }
   });
 
-  it('a 128-character request id, the longest the rule admits, disposes its directive card exactly end to end', async () => {
+  it('a 300-character request id with colons disposes its directive card exactly on its fitted subject', async () => {
     const harness = await boot(token);
     try {
-      const request = `r${'x'.repeat(127)}`;
-      const card = surface(harness, 'longest-job', request, 'native admission unproven after restart');
+      // Unvalidated caller ids: colons stay inside the dot-scoped instance.
+      const request = (tag: string) => `rt:655:${tag}-${'r'.repeat(300 - 9)}`;
+      const card = surface(harness, 'long-job', request('a'), 'native admission unproven after restart');
+      const other = surface(harness, 'other-long-job', request('b'), 'native admission unproven after restart');
+      expect(request('a')).toHaveLength(300);
       const item = await itemFor(harness, card.id);
-      expect(item.subject).toContain(request);
-      expect(item.subject.length).toBeLessThanOrEqual(256);
-      const written = await postJson(harness.port, '/api/decisions', token, acted(item, 'longest-attention'));
+      const otherItem = await itemFor(harness, other.id);
+      expect(item.subject).toBe(incidentSubjectOf(card));
+      expect(item.subject).toMatch(/^incident:silas\.directive-unreconciled\.rt:655:a-r+~[0-9a-f]{64}$/u);
+      expect(item.subject).toHaveLength(256);
+      expect(otherItem.subject).not.toBe(item.subject);
+      const written = await postJson(harness.port, '/api/decisions', token, acted(item, 'long-attention'));
       expect(written.status).toBe(201);
-      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, token,
-        resolution(item, written.body as DecisionRecord));
+      const decision = written.body as DecisionRecord;
+      expect(decision.subject).toBe(item.subject);
+      expect(harness.api.listDecisions({ subject: item.subject, activeOnly: true }).map((row) => row.id)).toEqual([decision.id]);
+      const crossed = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(otherItem.id)}/disposition`, token, resolution(otherItem, decision));
+      expect(crossed.status).toBe(409);
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, token, resolution(item, decision));
       expect(resolved.status).toBe(200);
       expect(await itemFor(harness, card.id)).toMatchObject({ basis: item.basis, state: 'resolved' });
+      expect((await itemFor(harness, other.id)).state).toBe('needs-gru');
     } finally { await harness.close(); }
   });
 

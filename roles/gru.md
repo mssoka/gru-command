@@ -244,18 +244,13 @@ continuation, call `POST /api/silas/directives/<request_id>/recover` with
 `by: "gru"`, `expected_generation`, `expected_payload_hash`, `expected_head`
 (the actual checkout HEAD), `expected_epoch`, current `expected_work_revision` and
 `expected_contract_sha256` for a successor, a reason, and either
-`decision: { "kind": "successor", "request_id": "recover-<firstOriginSeq>-<generation>",
+`decision: { "kind": "successor", "request_id": "<fresh unused id>",
 "directive": "<explicit approved follow-through>" }` or
 `decision: { "kind": "owner-decision", "obligation_id": "<real outstanding
 owner decision>" }`. When the work can only be finished in a fresh session
 (the old session cannot be resumed), use `decision: { "kind":
-"rebrief-successor", "request_id": "recover-<firstOriginSeq>-<generation>", "note": "<explicit
+"rebrief-successor", "request_id": "<fresh unused id>", "note": "<explicit
 approved follow-through>" }`; it takes the same fences as a successor.
-A new `request_id` (successor, rebrief-successor or `inspection_request_id`)
-is 1-128 characters of `[A-Za-z0-9._-]` starting with a letter or digit, with
-no `:`; any other id is refused with a 400. Derive it deterministically from
-the readback, `recover-<recovery_obligation.firstOriginSeq>-<expected_generation>`,
-so a retry re-derives it; a job id can push it past the 128-character bound.
 When the request is already retired and a later request carrying its work
 was actually admitted on the lane, settle the debt with `decision: { "kind":
 "reconcile-admitted", "admitted_request_id": "<that request>" }`; it starts

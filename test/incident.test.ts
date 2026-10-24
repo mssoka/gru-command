@@ -251,13 +251,38 @@ describe('incident identity — signal families (issue #503)', () => {
     const review = row('silas.phase-handback.phase-handoff:job-a:review:7');
     expect([incidentSignalOf(fix), incidentSubjectOf(fix), incidentBasisOf(fix)]).toEqual(['phase-handback', 'job:job-a', 'fix:1']);
     expect([incidentSignalOf(review), incidentSubjectOf(review), incidentBasisOf(review)]).toEqual(['phase-handback', 'job:job-a', 'review:7']);
-    // Legacy ':' request ids are not exact: two requests share subject,
-    // signal and basis. Both are hard floors, so no hold defers either.
-    const legacyA = row('silas.directive-unreconciled.a:J:3');
-    const legacyB = row('silas.directive-unreconciled.b:J:3');
-    for (const legacy of [legacyA, legacyB]) {
-      expect([incidentSignalOf(legacy), incidentSubjectOf(legacy), incidentBasisOf(legacy), isHardFloorRow(legacy)])
-        .toEqual(['directive-unreconciled', 'job:J', '3', true]);
-    }
+  });
+
+  it('a request id holding a colon inside a dot-scoped kind keeps an exact subject and basis', () => {
+    const first = row('silas.directive-unreconciled.a:J:3');
+    const second = row('silas.directive-unreconciled.b:J:3');
+    expect(incidentSubjectOf(first)).toBe('incident:silas.directive-unreconciled.a:J:3:recovery-owed');
+    expect(incidentSubjectOf(second)).toBe('incident:silas.directive-unreconciled.b:J:3:recovery-owed');
+    expect(incidentBasisOf(first)).toBe('silas.directive-unreconciled.a:J:3');
+    expect(incidentBasisOf(second)).not.toBe(incidentBasisOf(first));
+    expect(incidentSignalOf(first)).toBe('directive-unreconciled');
+    // A colon is a job scope only for the colon-scoped producers.
+    expect(incidentSubjectOf(row('silas.escalated:j-1'))).toBe('job:j-1');
+    expect(incidentSubjectOf(row('job-stop-unproven:j-1'))).toBe('job:j-1');
+    expect(incidentSubjectOf(row('worktree-sweep-paused:lane:a:pause-1'))).toBe('incident:worktree-sweep-paused:lane:a:pause-1:recovery-owed');
+    expect(incidentBasisOf(row('worktree-sweep-paused:lane:a:pause-1'))).toBe('worktree-sweep-paused:lane:a:pause-1');
+  });
+
+  it('a subject over the decision bound gets one deterministic fitting form', () => {
+    const long = (tag: string) => row(`silas.directive-unreconciled.${'r'.repeat(290)}-${tag}`, `Directive ${'r'.repeat(290)}-${tag}: recovery owed`);
+    const subject = incidentSubjectOf(long('a'));
+    expect(subject.length).toBe(256);
+    expect(subject).toMatch(/^incident:silas\.directive-unreconciled\.r+~[0-9a-f]{64}$/u);
+    expect(validateDecisionSubject(subject)).toBe(subject);
+    expect(incidentSubjectOf(long('a'))).toBe(subject);
+    // Two ids sharing the readable prefix still get distinct subjects.
+    expect(incidentSubjectOf(long('b'))).not.toBe(subject);
+    expect(incidentSubjectOf(long('b')).slice(0, 190)).toBe(subject.slice(0, 190));
+    // An owner-transfer card fits too; a subject within the bound is untouched.
+    const transfer = incidentSubjectOf({ kind: `silas.recovery-owner-transfer.directive.${'r'.repeat(128)}.12`,
+      title: `Reserved owner decision: recovery ${'r'.repeat(128)} (job j)`, routing: 'needs-owner' });
+    expect(transfer.length).toBeLessThanOrEqual(256);
+    expect(validateDecisionSubject(transfer)).toBe(transfer);
+    expect(incidentSubjectOf(row('supervision.turn-orphaned.a2'))).toBe('incident:supervision.turn-orphaned.a2:recovery-owed');
   });
 });

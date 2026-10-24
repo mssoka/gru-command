@@ -1,5 +1,6 @@
 import type { NotificationRecord } from '../ledger/api.js';
-import { isDecisionSignal } from '../ledger/decision-memory.js';
+import { createHash } from 'node:crypto';
+import { DECISION_SUBJECT_MAX_LENGTH, isDecisionSignal } from '../ledger/decision-memory.js';
 
 /**
  * Incident identity for the wake policy (issue #219): one wake per
@@ -74,27 +75,51 @@ export function incidentKeyOf(row: IncidentRow): string {
  * against a machine alert must use the SAME derivation — the awareness
  * layer consults exactly this subject.
  *
- * Job-scoped kinds are colon-scoped (`github.ci-failed:<job>:<sha>`)
- * plus the one dot-scoped producer that names its lane,
- * `silas.rebrief-unreconciled.<job>` — a job hold must defer that row,
- * so it maps to the same job subject. A red default branch is never
- * job-scoped: it maps to
- * `incident:github.default-branch-ci-failed:<owner>/<repo>`.
+ * Job-scoped kinds are the colon-scoped producers (`COLON_SCOPED_HEADS`:
+ * `github.ci-failed:<job>:<sha>`, …) plus the one dot-scoped producer that
+ * names its lane, `silas.rebrief-unreconciled.<job>` — a job hold must
+ * defer that row, so it maps to the same job subject. A red default branch
+ * is never job-scoped: it maps to
+ * `incident:github.default-branch-ci-failed:<owner>/<repo>`. Every subject
+ * fits the decision-subject bound (`fittedSubject`).
  */
 export function incidentSubjectOf(row: IncidentRow): string {
   const defaultBranch = defaultBranchCiScope(row.kind);
-  if (defaultBranch !== null) return `incident:${DEFAULT_BRANCH_CI_FAILED_KIND}:${defaultBranch.repo}`;
+  if (defaultBranch !== null) return fittedSubject(`incident:${DEFAULT_BRANCH_CI_FAILED_KIND}:${defaultBranch.repo}`);
   const rebrief = /^silas\.rebrief-unreconciled\.([^.]+)$/.exec(row.kind);
-  if (rebrief !== null) return `job:${rebrief[1] ?? ''}`;
-  const colon = row.kind.indexOf(':');
-  if (colon > 0 && colon < row.kind.length - 1) {
-    const scope = row.kind.slice(colon + 1);
-    // First `:`-separated segment of the scope is the lane/job id
+  if (rebrief !== null) return fittedSubject(`job:${rebrief[1] ?? ''}`);
+  if (isColonScoped(row.kind)) {
+    // First `:`-separated segment of the scope is the job id
     // (`github.ci-failed:<job>:<sha>`, `github.pr-conflict:<job>`).
-    const jobId = scope.split(':', 1)[0] ?? '';
-    if (jobId !== '') return `job:${jobId}`;
+    const jobId = row.kind.slice(row.kind.indexOf(':') + 1).split(':', 1)[0] ?? '';
+    if (jobId !== '') return fittedSubject(`job:${jobId}`);
   }
-  return `incident:${row.kind}:${normalizeIncidentTitle(row.title)}`;
+  return fittedSubject(`incident:${row.kind}:${normalizeIncidentTitle(row.title)}`);
+}
+
+/** The producer kinds scoped by `:` to a job, `<head>:<job>[:<instance>]`
+ * (#503). A `:` anywhere else — inside a caller-chosen request id in
+ * `silas.directive-unreconciled.<id>`, say — is part of a dot-scoped
+ * instance: it never re-scopes the row to a job or splits its basis. */
+const COLON_SCOPED_HEADS: readonly string[] = [
+  'github.ci-failed', 'github.pr-conflict', 'silas.phase-handback.phase-handoff', 'silas.escalated', 'job-stop-unproven',
+];
+
+function isColonScoped(kind: string): boolean {
+  const colon = kind.indexOf(':');
+  return colon > 0 && colon < kind.length - 1 && COLON_SCOPED_HEADS.includes(kind.slice(0, colon));
+}
+
+/** #503: a subject always fits the decision-subject bound. One over it
+ * keeps a readable prefix and ends `~<sha256 of the whole subject>`, so the
+ * card's mailbox item, the coverage query and a decision recorded on the
+ * item all derive the same exact subject. */
+function fittedSubject(subject: string): string {
+  if (subject.length <= DECISION_SUBJECT_MAX_LENGTH) return subject;
+  const digest = createHash('sha256').update(subject, 'utf8').digest('hex');
+  // Never end the prefix inside a surrogate pair.
+  const prefix = subject.slice(0, DECISION_SUBJECT_MAX_LENGTH - digest.length - 1).replace(/[\uD800-\uDBFF]$/u, '');
+  return `${prefix}~${digest}`;
 }
 
 /** Producer namespaces the signal vocabulary drops (`github.ci-failed` →
@@ -199,7 +224,7 @@ export function incidentBasisOf(row: IncidentRow): string {
   const defaultBranch = defaultBranchCiScope(row.kind);
   if (defaultBranch !== null) return defaultBranch.sha;
   const parts = row.kind.split(':');
-  if (parts.length >= 3 && parts[0] !== '' && parts[2] !== '') return parts.slice(2).join(':');
+  if (isColonScoped(row.kind) && parts.length >= 3 && parts[2] !== '') return parts.slice(2).join(':');
   return incidentKeyOf(row);
 }
 

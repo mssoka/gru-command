@@ -755,43 +755,6 @@ export class AmbiguousDirectiveError extends Error {
   }
 }
 
-/** A NEW directive or re-brief request id outside the safe record-id rule
- * (#503). The id is embedded whole in its recovery card's kind and so in the
- * card's incident subject: a directive card's subject overruns the
- * 256-character decision bound past a 137-character id, and a `:` re-scopes
- * the card to a job. The 128-character bound keeps every new directive card
- * within it (an owner-transfer card can still overrun from about 124; it is
- * needs-owner, never a mailbox item). Stored and reserved ids replay as
- * before. */
-export class DirectiveRequestIdError extends Error {
-  constructor(what: string, value: string) {
-    super(`${what} "${value}" must be a safe request id: 1-128 characters of [A-Za-z0-9._-] starting with a letter or digit (no ":") — choose a new id`);
-    this.name = 'DirectiveRequestIdError';
-  }
-}
-
-/** The Silas current-inspection rule id (`src/dispatch/silas-rules.ts`). */
-const CURRENT_INSPECTION_RULE_ID = 'current-inspection';
-
-/** #503: a current inspection already has a stored request (live or
- * terminal) for this blocker fingerprint: one inspection per historical
- * delivery. Names the stored request, which a pre-#503 caller may have
- * stored under the fingerprint itself. */
-export class CurrentInspectionExistsError extends Error {
-  constructor(readonly blockerFingerprint: string, readonly storedRequestId: string, readonly storedState: string) {
-    super(`current inspection "${blockerFingerprint}" already has request "${storedRequestId}" (${storedState}) — ` +
-      (isDirectiveTerminal(storedState as DirectiveRequestRecord['state'])
-        ? 'it is terminal: the inspection is owed to the chief, never a second request'
-        : `retry that request_id verbatim with the directive and blocker_fingerprint GET /api/silas/directives/${storedRequestId} returns`));
-    this.name = 'CurrentInspectionExistsError';
-  }
-}
-
-/** Refuse an id that would be stored new under the safe record-id rule. */
-function requireNewDirectiveRequestId(value: string, what: string): void {
-  if (!isSafePipelineRecordId(value)) throw new DirectiveRequestIdError(what, value);
-}
-
 /** The phase-handoff row already exists under this request id with a
  * DIFFERENT decision (or a second completion/binding contradicts the
  * recorded one). The durable intent is part of the request identity;
@@ -8443,9 +8406,8 @@ export class LedgerApi {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
     if (input.requestId !== undefined) {
-      this.requireAdmissibleRequestId(input.requestId, input.kind === 'rebrief' ? 're-brief request_id' : 'directive request_id',
-        input.kind === 'rebrief' ? undefined : { jobId: input.jobId, directive: input.directive });
-      const reserved = this.reservedInspectionClosure(input.requestId);
+      const reserved = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed'
+        AND json_extract(payload, '$.inspection_request_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.requestId) as Row | undefined;
       if (reserved !== undefined) {
         const closure = this.eventFromRow(reserved);
         const facts = closure.payload as { inspection_directive: unknown };
@@ -8495,15 +8457,6 @@ export class LedgerApi {
           }
           return { record: existing, created: false }; // durable replay — the accepted request, unchanged
         }
-      }
-      // #503: one current inspection per historical delivery, whatever id a
-      // caller chose (a request stored before #503 used the fingerprint as
-      // its id). Live or terminal, the stored request answers it.
-      if (input.blockerFingerprint !== undefined &&
-          (sourceContext?.ruleId === CURRENT_INSPECTION_RULE_ID || input.blockerFingerprint.startsWith(`${CURRENT_INSPECTION_RULE_ID}:`))) {
-        const stored = this.db.prepare(`SELECT request_id, state FROM pending_directives WHERE job_id = ?
-          AND json_extract(payload, '$.blocker_fingerprint') = ? ORDER BY created_at, rowid LIMIT 1`).get(input.jobId, input.blockerFingerprint) as Row | undefined;
-        if (stored !== undefined) throw new CurrentInspectionExistsError(input.blockerFingerprint, str(stored.request_id), str(stored.state));
       }
       // Fail CLOSED while ANY live request for the job exists: the lane is
       // single-writer, so a DIFFERENT request id must never start a second
@@ -8590,27 +8543,6 @@ export class LedgerApi {
       }
       return { record: this.getDirective(requestId) as DirectiveRequestRecord, created: true };
     });
-  }
-
-  /** #503: a request id about to be stored meets the safe request-id rule,
-   * unless the ledger already holds it: a stored request (a replay), or —
-   * for the exact `directive` it reserves on its own job — an inspection
-   * identity a control closure reserved, possibly before the rule. Any
-   * other route, job or text gets the rule. Throws DirectiveRequestIdError
-   * naming the rule. */
-  requireAdmissibleRequestId(requestId: string, what: string, directive?: { readonly jobId: string; readonly directive: string }): void {
-    if (this.getDirective(requestId) !== null) return;
-    const reserved = directive === undefined ? undefined : this.reservedInspectionClosure(requestId);
-    if (reserved !== undefined) {
-      const closure = this.eventFromRow(reserved);
-      if (closure.jobId === directive!.jobId && (closure.payload as { inspection_directive?: unknown }).inspection_directive === directive!.directive) return;
-    }
-    requireNewDirectiveRequestId(requestId, what);
-  }
-
-  private reservedInspectionClosure(requestId: string): Row | undefined {
-    return this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed'
-      AND json_extract(payload, '$.inspection_request_id') = ? ORDER BY seq DESC LIMIT 1`).get(requestId) as Row | undefined;
   }
 
   beginRebriefIntent(input: { readonly jobId: string; readonly note: string; readonly holder: string; readonly requestId?: string;
@@ -9329,8 +9261,6 @@ export class LedgerApi {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
       if (this.recoveryDecisionHistory('directive', row.requestId).some((entry) => entry.generation === input.generation)) return null;
-      // Before any writer clearance: a successor id is always stored new.
-      requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
       const debt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
       if (debt?.state === 'suspended' || debt?.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch ||
           input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
@@ -9350,7 +9280,6 @@ export class LedgerApi {
       return row.jobId;
     }
     if (this.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return null;
-    requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
     if (!/^[a-f0-9]{64}$/.test(input.expectedReceiptEvidenceSha256)) throw new DirectiveCheckpointError('legacy recovery requires expected_receipt_evidence_sha256 from authenticated readback');
     const marker = this.listPendingRebriefs().find((entry) => entry.id === input.markerId);
     if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
@@ -9388,9 +9317,6 @@ export class LedgerApi {
         if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('legacy rebrief recovery decision conflicts');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
       }
-      if (input.decision.kind === 'successor') requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
-      // The reserved inspection id is first stored here, then later admitted.
-      if (input.decision.kind === 'reconcile-completed') requireNewDirectiveRequestId(input.decision.inspectionRequestId, 'inspection_request_id');
       const marker = this.listPendingRebriefs().find((row) => row.id === input.markerId);
       if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
       const group = this.listPendingRebriefs({ jobId: marker.jobId });
@@ -9513,9 +9439,6 @@ export class LedgerApi {
       if (prior !== undefined) {
         if (prior.fingerprint !== fingerprint && prior.fingerprint !== legacyFingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
-      }
-      if (input.decision.kind === 'successor' || input.decision.kind === 'rebrief-successor') {
-        requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
       }
       const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
       const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind === 'owner-decision' && currentDebt.state === 'suspended') ? currentDebt : null;
@@ -10311,18 +10234,6 @@ export class LedgerApi {
   }
 
   /** True while an unreleased retirement hold fences the job's automation. */
-  /** #503: failed requests on `jobId` answering one digest row — those
-   * carrying its `blockerFingerprint`, or (a verdict rung) its
-   * `sourceRoundId`. The attempt ordinal of the row's next request id is
-   * this count plus one. */
-  countFailedDirectiveRequests(jobId: string, answering: { readonly blockerFingerprint: string } | { readonly sourceRoundId: string }): number {
-    const [column, value] = 'blockerFingerprint' in answering
-      ? ["json_extract(payload, '$.blocker_fingerprint')", answering.blockerFingerprint]
-      : ["json_extract(source_context, '$.sourceRoundId')", answering.sourceRoundId];
-    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM pending_directives WHERE job_id = ? AND state = 'failed' AND ${column} = ?`).get(jobId, value) as Row;
-    return Number(row.n);
-  }
-
   hasOpenDirectiveRecoveryHold(jobId: string): boolean {
     const row = this.db
       .prepare("SELECT 1 AS open FROM pending_directives WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL LIMIT 1")

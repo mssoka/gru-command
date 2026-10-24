@@ -651,18 +651,26 @@ Exactness lives in the subject and the basis. A dot-scoped kind keeps its
 whole kind in the subject (`incident:<kind>:<title>`), so a decision on one
 instance's subject never names another: a family decision on `job:X` never
 reaches a blocked-lane hand-back or a turn-orphaned row (agent-scoped) at
-all. A colon-scoped kind's subject is the segment between its first and
-second `:` (`job:<job>`), shared by every instance on that job, and its
-basis is everything after the second `:` (the head SHA, or `fix:1` for a
-marked phase hand-back), or the whole kind when there is only one `:`. A
-decision pinned to a basis covers that one instance; a null-basis family
-decision on the job covers every instance of the family on the job, as a
-`ci-failed` hold covers every head. A directive request id stored with a
-`:` before the id rule (below) is colon-scoped the same way and is not
-exact: `a:J:3` and `b:J:3` share subject `job:J`, signal and basis `3`; both
-are hard floors, so no hold defers either wake. Hard floors
-(`isHardFloorRow`) match kinds, not signals, so a family hold never defers
-one.
+all. Only the colon-scoped producers (`COLON_SCOPED_HEADS`:
+`github.ci-failed:<job>:<sha>`, `github.pr-conflict:<job>`, the marked
+phase hand-back `silas.phase-handback.phase-handoff:<job>:<source>:<n>`,
+`silas.escalated:<job>`, `job-stop-unproven:<job>`) are job-scoped: the
+subject is `job:<segment after the first :>`, shared by every instance on
+that job, and the basis is everything after the second `:` (the head SHA,
+or `fix:1`), or the whole kind when there is only one `:`. A decision
+pinned to a basis covers that one instance; a null-basis family decision
+on the job covers every instance of the family on the job, as a
+`ci-failed` hold covers every head. A `:` anywhere else — inside a
+caller-chosen request id in `silas.directive-unreconciled.<id>` — is part
+of the dot-scoped instance, so `a:J:3` and `b:J:3` keep distinct exact
+subjects and bases. Hard floors (`isHardFloorRow`) match kinds, not
+signals, so a family hold never defers one.
+
+Every subject fits the 256-character decision-subject bound. One that would
+exceed it (a card whose kind embeds a long request id, an owner-transfer
+card) keeps a readable prefix and ends `~<sha256 of the whole subject>`
+(`fittedSubject`); the card's mailbox item, the coverage query and a
+decision recorded on the item all derive that same exact form.
 
 **Where coverage runs.** Production always wires the Gru mailbox, which owns
 admission for action-required rows: `coveringDecision` never runs for them,
@@ -692,16 +700,11 @@ carrying a changed signal (a directive card, phase hand-back, provider
 wall, turn-orphaned, provider recovery-off or false-recovery reason)
 reopens once as `needs-gru` after the upgrade and wakes Gru once; its
 waiting, delegated or resolved disposition drops and is recorded again at
-the new basis. Its decisions stay listed and clearable.
-
-New directive and re-brief request ids follow the safe record-id rule
-(1-128 characters, no `:`; `docs/DIRECTIVE-RECOVERY.md`). A directive card's
-subject overruns the 256-character subject bound only past a 137-character
-id, so every new directive card fits; a pre-existing id whose card subject
-overruns it cannot be disposed exactly. An owner-transfer card
-(`silas.recovery-owner-transfer.<kind>.<id>.<generation>`) can still overrun
-from about a 124-character id; it is needs-owner, never a mailbox item, and a
-hard floor, so no decision has to name it.
+the new basis. So does every live incident item whose subject changes:
+one whose request id holds a `:` (no longer `job:<segment>`) or whose
+subject was over 256 characters (now fitted). Its disposition's decisions
+name the old subject and stop supporting it; record them again on the
+new subject. Its decisions stay listed and clearable.
 
 **Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
 each appending a `decision.recorded` / `decision.cleared` event in the

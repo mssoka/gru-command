@@ -1,6 +1,6 @@
 import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
-import { DirectiveProgressService, executeAcceptedDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { DirectiveProgressService, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
-import { DirectiveRequestIdError, LedgerApi, type DirectiveRequestRecord, type JobRecord } from '../src/ledger/api.js';
+import { LedgerApi, type DirectiveRequestRecord, type JobRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { loadConfig, DEFAULT_SILAS_CONFIG, DEFAULT_PROVIDER_RECOVERY_CONFIG, type Role } from '../src/config.js';
@@ -2220,55 +2220,6 @@ describe('legacy proven completion without fabricated historical delivery', () =
     return { h, lane, jobId, markers, marker, original, debt, route, body };
   }
 
-  /** #503: an inspection id reserved before the id rule (with a ':' or over
-   * 128 characters) is still admitted under its exact inspection directive
-   * and discharges its current-inspection debt over HTTP. */
-  async function reservedBeforeRule(reserved: string): Promise<void> {
-    const f = await completedFixture(); const { h } = f;
-    expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
-    const audit = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
-    // The reservation as a pre-rule ledger recorded it.
-    h.db.handle.prepare("UPDATE events SET payload = json_set(payload, '$.inspection_request_id', ?) WHERE seq = ?").run(reserved, audit.seq);
-    const debt = h.ledger.listObligations({ jobId: f.jobId }).find((row) => row.incidentKey === `rebrief-current-inspection:${f.marker.id}`)!;
-    expect(debt.state).toBe('open');
-    const instruction = (audit.payload as { inspection_directive: string }).inspection_directive;
-    // The exemption is the directive route's, for the reservation's own job and exact text only.
-    seedJob(h, 'other-inspection-job');
-    for (const [path, body] of [['/api/silas/rebrief', { job_id: f.jobId, note: instruction }], ['/api/silas/directive', { job_id: 'other-inspection-job', directive: instruction }],
-      ['/api/silas/directive', { job_id: f.jobId, directive: `${instruction} (rewritten)` }]] as const) {
-      const refused = await call(h.port, 'POST', path, { ...body, request_id: reserved }, TOKEN);
-      expect(refused.status, `${path} ${body.job_id}`).toBe(400);
-      expect(refused.json).toMatchObject({ error: 'invalid_request_id' });
-    }
-    expect(h.ledger.getDirective(reserved)).toBeNull();
-    const admitted = await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: reserved, directive: instruction }, TOKEN);
-    expect(admitted.status, JSON.stringify(admitted.json)).toBe(202);
-    await waitFor(() => h.ledger.getDirective(reserved)?.state === 'settled', 'reserved pre-rule inspection');
-    expect(h.ledger.getObligation(debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'superseded' } });
-    expect(h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-current-gates-owed')?.payload).toMatchObject({ inspection_request_id: reserved });
-    // Only the reservation is exempt: an unreserved id of the same shape is still refused.
-    const other = await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: `${reserved}x`, directive: instruction }, TOKEN);
-    expect(other.status).toBe(400);
-    expect(other.json).toMatchObject({ error: 'invalid_request_id' });
-  }
-  it('#503 an inspection id reserved before the rule with a colon is admitted and discharges its debt', () => reservedBeforeRule('inspect:completed-control-job:1'));
-  it('#503 an inspection id reserved before the rule over 128 characters is admitted and discharges its debt', () => reservedBeforeRule(`i${'x'.repeat(140)}`));
-
-  it('#503 legacy rebrief successor and new inspection ids are refused with 400 over HTTP and change nothing', async () => {
-    const f = await completedFixture(); const { h } = f;
-    const watermark = h.ledger.latestEventSeq();
-    const markers = h.ledger.listPendingRebriefs({ jobId: f.jobId });
-    for (const decision of [{ kind: 'successor', request_id: 'recover:completed-control-job:1', directive: 'finish' },
-      { kind: 'reconcile-completed', inspection_request_id: `i${'x'.repeat(128)}` }]) {
-      const refused = await call(h.port, 'POST', `${f.route}/recover`, { ...f.body(), decision }, TOKEN);
-      expect(refused.status, decision.kind).toBe(400);
-      expect(refused.json).toMatchObject({ error: 'invalid_request_id', detail: expect.stringMatching(/must be a safe request id/u) });
-    }
-    expect(h.ledger.latestEventSeq()).toBe(watermark);
-    expect(h.ledger.listPendingRebriefs({ jobId: f.jobId })).toEqual(markers);
-    expect(h.ledger.getObligation(f.debt.id)?.state).toBe('open');
-  });
-
   it('PR334 recovery completed legacy closure cannot bypass a generically closed transferred owner', async () => {
     const f = await completedFixture(); const { h } = f;
     h.ledger.setJobStatus(f.jobId, 'parked');
@@ -2744,21 +2695,9 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     expect(h.ledger.latestEventSeq()).toBe(events); expect(minionSpawns(h)).toHaveLength(before + 1);
   });
 
-  /** #503: a request id stored before the id rule. The rule refuses it as a
-   * new id, so the fixture writes the request under a safe id and renames it
-   * in place before anything else names it — the row, its intent event and
-   * any hold it released — as a pre-rule ledger held it. */
-  function storedBeforeRule(h: Harness, safeId: string, storedId: string): DirectiveRequestRecord {
-    h.db.handle.prepare('UPDATE pending_directives SET request_id = ? WHERE request_id = ?').run(storedId, safeId);
-    h.db.handle.prepare('UPDATE pending_directives SET hold_released_by = ? WHERE hold_released_by = ?').run(storedId, safeId);
-    h.db.handle.prepare("UPDATE events SET payload = json_set(payload, '$.request_id', ?) WHERE json_extract(payload, '$.request_id') = ?").run(storedId, safeId);
-    return h.ledger.getDirective(storedId)!;
-  }
-
   /** The live case: `revision-continuation:rt-agencies-motion:3` accepted at
    * revision 3, stuck in dispatching (never admitted), retired, then the
-   * work done by a separate fresh-session rebrief. Both production ids carry
-   * a ':', stored before the #503 id rule, and still answer through /recover. */
+   * work done by a separate fresh-session rebrief. */
   async function orphanedRetirement(name: string) {
     const h = await boot(); const repo = makeFixtureRepo(name); cleanupRepos.push(repo);
     const jobId = 'rt-agencies-motion'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
@@ -2771,14 +2710,8 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     // An earlier request that really ran, before the stuck one was accepted.
     expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, directive: 'earlier approved slice', request_id: 'earlier-directive' }, TOKEN)).status).toBe(202);
     await waitFor(() => h.ledger.getDirective('earlier-directive')?.state === 'settled', 'the earlier directive to settle');
-    const stuck = storedBeforeRule(h, h.ledger.beginDirectiveIntent({ jobId, requestId: 'stuck-before-rename', directive: 'continue revision 3', holder: 'gru' }).record.requestId,
-      'revision-continuation:rt-agencies-motion:3');
+    const stuck = h.ledger.beginDirectiveIntent({ jobId, requestId: 'revision-continuation:rt-agencies-motion:3', directive: 'continue revision 3', holder: 'gru' }).record;
     expect(stuck.workRevision).toBe(3);
-    // An HTTP replay of the stored ':' id starts nothing.
-    const replay = await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, request_id: stuck.requestId, directive: 'continue revision 3' }, TOKEN);
-    expect(replay.status, JSON.stringify(replay.json)).toBe(202);
-    expect(replay.json).toMatchObject({ request_id: stuck.requestId, replay: true });
-    expect(h.ledger.getDirective(stuck.requestId)).toEqual(stuck);
     surfaceDirectiveRecovery({ ledger: h.ledger, notifications: h.notifications }, stuck.requestId, 'accepted, never admitted: no native target, binding or minion');
     const debt = h.ledger.recoveryObligation(jobId, 'directive', stuck.requestId)!;
     expect(debt.id).toBe('rt-agencies-motion:operation:directive-recovery:revision-continuation:rt-agencies-motion:3');
@@ -2790,21 +2723,8 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
       expected_head: laneHead(lane), expected_epoch: h.ledger.directiveRecoveryEpoch(jobId),
       reason: 'the retired request\'s approved work was completed by a later fresh-session rebrief',
       decision: { kind: 'reconcile-admitted', admitted_request_id: admittedRequestId } });
-    const note = 'finish revision 3 in a fresh session';
     const rebrief = async (requestId: string) => {
-      if (requestId.includes(':')) {
-        storedBeforeRule(h, h.ledger.beginRebriefIntent({ jobId, note, holder: 'silas-ops', requestId: 'rebrief-before-rename' }).record.requestId, requestId);
-        // The rebrief route replays the stored ':' id and starts nothing; the
-        // fixture then runs the accepted request directly (no producer
-        // blockers here), standing in for the service's reconcile pass.
-        const replayed = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note, request_id: requestId }, TOKEN);
-        expect(replayed.status, JSON.stringify(replayed.json)).toBe(202);
-        expect(replayed.json).toMatchObject({ request_id: requestId, replay: true });
-        await executeAcceptedDirective({ ledger: h.ledger, registry: h.registry, worktrees: h.worktrees, notifications: h.notifications,
-          signal: new AbortController().signal, pendingProducerBlockers: () => [], clearLaneForWriter: (input) => h.wave.clearLaneForWriter(input) }, requestId);
-      } else {
-        expect((await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note, request_id: requestId }, TOKEN)).status).toBe(202);
-      }
+      expect((await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'finish revision 3 in a fresh session', request_id: requestId }, TOKEN)).status).toBe(202);
       await waitFor(() => h.ledger.getDirective(requestId)?.state === 'settled', `rebrief ${requestId} to settle`);
       return h.ledger.getDirective(requestId)!;
     };
@@ -2867,41 +2787,6 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     expect(readback.json).toMatchObject({ state: 'retired', recovery_decision: { successorId: null, eventSeq: decision.seq } });
   });
 
-  it('#503 one current inspection per delivery: a second request with the fingerprint is refused naming the stored one, which replays verbatim', async () => {
-    const h = await boot(); const repo = makeFixtureRepo('one-inspection'); cleanupRepos.push(repo);
-    const jobId = 'inspected-job'; seedJob(h, jobId); await seedLane(h, repo, jobId);
-    const fingerprint = `current-inspection:${jobId}:41`;
-    const directive = 'Deliver your current candidate';
-    const body = (requestId: string, seq = 41) => ({ job_id: jobId, directive, blocker_fingerprint: `current-inspection:${jobId}:${seq}`,
-      rule_id: 'current-inspection', request_id: requestId });
-    // A request stored before #503 under the fingerprint itself.
-    const stored = storedBeforeRule(h, h.ledger.beginDirectiveIntent({ jobId, requestId: 'inspection-before-rename', directive, blockerFingerprint: fingerprint,
-      sourceContext: { ruleId: 'current-inspection' }, holder: 'silas-ops' }).record.requestId, fingerprint);
-    const readback = await call(h.port, 'GET', `/api/silas/directives/${encodeURIComponent(stored.requestId)}`, undefined, TOKEN);
-    expect(readback.json).toMatchObject({ request_id: fingerprint, directive, blocker_fingerprint: fingerprint });
-    const second = await call(h.port, 'POST', '/api/silas/directive', body('current-inspection-41'), TOKEN);
-    expect(second.status).toBe(409);
-    expect(second.json).toMatchObject({ error: 'inspection_exists', stored_request_id: fingerprint, stored_state: 'dispatching' });
-    expect(h.ledger.getDirective('current-inspection-41')).toBeNull();
-    // The fingerprint alone names an inspection, with or without its rule id.
-    const { rule_id: _rule, ...unruled } = body('current-inspection-41');
-    expect((await call(h.port, 'POST', '/api/silas/directive', unruled, TOKEN)).json).toMatchObject({ error: 'inspection_exists', stored_request_id: fingerprint });
-    // Resent verbatim from the readback, the stored request replays and starts nothing.
-    const replay = await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, directive: field<string>(readback.json, 'directive'),
-      blocker_fingerprint: field<string>(readback.json, 'blocker_fingerprint'), rule_id: 'current-inspection', request_id: fingerprint }, TOKEN);
-    expect(replay.status, JSON.stringify(replay.json)).toBe(202);
-    expect(replay.json).toMatchObject({ request_id: fingerprint, replay: true });
-    // Terminal, it is owed to the chief: still refused, never a second inspection.
-    h.ledger.failDirective({ requestId: fingerprint, reason: 'fixture: positively never dispatched' });
-    const terminal = await call(h.port, 'POST', '/api/silas/directive', body('current-inspection-41'), TOKEN);
-    expect(terminal.status).toBe(409);
-    expect(terminal.json).toMatchObject({ error: 'inspection_exists', stored_request_id: fingerprint, stored_state: 'failed',
-      detail: expect.stringContaining('owed to the chief') });
-    // Another historical delivery is another inspection.
-    expect((await call(h.port, 'POST', '/api/silas/directive', body('current-inspection-42', 42), TOKEN)).status).toBe(202);
-    await waitFor(() => h.ledger.getDirective('current-inspection-42')?.state === 'settled', 'the next inspection');
-  });
-
   it('orphan settlement refuses a later admission that carries a lower work revision', async () => {
     const { h, jobId, amendments, stuck, debt, retireStuck, body, rebrief } = await orphanedRetirement('orphan-lower-revision');
     await retireStuck();
@@ -2909,7 +2794,7 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     expect(h.ledger.addJobAmendment({ jobId, body: 'Revision 3 requirement withdrawn.', supersedes: [`amendment:${amendments[2]!.id}`],
       approval: { by: 'owner', reference: 'PR #769 withdrawal' }, effect: 'administrative',
       expectedContractSha256: h.ledger.directiveCurrentAuthority(jobId).contractSha256 }).status).toBe('accepted');
-    const admitted = await rebrief('rebrief-rt-agencies-motion-rev2-fresh-session');
+    const admitted = await rebrief('rebrief:rt-agencies-motion:rev2-fresh-session');
     expect(admitted.workRevision).toBe(2);
     const before = h.ledger.latestEventSeq();
     const refused = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);
@@ -2920,99 +2805,5 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     const claimed = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);
     expect(claimed.status).toBe(409); expect(field<string>(claimed.json, 'detail')).toMatch(/claimed by request claiming-request/u);
     expect(h.ledger.getObligation(debt.id)?.state).toBe('open');
-  });
-});
-
-describe('new directive and re-brief request ids follow the safe request-id rule (#503)', () => {
-  const tooLong = `r${'x'.repeat(128)}`;
-  const longest = `r${'x'.repeat(127)}`;
-  const rule = /must be a safe request id: 1-128 characters of \[A-Za-z0-9._-\] starting with a letter or digit \(no ":"\)/u;
-
-  it('the ledger refuses a too-long, a colon and an empty new id by name and stores nothing', async () => {
-    const h = await boot();
-    seedJob(h, 'id-job');
-    const watermark = h.ledger.latestEventSeq();
-    for (const requestId of [tooLong, 'revision-continuation:id-job:3', '']) {
-      expect(() => h.ledger.beginDirectiveIntent({ jobId: 'id-job', directive: 'work', holder: 'silas-ops', requestId }), requestId)
-        .toThrow(DirectiveRequestIdError);
-      expect(() => h.ledger.beginRebriefIntent({ jobId: 'id-job', note: 'work', holder: 'silas-ops', requestId }), requestId).toThrow(rule);
-    }
-    expect(h.ledger.listPendingDirectives({ jobId: 'id-job' })).toEqual([]);
-    expect(h.ledger.latestEventSeq()).toBe(watermark);
-    expect(longest).toHaveLength(128);
-    expect(h.ledger.beginDirectiveIntent({ jobId: 'id-job', directive: 'work', holder: 'silas-ops', requestId: longest }).created).toBe(true);
-  });
-
-  it('a request id stored before the rule replays as before', async () => {
-    const h = await boot();
-    seedJob(h, 'legacy-id-job');
-    const accepted = h.ledger.beginDirectiveIntent({ jobId: 'legacy-id-job', directive: 'work', holder: 'silas-ops', requestId: 'stored-before-rule' }).record;
-    // The production shape a pre-rule caller chose; no migration rewrites it.
-    const legacy = 'revision-continuation:legacy-id-job:3';
-    h.db.handle.prepare('UPDATE pending_directives SET request_id = ? WHERE request_id = ?').run(legacy, accepted.requestId);
-    const replay = h.ledger.beginDirectiveIntent({ jobId: 'legacy-id-job', directive: 'work', holder: 'silas-ops', requestId: legacy });
-    expect(replay.created).toBe(false);
-    expect(replay.record).toEqual({ ...accepted, requestId: legacy });
-  });
-
-  it('the HTTP directive and re-brief routes answer 400 naming the rule before any lane gate', async () => {
-    const h = await boot();
-    seedJob(h, 'http-id-job');
-    const gate = vi.spyOn(h.wave, 'assertWriterAdmissible');
-    for (const [path, body] of [['/api/silas/directive', { directive: 'work' }], ['/api/silas/rebrief', { note: 'work' }]] as const) {
-      for (const requestId of [tooLong, 'recover:http-id-job:continue-1']) {
-        const refused = await call(h.port, 'POST', path, { job_id: 'http-id-job', ...body, request_id: requestId }, TOKEN);
-        expect(refused.status, `${path} ${requestId}`).toBe(400);
-        expect(refused.json).toMatchObject({ error: 'invalid_request_id', detail: expect.stringMatching(rule) });
-      }
-      // A present request_id is explicit identity: never silently replaced by a minted id.
-      for (const blank of ['', '   ', null, 7]) {
-        const refused = await call(h.port, 'POST', path, { job_id: 'http-id-job', ...body, request_id: blank }, TOKEN);
-        expect(refused.status, `${path} ${JSON.stringify(blank)}`).toBe(400);
-        expect(refused.json).toMatchObject({ error: 'bad_request', detail: expect.stringContaining('request_id must be a non-empty string') });
-      }
-    }
-    expect(gate).not.toHaveBeenCalled();
-    expect(h.ledger.listPendingDirectives({ jobId: 'http-id-job' })).toEqual([]);
-    gate.mockRestore();
-  });
-
-  it('recovery successor ids are refused with 400 before any writer clearance or retirement', async () => {
-    const repo = makeFixtureRepo('safe-successor-id'); cleanupRepos.push(repo);
-    const h = await boot();
-    const { lane, row } = await seededLiveRequest(h, repo, 'successor-id-job', 'successor-id-original');
-    const clearance = vi.spyOn(h.wave, 'clearLaneForWriter');
-    const watermark = h.ledger.latestEventSeq();
-    const recover = (decision: Record<string, unknown>) => call(h.port, 'POST', `/api/silas/directives/${row.requestId}/recover`, {
-      by: 'gru', expected_generation: 1, expected_epoch: 0, expected_payload_hash: row.payloadHash, expected_head: laneHead(lane),
-      expected_work_revision: 0, expected_contract_sha256: '0'.repeat(64), reason: 'finish approved scope', decision }, TOKEN);
-    const decisions = [{ kind: 'successor', request_id: 'recover:successor-id-job:1', directive: 'finish' },
-      { kind: 'rebrief-successor', request_id: tooLong, note: 'finish' }];
-    // Without and then with an active review the successor would first clear.
-    for (const reviewing of [false, true]) {
-      const active = vi.spyOn(h.wave, 'activeReview').mockReturnValue(reviewing ? { roundIds: ['obsolete-round'], operations: 1 } : null);
-      for (const decision of decisions) {
-        const refused = await recover(decision);
-        expect(refused.status, `${String(reviewing)} ${decision.kind}`).toBe(400);
-        expect(refused.json).toMatchObject({ error: 'invalid_request_id', detail: expect.stringMatching(rule) });
-      }
-      active.mockRestore();
-    }
-    expect(clearance).not.toHaveBeenCalled();
-    expect(h.ledger.latestEventSeq()).toBe(watermark);
-    expect(h.ledger.getDirective(row.requestId)).toEqual(row);
-    clearance.mockRestore();
-  });
-
-  it('legacy rebrief successor and reserved inspection ids are refused by name before any marker work', async () => {
-    const h = await boot();
-    const base = { markerId: 'no-such-marker', generation: 1, expectedPayloadHash: 'hash', expectedHead: 'head', expectedEpoch: 0,
-      expectedReceiptEvidenceSha256: 'a'.repeat(64), lane: { id: 'lane', resolvedHead: 'head' }, reason: 'finish' };
-    expect(() => h.ledger.consumeRebriefRecoveryDecision({ ...base, decision: { kind: 'successor', requestId: tooLong, directive: 'finish' } }))
-      .toThrow(DirectiveRequestIdError);
-    expect(() => h.ledger.consumeRebriefRecoveryDecision({ ...base, decision: { kind: 'reconcile-completed', inspectionRequestId: 'inspect:job:1' } }))
-      .toThrow(/inspection_request_id "inspect:job:1" must be a safe request id/u);
-    expect(() => h.ledger.validateRecoverySuccessorBeforeWriterClearance({ ...base, subjectKind: 'rebrief',
-      decision: { kind: 'successor', requestId: 'recover:job:1', directive: 'finish' } })).toThrow(DirectiveRequestIdError);
   });
 });

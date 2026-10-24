@@ -844,9 +844,7 @@ describe('the Silas digest owes ONE continuation while a revision is pending', (
     const pending = await digest();
     expect(pending.prWithoutReview).toEqual([]);
     expect(pending.revisionContinuations).toEqual([
-      { jobId: 'job-d', repo: 'r', requiredRevision: 3, deliveredRevision: 0, pendingVersions: [1, 3],
-        triggerSeq: ledger.listJobEventsByKinds('job-d', ['job.amendment-accepted']).find((event) => (event.payload as { version?: unknown }).version === 3)!.seq,
-        failedAttempts: 0 },
+      { jobId: 'job-d', repo: 'r', requiredRevision: 3, deliveredRevision: 0, pendingVersions: [1, 3] },
     ]);
     ledger.beginDirectiveIntent({ jobId: 'job-d', directive: 'implement revision 3', holder: 'silas-ops', requestId: 'cont-1' });
     expect((await digest()).revisionContinuations).toEqual([]);

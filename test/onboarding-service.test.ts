@@ -19,15 +19,12 @@ import { createOnboardingServer } from '../src/onboarding/server.js';
 import {
   ONBOARDING_DISPATCH_FAILED_KIND,
   ONBOARDING_DISPATCHED_KIND,
-  ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS,
   ONBOARDING_PROPOSAL_KIND,
   ONBOARDING_RECONCILE_INTERVAL_MS,
   OnboardingRefusal,
   OnboardingService,
-  onboardingProofDirectiveId,
   type OnboardingDispatchInput,
 } from '../src/onboarding/service.js';
-import { isSafePipelineRecordId } from '../src/ledger/pipeline.js';
 
 /**
  * Onboarding heists (#427): scan, cards, decisions, consent and dispatch.
@@ -636,17 +633,6 @@ describe('autonomous mode, boot path and briefing (#427)', () => {
     }
     expect(onboardingRepoKey('a..b')).toMatch(/^a-b-[0-9a-f]{10}$/u);
     expect(onboardingRepoKey('app.lock')).toMatch(/^app-[0-9a-f]{10}$/u);
-  });
-
-  it('#503 the proof directive request id meets the safe request-id rule at its longest', () => {
-    const head = 'f'.repeat(40);
-    // The longest verbatim key (80), a slugged long name, and an odd name.
-    for (const repo of ['a'.repeat(80), `${'Long Repo Name '.repeat(12)}✓`, 'Swift App ✓']) {
-      for (const jobAttempt of [1, 99_999]) {
-        const id = onboardingProofDirectiveId(onboardingJobId(repo, jobAttempt), head, ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS);
-        expect(isSafePipelineRecordId(id), id).toBe(true);
-      }
-    }
   });
 
   it('the briefing names no language or tool and tells the minion where to look, what to write and what to open', () => {

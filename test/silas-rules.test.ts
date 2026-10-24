@@ -8,7 +8,6 @@ import {
   SILAS_RULES,
   SILAS_RULE_IDS,
 } from '../src/dispatch/silas-rules.js';
-import { isSafePipelineRecordId } from '../src/ledger/pipeline.js';
 
 /**
  * The named-rule registry (issue #117, review finding g21): the promise
@@ -131,37 +130,5 @@ describe('parseSilasActionRuleId (request-boundary validation)', () => {
 
   it('a gate id is never requestable as an action rule (gates fire as refusals)', () => {
     expect(() => parseSilasActionRuleId('freeze-r1')).toThrow(/gate, not an action rule/);
-  });
-});
-
-describe('prescribed request ids (#503)', () => {
-  // A request id is seeded by a ledger-wide event seq and an attempt ordinal
-  // (or a recovery generation), never a per-job number or a job id.
-  const LEDGER_WIDE = /^(?:triggerSeq|seq|historicalDeliverySeq|firstOriginSeq|recovery_obligation\.firstOriginSeq)$/u;
-  const ORDINAL = /^(?:n|generation|expected_generation)$/u;
-  const placeholders = (template: string): readonly string[] => [...template.matchAll(/<([^>]+)>/gu)].map((match) => match[1]!);
-  // Worst-case instantiation: the largest seq and ordinal; anything else a
-  // 128-character id.
-  const instantiate = (template: string): string => template.replace(/<([^>]+)>/gu, (_whole, name: string) =>
-    LEDGER_WIDE.test(name) || ORDINAL.test(name) ? String(Number.MAX_SAFE_INTEGER) : `j${'x'.repeat(127)}`);
-  const ROLE_PATHS = ['gru.md', 'silas.md'].map((name) => join(import.meta.dirname, '..', 'roles', name));
-
-  it('every request_id the rule registry, the ops skill and the roles prescribe is ledger-wide, carries an attempt ordinal and fits at its longest', () => {
-    const fromRules = SILAS_RULES.flatMap((rule) => [...rule.summary.matchAll(/request_id (\S+)/gu)].map((match) => match[1]!));
-    expect(fromRules).toEqual(['current-inspection-<historicalDeliverySeq>']);
-    const documents = [SKILL_PATH, ...ROLE_PATHS].map((path) => readFileSync(path, 'utf8'));
-    // JSON request bodies, and the prose id examples (backticked, by GC's id prefixes).
-    const fromJson = documents.flatMap((text) => [...text.matchAll(/"(?:inspection_)?request_id": ?"([^"]+)"/gu)].map((match) => match[1]!));
-    const fromProse = documents.flatMap((text) => [...text.matchAll(/`((?:revision-continuation|rebrief|recover|current-inspection|verdict-rung-directive|verdict-rung-rebrief|pr-conflict-rebase|verification-repair|<rule_id>)[-:][^`\s]*)`/gu)].map((match) => match[1]!));
-    expect(fromJson.length).toBeGreaterThan(0);
-    expect(fromProse.length).toBeGreaterThan(0);
-    for (const template of [...fromRules, ...fromJson, ...fromProse]) {
-      const names = placeholders(template).filter((name) => name !== 'rule_id');
-      expect(names.length, template).toBeGreaterThan(0);
-      for (const name of names) expect(LEDGER_WIDE.test(name) || ORDINAL.test(name), `${template}: <${name}>`).toBe(true);
-      // One inspection per delivery takes no ordinal (a failed one is owed to the chief).
-      if (!template.startsWith('current-inspection-')) expect(ORDINAL.test(names.at(-1)!), `${template}: attempt ordinal`).toBe(true);
-      expect(isSafePipelineRecordId(instantiate(template.replace('<rule_id>', 'verdict-rung-directive'))), template).toBe(true);
-    }
   });
 });
