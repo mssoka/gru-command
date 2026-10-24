@@ -119,8 +119,8 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
       'stalledWorking, minionErrors or verificationFailures row is published for the job)',
     receipt: ['silas.directive-sent'],
     summary:
-      'Inspect the lane head read-only, then ONE directive with blocker_fingerprint and request_id ' +
-      'current-inspection:<job>:<historicalDeliverySeq> asking the minion to deliver its current candidate; the receipt ' +
+      'Inspect the lane head read-only, then ONE directive with blocker_fingerprint current-inspection:<job>:<historicalDeliverySeq> ' +
+      'and request_id current-inspection-<historicalDeliverySeq> asking the minion to deliver its current candidate; the receipt ' +
       'carries rule_id. Review stays fenced throughout.',
   },
   {

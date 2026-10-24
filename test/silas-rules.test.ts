@@ -8,6 +8,7 @@ import {
   SILAS_RULES,
   SILAS_RULE_IDS,
 } from '../src/dispatch/silas-rules.js';
+import { isSafePipelineRecordId } from '../src/ledger/pipeline.js';
 
 /**
  * The named-rule registry (issue #117, review finding g21): the promise
@@ -130,5 +131,20 @@ describe('parseSilasActionRuleId (request-boundary validation)', () => {
 
   it('a gate id is never requestable as an action rule (gates fire as refusals)', () => {
     expect(() => parseSilasActionRuleId('freeze-r1')).toThrow(/gate, not an action rule/);
+  });
+});
+
+describe('prescribed request ids (#503)', () => {
+  // Placeholders take a worst-case-shaped sample: a job id and an event seq.
+  const instantiate = (template: string): string => template.replace(/<[^>]+>/gu, (name) => (/seq/iu.test(name) ? '9007199254740991' : 'rt-655-sept-guidance-corrections'));
+
+  it('every request_id the rule registry and the ops skill prescribe meets the safe request-id rule', () => {
+    const fromRules = SILAS_RULES.flatMap((rule) => [...rule.summary.matchAll(/request_id (\S+)/gu)].map((match) => match[1]!));
+    const fromSkill = [...readFileSync(SKILL_PATH, 'utf8').matchAll(/"request_id":"([^"]+)"/gu)].map((match) => match[1]!);
+    expect(fromRules).toEqual(['current-inspection-<historicalDeliverySeq>']);
+    expect(fromSkill.length).toBeGreaterThan(0);
+    for (const template of [...fromRules, ...fromSkill]) {
+      expect(isSafePipelineRecordId(instantiate(template)), template).toBe(true);
+    }
   });
 });

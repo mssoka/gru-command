@@ -1693,6 +1693,23 @@ describe('board server — id-bearing incident signal families (issue #503)', ()
     } finally { await harness.close(); }
   });
 
+  it('a 128-character request id, the longest the rule admits, disposes its directive card exactly end to end', async () => {
+    const harness = await boot(token);
+    try {
+      const request = `r${'x'.repeat(127)}`;
+      const card = surface(harness, 'longest-job', request, 'native admission unproven after restart');
+      const item = await itemFor(harness, card.id);
+      expect(item.subject).toContain(request);
+      expect(item.subject.length).toBeLessThanOrEqual(256);
+      const written = await postJson(harness.port, '/api/decisions', token, acted(item, 'longest-attention'));
+      expect(written.status).toBe(201);
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, token,
+        resolution(item, written.body as DecisionRecord));
+      expect(resolved.status).toBe(200);
+      expect(await itemFor(harness, card.id)).toMatchObject({ basis: item.basis, state: 'resolved' });
+    } finally { await harness.close(); }
+  });
+
   it('a family decision for one directive never resolves another instance of the family', async () => {
     const harness = await boot(token);
     try {

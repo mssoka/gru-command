@@ -474,6 +474,21 @@ Concrete routine Gru judgment uses
 }
 ```
 
+Every NEW request id — a directive or re-brief `request_id`, a successor's,
+or a reserved `inspection_request_id` — is 1-128 characters of
+`[A-Za-z0-9._-]` starting with a letter or digit, with no `:` (the safe
+record-id rule, #503). Anything else is refused by name
+(`DirectiveRequestIdError`, HTTP 400 naming the rule) before any lane gate,
+writer clearance or recovery check. The id is embedded whole in its
+recovery card's kind and so in the card's `incident:` decision subject: the
+bound keeps that subject within the 256-character decision limit, and the
+`:` ban keeps a card from being scoped to a job. Ids stored before the rule
+read and replay as before (no migration). A pre-existing id long enough
+that its card's subject overruns the limit (over about 137 characters for a
+directive card) cannot be disposed exactly through `POST /api/decisions`,
+and a pre-existing id with a `:` keeps its card scoped to `job:<text after
+the first :>`; such debt still answers through its recovery endpoint.
+
 The service proves cessation and atomically retires only that exact
 request and accepts the named fresh successor. Retirement itself grants
 no authority. The old recovery debt settles on **actual successor native

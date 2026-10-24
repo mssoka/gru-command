@@ -649,7 +649,10 @@ covering. Mailbox items need no such alias: an item's basis hashes its
 reason signals, so an item carrying a family reason has a new basis and no
 pre-#503 exact-basis decision matches it. A live item with such a reason
 reopens once as `needs-gru` after the upgrade; its decisions stay listed
-and clearable.
+and clearable. New directive and re-brief request ids follow the safe
+record-id rule (1-128 characters, no `:`; `docs/DIRECTIVE-RECOVERY.md`), so
+a new recovery card's subject always fits the 256-character subject bound;
+a pre-existing id whose card subject overruns it cannot be disposed exactly.
 
 **Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
 each appending a `decision.recorded` / `decision.cleared` event in the

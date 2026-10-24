@@ -753,6 +753,22 @@ export class AmbiguousDirectiveError extends Error {
   }
 }
 
+/** A NEW directive or re-brief request id outside the safe record-id rule
+ * (#503). The id is embedded whole in the recovery card's kind and so in its
+ * incident subject: past 128 characters that subject overruns the decision
+ * bound, and a `:` re-scopes it to a job. Stored ids replay as before. */
+export class DirectiveRequestIdError extends Error {
+  constructor(what: string, value: string) {
+    super(`${what} "${value}" must be a safe request id: 1-128 characters of [A-Za-z0-9._-] starting with a letter or digit (no ":") — choose a new id`);
+    this.name = 'DirectiveRequestIdError';
+  }
+}
+
+/** Refuse an id that would be stored new under the safe record-id rule. */
+export function requireNewDirectiveRequestId(value: string, what: string): void {
+  if (!isSafePipelineRecordId(value)) throw new DirectiveRequestIdError(what, value);
+}
+
 /** The phase-handoff row already exists under this request id with a
  * DIFFERENT decision (or a second completion/binding contradicts the
  * recorded one). The durable intent is part of the request identity;
@@ -8403,6 +8419,10 @@ export class LedgerApi {
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
+    // A stored request replays as before; only a new id meets the bound.
+    if (input.requestId !== undefined && this.getDirective(input.requestId) === null) {
+      requireNewDirectiveRequestId(input.requestId, input.kind === 'rebrief' ? 're-brief request_id' : 'directive request_id');
+    }
     if (input.requestId !== undefined) {
       const reserved = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed'
         AND json_extract(payload, '$.inspection_request_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.requestId) as Row | undefined;
@@ -9259,6 +9279,8 @@ export class LedgerApi {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
       if (this.recoveryDecisionHistory('directive', row.requestId).some((entry) => entry.generation === input.generation)) return null;
+      // Before any writer clearance: a successor id is always stored new.
+      requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
       const debt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
       if (debt?.state === 'suspended' || debt?.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch ||
           input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
@@ -9278,6 +9300,7 @@ export class LedgerApi {
       return row.jobId;
     }
     if (this.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return null;
+    requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
     if (!/^[a-f0-9]{64}$/.test(input.expectedReceiptEvidenceSha256)) throw new DirectiveCheckpointError('legacy recovery requires expected_receipt_evidence_sha256 from authenticated readback');
     const marker = this.listPendingRebriefs().find((entry) => entry.id === input.markerId);
     if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
@@ -9315,6 +9338,9 @@ export class LedgerApi {
         if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('legacy rebrief recovery decision conflicts');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
       }
+      if (input.decision.kind === 'successor') requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
+      // The reserved inspection id is first stored here, then later admitted.
+      if (input.decision.kind === 'reconcile-completed') requireNewDirectiveRequestId(input.decision.inspectionRequestId, 'inspection_request_id');
       const marker = this.listPendingRebriefs().find((row) => row.id === input.markerId);
       if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
       const group = this.listPendingRebriefs({ jobId: marker.jobId });
@@ -9437,6 +9463,9 @@ export class LedgerApi {
       if (prior !== undefined) {
         if (prior.fingerprint !== fingerprint && prior.fingerprint !== legacyFingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
+      }
+      if (input.decision.kind === 'successor' || input.decision.kind === 'rebrief-successor') {
+        requireNewDirectiveRequestId(input.decision.requestId, 'successor request_id');
       }
       const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
       const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind === 'owner-decision' && currentDebt.state === 'suspended') ? currentDebt : null;
