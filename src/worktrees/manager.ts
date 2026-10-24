@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
+import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, pendingLaneHandoffPublished, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
 import { CreationIntentError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1695,8 +1695,10 @@ export class WorktreeManager {
     if (existing !== null) return existing;
     this.assertCreationIdentity(input.path, input.custody);
     const completion = this.assertCreationCustody(input.repo.repoPath, input.path, input.custody);
-    beginLaneHandoff({ id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: input.repo.repoPath,
-      path: input.path, branch: input.branch, sha: input.sha }, completion, input.custody.token);
+    const lane = { id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: input.repo.repoPath,
+      path: input.path, branch: input.branch, sha: input.sha } as const;
+    // A failed registration may follow this creation's own published receipt.
+    if (!pendingLaneHandoffPublished(lane, completion, input.custody.token)) beginLaneHandoff(lane, completion, input.custody.token);
     const record = this.opts.ledger.registerWorktree({
       id: input.jobId, kind: 'job', repoPath: input.repo.repoPath, repoName: input.repo.repoName,
       path: input.path, branch: input.branch, sha: input.sha, baseSource: input.base.baseSource, jobId: input.jobId,

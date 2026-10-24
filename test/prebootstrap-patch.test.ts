@@ -712,3 +712,24 @@ describe('pre-bootstrap worker admission custody', () => {
     expectRetainedLane(f, 'job-spawn-failed');
   });
 });
+
+describe('pre-bootstrap failure receipts', () => {
+  it('retries a failed registration over its own pending handoff and keeps the lane', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-publication' });
+    const original = f.ledger.registerWorktree.bind(f.ledger);
+    let calls = 0;
+    vi.spyOn(f.ledger, 'registerWorktree').mockImplementation((input) => {
+      calls += 1;
+      if (calls === 1) throw new Error('synthetic registry failure');
+      return original(input);
+    });
+    await expect(dispatch(f, 'job-publication', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(calls).toBe(2);
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-publication', 'worktree.prebootstrap-publication-failed')?.payload)
+      .toMatchObject({ stage: 'publication', error_class: 'Error' });
+    expectRetainedLane(f, 'job-publication');
+    expect(await readback(f, 'job-publication')).toMatchObject({ state: 'setup_succeeded_publication_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+  });
+});
