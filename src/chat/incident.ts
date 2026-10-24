@@ -146,17 +146,17 @@ function preFamilySignalOf(kind: string): string {
 }
 
 /**
- * Compatibility (#503): the pre-family token a decision recorded before
- * #503 may name for this row. Null when the family is that same token, or
- * when the token is no decision signal (over 64 characters, mixed case,
- * `@`): the write boundary never accepted one and every read re-validates
- * stored `covers`, so no decision row holds it. Only the hold-coverage query
- * needs it — a mailbox item's basis hashes its reason signals, so no
- * decision pinned to a pre-#503 basis can match a current item anyway.
+ * Compatibility (#503): the signal the pre-family derivation gave this row —
+ * what a decision recorded before migration 32 meant when it named one, and
+ * the only token such a decision matches (`coveringDecision`). Null when that
+ * token was no decision signal (over 64 characters, mixed case, `@`): the
+ * write boundary never accepted one and every read re-validates stored
+ * `covers`, so no old decision can match the row. For a kind whose signal did
+ * not change it is the family itself.
  */
-export function legacyIncidentSignalOf(row: IncidentRow): string | null {
+export function preFamilyIncidentSignalOf(row: IncidentRow): string | null {
   const legacy = preFamilySignalOf(row.kind);
-  return legacy !== incidentSignalOf(row) && isDecisionSignal(legacy) ? legacy : null;
+  return isDecisionSignal(legacy) ? legacy : null;
 }
 
 /**

@@ -17,7 +17,7 @@ import {
   incidentSignalOf,
   incidentSubjectOf,
   isHardFloorRow,
-  legacyIncidentSignalOf,
+  preFamilyIncidentSignalOf,
 } from './incident.js';
 import { redactedText } from '../decisions/questions.js';
 import { WakePolicy, type WakeCandidate, type WakeDecision } from './wake-policy.js';
@@ -110,9 +110,10 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'recorded as state keeps the incident from re-waking you; prose does not. Use the ' +
   'subject the wake path consults: for job-scoped alert kinds that is "job:<job id>" — for those ' +
   'job-scoped kinds use the head SHA as basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>); ' +
-  'omit basis_fingerprint entirely for kinds without a SHA (github.pr-conflict:<job>), and name ' +
-  'covers with the signal family ("ci-failed", "pr-conflict", "rebrief-unreconciled", "directive-unreconciled"); ' +
-  'for a mailbox item copy each reasons[].signal verbatim. ' +
+  'for a hold that should keep deferring re-detections, omit basis_fingerprint for kinds without a SHA (github.pr-conflict:<job>), ' +
+  'and name covers with the signal family ("ci-failed", "pr-conflict", "phase-handback", "supervision.turn-orphaned"). ' +
+  'A decision that backs a mailbox resolved disposition instead takes the item\'s subject, its exact basis as basis_fingerprint ' +
+  'and every reasons[].signal copied verbatim into covers. Recovery cards and provider walls are hard floors: no hold defers them. ' +
   'A red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>) has no lane: diagnose ' +
   'the run, open a fix heist from the current head, and hold "incident:github.default-branch-ci-failed:<owner>/<repo>" ' +
   '(covers "ci-failed") with no basis_fingerprint, so the hold reaches every later head and later red heads of that ' +
@@ -1037,7 +1038,7 @@ export class GruAwareness {
       renderedRows.set(id, row);
       if (this.mailbox?.captureRow(row) != null) {
         const item = JSON.parse(row.detail!) as MailboxItem;
-        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify(promptSafeDeep({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }))}` });
+        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify(promptSafeDeep({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map(({ signal, label }) => ({ signal, label })), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }))}` });
         return;
       }
       notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})` });
@@ -2156,14 +2157,13 @@ export class GruAwareness {
     if (this.mailbox?.captureRow(row) != null) return null; // exact-basis mailbox dispositions own admission, wildcard holds remain restrictions
     if (!this.coveredDeferralEnabled) return null;
     if (isHardFloorRow(row)) return null;
-    const legacy = legacyIncidentSignalOf(row);
     try {
       return this.ledger.coveringDecision({
         subject: incidentSubjectOf(row),
         signal: incidentSignalOf(row),
         basis: incidentBasisOf(row),
-        // #503: a hold recorded before signal families keeps covering.
-        ...(legacy === null ? {} : { legacySignals: [legacy] }),
+        // #503: a decision recorded before signal families keeps its meaning.
+        preFamilySignal: preFamilyIncidentSignalOf(row),
       });
     } catch (error) {
       // A malformed decision row must not take the wake path down: treat

@@ -431,8 +431,11 @@ Waiting/delegated/resolved exact-basis dispositions stay quiet until changed
 head/round/control/failure evidence or a due follow-up restores attention.
 Unresolved items remain visible in passive context and on the board.
 Each reason names a signal family (`directive-unreconciled`,
-`supervision.provider-wall`, `ci-failed`; #503), never an instance id: the
-item's subject and basis carry the exact instance. An attention-only
+`supervision.provider-wall`, `ci-failed`; #503) and no request, lane or agent
+id; only a report handback's signal carries its job id
+(`report-handback.<job>`, #314). The item's subject and basis carry the
+exact instance, and the wake note renders each reason's `signal` and
+`label` so Gru can copy the signals into `covers`. An attention-only
 `resolved` disposition references an `acted`/`dismissed`/`superseded`
 decision on the item's subject, pinned to its exact basis, whose `covers`
 name every reason's signal. It records mailbox metadata only: it never

@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, DirectiveRequestIdError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound, requireNewDirectiveRequestId } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, DirectiveRequestIdError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -1361,7 +1361,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (requestIdField === undefined || options.ledger.getDirective(requestIdField) === null) {
         try {
           // A new id meets the safe-id rule before any lane gate answers.
-          if (requestIdField !== undefined) requireNewDirectiveRequestId(requestIdField, 'directive request_id');
+          if (requestIdField !== undefined) options.ledger.requireAdmissibleRequestId(requestIdField, 'directive request_id');
         } catch (error) {
           if (!(error instanceof DirectiveRequestIdError)) throw error;
           json(res, 400, { error: 'invalid_request_id', detail: error.message });
@@ -1892,7 +1892,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       const requestId = strictOptStrField(body, 'request_id');
       if (requestId === undefined || options.ledger.getDirective(requestId) === null) {
-        try { if (requestId !== undefined) requireNewDirectiveRequestId(requestId, 're-brief request_id'); }
+        try { if (requestId !== undefined) options.ledger.requireAdmissibleRequestId(requestId, 're-brief request_id'); }
         catch (error) {
           if (!(error instanceof DirectiveRequestIdError)) throw error;
           json(res, 400, { error: 'invalid_request_id', detail: error.message }); return true;

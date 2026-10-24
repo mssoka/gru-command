@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
+import { mailboxBasis } from '../src/gru-mailbox/projection.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { DirectiveNativeFixture } from './helpers/directive-native-fixture.js';
 import { inspectDirectiveAdmission } from '../src/runtime/directive-checkpoint.js';
@@ -672,6 +673,39 @@ describe('GH-305 canonical durable mailbox', () => {
     expect(mailbox.snapshot().items[0]?.references).toContainEqual({ kind: 'decision', id: followUp.id });
     expect(ledger.getObligation(debt.id)).toEqual(before);
     expect(ledger.getJob('j')?.status).toBe('working');
+  });
+
+  it('GH-503 a live item dispositioned before signal families reopens once as needs-gru; an unchanged one keeps its ruling', () => {
+    const { db, ledger, mailbox } = fixture();
+    ledger.recordNotification({ id: 'orphaned', kind: 'supervision.turn-orphaned.lane-a', title: 'Interrupted turn on lane-a', routing: 'action-required', severity: 'error' });
+    ledger.recordNotification({ id: 'breaker', kind: 'supervision.breaker', title: 'Crash-loop breaker tripped', routing: 'action-required', severity: 'error' });
+    const items = mailbox.snapshot().items;
+    const changed = items.find((item) => item.notificationIds.includes('orphaned'))!;
+    const unchanged = items.find((item) => item.notificationIds.includes('breaker'))!;
+    expect(changed.reasons.map((reason) => reason.signal)).toEqual(['supervision.turn-orphaned']);
+    const waiting = (item: typeof changed) => {
+      const hold = ledger.recordDecision({ subject: item.subject, decision: 'hold', covers: item.reasons.map((reason) => reason.signal), reason: 'owner re-briefs the lane', by: 'owner' });
+      return { state: 'waiting', owner: 'owner', detail: 'owner re-briefs the lane', dependency: 'owner re-brief', recheckAt: '2026-10-11T01:20:01.000Z',
+        references: [{ kind: 'decision', id: hold.id }] };
+    };
+    // What the pre-family projection stored: each reason's old signal, the basis
+    // hashed over it, and a waiting ruling on that basis.
+    for (const [item, oldSignal] of [[changed, 'supervision.turn-orphaned.lane-a'], [unchanged, 'supervision.breaker']] as const) {
+      const reasons = item.reasons.map((reason) => ({ ...reason, signal: oldSignal }));
+      const basis = mailboxBasis(reasons.map((reason) => [reason.signal, reason.basis]));
+      const stored = { ...ledger.listMailboxItems().find((row) => row.id === item.id)!, reasons, basis, state: 'waiting', owner: 'owner',
+        disposition: { ...waiting(item), basis, recordedAt: '2026-10-11T00:20:01.000Z' } };
+      db.handle.prepare('UPDATE gru_mailbox SET item = ? WHERE id = ?').run(JSON.stringify(stored), item.id);
+    }
+    const upgraded = mailbox.snapshot().items;
+    expect(upgraded.find((item) => item.id === unchanged.id)).toMatchObject({ basis: unchanged.basis, state: 'waiting' });
+    expect(upgraded.find((item) => item.id === changed.id)).toMatchObject({ basis: changed.basis, state: 'needs-gru' });
+    expect(mailbox.attentionPage(8).map((item) => item.id)).toEqual([changed.id]);
+    // Recorded again at the new basis, it stays quiet: the reopen happens once.
+    mailbox.disposition(changed.id, { ...waiting(changed), basis: changed.basis });
+    expect(mailbox.snapshot().items.find((item) => item.id === changed.id)?.state).toBe('waiting');
+    expect(mailbox.attentionPage(8)).toEqual([]);
+    expect(ledger.getNotification('orphaned')).toMatchObject({ ackedAt: null, resolvedAt: null });
   });
 
   it('GH-503 a job-bound provider wall past 64 characters resolves by family without touching its owner stop', () => {

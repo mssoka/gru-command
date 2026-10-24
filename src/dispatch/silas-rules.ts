@@ -120,7 +120,9 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
     receipt: ['silas.directive-sent'],
     summary:
       'Inspect the lane head read-only, then ONE directive with blocker_fingerprint current-inspection:<job>:<historicalDeliverySeq> ' +
-      'and request_id current-inspection-<historicalDeliverySeq> asking the minion to deliver its current candidate; the receipt ' +
+      'and request_id current-inspection-<historicalDeliverySeq> asking the minion to deliver its current candidate (a request stored ' +
+      'before #503 under the fingerprint itself, GET /api/silas/directives/current-inspection:<job>:<historicalDeliverySeq>, already ' +
+      'answers the delivery: retry that stored id instead); the receipt ' +
       'carries rule_id. Review stays fenced throughout.',
   },
   {

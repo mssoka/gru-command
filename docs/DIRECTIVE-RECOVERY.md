@@ -475,19 +475,35 @@ Concrete routine Gru judgment uses
 ```
 
 Every NEW request id — a directive or re-brief `request_id`, a successor's,
-or a reserved `inspection_request_id` — is 1-128 characters of
+or a newly reserved `inspection_request_id` — is 1-128 characters of
 `[A-Za-z0-9._-]` starting with a letter or digit, with no `:` (the safe
-record-id rule, #503). Anything else is refused by name
-(`DirectiveRequestIdError`, HTTP 400 naming the rule) before any lane gate,
-writer clearance or recovery check. The id is embedded whole in its
-recovery card's kind and so in the card's `incident:` decision subject: the
-bound keeps that subject within the 256-character decision limit, and the
-`:` ban keeps a card from being scoped to a job. Ids stored before the rule
-read and replay as before (no migration). A pre-existing id long enough
-that its card's subject overruns the limit (over about 137 characters for a
-directive card) cannot be disposed exactly through `POST /api/decisions`,
-and a pre-existing id with a `:` keeps its card scoped to `job:<text after
-the first :>`; such debt still answers through its recovery endpoint.
+record-id rule, #503). Ids are ledger-wide, so name no job in one: use the
+rule and a fresh random suffix (`recover-7f3c9a2e`). Anything else is
+refused by name (`DirectiveRequestIdError`, HTTP 400 `invalid_request_id`
+naming the rule). It is the first write-side check: it runs before any lane
+gate, review writer clearance or recovery decision is written, but a
+read-only refusal can answer first: `/recover` answers 409
+`recovery_refused` when a successor's producer cessation is unproven
+(`live_work`) or its lane cannot be resolved (`lane_unavailable`). On `POST /api/silas/directive` a present `request_id`
+must be a non-empty string: blank, whitespace, null or a non-string is a 400
+(omit the field to have an id minted), as on `POST /api/silas/rebrief`.
+
+The id is embedded whole in its recovery card's kind and so in the card's
+`incident:` decision subject: the bound keeps a directive card's subject
+within the 256-character decision limit (it overruns only past a
+137-character id), and the `:` ban keeps a card from being scoped to a job.
+Ids the ledger already holds are read and replayed as before, with no
+migration: a stored request, and an inspection identity a control closure
+reserved (with a `:` or over 128 characters) before the rule — its exact
+inspection directive is still admitted under it and discharges its debt. A
+pre-existing directive id long enough that its card's subject overruns the
+limit cannot be disposed exactly through `POST /api/decisions`. A
+pre-existing id with a `:` makes its card colon-scoped: the subject is
+`job:<segment between the first and second :>` and the basis everything
+after the second `:`, so two such requests (`a:J:3`, `b:J:3`) share subject,
+signal and basis — the card is a hard floor, so no hold defers it. Such
+debt still answers through its recovery endpoint, which accepts the stored
+id.
 
 The service proves cessation and atomically retires only that exact
 request and accepts the named fresh successor. Retirement itself grants

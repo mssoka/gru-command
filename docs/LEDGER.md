@@ -614,6 +614,7 @@ table makes the hold queryable:
 | `client_key` | UNIQUE idempotency key — a retry with the same key and content returns the original row; changed content fails loud (`DecisionConflictError`) |
 | `created_at`, `recheck_at` | `recheck_at NULL` = no scheduled re-look (a basis change still re-opens) |
 | `cleared_at`, `cleared_by`, `cleared_reason` | stamped by `clearDecision`; rows are never rewritten or deleted |
+| `covers_scheme` | `family` \| `pre-family` (migration 32, #503): how `covers` is read; every decision recorded before signal families is `pre-family` |
 
 **The trigger query** is `LedgerApi.coveringDecision({ subject, signal,
 basis, now })`: it returns a decision only when the row is not cleared,
@@ -628,31 +629,60 @@ exhaustive for the subject (pages past any listing window).
 
 **Signal families (#503).** `incidentSignalOf` (`src/chat/incident.ts`)
 derives the signal from an alert kind. Kinds are `<namespace>.<family>`,
-scoped to an instance by `:` (`github.ci-failed:<job>:<sha>`) or by more
-`.` segments (`silas.directive-unreconciled.<request id>`,
-`silas.phase-handback.<job>@<seq>`,
+scoped to an instance by `:` (`github.ci-failed:<job>:<sha>`,
+`silas.phase-handback.phase-handoff:<job>:<source>:<n>`) or by more `.`
+segments (`silas.directive-unreconciled.<request id>`,
 `supervision.provider-wall.<agent>.<class>`). The family is the first two
 dot segments before any `:`, with the `github.`/`silas.` namespace dropped:
 `ci-failed`, `directive-unreconciled`, `phase-handback`,
 `supervision.provider-wall`, `supervision.turn-orphaned`. No instance id
 enters a signal, so a caller-chosen id can never overrun the 64-character
-bound and make an exact disposition unrecordable. Exactness lives in the
-subject (`incident:<kind>:<title>` keeps the whole kind) and the basis; a
-family decision on one instance's subject never covers another instance.
-Two rulings stand apart: a red default branch is `ci-failed` (#446), and a
-report handback keeps the exact `report-handback.<job id>` (#314). Hard
-floors (`isHardFloorRow`) match kinds, not signals, so a family hold still
-never defers them. Decisions recorded before #503 can name the old exact
-token (`supervision.turn-orphaned.<lane>`); `coveringDecision` takes it as
-`legacySignals` in the same newest-first scan, so such a hold keeps
-covering. Mailbox items need no such alias: an item's basis hashes its
-reason signals, so an item carrying a family reason has a new basis and no
-pre-#503 exact-basis decision matches it. A live item with such a reason
-reopens once as `needs-gru` after the upgrade; its decisions stay listed
-and clearable. New directive and re-brief request ids follow the safe
-record-id rule (1-128 characters, no `:`; `docs/DIRECTIVE-RECOVERY.md`), so
-a new recovery card's subject always fits the 256-character subject bound;
-a pre-existing id whose card subject overruns it cannot be disposed exactly.
+bound and make an exact disposition unrecordable. Two rulings stand apart:
+a red default branch is `ci-failed` (#446), and a report handback keeps the
+exact `report-handback.<job id>` (#314).
+
+Exactness lives in the subject and the basis. A dot-scoped kind keeps its
+whole kind in the subject (`incident:<kind>:<title>`), so a decision on one
+instance's subject never names another. A colon-scoped kind's subject is
+the segment between its first and second `:` (`job:<job>`), shared by every
+instance on that job, and its basis is everything after the second `:`
+(the head SHA, or `fix:1` for a marked phase hand-back; the whole kind when
+there is no second `:`): a decision pinned to a basis covers
+that one instance, and a null-basis family hold on the job covers every
+instance of the family on the job, as a `ci-failed` hold covers every head.
+A directive request id stored with a `:` before the id rule (below) is
+colon-scoped the same way and is not exact: `a:J:3` and `b:J:3` share
+subject `job:J`, signal and basis `3`; both are hard floors, so no hold
+defers either wake. Hard floors (`isHardFloorRow`) match kinds, not
+signals, so a family hold never defers one.
+
+**The cutover (migration 32).** Every decision recorded before signal
+families is flagged `covers_scheme = 'pre-family'` and keeps the meaning it
+was written with: `coveringDecision` matches it only against the signal the
+pre-family derivation gave the row (`preFamilyIncidentSignalOf`, e.g.
+`supervision.turn-orphaned.<lane>`), never against the family. An old hold
+naming an old exact token keeps covering; an old hold naming a bare family
+token (`phase-handback` on `job:X`), which matched nothing then, stays
+inert. Decisions recorded since match families only. Both schemes compete in
+the one newest-first scan. The mailbox needs no flag: an item's basis hashes
+its reason signals, so an item carrying a changed signal has a new basis no
+pre-#503 exact-basis decision matches, and an old null-basis follow-up hold
+can only reach a reason whose presence already makes the item owe Gru. So
+every live mailbox item carrying a changed signal (a directive card, phase
+hand-back, provider wall, turn-orphaned, provider recovery-off or
+false-recovery reason) reopens once as `needs-gru` after the upgrade and
+wakes Gru once; its waiting, delegated or resolved disposition drops and is
+recorded again at the new basis.
+Its decisions stay listed and clearable.
+
+New directive and re-brief request ids follow the safe record-id rule
+(1-128 characters, no `:`; `docs/DIRECTIVE-RECOVERY.md`). A directive card's
+subject overruns the 256-character subject bound only past a 137-character
+id, so every new directive card fits; a pre-existing id whose card subject
+overruns it cannot be disposed exactly. An owner-transfer card
+(`silas.recovery-owner-transfer.<kind>.<id>.<generation>`) can still overrun
+from about a 124-character id; it is needs-owner, never a mailbox item, and a
+hard floor, so no decision has to name it.
 
 **Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
 each appending a `decision.recorded` / `decision.cleared` event in the

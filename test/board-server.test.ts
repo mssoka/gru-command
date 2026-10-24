@@ -25,6 +25,7 @@ import type { DecisionRecord } from '../src/ledger/decision-memory.js';
 import type { MailboxItem } from '../src/ledger/mailbox.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { incidentSubjectOf } from '../src/chat/incident.js';
 import type { NotificationRecord } from '../src/ledger/api.js';
 
@@ -1623,7 +1624,7 @@ describe('board server — report-handback decision signals (issue #314)', () =>
 describe('board server — id-bearing incident signal families (issue #503)', () => {
   const token = 'signal-family-token';
   // A caller-chosen request id: the pre-#503 signal `directive-unreconciled.<id>`
-  // was 92 characters, past the 64-character write boundary.
+  // was 93 characters, past the 64-character write boundary.
   const requestId = (tag: string) => `rt-655-fix-reviews-${tag}-${'r'.repeat(40)}-20261024`;
 
   function surface(harness: Awaited<ReturnType<typeof boot>>, jobId: string, request: string, reason: string): NotificationRecord {
@@ -1707,6 +1708,48 @@ describe('board server — id-bearing incident signal families (issue #503)', ()
         resolution(item, written.body as DecisionRecord));
       expect(resolved.status).toBe(200);
       expect(await itemFor(harness, card.id)).toMatchObject({ basis: item.basis, state: 'resolved' });
+    } finally { await harness.close(); }
+  });
+
+  it('an admitted directive card resolves on its job item without touching the control, its debt, its card or the unknown producer', async () => {
+    const harness = await boot(token);
+    try {
+      const request = requestId('admitted');
+      const minion = 'admitted-minion';
+      const sessionFile = join(tmpDir(), `${minion}.jsonl`);
+      harness.api.addJob({ id: 'admitted-job', repo: 'r', title: 'admitted lane' });
+      harness.api.setJobStatus('admitted-job', 'working');
+      harness.api.beginDirectiveIntent({ jobId: 'admitted-job', requestId: request, directive: 'approved correction', holder: 'gru' });
+      admitNativeDirectiveFixture(harness.api, request, minion, sessionFile);
+      harness.api.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: 'admitted-job',
+        payload: { request_id: request, agent_id: minion, session_file: sessionFile } });
+      const blockers = harness.api.directiveProgressBlockers(request, 'admitted-job');
+      expect(blockers).toContain(`unproven producer cleanup: minion ${minion}, request ${request}`);
+      const card = surface(harness, 'admitted-job', request, 'admitted, no correlated terminal receipt');
+      expect(card.agentId).toBe(minion);
+      const item = await itemFor(harness, card.id);
+      expect(item.subject).toBe('job:admitted-job');
+      expect(item.references).toContainEqual({ kind: 'directive', id: request });
+      expect(item.reasons.find((reason) => reason.label === 'action-required')?.signal).toBe('directive-unreconciled');
+      const directive = harness.api.getDirective(request);
+      const debts = harness.api.listObligations({ jobId: 'admitted-job' });
+      const written = await postJson(harness.port, '/api/decisions', token, acted(item, 'admitted-attention'));
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, token, resolution(item, decision));
+      expect(resolved.status, JSON.stringify(resolved.body)).toBe(200);
+      expect(await itemFor(harness, card.id)).toMatchObject({ basis: item.basis, state: 'resolved' });
+      // Attention metadata only: the control, its debt, its card and the unknown producer stand.
+      expect(harness.api.getDirective(request)).toEqual(directive);
+      expect(harness.api.listObligations({ jobId: 'admitted-job' })).toEqual(debts);
+      expect(harness.api.getNotification(card.id)).toEqual(card);
+      expect(harness.api.directiveProgressBlockers(request, 'admitted-job')).toEqual(blockers);
+      // A changed basis reopens the job item.
+      surface(harness, 'admitted-job', request, 'producer ownership unknown');
+      const reopened = await itemFor(harness, card.id);
+      expect(reopened.basis).not.toBe(item.basis);
+      expect(reopened.state).toBe('needs-gru');
+      expect(harness.api.getDirective(request)).toEqual(directive);
     } finally { await harness.close(); }
   });
 

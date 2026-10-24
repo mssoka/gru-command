@@ -5,7 +5,7 @@ import {
   incidentSignalOf,
   incidentSubjectOf,
   isHardFloorRow,
-  legacyIncidentSignalOf,
+  preFamilyIncidentSignalOf,
   normalizeIncidentTitle,
 } from '../src/chat/incident.js';
 import { validateDecisionSignal, validateDecisionSubject } from '../src/ledger/decision-memory.js';
@@ -192,33 +192,52 @@ describe('incident identity — signal families (issue #503)', () => {
     expect(validateDecisionSignal(incidentSignalOf(row(`silas.report-handback.${job}`)))).toBe(`report-handback.${job}`);
   });
 
-  it('names the storable pre-family token only where the family replaced it', () => {
-    // A stored decision could name these: each was a valid decision signal.
-    expect(legacyIncidentSignalOf(row('supervision.turn-orphaned.a2'))).toBe('supervision.turn-orphaned.a2');
-    expect(legacyIncidentSignalOf(row('silas.directive-unreconciled.0b1c2d3e-0000-4000-8000-000000000000')))
+  it('names the signal a pre-family decision meant, or null where no decision could hold it', () => {
+    // A decision recorded before #503 could name these: each was a valid signal.
+    expect(preFamilyIncidentSignalOf(row('supervision.turn-orphaned.a2'))).toBe('supervision.turn-orphaned.a2');
+    expect(preFamilyIncidentSignalOf(row('silas.directive-unreconciled.0b1c2d3e-0000-4000-8000-000000000000')))
       .toBe('directive-unreconciled.0b1c2d3e-0000-4000-8000-000000000000');
-    expect(legacyIncidentSignalOf(row('provider.waiting.route-x'))).toBe('provider.waiting.route-x');
+    expect(preFamilyIncidentSignalOf(row('provider.waiting.route-x'))).toBe('provider.waiting.route-x');
+    // The marked hand-back card kind: the old signal stopped at the phase id's first ':'.
+    expect(preFamilyIncidentSignalOf(row('silas.phase-handback.phase-handoff:job-a:fix:1'))).toBe('phase-handback.phase-handoff');
     // The write boundary never accepted these, and reads re-validate every
     // stored token, so no decision row can hold them.
-    expect(legacyIncidentSignalOf(row(`silas.directive-unreconciled.${request}`))).toBeNull();
-    expect(legacyIncidentSignalOf(row('silas.phase-handback.j-1@17'))).toBeNull();
-    expect(legacyIncidentSignalOf(row(`supervision.provider-wall.${agent}.authentication_wall`))).toBeNull();
-    // Unchanged signals have no alias, and re-briefs were a family already.
-    expect(legacyIncidentSignalOf(row('github.ci-failed:j-1:abc123'))).toBeNull();
-    expect(legacyIncidentSignalOf(row('github.default-branch-ci-failed:acme/alpha:7:abc'))).toBeNull();
-    expect(legacyIncidentSignalOf(row('silas.rebrief-unreconciled.j-42'))).toBeNull();
-    expect(legacyIncidentSignalOf(row('silas.report-handback.review-old'))).toBeNull();
-    expect(legacyIncidentSignalOf(row('supervision.breaker'))).toBeNull();
+    expect(preFamilyIncidentSignalOf(row(`silas.directive-unreconciled.${request}`))).toBeNull();
+    expect(preFamilyIncidentSignalOf(row('silas.phase-handback.j-1@17'))).toBeNull();
+    expect(preFamilyIncidentSignalOf(row(`supervision.provider-wall.${agent}.authentication_wall`))).toBeNull();
+    // Unchanged signals are their own pre-family token; re-briefs and the
+    // default branch were families already.
+    expect(preFamilyIncidentSignalOf(row('github.ci-failed:j-1:abc123'))).toBe('ci-failed');
+    expect(preFamilyIncidentSignalOf(row('github.default-branch-ci-failed:acme/alpha:7:abc'))).toBe('ci-failed');
+    expect(preFamilyIncidentSignalOf(row('silas.rebrief-unreconciled.j-42'))).toBe('rebrief-unreconciled');
+    expect(preFamilyIncidentSignalOf(row('silas.report-handback.review-old'))).toBe('report-handback.review-old');
+    expect(preFamilyIncidentSignalOf(row('supervision.breaker'))).toBe('supervision.breaker');
   });
 
-  it('a family never widens hard floors or merges two instances', () => {
+  it('a family never widens hard floors; the subject or the basis keeps instances apart', () => {
     for (const kind of [`silas.directive-unreconciled.${request}`, `supervision.provider-wall.${agent}.quota_wall`, 'provider.false-recovery.route-x']) {
       expect(isHardFloorRow(row(kind)), kind).toBe(true);
     }
+    // Dot-scoped instances differ in their subject.
     const first = row('supervision.turn-orphaned.lane-a', 'Interrupted turn on lane-a');
     const second = row('supervision.turn-orphaned.lane-b', 'Interrupted turn on lane-b');
     expect(incidentSignalOf(first)).toBe(incidentSignalOf(second));
     expect(incidentSubjectOf(first)).not.toBe(incidentSubjectOf(second));
     expect(incidentBasisOf(first)).not.toBe(incidentBasisOf(second));
+    // Colon-scoped instances share their job subject and differ only in the
+    // basis: a null-basis family hold on the job covers every one, as
+    // ci-failed does across SHAs.
+    const fix = row('silas.phase-handback.phase-handoff:job-a:fix:1');
+    const review = row('silas.phase-handback.phase-handoff:job-a:review:7');
+    expect([incidentSignalOf(fix), incidentSubjectOf(fix), incidentBasisOf(fix)]).toEqual(['phase-handback', 'job:job-a', 'fix:1']);
+    expect([incidentSignalOf(review), incidentSubjectOf(review), incidentBasisOf(review)]).toEqual(['phase-handback', 'job:job-a', 'review:7']);
+    // Legacy ':' request ids are not exact: two requests share subject,
+    // signal and basis. Both are hard floors, so no hold defers either.
+    const legacyA = row('silas.directive-unreconciled.a:J:3');
+    const legacyB = row('silas.directive-unreconciled.b:J:3');
+    for (const legacy of [legacyA, legacyB]) {
+      expect([incidentSignalOf(legacy), incidentSubjectOf(legacy), incidentBasisOf(legacy), isHardFloorRow(legacy)])
+        .toEqual(['directive-unreconciled', 'job:J', '3', true]);
+    }
   });
 });

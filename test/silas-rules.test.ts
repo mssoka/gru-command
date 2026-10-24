@@ -135,15 +135,21 @@ describe('parseSilasActionRuleId (request-boundary validation)', () => {
 });
 
 describe('prescribed request ids (#503)', () => {
-  // Placeholders take a worst-case-shaped sample: a job id and an event seq.
-  const instantiate = (template: string): string => template.replace(/<[^>]+>/gu, (name) => (/seq/iu.test(name) ? '9007199254740991' : 'rt-655-sept-guidance-corrections'));
+  // Worst-case placeholders: a 128-character job (or chosen) id, the largest event seq.
+  const instantiate = (template: string): string =>
+    template.replace(/<[^>]+>/gu, (name) => (/seq/iu.test(name) ? String(Number.MAX_SAFE_INTEGER) : `j${'x'.repeat(127)}`));
+  const ROLE_PATHS = ['gru.md', 'silas.md'].map((name) => join(import.meta.dirname, '..', 'roles', name));
 
-  it('every request_id the rule registry and the ops skill prescribe meets the safe request-id rule', () => {
+  it('every request_id the rule registry, the ops skill and the roles prescribe meets the safe request-id rule at its longest', () => {
     const fromRules = SILAS_RULES.flatMap((rule) => [...rule.summary.matchAll(/request_id (\S+)/gu)].map((match) => match[1]!));
-    const fromSkill = [...readFileSync(SKILL_PATH, 'utf8').matchAll(/"request_id":"([^"]+)"/gu)].map((match) => match[1]!);
     expect(fromRules).toEqual(['current-inspection-<historicalDeliverySeq>']);
-    expect(fromSkill.length).toBeGreaterThan(0);
-    for (const template of [...fromRules, ...fromSkill]) {
+    const documents = [SKILL_PATH, ...ROLE_PATHS].map((path) => readFileSync(path, 'utf8'));
+    // JSON request bodies, and the prose id examples (backticked, by GC's id prefixes).
+    const fromJson = documents.flatMap((text) => [...text.matchAll(/"(?:inspection_)?request_id": ?"([^"]+)"/gu)].map((match) => match[1]!));
+    const fromProse = documents.flatMap((text) => [...text.matchAll(/`((?:revision-continuation|rebrief|recover|current-inspection)[-:][^`\s]*)`/gu)].map((match) => match[1]!));
+    expect(fromJson.length).toBeGreaterThan(0);
+    expect(fromProse.length).toBeGreaterThan(0);
+    for (const template of [...fromRules, ...fromJson, ...fromProse]) {
       expect(isSafePipelineRecordId(instantiate(template)), template).toBe(true);
     }
   });

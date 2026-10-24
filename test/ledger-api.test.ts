@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
@@ -1221,20 +1221,48 @@ describe('decision memory (issue #218)', () => {
     by: 'gru' as const,
   };
 
-  it('GH-503 legacy exact tokens join the family in one newest-first coverage scan', () => {
-    const ledger = fresh();
+  it('GH-503 migration 32 flags every earlier decision pre-family; later decisions are family', () => {
+    const dir = tmpDir();
+    const before = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 31) });
+    new LedgerApi(before.handle).recordDecision({ ...base, covers: ['phase-handback'], clientKey: 'before-cutover' });
+    before.close();
+    const after = new LedgerDb(dir);
+    closeFns.push(() => after.close());
+    new LedgerApi(after.handle).recordDecision({ ...base, covers: ['phase-handback'], clientKey: 'after-cutover' });
+    const schemes = after.handle.prepare('SELECT client_key, covers_scheme FROM decisions ORDER BY rowid').all();
+    expect(schemes).toEqual([{ client_key: 'before-cutover', covers_scheme: 'pre-family' }, { client_key: 'after-cutover', covers_scheme: 'family' }]);
+  });
+
+  it('GH-503 a pre-family decision matches only its old signal, in one newest-first scan with family decisions', () => {
+    const d = new LedgerDb(tmpDir());
+    closeFns.push(() => d.close());
+    const ledger = new LedgerApi(d.handle);
+    const preFamily = (id: string) => d.handle.prepare("UPDATE decisions SET covers_scheme = 'pre-family' WHERE id = ?").run(id);
     const subject = 'incident:supervision.turn-orphaned.a2:interrupted-turn';
     const query = { subject, signal: 'supervision.turn-orphaned', basis: 'supervision.turn-orphaned.a2:interrupted-turn',
-      legacySignals: ['supervision.turn-orphaned.a2'] };
-    const legacy = ledger.recordDecision({ ...base, subject, covers: ['supervision.turn-orphaned.a2'], basisFingerprint: null });
-    expect(ledger.coveringDecision(query)?.id).toBe(legacy.id);
-    // Without the alias the family alone never finds a pre-#503 hold.
-    expect(ledger.coveringDecision({ subject, signal: query.signal, basis: query.basis })).toBeNull();
+      preFamilySignal: 'supervision.turn-orphaned.a2' };
+    const old = ledger.recordDecision({ ...base, subject, covers: ['supervision.turn-orphaned.a2'], basisFingerprint: null });
+    preFamily(old.id);
+    expect(ledger.coveringDecision(query)?.id).toBe(old.id);
+    // No storable old token: no pre-family decision can match the row.
+    expect(ledger.coveringDecision({ ...query, preFamilySignal: null })).toBeNull();
+    // A pre-family bare family token matched nothing then and stays inert.
+    const inert = ledger.recordDecision({ ...base, subject: 'job:job-a', covers: ['phase-handback'], basisFingerprint: null });
+    preFamily(inert.id);
+    const phase = { subject: 'job:job-a', signal: 'phase-handback', basis: 'fix:1', preFamilySignal: 'phase-handback.phase-handoff' };
+    expect(ledger.coveringDecision(phase)).toBeNull();
+    // An unstorable old token (`phase-handback.<job>@<seq>`): still inert, never read as the family.
+    expect(ledger.coveringDecision({ ...phase, preFamilySignal: null })).toBeNull();
+    const live = ledger.recordDecision({ ...base, subject: 'job:job-a', covers: ['phase-handback'], basisFingerprint: null });
+    expect(ledger.coveringDecision(phase)?.id).toBe(live.id);
+    // A family decision is read as family vocabulary: the old exact token is no family.
+    const exact = ledger.recordDecision({ ...base, subject: 'incident:supervision.turn-orphaned.a3:x', covers: ['supervision.turn-orphaned.a3'], basisFingerprint: null });
+    expect(ledger.coveringDecision({ subject: exact.subject, signal: 'supervision.turn-orphaned', basis: 'b', preFamilySignal: 'supervision.turn-orphaned.a3' })).toBeNull();
     // A newer family decision on another basis re-opens the row: the older
-    // legacy hold must not shadow it.
+    // pre-family hold must not shadow it.
     ledger.recordDecision({ ...base, subject, covers: ['supervision.turn-orphaned'], basisFingerprint: 'moved' });
     expect(ledger.coveringDecision(query)).toBeNull();
-    expect(() => ledger.coveringDecision({ ...query, legacySignals: ['Turn-Orphaned.A2'] })).toThrow(/lowercase token/);
+    expect(() => ledger.coveringDecision({ ...query, preFamilySignal: 'Turn-Orphaned.A2' })).toThrow(/lowercase token/);
   });
 
   it('GH-314 preserves long and legacy short signal decisions across ledger restart', () => {

@@ -16,7 +16,7 @@ import { DECISION_SURFACE_ESCALATION_TRIAGE } from '../src/decisions/questions.j
 import type { DecisionService } from '../src/decisions/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { DefaultBranchCiWatch } from '../src/repos/default-branch-ci.js';
 import type { RepoOverviewRunRaw } from '../src/repos/overview.js';
@@ -1923,19 +1923,50 @@ describe('gru awareness — wake rework (issue #219)', () => {
     }
   });
 
-  it('#503 a stored hold naming the pre-family exact token keeps covering its row', () => {
+  /** A ledger written before migration 32: decisions recorded here are pre-family. */
+  function preFamilyLedger(record: (api: LedgerApi) => void): string {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 31) });
+    try { record(new LedgerApi(db.handle)); } finally { db.close(); }
+    return dir;
+  }
+
+  it('#503 a hold recorded before signal families keeps covering by its exact old token', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-10-05T12:00:00'));
-      const rig = boot({ wakeMode: 'action-required' });
-      const hold = rig.api.recordDecision({
-        subject: 'incident:supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
-        decision: 'hold', covers: ['supervision.turn-orphaned.lane-a'], basisFingerprint: 'supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
-        reason: 'recorded before signal families', by: 'gru', clientKey: 'legacy-hold-lane-a',
+      let holdId = '';
+      const dir = preFamilyLedger((api) => {
+        holdId = api.recordDecision({
+          subject: 'incident:supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
+          decision: 'hold', covers: ['supervision.turn-orphaned.lane-a'], basisFingerprint: 'supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
+          reason: 'recorded before signal families', by: 'gru', clientKey: 'legacy-hold-lane-a',
+        }).id;
       });
+      const rig = boot({ dir, wakeMode: 'action-required' });
       rig.notifications.post({ kind: 'supervision.turn-orphaned.lane-a', routing: 'action-required', severity: 'error', title: 'Interrupted turn on lane-a' });
       expect(rig.woke).toHaveLength(0);
-      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered', decision_id: hold.id });
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered', decision_id: holdId });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#503 a bare-family hold recorded before signal families stays inert; a later one defers', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const hold = { subject: 'job:job-x', decision: 'hold' as const, covers: ['phase-handback'], basisFingerprint: null, by: 'gru' as const };
+      // It matched nothing when recorded: the old signal was phase-handback.phase-handoff.
+      const dir = preFamilyLedger((api) => { api.recordDecision({ ...hold, reason: 'dormant pre-family hold', clientKey: 'pre-family-phase' }); });
+      const rig = boot({ dir, wakeMode: 'action-required' });
+      rig.notifications.post({ kind: 'silas.phase-handback.phase-handoff:job-x:fix:1', routing: 'action-required', severity: 'info', title: 'Phase completed on job job-x — Gru decision owed' });
+      expect(rig.woke).toHaveLength(1);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
+      const later = rig.api.recordDecision({ ...hold, reason: 'phase hand-backs parked under the fix lane', clientKey: 'family-phase' });
+      rig.notifications.post({ kind: 'silas.phase-handback.phase-handoff:job-x:review:2', routing: 'action-required', severity: 'info', title: 'Phase completed on job job-x — Gru decision owed' });
+      expect(rig.woke).toHaveLength(1);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered', decision_id: later.id });
     } finally {
       vi.useRealTimers();
     }
@@ -2663,6 +2694,25 @@ describe('GH-305 awareness repair regressions', () => {
       expect(event?.payload).toMatchObject({ id: before.id, receipt: { basis: before.basis, attentionKey: before.attentionKey } });
       expect(r.mailbox.attentionPage(10)).toHaveLength(1);
     } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('#503 the wake note names each reason signal and label, so covers copied from it resolve the item', () => {
+    const r = rig('never');
+    try {
+      const agent = 'minion_8889b879-0000-4000-8000-000000000503';
+      r.api.addJob({ id: 'walled', repo: 'r', title: 'walled' });
+      r.api.registerAgent({ id: agent, role: 'minion', jobId: 'walled' });
+      r.api.recordNotification({ id: 'wall', kind: `supervision.provider-wall.${agent}.authentication_wall`, title: `Agent ${agent} stopped: authentication wall`,
+        routing: 'action-required', severity: 'error', agentId: agent });
+      const line = r.awareness.prepare()!.text.split('\n').find((text) => text.includes('"subject":"job:walled"'))!;
+      const note = JSON.parse(line.slice(line.indexOf('{'))) as { id: string; subject: string; basis: string; reasons: readonly { signal: string; label: string }[] };
+      expect(note.reasons).toEqual([{ signal: 'supervision.provider-wall', label: 'action-required' }]);
+      const decision = r.api.recordDecision({ subject: note.subject, decision: 'acted', covers: note.reasons.map((reason) => reason.signal),
+        basisFingerprint: note.basis, reason: 'covers copied from the wake note', by: 'gru' });
+      r.mailbox.disposition(note.id, { state: 'resolved', basis: note.basis, owner: 'gru', detail: 'wall attention accounted',
+        references: [{ kind: 'decision', id: decision.id }] });
+      expect(r.mailbox.snapshot().items.find((item) => item.id === note.id)?.state).toBe('resolved');
+    } finally { r.close(); }
   });
 
   it('F02 parks accepted captures before unrelated malformed source reconciliation', () => assertUnavailableAcceptanceRecovery(false));

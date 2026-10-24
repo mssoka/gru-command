@@ -13,6 +13,10 @@ export function surfaceRecoveryOwnerTransfer(
   const transfer = view.transfer?.ownerTransfer;
   if (transfer == null) return;
   const route = kind === 'directive' ? 'directives' : 'rebriefs';
+  // The kind embeds the whole subject id, so from about a 124-character id
+  // this card's incident subject overruns the 256-character decision bound
+  // (#503). It needs no decision: needs-owner, never a mailbox item, and a
+  // hard floor no hold defers.
   deps.notifications.postIncident({ kind: `silas.recovery-owner-transfer.${kind}.${subjectId}.${transfer.generation}`,
     routing: 'needs-owner', severity: 'error', dedupe: 'active',
     title: `Reserved owner decision: recovery ${subjectId} (job ${transfer.subject.jobId})`,

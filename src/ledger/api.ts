@@ -754,9 +754,13 @@ export class AmbiguousDirectiveError extends Error {
 }
 
 /** A NEW directive or re-brief request id outside the safe record-id rule
- * (#503). The id is embedded whole in the recovery card's kind and so in its
- * incident subject: past 128 characters that subject overruns the decision
- * bound, and a `:` re-scopes it to a job. Stored ids replay as before. */
+ * (#503). The id is embedded whole in its recovery card's kind and so in the
+ * card's incident subject: a directive card's subject overruns the
+ * 256-character decision bound past a 137-character id, and a `:` re-scopes
+ * the card to a job. The 128-character bound keeps every new directive card
+ * within it (an owner-transfer card can still overrun from about 124; it is
+ * needs-owner, never a mailbox item). Stored and reserved ids replay as
+ * before. */
 export class DirectiveRequestIdError extends Error {
   constructor(what: string, value: string) {
     super(`${what} "${value}" must be a safe request id: 1-128 characters of [A-Za-z0-9._-] starting with a letter or digit (no ":") — choose a new id`);
@@ -765,7 +769,7 @@ export class DirectiveRequestIdError extends Error {
 }
 
 /** Refuse an id that would be stored new under the safe record-id rule. */
-export function requireNewDirectiveRequestId(value: string, what: string): void {
+function requireNewDirectiveRequestId(value: string, what: string): void {
   if (!isSafePipelineRecordId(value)) throw new DirectiveRequestIdError(what, value);
 }
 
@@ -8419,13 +8423,9 @@ export class LedgerApi {
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
-    // A stored request replays as before; only a new id meets the bound.
-    if (input.requestId !== undefined && this.getDirective(input.requestId) === null) {
-      requireNewDirectiveRequestId(input.requestId, input.kind === 'rebrief' ? 're-brief request_id' : 'directive request_id');
-    }
     if (input.requestId !== undefined) {
-      const reserved = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed'
-        AND json_extract(payload, '$.inspection_request_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.requestId) as Row | undefined;
+      this.requireAdmissibleRequestId(input.requestId, input.kind === 'rebrief' ? 're-brief request_id' : 'directive request_id');
+      const reserved = this.reservedInspectionClosure(input.requestId);
       if (reserved !== undefined) {
         const closure = this.eventFromRow(reserved);
         const facts = closure.payload as { inspection_directive: unknown };
@@ -8561,6 +8561,20 @@ export class LedgerApi {
       }
       return { record: this.getDirective(requestId) as DirectiveRequestRecord, created: true };
     });
+  }
+
+  /** #503: a request id about to be stored meets the safe request-id rule,
+   * unless the ledger already holds it — a stored request (a replay) or an
+   * inspection identity a control closure reserved, possibly before the
+   * rule. Throws DirectiveRequestIdError naming the rule. */
+  requireAdmissibleRequestId(requestId: string, what: string): void {
+    if (this.getDirective(requestId) !== null || this.reservedInspectionClosure(requestId) !== undefined) return;
+    requireNewDirectiveRequestId(requestId, what);
+  }
+
+  private reservedInspectionClosure(requestId: string): Row | undefined {
+    return this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed'
+      AND json_extract(payload, '$.inspection_request_id') = ? ORDER BY seq DESC LIMIT 1`).get(requestId) as Row | undefined;
   }
 
   beginRebriefIntent(input: { readonly jobId: string; readonly note: string; readonly holder: string; readonly requestId?: string;
@@ -11197,23 +11211,29 @@ export class LedgerApi {
    *   re-opens the subject);
    * - its `recheck_at` is null or later than `now` (a passed recheck
    *   re-opens the subject).
-   * `legacySignals` (#503) are the pre-family exact tokens a decision
-   * recorded before signal families may name for this same row; a decision
-   * listing one competes in the same newest-first scan as the family. */
-  coveringDecision(opts: { subject: string; signal: string; basis: string; now?: string; legacySignals?: readonly string[] }): DecisionRecord | null {
+   * Signal families (#503): a decision recorded before migration 32 is
+   * read in the vocabulary it was written in. It matches `preFamilySignal`
+   * — the signal the pre-family derivation gave this row — never the
+   * family, so a bare family token that matched nothing then stays inert.
+   * `preFamilySignal` omitted = the row's signal did not change (`signal`);
+   * null = the old token was no storable signal, so no old decision can
+   * match. Both schemes compete in the one newest-first scan. */
+  coveringDecision(opts: { subject: string; signal: string; basis: string; now?: string; preFamilySignal?: string | null }): DecisionRecord | null {
     if (opts.signal.length === 0) throw new Error('coveringDecision "signal" must be non-empty');
     if (opts.basis.length === 0) throw new Error('coveringDecision "basis" must be non-empty');
     const nowMs = Date.parse(opts.now ?? nowIso());
     if (!Number.isFinite(nowMs)) throw new Error(`coveringDecision "now" must be a parseable timestamp, got "${String(opts.now)}"`);
-    const signals = [opts.signal, ...(opts.legacySignals ?? [])];
-    for (const signal of signals) validateDecisionSignal(signal);
+    validateDecisionSignal(opts.signal);
+    const preFamily = opts.preFamilySignal === undefined ? opts.signal : opts.preFamilySignal;
+    if (preFamily !== null) validateDecisionSignal(preFamily);
     // Page to exhaustion: a hold older than any single listing window
     // must still be found (bounded per subject, newest first).
     const pageSize = 500;
     for (let offset = 0; ; offset += pageSize) {
-      const page = this.listDecisions({ subject: opts.subject, activeOnly: true, limit: pageSize, offset });
-      for (const row of page) {
-        if (!signals.some((signal) => row.covers.includes(signal))) continue;
+      const page = this.listCoverageDecisions(opts.subject, pageSize, offset);
+      for (const { record: row, preFamilyScheme } of page) {
+        const signal = preFamilyScheme ? preFamily : opts.signal;
+        if (signal === null || !row.covers.includes(signal)) continue;
         if (row.basisFingerprint !== null && row.basisFingerprint !== opts.basis) return null;
         if (row.recheckAt !== null) {
           const recheckMs = Date.parse(row.recheckAt);
@@ -11226,6 +11246,14 @@ export class LedgerApi {
       }
       if (page.length < pageSize) return null;
     }
+  }
+
+  /** Active decisions on one subject, newest first (listDecisions' order),
+   * each with whether it was recorded under the pre-family scheme (#503). */
+  private listCoverageDecisions(subject: string, limit: number, offset: number): readonly { readonly record: DecisionRecord; readonly preFamilyScheme: boolean }[] {
+    return (this.db.prepare(`SELECT * FROM decisions WHERE subject = ? AND cleared_at IS NULL
+      ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(subject, limit, offset) as Row[])
+      .map((row) => ({ record: this.decisionFromRow(row), preFamilyScheme: str(row.covers_scheme) === 'pre-family' }));
   }
 
   private decisionByClientKey(clientKey: string): DecisionRecord | null {

@@ -324,9 +324,13 @@ retrying. When the answer is `409` with
      request id (or an identity-less repeat) is refused with the live
      request named, and a request that is still `dispatching`/`admitted`
      must never get a second turn. A new `request_id` is 1-128 characters
-     of `[A-Za-z0-9._-]` starting with a letter or digit, no `:`
-     (`revision-continuation-<job>-3`, not `revision-continuation:<job>:3`);
-     any other new id is refused with a 400 naming the rule.
+     of `[A-Za-z0-9._-]` starting with a letter or digit, with no `:` and
+     no job id: ids are ledger-wide, so use the rule and a fresh random
+     suffix (`revision-continuation-7f3c9a2e`). Any other new id is refused
+     with a 400 naming the rule, and so is a blank, whitespace, null or
+     non-string `request_id` on `POST /api/silas/directive` (omit the field
+     to have one minted). A stored id, even one from before this rule,
+     still replays.
      A NEW blocker gets this rung too — it is the first fix directive, and
      without it the lane can never re-open. The service routes the
      directive to the live minion (or a fresh one on the lane), flips the
@@ -447,7 +451,11 @@ service enforces the rest — you never decide it from a status:
   directive asking the minion to deliver its current candidate:
   `POST /api/silas/directive {"job_id":"<job>","directive":"Deliver your current candidate ...","blocker_fingerprint":"current-inspection:<job>:<seq>","rule_id":"current-inspection","request_id":"current-inspection-<seq>"}`
   (`<seq>` is the row's `historicalDeliverySeq`, a ledger-wide event seq: one
-  request per historical delivery; a later one is a new inspection). A stalled-lane, minion-error or
+  request per historical delivery; a later one is a new inspection). Before
+  #503 the request id was the blocker fingerprint itself, so first read
+  `GET /api/silas/directives/current-inspection:<job>:<seq>`: a request
+  stored under it already answers this delivery — retry that SAME stored id
+  (it replays), never mint a second inspection. A stalled-lane, minion-error or
   failed-verification row offered for the same job takes precedence: no
   inspection row is offered alongside one.
   The proven delivery then owes the ordinary verification (and any revision
@@ -485,8 +493,9 @@ POST /api/decisions
 ```
 
 - `covers` names the signal families the hold suppresses (e.g. `pr-conflict`,
-  `ci-failed`, `directive-unreconciled`), not request or agent ids — the
+  `ci-failed`, `phase-handback`), not request, lane or agent ids — the
   subject and basis pin the instance; anything not listed stays loud.
+  Recovery cards and provider walls are hard floors: no hold defers them.
 - `basis_fingerprint` pins the hold to the state you judged (head SHA,
   incident hash); omit it only for holds that stand on ANY basis.
 - `recheck_at` schedules your own re-look; once it passes the subject

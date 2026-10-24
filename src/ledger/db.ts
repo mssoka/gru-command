@@ -1174,4 +1174,18 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
     `,
   },
+  {
+    // #503: signal families. A decision's `covers` names signal families
+    // since this migration; every decision recorded before it is flagged
+    // 'pre-family' and matches only the signal the pre-family derivation
+    // gave a row. A bare family token in an old decision matched nothing
+    // then and stays inert, instead of starting to defer wakes.
+    id: 32,
+    name: 'decision-covers-scheme',
+    sql: `
+      ALTER TABLE decisions ADD COLUMN covers_scheme TEXT NOT NULL DEFAULT 'family'
+        CHECK (covers_scheme IN ('pre-family', 'family'));
+      UPDATE decisions SET covers_scheme = 'pre-family';
+    `,
+  },
 ];

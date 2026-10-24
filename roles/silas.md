@@ -222,8 +222,9 @@ again.
 
 New directives and rebriefs receive durable request IDs before dispatch;
 202 is acceptance, not native admission. A `request_id` you choose is 1-128
-characters of `[A-Za-z0-9._-]` starting with a letter or digit, no `:`
-(`rebrief-<job>-rev3-2`, not `rebrief:<job>:rev3:2`); anything else is a 400. Read their exact request/session/
+characters of `[A-Za-z0-9._-]` starting with a letter or digit, with no `:`
+and no job id (ids are ledger-wide: the rule plus a fresh random suffix,
+`rebrief-7f3c9a2e`); anything else, or a blank one, is a 400. Read their exact request/session/
 checkpoint/approved-revision/authority-epoch evidence through
 `GET /api/silas/directives/<request_id>`. The service inspects correlated
 completion first and safely continues only a proven native checkpoint on
