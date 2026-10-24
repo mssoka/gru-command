@@ -3230,6 +3230,8 @@ describe('supervisor — decision-backed failure guidance', () => {
     handle.emit({ type: 'error', error: 'tool runner hiccup', fatal: false });
     expect(decide).toHaveBeenCalledTimes(1);
     handle.emit({ type: 'error', error: 'API Error: 401 Invalid authentication credentials', fatal: false });
+    // Stopped at once, while the generic failure's decision is still pending.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
     await h.registry.disposeHandle(handle);
     for (const answer of answers) answer();
     await flushMicrotasks();
@@ -3239,10 +3241,11 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
-  it('a known wall still stops when its guidance record cannot be written (#492)', async () => {
+  it('a failed guidance record alone does not hold up a known wall\'s stop, and is logged (#492)', async () => {
     const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
       deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
-    const h = boot({ decide } as unknown as DecisionService);
+    const logs: { level: string; msg: string }[] = [];
+    const h = boot({ decide } as unknown as DecisionService, { log: (level, msg) => { logs.push({ level, msg }); } });
     const append = h.api.appendCustomEvent.bind(h.api);
     vi.spyOn(h.api, 'appendCustomEvent').mockImplementation((event) => {
       if (event.kind === 'supervision.guidance') throw new Error('SQLITE_BUSY: database is locked');
@@ -3254,6 +3257,8 @@ describe('supervisor — decision-backed failure guidance', () => {
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(logs).toContainEqual({ level: 'error', msg: 'supervision guidance record failed; stopping the known wall anyway' });
+    expect(decide).not.toHaveBeenCalled();
     h.dispose();
   });
 

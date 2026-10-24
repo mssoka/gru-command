@@ -1848,7 +1848,7 @@ export class Supervisor {
           },
         });
       } catch (error) {
-        // The stop is what matters; its guidance record is best-effort.
+        // A failed guidance record alone doesn't hold up the stop.
         this.log('error', 'supervision guidance record failed; stopping the known wall anyway', {
           agent_id: agent.agentId,
           error: String(error),
