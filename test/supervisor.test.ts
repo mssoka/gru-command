@@ -2636,13 +2636,15 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
           expect(f.rig.api.latestJobEvent(f.jobId, 'job.delivered')).toBeNull();
           return;
         }
+        // A known wall stops at once, while the generic failure's decision is still pending (#492).
+        if (kind === 'stop') expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
         answers[0]!(); await flushMicrotasks();
         if (kind === 'queued') {
           expect(answers).toHaveLength(2);
           expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
           answers[1]!(); await flushMicrotasks();
         }
-        // A known wall stops without a decision of its own (#492).
+        // It needs no decision of its own.
         if (kind === 'stop') expect(answers).toHaveLength(1);
       }
       if (kind === 'stop') {
@@ -2673,7 +2675,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
   it('preserves a newer controller while recovered429 generic guidance settles (GH-280 residual R11)', () => failedRecoveredRetry('newer'));
   it('awaits delayed default guidance before orphaning a recovered429 failed retry (GH-280 residual R11)', () => failedRecoveredRetry('delayed'));
   it('awaits queued default guidance before orphaning a recovered429 failed retry (GH-280 residual R11)', () => failedRecoveredRetry('queued'));
-  it('preserves queued provider-stop custody after a recovered429 failed retry (GH-280 residual R11)', () => failedRecoveredRetry('stop'));
+  it('stops a wall behind a pending decision at once and preserves provider-stop custody after a recovered429 failed retry (GH-280 residual R11, #492)', () => failedRecoveredRetry('stop'));
 
   it('retries a same-ID binding refusal once while preserving original unknown cleanup generation (GH-280 residual R11)', async () => {
     vi.useFakeTimers();
@@ -2759,8 +2761,10 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
           expect(f.replacement.promptCalls).toEqual([{ text: 'startup retry A', owner: `dispatch:${f.jobId}` }]);
           return;
         }
+        // A known wall stops at once, while the generic failure's decision is still pending (#492).
+        if (kind === 'stop') expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
         answers[0]!(); await flushMicrotasks();
-        // A known wall stops without a decision of its own (#492).
+        // It needs no decision of its own.
         expect(answers).toHaveLength(kind === 'stop' ? 1 : 2);
         expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
         answers[1]?.(); await flushMicrotasks();
@@ -2793,7 +2797,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
   it('retains bounded startup exhaustion quota-stop custody through owner re-arm (GH-280 residual R9)', () => failedStartupRetry('exhausted'));
   it('retains internally failed startup retry quota-stop custody through owner re-arm (GH-280 residual R9)', () => failedStartupRetry('internal'));
   it('awaits the full queued generic classification before startup-retry orphan settlement (GH-280 residual R9)', () => failedStartupRetry('queued'));
-  it('preserves newer queued provider-stop custody and owner re-arm after startup-retry failure (GH-280 residual R9)', () => failedStartupRetry('stop'));
+  it('stops a newer wall behind a pending decision at once and preserves provider-stop custody and owner re-arm after startup-retry failure (GH-280 residual R9, #492)', () => failedStartupRetry('stop'));
   it('preserves a newer intentional controller snapshot while old startup-retry guidance settles (GH-280 residual R9)', () => failedStartupRetry('newer'));
 
   it('refuses a queued startup retry after durable A-to-B rebind with unchanged native authority (GH-280 residual R9)', async () => {
@@ -3209,6 +3213,47 @@ describe('supervisor — decision-backed failure guidance', () => {
     });
     expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
     expect(decide).not.toHaveBeenCalled();
+    h.dispose();
+  });
+
+  it('a wall that follows a generic failure on a directive turn stops at once, though that failure\'s decision is pending and recovery disposes the handle (#492)', async () => {
+    const answers: (() => void)[] = [];
+    const decide = vi.fn((request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
+        answers.push(() => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled')));
+      }));
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-directive-generic-then-wall', null);
+    handle.pendingTurnSnapshot = { text: 'directive prompt', owner: 'silas-directive:generic-then-wall' };
+    h.registry.adopt(handle);
+    handle.emit({ type: 'turn_start' });
+    handle.emit({ type: 'error', error: 'tool runner hiccup', fatal: false });
+    expect(decide).toHaveBeenCalledTimes(1);
+    handle.emit({ type: 'error', error: 'API Error: 401 Invalid authentication credentials', fatal: false });
+    await h.registry.disposeHandle(handle);
+    for (const answer of answers) answer();
+    await flushMicrotasks();
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(decide).toHaveBeenCalledTimes(1);
+    h.dispose();
+  });
+
+  it('a known wall still stops when its guidance record cannot be written (#492)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    const h = boot({ decide } as unknown as DecisionService);
+    const append = h.api.appendCustomEvent.bind(h.api);
+    vi.spyOn(h.api, 'appendCustomEvent').mockImplementation((event) => {
+      if (event.kind === 'supervision.guidance') throw new Error('SQLITE_BUSY: database is locked');
+      return append(event);
+    });
+    const handle = new FakeHandle('minion', 'minion-wall-guidance-busy', null);
+    h.registry.adopt(handle);
+    handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
     h.dispose();
   });
 
