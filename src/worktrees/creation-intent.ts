@@ -53,6 +53,27 @@ export class RetainedCreationRefusalError extends Error {
   }
 }
 
+/** A strict continuation failed after adopting its receipt; the retained
+ * ref, receipt and any partial checkout are kept for inspection. */
+export class RetainedCreationFailedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RetainedCreationFailedError';
+  }
+}
+
+/** The retained receipt a continuation accepted: its token digest and the
+ * producer settlement that proved the original creation stopped. */
+export interface RetainedReceiptExpectation {
+  readonly receiptTokenSha256: string;
+  readonly producerSettlementSeq: number;
+}
+
+/** A creation token is custody authority: it never enters a note or event. */
+export function redactCreationTokens(text: string): string {
+  return text.replace(/gru-creation:[A-Za-z0-9-]+/gu, '<redacted-creation-token>');
+}
+
 /** The lane a creation receipt belongs to. Identity fields only — every one
  * is revalidated on read against the caller's request, never trusted. */
 export interface CreationIntentLane {

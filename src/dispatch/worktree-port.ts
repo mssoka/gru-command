@@ -97,9 +97,14 @@ export interface WorktreePort {
   }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
   /** Strict same-job continuation only: inspection is read-only and the
-   * create method refuses absent receipts/refs instead of resolving a base. */
+   * create method refuses absent receipts/refs instead of resolving a base,
+   * and any receipt other than the one the continuation accepted. */
   inspectRetainedJobCreation?(input: { readonly repoPath: string; readonly jobId: string }): Promise<RetainedJobCreationInspection>;
-  createRetainedJobWorktree?(input: { readonly repoPath: string; readonly jobId: string }): Promise<WorktreeLane>;
+  createRetainedJobWorktree?(input: {
+    readonly repoPath: string;
+    readonly jobId: string;
+    readonly expected: { readonly receiptTokenSha256: string; readonly producerSettlementSeq: number };
+  }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
     repoPath: string;
     roundId: string;

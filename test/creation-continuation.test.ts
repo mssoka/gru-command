@@ -1,215 +1,60 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, type Server as HttpServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { EventBus } from '../src/events/bus.js';
-import { LedgerApi } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
-import { loadConfig } from '../src/config.js';
-import { DispatchService } from '../src/dispatch/service.js';
-import { createDispatchServer } from '../src/dispatch/server.js';
-import type { WaveRunner } from '../src/dispatch/perkins.js';
-import type { AgentHandle } from '../src/runtime/types.js';
-import { repositoryGitEnv } from '../src/dispatch/perkins-review/artifacts.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { CreationContinuationConflictError, RecordNotFound } from '../src/ledger/api.js';
+import type { DispatchService } from '../src/dispatch/service.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { writeCreationIntent } from '../src/worktrees/creation-intent.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import {
+  cleanupContinuationFixtures, directory, git, httpHarness, managerFixture, receiptFiles, request, requestPayloadSha256,
+  retainedFixture, routeHarness, syntheticRetained, TOKEN, waitForState,
+} from './helpers/creation-continuation.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
-const TOKEN = 'synthetic-continuation-test-token';
-const repos: FixtureRepo[] = [];
-const dirs: string[] = [];
-const dbs: LedgerDb[] = [];
-const servers: { readonly server: HttpServer; readonly api: ReturnType<typeof createDispatchServer> }[] = [];
-afterEach(async () => {
-  vi.unstubAllEnvs();
-  while (servers.length > 0) {
-    const current = servers.pop()!;
-    current.api.dispose();
-    await new Promise<void>((resolve, reject) => current.server.close((error) => error ? reject(error) : resolve()));
-  }
-  while (dbs.length > 0) dbs.pop()!.close();
-  while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
-  while (repos.length > 0) repos.pop()!.cleanup();
-});
-
-function directory(): string {
-  const path = mkdtempSync(join(tmpdir(), 'gru-creation-continuation-'));
-  dirs.push(path);
-  return path;
-}
-
-function git(repo: FixtureRepo, args: readonly string[]): string {
-  return execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-C', repo.path, ...args], {
-    encoding: 'utf8', env: { ...repositoryGitEnv(false), GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
-}
-
-function managerFixture(name: string) {
-  const repo = makeFixtureRepo(name);
-  repos.push(repo);
-  const root = directory();
-  const preserveRoot = directory();
-  const db = new LedgerDb(directory());
-  dbs.push(db);
-  const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-  const worktrees = new WorktreeManager({ ledger, root, preserveRoot, setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
-  return { repo, root, ledger, worktrees };
-}
-
-/** A synthetic Git wrapper commits its first update-ref, then remains alive
- * past the close budget. WorktreeManager sends signals only to this owned
- * fixture child and records its later Node close event as producer cessation. */
-function committedStall(repo: FixtureRepo, branch: string): string {
-  const root = directory();
-  const originalPath = process.env.PATH ?? '';
-  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-  const script = join(root, 'git');
-  writeFileSync(script, [
-    '#!/usr/bin/env node',
-    'const cp = require("node:child_process"), fs = require("node:fs");',
-    'const args = process.argv.slice(2);',
-    `const real = ${JSON.stringify(realGit)};`,
-    `const branch = ${JSON.stringify(branch)};`,
-    `const once = ${JSON.stringify(join(root, 'stalled'))};`,
-    `if (args[0] !== 'update-ref' || !args.includes('--stdin')) { const r = cp.spawnSync(real, args, {stdio:'inherit'}); process.exit(r.status ?? 1); }`,
-    `const child = cp.spawn(real, args, {stdio:['pipe','pipe','pipe']});`,
-    'const stall = !fs.existsSync(once); if (stall) fs.writeFileSync(once, "1");',
-    'child.stdin.on("error", () => {}); process.stdin.pipe(child.stdin); child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);',
-    'let exited = false;',
-    'process.on("SIGTERM", () => {});',
-    'child.on("close", code => { exited = true; if (!stall) { process.exit(code ?? 1); } setInterval(() => {}, 1000); });',
-  ].join('\n') + '\n');
-  chmodSync(script, 0o755);
-  vi.stubEnv('PATH', `${root}:${process.env.PATH ?? ''}`);
-  return originalPath;
-}
-
-async function retainedFixture(jobId: string) {
-  const h = managerFixture(`retained-${jobId}`);
-  const job = h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Original briefing ${jobId}` });
-  h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: job.repo, repoPath: h.repo.path } });
-  h.ledger.setJobStatus(jobId, 'working');
-  const originalPath = committedStall(h.repo, `gru/${jobId}`);
-  await expect(h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId })).rejects.toThrow(/did not close within 1000ms/u);
-  vi.stubEnv('PATH', originalPath);
-  h.ledger.setJobStatus(jobId, 'blocked');
-  expect(h.ledger.getWorktree(jobId)).toBeNull();
-  const inspection = await h.worktrees.inspectRetainedJobCreation({ repoPath: h.repo.path, jobId });
-  expect(inspection.sha).toBe(git(h.repo, ['rev-parse', `refs/heads/gru/${jobId}`]));
-  return { ...h, job: h.ledger.getJob(jobId)!, inspection };
-}
-
-function fakeHandle(id: string, prompts: string[]): AgentHandle {
-  const capabilities = {
-    streaming: true, steer: 'native' as const, resume: 'file' as const,
-    images: false, thinking: false, thinkingLevelControl: false, followUp: false,
-  };
-  return {
-    role: 'minion', id, sessionFile: null, capabilities,
-    async prompt(text) { prompts.push(text); },
-    async steer() {}, async followUp() {}, subscribe() { return () => {}; },
-    health() { return { state: 'idle', lastActivity: null, sessionFile: null }; },
-    async dispose() {},
-  };
-}
-
-type RetainedFixture = Awaited<ReturnType<typeof retainedFixture>>;
-async function httpHarness(
-  h: Omit<RetainedFixture, 'inspection'> & { readonly inspection?: RetainedFixture['inspection'] },
-  workerGate?: PacingGate,
-  diskFloor?: Pick<DiskFloorGate, 'admitLane'>,
-  spawnFailure?: Error,
-) {
-  const configDir = directory();
-  writeFileSync(join(configDir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf8');
-  const config = loadConfig({ GRU_COMMAND_HOME: configDir }, '/home/tester');
-  const prompts: string[] = [];
-  const spawns: string[] = [];
-  const dispatch = new DispatchService({
-    ledger: h.ledger,
-    worktrees: h.worktrees,
-    ...(workerGate !== undefined ? { workerGate } : {}),
-    ...(diskFloor !== undefined ? { diskFloor } : {}),
-    spawner: async () => {
-      if (spawnFailure !== undefined) throw spawnFailure;
-      const id = `fixture-minion-${spawns.length + 1}`;
-      spawns.push(id);
-      return fakeHandle(id, prompts);
-    },
-  });
-  const api = createDispatchServer({ config, dispatch, wave: {} as WaveRunner, ledger: h.ledger, pendingProducerBlockers: () => [] });
-  const server = createServer((req, res) => {
-    const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
-    if (!api.requestHook(req, res, path)) { res.writeHead(404); res.end(); }
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  servers.push({ server, api });
-  const address = server.address() as AddressInfo;
-  return { base: `http://127.0.0.1:${address.port}`, dispatch, ledger: h.ledger, worktrees: h.worktrees, prompts, spawns, repo: h.repo, jobId: h.job.id, inspection: h.inspection ?? null };
-}
-
-async function request(base: string, method: 'GET' | 'POST', body?: unknown, token: string | null = TOKEN) {
-  const response = await fetch(`${base}/api/dispatch/creation-continuation${method === 'GET' ? `?job_id=${encodeURIComponent(String((body as { job_id?: string } | undefined)?.job_id ?? ''))}&request_id=${encodeURIComponent(String((body as { request_id?: string } | undefined)?.request_id ?? ''))}` : ''}`, {
-    method,
-    ...(body === undefined || method === 'GET' ? {} : { headers: { 'content-type': 'application/json', ...(token === null ? {} : { authorization: `Bearer ${token}` }) }, body: JSON.stringify(body) }),
-    ...(method === 'GET' ? { headers: token === null ? {} : { authorization: `Bearer ${token}` } } : {}),
-  });
-  return { status: response.status, body: await response.json() as Record<string, unknown> };
-}
-
-async function waitForState(base: string, jobId: string, requestId: string, expected: string) {
-  let last: Record<string, unknown> = {};
-  await vi.waitFor(async () => {
-    const current = await request(base, 'GET', { job_id: jobId, request_id: requestId });
-    last = current.body;
-    expect((current.body['readback'] as Record<string, unknown>)?.['state']).toBe(expected);
-  }, { timeout: 10_000 });
-  return last['readback'] as Record<string, unknown>;
-}
-
-function requestPayloadSha256(values: unknown): string {
-  return createHash('sha256').update(JSON.stringify(values), 'utf8').digest('hex');
-}
-
-const receiptFiles = (repo: FixtureRepo): string[] => {
-  const common = git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-  const directory = join(common, 'gru-creation');
-  return existsSync(directory) ? readdirSync(directory).filter((entry) => entry.endsWith('.json')) : [];
-};
+afterEach(cleanupContinuationFixtures);
 
 describe('same-job retained initial-creation continuation', () => {
-  it('routes an authenticated continuation request to its durable owner', async () => {
-    const configDir = directory();
-    writeFileSync(join(configDir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf8');
-    const config = loadConfig({ GRU_COMMAND_HOME: configDir }, '/home/tester');
-    const db = new LedgerDb(directory());
-    dbs.push(db);
-    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+  it('routes an authenticated continuation request to its durable owner and maps every outcome to its status', async () => {
     const readback = { job_id: 'route-job', request_id: 'route-request', state: 'accepted' };
-    const requestContinuation = vi.fn(async () => ({ created: true, readback }));
-    const dispatch = { requestCreationContinuation: requestContinuation } as unknown as DispatchService;
-    const api = createDispatchServer({ config, dispatch, wave: {} as WaveRunner, ledger, pendingProducerBlockers: () => [] });
-    const server = createServer((req, res) => {
-      const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
-      if (!api.requestHook(req, res, path)) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); }
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    servers.push({ server, api });
-    const address = server.address() as AddressInfo;
-    const response = await request(`http://127.0.0.1:${address.port}`, 'POST', { job_id: 'route-job', request_id: 'route-request' });
-    expect(response.status).toBe(202);
-    expect(response.body['readback']).toEqual(readback);
+    const outcomes: (() => unknown)[] = [
+      () => ({ created: true, readback }),
+      () => ({ created: false, readback }),
+      () => ({ created: true, readback: { ...readback, state: 'refused' } }),
+      () => ({ created: false, readback: { ...readback, state: 'custody-unknown' } }),
+      () => { throw new CreationContinuationConflictError('request id route-request was already used with a different payload'); },
+      () => { throw new RecordNotFound('job "route-job" not found'); },
+    ];
+    const requestContinuation = vi.fn(async () => outcomes.shift()!());
+    const readContinuation = vi.fn((jobId: string, requestId: string) => requestId === 'route-request' ? { ...readback, job_id: jobId } : null);
+    const dispatch = { requestCreationContinuation: requestContinuation, getCreationContinuationReadback: readContinuation } as unknown as DispatchService;
+    const base = await routeHarness(dispatch);
+    const body = { job_id: 'route-job', request_id: 'route-request' };
+    const statuses: [number, unknown][] = [];
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const response = await request(base, 'POST', body);
+      statuses.push([response.status, response.body['error'] ?? null]);
+    }
+    expect(statuses).toEqual([
+      [202, null], [200, null], [409, 'creation_continuation_refused'], [409, 'creation_continuation_unknown'],
+      [409, 'creation_continuation_conflict'], [404, 'not_found'],
+    ]);
     expect(requestContinuation).toHaveBeenCalledWith({ jobId: 'route-job', requestId: 'route-request' });
-    const extraField = await request(`http://127.0.0.1:${address.port}`, 'POST', { job_id: 'route-job', request_id: 'other-request', branch: 'gru/forged' });
+    const extraField = await request(base, 'POST', { ...body, branch: 'gru/forged' });
     expect(extraField.status).toBe(400);
-    expect(requestContinuation).toHaveBeenCalledTimes(1);
+    expect(requestContinuation).toHaveBeenCalledTimes(6);
+
+    const get = async (query: string) => {
+      const response = await fetch(`${base}/api/dispatch/creation-continuation${query}`, { headers: { authorization: `Bearer ${TOKEN}` } });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    expect(await get('?job_id=route-job&request_id=route-request')).toEqual({ status: 200, body: { readback } });
+    expect(await get('?job_id=route-job&request_id=unknown-request')).toMatchObject({ status: 404, body: { error: 'not_found' } });
+    for (const query of ['?job_id=route-job', '?request_id=route-request', '?job_id=route-job&request_id=', '?job_id=a&job_id=b&request_id=route-request', '?job_id=route-job&request_id=route-request&branch=gru/forged']) {
+      expect(await get(query), query).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+    }
+    expect(readContinuation).toHaveBeenCalledTimes(2);
   });
 
   it('adopts the exact receipt-owned branch/base/provenance and delivers the original job once through authenticated API', async () => {
@@ -241,6 +86,12 @@ describe('same-job retained initial-creation continuation', () => {
     });
     expect(readback['admission']).toMatchObject({ agent_id: api.spawns[0], event_seq: expect.any(Number) });
     expect(readback['delivery']).toMatchObject({ agent_id: api.spawns[0], sha: inspection.sha, event_seq: expect.any(Number) });
+    // Directive correlation joins job.delivered on request_id: the
+    // continuation's delivery carries only its own namespaced identity.
+    const delivered = api.ledger.listJobEventsByKinds(api.jobId, ['job.delivered']);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.payload).toMatchObject({ source: 'dispatch', creation_continuation_request_id: requestId, creation_continuation_generation: readback['generation'] });
+    expect(delivered[0]!.payload).not.toHaveProperty('request_id');
     expect(JSON.stringify({ readback, timeline: api.ledger.getCreationContinuation(api.jobId, requestId) })).not.toContain('gru-creation:');
     expect(api.spawns).toHaveLength(1);
     expect(api.prompts).toHaveLength(1);
@@ -279,31 +130,75 @@ describe('same-job retained initial-creation continuation', () => {
     expect(api.ledger.listJobEventsByKinds(api.jobId, ['job.handoff'], { limit: 5 })).toHaveLength(1);
   });
 
-  it('refuses jobs with non-blocked, agent or live-admission custody state', async () => {
-    for (const guard of ['not-blocked', 'amended-contract', 'existing-agent', 'existing-admission'] as const) {
-      const h = await retainedFixture(`continuation-existing-${guard}`);
-      let releaseAdmission: (() => void) | null = null;
-      if (guard === 'not-blocked') h.ledger.setJobStatus(h.job.id, 'working');
-      else if (guard === 'amended-contract') {
-        const contract = h.ledger.effectiveContract(h.job.id)!;
-        expect(h.ledger.addJobAmendment({ jobId: h.job.id, body: 'Synthetic contract amendment', approval: { by: 'fixture-owner', reference: 'synthetic fixture approval' }, expectedContractSha256: contract.contractSha256, effect: 'administrative' }).status).toBe('accepted');
-      } else if (guard === 'existing-agent') h.ledger.registerAgent({ id: 'pre-existing-agent', role: 'minion', jobId: h.job.id });
-      else releaseAdmission = h.ledger.beginJobAdmission(h.job.id, 'fixture pre-existing admission');
-      const api = await httpHarness(h);
-      const response = await request(api.base, 'POST', { job_id: api.jobId, request_id: `existing-${guard}` });
-      expect(response.status).toBe(409);
-      expect((response.body['readback'] as Record<string, unknown>)).toMatchObject({ state: 'refused', active: false });
-      expect((response.body['readback'] as Record<string, unknown>)['reason']).toMatch(
-        guard === 'not-blocked' ? /not blocked/u
-          : guard === 'amended-contract' ? /amended contract/u
-            : guard === 'existing-agent' ? /agent record/u : /live admission/u,
-      );
-      expect(api.ledger.getWorktree(api.jobId)).toBeNull();
-      expect(api.spawns).toHaveLength(0);
-      expect(api.prompts).toHaveLength(0);
-      expect(git(api.repo, ['rev-parse', `refs/heads/gru/${api.jobId}`])).toBe(h.inspection.sha);
-      expect(receiptFiles(api.repo)).toHaveLength(1);
-      releaseAdmission?.();
+  it('refuses every job outside a blocked, unamended, workerless initial PR dispatch with its custody kept', async () => {
+    const h = managerFixture('continuation-scope');
+    const other = makeFixtureRepo('another-repository');
+    try {
+      const guards = [
+        'not-blocked', 'amended-contract', 'existing-agent', 'existing-admission', 'phase-handoff', 'pr-url', 'target-ref', 'target-sha',
+        'non-pr-deliverable', 'worker-history', 'delivery-history', 'duplicate-handoff', 'mismatched-handoff', 'live-directive',
+        'pending-rebrief', 'directive-request-id',
+      ] as const;
+      const harness = await httpHarness({ ...h, job: syntheticRetained(h, 'continuation-scope-anchor').job });
+      for (const guard of guards) {
+        const jobId = `continuation-scope-${guard}`;
+        const retained = syntheticRetained(h, jobId, {
+          ...(guard === 'non-pr-deliverable' ? { deliverable: 'artifact' as const } : {}),
+          ...(guard === 'mismatched-handoff' ? { handoffRepoPath: other.path } : {}),
+        });
+        let releaseAdmission: (() => void) | null = null;
+        let requestId = `scope-${guard}`;
+        if (guard === 'not-blocked') h.ledger.setJobStatus(jobId, 'working');
+        else if (guard === 'amended-contract') {
+          const contract = h.ledger.effectiveContract(jobId)!;
+          expect(h.ledger.addJobAmendment({ jobId, body: 'Synthetic contract amendment', approval: { by: 'fixture-owner', reference: 'synthetic fixture approval' }, expectedContractSha256: contract.contractSha256, effect: 'administrative' }).status).toBe('accepted');
+        } else if (guard === 'existing-agent') h.ledger.registerAgent({ id: `${jobId}-agent`, role: 'minion', jobId });
+        else if (guard === 'existing-admission') releaseAdmission = h.ledger.beginJobAdmission(jobId, 'fixture pre-existing admission');
+        else if (guard === 'phase-handoff') h.ledger.beginPhaseHandoff({ jobId, source: 'dispatch', intent: { kind: 'gru-decision', decision: 'fixture decision' } });
+        else if (guard === 'pr-url') h.ledger.setJobPr(jobId, 'https://example.invalid/pull/1');
+        // A legacy row may carry report targets on a PR-owing job.
+        else if (guard === 'target-ref') h.db.handle.prepare('UPDATE jobs SET target_ref = ? WHERE id = ?').run('refs/heads/fixture', jobId);
+        else if (guard === 'target-sha') h.db.handle.prepare('UPDATE jobs SET target_sha = ? WHERE id = ?').run(retained.sha, jobId);
+        else if (guard === 'worker-history') h.ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId, payload: { agentId: 'earlier-minion', worktree: '/nowhere', branch: retained.branch } });
+        else if (guard === 'delivery-history') h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { agentId: 'earlier-minion', source: 'dispatch', sha: retained.sha, work_revision: 0 } });
+        else if (guard === 'duplicate-handoff') h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: retained.job.repo, repoPath: h.repo.path } });
+        else if (guard === 'live-directive') h.ledger.beginDirectiveIntent({ jobId, directive: 'fixture directive', holder: 'silas-ops' });
+        else if (guard === 'pending-rebrief') h.ledger.beginPendingRebrief({ jobId, note: 'fixture re-brief', briefing: null });
+        else if (guard === 'directive-request-id') {
+          h.ledger.addJob({ id: 'directive-owner', repo: retained.job.repo, title: 'directive owner', baseBranch: 'main', briefing: 'directive owner' });
+          requestId = h.ledger.beginDirectiveIntent({ jobId: 'directive-owner', directive: 'fixture directive', holder: 'silas-ops', requestId: 'shared-request-id' }).record.requestId;
+        }
+        const response = await request(harness.base, 'POST', { job_id: jobId, request_id: requestId });
+        expect(response.status, guard).toBe(409);
+        const readback = response.body['readback'] as Record<string, unknown>;
+        expect(readback, guard).toMatchObject({ state: 'refused', active: false });
+        expect(readback['reason'], guard).toMatch({
+          'not-blocked': /is working, not blocked/u,
+          'amended-contract': /amended contract/u,
+          'existing-agent': /already has an agent record/u,
+          'existing-admission': /already has a live admission/u,
+          'phase-handoff': /prior phase-handoff contract/u,
+          'pr-url': /report or pull-request state/u,
+          'target-ref': /report or pull-request state/u,
+          'target-sha': /report or pull-request state/u,
+          'non-pr-deliverable': /not a PR-owing initial dispatch/u,
+          'worker-history': /worker or delivery history/u,
+          'delivery-history': /worker or delivery history/u,
+          'duplicate-handoff': /no unique original job.handoff/u,
+          'mismatched-handoff': /records repository ".+", but its handoff path resolves to "another-repository"/u,
+          'live-directive': /live directive request .* owns the lane/u,
+          'pending-rebrief': /pending re-brief that owns the lane/u,
+          'directive-request-id': /names a directive request/u,
+        }[guard]);
+        expect(h.ledger.getWorktree(jobId), guard).toBeNull();
+        expect(git(h.repo, ['rev-parse', `refs/heads/${retained.branch}`]), guard).toBe(retained.sha);
+        expect(receiptFiles(h.repo), guard).toContain(`${createHash('sha256').update(retained.branch).digest('hex').slice(0, 40)}.json`);
+        releaseAdmission?.();
+      }
+      expect(harness.spawns).toHaveLength(0);
+      expect(harness.prompts).toHaveLength(0);
+    } finally {
+      other.cleanup();
     }
   });
 
@@ -311,7 +206,7 @@ describe('same-job retained initial-creation continuation', () => {
     const h = await retainedFixture('continuation-queued');
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
     const occupied = await gate.acquireWorkerTurn({ id: 'fixture-occupant', label: 'fixture occupant', jobId: 'other-job' });
-    const api = await httpHarness(h, gate);
+    const api = await httpHarness(h, { service: { workerGate: gate } });
     const requestId = 'queued-continuation';
     const accepted = await request(api.base, 'POST', { job_id: api.jobId, request_id: requestId });
     expect(accepted.status).toBe(202);
@@ -334,7 +229,7 @@ describe('same-job retained initial-creation continuation', () => {
         releaseFloor = () => resolve({ waitedMs: 5, done() {} });
       })),
     };
-    const api = await httpHarness(h, undefined, floor);
+    const api = await httpHarness(h, { service: { diskFloor: floor } });
     const requestId = 'disk-floor-continuation';
     const accepted = await request(api.base, 'POST', { job_id: api.jobId, request_id: requestId });
     expect(accepted.status).toBe(202);
@@ -351,7 +246,7 @@ describe('same-job retained initial-creation continuation', () => {
 
   it('records a known swept spawn failure without inventing an admission or delivery', async () => {
     const h = await retainedFixture('continuation-spawn-failure');
-    const api = await httpHarness(h, undefined, undefined, new Error('synthetic spawn failure'));
+    const api = await httpHarness(h, { spawnFailure: new Error('synthetic spawn failure') });
     const requestId = 'spawn-failure-request';
     const accepted = await request(api.base, 'POST', { job_id: api.jobId, request_id: requestId });
     expect(accepted.status).toBe(202);
@@ -413,7 +308,7 @@ describe('same-job retained initial-creation continuation', () => {
       producerSettlementSeq: h.inspection.producerSettlementSeq, receiptTokenSha256: h.inspection.receiptTokenSha256,
     });
     expect(accepted.timeline.state).toBe('accepted');
-    const lane = await h.worktrees.createRetainedJobWorktree({ repoPath: h.repo.path, jobId: h.job.id });
+    const lane = await h.worktrees.createRetainedJobWorktree({ repoPath: h.repo.path, jobId: h.job.id, expected: h.inspection });
     h.ledger.recordCreationContinuationState({
       jobId: h.job.id, requestId, generation: accepted.timeline.identity.generation,
       stage: 'custody-adopted', details: {
@@ -493,7 +388,7 @@ describe('same-job retained initial-creation continuation', () => {
     const h = managerFixture('no-fresh-base');
     const jobId = 'continuation-no-fresh-base';
     h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: 'no fresh base', baseBranch: 'main', briefing: 'original' });
-    await expect(h.worktrees.createRetainedJobWorktree({ repoPath: h.repo.path, jobId })).rejects.toThrow(/receipt .* absent|receipt .* unreadable/u);
+    await expect(h.worktrees.createRetainedJobWorktree({ repoPath: h.repo.path, jobId, expected: { receiptTokenSha256: '0'.repeat(64), producerSettlementSeq: 1 } })).rejects.toThrow(/receipt .* absent|receipt .* unreadable/u);
     expect(git(h.repo, ['branch', '--list', `gru/${jobId}`])).toBe('');
     expect(h.ledger.getWorktree(jobId)).toBeNull();
 
@@ -501,7 +396,7 @@ describe('same-job retained initial-creation continuation', () => {
     const branch = `refs/heads/gru/${retained.job.id}`;
     git(retained.repo, ['update-ref', '-d', branch]);
     const receiptBefore = receiptFiles(retained.repo);
-    await expect(retained.worktrees.createRetainedJobWorktree({ repoPath: retained.repo.path, jobId: retained.job.id })).rejects.toThrow(/no branch ref|cannot clear the receipt|new base/u);
+    await expect(retained.worktrees.createRetainedJobWorktree({ repoPath: retained.repo.path, jobId: retained.job.id, expected: retained.inspection })).rejects.toThrow(/no branch ref|cannot clear the receipt|new base/u);
     expect(receiptFiles(retained.repo)).toEqual(receiptBefore);
     expect(retained.ledger.getWorktree(retained.job.id)).toBeNull();
     expect(git(retained.repo, ['branch', '--list', `gru/${retained.job.id}`])).toBe('');
@@ -522,7 +417,12 @@ describe('same-job retained initial-creation continuation', () => {
         const receipt = join(common, 'gru-creation', `${createHash('sha256').update(h.inspection.branch).digest('hex').slice(0, 40)}.json`);
         writeFileSync(receipt, '{ malformed receipt\n');
       } else if (guard === 'symbolic-ref') {
-        git(h.repo, ['symbolic-ref', branch, 'refs/heads/main']);
+        // Rewrite the loose ref in place: its own reflog still names the
+        // receipt and the alias resolves to the same base, so only the
+        // symbolic-ref guard can refuse it.
+        git(h.repo, ['update-ref', 'refs/heads/fixture-alias', h.inspection.sha]);
+        const common = git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+        writeFileSync(join(common, branch), 'ref: refs/heads/fixture-alias\n');
       } else if (guard === 'moved-ref') {
         const moved = h.repo.commitFile('changed-base.txt', 'moved\n', 'synthetic moved base');
         git(h.repo, ['update-ref', '-m', 'foreign move', branch, moved]);
@@ -539,7 +439,7 @@ describe('same-job retained initial-creation continuation', () => {
       await expect(h.worktrees.inspectRetainedJobCreation({ repoPath: h.repo.path, jobId: h.job.id })).rejects.toThrow(
         guard === 'lock' ? /unsettled ref transaction/u
           : guard === 'unreadable-receipt' ? /not valid JSON/u
-            : guard === 'symbolic-ref' ? /symbolic ref|reflog/u
+            : guard === 'symbolic-ref' ? /is a symbolic ref/u
             : guard === 'moved-ref' ? /names base/u
               : guard === 'foreign-holder' ? /held by a worktree/u
                 : guard === 'foreign-checkout' ? /checkout at/u
