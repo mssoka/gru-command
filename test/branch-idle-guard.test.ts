@@ -1,4 +1,4 @@
-import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -1954,10 +1954,11 @@ describe('branch-idle guard', () => {
       h.ledger.setJobStatus('terminal-merged', 'merged');
       await createLaneJob(h, repo, { jobId: 'terminal-done', status: 'delivered' });
       h.ledger.beginPendingRebrief({ jobId: 'terminal-done', note: 'n', briefing: 'b' });
-      h.ledger.setJobStatus('terminal-done', 'done');
+      markLegacyTerminalJobFixture(h.ledger, 'terminal-done', 'done');
       await createLaneJob(h, repo, { jobId: 'terminal-binned', status: 'delivered' });
       h.ledger.beginPendingRebrief({ jobId: 'terminal-binned', note: 'n', briefing: 'b' });
-      h.ledger.setJobStatus('terminal-binned', 'binned');
+      // Binned before pending markers refused a bin (legacy history).
+      markLegacyTerminalJobFixture(h.ledger, 'terminal-binned', 'binned');
       for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done'], ['terminal-binned', 'binned']] as const) {
         const refused = await postReview(h, { job_id: jobId });
         expect(refused.status).toBe(400);

@@ -8,7 +8,7 @@ import { adapterCessationEvidence } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import { LIVE_DIRECTIVE_STATES, RESTART_CLEANUP_UNCONFIRMED, UNPROVEN_DIRECTIVE_CESSATION } from '../ledger/directives.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DecisionService } from '../decisions/types.js';
 import {
@@ -3881,7 +3881,7 @@ export class Supervisor {
     for (const [handle, originalJobId] of this.retainedDirectiveProducers) {
       if (originalJobId !== jobId) continue;
       if (this.restartCessationConfirmed(handle)) this.retainedDirectiveProducers.delete(handle);
-      else retained.push(`unproven directive producer cessation: ${handle.id}`);
+      else retained.push(`${UNPROVEN_DIRECTIVE_CESSATION} ${handle.id}`);
     }
     const unjournaled: string[] = [];
     for (const [handle, cleanup] of this.rejectedRestartCleanup) {
@@ -3893,7 +3893,7 @@ export class Supervisor {
       } catch (error) {
         this.log('error', 'restart cleanup journal unavailable — custody retained', { agent_id: handle.id, error: String(error) });
       }
-      if (cleanup.debt === null) unjournaled.push(`restart cleanup unconfirmed: ${handle.id} (pending journal write failed)`);
+      if (cleanup.debt === null) unjournaled.push(`${RESTART_CLEANUP_UNCONFIRMED} ${handle.id} (pending journal write failed)`);
     }
     const rejected = this.cleanupJournal.unresolved(jobId).map(restartCleanupDiagnostic);
     const supervised = this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {

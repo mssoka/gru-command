@@ -8,6 +8,7 @@ import { computeSilasDigest, digestActionCount, SilasDriver, type SilasOpsDigest
 import { LedgerApi, type DecisionRecord, type EventRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { AgentHandle } from '../src/runtime/types.js';
+import { directiveRetirementInputs } from './helpers/directive-native-fixture.js';
 
 const HEAD = 'a'.repeat(40);
 const NEXT_HEAD = 'b'.repeat(40);
@@ -220,7 +221,8 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
       } else {
         const intent = ledger.beginDirectiveIntent({ jobId: 'corrective-job', directive: 'Interrupted correction.', holder: 'fixture' });
         ledger.retireInterruptedDirective({ requestId: intent.record.requestId, expectedJobId: 'corrective-job', expectedState: 'dispatching',
-          expectedPayloadHash: intent.record.payloadHash, expectedHead: HEAD, lane: { id: 'fixture-lane', resolvedHead: HEAD },
+          expectedPayloadHash: intent.record.payloadHash, expectedHead: HEAD, ...directiveRetirementInputs(ledger, intent.record.requestId),
+          lane: { id: 'fixture-lane', resolvedHead: HEAD },
           reason: 'Fixture producer cessation was proven.', by: 'owner' });
         expect(ledger.hasOpenDirectiveRecoveryHold('corrective-job')).toBe(true);
       }

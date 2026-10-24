@@ -475,14 +475,53 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
   }
   const debt = deps.ledger.openDirectiveRecoveryDebt(requestId, reason);
   const current = deps.ledger.directiveCurrentAuthority(row.jobId);
+  const custody = deps.ledger.directiveCustodyGaps(row);
   postRecoveryIncident(deps.notifications, { kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
     title: `Directive ${requestId}: concrete Gru recovery decision owed (job ${row.jobId})`,
     detail: `Request ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
       `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}. Inspect GET /api/silas/directives/${requestId}, ` +
-      `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
-      'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
-      'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.',
+      (custody.length > 0
+        ? `but its producer custody is unknown (${custody.join('; ')}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`
+        : `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
+          'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
+          'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.'),
     ...(row.admissionMinion === null ? {} : { agentId: row.admissionMinion }), dedupe: 'active' });
+}
+
+/** The card text that hands an unknown-custody request to the owner: Gru
+ * asks, it never abandons. */
+function ownerAbandonmentAsk(requestId: string): string {
+  return `ask the owner whether to abandon it (POST /api/silas/directives/${requestId}/abandon with by "owner" and confirm_intent true; ` +
+    'it records the outcome as unknown and holds the lane). Never call /abandon yourself.';
+}
+
+/** A live request on a terminal job never runs again: the job merged, or
+ * went terminal before live directives refused a terminal status write
+ * (a legacy bin or done). Completion still settles from exact native
+ * evidence (bookkeeping only); otherwise the request stays visible on an
+ * unbound card, never hidden behind the terminal status. */
+export function observeTerminalJobDirective(deps: DirectiveProgressDeps, requestId: string): void {
+  const row = deps.ledger.getDirective(requestId);
+  const job = row === null ? null : deps.ledger.getJob(row.jobId);
+  if (row === null || isDirectiveTerminal(row.state) || job === null || !isJobTerminal(job.status)) return;
+  let evidence = 'no exact native completion evidence';
+  if (row.nativeTarget !== null) {
+    try {
+      if (settleNativeDirective(deps, deps.ledger.directiveTurnIdentity(requestId))) return;
+    } catch (error) { evidence = String(error); }
+  }
+  const current = deps.ledger.getDirective(requestId) ?? row;
+  const kind = `silas.directive-unreconciled.${requestId}`;
+  // A card bound to the admission minion while the job was live reads as a
+  // closed receipt now that the job is terminal: replace it, unbound.
+  const prior = deps.ledger.findNotificationByKind(kind, 'active');
+  if (prior !== null && prior.agentId !== null && prior.routing === 'action-required') deps.ledger.resolveNotificationById(prior.id, 'directive-terminal-job-card');
+  postRecoveryIncident(deps.notifications, { kind, routing: 'action-required', severity: 'error',
+    title: `Directive ${requestId} is still ${current.state} on ${job.status} job ${row.jobId}`,
+    detail: `Request ${requestId} (payload_hash ${row.payloadHash}) has no terminal receipt, but job ${row.jobId} is ${job.status}: it never runs again ` +
+      `and its outcome stays UNKNOWN (${evidence}). Inspect GET /api/silas/directives/${requestId}. Retire it with POST /api/silas/directives/${requestId}/retire ` +
+      `when the service can verify cessation; if its producer custody is unknown, ${ownerAbandonmentAsk(requestId)} Neither claims completion or no effect.`,
+    dedupe: 'active' });
 }
 
 /** One service owns all background continuations. Bounded round-robin
@@ -517,6 +556,12 @@ export class DirectiveProgressService {
     for (const row of rows) {
       cursor = this.deps.ledger.directiveRowid(row.requestId) ?? cursor;
       if (this.active.has(row.requestId) || this.deps.ledger.listJobAdmissions(row.jobId).length > 0) continue;
+      const job = this.deps.ledger.getJob(row.jobId);
+      if (job === null) continue;
+      if (isJobTerminal(job.status)) {
+        observeTerminalJobDirective(this.deps, row.requestId);
+        continue;
+      }
       // Publication may run inside synchronous intake before its HTTP owner
       // reserves. Observe only after that turn, rechecking ownership; this
       // never provides no-effect proof or permission to dispatch a null target.
@@ -528,8 +573,6 @@ export class DirectiveProgressService {
         });
         continue;
       }
-      const job = this.deps.ledger.getJob(row.jobId);
-      if (job === null || isJobTerminal(job.status)) continue;
       if (this.deps.ledger.recoveryOwnerBasis('directive', row.requestId).owned) {
         surfaceRecoveryOwnerTransfer(this.deps, 'directive', row.requestId);
         continue;

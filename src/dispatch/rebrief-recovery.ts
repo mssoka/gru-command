@@ -431,6 +431,11 @@ export function observePendingRebriefs(
       // mint a delivery.
       const job = deps.ledger.getJob(jobId);
       if (job !== null && isJobTerminal(job.status)) {
+        // A merge is an observed fact, never custody evidence: markers whose
+        // original producer custody is unproven stay visible, not retired.
+        // (`done` and binned refuse pending markers; a terminal job reached
+        // before that refusal keeps the old administrative retirement.)
+        if (job.status === 'merged' && surfaceUnprovenMergedRebriefs(deps, jobId, group)) continue;
         const retirement = retireTerminalRebriefs(deps.ledger, job, group);
         if (retirement.retired.length > 0) {
           retired += 1;
@@ -558,6 +563,27 @@ function retireTerminalRebriefs(
     reason: TERMINAL_REBRIEF_RETIREMENT_REASON,
     candidates,
   });
+}
+
+/** True (and the job-keyed card posted, unbound) when a merged job's
+ * pending marker generation has no proven producer cessation. */
+function surfaceUnprovenMergedRebriefs(deps: ReconcileRebriefDeps, jobId: string, group: readonly PendingRebriefRecord[]): boolean {
+  const marker = group.find((row) => row.kind === 'silas.rebrief') ?? group[0];
+  if (marker === undefined) return false;
+  const lane = deps.worktrees.listWorktrees({ jobId }).find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+  const unproven = deps.ledger.rebriefProgressBlockers(marker.id, lane?.id ?? '');
+  if (unproven.length === 0) return false;
+  const kind = `silas.rebrief-unreconciled.${jobId}`;
+  const prior = deps.ledger.findNotificationByKind(kind, 'active');
+  if (prior !== null && prior.agentId !== null && prior.routing === 'action-required') deps.ledger.resolveNotificationById(prior.id, 'rebrief-merged-job-card');
+  postRecoveryIncident(deps.notifications, { kind, routing: 'action-required', severity: 'error',
+    title: `Re-brief markers still pending on merged job ${jobId}`,
+    detail: `Pending re-brief markers ${group.map((row) => `${row.id} (${row.kind})`).join(', ')} remain on merged job ${jobId} with no proof that their ` +
+      `original producer ceased (${unproven.join('; ')}); a merge is not custody evidence, so they are not retired. Inspect GET /api/silas/rebriefs/${marker.id}. ` +
+      `If their producer custody is unknown, ask the owner whether to abandon them (POST /api/silas/rebriefs/${marker.id}/abandon with by "owner" and confirm_intent true); ` +
+      'never call /abandon yourself.',
+    dedupe: 'active' });
+  return true;
 }
 
 function escalateRecoveryFailure(
