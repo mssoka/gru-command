@@ -192,6 +192,8 @@ export interface HarnessOptions {
   readonly prompt?: (text: string) => Promise<void>;
   readonly health?: AgentHandle['health'];
   readonly disposeFailure?: Error;
+  /** Runs once a minion is spawned, before dispatch checks the job again. */
+  readonly afterSpawn?: () => void;
   readonly service?: Partial<Omit<DispatchServiceOptions, 'ledger' | 'worktrees' | 'spawner'>>;
   readonly serverLog?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -213,6 +215,7 @@ export async function httpHarness(h: HarnessSource, options: HarnessOptions = {}
       if (options.spawnFailure !== undefined) throw options.spawnFailure;
       const id = `fixture-minion-${spawns.length + 1}`;
       spawns.push(id);
+      options.afterSpawn?.();
       return fakeHandle(id, prompts, {
         disposed, ...(options.prompt === undefined ? {} : { prompt: options.prompt }), ...(options.health === undefined ? {} : { health: options.health }),
         ...(options.disposeFailure === undefined ? {} : { disposeFailure: options.disposeFailure }),

@@ -877,13 +877,6 @@ export class DispatchService {
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
           ...(parentNativeTools.length > 0 ? { nativeTools: parentNativeTools } : {}),
         });
-        try {
-          assertHandoff();
-        assertAdmissible();
-        } catch (error) {
-          await handle.dispose();
-          throw error;
-        }
       } catch (error) {
         // The lane cannot start — release the pacing slot, sweep the fresh
         // worktree (preserve first, per ruling 18c) and block the job.
@@ -891,11 +884,6 @@ export class DispatchService {
         await this.sweepQuietly(worktree.id);
         throw error;
       }
-      // Register the minion lane binding OURSELVES (idempotent): the
-      // board engine's spawn-envelope registration is an observer, never
-      // a precondition — dispatch must not depend on listener ordering.
-      // Issue #161: a dispatched minion is explicitly TOP-LEVEL (legacy
-      // rows stay unknown; the marker is never retro-fitted).
       // A minion abandoned before its prompt is disposed. Its row says so and
       // its lane is released as a refused spawn's is only once the disposal
       // resolved; a failed one may leave it running, so nothing is released.
@@ -912,6 +900,17 @@ export class DispatchService {
         await this.sweepQuietly(worktree.id);
         throw error;
       };
+      try {
+        assertHandoff();
+        assertAdmissible();
+      } catch (error) {
+        await abandonBeforePrompt(error, false);
+      }
+      // Register the minion lane binding OURSELVES (idempotent): the
+      // board engine's spawn-envelope registration is an observer, never
+      // a precondition — dispatch must not depend on listener ordering.
+      // Issue #161: a dispatched minion is explicitly TOP-LEVEL (legacy
+      // rows stay unknown; the marker is never retro-fitted).
       // A throw from any write after the spawn abandons the minion: no
       // unprompted minion outlives a failed dispatch.
       let registered = false;

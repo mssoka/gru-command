@@ -1532,11 +1532,14 @@ export class WorktreeManager {
         // holds the lane and the receipt may already be spent.
         if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error;
         if (requireRetained) {
-          // A refusal, or setup processes still running in the checkout,
-          // retain everything. Any other failure rolls the checkout back
-          // under the receipt's own token and keeps the ref and receipt, so
-          // a later continuation adopts them again.
-          if (error instanceof RetainedCreationRefusalError || (error instanceof WorktreeSetupError && error.processesRemain)) throw error;
+          // A refusal retains everything, and so does anything still running
+          // there: a setup step's process group, or any process rooted in
+          // the checkout (a detached daemon a step started included). Any
+          // other failure rolls the checkout back under the receipt's own
+          // token and keeps the ref and receipt, so a later continuation
+          // adopts them again.
+          if (error instanceof RetainedCreationRefusalError || (error instanceof WorktreeSetupError && error.processesRemain) ||
+              await this.processesRootedIn(path)) throw error;
           await this.rollbackPartialLane(repo.repoPath, path, custody, error, { keepRef: true });
           throw new RetainedCreationFailedError(`retained creation of branch ${branch} failed after adoption; its checkout was rolled back and its ref and receipt are kept: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
         }
@@ -2583,6 +2586,16 @@ export class WorktreeManager {
       this.laneReapsWaiting.delete(laneId);
       this.log('warn', 'the processes a lane\'s sessions left could not be reaped after their turns; its sweep reaps them', { id: laneId, error: String(error) });
       return [];
+    }
+  }
+
+  /** Whether any process is rooted in a tree; a listing that fails says yes. */
+  private async processesRootedIn(treePath: string): Promise<boolean> {
+    try {
+      return (await this.enumerateListed(treePath)).length > 0;
+    } catch (error) {
+      this.log('warn', 'the processes rooted in a tree could not be listed; it is kept', { path: treePath, error: String(error) });
+      return true;
     }
   }
 

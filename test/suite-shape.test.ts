@@ -226,7 +226,7 @@ const PINS: Record<string, number> = {
   'config-env.test.ts': 25,
   'config-generate.test.ts': 26,
   'config.test.ts': 87,
-  'creation-continuation-custody.test.ts': 31,
+  'creation-continuation-custody.test.ts': 33,
   'creation-continuation.test.ts': 14,
   'decisions-backtest.test.ts': 20,
   'decisions-cli.test.ts': 8,

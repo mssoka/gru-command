@@ -184,6 +184,47 @@ describe('retained-creation continuation custody', () => {
     }
   });
 
+  it('keeps everything and reads custody-unknown when a detached daemon a setup step started still runs in the checkout', async () => {
+    const signals = directory();
+    const pidFile = join(signals, 'daemon.pid');
+    const release = join(signals, 'release');
+    const starter = [
+      "const { spawn } = require('node:child_process');",
+      `spawn('/bin/sh', ['-c', 'echo $$ > "$0"; while [ ! -e "$1" ]; do sleep 0.05; done', ${JSON.stringify(pidFile)}, ${JSON.stringify(release)}], { detached: true, stdio: 'ignore' }).unref();`,
+    ].join('\n') + '\n';
+    const h = await retainedFixture('setup-daemon', {
+      // The real process listing (no stub): the daemon is in its own
+      // session, outside every step's group.
+      manager: { enumerateProcesses: undefined },
+      prepare: (repo) => {
+        repo.commitFile('start-daemon.js', starter, 'daemon starter');
+        repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "node start-daemon.js"\n\n[[setup]]\ncommand = "exit 4"\n', 'setup with a daemon');
+      },
+    });
+    try {
+      const api = await httpHarness(h);
+      expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'daemon' })).status).toBe(202);
+      const unknown = await waitForState(api.base, api.jobId, 'daemon', 'custody-unknown');
+      expect(unknown['reason']).toMatch(/worktree setup command exited 4/u);
+      expect(processGone(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+      expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`))).toBe(true);
+      expect(receiptFiles(api.repo)).toHaveLength(1);
+      expect(api.spawns).toHaveLength(0);
+    } finally {
+      writeFileSync(release, '');
+    }
+
+    // A listing that fails cannot clear the checkout either.
+    const unlisted = await retainedFixture('setup-unlisted', {
+      manager: { enumerateProcesses: () => { throw new Error('synthetic process listing failure'); } },
+      prepare: (repo) => { repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "exit 4"\n', 'failing setup'); },
+    });
+    const api = await httpHarness(unlisted);
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'unlisted' })).status).toBe(202);
+    await waitForState(api.base, api.jobId, 'unlisted', 'custody-unknown');
+    expect(existsSync(join(unlisted.root, basename(unlisted.repo.path), `job-${api.jobId}`))).toBe(true);
+  });
+
   it('reads back refused, with everything retained, when a custody guard refuses after adoption', async () => {
     const h = await retainedFixture('guard-after-adoption');
     const manager = h.worktrees as unknown as { assertCreationIdentity: (...args: unknown[]) => void };
@@ -262,6 +303,35 @@ describe('retained-creation continuation custody', () => {
     const unknown = await waitForState(api.base, api.jobId, 'dispose-fails', 'custody-unknown');
     expect(unknown).toMatchObject({ custody: { status: 'active' }, admission: { agent_id: 'fixture-minion-1' } });
     expect(api.ledger.getAgent('fixture-minion-1')?.state).toBe('spawning');
+  });
+
+  it('keeps the lane and reads custody-unknown when the minion refused right after its spawn does not dispose', async () => {
+    // Ordinary dispatch: the original refusal comes first and the lane stays.
+    const h = managerFixture('post-spawn-check');
+    const handle = fakeHandle('post-spawn-check-minion', []);
+    handle.dispose = async () => { throw new Error('synthetic dispose failure'); };
+    const dispatch = new DispatchService({
+      ledger: h.ledger, worktrees: h.worktrees,
+      spawner: async () => { h.ledger.setJobStatus('post-spawn-check', 'parked'); return handle; },
+    });
+    const error = await dispatch.dispatch({ jobId: 'post-spawn-check', repoPath: h.repo.path, title: 'parked', briefing: 'parked briefing' }).then(() => null, (failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map(String)).toEqual(['Error: initial dispatch refused — job "post-spawn-check" is parked', 'Error: synthetic dispose failure']);
+    expect(h.ledger.getWorktree('post-spawn-check')?.status).toBe('active');
+    expect(h.ledger.getAgent('post-spawn-check-minion')).toBeNull();
+
+    // A continuation reads it back as custody-unknown.
+    const retained = await retainedFixture('post-spawn-check-continuation');
+    const api = await httpHarness(retained, {
+      disposeFailure: new Error('synthetic dispose failure'),
+      afterSpawn: () => { retained.ledger.setJobStatus(retained.job.id, 'parked'); },
+    });
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'post-spawn-check' })).status).toBe(202);
+    const unknown = await waitForState(api.base, api.jobId, 'post-spawn-check', 'custody-unknown');
+    expect(unknown).toMatchObject({ custody: { status: 'active' }, admission: null, delivery: null });
+    expect(unknown['reason']).toMatch(/is parked; disposing the spawned minion also failed: Error: synthetic dispose failure/u);
+    expect(api.spawns).toEqual(['fixture-minion-1']);
+    expect(api.prompts).toHaveLength(0);
   });
 
   it('settles the job delivered when only the continuation delivered-state write fails', async () => {
