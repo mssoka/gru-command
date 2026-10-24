@@ -17,7 +17,7 @@ import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCh
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
-import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
+import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -2624,6 +2624,23 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   }
   it('a fresh-session successor that fails before native admission reopens the retired predecessor debt for reconcile-admitted (#470)', () => assertStrandedSuccessorReopensDebt('rebrief-successor', 'failed'));
   it('a successor retired before native admission reopens the retired predecessor debt for reconcile-admitted (#470)', () => assertStrandedSuccessorReopensDebt('successor', 'retired'));
+
+  it('an owner-abandoned successor reopens the predecessor debt as an owner decision, never as unadmitted (#493)', async () => {
+    const f = await strandableSuccessor('successor');
+    // The successor's native producer journal never proved cessation: custody unknown.
+    f.ledger.prepareDirectiveTarget(f.successor.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveProducer({ identity: f.ledger.directiveTurnIdentity(f.successor.requestId), agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    abandonLiveDirectiveFromRoute({ ...f.deps, requestId: f.successor.requestId, reason: 'successor custody unknown', by: 'owner',
+      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash } });
+    const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
+    expect(f.ledger.getObligation(f.debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'superseded', byObligationId: reopened.id,
+      reason: `named successor ${f.successor.requestId} was abandoned by the owner with its outcome unknown` } });
+    expect(reopened.nextAction).toEqual({ kind: 'owner-decision', decision: `named successor ${f.successor.requestId} was abandoned by the owner with its outcome unknown. ` +
+      'Whether this retired request\'s approved work still needs doing is the owner\'s decision: nothing records that the successor ran, or that it did not.' });
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-recovery-reopened')?.payload).toMatchObject({ successor_state: 'abandoned' });
+    expect(JSON.stringify(f.ledger.listJobEvents(f.intent.jobId))).not.toContain('without native admission');
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 0, failures: [] });
+  });
 
   it('a successor chain reopens the first predecessor when its successor is itself recovered; each debt settles on the final admission (#470)', async () => {
     const f = await strandableSuccessor('rebrief-successor');

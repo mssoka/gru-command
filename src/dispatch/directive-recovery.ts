@@ -148,50 +148,73 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
   return callLedger({ id: lane.id, resolvedHead });
 }
 
-/** The owner abandonment route. Lane resolution, supervisor ownership and
- * the pace queue are read here as in retirement, but a missing lane or an
- * unproven owner becomes a recorded reason retirement is refused, never a
- * refusal: unknown custody is exactly what abandonment closes. A queued
- * worker turn is a running producer and refuses. */
+/** What the abandonment routes read beside the ledger: the single lane and
+ * its head (or why none binds), the supervisor's ownership and the pace
+ * queue. The ledger refuses every entry that names a live or scheduled
+ * producer; only producer-custody uncertainty may be abandoned. */
+function abandonmentRouteEvidence(input: {
+  readonly ledger: Pick<LedgerApi, 'listAgents'>;
+  readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
+  readonly workerGate?: Pick<PacingGate, 'view'>;
+  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+}, jobId: string): { readonly lane: Parameters<LedgerApi['abandonLiveDirective']>[0]['lane']; readonly routeBlockers: readonly string[] } {
+  let lane: Parameters<LedgerApi['abandonLiveDirective']>[0]['lane'];
+  try {
+    const resolved = resolveRetirementLane(input.worktrees, jobId);
+    lane = { id: resolved.id, resolvedHead: resolveGitCommit(resolved.path, 'HEAD') };
+  } catch (error) {
+    lane = { unavailable: error instanceof DirectiveRetirementError ? error.message : `lane head is unresolvable (${String(error).slice(0, 200)})` };
+  }
+  const routeBlockers: string[] = [];
+  try {
+    routeBlockers.push(...input.pendingProducerBlockers(jobId));
+  } catch (error) {
+    routeBlockers.push(`supervisor ownership unreadable (${String(error).slice(0, 200)}) — a running producer cannot be ruled out`);
+  }
+  if (input.workerGate !== undefined) {
+    const agentIds = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === jobId).map((agent) => agent.id));
+    for (const entry of input.workerGate.view().worker.queued.filter((queued) => queued.id === jobId || agentIds.has(queued.id))) {
+      routeBlockers.push(`queued worker turn: ${entry.label}`);
+    }
+  }
+  return { lane, routeBlockers };
+}
+
+/** The owner abandonment route for a live directive request. */
 export function abandonLiveDirectiveFromRoute(input: {
   readonly ledger: Pick<LedgerApi, 'getDirective' | 'abandonLiveDirective' | 'listAgents'>;
   readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
   readonly workerGate?: Pick<PacingGate, 'view'>;
   readonly pendingProducerBlockers: (jobId: string) => readonly string[];
   readonly requestId: string;
-  readonly expected: { readonly jobId: string; readonly state: LiveDirectiveState; readonly payloadHash: string };
+  readonly expected: { readonly jobId: string; readonly state: LiveDirectiveState | 'abandoned'; readonly payloadHash: string };
   readonly reason: string;
   readonly by: string;
 }): ReturnType<LedgerApi['abandonLiveDirective']> {
   const row = input.ledger.getDirective(input.requestId);
   if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
-  const call = (lane: Parameters<LedgerApi['abandonLiveDirective']>[0]['lane'], routeBlockers: readonly string[]) =>
-    input.ledger.abandonLiveDirective({ requestId: input.requestId, expectedJobId: input.expected.jobId, expectedState: input.expected.state,
-      expectedPayloadHash: input.expected.payloadHash, lane, routeBlockers, reason: input.reason, by: input.by });
   // An abandoned or terminal row is decided by durable state alone.
-  if (!RETIRABLE_STATES.includes(row.state as LiveDirectiveState)) return call({ unavailable: 'request is not live' }, []);
-  if (input.workerGate !== undefined) {
-    const agentIds = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === row.jobId).map((agent) => agent.id));
-    const queued = input.workerGate.view().worker.queued.find((entry) => entry.id === row.jobId || agentIds.has(entry.id));
-    if (queued !== undefined) {
-      throw new DirectiveRetirementError('live_work', `job "${row.jobId}" has a queued worker turn — abandonment waits for it to settle`,
-        [`queued worker turn: ${queued.label}`]);
-    }
-  }
-  let lane: Parameters<LedgerApi['abandonLiveDirective']>[0]['lane'];
-  try {
-    const resolved = resolveRetirementLane(input.worktrees, row.jobId);
-    lane = { id: resolved.id, resolvedHead: resolveGitCommit(resolved.path, 'HEAD') };
-  } catch (error) {
-    lane = { unavailable: error instanceof DirectiveRetirementError ? error.message : `lane head is unresolvable (${String(error).slice(0, 200)})` };
-  }
-  let routeBlockers: readonly string[];
-  try {
-    routeBlockers = input.pendingProducerBlockers(row.jobId);
-  } catch (error) {
-    routeBlockers = [`supervisor ownership unreadable (${String(error).slice(0, 200)})`];
-  }
-  return call(lane, routeBlockers);
+  const evidence = RETIRABLE_STATES.includes(row.state as LiveDirectiveState)
+    ? abandonmentRouteEvidence(input, row.jobId) : { lane: { unavailable: 'request is not live' }, routeBlockers: [] };
+  return input.ledger.abandonLiveDirective({ requestId: input.requestId, expectedJobId: input.expected.jobId, expectedState: input.expected.state,
+    expectedPayloadHash: input.expected.payloadHash, ...evidence, reason: input.reason, by: input.by });
+}
+
+/** The owner abandonment route for a pending re-brief marker generation. */
+export function abandonPendingRebriefFromRoute(input: {
+  readonly ledger: Pick<LedgerApi, 'listPendingRebriefs' | 'abandonPendingRebrief' | 'listAgents'>;
+  readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
+  readonly workerGate?: Pick<PacingGate, 'view'>;
+  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+  readonly markerId: string;
+  readonly expected: { readonly jobId: string; readonly payloadHash: string };
+  readonly reason: string;
+  readonly by: string;
+}): ReturnType<LedgerApi['abandonPendingRebrief']> {
+  const marker = input.ledger.listPendingRebriefs().find((row) => row.id === input.markerId);
+  const evidence = marker === undefined ? { lane: { unavailable: 'marker is no longer pending' }, routeBlockers: [] } : abandonmentRouteEvidence(input, marker.jobId);
+  return input.ledger.abandonPendingRebrief({ markerId: input.markerId, expectedJobId: input.expected.jobId,
+    expectedPayloadHash: input.expected.payloadHash, ...evidence, reason: input.reason, by: input.by });
 }
 
 /** Concrete Gru judgment. The same cessation predicates as retirement

@@ -83,7 +83,7 @@ interface FakeLedgerState {
   heldDecisions: { id: string; subject: string; signal: string; basis: string | null }[];
   /** Durable FAILED directive requests, with their stored payload JSON
    * (issue #243 R2-H6: the conflict cutoff reads these, not sent receipts). */
-  failedDirectives: { jobId: string; requestId: string; payload: string }[];
+  failedDirectives: { jobId: string; requestId: string; payload: string; abandonedAt?: string }[];
 }
 
 class FakeLedger {
@@ -171,6 +171,7 @@ class FakeLedger {
     jobId: string;
     requestId: string;
     payload: string;
+    abandonedAt: string | null;
   }[] {
     if (input.states?.includes('failed') === true) {
       // Request-id sort + cursor + cap, exactly like the real ledger, so a
@@ -179,12 +180,12 @@ class FakeLedger {
         .filter((record) => record.jobId === input.jobId)
         .sort((left, right) => left.requestId.localeCompare(right.requestId))
         .filter((record) => input.cursor === undefined || record.requestId > input.cursor)
-        .map((record) => ({ jobId: record.jobId, requestId: record.requestId, payload: record.payload }));
+        .map((record) => ({ jobId: record.jobId, requestId: record.requestId, payload: record.payload, abandonedAt: record.abandonedAt ?? null }));
       const limit = input.limit ?? 200;
       return sorted.slice(0, limit);
     }
     return this.state.liveDirectiveJobs.includes(input.jobId)
-      ? [{ jobId: input.jobId, requestId: `${input.jobId}-live`, payload: '{}' }]
+      ? [{ jobId: input.jobId, requestId: `${input.jobId}-live`, payload: '{}', abandonedAt: null }]
       : [];
   }
 
@@ -930,6 +931,21 @@ describe('pr-conflict-rebase (rule hit and rule miss)', () => {
       ops: third.ops,
     });
     expect(otherHead.decisions).toBe(1);
+
+    // An owner abandonment for this head is an unknown outcome, never a
+    // spent attempt: one alone stops the automatic retry, by name.
+    ledger.state.failedDirectives.push({ jobId: 'job-conflict', requestId: 'req-abandoned',
+      payload: JSON.stringify({ directive: 'x', blocker_fingerprint: fingerprint }), abandonedAt: '2026-10-24T00:00:00.000Z' });
+    const fourth = fakeOps();
+    const abandoned = await runSilasAutopilot({
+      digest: digest({ conflictingPrs: [conflictRow()] }),
+      config: enabled({ 'pr-conflict-rebase': 'enforce' }),
+      ledger: ledger.port,
+      ops: fourth.ops,
+    });
+    expect(abandoned.decisions).toBe(0);
+    expect(abandoned.refusals).toBe(1);
+    expect(fourth.calls).toEqual([]);
   });
 });
 

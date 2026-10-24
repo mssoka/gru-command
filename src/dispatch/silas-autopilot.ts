@@ -419,8 +419,11 @@ function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLe
  * The ledger sorts/caps by request id and exposes a cursor: the history is
  * PAGED to exhaustion (issue #243 F-M3) so two matching failures behind more
  * than one page of earlier-sorting unrelated failures still stop the cutoff.
- * The scan stops early once the two-match threshold is reached. */
-function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, fingerprint: string): number {
+ * The scan stops early once the two-match threshold is reached. An owner
+ * abandonment is stored failed but its outcome is unknown: it may have done
+ * the work, so it is never a spent attempt that licenses another one —
+ * `abandoned` names it and the caller sends nothing more. */
+function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, fingerprint: string): { readonly failed: number; readonly abandoned: string | null } {
   const pageSize = 1000;
   let matches = 0;
   let cursor: string | undefined;
@@ -434,15 +437,17 @@ function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, 
     for (const record of page) {
       try {
         const parsed = JSON.parse(record.payload) as { blocker_fingerprint?: unknown };
-        if (parsed.blocker_fingerprint === fingerprint) matches += 1;
+        if (parsed.blocker_fingerprint !== fingerprint) continue;
+        if (record.abandonedAt !== null) return { failed: matches, abandoned: record.requestId };
+        matches += 1;
       } catch {
         // A malformed durable payload can never match a fingerprint.
       }
     }
-    if (matches >= 2) return matches;
-    if (page.length < pageSize) return matches;
+    if (matches >= 2) return { failed: matches, abandoned: null };
+    if (page.length < pageSize) return { failed: matches, abandoned: null };
     const last: string | undefined = page[page.length - 1]?.requestId;
-    if (last === undefined || last === cursor) return matches;
+    if (last === undefined || last === cursor) return { failed: matches, abandoned: null };
     cursor = last;
   }
 }
@@ -523,7 +528,10 @@ function planConflictRebase(row: ConflictingPrRow, ledger: AutopilotLedger): Ver
   if (row.headSha === null || row.headSha.trim() === '') return refuse('the conflict row carries no head sha to fingerprint');
   const fingerprint = `pr-conflict:${row.headSha}`;
   const hold: DecisionHoldTriple = { signal: 'pr-conflict', basis: fingerprint };
-  const failed = failedDirectivesForFingerprint(ledger, row.jobId, fingerprint);
+  const { failed, abandoned } = failedDirectivesForFingerprint(ledger, row.jobId, fingerprint);
+  if (abandoned !== null) {
+    return refuse(`the owner abandoned conflict-integration directive ${abandoned} for head ${row.headSha.slice(0, 12)} with its outcome unknown — no automatic retry`);
+  }
   if (failed >= 2) {
     return refuse(`a conflict-integration directive for head ${row.headSha.slice(0, 12)} already failed ${failed}×`);
   }

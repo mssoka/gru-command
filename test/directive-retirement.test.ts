@@ -1,6 +1,6 @@
 import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
-import { DirectiveProgressService, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { DirectiveProgressService, observeTerminalJobDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -369,7 +369,7 @@ async function abandon(
   const row = h.ledger.getDirective(requestId);
   if (row === null) throw new Error(`no directive request ${requestId}`);
   const body = { expected_job_id: row.jobId, expected_state: row.state === 'admitted' ? 'admitted' : 'dispatching',
-    expected_payload_hash: row.payloadHash, reason: 'original producer custody cannot be established', by: 'owner', ...overrides };
+    expected_payload_hash: row.payloadHash, reason: 'original producer custody cannot be established', by: 'owner', confirm_intent: true, ...overrides };
   return call(h.port, 'POST', `/api/silas/directives/${encodeURIComponent(requestId)}/abandon`, body, token ?? undefined);
 }
 
@@ -631,7 +631,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(field<string>(result.json, 'error')).toBe('live_work');
     expect(field<string[]>(result.json, 'blockers')).toEqual([
       'original producer custody UNKNOWN: request req-c predates the native producer identity and journal',
-      'original producer custody UNKNOWN: admission minion minion-c was never registered to job job-c',
+      'original producer custody UNKNOWN: admission minion minion-c has no registration on job job-c',
     ]);
     // The refusal rolled back the admission binding with everything else.
     expect(h.ledger.getDirective('req-c')).toEqual(before);
@@ -1155,9 +1155,11 @@ describe('directive retirement — write-boundary context and terminal jobs', ()
     const accepted = h.ledger.directiveCurrentAuthority('job-recipe');
     h.ledger.addJobAmendment({ jobId: 'job-recipe', body: 'material scope added after the request was accepted', effect: 'material', supersedes: [],
       approval: { by: 'owner', reference: 'recipe' }, expectedContractSha256: accepted.contractSha256 });
+    const debt = h.ledger.openDirectiveRecoveryDebt('req-recipe', 'restart interrupted the writer');
     const readback = (await call(h.port, 'GET', '/api/silas/directives/req-recipe', undefined, TOKEN)).json;
     const current = field<{ workRevision: number; contractSha256: string }>(readback, 'current_approved_authority');
     const obligation = field<{ generation: number; planRevision: number; state: string } | null>(readback, 'recovery_obligation');
+    expect(obligation).toMatchObject({ id: debt.id, generation: debt.generation, planRevision: debt.planRevision, state: 'open' });
     // The accepted request's own values are no longer current.
     expect(field<number>(readback, 'authority_epoch')).not.toBe(field<number>(readback, 'current_authority_epoch'));
     expect(field<number>(readback, 'work_revision')).not.toBe(current.workRevision);
@@ -1246,7 +1248,7 @@ describe('directive retirement — unknown custody and owner abandonment', () =>
     const admitted = h.ledger.getDirective('req-ghost')!;
     const custody = [
       'original producer custody UNKNOWN: request req-ghost predates the native producer identity and journal',
-      'original producer custody UNKNOWN: admission minion ghost-minion was never registered to job job-ghost',
+      'original producer custody UNKNOWN: admission minion ghost-minion has no registration on job job-ghost',
     ];
     const events = eventKinds(h);
     const refused = await retire(h, 'req-ghost', laneHead(lane));
@@ -1281,8 +1283,14 @@ describe('directive retirement — unknown custody and owner abandonment', () =>
     expect(replayed.status).toBe(200);
     expect(replayed.json).toMatchObject({ state: 'abandoned', replay: true, abandoned_by: 'owner' });
     expect(Object.keys(replayed.json as object).filter((key) => key.startsWith('retire'))).toEqual([]);
-    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-ghost')).toBe(false);
-    expect(h.ledger.listDirectiveRecoveryHolds({ jobId: 'job-ghost' })).toEqual([]);
+    // The lane stays fenced: an open hold that no ordinary request releases.
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-ghost')).toBe(true);
+    expect(h.ledger.listDirectiveRecoveryHolds({ jobId: 'job-ghost' })).toEqual([expect.objectContaining({ kind: 'abandoned', requestId: 'req-ghost',
+      retiredBy: 'owner', reason: 'original producer custody cannot be established', releasedBy: null })]);
+    const fresh = await call(h.port, 'POST', '/api/silas/directive', { job_id: 'job-ghost', directive: 'new work', request_id: 'req-ghost-fresh' }, TOKEN);
+    expect(fresh.status).toBe(409);
+    expect(field<string>(fresh.json, 'error')).toBe('writer_conflict');
+    expect(h.ledger.getDirective('req-ghost-fresh')).toBeNull();
     expect(h.spawns).toHaveLength(0);
 
     // Idempotent by request id: the recorded abandonment stands.
@@ -1332,7 +1340,7 @@ describe('directive retirement — unknown custody and owner abandonment', () =>
     }
     expect((await abandon(h, 'req-avail', { expected_state: 'teleported' })).status).toBe(400);
     expect((await call(h.port, 'POST', '/api/silas/directives/req-nope/abandon', { expected_job_id: 'job-avail', expected_state: 'dispatching',
-      expected_payload_hash: row.payloadHash, reason: 'r', by: 'owner' }, TOKEN)).status).toBe(404);
+      expected_payload_hash: row.payloadHash, reason: 'r', by: 'owner', confirm_intent: true }, TOKEN)).status).toBe(404);
     expect(h.ledger.getDirective('req-avail')).toEqual(row);
     expect(eventKinds(h)).toEqual(events);
 
@@ -1354,6 +1362,384 @@ describe('directive retirement — unknown custody and owner abandonment', () =>
     expect(field<string>(owned.json, 'error')).toBe('terminal_receipt_present');
     expect(h.ledger.getDirective('req-delivered')?.state).toBe('dispatching');
     expect(countEvents(h, 'silas.directive-abandoned')).toBe(0);
+  });
+});
+
+describe('directive retirement — owner abandonment never discards known live work', () => {
+  /** A historical live request: its producer identity and journal never existed. */
+  async function historicalLiveRequest(h: Harness, repo: FixtureRepo, jobId: string, requestId: string): Promise<{ lane: WorktreeLane; row: DirectiveRequestRecord }> {
+    const seeded = await seededLiveRequest(h, repo, jobId, requestId);
+    markHistoricalDirectiveFixture(h.ledger, requestId);
+    return { lane: seeded.lane, row: h.ledger.getDirective(requestId)! };
+  }
+  const providerWait = (id: string, jobId: string) => ({ id, routeKey: `route-${id}`, provider: 'p', model: 'm', endpoint: 'e', credentialFingerprint: 'fp',
+    waiterKind: 'job-minion' as const, jobId, agentId: null, slotId: null, sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working' as const,
+    lineageKey: null, incidentId: `incident-${id}`, incidentGeneration: 1, reasonClass: 'temporary-limit' as const });
+
+  it('refuses every producer known to be live or about to run, by name; only producer-custody uncertainty may be abandoned', async () => {
+    const repo = makeFixtureRepo('abandon-live-producers');
+    cleanupRepos.push(repo);
+    let supervised: () => readonly string[] = () => [];
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    const h = await boot({ workerGate: gate, pendingProducerBlockers: () => supervised() });
+    const { lane, row } = await historicalLiveRequest(h, repo, 'job-live', 'req-live');
+    const refuses = async (blocker: string, label: string) => {
+      const before = eventKinds(h);
+      const refused = await abandon(h, 'req-live');
+      expect(refused.status, label).toBe(409);
+      expect(field<string>(refused.json, 'error'), label).toBe('live_work');
+      expect(field<string[]>(refused.json, 'blockers'), label).toContain(blocker);
+      expect(h.ledger.getDirective('req-live'), label).toEqual(row);
+      expect(eventKinds(h), label).toEqual(before);
+    };
+    // A lane process the service recorded.
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: [{ pid: 4242, command: 'node writer.js', evidence: 'cwd' }], state: 'live' });
+    await refuses(`live lane process(es): ${lane.id} pid 4242`, 'pid');
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: [{ pid: 4242, command: 'node writer.js', evidence: 'cwd' }], state: 'killed' });
+    // An open provider continuation, which would re-prompt the turn.
+    h.ledger.recordProviderWait(providerWait('wait-live', 'job-live'));
+    await refuses('open provider continuation(s): wait-live (waiting)', 'provider wait');
+    h.ledger.setProviderWaitStatus('wait-live', 'cancelled');
+    // A re-brief that owns the lane (rows written before the single-writer fence).
+    const legacyMarker = h.db.handle.prepare(`INSERT INTO pending_rebriefs (id, job_id, kind, payload, payload_hash, baseline_seq, requested_at, updated_at)
+      VALUES (?, 'job-live', ?, '{"note":"n","briefing":"b"}', 'legacy-hash', 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`);
+    legacyMarker.run('legacy-live-rebrief', 'silas.rebrief');
+    await refuses('unresolved re-brief request(s) own the lane', 're-brief');
+    h.ledger.clearPendingRebriefs(['legacy-live-rebrief']);
+    // The supervisor: a restart in flight or a pending retry, an open turn,
+    // and ownership it cannot read all refuse.
+    for (const blocker of ['supervised producer: m1 (pending recovery/retry)', 'supervised producer: m1 (open turn/control/tool)']) {
+      supervised = () => [blocker];
+      await refuses(blocker, blocker);
+    }
+    supervised = () => { throw new Error('supervisor offline'); };
+    await refuses('supervisor ownership unreadable (Error: supervisor offline) — a running producer cannot be ruled out', 'unreadable supervisor');
+    // A worker turn queued for a pace slot.
+    supervised = () => [];
+    const held = await gate.acquireWorkerTurn({ id: 'holder', label: 'other lane', jobId: 'other-job' });
+    const queued = gate.acquireWorkerTurn({ id: 'job-live', label: 'directive → job-live', jobId: 'job-live' });
+    await new Promise((resolve) => setImmediate(resolve));
+    await refuses('queued worker turn: directive → job-live', 'queued turn');
+    held.release();
+    (await queued).release();
+
+    // Producer-custody uncertainty is what abandonment closes; it is
+    // recorded, never cleared.
+    const uncertain = ['restart cleanup unconfirmed: m1 (generation g-1, originating event 3). Only the original native owner can record it.',
+      'unproven directive producer cessation: m1'];
+    supervised = () => uncertain;
+    const abandoned = await abandon(h, 'req-live');
+    expect(abandoned.status).toBe(200);
+    expect(field<string[]>(abandoned.json, 'retirement_refused')).toEqual([...uncertain,
+      'original producer custody UNKNOWN: request req-live predates the native producer identity and journal']);
+  });
+
+  it('refuses a native session lock; a producer journal that only lacks cessation may be abandoned', async () => {
+    const repo = makeFixtureRepo('abandon-session-lock');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { row } = await seededLiveRequest(h, repo, 'job-lock', 'req-lock');
+    const file = join(h.dir, 'lock-session.jsonl');
+    writeFileSync(file, `${JSON.stringify({ type: 'session', id: 'lock-session', version: 3 })}\n`);
+    h.ledger.registerAgent({ id: 'lock-agent', role: 'minion', jobId: 'job-lock', sessionFile: file });
+    h.ledger.setAgentState('lock-agent', 'disposed');
+    h.ledger.prepareDirectiveTarget(row.requestId, { agentId: 'lock-agent', sessionFile: file });
+    prepareDirectiveProducer({ identity: h.ledger.directiveTurnIdentity(row.requestId), agentId: 'lock-agent', sessionId: 'lock-session', sessionFile: file });
+    writeFileSync(`${file}.lock`, JSON.stringify({ host: 'another-host', pid: 1, bootId: 'b' }));
+    const locked = await abandon(h, 'req-lock');
+    expect(locked.status).toBe(409);
+    expect(field<string[]>(locked.json, 'blockers')).toEqual(['current native lock owner is foreign/legacy/unbound']);
+    rmSync(`${file}.lock`);
+    const abandoned = await abandon(h, 'req-lock');
+    expect(abandoned.status).toBe(200);
+    expect(field<string[]>(abandoned.json, 'retirement_refused')).toEqual(['original native physical owner cessation remains UNKNOWN']);
+  });
+
+  it('only the owner abandons: by "owner" and confirm_intent true, or nothing changes', async () => {
+    const repo = makeFixtureRepo('abandon-owner-only');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { row } = await historicalLiveRequest(h, repo, 'job-owner', 'req-owner');
+    const events = eventKinds(h);
+    for (const attribution of [{ by: 'gru' }, { by: 'silas-ops' }, { confirm_intent: false }, { confirm_intent: 'true' }, { by: 'owner', confirm_intent: undefined }]) {
+      const refused = await abandon(h, 'req-owner', attribution);
+      expect(refused.status, JSON.stringify(attribution)).toBe(400);
+      expect(field<string>(refused.json, 'detail'), JSON.stringify(attribution)).toContain('explicit owner attribution and confirm_intent=true are required');
+    }
+    expect(() => h.ledger.abandonLiveDirective({ requestId: 'req-owner', expectedJobId: 'job-owner', expectedState: 'dispatching',
+      expectedPayloadHash: row.payloadHash, lane: { unavailable: 'none' }, routeBlockers: [], reason: 'r', by: 'gru' })).toThrow(/by must be "owner"/u);
+    expect(h.ledger.getDirective('req-owner')).toEqual(row);
+    expect(eventKinds(h)).toEqual(events);
+  });
+
+  it('holds the lane after abandonment: resume, the sensor, branch-idle and the digest stay fenced until the owner accepts fresh work', async () => {
+    const repo = makeFixtureRepo('abandon-hold');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await historicalLiveRequest(h, repo, 'job-hold', 'req-hold');
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree(lane);
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-hold', payload: { source: 'silas-directive', sha: laneHead(lane) } });
+    h.ledger.setJobStatus('job-hold', 'in-review');
+    h.ledger.setJobPr('job-hold', 'https://git.example.invalid/fixture-owner/fixture-app/pull/93');
+    const digest = () => computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+    const abandonment = await abandon(h, 'req-hold');
+    expect(abandonment.status).toBe(200);
+    // A control event, like retirement: an older authority snapshot is stale.
+    expect(h.ledger.directiveRecoveryEpoch('job-hold')).toBe(field<number>(abandonment.json, 'abandonment_event_seq'));
+    expect(h.ledger.listPendingDirectives({ jobId: 'job-hold', states: ['dispatching', 'admitted'] })).toEqual([]);
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-hold')).toBe(true);
+    // The digest offers no review; branch-idle keeps the lane busy.
+    expect((await digest()).prWithoutReview).toEqual([]);
+    expect(laneIsBusy(h.ledger, h.ledger.getJob('job-hold')!)).toBe(true);
+    // A late provider wait is never claimed or offered.
+    h.ledger.recordProviderWait(providerWait('wait-hold', 'job-hold'));
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-hold', routeKey: 'route-wait-hold', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-hold', jobId: 'job-hold' }] });
+    const claimed = await claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
+      registry: { getHandle: () => null, disposeHandle: async () => {}, spawn: async () => { throw new Error('must not spawn'); } } }, 'wait-hold', 'silas');
+    expect(claimed.outcome).toBe('skipped');
+    expect(h.ledger.providerWaitRetirementIdentity(h.ledger.getProviderWait('wait-hold')!)).toBe('unknown');
+    expect((await digest()).providerRecoveryPending).toEqual([]);
+    // The sensor records no new wait on the held lane.
+    const sensor = new ProviderRecoverySensor({ config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
+      ledger: h.ledger, notifications: h.notifications, wake: { trigger: async () => {} }, silasHosted: () => true,
+      probe: { resolveRoute: async () => ({ endpoint: 'https://fixture.invalid', credentialFingerprint: 'fp' }), probe: async () => { throw new Error('must not probe'); } } });
+    try {
+      expect(await establishProviderWait(sensor, { agentId: 'held-agent', role: 'minion', slotId: null, jobId: 'job-hold', sessionFile: null,
+        failureClass: 'quota_wall', provider: 'zai-coding-cn', model: 'glm-5.3', typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+        errorMessage: '429 usage window limit', incidentId: null, continuation: { promptText: 'saved prompt', promptOwner: 'minion-brief', hadOpenTurn: true } })).toBeNull();
+    } finally { sensor.stop(); }
+    expect(h.spawns).toEqual([]);
+    // Only a fresh request the owner accepts releases it; a re-brief alike.
+    h.ledger.setProviderWaitStatus('wait-hold', 'cancelled');
+    for (const [path, body] of [['/api/silas/directive', { job_id: 'job-hold', directive: 'fresh work', request_id: 'req-hold-fresh' }],
+      ['/api/silas/rebrief', { job_id: 'job-hold', note: 'fresh work', request_id: 'req-hold-rebrief' }]] as const) {
+      const refused = await call(h.port, 'POST', path, body, TOKEN);
+      expect(refused.status, path).toBe(409);
+      expect(field<string>(refused.json, 'detail'), path).toContain('only a fresh request the owner accepts');
+    }
+    expect(() => h.ledger.beginDirectiveIntent({ jobId: 'job-hold', directive: 'gru work', holder: 'gru', requestId: 'req-hold-gru' })).toThrow(/owner's abandonment of req-hold/u);
+    h.ledger.setJobStatus('job-hold', 'working');
+    const accepted = await call(h.port, 'POST', '/api/silas/directive', { job_id: 'job-hold', directive: 'owner work', request_id: 'req-hold-owner',
+      by: 'owner', confirm_intent: true }, TOKEN);
+    expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-hold')).toBe(false);
+    expect(h.ledger.listDirectiveRecoveryHolds({ jobId: 'job-hold' })).toEqual([expect.objectContaining({ kind: 'abandoned', releasedBy: 'req-hold-owner' })]);
+    expect(h.ledger.latestJobEvent('job-hold', 'silas.directive-recovery-handoff')?.payload).toMatchObject({ request_id: 'req-hold-owner',
+      owner_accepted_abandoned_ids: ['req-hold'] });
+  });
+
+  it('closes its own recovery debt and card as outcome-unknown; retirement resolves its card too', async () => {
+    const repo = makeFixtureRepo('abandon-debt');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { row } = await historicalLiveRequest(h, repo, 'job-debt', 'req-debt');
+    surfaceDirectiveRecovery({ ledger: h.ledger, notifications: h.notifications }, 'req-debt', 'restart interrupted the writer');
+    const debt = h.ledger.recoveryObligation('job-debt', 'directive', 'req-debt')!;
+    const card = (requestId: string) => h.ledger.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
+    // Unknown custody: the card says the owner decides, never a successor.
+    expect(card('req-debt')?.detail).toContain('It needs the owner: ask the owner whether to abandon it');
+    expect(card('req-debt')?.detail).toContain('Never call /abandon yourself.');
+    expect(card('req-debt')?.detail).not.toContain('with a fresh named successor');
+    const abandoned = await abandon(h, 'req-debt');
+    expect(abandoned.status).toBe(200);
+    const seq = field<number>(abandoned.json, 'abandonment_event_seq');
+    expect(h.ledger.getObligation(debt.id)).toMatchObject({ state: 'closed',
+      settlement: { kind: 'cancelled', reason: `abandoned by the owner (event ${seq}); outcome unknown — no successor and no no-effect claim` } });
+    expect(card('req-debt')).toBeNull();
+    expect(h.ledger.recoveryObligation('job-debt', 'directive', 'req-debt')).toBeNull();
+    expect(row.state).toBe('dispatching');
+
+    // Retirement resolves the card of a request it closes; a recovery debt
+    // that still owes a decision keeps its card as the pointer.
+    for (const debtOwed of [false, true]) {
+      const { lane } = await seededLiveRequest(h, repo, `job-card-${String(debtOwed)}`, `req-card-${String(debtOwed)}`);
+      surfaceDirectiveRecovery({ ledger: h.ledger, notifications: h.notifications }, `req-card-${String(debtOwed)}`, 'restart interrupted the writer');
+      const open = h.ledger.recoveryObligation(`job-card-${String(debtOwed)}`, 'directive', `req-card-${String(debtOwed)}`)!;
+      if (!debtOwed) h.ledger.settleObligation({ obligationId: open.id, settlement: { kind: 'cancelled', reason: 'fixture: nothing left to decide' } });
+      expect((await retire(h, `req-card-${String(debtOwed)}`, laneHead(lane))).status).toBe(200);
+      expect(card(`req-card-${String(debtOwed)}`) === null, String(debtOwed)).toBe(!debtOwed);
+    }
+  });
+
+  it('binds a correlated admission first, names one with no minion, and closes an awaiting phase', async () => {
+    const repo = makeFixtureRepo('abandon-sent');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    await historicalLiveRequest(h, repo, 'job-sent', 'req-sent');
+    const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-sent', payload: { request_id: 'req-sent', minion_id: 'minion-sent' } });
+    const bound = await abandon(h, 'req-sent');
+    expect(bound.status).toBe(200);
+    expect(bound.json).toMatchObject({ admission_class: 'admitted-without-terminal', admission_seq: sent.seq, minion_id: 'minion-sent' });
+    expect(field<string[]>(bound.json, 'retirement_refused')).toContain('original producer custody UNKNOWN: admission minion minion-sent has no registration on job job-sent');
+
+    seedJob(h, 'job-nominion');
+    await seedLane(h, repo, 'job-nominion');
+    h.ledger.beginDirectiveIntent({ jobId: 'job-nominion', directive: 'phase work', holder: 'silas-ops', requestId: 'req-nominion',
+      handoff: { kind: 'gru-decision', decision: 'rule on the phase' } });
+    markHistoricalDirectiveFixture(h.ledger, 'req-nominion');
+    const phase = h.ledger.findPhaseHandoffByRequest({ jobId: 'job-nominion', requestId: 'req-nominion' })!;
+    const anonymous = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-nominion', payload: { request_id: 'req-nominion' } });
+    const named = await abandon(h, 'req-nominion');
+    expect(named.status).toBe(200);
+    expect(named.json).toMatchObject({ admission_class: 'admission-unknown', admission_seq: null });
+    expect(field<string[]>(named.json, 'retirement_refused')).toContain(`correlated admission evidence at seq ${anonymous.seq} has no minion identity`);
+    expect(h.ledger.getPhaseHandoff(phase.phaseId)).toMatchObject({ state: 'closed' });
+    expect(h.ledger.getPhaseHandoff(phase.phaseId)?.closeReason).toContain('abandoned by the owner without completion');
+    expect(countEvents(h, 'job.phase-handoff-completed')).toBe(0);
+  });
+
+  it('answers a lost-response retry rebuilt from GET idempotently', async () => {
+    const repo = makeFixtureRepo('abandon-replay');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    await historicalLiveRequest(h, repo, 'job-replay', 'req-replay');
+    const first = await abandon(h, 'req-replay');
+    expect(first.status).toBe(200);
+    const readback = (await call(h.port, 'GET', '/api/silas/directives/req-replay', undefined, TOKEN)).json;
+    const replay = await call(h.port, 'POST', '/api/silas/directives/req-replay/abandon', { expected_job_id: field<string>(readback, 'job_id'),
+      expected_state: field<string>(readback, 'state'), expected_payload_hash: field<string>(readback, 'payload_hash'),
+      reason: field<string>(readback, 'abandon_reason'), by: field<string>(readback, 'abandoned_by'), confirm_intent: true }, TOKEN);
+    expect(field<string>(readback, 'state')).toBe('abandoned');
+    expect(replay.status).toBe(200);
+    expect(replay.json).toMatchObject({ idempotent: true, state: 'abandoned', abandonment_event_seq: field<number>(first.json, 'abandonment_event_seq') });
+    expect(countEvents(h, 'silas.directive-abandoned')).toBe(1);
+    // Every refusal and message names the state abandoned, never failed.
+    const retired = await retire(h, 'req-replay', 'a'.repeat(40));
+    expect(field<string>(retired.json, 'detail')).toContain('is abandoned — only a live request can be retired');
+  });
+
+  it('a retired row replayed with a partial or null context is a retire_conflict naming the recorded expectations', async () => {
+    const repo = makeFixtureRepo('retire-partial-replay');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane, row } = await seededLiveRequest(h, repo, 'job-partial', 'req-partial');
+    expect((await retire(h, 'req-partial', laneHead(lane))).status).toBe(200);
+    const recorded = retireBodyFromReadback((await call(h.port, 'GET', '/api/silas/directives/req-partial', undefined, TOKEN)).json);
+    const { expected_plan_revision: _plan, ...partial } = recorded;
+    const nulls = { ...recorded, expected_generation: null, expected_plan_revision: null, expected_obligation_state: null,
+      expected_authority_epoch: null, expected_work_revision: null, expected_contract_sha256: null };
+    for (const [label, body] of [['partial', partial], ['nulls', nulls]] as const) {
+      const conflict = await call(h.port, 'POST', '/api/silas/directives/req-partial/retire', body, TOKEN);
+      expect(conflict.status, label).toBe(409);
+      expect(field<string>(conflict.json, 'error'), label).toBe('retire_conflict');
+      expect(field<string>(conflict.json, 'detail'), label).toContain('recorded retire_expected_* fields');
+    }
+    const { expectedPlanRevision: _p, ...partialInputs } = directiveRetirementInputs(h.ledger, 'req-partial');
+    expect(() => h.ledger.retireInterruptedDirective({ requestId: 'req-partial', expectedJobId: 'job-partial', expectedState: 'dispatching',
+      expectedPayloadHash: row.payloadHash, expectedHead: laneHead(lane), ...partialInputs, reason: 'writer ceased; no terminal receipt can exist', by: 'silas-ops' }))
+      .toThrow(expect.objectContaining({ code: 'retire_conflict' }));
+    expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+  });
+
+  it('the directive replay carries payload_hash and reads a stored id on a terminal lane', async () => {
+    const repo = makeFixtureRepo('replay-terminal');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane, row } = await seededLiveRequest(h, repo, 'job-replay-terminal', 'req-replay-terminal');
+    expect((await retire(h, 'req-replay-terminal', laneHead(lane))).status).toBe(200);
+    expect(h.ledger.setJobStatus('job-replay-terminal', 'binned').status).toBe('binned');
+    const replay = await call(h.port, 'POST', '/api/silas/directive', { job_id: 'job-replay-terminal', directive: 'repair job-replay-terminal',
+      request_id: 'req-replay-terminal' }, TOKEN);
+    expect(replay.status).toBe(200);
+    expect(replay.json).toMatchObject({ state: 'retired', replay: true, payload_hash: row.payloadHash });
+    const fresh = await call(h.port, 'POST', '/api/silas/directive', { job_id: 'job-replay-terminal', directive: 'new work', request_id: 'req-new-on-binned' }, TOKEN);
+    expect(fresh.status).toBe(400);
+    expect(field<string>(fresh.json, 'detail')).toContain('terminal lanes take no directives');
+  });
+
+  it('a minion spawned on the job keeps its registration history after its binding moves', async () => {
+    const repo = makeFixtureRepo('custody-history');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await historicalLiveRequest(h, repo, 'job-history', 'req-history');
+    h.ledger.registerAgent({ id: 'minion-history', role: 'minion', jobId: 'job-history' });
+    h.ledger.setAgentState('minion-history', 'disposed');
+    const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-history', payload: { request_id: 'req-history', minion_id: 'minion-history' } });
+    h.ledger.recordDirectiveAdmission({ requestId: 'req-history', minionId: 'minion-history', eventSeq: sent.seq });
+    seedJob(h, 'job-elsewhere');
+    h.ledger.registerAgent({ id: 'minion-history', role: 'minion', jobId: 'job-elsewhere' });
+    expect(h.ledger.getAgent('minion-history')?.jobId).toBe('job-elsewhere');
+    const refused = await retire(h, 'req-history', laneHead(lane));
+    expect(field<string[]>(refused.json, 'blockers')).toEqual(['original producer custody UNKNOWN: request req-history predates the native producer identity and journal']);
+  });
+
+  it('replaces a card bound while the job was live with an unbound one once the job merged; abandonment resolves it', async () => {
+    const repo = makeFixtureRepo('terminal-card-bound');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    await historicalLiveRequest(h, repo, 'job-bound', 'req-bound');
+    h.ledger.registerAgent({ id: 'minion-bound', role: 'minion', jobId: 'job-bound', sessionFile: join(h.dir, 'none.jsonl') });
+    h.ledger.setAgentState('minion-bound', 'idle');
+    const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-bound', payload: { request_id: 'req-bound', minion_id: 'minion-bound' } });
+    h.ledger.recordDirectiveAdmission({ requestId: 'req-bound', minionId: 'minion-bound', eventSeq: sent.seq });
+    surfaceDirectiveRecovery({ ledger: h.ledger, notifications: h.notifications }, 'req-bound', 'restart interrupted the writer');
+    const bound = h.ledger.findNotificationByKind('silas.directive-unreconciled.req-bound', 'active')!;
+    expect(bound.agentId).toBe('minion-bound');
+    h.ledger.setJobStatus('job-bound', 'in-review');
+    h.ledger.setJobStatus('job-bound', 'merged');
+    observeTerminalJobDirective({ ledger: h.ledger, notifications: h.notifications } as unknown as Parameters<typeof observeTerminalJobDirective>[0], 'req-bound');
+    const card = h.ledger.findNotificationByKind('silas.directive-unreconciled.req-bound', 'active')!;
+    expect(card.id).not.toBe(bound.id);
+    expect(card).toMatchObject({ agentId: null, routing: 'action-required', title: 'Directive req-bound is still admitted on merged job job-bound' });
+    expect(card.detail).toContain('Never call /abandon yourself.');
+    expect(h.ledger.getNotification(bound.id)?.resolvedAt).not.toBeNull();
+    expect((await abandon(h, 'req-bound', { expected_state: 'admitted' })).status).toBe(200);
+    expect(h.ledger.findNotificationByKind('silas.directive-unreconciled.req-bound', 'active')).toBeNull();
+  });
+
+  it('refuses a Gru successor on unknown custody before any writer clearance', async () => {
+    const repo = makeFixtureRepo('successor-custody');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane, row } = await historicalLiveRequest(h, repo, 'job-successor', 'req-successor');
+    const debt = h.ledger.openDirectiveRecoveryDebt('req-successor', 'restart interrupted the writer');
+    const authority = h.ledger.directiveCurrentAuthority('job-successor');
+    expect(() => h.ledger.validateRecoverySuccessorBeforeWriterClearance({ subjectKind: 'directive', requestId: 'req-successor', generation: debt.generation,
+      expectedPayloadHash: row.payloadHash, expectedHead: laneHead(lane), expectedEpoch: authority.authorityEpoch, expectedWorkRevision: authority.workRevision,
+      expectedContractSha256: authority.contractSha256, lane: { id: lane.id, resolvedHead: laneHead(lane) }, reason: 'continue',
+      decision: { kind: 'successor', requestId: 'succ-successor', directive: 'continue' } }))
+      .toThrow(expect.objectContaining({ code: 'live_work', blockers: ['original producer custody UNKNOWN: request req-successor predates the native producer identity and journal'] }));
+  });
+});
+
+describe('re-brief markers — done and closeout refuse them; the owner abandons unknown custody to binned', () => {
+  it('refuses done by name, abandons the marker generation for the owner only, holds the lane, and bins', async () => {
+    const repo = makeFixtureRepo('rebrief-abandon');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    seedJob(h, 'job-markers');
+    const lane = await seedLane(h, repo, 'job-markers');
+    const markers = h.ledger.beginPendingRebrief({ jobId: 'job-markers', note: 'stalled', briefing: 'b' });
+    const debt = h.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'historical marker');
+    const named = `pending re-brief marker(s): ${markers.map((marker) => `${marker.id} (${marker.kind})`).join(', ')}`;
+    expect(() => h.ledger.setJobStatus('job-markers', 'done')).toThrow(named);
+    expect(() => h.ledger.setJobStatus('job-markers', 'binned')).toThrow(named);
+    const path = `/api/silas/rebriefs/${markers[0]!.id}/abandon`;
+    const body = { expected_job_id: 'job-markers', expected_payload_hash: markers[0]!.payloadHash, reason: 'marker producer custody unknown', by: 'owner', confirm_intent: true };
+    expect((await call(h.port, 'POST', path, { ...body, by: 'gru' }, TOKEN)).status).toBe(400);
+    expect((await call(h.port, 'POST', path, body, null as never)).status).toBe(401);
+    // A running producer refuses; unknown custody is the exit.
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: [{ pid: 4243, command: 'node writer.js', evidence: 'cwd' }], state: 'live' });
+    const live = await call(h.port, 'POST', path, body, TOKEN);
+    expect(live.status).toBe(409);
+    expect(field<string[]>(live.json, 'blockers')).toEqual([`live lane process(es): ${lane.id} pid 4243`]);
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: [{ pid: 4243, command: 'node writer.js', evidence: 'cwd' }], state: 'killed' });
+    const abandoned = await call(h.port, 'POST', path, body, TOKEN);
+    expect(abandoned.status).toBe(200);
+    expect(abandoned.json).toMatchObject({ state: 'abandoned', idempotent: false, marker_ids: markers.map((marker) => marker.id),
+      retirement_refused: ['original historical native session ownership is unbound/UNKNOWN'] });
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-markers' })).toEqual([]);
+    expect(h.ledger.getObligation(debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'cancelled' } });
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-markers')).toBe(true);
+    expect(countEvents(h, 'silas.rebrief-retired')).toBe(0);
+    const readback = await call(h.port, 'GET', `/api/silas/rebriefs/${markers[1]!.id}`, undefined, TOKEN);
+    expect(readback.json).toMatchObject({ state: 'abandoned', abandoned_by: 'owner', payload_hash: markers[0]!.payloadHash });
+    const replay = await call(h.port, 'POST', path, body, TOKEN);
+    expect(replay.json).toMatchObject({ idempotent: true, abandonment_event_seq: field<number>(abandoned.json, 'abandonment_event_seq') });
+    expect(countEvents(h, 'silas.rebrief-abandoned')).toBe(1);
+    expect(() => h.ledger.beginDirectiveIntent({ jobId: 'job-markers', directive: 'x', holder: 'silas-ops' })).toThrow(/owner's abandonment/u);
+    expect(h.ledger.setJobStatus('job-markers', 'binned').status).toBe('binned');
   });
 });
 
@@ -3237,6 +3623,7 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     for (const stale of [{ expected_generation: debt.generation + 1 }, { expected_payload_hash: 'b'.repeat(64) }, { expected_head: 'c'.repeat(40) }, { expected_epoch: 99 }]) {
       await refuse(admitted.requestId, /stale/u, stale);
     }
+    // The open debt still owes a decision: its card stays its pointer.
     expect(card()).not.toBeNull();
     const spawns = h.spawns.length;
     const settled = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);

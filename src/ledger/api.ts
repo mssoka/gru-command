@@ -117,6 +117,8 @@ import {
   directiveRetirementFingerprint,
   directiveRetirementHasContext,
   DirectiveRetirementError,
+  directiveStateName,
+  isProducerCustodyUncertainty,
   isDirectiveState,
   isDirectiveTerminal,
   LIVE_DIRECTIVE_STATES,
@@ -1031,6 +1033,21 @@ export interface PendingProviderRecoveryRecord {
   readonly createdAt: string;
 }
 
+/** An owner abandonment of one pending re-brief marker generation (one row
+ * per marker of the generation, sharing the audit event). */
+export interface RebriefAbandonmentRecord {
+  readonly markerId: string;
+  readonly jobId: string;
+  readonly payloadHash: string;
+  readonly baselineSeq: number;
+  readonly abandonedAt: string;
+  readonly abandonedBy: string;
+  readonly abandonReason: string;
+  readonly eventSeq: number;
+  readonly holdReleasedBy: string | null;
+  readonly holdReleasedAt: string | null;
+}
+
 export interface PendingRebriefRecord {
   readonly id: string;
   readonly jobId: string;
@@ -1157,7 +1174,7 @@ function isRealIsoUtcTimestamp(value: string): boolean {
   return Number.isFinite(ms) && new Date(ms).toISOString() === normalized;
 }
 
-const DIRECTIVE_CONTROL_SQL = `kind IN ('silas.directive-retired', 'silas.directive-recovery-handoff', 'silas.rebrief-recovery-handoff', 'job.amendment-accepted')
+const DIRECTIVE_CONTROL_SQL = `kind IN ('silas.directive-retired', 'silas.directive-abandoned', 'silas.rebrief-abandoned', 'silas.directive-recovery-handoff', 'silas.rebrief-recovery-handoff', 'job.amendment-accepted')
   OR (kind = 'job.status' AND json_extract(payload, '$.to') IN ('parked', 'blocked', 'needs-owner', 'merged', 'done', 'binned'))
   OR (kind = 'job.obligation-recorded' AND json_extract(payload, '$.next_action.kind') = 'owner-decision')
   OR (kind = 'ruling.recorded' AND json_extract(payload, '$.permission') = 'fresh-current-approved-recovery-successor')
@@ -2107,10 +2124,10 @@ export class LedgerApi {
           }
         } else if (status === 'done') {
           // `done` is a decision, not an observed fact (`merged` is, and is
-          // accepted): it must not close over a live directive request.
-          const live = this.liveDirectiveBlockers(id);
+          // accepted): it must not close over live directive control.
+          const live = this.doneBlockers(id);
           if (live.length > 0) {
-            throw new Error(`job "${id}" has a live directive request — settle, retire or abandon it before marking the job done: ${live.join('; ')}`);
+            throw new Error(`job "${id}" has live directive control — settle, retire or (the owner) abandon it before marking the job done: ${live.join('; ')}`);
           }
         }
         const event = this.writeJobStatus(id, current.status, status);
@@ -2158,17 +2175,17 @@ export class LedgerApi {
    * - the job's latest recorded `github.branch-state` observation must say
    *   the PR is closed (`pr_open === false`), not merged (`merged ===
    *   false`) and name exactly the expected url + head sha;
-   * - no target-owned live work: live directive requests,
-   *   spawning/streaming worker turns, non-terminal tracked children,
-   *   pending/live review rounds or unsettled verification runs refuse the
-   *   closeout.
+   * - no target-owned live work: live directive requests, pending re-brief
+   *   markers, spawning/streaming worker turns, non-terminal tracked
+   *   children, pending/live review rounds or unsettled verification runs
+   *   refuse the closeout.
    *
    * Repeated identical requests return the recorded closeout idempotently;
    * a changed request against an already-closed lane is refused, never
-   * silently folded into the recorded one. Directive rows are read (a live
-   * request refuses); no directive/re-brief row, worktree, round, agent or
-   * child is rewritten — historical uncertain-control rows stay truthful
-   * history. */
+   * silently folded into the recorded one. Directive and re-brief rows are
+   * read (a live one refuses) but never rewritten, nor are worktrees,
+   * rounds, agents or children — historical uncertain-control rows stay
+   * truthful history. */
   adminCloseParkedJob(input: AdminCloseoutInput): AdminCloseoutResult {
     if (input.expectedStatus !== 'parked') {
       throw new Error(
@@ -2368,9 +2385,9 @@ export class LedgerApi {
         );
       }
 
-      // Live-work fence: refusal names every live directive and running
-      // producer. Re-brief markers keep their terminal-job reconciliation.
-      const blockers = [...this.liveDirectiveBlockers(job.id), ...this.liveProducerBlockers(job.id)];
+      // Live-work fence: refusal names every live directive control and
+      // running producer.
+      const blockers = this.terminalLiveWorkBlockers(job.id);
       if (blockers.length > 0) {
         throw new AdminCloseoutRefusal(
           'live-work',
@@ -2415,21 +2432,21 @@ export class LedgerApi {
    * ownership classifies leftovers at the runtime boundary; a historical gap
    * must not block a truthful closure). */
   private terminalLiveWorkBlockers(jobId: string): readonly string[] {
-    const markers = this.listPendingRebriefs({ jobId });
-    return [
-      ...this.liveDirectiveBlockers(jobId),
-      ...(markers.length === 0 ? [] : [`pending re-brief marker(s): ${markers.map((marker) => `${marker.id} (${marker.kind})`).join(', ')}`]),
-      ...this.liveProducerBlockers(jobId),
-    ];
+    return [...this.doneBlockers(jobId), ...this.liveProducerBlockers(jobId)];
   }
 
-  /** Live directive requests by name and state. Each closes through its own
-   * path (settlement, evidence-fenced retirement, owner abandonment); a
-   * terminal status write must not hide one. The single-writer rule keeps
+  /** Live directive control by name: live directive requests and pending
+   * re-brief markers. Each closes through its own path (settlement,
+   * evidence-fenced retirement, re-brief recovery, owner abandonment); no
+   * `done` or binned write closes over one. The single-writer rule keeps
    * the list short. */
-  private liveDirectiveBlockers(jobId: string): readonly string[] {
+  doneBlockers(jobId: string): readonly string[] {
     const live = this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES });
-    return live.length === 0 ? [] : [`live directive request(s): ${live.map((request) => `${request.requestId} (${request.state})`).join(', ')}`];
+    const markers = this.listPendingRebriefs({ jobId });
+    return [
+      ...(live.length === 0 ? [] : [`live directive request(s): ${live.map((request) => `${request.requestId} (${request.state})`).join(', ')}`]),
+      ...(markers.length === 0 ? [] : [`pending re-brief marker(s): ${markers.map((marker) => `${marker.id} (${marker.kind})`).join(', ')}`]),
+    ];
   }
 
   /** Producers the service can see running: open worker turns, in-flight
@@ -8431,6 +8448,9 @@ export class LedgerApi {
     sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string };
     /** Explicit completion intent; omitted = ordinary directive. */
     handoff?: CompletionHandoffIntent;
+    /** The owner accepts this fresh request (by "owner", confirm_intent):
+     * the only acceptance that releases an owner-abandonment hold. */
+    ownerAccepted?: boolean;
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
@@ -8447,9 +8467,6 @@ export class LedgerApi {
     }
     const job = this.getJob(input.jobId);
     if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-    if (isJobTerminal(job.status)) {
-      throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
-    }
     const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } | null | undefined) =>
       context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined && context.source === undefined ? null :
         { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }),
@@ -8486,6 +8503,11 @@ export class LedgerApi {
           }
           return { record: existing, created: false }; // durable replay — the accepted request, unchanged
         }
+      }
+      // A replay of a stored id reads its outcome on any job; only a new
+      // request needs a lane that still takes work.
+      if (isJobTerminal(job.status)) {
+        throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
       }
       // Fail CLOSED while ANY live request for the job exists: the lane is
       // single-writer, so a DIFFERENT request id must never start a second
@@ -8550,7 +8572,7 @@ export class LedgerApi {
       // A fresh accepted directive is the separately authorized, identity-
       // checked handoff that supersedes an open retirement hold on this
       // lane (the hold's own release record names THIS request).
-      this.releaseDirectiveRecoveryHolds(input.jobId, requestId);
+      this.releaseDirectiveRecoveryHolds(input.jobId, requestId, input.ownerAccepted === true);
       this.db.prepare('UPDATE pending_directives SET authority_epoch = ? WHERE request_id = ?').run(this.directiveRecoveryEpoch(input.jobId), requestId);
       this.appendEvent({
         kind: 'silas.directive-intent',
@@ -8575,10 +8597,11 @@ export class LedgerApi {
   }
 
   beginRebriefIntent(input: { readonly jobId: string; readonly note: string; readonly holder: string; readonly requestId?: string;
-    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } }): ReturnType<LedgerApi['beginDirectiveIntent']> {
+    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string };
+    readonly ownerAccepted?: boolean }): ReturnType<LedgerApi['beginDirectiveIntent']> {
     return this.beginDirectiveIntent({ jobId: input.jobId, directive: input.note, holder: input.holder, kind: 'rebrief',
       ...(input.requestId === undefined ? {} : { requestId: input.requestId }), ...(input.handoff === undefined ? {} : { handoff: input.handoff }),
-      ...(input.sourceContext === undefined ? {} : { sourceContext: input.sourceContext }) });
+      ...(input.sourceContext === undefined ? {} : { sourceContext: input.sourceContext }), ...(input.ownerAccepted === true ? { ownerAccepted: true } : {}) });
   }
 
   getDirective(requestId: string): DirectiveRequestRecord | null {
@@ -9251,12 +9274,22 @@ export class LedgerApi {
   }
 
   rebriefProgressBlockers(markerId: string, laneId: string): readonly string[] {
+    return this.rebriefOwnership(markerId, laneId).map(({ text }) => text);
+  }
+
+  /** `rebriefProgressBlockers`, each entry tagged as `directiveOwnership`
+   * tags its own: an unbound or unproven historical session is `unknown`
+   * custody, a session lock or any other producer is `live`. */
+  private rebriefOwnership(markerId: string, laneId: string): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
     const marker = this.listPendingRebriefs().find((row) => row.id === markerId);
     if (marker === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
-    const blockers = this.directiveRetirementBlockers({ jobId: marker.jobId, requestId: markerId }, laneId)
-      .filter((blocker) => blocker !== 'unresolved re-brief request(s) own the lane');
+    const blockers = this.directiveOwnership({ jobId: marker.jobId, requestId: markerId }, laneId)
+      .filter(({ text }) => text !== 'unresolved re-brief request(s) own the lane');
+    const unknown = (text: string) => blockers.push({ text, custody: 'unknown' });
     const peers = this.listPendingRebriefs({ jobId: marker.jobId }).filter((row) => row.payloadHash === marker.payloadHash && row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId);
-    if (marker.agentId === null || marker.sessionFile === null || marker.workRevision === null || peers.some((row) => row.agentId !== marker.agentId || row.sessionFile !== marker.sessionFile)) return [...blockers, 'original historical native session ownership is unbound/UNKNOWN'];
+    if (marker.agentId === null || marker.sessionFile === null || marker.workRevision === null || peers.some((row) => row.agentId !== marker.agentId || row.sessionFile !== marker.sessionFile)) {
+      return [...blockers, { text: 'original historical native session ownership is unbound/UNKNOWN', custody: 'unknown' }];
+    }
     try {
       const header = readDirectiveSessionHeader(marker.sessionFile);
       const owners = inspectDirectiveProducers(marker.sessionFile);
@@ -9269,11 +9302,11 @@ export class LedgerApi {
         if (association === null || !isDeepStrictEqual(association.identity, producer.identity) || association.agentId !== marker.agentId || association.sessionId !== header.id || association.sessionFile !== marker.sessionFile) throw new DirectiveCheckpointError('original historical accepted identity/association is unavailable or changed');
         inspectDirectiveAdmission(marker.sessionFile, producer.identity);
         const checkpoint = inspectDirectiveCheckpoint(marker.sessionFile, producer.identity);
-        if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) blockers.push('original historical native effects/checkpoint remain UNKNOWN');
+        if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) unknown('original historical native effects/checkpoint remain UNKNOWN');
       }
-      if (header.type !== 'session' || original.length === 0 || owners.some(({ evidence }) => evidence !== 'ceased')) blockers.push('original historical native physical cessation remains UNKNOWN');
-      const last = owners.at(-1); if (last !== undefined) { const lock = directiveProducerLockBlocker(last.producer); if (lock !== null) blockers.push(lock); }
-    } catch (error) { blockers.push(`original historical native ownership unreadable: ${String(error)}`); }
+      if (header.type !== 'session' || original.length === 0 || owners.some(({ evidence }) => evidence !== 'ceased')) unknown('original historical native physical cessation remains UNKNOWN');
+      const last = owners.at(-1); if (last !== undefined) { const lock = directiveProducerLockBlocker(last.producer); if (lock !== null) blockers.push({ text: lock, custody: 'live' }); }
+    } catch (error) { unknown(`original historical native ownership unreadable: ${String(error)}`); }
     return blockers;
   }
 
@@ -9306,6 +9339,10 @@ export class LedgerApi {
       const text = input.decision.kind === 'successor' ? input.decision.directive : input.decision.note;
       if (input.decision.requestId === row.requestId || !input.decision.requestId.trim() || !text.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request and nonempty directive or note');
       this.assertNoCompletedNativeRetirement(row);
+      // Refuse before any writer clearance stops a review: a successor
+      // retires the original, which unknown custody never allows.
+      const custody = this.directiveCustodyGaps(row);
+      if (custody.length > 0) throw new DirectiveRetirementError('live_work', `directive request "${row.requestId}" has unknown producer custody — no successor can retire it; the owner decides (abandonment)`, custody);
       return row.jobId;
     }
     if (this.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return null;
@@ -9477,7 +9514,7 @@ export class LedgerApi {
       if (!job || isJobTerminal(job.status)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
       if (input.decision.kind === 'reconcile-admitted' ? row.state !== 'retired' : isDirectiveTerminal(row.state)) {
         throw new DirectiveCheckpointError(input.decision.kind === 'reconcile-admitted'
-          ? `request is ${row.state}, not retired — a live request takes a successor decision; only a retired request's debt reconciles to a later admission`
+          ? `request is ${directiveStateName(row)}, not retired — a live request takes a successor decision; only a retired request's debt reconciles to a later admission`
           : 'terminal work cannot be revived by recovery');
       }
       let successor: DirectiveRequestRecord | null = null;
@@ -9581,16 +9618,25 @@ export class LedgerApi {
       const debt = this.recoveryObligation(successor.jobId, 'directive', requestId);
       if (debt === null || !['open', 'waiting', 'suspended'].includes(debt.state) ||
           !this.recoveryDecisionHistory('directive', requestId).some((decision) => decision.generation === debt.generation && decision.successorId === successor.requestId)) continue;
-      const cause = `named successor ${successor.requestId} ended ${successor.state} without native admission`;
+      // An owner-abandoned successor's outcome is unknown: it may have carried
+      // the work. Nothing reads it as unadmitted or plans a fresh request;
+      // whether the work still needs doing is the owner's decision.
+      const abandoned = successor.abandonedAt !== null;
+      const cause = abandoned
+        ? `named successor ${successor.requestId} was abandoned by the owner with its outcome unknown`
+        : `named successor ${successor.requestId} ended ${successor.state} without native admission`;
       // The newest seq on the job: the new incarnation can never read as a stale replay.
       const audit = this.appendEvent({ kind: 'silas.directive-recovery-reopened', jobId: debt.jobId,
-        payload: { request_id: requestId, successor_request_id: successor.requestId, successor_state: successor.state,
+        payload: { request_id: requestId, successor_request_id: successor.requestId, successor_state: directiveStateName(successor),
           superseded_obligation_id: debt.id, consumed_generation: debt.generation } });
       this.settleObligation({ obligationId: debt.id, settlement: { kind: 'superseded',
         byObligationId: this.nextIncarnationId(obligationId(debt.jobId, 'operation', debt.incidentKey)), reason: cause } });
       const next = this.observeRecoveryDebt('directive', requestId, debt.jobId, audit.seq, { logicalStep: 'operation', incidentKey: debt.incidentKey,
         category: debt.category, observedAtSeq: audit.seq, ...(debt.description === null ? {} : { description: debt.description }),
-        nextAction: { kind: 'gru-decision', decision: `${cause}, so it cannot settle this retired request's debt, and the retired request takes no new successor. ` +
+        nextAction: abandoned
+          ? { kind: 'owner-decision', decision: `${cause}. Whether this retired request's approved work still needs doing is the owner's decision: ` +
+              'nothing records that the successor ran, or that it did not.' }
+          : { kind: 'gru-decision', decision: `${cause}, so it cannot settle this retired request's debt, and the retired request takes no new successor. ` +
           'First inspect the job\'s later requests: if one carrying the approved work is live or already admitted, use it; only otherwise begin a fresh ' +
           'request (POST /api/silas/directive or /api/silas/rebrief). Once that request is actually admitted on this lane, settle this debt at its new ' +
           `generation with POST /api/silas/directives/${requestId}/recover decision reconcile-admitted naming it` } });
@@ -9639,7 +9685,7 @@ export class LedgerApi {
         return row; // exact replay
       }
       if (row.state !== 'dispatching') {
-        throw new Error(`directive request "${input.requestId}" is ${row.state} — admission evidence cannot bind here`);
+        throw new Error(`directive request "${input.requestId}" is ${directiveStateName(row)} — admission evidence cannot bind here`);
       }
       const event = this.getEvent(input.eventSeq);
       if (event === null) throw new Error(`admission for "${input.requestId}" cites event seq ${input.eventSeq} which does not exist`);
@@ -9811,7 +9857,7 @@ export class LedgerApi {
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
       if (row.state === 'settled' && row.deliverySeq === input.eventSeq) return row; // idempotent replay
       if (row.state !== 'admitted') {
-        throw new Error(`directive request "${input.requestId}" is ${row.state} — terminal delivery requires admitted state`);
+        throw new Error(`directive request "${input.requestId}" is ${directiveStateName(row)} — terminal delivery requires admitted state`);
       }
       if (row.requestKind !== null && row.nativeBinding === null) throw new DirectiveCheckpointError('current directive delivery requires exact native admission');
       const event = this.getEvent(input.eventSeq);
@@ -9955,7 +10001,21 @@ export class LedgerApi {
    * same boundary every producer must reserve before its first await), so
    * a synchronous check inside the state transaction is authoritative. */
   private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
-    const blockers: string[] = [...this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)];
+    return this.directiveOwnership(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer).map(({ text }) => text);
+  }
+
+  /** The same ownership, each entry tagged: `unknown` when it records only
+   * that a producer's cessation is unproven (unproven cleanup, a missing or
+   * unreadable producer journal), `live` when it names a producer that runs
+   * or is about to (a session lock, an open turn, an admission, a child, a
+   * re-brief or another request owning the lane, a provider continuation, a
+   * verification run, a review round, a lane process). */
+  private directiveOwnership(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number,
+    ownNativeProducer?: DirectiveProducer): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
+    const blockers: { text: string; custody: 'unknown' | 'live' }[] = this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)
+      .map((text) => ({ text, custody: 'unknown' }));
+    const unknown = (text: string) => blockers.push({ text, custody: 'unknown' });
+    const live = (text: string) => blockers.push({ text, custody: 'live' });
     const target = this.getDirective(row.requestId)?.nativeTarget;
     if (target != null && ownNativeProducer === undefined) {
       try {
@@ -9964,13 +10024,13 @@ export class LedgerApi {
         const original = owners.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
         const last = owners.at(-1);
         const lock = last === undefined ? null : directiveProducerLockBlocker(last.producer);
-        if (lock !== null) blockers.push(lock);
-        if (original.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) blockers.push('original native physical owner cessation remains UNKNOWN');
+        if (lock !== null) live(lock);
+        if (original.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) unknown('original native physical owner cessation remains UNKNOWN');
         else if (original.some(({ evidence }) => evidence === 'host-absent')) {
           const checkpoint = inspectDirectiveCheckpoint(target.sessionFile, identity);
-          if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) blockers.push('original host absent but native effects/checkpoint remain UNKNOWN');
+          if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) unknown('original host absent but native effects/checkpoint remain UNKNOWN');
         }
-      } catch (error) { blockers.push(`original native physical ownership unreadable: ${String(error)}`); }
+      } catch (error) { unknown(`original native physical ownership unreadable: ${String(error)}`); }
     }
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === row.jobId && ((agent.state === 'spawning' && agent.id !== ownSpawningAgentId) ||
@@ -9979,31 +10039,31 @@ export class LedgerApi {
         agent.state === 'streaming' && !(agent.id === ownNativeProducer?.agentId && agent.sessionFile === ownNativeProducer.sessionFile)),
     );
     if (openTurns.length > 0) {
-      blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
+      live(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
     }
     const admissions = this.listJobAdmissions(row.jobId);
-    if (admissions.length > 0) blockers.push(`in-flight admission(s): ${admissions.join(', ')}`);
+    if (admissions.length > 0) live(`in-flight admission(s): ${admissions.join(', ')}`);
     const children = this.listChildWorkers({ jobId: row.jobId }).filter((child) => child.resultState === null);
     if (children.length > 0) {
-      blockers.push(`non-terminal child worker(s): ${children.map((child) => `${child.id} (${child.state})`).join(', ')}`);
+      live(`non-terminal child worker(s): ${children.map((child) => `${child.id} (${child.state})`).join(', ')}`);
     }
     if (this.listPendingRebriefs({ jobId: row.jobId }).length > 0) {
-      blockers.push('unresolved re-brief request(s) own the lane');
+      live('unresolved re-brief request(s) own the lane');
     }
     const otherLive = this.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).filter(
       (other) => other.requestId !== row.requestId,
     );
     if (otherLive.length > 0) {
-      blockers.push(`other live directive request(s): ${otherLive.map((other) => `${other.requestId} (${other.state})`).join(', ')}`);
+      live(`other live directive request(s): ${otherLive.map((other) => `${other.requestId} (${other.state})`).join(', ')}`);
     }
     const waits = this.listOpenProviderWaitsForJob(row.jobId);
     if (waits.length > 0) {
-      blockers.push(`open provider continuation(s): ${waits.map((wait) => `${wait.id} (${wait.status})`).join(', ')}`);
+      live(`open provider continuation(s): ${waits.map((wait) => `${wait.id} (${wait.status})`).join(', ')}`);
     }
-    if (this.hasUnsettledVerificationRun(row.jobId)) blockers.push('unsettled verification run(s) hold the lane');
+    if (this.hasUnsettledVerificationRun(row.jobId)) live('unsettled verification run(s) hold the lane');
     const rounds = this.listRounds(row.jobId).filter((round) => round.status === 'pending' || round.status === 'live');
     if (rounds.length > 0) {
-      blockers.push(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
+      live(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
     }
     // #464: a swept lane runs nothing; a row it left `live` (recorded
     // before sweeps moved them to `exited`) never fences a writer.
@@ -10017,7 +10077,7 @@ export class LedgerApi {
       )
       .all(row.jobId, laneId) as Row[];
     if (liveProcesses.length > 0) {
-      blockers.push(
+      live(
         `live lane process(es): ${liveProcesses
           .map((proc) => `${str(proc.worktree_id)} pid ${Number(proc.pid)}`)
           .join(', ')}`,
@@ -10041,13 +10101,16 @@ export class LedgerApi {
    * producer journal to read, and an admission minion that never registered
    * has no custody to inspect: unknown custody stays unknown and refuses
    * retirement (owner abandonment is the exit; it claims nothing). */
-  private directiveCustodyGaps(row: DirectiveRequestRecord): readonly string[] {
+  directiveCustodyGaps(row: DirectiveRequestRecord): readonly string[] {
     const gaps: string[] = [];
     if (row.requestKind === null || row.authorityEpoch === null || row.workRevision === null || row.contractSha256 === null) {
       gaps.push(`original producer custody UNKNOWN: request ${row.requestId} predates the native producer identity and journal`);
     }
-    if (row.admissionMinion !== null && this.getAgent(row.admissionMinion)?.jobId !== row.jobId) {
-      gaps.push(`original producer custody UNKNOWN: admission minion ${row.admissionMinion} was never registered to job ${row.jobId}`);
+    // History, not the mutable current binding: a minion spawned on this job
+    // (its `agent.spawned` record) or bound to it now was registered here.
+    if (row.admissionMinion !== null && this.getAgent(row.admissionMinion)?.jobId !== row.jobId &&
+        this.db.prepare("SELECT 1 FROM events WHERE kind = 'agent.spawned' AND agent_id = ? AND job_id = ? LIMIT 1").get(row.admissionMinion, row.jobId) === undefined) {
+      gaps.push(`original producer custody UNKNOWN: admission minion ${row.admissionMinion} has no registration on job ${row.jobId}`);
     }
     return gaps;
   }
@@ -10098,17 +10161,20 @@ export class LedgerApi {
       if (row.state === 'settled' || row.state === 'failed') {
         throw new DirectiveRetirementError(
           'directive_not_live',
-          `directive request "${input.requestId}" is ${row.state} — only a live request can be retired`,
+          `directive request "${input.requestId}" is ${directiveStateName(row)} — only a live request can be retired`,
         );
       }
-      const fingerprint = directiveRetirementFingerprint(intent satisfies DirectiveRetirementIntent);
       if (row.state === 'retired') {
         // One logical operation is idempotent; changed intent is a conflict.
+        // A partial context can never be the recorded one.
+        let fingerprint: string | null = null;
+        try { fingerprint = directiveRetirementFingerprint(intent); }
+        catch (error) { if (!(error instanceof DirectiveRetirementError && error.code === 'incomplete_context')) throw error; }
         if (row.retireFingerprint !== fingerprint) {
           throw new DirectiveRetirementError(
             'retire_conflict',
             `directive request "${input.requestId}" was retired by a different decision — ` +
-              'a retirement is one exact logical operation; the recorded outcome stands',
+              'a retirement is one exact logical operation; the recorded outcome stands (replay it with the recorded retire_expected_* fields)',
           );
         }
         // The original call may have closed an awaiting phase handoff;
@@ -10140,6 +10206,7 @@ export class LedgerApi {
           `directive request "${input.requestId}" payload hash does not match the accepted request`,
         );
       }
+      const fingerprint = directiveRetirementFingerprint(intent satisfies DirectiveRetirementIntent);
       if (!directiveRetirementHasContext(intent)) {
         throw new DirectiveRetirementError('incomplete_context',
           `live directive retirement of "${input.requestId}" requires ${Object.values(DIRECTIVE_RETIREMENT_CONTEXT).join(', ')} from fresh readback`);
@@ -10276,34 +10343,46 @@ export class LedgerApi {
       });
       const record = this.getDirective(row.requestId) as DirectiveRequestRecord;
       this.reopenStrandedRecoveryDebt(record);
+      // Retirement ends what the request's card asks for, unless a recovery
+      // debt still owes a decision: the card stays its pointer until that
+      // debt settles (or reopens), which resolves it.
+      const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
+      if (card?.routing === 'action-required' && this.recoveryObligation(row.jobId, 'directive', row.requestId) === null) {
+        this.resolveNotificationById(card.id, 'directive-retired');
+      }
       return { record, idempotent: false, phaseClosed };
     });
   }
 
   /** Owner abandonment: the exit for a live request whose producer custody
-   * the service cannot establish, so retirement stays refused (no or several
-   * lanes, missing producer identity/journal, an unregistered minion,
-   * unproven cleanup). It records the request `failed` with
-   * `abandoned_*` facts and one `silas.directive-abandoned` audit naming
-   * what stays unknown and why retirement was refused. It claims no
-   * completion, no effect and no cessation, clears no producer-uncertainty
-   * record and leaves no continuation hold; binning can follow. Refused
-   * while settlement owns the request, while a producer is visibly running,
-   * or when retirement could verify cessation. Idempotent by request id. */
+   * the service cannot establish, so retirement stays refused: no producer
+   * identity or journal, a minion with no registration on the job, unproven
+   * cleanup, no or several lanes. Only those unknowns may be abandoned; any
+   * producer known to be live or about to run (a lane process, a provider
+   * continuation, a session lock, a re-brief or other request owning the
+   * lane, an open turn, an admission, a supervised restart or retry) refuses
+   * by name. It records the request `failed` with `abandoned_*` facts and an
+   * open continuation hold, closes the request's own recovery debt and card
+   * as outcome-unknown, and appends one `silas.directive-abandoned` audit
+   * naming what stays unknown and why retirement was refused. It claims no
+   * completion, no effect and no cessation, and clears no producer-
+   * uncertainty record. Owner only; idempotent by request id. */
   abandonLiveDirective(input: {
     requestId: string;
     expectedJobId: string;
-    expectedState: LiveDirectiveState;
+    /** `abandoned` only to replay an abandonment rebuilt from readback. */
+    expectedState: LiveDirectiveState | 'abandoned';
     expectedPayloadHash: string;
     /** Route evidence: the single resolved lane, or why none could be bound. */
     lane: { readonly id: string; readonly resolvedHead: string } | { readonly unavailable: string };
-    /** Route-side ownership facts that refuse retirement (supervisor, pace queue). */
+    /** Route-side ownership (supervisor, pace queue): producer-custody
+     * uncertainty may be abandoned, every other entry refuses. */
     routeBlockers: readonly string[];
     reason: string;
     by: string;
   }): { readonly record: DirectiveRequestRecord; readonly idempotent: boolean; readonly event: EventRecord } {
+    if (input.by !== 'owner') throw new Error('directive abandonment is the owner\'s decision: by must be "owner"');
     if (input.reason.trim() === '') throw new Error('directive abandonment requires a reason');
-    if (input.by.trim() === '') throw new Error('directive abandonment requires a by label');
     return this.transaction(() => {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
@@ -10318,7 +10397,7 @@ export class LedgerApi {
       }
       if (isDirectiveTerminal(row.state)) {
         throw new DirectiveRetirementError('directive_not_live',
-          `directive request "${input.requestId}" is ${row.state} — only a live request can be abandoned`);
+          `directive request "${input.requestId}" is ${directiveStateName(row)} — only a live request can be abandoned`);
       }
       if (row.state !== input.expectedState) {
         throw new DirectiveRetirementError('request_mismatch',
@@ -10331,18 +10410,18 @@ export class LedgerApi {
         throw new DirectiveRetirementError('terminal_receipt_present',
           `directive request "${input.requestId}" has a correlated job.delivered receipt at seq ${delivered.seq} — normal settlement owns it`);
       }
-      // A producer the service can see running must settle first.
-      const running = this.liveProducerBlockers(row.jobId);
-      if (running.length > 0) {
-        throw new DirectiveRetirementError('live_work',
-          `job "${row.jobId}" has a running producer — abandonment waits for it to settle`, running);
-      }
       const laneId = 'unavailable' in input.lane ? null : input.lane.id;
-      // Why retirement is refused, read by the service itself.
+      const ownership = [...this.directiveOwnership(row, laneId ?? ''),
+        ...input.routeBlockers.map((text) => ({ text, custody: isProducerCustodyUncertainty(text) ? 'unknown' as const : 'live' as const }))];
+      const live = ownership.filter(({ custody }) => custody === 'live').map(({ text }) => text);
+      if (live.length > 0) {
+        throw new DirectiveRetirementError('live_work',
+          `job "${row.jobId}" has a producer that is live or about to run — abandonment closes only unknown custody, never known live work`, live);
+      }
+      // Why retirement is refused: unknown custody only, read by the service.
       const refused = [
         ...('unavailable' in input.lane ? [input.lane.unavailable] : []),
-        ...this.directiveRetirementBlockers(row, laneId ?? ''),
-        ...input.routeBlockers,
+        ...ownership.map(({ text }) => text),
       ];
       // A correlated admission binds first, as in retirement, so the audit
       // keeps the real turn instead of erasing it.
@@ -10389,15 +10468,108 @@ export class LedgerApi {
           retirement_refused: refused,
         },
       });
+      // What the abandonment ends: the request's own recovery debt (closed,
+      // outcome unknown — no successor plan) and its unreconciled card.
+      const debt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
+      if (debt !== null) {
+        this.settleObligation({ obligationId: debt.id, settlement: { kind: 'cancelled',
+          reason: `abandoned by the owner (event ${event.seq}); outcome unknown — no successor and no no-effect claim` } });
+      }
+      const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
+      if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-abandoned');
       const record = this.getDirective(row.requestId) as DirectiveRequestRecord;
       this.reopenStrandedRecoveryDebt(record);
       return { record, idempotent: false, event };
     });
   }
 
-  /** Continuation holds created by retirements, oldest first. An OPEN hold
-   * (`releasedBy === null`) fences lane automation until a fresh accepted
-   * directive/re-brief identity supersedes it. */
+  /** The recorded owner abandonment that consumed this marker, if any. */
+  rebriefAbandonment(markerId: string): RebriefAbandonmentRecord | null {
+    const row = this.db.prepare('SELECT * FROM rebrief_abandonments WHERE marker_id = ?').get(markerId) as Row | undefined;
+    return row === undefined ? null : { markerId: str(row.marker_id), jobId: str(row.job_id), payloadHash: str(row.payload_hash),
+      baselineSeq: Number(row.baseline_seq), abandonedAt: str(row.abandoned_at), abandonedBy: str(row.abandoned_by),
+      abandonReason: str(row.abandon_reason), eventSeq: Number(row.event_seq), holdReleasedBy: nstr(row.hold_released_by),
+      holdReleasedAt: nstr(row.hold_released_at) };
+  }
+
+  /** Owner abandonment of a pending re-brief marker generation whose
+   * producer custody is unknown: the marker's exit to binned. The contract
+   * of `abandonLiveDirective`: a producer known to be live or about to run
+   * refuses by name, unknown custody may be abandoned. The generation's
+   * markers are deleted with one `silas.rebrief-abandoned` audit and an open
+   * continuation hold; their recovery debts and card close as
+   * outcome-unknown. It claims no completion, no effect and no cessation.
+   * Owner only; idempotent by marker id. */
+  abandonPendingRebrief(input: {
+    markerId: string;
+    expectedJobId: string;
+    expectedPayloadHash: string;
+    lane: { readonly id: string; readonly resolvedHead: string } | { readonly unavailable: string };
+    routeBlockers: readonly string[];
+    reason: string;
+    by: string;
+  }): { readonly record: RebriefAbandonmentRecord; readonly idempotent: boolean; readonly event: EventRecord } {
+    if (input.by !== 'owner') throw new Error('re-brief abandonment is the owner\'s decision: by must be "owner"');
+    if (input.reason.trim() === '') throw new Error('re-brief abandonment requires a reason');
+    return this.transaction(() => {
+      const prior = this.rebriefAbandonment(input.markerId);
+      const marker = this.listPendingRebriefs().find((row) => row.id === input.markerId);
+      const identity = prior ?? marker;
+      if (identity === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
+      if (identity.jobId !== input.expectedJobId || identity.payloadHash !== input.expectedPayloadHash) {
+        throw new DirectiveRetirementError('request_mismatch',
+          `rebrief marker "${input.markerId}" does not match the expected job and payload hash — read the marker again`);
+      }
+      if (prior !== null) return { record: prior, idempotent: true, event: this.getEvent(prior.eventSeq) as EventRecord };
+      const found = marker as PendingRebriefRecord;
+      const group = this.listPendingRebriefs({ jobId: found.jobId })
+        .filter((row) => row.payloadHash === found.payloadHash && row.baselineSeq === found.baselineSeq);
+      const landed = group.map((row) => ({ marker_id: row.id, kind: row.kind, landed: this.pendingRebriefReceipt(row) !== null }));
+      if (PENDING_REBRIEF_KINDS.every((kind) => landed.some((row) => row.kind === kind && row.landed))) {
+        throw new DirectiveRetirementError('terminal_receipt_present',
+          `rebrief marker "${input.markerId}" has both guarded receipts — settlement of the pair owns it`);
+      }
+      const laneId = 'unavailable' in input.lane ? null : input.lane.id;
+      const ownership = [...this.rebriefOwnership(found.id, laneId ?? ''),
+        ...input.routeBlockers.map((text) => ({ text, custody: isProducerCustodyUncertainty(text) ? 'unknown' as const : 'live' as const }))];
+      const live = ownership.filter(({ custody }) => custody === 'live').map(({ text }) => text);
+      if (live.length > 0) {
+        throw new DirectiveRetirementError('live_work',
+          `job "${found.jobId}" has a producer that is live or about to run — abandonment closes only unknown custody, never known live work`, live);
+      }
+      const refused = [...('unavailable' in input.lane ? [input.lane.unavailable] : []), ...ownership.map(({ text }) => text)];
+      if (refused.length === 0) {
+        throw new DirectiveRetirementError('retirement_available',
+          `rebrief marker "${input.markerId}" has verifiable cessation — use POST /api/silas/rebriefs/${input.markerId}/recover instead`);
+      }
+      const ts = nowIso();
+      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
+      for (const row of group) remove.run(row.id);
+      if (found.phaseId !== null) {
+        const phase = this.getPhaseHandoff(found.phaseId);
+        if (phase?.state === 'awaiting') this.closePhaseHandoff({ phaseId: found.phaseId, reason: `re-brief abandoned by the owner without completion: ${input.reason}` });
+      }
+      const event = this.appendEvent({ kind: 'silas.rebrief-abandoned', jobId: found.jobId, payload: {
+        marker_id: input.markerId, markers: group, by: input.by, reason: input.reason, lane_id: laneId, guarded_event_landed: landed,
+        unknown: ['outcome', 'native effects', 'producer custody'], claims: 'none: no completion, no no-effect, no cessation', retirement_refused: refused } });
+      const insert = this.db.prepare(`INSERT INTO rebrief_abandonments (marker_id, job_id, payload_hash, baseline_seq, abandoned_at, abandoned_by, abandon_reason, event_seq)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const row of group) insert.run(row.id, row.jobId, row.payloadHash, row.baselineSeq, ts, input.by, input.reason, event.seq);
+      for (const row of group) {
+        const debt = this.recoveryObligation(row.jobId, 'rebrief', row.id);
+        if (debt !== null) this.settleObligation({ obligationId: debt.id, settlement: { kind: 'cancelled',
+          reason: `abandoned by the owner (event ${event.seq}); outcome unknown — no successor and no no-effect claim` } });
+      }
+      const card = this.findNotificationByKindAndRouting(`silas.rebrief-unreconciled.${found.jobId}`, 'action-required', 'active');
+      if (card !== null) this.resolveNotificationById(card.id, 'rebrief-abandoned');
+      return { record: this.rebriefAbandonment(input.markerId) as RebriefAbandonmentRecord, idempotent: false, event };
+    });
+  }
+
+  /** Continuation holds created by retirements and owner abandonments,
+   * oldest first. An OPEN hold (`releasedBy === null`) fences lane automation
+   * until a fresh accepted directive/re-brief identity supersedes it (for an
+   * abandonment hold, only one the owner accepts). */
   listDirectiveRecoveryHolds(opts: {
     jobId?: string;
     openOnly?: boolean;
@@ -10405,32 +10577,42 @@ export class LedgerApi {
      * healthy holds visible. Strict callers still throw on any bad row. */
     onMalformed?: (requestId: string, jobId: string, error: unknown) => void;
   } = {}): readonly DirectiveRecoveryHold[] {
-    const where: string[] = ["state = 'retired'"];
+    const where: string[] = ["(state = 'retired' OR abandoned_at IS NOT NULL)"];
+    const markerWhere: string[] = ['1 = 1'];
     const params: unknown[] = [];
     if (opts.jobId !== undefined) {
       where.push('job_id = ?');
+      markerWhere.push('job_id = ?');
       params.push(opts.jobId);
     }
-    if (opts.openOnly === true) where.push('hold_released_by IS NULL');
+    if (opts.openOnly === true) {
+      where.push('hold_released_by IS NULL');
+      markerWhere.push('hold_released_by IS NULL');
+    }
     const rows = this.db
-      .prepare(`SELECT * FROM pending_directives WHERE ${where.join(' AND ')} ORDER BY retired_at, request_id`)
+      .prepare(`SELECT * FROM pending_directives WHERE ${where.join(' AND ')}`)
       .all(...(params as never[])) as Row[];
-    return rows.flatMap((row) => {
+    const holds = rows.flatMap((row): DirectiveRecoveryHold[] => {
       try {
         const record = this.directiveFromRow(row);
-        if (record.retiredAt === null || record.retiredBy === null || record.retireReason === null) {
+        const abandoned = record.abandonedAt !== null;
+        const closedAt = abandoned ? record.abandonedAt : record.retiredAt;
+        const closedBy = abandoned ? record.abandonedBy : record.retiredBy;
+        const reason = abandoned ? record.abandonReason : record.retireReason;
+        if (closedAt === null || closedBy === null || reason === null) {
           throw new Error(
-            `pending_directives row "${record.requestId}" is retired but is missing its audit facts — ` +
+            `pending_directives row "${record.requestId}" is ${abandoned ? 'abandoned' : 'retired'} but is missing its audit facts — ` +
               'the record is inconsistent and cannot be projected',
           );
         }
         return [{
+          kind: abandoned ? 'abandoned' : 'retired',
           jobId: record.jobId,
           requestId: record.requestId,
           admissionClass: directiveAdmissionClass(record),
-          retiredAt: record.retiredAt,
-          retiredBy: record.retiredBy,
-          reason: record.retireReason,
+          retiredAt: closedAt,
+          retiredBy: closedBy,
+          reason,
           releasedBy: record.holdReleasedBy,
           releasedAt: record.holdReleasedAt,
         }];
@@ -10440,32 +10622,52 @@ export class LedgerApi {
         return [];
       }
     });
+    const markers = this.db
+      .prepare(`SELECT * FROM rebrief_abandonments WHERE ${markerWhere.join(' AND ')}`)
+      .all(...(params as never[])) as Row[];
+    for (const row of markers) {
+      holds.push({ kind: 'rebrief-abandoned', jobId: str(row.job_id), requestId: str(row.marker_id), admissionClass: 'admission-unknown',
+        retiredAt: str(row.abandoned_at), retiredBy: str(row.abandoned_by), reason: str(row.abandon_reason),
+        releasedBy: nstr(row.hold_released_by), releasedAt: nstr(row.hold_released_at) });
+    }
+    return holds.sort((left, right) => left.retiredAt.localeCompare(right.retiredAt) || left.requestId.localeCompare(right.requestId));
   }
 
-  /** True while an unreleased retirement hold fences the job's automation. */
+  /** True while an unreleased retirement or abandonment hold fences the
+   * job's automation. */
   hasOpenDirectiveRecoveryHold(jobId: string): boolean {
     const row = this.db
-      .prepare("SELECT 1 AS open FROM pending_directives WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL LIMIT 1")
-      .get(jobId) as Row | undefined;
+      .prepare(`SELECT 1 AS open FROM pending_directives WHERE job_id = ? AND (state = 'retired' OR abandoned_at IS NOT NULL) AND hold_released_by IS NULL
+        UNION ALL SELECT 1 AS open FROM rebrief_abandonments WHERE job_id = ? AND hold_released_by IS NULL LIMIT 1`)
+      .get(jobId, jobId) as Row | undefined;
     return row !== undefined;
   }
 
-  /** Release every open retirement hold for a job from a fresh, audited
-   * producer acceptance (new directive request id or re-brief marker id).
-   * Runs inside the accepting transaction; a replay never releases again. */
-  private releaseDirectiveRecoveryHolds(jobId: string, byIdentity: string): void {
+  /** Release every open hold for a job from a fresh, audited producer
+   * acceptance (new directive request id or re-brief marker id). An open
+   * owner-abandonment hold refuses the acceptance unless the owner accepts
+   * it. Runs inside the accepting transaction; a replay never releases
+   * again. */
+  private releaseDirectiveRecoveryHolds(jobId: string, byIdentity: string, ownerAccepted = false): void {
     const holds = this.listDirectiveRecoveryHolds({ jobId });
     if (holds.length === 0) return;
+    const abandoned = holds.filter((hold) => hold.releasedBy === null && hold.kind !== 'retired');
+    if (abandoned.length > 0 && !ownerAccepted) {
+      throw new LaneWriterConflictError(`job "${jobId}" is held by the owner's abandonment of ${abandoned.map((hold) => hold.requestId).join(', ')} — ` +
+        'its producer custody is unknown: only a fresh request the owner accepts (by "owner", confirm_intent true) or binning releases the lane');
+    }
     const ts = nowIso();
     this.db
       .prepare(
-        "UPDATE pending_directives SET hold_released_by = ?, hold_released_at = ?, updated_at = ? WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL",
+        "UPDATE pending_directives SET hold_released_by = ?, hold_released_at = ?, updated_at = ? WHERE job_id = ? AND (state = 'retired' OR abandoned_at IS NOT NULL) AND hold_released_by IS NULL",
       )
       .run(byIdentity, ts, ts, jobId);
+    this.db.prepare('UPDATE rebrief_abandonments SET hold_released_by = ?, hold_released_at = ? WHERE job_id = ? AND hold_released_by IS NULL').run(byIdentity, ts, jobId);
     // Exact durable ordering, not wall-clock age. This is an accepted
     // authority handoff, never a work-delivery or retirement receipt.
     this.appendEvent({ kind: 'silas.directive-recovery-handoff', jobId,
-      payload: { request_id: byIdentity, retired_request_ids: holds.map((hold) => hold.requestId) } });
+      payload: { request_id: byIdentity, retired_request_ids: holds.map((hold) => hold.requestId),
+        ...(abandoned.length === 0 ? {} : { owner_accepted_abandoned_ids: abandoned.map((hold) => hold.requestId) }) } });
   }
 
   /** A wait must not carry its saved prompt across a fresh retirement

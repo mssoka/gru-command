@@ -4,7 +4,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
-import { DIRECTIVE_RETIREMENT_CONTEXT, DirectiveRetirementError, directiveAdmissionClass, type DirectiveRequestRecord, type DirectiveRetirementIntent, type LiveDirectiveState } from '../ledger/directives.js';
+import { DIRECTIVE_RETIREMENT_CONTEXT, DirectiveRetirementError, directiveAdmissionClass, directiveStateName, type DirectiveRequestRecord, type DirectiveRetirementIntent, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal, isObligationState } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
@@ -19,7 +19,7 @@ import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from './fix-directive.js';
-import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
+import { abandonLiveDirectiveFromRoute, abandonPendingRebriefFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
@@ -185,11 +185,13 @@ function retirementContextFields(body: Record<string, unknown>, row: DirectiveRe
     expectedContractSha256: contractSha256 };
 }
 
-/** The state a directive readback reports: an owner abandonment is stored as
- * `failed` but is never no-effect proof, so it reads `abandoned`. */
-function directiveReadbackState(record: DirectiveRequestRecord): string {
-  return record.abandonedAt === null ? record.state : 'abandoned';
+/** Owner attribution, as the owner-resolution route requires it: the shared
+ * bearer is not identity, so the owner says so explicitly. */
+function ownerConfirmed(body: Record<string, unknown>): boolean {
+  return body['by'] === 'owner' && body['confirm_intent'] === true;
 }
+
+const OWNER_CONFIRMATION_REQUIRED = 'explicit owner attribution and confirm_intent=true are required; shared bearer attribution is not verified identity';
 
 /** The recorded retirement facts every retired-row readback carries, so a
  * lost-response retry rebuilds the exact intent from any of them. */
@@ -1440,7 +1442,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
-      if (isJobTerminal(job.status)) {
+      // A replay of a stored id reads its recorded outcome on any lane.
+      const storedRequest = requestIdField === undefined ? null : options.ledger.getDirective(requestIdField);
+      if (isJobTerminal(job.status) && storedRequest === null) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes take no directives`);
       }
       // Owner rules 3/5: a NEW writer request on a lane under review is
@@ -1475,6 +1479,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(fingerprint !== undefined ? { blockerFingerprint: fingerprint } : {}),
           ...(requestIdField !== undefined ? { requestId: requestIdField } : {}),
           ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
+          ...(ownerConfirmed(body) ? { ownerAccepted: true } : {}),
         });
       } catch (error) {
         if (error instanceof AmbiguousDirectiveError) {
@@ -1500,8 +1505,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 200, {
           request_id: intent.requestId,
           job_id: jobId,
-          state: directiveReadbackState(intent),
+          state: directiveStateName(intent),
           replay: true,
+          payload_hash: intent.payloadHash,
           minion_id: intent.admissionMinion,
           fail_reason: intent.failReason,
           // A caller who only uses this replay path learns the same
@@ -1610,8 +1616,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const markerId = decodeURIComponent(rebriefReadback[1]!);
       const marker = options.ledger.listPendingRebriefs().find((row) => row.id === markerId);
       const decision = options.ledger.getRebriefRecoveryDecision(markerId);
-      if (marker === undefined && decision === null) { json(res, 404, { error: 'not_found' }); return true; }
+      const abandonment = options.ledger.rebriefAbandonment(markerId);
+      if (marker === undefined && decision === null && abandonment === null) { json(res, 404, { error: 'not_found' }); return true; }
       json(res, 200, { marker_id: markerId, markers: marker === undefined ? [] : options.ledger.listPendingRebriefs({ jobId: marker.jobId }),
+        ...(abandonment === null ? {} : { state: 'abandoned', job_id: abandonment.jobId, payload_hash: abandonment.payloadHash,
+          abandoned_at: abandonment.abandonedAt, abandoned_by: abandonment.abandonedBy, abandon_reason: abandonment.abandonReason,
+          abandonment_event_seq: abandonment.eventSeq, hold_released_by: abandonment.holdReleasedBy, hold_released_at: abandonment.holdReleasedAt }),
         recovery_decision: decision, recovery_owner: options.ledger.recoveryOwnerReadback('rebrief', markerId),
         recovery_decision_events: options.ledger.recoveryDecisionHistory('rebrief', markerId).map((history) => options.ledger.getEvent(history.eventSeq)),
         current_inspection_obligations: options.ledger.recoveryDecisionHistory('rebrief', markerId)
@@ -1818,7 +1828,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       // A settled/failed row is refused by the ledger before any expectation
       // is read: its body context is not validated here.
-      const context = currentRow.state === 'settled' || currentRow.state === 'failed' ? {} : retirementContextFields(body, currentRow);
+      let context: ReturnType<typeof retirementContextFields> = {};
+      if (currentRow.state === 'retired') {
+        // A retired row's replay identity is the recorded intent: a body that
+        // is not a complete, well-formed context can never be it.
+        try { context = retirementContextFields(body, currentRow); } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          json(res, 409, { error: 'retire_conflict', detail: `directive request "${requestId}" was retired under a recorded intent — ` +
+            `replay it with the recorded retire_expected_* fields from GET /api/silas/directives/${requestId} (${error.message})` });
+          return true;
+        }
+      } else if (currentRow.state !== 'settled' && currentRow.state !== 'failed') context = retirementContextFields(body, currentRow);
       const reason = strField(body, 'reason');
       const by = strField(body, 'by');
       let outcome: ReturnType<typeof retireInterruptedDirectiveFromRoute>;
@@ -1859,8 +1879,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       });
       return true;
     }
-    // Owner abandonment of a live request whose custody is unknown: same
-    // auth boundary as retirement and binning; never evidence of anything.
+    // Owner abandonment of a live request whose custody is unknown: the
+    // owner's explicit decision (by "owner", confirm_intent), never Gru's;
+    // never evidence of anything.
     const directiveAbandonment = /^\/api\/silas\/directives\/([^/]+)\/abandon$/.exec(path);
     if (req.method === 'POST' && directiveAbandonment !== null) {
       if (!authed(req, res)) return true;
@@ -1868,20 +1889,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (ops === null) return true;
       const requestId = decodeURIComponent(directiveAbandonment[1] ?? '');
       const body = await readBody(req);
+      if (!ownerConfirmed(body)) {
+        json(res, 400, { error: 'bad_request', detail: OWNER_CONFIRMATION_REQUIRED });
+        return true;
+      }
       const expectedJobId = strField(body, 'expected_job_id');
       const expectedState = strField(body, 'expected_state');
-      if (expectedState !== 'dispatching' && expectedState !== 'admitted') {
-        throw new Error('expected_state must be "dispatching" or "admitted"');
+      if (expectedState !== 'dispatching' && expectedState !== 'admitted' && expectedState !== 'abandoned') {
+        throw new Error('expected_state must be "dispatching" or "admitted" (or "abandoned" to replay an abandonment)');
       }
       const expectedPayloadHash = strField(body, 'expected_payload_hash').trim().toLowerCase();
       const reason = strField(body, 'reason');
-      const by = strField(body, 'by');
       let outcome: ReturnType<typeof abandonLiveDirectiveFromRoute>;
       try {
         outcome = abandonLiveDirectiveFromRoute({ ledger: options.ledger, worktrees: ops.worktrees,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
           pendingProducerBlockers: options.pendingProducerBlockers, requestId,
-          expected: { jobId: expectedJobId, state: expectedState, payloadHash: expectedPayloadHash }, reason, by });
+          expected: { jobId: expectedJobId, state: expectedState, payloadHash: expectedPayloadHash }, reason, by: 'owner' });
       } catch (error) {
         if (directiveControlRefusal(res, error)) return true;
         throw error;
@@ -1891,7 +1915,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       json(res, 200, {
         request_id: record.requestId,
         job_id: record.jobId,
-        state: directiveReadbackState(record),
+        state: directiveStateName(record),
         idempotent: outcome.idempotent,
         admission_seq: record.admissionSeq,
         minion_id: record.admissionMinion,
@@ -1902,6 +1926,37 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         abandonment_event_seq: outcome.event.seq,
         note: ABANDONED_NOTE,
       });
+      return true;
+    }
+    const rebriefAbandonment = /^\/api\/silas\/rebriefs\/([^/]+)\/abandon$/.exec(path);
+    if (req.method === 'POST' && rebriefAbandonment !== null) {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const markerId = decodeURIComponent(rebriefAbandonment[1] ?? '');
+      const body = await readBody(req);
+      if (!ownerConfirmed(body)) {
+        json(res, 400, { error: 'bad_request', detail: OWNER_CONFIRMATION_REQUIRED });
+        return true;
+      }
+      const expectedJobId = strField(body, 'expected_job_id');
+      const expectedPayloadHash = strField(body, 'expected_payload_hash').trim().toLowerCase();
+      const reason = strField(body, 'reason');
+      let outcome: ReturnType<typeof abandonPendingRebriefFromRoute>;
+      try {
+        outcome = abandonPendingRebriefFromRoute({ ledger: options.ledger, worktrees: ops.worktrees,
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          pendingProducerBlockers: options.pendingProducerBlockers, markerId,
+          expected: { jobId: expectedJobId, payloadHash: expectedPayloadHash }, reason, by: 'owner' });
+      } catch (error) {
+        if (directiveControlRefusal(res, error)) return true;
+        throw error;
+      }
+      const facts = outcome.event.payload as { markers?: readonly { id?: unknown }[]; unknown?: unknown; retirement_refused?: unknown };
+      json(res, 200, { marker_id: markerId, job_id: outcome.record.jobId, state: 'abandoned', idempotent: outcome.idempotent,
+        marker_ids: (facts.markers ?? []).map((marker) => marker.id), payload_hash: outcome.record.payloadHash,
+        abandoned_at: outcome.record.abandonedAt, abandoned_by: outcome.record.abandonedBy, abandon_reason: outcome.record.abandonReason,
+        unknown: facts.unknown, retirement_refused: facts.retirement_refused, abandonment_event_seq: outcome.event.seq, note: ABANDONED_NOTE });
       return true;
     }
     const directiveReadback = /^\/api\/silas\/directives\/([^/]+)$/.exec(path);
@@ -1916,7 +1971,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       json(res, 200, {
         request_id: record.requestId,
         job_id: record.jobId,
-        state: directiveReadbackState(record),
+        state: directiveStateName(record),
         payload_hash: record.payloadHash,
         accepted_at: record.createdAt,
         updated_at: record.updatedAt,
@@ -2000,7 +2055,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       let begun;
       try {
-        begun = options.ledger.beginRebriefIntent({ jobId, note, holder: 'silas-ops',
+        begun = options.ledger.beginRebriefIntent({ jobId, note, holder: 'silas-ops', ...(ownerConfirmed(body) ? { ownerAccepted: true } : {}),
           ...(requestId === undefined ? {} : { requestId }), ...(completionHandoff === undefined ? {} : { handoff: completionHandoff }),
           sourceContext: { ...(ruleId === null ? {} : { ruleId }), ...(sourceRoundId === undefined ? {} : { sourceRoundId }) } });
       } catch (error) {
@@ -2010,7 +2065,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const intent = begun.record;
       if (!begun.created) {
         json(res, intent.state === 'dispatching' || intent.state === 'admitted' ? 202 : 200,
-          { request_id: intent.requestId, job_id: jobId, state: directiveReadbackState(intent), replay: true });
+          { request_id: intent.requestId, job_id: jobId, state: directiveStateName(intent), replay: true });
         return true;
       }
       const release = options.ledger.beginJobAdmission(jobId, `rebrief ${intent.requestId}`);

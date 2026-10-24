@@ -27,6 +27,9 @@ const UNMARKED_CARDS_SCOPE = 'unmarked-handback-cards';
  * target merged or whose obligation open was lost. */
 const REPORT_BACKSTOP_SCOPE = 'report-obligation-backstop';
 const REPORT_SUPERSEDE_SCOPE = 'report-closure-supersede';
+/** A provable supersede that waits for the report job's live directive
+ * control to close first (the note names it). */
+const REPORT_SUPERSEDE_DEFERRED_EVENT = 'report.supersede-deferred';
 
 /**
  * The bounded, non-LLM durable reconciliation pass (issue #163).
@@ -295,6 +298,16 @@ export function reconcileReportClosures(
         if (source === null || source.id === job.id) continue; // unobservable target — the commissioner keeps the debt
         const reason = reportSupersedeReason(deps, job.targetSha ?? '', source);
         if (reason === null) continue;
+        // `done` never closes over live directive control. Defer with one
+        // durable note per distinct blocker set, not a refusal every pass.
+        const held = deps.ledger.doneBlockers(job.id);
+        if (held.length > 0) {
+          const noted = deps.ledger.latestJobEvent(job.id, REPORT_SUPERSEDE_DEFERRED_EVENT)?.payload as { blockers?: unknown } | undefined;
+          if (JSON.stringify(noted?.blockers) !== JSON.stringify(held)) {
+            deps.ledger.appendCustomEvent({ kind: REPORT_SUPERSEDE_DEFERRED_EVENT, jobId: job.id, payload: { reason, blockers: held } });
+          }
+          continue;
+        }
         deps.ledger.supersedeReportObligation({ jobId: job.id, reason });
         superseded += 1;
       } catch (error) {

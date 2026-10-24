@@ -1075,7 +1075,9 @@ export class BoardEngine {
         return job !== null && !isJobTerminal(job.status);
       });
       if (hold !== undefined) {
-        return `directive ${hold.requestId}: retired — continuation requires a fresh request (${hold.jobId})`;
+        return hold.kind === 'retired'
+          ? `directive ${hold.requestId}: retired — continuation requires a fresh request (${hold.jobId})`
+          : `${hold.kind === 'abandoned' ? 'directive' : 're-brief'} ${hold.requestId}: abandoned by the owner, outcome unknown — continuation requires a fresh request the owner accepts (${hold.jobId})`;
       }
       if (damaged.length > 0) return damaged[0] ?? null;
     } catch (error) {

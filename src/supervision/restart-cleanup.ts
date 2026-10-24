@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { EventRecord, LedgerApi } from '../ledger/api.js';
 import type { AgentHandle } from '../runtime/types.js';
+import { RESTART_CLEANUP_UNCONFIRMED } from '../ledger/directives.js';
 
 const PENDING = 'supervision.restart-cleanup-pending';
 const CONFIRMED = 'supervision.restart-cleanup-confirmed';
@@ -156,7 +157,7 @@ export class RestartCleanupJournal {
 }
 
 export function restartCleanupDiagnostic(debt: RestartCleanupDebt): string {
-  return `restart cleanup unconfirmed: ${debt.replacementAgentId ?? '(unknown minion)'} ` +
+  return `${RESTART_CLEANUP_UNCONFIRMED} ${debt.replacementAgentId ?? '(unknown minion)'} ` +
     `(generation ${debt.generation ?? 'legacy/unknown'}, originating event ${debt.originSeq}). ` +
     'Only the original native owner can record disposal acknowledgment and positive cessation proof. ' +
     'If that owner was lost in a hard crash, proof is unavailable and custody remains blocked; ACK, restart or successor cleanup cannot release it.';

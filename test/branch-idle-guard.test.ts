@@ -1954,7 +1954,7 @@ describe('branch-idle guard', () => {
       h.ledger.setJobStatus('terminal-merged', 'merged');
       await createLaneJob(h, repo, { jobId: 'terminal-done', status: 'delivered' });
       h.ledger.beginPendingRebrief({ jobId: 'terminal-done', note: 'n', briefing: 'b' });
-      h.ledger.setJobStatus('terminal-done', 'done');
+      markLegacyTerminalJobFixture(h.ledger, 'terminal-done', 'done');
       await createLaneJob(h, repo, { jobId: 'terminal-binned', status: 'delivered' });
       h.ledger.beginPendingRebrief({ jobId: 'terminal-binned', note: 'n', briefing: 'b' });
       // Binned before pending markers refused a bin (legacy history).

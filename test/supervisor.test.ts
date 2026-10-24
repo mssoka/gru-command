@@ -32,7 +32,7 @@ import type {
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
-import { directiveRetirementInputs } from './helpers/directive-native-fixture.js';
+import { directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { rebriefFreshMinion, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
@@ -2203,16 +2203,15 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     vi.useFakeTimers();
     const f = await deferredRestart();
     try {
-      // Its pending re-brief markers refuse binning; a merge is an observed fact.
-      f.rig.api.setJobStatus(f.jobId, 'in-review');
-      f.rig.api.setJobStatus(f.jobId, 'merged');
+      // Its pending re-brief markers refuse binning now: binned before that.
+      markLegacyTerminalJobFixture(f.rig.api, f.jobId, 'binned');
       f.releaseSpawn(f.replacement);
       await flushMicrotasks();
       expect(f.replacement.disposed).toBe(true);
       expect(f.register).not.toHaveBeenCalled();
       expect(f.swapped).not.toHaveBeenCalled();
       expect(f.replacement.promptCalls).toEqual([]);
-      expect(f.rig.api.getJob(f.jobId)?.status).toBe('merged');
+      expect(f.rig.api.getJob(f.jobId)?.status).toBe('binned');
       expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
@@ -3003,9 +3002,8 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       const jobId = 'idle-terminal-job';
       freshHandoffJob(rig, jobId);
       const idle = adoptIdle(rig, 'idle-terminal', jobId, null);
-      // Its live directive refuses `done`; a merge is an observed fact.
-      rig.api.setJobStatus(jobId, 'in-review');
-      rig.api.setJobStatus(jobId, 'merged');
+      // Its live directive refuses `done` now: done before that.
+      markLegacyTerminalJobFixture(rig.api, jobId, 'done');
       rig.registry.spawnImpl = async () => new FakeHandle('minion', 'idle-terminal-should-not-run', null);
       idle.emit({ type: 'error', error: 'idle session stream died', fatal: true });
       await flushMicrotasks();

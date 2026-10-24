@@ -1,4 +1,4 @@
-import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -269,6 +269,13 @@ async function assertHistoricalRefusal(h: Harness, jobId: string, workerGate?: P
 }
 
 /** The seed leaves the job working; terminal is in-review → merged. */
+/** A job that went terminal before pending markers refused `done` and a
+ * bin (pre-#493 history): the terminal reconciler still retires its
+ * markers administratively. A merge no longer does that. */
+function binBeforeMarkerFence(h: Harness, jobId: string): void {
+  markLegacyTerminalJobFixture(h.ledger, jobId, 'binned');
+}
+
 function merge(h: Harness, jobId: string): void {
   h.ledger.setJobStatus(jobId, 'in-review');
   h.ledger.setJobStatus(jobId, 'merged');
@@ -744,10 +751,10 @@ describe('re-brief restart safety (durable markers)', () => {
     const h = makeHarness(); const jobId = 'terminal-historical-558';
     try {
       await seedPendingRebrief({ h, jobId }); await assertHistoricalRefusal(h, jobId);
-      merge(h, jobId);
+      binBeforeMarkerFence(h, jobId);
       const pass = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
       await pass.settled; expect(pass.retired).toBe(1);
-      expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+      expect(h.ledger.getJob(jobId)?.status).toBe('binned');
       expect(h.registry.workers).toEqual([]); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
       expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     } finally { h.close(); }
@@ -1627,8 +1634,8 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId: malformedJob });
     const mixed = h.ledger.listPendingRebriefs({ jobId: malformedJob });
     h.db.handle.prepare('UPDATE pending_rebriefs SET phase_id = ? WHERE id = ?').run('foreign', mixed[0]!.id);
-    merge(h, retiredJob);
-    merge(h, malformedJob);
+    binBeforeMarkerFence(h, retiredJob);
+    binBeforeMarkerFence(h, malformedJob);
     const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
     await report.settled;
     expect(report.retired).toBe(1);
@@ -1773,13 +1780,13 @@ describe('terminal re-brief retirement', () => {
     return view;
   }
 
-  it('boot retires an admitted re-brief on a merged job: audited, no spawn, no fabricated delivery, no alert', async () => {
+  it('boot retires an admitted re-brief on a job binned before markers refused it: audited, no spawn, no fabricated delivery, no alert', async () => {
     const h = makeHarness();
     const jobId = 'terminal-pair-job';
     const boundAgent = 'worker-bound-1';
     const boundSession = '/sessions/bound-worker.jsonl';
     await seedPendingRebrief({ h, jobId, bindWorker: { agentId: boundAgent, sessionFile: boundSession } });
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     const markers = h.ledger.listPendingRebriefs({ jobId });
     const logs: string[] = [];
     const report = await reconcilePendingRebriefs(
@@ -1797,7 +1804,7 @@ describe('terminal re-brief retirement', () => {
 
     // No worker ever ran, no guarded event was fabricated, the lane stayed terminal.
     expect(h.registry.workers).toHaveLength(0);
-    expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+    expect(h.ledger.getJob(jobId)?.status).toBe('binned');
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
@@ -1806,7 +1813,7 @@ describe('terminal re-brief retirement', () => {
     const audit = h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired');
     expect(audit).not.toBeNull();
     const payload = audit?.payload as { job_status?: string; reason?: string };
-    expect(payload.job_status).toBe('merged');
+    expect(payload.job_status).toBe('binned');
     expect(payload.reason).toContain('terminal');
     const retired = retiredAudit(h, jobId);
     expect(retired.map((marker) => marker.kind).sort()).toEqual(['job.delivered', 'silas.rebrief']);
@@ -1841,7 +1848,7 @@ describe('terminal re-brief retirement', () => {
     // The turn settled and `silas.rebrief` posted; the crash hit before the
     // delivery record — and the job merged before the next boot.
     seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
     expect(report.retired).toBe(1);
     expect(report.completed).toBe(0); // NOT the delivery-only crash shortcut
@@ -1896,11 +1903,37 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.listPendingRebriefs({ jobId }).map((row) => row.note)).toEqual(['new request', 'new request']);
   });
 
+  it('a merge is not custody evidence: unproven markers on a merged job stay visible, unretired, until the owner abandons them', async () => {
+    const h = makeHarness();
+    const jobId = 'merged-unproven-job';
+    await seedPendingRebrief({ h, jobId });
+    const markers = h.ledger.listPendingRebriefs({ jobId });
+    merge(h, jobId);
+    for (let pass = 0; pass < 2; pass += 1) {
+      const report = await reconcilePendingRebriefs(deps(h), { limit: 100 });
+      await report.settled;
+      expect(report.retired).toBe(0);
+    }
+    expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(markers);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    const cards = h.ledger.listNotifications({ limit: 100 }).filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}` && row.resolvedAt === null);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ agentId: null, routing: 'action-required', title: `Re-brief markers still pending on merged job ${jobId}` });
+    expect(cards[0]!.detail).toContain('a merge is not custody evidence');
+    expect(cards[0]!.detail).toContain('never call /abandon yourself');
+    const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+    h.ledger.abandonPendingRebrief({ markerId: marker.id, expectedJobId: jobId, expectedPayloadHash: marker.payloadHash, lane: { unavailable: 'none' },
+      routeBlockers: [], reason: 'marker custody unknown', by: 'owner' });
+    expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+    expect(h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+  });
+
   it('repeated and overlapping boot passes retire exactly once (idempotent by request identity)', async () => {
     const h = makeHarness();
     const jobId = 'terminal-replay-job';
     await seedPendingRebrief({ h, jobId });
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     // Both passes start in the same tick: the first scan retires
     // synchronously, so the second must find nothing left to retire.
     const first = reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
@@ -1919,10 +1952,10 @@ describe('terminal re-brief retirement', () => {
     const h = makeHarness(); const jobId = 'terminal-historical-1406';
     try {
       await seedPendingRebrief({ h, jobId }); await assertHistoricalRefusal(h, jobId);
-      merge(h, jobId);
+      binBeforeMarkerFence(h, jobId);
       const pass = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
       await pass.settled; expect(pass.retired).toBe(1);
-      expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+      expect(h.ledger.getJob(jobId)?.status).toBe('binned');
       expect(h.registry.workers).toEqual([]); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
       expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     } finally { h.close(); }
@@ -1932,10 +1965,10 @@ describe('terminal re-brief retirement', () => {
     const h = makeHarness(); const jobId = 'terminal-historical-1437';
     try {
       await seedPendingRebrief({ h, jobId }); await assertHistoricalRefusal(h, jobId);
-      merge(h, jobId);
+      binBeforeMarkerFence(h, jobId);
       const pass = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
       await pass.settled; expect(pass.retired).toBe(1);
-      expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+      expect(h.ledger.getJob(jobId)?.status).toBe('binned');
       expect(h.registry.workers).toEqual([]); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
       expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     } finally { h.close(); }
@@ -1948,7 +1981,7 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId: terminalJob });
     await seedPendingRebrief({ h, jobId: workingJob });
     const unfinished = h.ledger.listPendingRebriefs({ jobId: workingJob });
-    merge(h, terminalJob);
+    binBeforeMarkerFence(h, terminalJob);
     const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
     expect(report.retired).toBe(1);
     expect(report.redispatched).toBe(0);
@@ -1968,11 +2001,11 @@ describe('terminal re-brief retirement', () => {
       .toEqual([expect.objectContaining({ state: 'open', nextAction: expect.objectContaining({ kind: 'gru-decision' }) })]);
   });
 
-  it('retires a terminal request on a done job exactly as on a merged one', async () => {
+  it('retires a terminal request on a legacy done job exactly as on a legacy binned one', async () => {
     const h = makeHarness();
     const jobId = 'terminal-done-job';
     await seedPendingRebrief({ h, jobId });
-    h.ledger.setJobStatus(jobId, 'done');
+    markLegacyTerminalJobFixture(h.ledger, jobId, 'done');
     const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
     expect(report.retired).toBe(1);
     expect(report.redispatched).toBe(0);
@@ -2174,7 +2207,7 @@ describe('terminal re-brief retirement', () => {
     const h = makeHarness();
     const jobId = 'boot-incomplete-retirement';
     await seedPendingRebrief({ h, jobId });
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     const logs: string[] = [];
     const stale: PendingRebriefRetirement = {
       retired: [],
@@ -2214,7 +2247,7 @@ describe('terminal re-brief retirement', () => {
       skippedIds: ['stale-generation'],
       refused: null,
     };
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     const report = await reconcilePendingRebriefs(
       {
         registry: h.registry,
@@ -2245,7 +2278,7 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId });
     const driftedId = h.ledger.listPendingRebriefs({ jobId })[0]!.id;
     const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     const report = await reconcilePendingRebriefs(
       {
         registry: h.registry,
@@ -2278,14 +2311,14 @@ describe('terminal re-brief retirement', () => {
 
   it('one pass retires multiple terminal jobs: per-job audits, statuses, and an untouched working lane', async () => {
     const h = makeHarness();
-    const mergedJobId = 'multi-terminal-merged';
+    const binnedJobId = 'multi-terminal-binned';
     const doneJobId = 'multi-terminal-done';
     const workingJobId = 'multi-terminal-working';
-    await seedPendingRebrief({ h, jobId: mergedJobId });
+    await seedPendingRebrief({ h, jobId: binnedJobId });
     await seedPendingRebrief({ h, jobId: doneJobId });
     await seedPendingRebrief({ h, jobId: workingJobId });
-    merge(h, mergedJobId);
-    h.ledger.setJobStatus(doneJobId, 'done');
+    binBeforeMarkerFence(h, binnedJobId);
+    markLegacyTerminalJobFixture(h.ledger, doneJobId, 'done');
     const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
     expect(report.examined).toBe(6);
     expect(report.retired).toBe(2);
@@ -2295,7 +2328,7 @@ describe('terminal re-brief retirement', () => {
     // The loop carried BOTH terminal groups: one audit per job, each with
     // its own terminal status, and no terminal lane spawned a worker.
     expect(h.registry.workers).toHaveLength(0);
-    for (const [jobId, status] of [[mergedJobId, 'merged'], [doneJobId, 'done']] as const) {
+    for (const [jobId, status] of [[binnedJobId, 'binned'], [doneJobId, 'done']] as const) {
       const audits = h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired');
       expect(audits).toHaveLength(1);
       expect((audits[0]!.payload as { job_status?: string }).job_status).toBe(status);
@@ -2312,7 +2345,7 @@ describe('terminal re-brief retirement', () => {
     const h = makeHarness();
     const jobId = 'partial-retirement-boot';
     await seedPendingRebrief({ h, jobId });
-    merge(h, jobId);
+    binBeforeMarkerFence(h, jobId);
     // Drift ONE candidate's identity after the pass examined the rows: the
     // real transaction retires the matching marker and skips the drifted
     // one — the partial composition, deterministically.
@@ -2346,7 +2379,7 @@ describe('terminal re-brief retirement', () => {
     // the disposition — never a bare success over a kept marker.
     const finalizeJobId = 'partial-retirement-finalize';
     await seedPendingRebrief({ h, jobId: finalizeJobId });
-    merge(h, finalizeJobId);
+    binBeforeMarkerFence(h, finalizeJobId);
     const driftedFinalizeId = h.ledger.listPendingRebriefs({ jobId: finalizeJobId })[0]!.id;
     const result = finalizeRebriefRequest({
       ledger: ledgerWith(h, {

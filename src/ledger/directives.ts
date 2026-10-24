@@ -244,10 +244,15 @@ export interface DirectiveRequestRecord {
   readonly recoveryDecision: { readonly fingerprint: string; readonly successorId: string | null; readonly eventSeq: number } | null;
 }
 
-/** One open (or released) continuation hold created by a retirement. The
- * presence of an unreleased hold fences lane automation (review arming,
- * digest offers) until a fresh directive/re-brief request is accepted. */
+/** One open (or released) continuation hold created by a retirement or an
+ * owner abandonment. The presence of an unreleased hold fences lane
+ * automation (review arming, digest offers) until a fresh directive/re-brief
+ * request is accepted; an abandonment hold only by one the owner accepts
+ * (or binning). `retiredAt`/`retiredBy`/`reason` are when, by whom and why
+ * control closed, whichever `kind` closed it. `requestId` is the marker id
+ * of an abandoned re-brief generation. */
 export interface DirectiveRecoveryHold {
+  readonly kind: 'retired' | 'abandoned' | 'rebrief-abandoned';
   readonly jobId: string;
   readonly requestId: string;
   readonly admissionClass: DirectiveAdmissionClass;
@@ -256,4 +261,20 @@ export interface DirectiveRecoveryHold {
   readonly reason: string;
   readonly releasedBy: string | null;
   readonly releasedAt: string | null;
+}
+
+/** The state a reader names: an owner abandonment is stored `failed` but is
+ * never no-effect proof, so it reads `abandoned`. */
+export function directiveStateName(record: Pick<DirectiveRequestRecord, 'state' | 'abandonedAt'>): string {
+  return record.abandonedAt === null ? record.state : 'abandoned';
+}
+
+/** Producer-custody uncertainty a supervisor or ledger reports: a producer
+ * whose cessation is unproven, never one known to run. Owner abandonment may
+ * close a request over these (it clears none of them). Every other blocker
+ * names a producer that is live or about to run. */
+export const RESTART_CLEANUP_UNCONFIRMED = 'restart cleanup unconfirmed:';
+export const UNPROVEN_DIRECTIVE_CESSATION = 'unproven directive producer cessation:';
+export function isProducerCustodyUncertainty(blocker: string): boolean {
+  return blocker.startsWith(RESTART_CLEANUP_UNCONFIRMED) || blocker.startsWith(UNPROVEN_DIRECTIVE_CESSATION);
 }
