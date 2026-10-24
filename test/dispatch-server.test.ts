@@ -3270,7 +3270,7 @@ describe('prebootstrap dependency patch readback', () => {
       } });
       h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-started', jobId: 'job-patch-readback', payload: {
         version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64),
-        worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+        worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40), base_tree: 'f'.repeat(40),
       } });
       const unauthenticated = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch');
       expect(unauthenticated.status).toBe(401);
