@@ -474,21 +474,27 @@ lifecycle fact — so a settled report read as independent coverage.
   `"` counts as "any other", so a leading quote always marks the escaped form.
   The package bytes are kept (`review.blind-input-package`, written before the
   admission), so a fresh replacement reviewer (provider recovery, a Silas
-  re-brief, or a directive whose session cannot resume) gets the same REVIEW
-  SOURCE and package blocks, once; a resumed session already holds them. An
-  attested reviewer whose package was not kept (one admitted before packages were
-  kept) is refused by name before any session is stopped or spawned — never a
-  replacement briefed without its input.
+  re-brief, or a directive whose session cannot resume or whose session file is
+  gone) gets the package block again, once, even when its carried-over prompt
+  already held it; a resumed session already holds it. Any review job whose
+  dispatch recorded `job.review-source-verified` gets its REVIEW SOURCE block
+  back the same way, after checking that the lane still uses the verified object
+  store. A package that was not kept (one admitted before packages were kept), a
+  malformed record or a different object store is refused by name before the
+  lane is cleared, any session is stopped or spawned, or a provider wait is
+  claimed (that wait is cancelled) — never a replacement briefed without its
+  input.
 - **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
   refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
 - **Role-specific host context.** The admitted role decides what GC adds to a
   reviewer's prompt. A blind reviewer gets no Book of Lessons lookup or pointer on
-  any path (dispatch, directive, re-brief, provider recovery), a re-brief gives it
-  the read-only review orders, and its briefing offers no child workers: a
+  any path (dispatch, directive, re-brief, provider recovery), and no child
+  workers: its sessions are spawned without the child-worker tools and a
   `request_child_worker` call from an admitted blind job is refused as
   `parent_not_permitted`, since a child holds neither the package nor the
-  isolation rule and its reads are not observed. Ordinary workers and `claims`
-  reviewers keep the lesson references.
+  isolation rule and its reads are not observed. Every review job's re-brief and
+  fresh directive session carries the read-only review orders. Ordinary workers
+  and `claims` reviewers keep the lesson references.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 
@@ -535,5 +541,7 @@ whose recorded blind-access facts cannot be counted — repair them in the ledge
 first). A blocked, parked or binned sibling is skipped. Any other blind sibling
 whose coverage is not `qualifying` (`invalidated`, `unattested` or `unobserved`,
 terminal or not) may be replaced: the new admission lists it in `replaces`, and
-its report stays exactly as recorded.
+its report stays exactly as recorded. Replacing does not stop it: a sibling
+still running keeps running, and a report it delivers later is recorded as it
+is.
 
