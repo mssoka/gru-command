@@ -131,7 +131,9 @@ are rechecked at application and before worker admission.
 
 The supported file grammar is intentionally small: root `requirements.txt`,
 blank/comment lines and pinned `distribution==version` declarations only.
-Existing comment/blank lines must remain identical. No include/constraint files,
+Existing comment/blank lines must remain identical, and every pin keeps its
+line, name and extras: only its `==version` may change, so no distribution is
+added, removed or moved. No include/constraint files,
 URLs, VCS/path references, options, environment expansion, secrets, manifests,
 setup commands, configuration or other file paths are accepted. Package
 content is never interpreted as a shell command or diff. The patch binds the

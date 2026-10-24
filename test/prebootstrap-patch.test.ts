@@ -269,6 +269,25 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(() => assertSafeRequirementsPatch(OLD_REQUIREMENTS, '# changed comment\nfixture-dep==2.0.0\nshared-lib==4.2.0\n')).toThrow(/comments and blank lines/u);
   });
 
+  it('lets a patch change pinned versions only, refusing by name', () => {
+    const before = '# core\nfoo==1.0\n\n# extra\nbar==2.0\n';
+    expect(() => assertSafeRequirementsPatch(before, '# core\nfoo==1.1\n\n# extra\nbar==2.0\n')).not.toThrow();
+    const refusal = (after: string): unknown => {
+      try { assertSafeRequirementsPatch(before, after); } catch (error) { return error; }
+      return null;
+    };
+    expect(refusal('# core\n\n# extra\nfoo==1.1\nbar==2.0\nevil-pkg==0.0.1\n'))
+      .toMatchObject({ name: 'PreBootstrapPatchError', code: 'content_invalid', message: expect.stringContaining('adds distribution evil-pkg') });
+    expect(refusal('# core\nfoo==1.1\n\n# extra\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('removes the pin for bar') });
+    expect(refusal('# core\n\n# extra\nfoo==1.1\nbar==2.0\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('moves distribution foo') });
+    expect(refusal('# core\nbar==2.0\n\n# extra\nfoo==1.1\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('moves distribution foo') });
+    expect(refusal('# core\nfoo[cli]==1.1\n\n# extra\nbar==2.0\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('changes more than the version of foo') });
+  });
+
   it('rejects an unapproved or mismatched contract before creating a job or lane', async () => {
     const f = makeFixture();
     const made = f.makePackage({ briefing: 'Missing the explicit authorization.' });

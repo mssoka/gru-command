@@ -345,38 +345,58 @@ export function assertPreBootstrapPatchDispatchBinding(
 /** The only supported dependency syntax contains pinned requirements; comments
  * and blank lines are immutable across the patch, so configuration, includes,
  * URLs, credentials, command flags, environment markers and VCS paths cannot
- * enter through this write surface. */
+ * enter through this write surface. Every line keeps its slot: a pin keeps its
+ * exact name and extras and may change only its `==version`, so no
+ * distribution is added, removed or moved. */
 export function assertSafeRequirementsPatch(before: string, after: string): void {
-  const parse = (text: string, label: string): { readonly declarations: readonly string[]; readonly otherLines: readonly string[] } => {
+  type Line = { readonly pin: null; readonly text: string } | { readonly pin: string; readonly spec: string; readonly version: string; readonly text: string };
+  const parse = (text: string, label: string): readonly Line[] => {
     if (Buffer.byteLength(text, 'utf8') > PREBOOTSTRAP_PATCH_MAX_FILE_BYTES || text.includes('\u0000') || text.includes('\r') || Buffer.from(text, 'utf8').toString('utf8') !== text) {
       throw new PreBootstrapPatchError('content_invalid', `${label} must be bounded UTF-8 text with LF newlines`);
     }
-    const declarations: string[] = [];
-    const otherLines: string[] = [];
     const names = new Set<string>();
-    for (const [index, line] of text.split('\n').entries()) {
-      if (line === '' || /^\s*$/u.test(line) || /^\s*#/u.test(line)) {
-        otherLines.push(line);
-        continue;
-      }
+    const lines = text.split('\n').map((line, index): Line => {
+      if (line === '' || /^\s*$/u.test(line) || /^\s*#/u.test(line)) return { pin: null, text: line };
       const match = REQUIREMENT.exec(line);
       if (match === null) throw new PreBootstrapPatchError('content_invalid', `${label} line ${String(index + 1)} is not a pinned distribution==version dependency`);
       const name = (match[1] ?? '').toLowerCase().replace(/[-_.]+/gu, '-');
       if (names.has(name)) throw new PreBootstrapPatchError('content_invalid', `${label} contains duplicate dependency ${name}`);
       names.add(name);
-      declarations.push(line);
-    }
-    if (declarations.length === 0) throw new PreBootstrapPatchError('content_invalid', `${label} must contain at least one pinned dependency`);
-    return { declarations, otherLines };
+      const version = match[2] ?? '';
+      return { pin: name, spec: line.slice(0, line.length - version.length - 2), version, text: line };
+    });
+    if (names.size === 0) throw new PreBootstrapPatchError('content_invalid', `${label} must contain at least one pinned dependency`);
+    return lines;
   };
-  const oldParsed = parse(before, 'existing requirements.txt');
-  const newParsed = parse(after, 'patched requirements.txt');
-  if (JSON.stringify(oldParsed.otherLines) !== JSON.stringify(newParsed.otherLines)) {
+  const oldLines = parse(before, 'existing requirements.txt');
+  const newLines = parse(after, 'patched requirements.txt');
+  const pins = (lines: readonly Line[]): ReadonlySet<string> => new Set(lines.flatMap((line) => line.pin === null ? [] : [line.pin]));
+  const oldPins = pins(oldLines);
+  const newPins = pins(newLines);
+  for (const name of newPins) {
+    if (!oldPins.has(name)) throw new PreBootstrapPatchError('content_invalid', `prebootstrap patch adds distribution ${name}; it may change pinned versions only`);
+  }
+  for (const name of oldPins) {
+    if (!newPins.has(name)) throw new PreBootstrapPatchError('content_invalid', `prebootstrap patch removes the pin for ${name}; it may change pinned versions only`);
+  }
+  if (oldLines.length !== newLines.length) {
     throw new PreBootstrapPatchError('content_invalid', 'prebootstrap patch may change pinned dependency declarations only; comments and blank lines must remain unchanged');
   }
-  if (JSON.stringify(oldParsed.declarations) === JSON.stringify(newParsed.declarations)) {
-    throw new PreBootstrapPatchError('content_invalid', 'prebootstrap dependency patch does not change any pinned dependency');
+  let changed = false;
+  for (const [index, oldLine] of oldLines.entries()) {
+    const newLine = newLines[index]!;
+    if (oldLine.pin === null || newLine.pin === null || oldLine.pin !== newLine.pin) {
+      const moved = oldLine.pin ?? newLine.pin;
+      if (moved !== null) throw new PreBootstrapPatchError('content_invalid', `prebootstrap patch moves distribution ${moved}; every pin must keep its line`);
+      if (oldLine.text !== newLine.text) {
+        throw new PreBootstrapPatchError('content_invalid', 'prebootstrap patch may change pinned dependency declarations only; comments and blank lines must remain unchanged');
+      }
+      continue;
+    }
+    if (newLine.spec !== oldLine.spec) throw new PreBootstrapPatchError('content_invalid', `prebootstrap patch changes more than the version of ${oldLine.pin}`);
+    if (newLine.version !== oldLine.version) changed = true;
   }
+  if (!changed) throw new PreBootstrapPatchError('content_invalid', 'prebootstrap dependency patch does not change any pinned dependency');
 }
 
 export function originIdentitySha256(origin: string): string {
