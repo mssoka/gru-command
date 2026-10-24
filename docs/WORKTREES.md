@@ -601,33 +601,43 @@ handoff, or accept caller-supplied source/briefing/base fields. A job with an
 accepted amendment, previous phase-handoff, report/PR target, worker, lane,
 admission, live directive or pending re-brief is outside this control and is
 refused, as is a request id that names a directive request. The handoff
-path's canonical realpath must name the job's recorded repository; a refusal
-names both.
+path's own leaf must be the job's recorded repository (dispatch derived it so,
+a symlinked path included) and the path must resolve to the repository the
+manager inspects; the continuation dispatches through that same path.
 
 Every job branch creation, ordinary dispatch included, journals one
 `job.creation-producer-settled` event per receipt token when its Git child's
-own `close` shows that the child and every descendant holding its pipes
-stopped. A child that exited while a descendant still holds the pipes is
-watched for up to ten minutes; a close caused by GC releasing those pipes
-proves nothing. A failed write is logged and never fails the creation. The
-receipt token is bound by its SHA-256 digest; the raw token never reaches the
-readback, and a dispatch failure's job note and events redact it. Receipt
+own `close` shows that the child exited and every holder released its pipes
+(a descendant that redirected its output can outlive that). A child that
+exited while something still holds the pipes is watched for up to ten
+minutes; a close caused by GC releasing those pipes proves nothing, and the
+producer then stays UNKNOWN. A failed write is logged and never fails the
+creation. The receipt token is bound by its SHA-256 digest; the raw token
+never reaches the readback, and a dispatch failure's job note, events, HTTP
+detail and log line redact it. Receipt
 host/PID, a missing PID, service restart and ref commitment are not
 producer-cessation evidence. Without the settlement the request is refused and
 custody remains UNKNOWN.
 
 A continuation waits at the ordinary disk floor (the owner may bin or park the
-job meanwhile), then takes the job admission and calls WorktreeManager's
+job meanwhile), then takes the job admission, refuses a live directive or
+pending re-brief that started during the wait, and calls WorktreeManager's
 guarded reconciliation with a strict retained-only policy. The receipt must be
 the one the request accepted (same token digest and settlement), and it and
 the exact direct branch ref must remain present and unchanged, including the
 receipt-matched reflog and repository/worktree-holder fences. Missing
 receipt/ref cannot clear the receipt and fall through to the ordinary
 new-base branch; mismatch, lock, symbolic ref, foreign checkout/admin/holder
-and unreadable evidence refuse without continuation cleanup. A failure after
-adoption, a failing `[[setup]]` included, keeps the ref, receipt and any
-partial checkout and reads back `failed`. A registered lane goes through the
-ordinary worker pacing gate, spawn and delivery path.
+and unreadable evidence refuse without continuation cleanup, before adoption or
+after it. Any other failure before registration, a failing `[[setup]]`
+included, rolls the checkout back under the receipt's own token and keeps the
+ref and receipt: readback says `failed` with the retained custody, and a later
+request adopts them again. A setup whose processes outlive it keeps everything
+and reads `custody-unknown`, as does an unconfirmed rollback. A failure after
+registration reads `custody-unknown`: the registry row holds the lane and the
+receipt may already be spent. A registered lane goes through the ordinary worker pacing
+gate, spawn and delivery path; a minion GC disposes before its prompt has its
+lane swept and reads `failed`.
 
 The durable request history names its generation and payload digest and
 readback distinguishes `accepted`, `queued`, `admitted`, `delivered`, `failed`,
@@ -642,8 +652,8 @@ never reports a prompt as delivered from acceptance or job status alone.
 
 Exact POST retries return the durable readback and never relaunch. A different
 request cannot compete with an accepted, queued, admitted or custody-unknown
-generation. If process ownership is lost before the delivery receipt, or
-shutdown cancels the automatic retries of a sent prompt, readback reports
+generation. If process ownership is lost before the delivery receipt, or a
+sent prompt's turn fails while the service is stopping, readback reports
 `custody-unknown`; neither GET nor retry resumes it. The unknown request
 remains a stop, not an automatic replay invitation. This route is not a
 generic retry/migration command, does not recover historical directives, and
