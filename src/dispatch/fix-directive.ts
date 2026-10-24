@@ -33,7 +33,8 @@ import type { ReviewRole } from './blind-input.js';
 /** The product-owned identity + GC-mediated child tools for a
  * (re)dispatched parent session (issue #161). A fresh physical session
  * still belongs to its recorded logical minion; only a job without an
- * implementer record mints an identity. */
+ * implementer record mints an identity. An admitted blind reviewer gets no
+ * child tools: a child holds neither its package nor its isolation rule. */
 function parentIdentitySpawnOptions(
   input: {
     readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
@@ -41,11 +42,12 @@ function parentIdentitySpawnOptions(
   },
   jobId: string,
   resumeFile: string | null,
+  blindReview: boolean,
 ): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
   const implementers = input.ledger.listImplementerMinions(jobId);
   const original = implementers.find((agent) => resumeFile !== null && agent.sessionFile === resumeFile) ?? implementers[0];
   const agentId = original?.id ?? `minion_${randomUUID()}`;
-  const nativeTools = input.parentTools?.(agentId) ?? [];
+  const nativeTools = blindReview ? [] : input.parentTools?.(agentId) ?? [];
   return {
     agentId,
     // A runtime that cannot host parent tools returns none: no empty array
@@ -480,7 +482,7 @@ export async function routeFixDirectiveToMinion(
     // Issue #161: the (re)dispatched parent keeps one product-owned id
     // (its recorded row's id, even without a transcript) and receives the
     // child tools bound to it — re-briefed parents stay able to commission.
-    const identity = parentIdentitySpawnOptions(input, input.jobId, resumeFile);
+    const identity = parentIdentitySpawnOptions(input, input.jobId, resumeFile, blindReview);
     // A brand-new session (nothing to resume) has no memory of the contract:
     // brief it with the effective contract like the resume fallback below
     // (owner rule 4) — when the caller supplied one.
@@ -935,6 +937,7 @@ export async function rebriefFreshMinion(
       input,
       input.jobId,
       input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
+      blindReview,
     );
     const handle = await input.registry.spawn('minion', {
       cwd,

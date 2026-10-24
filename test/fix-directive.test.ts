@@ -1296,7 +1296,7 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
     }
   });
 
-  it('briefs a fresh blind re-brief with its frozen package exactly once, reviewer orders and no lesson pointer', async () => {
+  it('briefs a fresh blind re-brief with its frozen package exactly once, reviewer orders, no lesson pointer or child tools', async () => {
     const jobId = 'job-blind-fresh-rebrief-context';
     const agentId = 'fresh-blind-context-minion';
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-rebrief-context-'));
@@ -1320,14 +1320,17 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
         health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
         async dispose() {},
       } satisfies AgentHandle;
+      const spawned: SpawnOptions[] = [];
       const result = await rebriefFreshMinion({
-        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+        registry: { getHandle: () => null, spawn: async (_role, options) => { spawned.push(options ?? {}); return handle; }, disposeHandle: async () => {} },
         ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
         // A briefing that names the package header is still given the package.
         jobId, note: 'continue only from the frozen source', briefing: 'Review the BLIND INPUT PACKAGE (below) read-only.',
         lessons: { referencesFor: () => { referenceLookups += 1; return [canary]; } },
+        parentTools: () => [{ name: 'request_child_worker', description: 'fixture', inputSchema: {}, async execute() { return { text: '{}' }; } }],
       });
       expect(result.outcome).toBe('completed');
+      expect(spawned.map((options) => options.nativeTools ?? null)).toEqual([null]);
       expect(referenceLookups).toBe(0);
       expect(prompts).toHaveLength(1);
       expect(prompts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
@@ -1402,6 +1405,7 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
     chapter: 'synthetic-book-canary', lesson: 'outside-package',
     path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
   };
+  const TOOL = { name: 'request_child_worker', description: 'fixture', inputSchema: {}, async execute() { return { text: '{}' }; } };
   const count = (text: string, needle: string): number => text.split(needle).length - 1;
 
   /** A real ledger and a real git lane for a review job: an attested blind
@@ -1458,7 +1462,7 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
     return { ledger, dir, priorSession, prompts, spawned, disposed, handle, sourceBlock, dispose: () => db.close() };
   }
 
-  it('the production fresh re-brief carries the verified source and the package exactly once, reviewer orders, no lesson pointer', async () => {
+  it('the production fresh re-brief carries the verified source and the package exactly once, reviewer orders, no lesson pointer or child tools', async () => {
     const h = reviewLane();
     const prior = h.handle('prior-reviewer');
     let lookups = 0;
@@ -1478,6 +1482,7 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
           disposeHandle: async (handle) => { await handle.dispose(); },
         },
         lessons: { referencesFor: () => { lookups += 1; return [CANARY]; } },
+        parentTools: () => [TOOL],
         directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
         onPrepared: (handle) => { prepared.push(handle.id); },
         beforeTurnSideEffect: () => { fenced += 1; },
@@ -1486,6 +1491,8 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
       expect(h.disposed).toContain('prior-reviewer');
       expect(prepared).toEqual(['fresh-reviewer']);
       expect(fenced).toBeGreaterThan(0);
+      expect(h.spawned).toHaveLength(1);
+      expect(h.spawned[0]!.nativeTools).toBeUndefined();
       expect(h.prompts).toHaveLength(1);
       const prompt = h.prompts[0]!;
       expect(count(prompt, SOURCE_HEADER)).toBe(1);
@@ -1507,11 +1514,12 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
         jobId: JOB, directive: 'Please re-check finding 2.', contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
         ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
         registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        parentTools: () => [TOOL],
         directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
         onPrepared: () => {},
       });
       expect(result).toMatchObject({ delivered: true, minionId: 'fresh-reviewer' });
-      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([null]);
+      expect(h.spawned.map((options) => [options.resumeFile ?? null, options.nativeTools ?? null])).toEqual([[null, null]]);
       const prompt = h.prompts[0]!;
       expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 1, 1]);
     } finally { h.dispose(); }
@@ -1550,9 +1558,10 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
           disposeHandle: async () => {},
         },
         lessons: { referencesFor: () => [CANARY] },
+        parentTools: () => [TOOL],
       });
       expect(result).toMatchObject({ delivered: true, minionId: 'fallback-reviewer' });
-      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([h.priorSession, null]);
+      expect(h.spawned.map((options) => [options.resumeFile ?? null, options.nativeTools ?? null])).toEqual([[h.priorSession, null], [null, null]]);
       expect(h.prompts).toHaveLength(1);
       const prompt = h.prompts[0]!;
       expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, FILE_LINE), count(prompt, READ_ONLY)]).toEqual([1, 1, 1, 1]);
@@ -1569,6 +1578,7 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
         jobId: JOB, directive, freshSession: true, contract, signal: new AbortController().signal,
         ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
         registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        parentTools: () => [TOOL],
       });
       expect(result).toMatchObject({ delivered: true });
       const prompt = h.prompts[0]!;
@@ -1576,6 +1586,8 @@ describe('a fresh reviewer session gets its recorded input once (#503)', () => {
       expect(prompt).toContain(`Required claims input: docs/claims.md @ ${TARGET} (blob ${'c'.repeat(40)})`);
       expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 0, 1]);
       expect(prompt).not.toContain('commit your work to the branch');
+      // An ordinary reviewer keeps its child tools.
+      expect(h.spawned[0]!.nativeTools?.map((tool) => tool.name)).toEqual(['request_child_worker']);
     } finally { h.dispose(); }
   });
 

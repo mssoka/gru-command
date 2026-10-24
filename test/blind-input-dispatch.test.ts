@@ -51,6 +51,8 @@ interface Harness {
   ledger: LedgerApi;
   prompts: string[];
   spawnCount: () => number;
+  /** The options each minion spawn received. */
+  minionSpawns: SpawnOptions[];
   repo: FixtureRepo;
 }
 
@@ -81,8 +83,10 @@ async function boot(opts: {
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const prompts: string[] = [];
   let spawns = 0;
-  const spawner = async (role: Role, _options?: SpawnOptions): Promise<AgentHandle> => {
+  const minionSpawns: SpawnOptions[] = [];
+  const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns += 1;
+    if (role === 'minion') minionSpawns.push(options ?? {});
     const id = `agent-${spawns}`;
     // A real (empty) transcript, as every production session has: a settle
     // scan reads it, so absence never stands in for an observation.
@@ -127,7 +131,7 @@ async function boot(opts: {
     db.close();
   });
   const repo = makeFixtureRepo('fixture-blind');
-  return { port: (http.address() as AddressInfo).port, ledger, prompts, spawnCount: () => spawns, repo };
+  return { port: (http.address() as AddressInfo).port, ledger, prompts, spawnCount: () => spawns, minionSpawns, repo };
 }
 
 async function call(port: number, method: string, path: string, body?: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
@@ -317,11 +321,12 @@ describe('blind review commissioning (issue #316)', () => {
     expect(lookups).toBe(2);
   });
 
-  it('briefs a blind reviewer without the child-worker tools an ordinary parent is offered', async () => {
+  it('spawns and briefs a blind reviewer without the child-worker tools an ordinary parent is given', async () => {
     const tool: NativeAgentTool = { name: 'request_child_worker', description: 'fixture', inputSchema: {}, async execute() { return { text: '{}' }; } };
     const h = await boot({ parentTools: () => [tool] });
     await dispatchParent(h);
     expect(h.prompts[0]).toContain('`request_child_worker`');
+    expect(h.minionSpawns[0]!.nativeTools?.map((native) => native.name)).toEqual(['request_child_worker']);
     const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-no-children', {
       repo_path: h.repo.path, input_package: validPackage(),
     }));
@@ -330,6 +335,8 @@ describe('blind review commissioning (issue #316)', () => {
     const blindPrompt = h.prompts.find((prompt) => prompt.includes('rev-no-children'))!;
     expect(blindPrompt).toContain('BLIND INPUT PACKAGE (');
     expect(blindPrompt).not.toContain('request_child_worker');
+    expect(h.minionSpawns).toHaveLength(2);
+    expect(h.minionSpawns[1]!.nativeTools).toBeUndefined();
   });
 
   it('a forbidden read in a blind turn invalidates its coverage although the turn delivered', async () => {

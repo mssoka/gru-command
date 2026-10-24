@@ -3742,6 +3742,19 @@ function admitFixtureAsBlind(f: Awaited<ReturnType<typeof fixture>>, keepPackage
   recordBlindAdmission(f.ledger, f.intent.jobId, admission, keepPackage ? inputPackage : undefined);
 }
 
+it('P35 a blind reviewer\'s checkpoint continuation is spawned without the child-worker tools', async () => {
+  const f = await fixture(); f.seed(); admitFixtureAsBlind(f);
+  const capability = { name: 'request_child_worker', description: 'request a child worker for the original parent', inputSchema: { type: 'object' },
+    authorityManifest: 'original-parent:logical-minion', execute: async () => ({ text: 'ok' }) };
+  const service = new DirectiveProgressService({ ...f.deps, parentTools: () => [capability] });
+  service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+  expect(f.native.continuations).toBe(1);
+  expect(f.spawns).toHaveLength(1);
+  expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file });
+  expect(f.spawns[0]!.nativeTools).toBeUndefined();
+  await service.dispose();
+});
+
 it('a re-brief whose fresh reviewer input cannot be re-delivered fails by name before the lane is cleared for it', async () => {
   const f = await fixture('rebrief'); admitFixtureAsBlind(f, false);
   const cleared: string[] = [];

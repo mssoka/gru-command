@@ -619,7 +619,8 @@ export class DirectiveProgressService {
       if (deps.workerGate !== undefined) lease = await deps.workerGate.acquireWorkerTurn({ id: row.jobId, jobId: row.jobId, label: `checkpoint recovery → ${requestId}`, signal: deps.signal });
       assertProducerFences();
       const head = resolveGitCommit(lane.path, 'HEAD');
-      const tools = deps.parentTools?.(proof.binding.agentId) ?? [];
+      // The same tools the session was bound with: none for a blind reviewer.
+      const tools = isAdmittedBlind(deps.ledger, row.jobId) ? [] : deps.parentTools?.(proof.binding.agentId) ?? [];
       const predecessor = inspectDirectiveProducers(proof.binding.sessionFile, identity).at(-1);
       handle = await deps.registry.spawn('minion', { resumeFile: proof.binding.sessionFile, agentId: proof.binding.agentId,
         ...(predecessor === undefined ? {} : { directiveRecoveryProducer: predecessor.producer }),

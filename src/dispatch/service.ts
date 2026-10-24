@@ -570,11 +570,13 @@ export class DispatchService {
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
         // reaches the session (the tools execute in the service process;
-        // a runtime that cannot host them returns none).
+        // a runtime that cannot host them returns none). An admitted blind
+        // reviewer gets none: a child holds neither its package nor its
+        // isolation rule.
         const parentAgentId =
           this.opts.parentTools === undefined ? undefined : `minion_${randomUUID()}`;
         const parentNativeTools =
-          parentAgentId === undefined ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
+          parentAgentId === undefined || blindAdmission?.payload.role === 'blind' ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
         handle = await this.opts.spawner('minion', {
           cwd,
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
