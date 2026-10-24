@@ -18,7 +18,7 @@ managed-repositories-static = "npm run lint && npm run typecheck && npm run buil
 managed-repositories-browser = "npm run e2e"
 # Integration correction: GH-314 decisions never close GH-313 producer-owned custody.
 report-signal-custody = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/board-server.test.ts test/report-handback-mailbox.test.ts test/gru-mailbox.test.ts"
-creation-continuation-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/creation-continuation.test.ts test/creation-continuation-custody.test.ts && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts && npx vitest run test/ledger-api.test.ts test/ledger-db.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+creation-continuation-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/creation-continuation.test.ts test/creation-continuation-custody.test.ts && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts && npx vitest run test/ledger-api.test.ts test/ledger-db.test.ts test/pacing-admission.test.ts test/job-stop.test.ts test/creation-intent.test.ts test/worktree-handoff-layouts.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 creation-continuation-dispatch = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts"
 creation-continuation-static = "npm run lint && npm run typecheck && npm run build"
 # GH-270 fixed-main reconciliation: shared arm authority, canonical idleness,
