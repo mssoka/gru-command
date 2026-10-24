@@ -90,6 +90,10 @@ const treeObjectField = (value: unknown, label: string): string => {
   return value;
 };
 
+/** A version-1 package nests three levels deep; the duplicate-key scan
+ * recurses, so deeper input is refused before it can exhaust the stack. */
+const PREBOOTSTRAP_PATCH_MAX_JSON_DEPTH = 16;
+
 /** JSON.parse accepts duplicate keys by keeping the last value. The package
  * format is strict and hash-pinned, so refuse that ambiguous representation. */
 function assertUniqueJsonObjectKeys(text: string): void {
@@ -106,8 +110,11 @@ function assertUniqueJsonObjectKeys(text: string): void {
     }
     throw new PreBootstrapPatchError('package_invalid', 'prebootstrap package contains an unterminated JSON string');
   };
-  const value = (): void => {
+  const value = (depth: number): void => {
     whitespace();
+    if ((text[index] === '{' || text[index] === '[') && depth >= PREBOOTSTRAP_PATCH_MAX_JSON_DEPTH) {
+      throw new PreBootstrapPatchError('package_invalid', `prebootstrap package JSON nests deeper than ${String(PREBOOTSTRAP_PATCH_MAX_JSON_DEPTH)} levels`);
+    }
     if (text[index] === '{') {
       index += 1;
       whitespace();
@@ -120,7 +127,7 @@ function assertUniqueJsonObjectKeys(text: string): void {
         keys.add(key);
         whitespace();
         index += 1; // the already-validated colon
-        value();
+        value(depth + 1);
         whitespace();
         const separator = text[index];
         index += 1;
@@ -132,7 +139,7 @@ function assertUniqueJsonObjectKeys(text: string): void {
       whitespace();
       if (text[index] === ']') { index += 1; return; }
       while (index < text.length) {
-        value();
+        value(depth + 1);
         whitespace();
         const separator = text[index];
         index += 1;
@@ -146,7 +153,7 @@ function assertUniqueJsonObjectKeys(text: string): void {
     }
     if (index > text.length) throw new PreBootstrapPatchError('package_invalid', 'prebootstrap package JSON scan exceeded its input');
   };
-  value();
+  value(0);
   whitespace();
   if (index !== text.length) throw new PreBootstrapPatchError('package_invalid', 'prebootstrap package has trailing JSON content');
 }

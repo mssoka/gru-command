@@ -269,6 +269,13 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(() => assertSafeRequirementsPatch(OLD_REQUIREMENTS, '# changed comment\nfixture-dep==2.0.0\nshared-lib==4.2.0\n')).toThrow(/comments and blank lines/u);
   });
 
+  it('refuses a too-deeply nested package by name instead of overflowing the stack', () => {
+    const deep = Buffer.from(`{"version":${'['.repeat(100_000)}${']'.repeat(100_000)}}`);
+    let refusal: unknown = null;
+    try { parsePreBootstrapDependencyPatchPackage(deep, sha(deep)); } catch (error) { refusal = error; }
+    expect(refusal).toMatchObject({ name: 'PreBootstrapPatchError', code: 'package_invalid', message: expect.stringContaining('nests deeper than 16 levels') });
+  });
+
   it('lets a patch change pinned versions only, refusing by name', () => {
     const before = '# core\nfoo==1.0\n\n# extra\nbar==2.0\n';
     expect(() => assertSafeRequirementsPatch(before, '# core\nfoo==1.1\n\n# extra\nbar==2.0\n')).not.toThrow();
