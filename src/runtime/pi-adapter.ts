@@ -1885,7 +1885,12 @@ export class PiAgentHandle implements AgentHandle {
           throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
         }
       } catch (error) {
-        // Pi calls this outside its own try: the prompt rejects with this very object.
+        // Pi calls this outside its own try: the prompt rejects with this very
+        // object. GC's authority or compaction refusal here keeps a durable
+        // authority receipt, as a fence refusal does (an unrecorded one rejects
+        // as its AggregateError). A bookkeeping fault before acceptance keeps
+        // none, so it never blocks the resume of a checkpoint the SDK writes.
+        if (error instanceof DirectiveCheckpointError && !(error instanceof DirectiveBookkeepingError)) this.refuseDirectiveGuard(directive, undefined, error);
         this.recordDirectiveRefusal(error);
         this.logBookkeepingFault(error);
         throw error;

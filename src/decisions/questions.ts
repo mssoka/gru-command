@@ -197,7 +197,20 @@ export const FAILURE_CLASSES = [
 ] as const;
 export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
-export function deterministicFailureClass(reason: string): FailureClass {
+export function deterministicFailureClass(
+  reason: string,
+  typed?: { readonly status?: number; readonly bodyCode?: string } | null,
+): FailureClass {
+  // Structured provider rejection evidence wins over conflicting prose:
+  // local directive language such as "no work is authorized" must not
+  // turn a typed quota response into an authentication wall.
+  if (typed?.status === 401) return 'authentication_wall';
+  if (typed?.status === 429) return 'quota_wall';
+  if (
+    typed?.status !== 402 &&
+    typed?.status !== 403 &&
+    (typed?.bodyCode === '1302' || typed?.bodyCode === '1308')
+  ) return 'quota_wall';
   // Word-bounded signals: bare substrings wall-classified unrelated text
   // ("author" hit `auth`; "port 13020" hit `1302`). The authentication patterns:
   // the words unauthorized, oauth, auth, authn, authentication, authorization
@@ -288,12 +301,13 @@ export const SUPERVISION_RISKS: Readonly<Record<keyof SupervisionQuestions, Risk
 
 export function supervisionDecisionRequest(input: {
   readonly reason: string;
+  readonly typed?: { readonly status?: number; readonly bodyCode?: string } | null;
   readonly agentId: string;
   readonly role: string;
   readonly restartCount: number;
   readonly breakerLimit: number;
 }): DecisionRequest<typeof SUPERVISION_QUESTIONS> {
-  const failureClass = deterministicFailureClass(input.reason);
+  const failureClass = deterministicFailureClass(input.reason, input.typed);
   const restart = failureClass !== 'authentication_wall' && failureClass !== 'quota_wall';
   return {
     state: filteredState(input),

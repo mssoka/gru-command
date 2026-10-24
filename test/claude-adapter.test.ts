@@ -1535,9 +1535,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const sessionDir = fx.store.sessionDirFor('perkins', fx.workspace);
     mkdirSync(dirname(sessionDir), { recursive: true });
     writeFileSync(sessionDir, 'not a directory');
-    // Confine bridge temp dirs to this test's own TMPDIR: the assertion can
-    // never observe a concurrent worker's live bridge.
-    const bridgeTmp = mkdtempSync(join(tmpdir(), 'claude-bridge-tmp-'));
+    // Confine bridge temp dirs to this test's own directory. On Unix the
+    // bridge uses an AF_UNIX socket whose path limit is short; the hosted
+    // worker's default TMPDIR plus its private subdirectory can exceed it.
+    const bridgeTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
+    const bridgeTmp = mkdtempSync(join(bridgeTmpRoot, 'claude-bridge-tmp-'));
     cleanupDirs.push(bridgeTmp);
     const previousTmpdir = process.env['TMPDIR'];
     process.env['TMPDIR'] = bridgeTmp;
