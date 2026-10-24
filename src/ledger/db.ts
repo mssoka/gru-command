@@ -1179,9 +1179,11 @@ export const MIGRATIONS: readonly Migration[] = [
     // generation/plan revision/state, control epoch, approved work revision
     // and contract) lives on the row beside `retire_expected_state`/`_head`,
     // so reading a retired row never scans events. Rows retired earlier keep
-    // NULL: their context was never recorded. Additive and nullable.
-    // LANDING COLLISION (same convention as migrations 10-31): renumber ONLY
-    // this never-applied migration if main lands id 32 first.
+    // NULL: their context was never recorded. An owner abandonment of a live
+    // request (state `failed`, outcome and producer custody unknown) records
+    // who and why. Additive and nullable. LANDING COLLISION (same convention
+    // as migrations 10-31): renumber ONLY this never-applied migration if
+    // main lands id 32 first.
     id: 32,
     name: 'directive-retirement-context',
     sql: `
@@ -1191,6 +1193,9 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE pending_directives ADD COLUMN retire_expected_authority_epoch INTEGER;
       ALTER TABLE pending_directives ADD COLUMN retire_expected_work_revision INTEGER;
       ALTER TABLE pending_directives ADD COLUMN retire_expected_contract_sha256 TEXT;
+      ALTER TABLE pending_directives ADD COLUMN abandoned_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN abandoned_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN abandon_reason TEXT;
     `,
   },
 ];

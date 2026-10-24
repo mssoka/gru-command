@@ -23,7 +23,8 @@ import type { ObligationState } from './states.js';
  * - `settled`/`failed` are terminal for the request id: a retry is a NEW
  *   decision with a NEW request id, never a silent replay of consumed
  *   authorization (recovered capacity is not permission — incident
- *   PR131/287e16f2).
+ *   PR131/287e16f2). An owner abandonment is also `failed`, but it is no
+ *   no-effect proof: its outcome and producer custody stay unknown.
  * - `retired` is the guarded, audited CONTROL closure for an interrupted
  *   request: the writer ceased (server-verified) and no correlated
  *   terminal receipt exists or can be fabricated. It claims neither
@@ -63,7 +64,7 @@ export function directiveAdmissionClass(record: Pick<DirectiveRequestRecord, 'ad
   return record.admissionSeq === null ? 'admission-unknown' : 'admitted-without-terminal';
 }
 
-/** Typed refusals of the guarded retirement transition.
+/** Typed refusals of the guarded retirement and abandonment transitions.
  * Every code maps to HTTP 409 at the route except `incomplete_context`, a
  * 400: the request is real and the caller must change state or evidence,
  * never retry blindly. `blockers` names the live ownership the service found
@@ -80,6 +81,8 @@ export const DIRECTIVE_RETIREMENT_REFUSAL_CODES = [
   'lane_unavailable',
   'live_work',
   'incomplete_context',
+  // Abandonment only: the service can verify cessation, so retire instead.
+  'retirement_available',
 ] as const;
 export type DirectiveRetirementRefusalCode = (typeof DIRECTIVE_RETIREMENT_REFUSAL_CODES)[number];
 
@@ -213,6 +216,12 @@ export interface DirectiveRequestRecord {
   readonly retireExpectedAuthorityEpoch: number | null;
   readonly retireExpectedWorkRevision: number | null;
   readonly retireExpectedContractSha256: string | null;
+  /** Owner abandonment (the row is `failed`; set only by
+   * `abandonLiveDirective`): who closed the request and why. It claims no
+   * completion, no effect and no cessation. */
+  readonly abandonedAt: string | null;
+  readonly abandonedBy: string | null;
+  readonly abandonReason: string | null;
   /** Continuation hold: set to the identity of the fresh accepted request
    * that superseded this retirement; null while the hold is open. */
   readonly holdReleasedBy: string | null;

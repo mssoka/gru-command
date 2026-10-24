@@ -2472,7 +2472,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       const card = f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active');
       expect(card, terminal).toMatchObject({ routing: 'action-required', agentId: null,
         title: `Directive ${f.intent.requestId} is still admitted on ${terminal} job ${f.intent.jobId}` });
-      expect(card?.detail, terminal).toContain(`POST /api/silas/directives/${f.intent.requestId}/retire`);
+      expect(card?.detail, terminal).toContain(`POST /api/silas/directives/${f.intent.requestId}/abandon`);
       await service.dispose();
     }
   });

@@ -19,7 +19,7 @@ import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from './fix-directive.js';
-import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
+import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
@@ -185,6 +185,12 @@ function retirementContextFields(body: Record<string, unknown>, row: DirectiveRe
     expectedContractSha256: contractSha256 };
 }
 
+/** The state a directive readback reports: an owner abandonment is stored as
+ * `failed` but is never no-effect proof, so it reads `abandoned`. */
+function directiveReadbackState(record: DirectiveRequestRecord): string {
+  return record.abandonedAt === null ? record.state : 'abandoned';
+}
+
 /** The recorded retirement facts every retired-row readback carries, so a
  * lost-response retry rebuilds the exact intent from any of them. */
 function retirementReadback(record: DirectiveRequestRecord): Record<string, unknown> {
@@ -206,7 +212,19 @@ function retirementReadback(record: DirectiveRequestRecord): Record<string, unkn
   };
 }
 
-/** A typed retirement refusal or missing request as its HTTP
+function abandonmentReadback(record: DirectiveRequestRecord): Record<string, unknown> {
+  return {
+    admission_class: directiveAdmissionClass(record),
+    abandoned_at: record.abandonedAt,
+    abandoned_by: record.abandonedBy,
+    abandon_reason: record.abandonReason,
+  };
+}
+
+const ABANDONED_NOTE = 'abandoned by the owner: outcome, native effects and producer custody stay UNKNOWN — ' +
+  'no completion, no no-effect and no cessation is claimed; the id never re-runs';
+
+/** A typed retirement/abandonment refusal or missing request as its HTTP
  * answer; false for any other error. An incomplete context is a malformed
  * body (400); every other refusal is a 409 naming its live ownership. */
 function directiveControlRefusal(res: ServerResponse, error: unknown): boolean {
@@ -1482,18 +1500,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 200, {
           request_id: intent.requestId,
           job_id: jobId,
-          state: intent.state,
+          state: directiveReadbackState(intent),
           replay: true,
           minion_id: intent.admissionMinion,
           fail_reason: intent.failReason,
           // A caller who only uses this replay path learns the same
-          // retirement facts the GET readback exposes — the id is consumed
-          // and why/when, never a success or no-effect claim.
+          // retirement/abandonment facts the GET readback exposes — the id
+          // is consumed and why/when, never a success or no-effect claim.
           ...(intent.state === 'retired' ? retirementReadback(intent) : {}),
+          ...(intent.abandonedAt === null ? {} : abandonmentReadback(intent)),
           note:
             intent.state === 'retired'
               ? 'this request id was retired after server-verified writer cessation — it never re-runs; submit changed work under a new request id'
-              : 'this request id already reached a terminal state — submit changed work under a new request id',
+              : intent.abandonedAt !== null
+                ? `${ABANDONED_NOTE}; submit changed work under a new request id`
+                : 'this request id already reached a terminal state — submit changed work under a new request id',
         });
         return true;
       }
@@ -1838,6 +1859,51 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       });
       return true;
     }
+    // Owner abandonment of a live request whose custody is unknown: same
+    // auth boundary as retirement and binning; never evidence of anything.
+    const directiveAbandonment = /^\/api\/silas\/directives\/([^/]+)\/abandon$/.exec(path);
+    if (req.method === 'POST' && directiveAbandonment !== null) {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const requestId = decodeURIComponent(directiveAbandonment[1] ?? '');
+      const body = await readBody(req);
+      const expectedJobId = strField(body, 'expected_job_id');
+      const expectedState = strField(body, 'expected_state');
+      if (expectedState !== 'dispatching' && expectedState !== 'admitted') {
+        throw new Error('expected_state must be "dispatching" or "admitted"');
+      }
+      const expectedPayloadHash = strField(body, 'expected_payload_hash').trim().toLowerCase();
+      const reason = strField(body, 'reason');
+      const by = strField(body, 'by');
+      let outcome: ReturnType<typeof abandonLiveDirectiveFromRoute>;
+      try {
+        outcome = abandonLiveDirectiveFromRoute({ ledger: options.ledger, worktrees: ops.worktrees,
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          pendingProducerBlockers: options.pendingProducerBlockers, requestId,
+          expected: { jobId: expectedJobId, state: expectedState, payloadHash: expectedPayloadHash }, reason, by });
+      } catch (error) {
+        if (directiveControlRefusal(res, error)) return true;
+        throw error;
+      }
+      const record = outcome.record;
+      const facts = outcome.event.payload as { unknown?: unknown; retirement_refused?: unknown };
+      json(res, 200, {
+        request_id: record.requestId,
+        job_id: record.jobId,
+        state: directiveReadbackState(record),
+        idempotent: outcome.idempotent,
+        admission_seq: record.admissionSeq,
+        minion_id: record.admissionMinion,
+        ...abandonmentReadback(record),
+        fail_reason: record.failReason,
+        unknown: facts.unknown,
+        retirement_refused: facts.retirement_refused,
+        abandonment_event_seq: outcome.event.seq,
+        note: ABANDONED_NOTE,
+      });
+      return true;
+    }
     const directiveReadback = /^\/api\/silas\/directives\/([^/]+)$/.exec(path);
     if (req.method === 'GET' && directiveReadback !== null) {
       if (!authed(req, res)) return true;
@@ -1850,7 +1916,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       json(res, 200, {
         request_id: record.requestId,
         job_id: record.jobId,
-        state: record.state,
+        state: directiveReadbackState(record),
         payload_hash: record.payloadHash,
         accepted_at: record.createdAt,
         updated_at: record.updatedAt,
@@ -1876,6 +1942,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         recovery_subject_sha256: options.ledger.recoverySubject('directive', requestId).snapshotSha256,
         recovery_obligation: options.ledger.recoveryObligation(record.jobId, 'directive', record.requestId),
         ...(record.state === 'retired' ? retirementReadback(record) : {}),
+        ...(record.abandonedAt === null ? {} : abandonmentReadback(record)),
         states: {
           dispatching:
             'accepted; a dispatch claim was taken before any side effect — native admission not yet recorded (or unknown after a crash)',
@@ -1885,6 +1952,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           retired:
             'control ownership closed after server-verified writer cessation; no delivery and no no-effect outcome is claimed, ' +
             'the work remains unfinished, and continuation requires a fresh authorized request',
+          abandoned:
+            'the owner closed a request whose producer custody the service could not establish; outcome, native effects and custody stay ' +
+            'unknown — no completion, no no-effect and no cessation is claimed',
         },
       });
       return true;
@@ -1940,7 +2010,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const intent = begun.record;
       if (!begun.created) {
         json(res, intent.state === 'dispatching' || intent.state === 'admitted' ? 202 : 200,
-          { request_id: intent.requestId, job_id: jobId, state: intent.state, replay: true });
+          { request_id: intent.requestId, job_id: jobId, state: directiveReadbackState(intent), replay: true });
         return true;
       }
       const release = options.ledger.beginJobAdmission(jobId, `rebrief ${intent.requestId}`);

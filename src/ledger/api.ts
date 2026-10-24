@@ -2110,7 +2110,7 @@ export class LedgerApi {
           // accepted): it must not close over a live directive request.
           const live = this.liveDirectiveBlockers(id);
           if (live.length > 0) {
-            throw new Error(`job "${id}" has a live directive request — settle or retire it before marking the job done: ${live.join('; ')}`);
+            throw new Error(`job "${id}" has a live directive request — settle, retire or abandon it before marking the job done: ${live.join('; ')}`);
           }
         }
         const event = this.writeJobStatus(id, current.status, status);
@@ -2424,8 +2424,8 @@ export class LedgerApi {
   }
 
   /** Live directive requests by name and state. Each closes through its own
-   * path (settlement or evidence-fenced retirement); a terminal status write
-   * must not hide one. The single-writer rule keeps
+   * path (settlement, evidence-fenced retirement, owner abandonment); a
+   * terminal status write must not hide one. The single-writer rule keeps
    * the list short. */
   private liveDirectiveBlockers(jobId: string): readonly string[] {
     const live = this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES });
@@ -9942,11 +9942,12 @@ export class LedgerApi {
   // from durable ownership marks plus the caller's binding expectations.
   // The caller contributes request/lane binding, the recovery obligation's
   // generation/plan/state, current epoch/revision/contract expectations and
-  // audit labels — never physical cessation evidence. The transition runs
-  // in ONE transaction: refusal checks, admission preservation, the state
-  // flip, exactly one `silas.directive-retired` audit event, the durable
-  // continuation hold, and the closure (never completion) of an awaiting
-  // phase handoff all commit or roll back together.
+  // audit labels — never physical cessation evidence. Unknown producer
+  // custody refuses; owner abandonment is that case's exit. The transition
+  // runs in ONE transaction: refusal checks, admission preservation, the
+  // state flip, exactly one `silas.directive-retired` audit event, the
+  // durable continuation hold, and the closure (never completion) of an
+  // awaiting phase handoff all commit or roll back together.
   // ------------------------------------------------------------------
 
   /** Live ownership that forbids retiring an interrupted request. Every
@@ -10033,6 +10034,22 @@ export class LedgerApi {
     if (proof.state === 'terminal' && proof.ok && isDeepStrictEqual(proof.binding, row.nativeBinding)) {
       throw new DirectiveRetirementError('terminal_receipt_present', `directive request "${row.requestId}" has successful native completion — normal settlement owns it; do not clear writers or retire it to execute a successor`);
     }
+  }
+
+  /** Why the service cannot name who held this request, after its admission
+   * evidence is bound. A row from before native producer identity has no
+   * producer journal to read, and an admission minion that never registered
+   * has no custody to inspect: unknown custody stays unknown and refuses
+   * retirement (owner abandonment is the exit; it claims nothing). */
+  private directiveCustodyGaps(row: DirectiveRequestRecord): readonly string[] {
+    const gaps: string[] = [];
+    if (row.requestKind === null || row.authorityEpoch === null || row.workRevision === null || row.contractSha256 === null) {
+      gaps.push(`original producer custody UNKNOWN: request ${row.requestId} predates the native producer identity and journal`);
+    }
+    if (row.admissionMinion !== null && this.getAgent(row.admissionMinion)?.jobId !== row.jobId) {
+      gaps.push(`original producer custody UNKNOWN: admission minion ${row.admissionMinion} was never registered to job ${row.jobId}`);
+    }
+    return gaps;
   }
 
   /** An admitted row whose bound admission no longer matches its exact sent
@@ -10201,6 +10218,13 @@ export class LedgerApi {
       }
       const admissionGap = this.directiveAdmissionIdentityGap(current);
       if (admissionGap !== null) throw new DirectiveRetirementError('admission_evidence_incomplete', admissionGap);
+      // Last, unknown custody: no producer identity/journal or no
+      // registered admission minion means no cessation can be verified.
+      const custody = this.directiveCustodyGaps(current);
+      if (custody.length > 0) {
+        throw new DirectiveRetirementError('live_work',
+          `directive request "${input.requestId}" has unknown producer custody — retirement cannot verify cessation`, custody);
+      }
       const admissionClass = directiveAdmissionClass(current);
       const ts = nowIso();
       this.db
@@ -10253,6 +10277,121 @@ export class LedgerApi {
       const record = this.getDirective(row.requestId) as DirectiveRequestRecord;
       this.reopenStrandedRecoveryDebt(record);
       return { record, idempotent: false, phaseClosed };
+    });
+  }
+
+  /** Owner abandonment: the exit for a live request whose producer custody
+   * the service cannot establish, so retirement stays refused (no or several
+   * lanes, missing producer identity/journal, an unregistered minion,
+   * unproven cleanup). It records the request `failed` with
+   * `abandoned_*` facts and one `silas.directive-abandoned` audit naming
+   * what stays unknown and why retirement was refused. It claims no
+   * completion, no effect and no cessation, clears no producer-uncertainty
+   * record and leaves no continuation hold; binning can follow. Refused
+   * while settlement owns the request, while a producer is visibly running,
+   * or when retirement could verify cessation. Idempotent by request id. */
+  abandonLiveDirective(input: {
+    requestId: string;
+    expectedJobId: string;
+    expectedState: LiveDirectiveState;
+    expectedPayloadHash: string;
+    /** Route evidence: the single resolved lane, or why none could be bound. */
+    lane: { readonly id: string; readonly resolvedHead: string } | { readonly unavailable: string };
+    /** Route-side ownership facts that refuse retirement (supervisor, pace queue). */
+    routeBlockers: readonly string[];
+    reason: string;
+    by: string;
+  }): { readonly record: DirectiveRequestRecord; readonly idempotent: boolean; readonly event: EventRecord } {
+    if (input.reason.trim() === '') throw new Error('directive abandonment requires a reason');
+    if (input.by.trim() === '') throw new Error('directive abandonment requires a by label');
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.jobId !== input.expectedJobId || row.payloadHash !== input.expectedPayloadHash) {
+        throw new DirectiveRetirementError('request_mismatch',
+          `directive request "${input.requestId}" does not match the expected job and payload hash — read the row again`);
+      }
+      if (row.abandonedAt !== null) {
+        const recorded = this.latestJobEventByRequestId(row.jobId, 'silas.directive-abandoned', row.requestId);
+        if (recorded === null) throw new Error(`directive request "${row.requestId}" is abandoned but its silas.directive-abandoned audit is missing`);
+        return { record: row, idempotent: true, event: recorded };
+      }
+      if (isDirectiveTerminal(row.state)) {
+        throw new DirectiveRetirementError('directive_not_live',
+          `directive request "${input.requestId}" is ${row.state} — only a live request can be abandoned`);
+      }
+      if (row.state !== input.expectedState) {
+        throw new DirectiveRetirementError('request_mismatch',
+          `directive request "${input.requestId}" is ${row.state}, not the expected ${input.expectedState} — read the row again`);
+      }
+      // Settlement owns a request with completion evidence.
+      this.assertNoCompletedNativeRetirement(row);
+      const delivered = this.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
+      if (delivered !== null) {
+        throw new DirectiveRetirementError('terminal_receipt_present',
+          `directive request "${input.requestId}" has a correlated job.delivered receipt at seq ${delivered.seq} — normal settlement owns it`);
+      }
+      // A producer the service can see running must settle first.
+      const running = this.liveProducerBlockers(row.jobId);
+      if (running.length > 0) {
+        throw new DirectiveRetirementError('live_work',
+          `job "${row.jobId}" has a running producer — abandonment waits for it to settle`, running);
+      }
+      const laneId = 'unavailable' in input.lane ? null : input.lane.id;
+      // Why retirement is refused, read by the service itself.
+      const refused = [
+        ...('unavailable' in input.lane ? [input.lane.unavailable] : []),
+        ...this.directiveRetirementBlockers(row, laneId ?? ''),
+        ...input.routeBlockers,
+      ];
+      // A correlated admission binds first, as in retirement, so the audit
+      // keeps the real turn instead of erasing it.
+      let current = row;
+      const sent = row.state === 'dispatching' ? this.latestJobEventByRequestId(row.jobId, 'silas.directive-sent', row.requestId) : null;
+      if (sent !== null) {
+        const minionId = (sent.payload as { minion_id?: unknown } | null)?.minion_id;
+        if (typeof minionId !== 'string' || minionId === '') refused.push(`correlated admission evidence at seq ${sent.seq} has no minion identity`);
+        else {
+          try { current = this.recordDirectiveAdmission({ requestId: row.requestId, minionId, eventSeq: sent.seq }); }
+          catch (error) { refused.push(`correlated admission evidence at seq ${sent.seq} is inconsistent: ${String(error)}`); }
+        }
+      }
+      const admissionGap = this.directiveAdmissionIdentityGap(current);
+      refused.push(...(admissionGap === null ? [] : [admissionGap]), ...this.directiveCustodyGaps(current));
+      if (refused.length === 0) {
+        throw new DirectiveRetirementError('retirement_available',
+          `directive request "${input.requestId}" can be retired: the service verifies its cessation — ` +
+            `use POST /api/silas/directives/${input.requestId}/retire with fresh readback instead`);
+      }
+      const ts = nowIso();
+      this.db
+        .prepare(`UPDATE pending_directives SET state = 'failed', fail_reason = ?, abandoned_at = ?, abandoned_by = ?, abandon_reason = ?, updated_at = ?
+          WHERE request_id = ?`)
+        .run(`abandoned by the owner; outcome and producer custody unknown: ${input.reason}`, ts, input.by, input.reason, ts, row.requestId);
+      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+      if (phase?.state === 'awaiting') {
+        this.closePhaseHandoff({ phaseId: phase.phaseId, reason: `directive request abandoned by the owner without completion: ${input.reason}` });
+      }
+      const event = this.appendEvent({
+        kind: 'silas.directive-abandoned',
+        jobId: row.jobId,
+        payload: {
+          request_id: row.requestId,
+          by: input.by,
+          reason: input.reason,
+          expected_state: input.expectedState,
+          admission_class: directiveAdmissionClass(current),
+          admission_seq: current.admissionSeq,
+          admission_minion: current.admissionMinion,
+          lane_id: laneId,
+          unknown: ['outcome', 'native effects', 'producer custody'],
+          claims: 'none: no completion, no no-effect, no cessation',
+          retirement_refused: refused,
+        },
+      });
+      const record = this.getDirective(row.requestId) as DirectiveRequestRecord;
+      this.reopenStrandedRecoveryDebt(record);
+      return { record, idempotent: false, event };
     });
   }
 
@@ -11051,6 +11190,9 @@ export class LedgerApi {
       retireExpectedAuthorityEpoch: retireInteger('retire_expected_authority_epoch'),
       retireExpectedWorkRevision: retireInteger('retire_expected_work_revision'),
       retireExpectedContractSha256,
+      abandonedAt: nstr(row.abandoned_at),
+      abandonedBy: nstr(row.abandoned_by),
+      abandonReason: nstr(row.abandon_reason),
       holdReleasedBy: nstr(row.hold_released_by),
       holdReleasedAt: nstr(row.hold_released_at),
       workRevision: row.work_revision === null || row.work_revision === undefined ? null : Number(row.work_revision),

@@ -505,7 +505,8 @@ export function observeTerminalJobDirective(deps: DirectiveProgressDeps, request
     title: `Directive ${requestId} is still ${current.state} on ${job.status} job ${row.jobId}`,
     detail: `Request ${requestId} (payload_hash ${row.payloadHash}) has no terminal receipt, but job ${row.jobId} is ${job.status}: it never runs again ` +
       `and its outcome stays UNKNOWN (${evidence}). Inspect GET /api/silas/directives/${requestId}. Retire it with POST /api/silas/directives/${requestId}/retire ` +
-      'when the service can verify cessation; retirement claims neither completion nor no effect.',
+      `when the service can verify cessation; when its producer custody is unknown, the owner may abandon it with POST /api/silas/directives/${requestId}/abandon. ` +
+      'Neither claims completion or no effect.',
     dedupe: 'active' });
 }
 
