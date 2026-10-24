@@ -1047,6 +1047,37 @@ it('R13 retained UNKNOWN producer inventory follows its original job after logic
   } finally { h.dispose(); }
 });
 
+it('#497 a throwing cessation probe keeps explicit restart ownership, surfaces directive recovery and blocks closure until it settles', async () => {
+  const logs: { msg: string; fields?: Record<string, unknown> }[] = [];
+  const h = boot(undefined, { log: (_level, msg, fields) => { logs.push({ msg, ...(fields === undefined ? {} : { fields }) }); } });
+  try {
+    const jobId = 'gh497-throwing-probe-job';
+    h.api.addJob({ id: jobId, repo: 'fixture', title: 'throwing probe job' }); h.api.setJobStatus(jobId, 'working');
+    const handle = new FakeHandle('minion', 'gh497-throwing-producer', null);
+    let journalFull = true;
+    // The probe throws while its receipt journal cannot be appended (Pi
+    // before #497); a recovered journal lets it attest cessation.
+    handle.cessationEvidence = () => {
+      if (journalFull) throw new Error('ENOSPC: no space left on device, write');
+      return 'ceased';
+    };
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+    const request = h.api.beginDirectiveIntent({ jobId, requestId: 'gh497-throwing-request', directive: 'original accepted turn', holder: 'gru' }).record;
+    handle.pendingTurnSnapshot = { text: 'original accepted turn', owner: `dispatch:${jobId}`, directive: {
+      identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+    } };
+    h.registry.adopt(handle); hang(handle); h.advance(60);
+    await vi.waitFor(() => expect(h.supervisor.viewFor(handle.id)?.state).toBe('stopped'));
+    expect(logs.map((entry) => entry.msg)).toContain('directive cleanup has unknown cessation — explicit supervisor ownership retained');
+    expect(logs.find((entry) => entry.msg === 'restart cessation evidence unavailable')?.fields?.['error']).toBe('Error: ENOSPC: no space left on device, write');
+    expect(h.notificationsOfKind(`silas.directive-unreconciled.${request.requestId}`)).toHaveLength(1);
+    expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([`unproven directive producer cessation: ${handle.id}`]);
+    expect(handle.promptCount).toBe(0); expect(h.registry.spawnCalls).toEqual([]);
+    journalFull = false;
+    expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+  } finally { h.dispose(); }
+});
+
 describe('supervisor — durable restart association', () => {
   it('reports failed-restart backoff as producer ownership before any pacing entry exists', async () => {
     vi.useFakeTimers();
@@ -2015,6 +2046,46 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(f.swapped).not.toHaveBeenCalled();
       expect(f.replacement.promptCalls).toEqual([]);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('#497 re-runs a failed replacement disposal once its adapter attests cessation, so custody settles', async () => {
+    // A Pi replacement whose cessation receipt cannot be written rejects its
+    // disposal and keeps UNKNOWN. The receipt is written either at once (the
+    // registry re-queries on the rejection) or by a later custody query; Pi
+    // then resolves a re-run disposal immediately.
+    for (const written of ['on-rejection', 'later'] as const) {
+      vi.useFakeTimers();
+      const f = await deferredRestart();
+      try {
+        f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer work', briefing: null });
+        let receipt = false;
+        let disposals = 0;
+        const dispose = f.replacement.dispose.bind(f.replacement);
+        f.replacement.dispose = async () => {
+          await dispose();
+          disposals += 1;
+          if (disposals > 1) return;
+          if (written === 'on-rejection') receipt = true;
+          throw new Error('ENOSPC: no space left on device, write');
+        };
+        f.replacement.cessationEvidence = () => receipt ? 'ceased' : 'unknown';
+        f.releaseSpawn(f.replacement);
+        await flushMicrotasks();
+        if (written === 'later') {
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' '), written).toContain(`restart cleanup unconfirmed: ${f.replacement.id}`);
+          expect(disposals, written).toBe(1);
+          receipt = true; // the journal recovers; the next custody query writes the receipt
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' '), written).toContain(`restart cleanup unconfirmed: ${f.replacement.id}`);
+          await flushMicrotasks();
+        }
+        expect(disposals, written).toBe(2);
+        expect(f.rig.supervisor.pendingProducerBlockers(f.jobId), written).toEqual([]);
+        expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')[0]?.resolvedBy, written).toBe('supervision-cleanup-confirmed');
+        expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-cleanup-confirmed')?.payload, written)
+          .toMatchObject({ replacement_agent_id: f.replacement.id });
+        expect(f.replacement.promptCalls, written).toEqual([]);
+      } finally { f.rig.dispose(); vi.useRealTimers(); }
+    }
   });
 
   it('rejects a same-id resumed replacement without reviving its historical job binding or swapping the slot', async () => {

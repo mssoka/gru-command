@@ -80,7 +80,9 @@ here before the v1.0.0 tag)*
   - `glab` — `glab auth login [--hostname <host>]` with a `read_api` or
     `api` token, confirm with `glab auth status`; the Managed Repos
     overview reads GitLab repositories through it. Perkins review on
-    GitLab still uses `GITLAB_TOKEN`; see [FLOW.md](docs/FLOW.md).
+    GitLab still uses `GITLAB_TOKEN`; see [FLOW.md](docs/FLOW.md). Set it
+    in `config.toml` under `[env]` so updates keep it
+    ([CONFIG.md](docs/CONFIG.md#service-environment-env)).
 - **Perkins App bundle — install prerequisite for review verdicts.** On
   github.com, Perkins publishes its verdicts as the installed GitHub App
   (`perkins-review[bot]`), never your personal `gh` account (owner ruling
