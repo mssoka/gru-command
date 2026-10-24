@@ -3346,6 +3346,22 @@ describe('prebootstrap dependency patch request admission', () => {
     } finally { await h.close(); }
   });
 
+  it('refuses an explicit commissioner on a patched lane but not the request\'s by', async () => {
+    const h = await boot();
+    try {
+      const request = { repo_path: '/tmp/synthetic', title: 'patch', briefing: 'explicit',
+        prebootstrap_patch: { package_file: 'fixture.json', package_sha256: 'a'.repeat(64) } };
+      const withBy = await call(h.port, 'POST', '/api/dispatch', { ...request, job_id: 'http-patch-by', by: 'gru' }, TOKEN);
+      expect(withBy.status).toBe(422);
+      expect(field<string>(withBy.json, 'code')).toBe('package_unavailable');
+      const explicit = await call(h.port, 'POST', '/api/dispatch', { ...request, job_id: 'http-patch-commissioner', commissioner: 'gru' }, TOKEN);
+      expect(explicit.status).toBe(422);
+      expect(field<string>(explicit.json, 'code')).toBe('lane_unsupported');
+      expect(h.ledger.getJob('http-patch-by')).toBeNull();
+      expect(h.ledger.getJob('http-patch-commissioner')).toBeNull();
+    } finally { await h.close(); }
+  });
+
   it('validates the optional package reference before any job row is created', async () => {
     const h = await boot();
     try {

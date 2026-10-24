@@ -30,8 +30,8 @@ finalTestBlob=$(git rev-parse "$headrev:test/dispatch-server.test.ts")
 printf '%s base=%s sourceBlob=%s head=%s finalTestBlob=%s\n' "$d" "$base" "$baseSourceBlob" "$headrev" "$finalTestBlob" > "$prep/formal-verdicts-r6-baseline.last-snapshot.txt"
 cd "$d"
 registered=$(grep -oE '\bit\(|\bit\.skipIf\(' test/dispatch-server.test.ts | wc -l | tr -d ' ')
-if [ "$registered" != 74 ]; then
-  echo "formal-verdicts-r6 registration guard failed for dispatch-server.test.ts: pin=74 registered=$registered" >&2
+if [ "$registered" != 75 ]; then
+  echo "formal-verdicts-r6 registration guard failed for dispatch-server.test.ts: pin=75 registered=$registered" >&2
   exit 2
 fi
 node tools/patch-vitest-rpc-timeout.mjs

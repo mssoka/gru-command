@@ -561,7 +561,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           title: strField(body, 'title'),
           ...(displayName !== undefined ? { displayName } : {}),
           ...(deliverable !== undefined ? { deliverable } : {}),
-          ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
+          // A PR lane ignores the by-derived debtor, so it never makes a
+          // patched lane look like report metadata; an explicit one still does.
+          ...(commissioner !== undefined ? { commissioner } : by !== undefined && preBootstrapPatch === undefined ? { commissioner: by } : {}),
           ...(targetRef !== undefined ? { targetRef } : {}),
           ...(targetSha !== undefined ? { targetSha } : {}),
           ...(targetBase !== undefined ? { targetBase } : {}),
