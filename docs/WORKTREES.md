@@ -635,7 +635,9 @@ ref and receipt: readback says `failed` with the retained custody, and a later
 request adopts them again. A failure while a setup step's process group still
 has a member, or while any process is rooted in the checkout (a detached daemon
 a step started included), keeps everything and reads `custody-unknown`, as
-does an unconfirmed rollback. A daemon that leaves the checkout and does not
+do a process listing that fails or cannot read the working directories (`lsof`
+or `/proc` failing; command lines alone miss a daemon tied only by its cwd)
+and an unconfirmed rollback. A daemon that leaves the checkout and does not
 name it is not seen. A failure before the manager starts adopting (the
 repository path gone, say) touches nothing and reads `failed`. A failure after
 registration reads `custody-unknown`: the registry row holds the lane and the

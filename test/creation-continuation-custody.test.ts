@@ -225,6 +225,34 @@ describe('retained-creation continuation custody', () => {
     expect(existsSync(join(unlisted.root, basename(unlisted.repo.path), `job-${api.jobId}`))).toBe(true);
   });
 
+  it('keeps everything and reads custody-unknown when the listing cannot read the working directories of a daemon tied only by its cwd', async () => {
+    const signals = directory();
+    const pidFile = join(signals, 'daemon.pid');
+    const release = join(signals, 'release');
+    const starter = [
+      "const { spawn } = require('node:child_process');",
+      `spawn('/bin/sh', ['-c', 'echo $$ > "$0"; while [ ! -e "$1" ]; do sleep 0.05; done', ${JSON.stringify(pidFile)}, ${JSON.stringify(release)}], { detached: true, stdio: 'ignore' }).unref();`,
+    ].join('\n') + '\n';
+    const h = await retainedFixture('setup-daemon-no-cwds', {
+      // ps answers; the working-directory listing (lsof, /proc) fails.
+      manager: { enumerateProcesses: undefined, listProcessCwds: () => Promise.reject(new Error('lsof: synthetic failure (exit 1)')) },
+      prepare: (repo) => {
+        repo.commitFile('start-daemon.js', starter, 'daemon starter');
+        repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "node start-daemon.js"\n\n[[setup]]\ncommand = "exit 4"\n', 'setup with a daemon');
+      },
+    });
+    try {
+      const api = await httpHarness(h);
+      expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'no-cwds' })).status).toBe(202);
+      await waitForState(api.base, api.jobId, 'no-cwds', 'custody-unknown');
+      expect(processGone(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+      expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`))).toBe(true);
+      expect(receiptFiles(api.repo)).toHaveLength(1);
+    } finally {
+      writeFileSync(release, '');
+    }
+  });
+
   it('reads back refused, with everything retained, when a custody guard refuses after adoption', async () => {
     const h = await retainedFixture('guard-after-adoption');
     const manager = h.worktrees as unknown as { assertCreationIdentity: (...args: unknown[]) => void };

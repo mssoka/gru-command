@@ -2589,10 +2589,19 @@ export class WorktreeManager {
     }
   }
 
-  /** Whether any process is rooted in a tree; a listing that fails says yes. */
+  /** Whether any process is rooted in a tree. A listing that fails says
+   * yes, and so does one that could not read the working directories:
+   * command lines alone miss a daemon whose only tie is its cwd. */
   private async processesRootedIn(treePath: string): Promise<boolean> {
     try {
-      return (await this.enumerateListed(treePath)).length > 0;
+      if (this.opts.enumerateProcesses !== undefined) return this.opts.enumerateProcesses(treePath).length > 0;
+      let cwdError: unknown = `${process.platform} has no listing of process working directories GC can read`;
+      const table = await processTableAsync({
+        ...(this.opts.listProcessCwds !== undefined ? { listCwds: this.opts.listProcessCwds } : {}),
+        onCwdError: (error) => { cwdError = error; },
+      });
+      if (!table.cwdsListed) throw new Error(`process working directories could not be listed: ${String(cwdError)}`);
+      return table.rootedIn(treePath).length > 0;
     } catch (error) {
       this.log('warn', 'the processes rooted in a tree could not be listed; it is kept', { path: treePath, error: String(error) });
       return true;
