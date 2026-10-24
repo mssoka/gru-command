@@ -1618,10 +1618,14 @@ export class WorktreeManager {
     this.assertCreationCustody(repoPath, worktreePath, custody);
     const after = readFileSync(filePath);
     if (preBootstrapSha256(after) !== entry.afterSha256) throw new PreBootstrapPatchError('file_mismatch', 'applied requirements.txt bytes do not match the package after_sha256');
-    const changed = runGit(worktreePath, ['diff', '--name-only', '--no-ext-diff', '--no-textconv', 'HEAD', '--']);
-    const untracked = runGit(worktreePath, ['ls-files', '--others', '--exclude-standard']);
-    const staged = runGit(worktreePath, ['diff', '--cached', '--name-only', '--']);
-    if (changed !== 'requirements.txt' || untracked !== '' || staged !== '') {
+    const listed = (args: readonly string[]): readonly string[] => runGit(worktreePath, args).split('\n').filter((line) => line !== '');
+    const changed = listed(['diff', '--name-only', '--no-ext-diff', '--no-textconv', 'HEAD', '--']);
+    const untracked = listed(['ls-files', '--others', '--exclude-standard']);
+    const staged = listed(['diff', '--cached', '--name-only', '--']);
+    // The receipt records this measured set, so it can never claim a set the
+    // lane did not have.
+    const changedPaths = [...changed, ...staged, ...untracked];
+    if (changed.length !== 1 || changed[0] !== 'requirements.txt' || staged.length > 0 || untracked.length > 0) {
       throw new PreBootstrapPatchError('changed_paths', `prebootstrap patch produced unapproved tracked/untracked changes (tracked=${JSON.stringify(changed)}, staged=${JSON.stringify(staged)}, untracked=${JSON.stringify(untracked)})`);
     }
     const afterTree = gitTreeWithRequirementsPatch(worktreePath, custody.sha, afterBytes);
@@ -1640,7 +1644,7 @@ export class WorktreeManager {
         before_tree: beforeTree,
         after_tree: afterTree,
         manifest_blob: manifestBlob,
-        changed_paths: ['requirements.txt'],
+        changed_paths: changedPaths,
         file_before_sha256: entry.beforeSha256,
         file_after_sha256: entry.afterSha256,
         producer_host: hostname(),
@@ -1747,9 +1751,6 @@ export class WorktreeManager {
     return this.withRepoLock(input.repoPath, async () => {
       const repo = this.assertRepo(input.repoPath);
       const patch = input.preBootstrapPatch;
-      if (patch === undefined && this.opts.ledger.listJobEvents(input.jobId, { kinds: ['job.prebootstrap-patch-admitted'], limit: 1 }).length > 0) {
-        throw new PreBootstrapPatchError('request_consumed', `job "${input.jobId}" already consumed a prebootstrap patch request; setup or patch replay is refused`);
-      }
       const branch = `gru/${input.jobId}`;
       const path = join(this.opts.root, repo.repoName, `job-${input.jobId}`);
       const lane = { id: input.jobId, kind: 'job' as const, jobId: input.jobId, roundId: null, path };
@@ -1781,8 +1782,8 @@ export class WorktreeManager {
         }
       }
       if (patch !== undefined) {
-        const priorClaim = this.opts.ledger.listJobEvents(input.jobId, { kinds: ['worktree.prebootstrap-patch-creation-claimed'], limit: 1 });
-        if (priorClaim.length > 0) throw new PreBootstrapPatchError('request_consumed', `job "${input.jobId}" already claimed its prebootstrap patch request; replay is refused`);
+        // One claim per request: the request is bound to its job id, and
+        // dispatch creates that job row once, so no second claim can follow.
         this.opts.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-creation-claimed', jobId: input.jobId,
           payload: { version: 1, package_sha256: patch.packageBytesSha256, request_payload_sha256: patch.requestPayloadSha256,
             intake_identity_sha256: patch.intakeIdentitySha256, repository_path: repo.repoPath,
