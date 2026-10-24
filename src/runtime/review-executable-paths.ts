@@ -2758,6 +2758,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/runtime/worker-verification-hook.js",
   "dist/runtime/worker-verification-policy.js",
   "dist/server.js",
+  "dist/service-environment.js",
   "dist/service-port-guard.js",
   "dist/service-shutdown.js",
   "dist/sessions/lock-coordination.js",

@@ -19,6 +19,7 @@ import {
   expandTilde,
   type GruCommandConfig,
   loadConfig,
+  tomlErrorSummary,
 } from '../config.js';
 import { discoverManagedRepos } from '../repos/discovery.js';
 import { renderReferenceConfig } from '../config-reference.js';
@@ -107,7 +108,7 @@ export function writeConfigText(
   try {
     parse(text); // self-check: escaping/schema-fragment syntax fails before disk mutation
   } catch (error) {
-    throw new Error(`generated config failed its TOML self-check: ${(error as Error).message}`);
+    throw new Error(`generated config failed its TOML self-check: ${tomlErrorSummary(error)}`);
   }
 
   mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
