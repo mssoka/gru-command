@@ -473,13 +473,31 @@ lifecycle fact — so a settled report read as independent coverage.
   written, and any other path as that literal. A path that itself opens with
   `"` counts as "any other", so a leading quote always marks the escaped form.
   The package bytes are kept (`review.blind-input-package`, written before the
-  admission), so a fresh
-  replacement reviewer spawned by provider recovery gets the same block; a resumed
-  session already holds it. An attested reviewer whose package was not kept (one
-  admitted before packages were kept) fails that fresh continuation by name —
-  never a replacement briefed without its input.
+  admission), so a fresh replacement reviewer (provider recovery, a Silas
+  re-brief, or a directive whose session cannot resume, including a session
+  whose transcript is missing, empty or holds no conversation) gets the
+  package block again, once, even when its carried-over prompt already held
+  it; a resumed session already holds it. Any review job whose dispatch
+  recorded `job.review-source-verified` gets its REVIEW SOURCE block back the
+  same way, after checking that the lane can still read the verified target,
+  base and input objects (a moved and repaired repository still can). A package that was not kept (one admitted
+  before packages were kept), a malformed record or objects the lane cannot read
+  are refused by name before the lane is cleared, any session is stopped or
+  spawned, or a provider wait is claimed (that wait is cancelled) — never a
+  replacement briefed without its input. A git failure is a fault, not a
+  refusal: the request or the wait stays for a later pass.
 - **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
   refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
+- **Role-specific host context.** The admitted role decides what GC adds to a
+  reviewer's prompt. A blind reviewer gets no Book of Lessons lookup or pointer on
+  any path (dispatch, directive, re-brief, provider recovery), and no child
+  workers: a new session is spawned without the child-worker tools (a checkpoint
+  continuation keeps the tools its session was bound with) and a
+  `request_child_worker` call from an admitted blind job is refused as
+  `parent_not_permitted`, since a child holds neither the package nor the
+  isolation rule and its reads are not observed. Every review job's re-brief and
+  fresh directive session carries the read-only review orders. Ordinary workers
+  and `claims` reviewers keep the lesson references.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 
@@ -518,10 +536,15 @@ that turn read is unknown, whatever came after (#360). And
 `POST /api/dispatch/blind-access {job_id, tool_results:[{tool_name?, text}]}`
 records a LATER read. Any prohibited observation makes the coverage
 `invalidated`; the report, its findings, its status and its disposition are left
-exactly as recorded (no replay, no debt revival). A blind commission for a target
-whose blind coverage is already `qualifying` under the same parent answers
-`409 blind_coverage_owned` naming the job to reuse (or `409
-blind_coverage_unreadable` naming a sibling whose recorded blind-access facts
-cannot be counted — repair them in the ledger first); invalidated coverage may be
-replaced and the new admission lists what it replaces.
+exactly as recorded (no replay, no debt revival and no binning or revival of a
+terminal report). A blind commission for a target whose blind coverage is
+already `qualifying` under the same parent answers `409 blind_coverage_owned`
+naming the job to reuse (or `409 blind_coverage_unreadable` naming a sibling
+whose recorded blind-access facts cannot be counted — repair them in the ledger
+first). A blocked, parked or binned sibling is skipped. Any other blind sibling
+whose coverage is not `qualifying` (`invalidated`, `unattested` or `unobserved`,
+terminal or not) may be replaced: the new admission lists it in `replaces`, and
+its report stays exactly as recorded. Replacing does not stop it: a sibling
+still running keeps running, and a report it delivers later is recorded as it
+is.
 

@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -28,6 +29,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { Role } from '../src/config.js';
+import { renderMinionBriefing } from '../src/dispatch/service.js';
 
 /**
  * The guarded eligible-state transition (acceptance 7): one recovered wait
@@ -50,6 +52,8 @@ const BASE = 'a'.repeat(40);
 const BLIND_PACKAGE = { baseSha: BASE, targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
 
 /** A pi-session toolResult line (what the reviewer's session jsonl holds). */
+/** One user entry: a transcript that holds a conversation. */
+const CONVERSATION = `${JSON.stringify({ type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'do the work' }] } })}\n`;
 const sessionToolResult = (text: string): string =>
   `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: text } })}\n`;
 
@@ -224,7 +228,8 @@ class ClaimHarness {
   /** A job with a lane, a minion agent, and a recovered wait on it. Each
    * call mints a unique job id (the shared fixture repo's worktree
    * branches collide otherwise). */
-  async recoveredMinionWait(opts: { sessionFile?: string | null; jobId?: string; writeSession?: boolean } = {}): Promise<string> {
+  /** `review`: the job is a review job (a blind admission's is). */
+  async recoveredMinionWait(opts: { sessionFile?: string | null; jobId?: string; writeSession?: boolean; promptText?: string; review?: boolean } = {}): Promise<string> {
     const jobId = opts.jobId ?? `job-${++ClaimHarness.jobs}`;
     const repo = fixtureRepo();
     this.ledger.addJob({
@@ -232,6 +237,7 @@ class ClaimHarness {
       repo: repo.path,
       title: `job ${jobId}`,
       briefing: 'do the work',
+      ...(opts.review === true ? { deliverable: 'review' as const } : {}),
     });
     await this.worktrees.createJobWorktree({ repoPath: repo.path, jobId });
     this.ledger.setJobStatus(jobId, 'working');
@@ -239,7 +245,8 @@ class ClaimHarness {
     const sessionFile = opts.sessionFile ?? null;
     if (sessionFile !== null && opts.writeSession !== false) {
       mkdirSync(dirname(sessionFile), { recursive: true });
-      writeFileSync(sessionFile, '{}\n');
+      // A resumable session: its transcript holds a conversation.
+      writeFileSync(sessionFile, CONVERSATION);
     }
     this.ledger.recordProviderWait({
       id: 'wait-1',
@@ -255,7 +262,7 @@ class ClaimHarness {
       agentId: `agent-${jobId}`,
       slotId: null,
       sessionFile,
-      continuation: { promptText: 'continue the work', promptOwner: 'minion-brief', hadOpenTurn: true },
+      continuation: { promptText: opts.promptText ?? 'continue the work', promptOwner: 'minion-brief', hadOpenTurn: true },
       incidentId: 'incident-1',
       incidentGeneration: 1,
       reasonClass: 'temporary-recoverable:429',
@@ -614,17 +621,30 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     };
   }
 
-  it('a FRESH replacement blind reviewer is briefed with the package it was admitted with; a resumed one already holds it (#360 R5-B3)', async () => {
+  it('a FRESH replacement blind reviewer is briefed with its source and package once; a resumed one already holds them (#360 R5-B3)', async () => {
     const h = new ClaimHarness();
     const jobId = 'j-blind-fresh';
-    const waitId = await h.recoveredMinionWait({ jobId });
+    // The interrupted turn was the dispatch briefing itself, which already
+    // carried the REVIEW SOURCE and package blocks.
+    // The verified source is the lane's own commit, which the lane can read.
+    const head = execFileSync('git', ['-C', fixtureRepo().path, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    const binding = { objectStore: '', repoPath: fixtureRepo().path, targetSha: head, targetBase: null, rangeCommits: null, inputs: [], source: 'repository' as const, packageSha256: null };
+    const waitId = await h.recoveredMinionWait({ review: true, jobId, promptText: renderMinionBriefing({
+      jobId, repoName: 'fixture', branch: `gru/${jobId}`, worktreePath: '/wt', sha: head, briefing: 'do the work',
+      deliverable: 'review', reviewRole: 'blind', reviewSource: binding, blindPackage: BLIND_PACKAGE,
+    }) });
+    h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId, payload: {
+      object_store: '/recorded/store', target_sha: head, target_base: null, range_commits: null, inputs: [], source: 'repository', package_sha256: null,
+    } });
     h.admitBlind(jobId, fixtureRepo().path);
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
     expect(result).toMatchObject({ outcome: 'continued', path: 'redispatched' });
     const prompted = [...h.registry.handles.values()].flatMap((handle) => handle.prompts);
     expect(prompted).toHaveLength(1);
     expect(prompted[0]).toContain('do the work');
-    expect(prompted[0]!.split('BLIND INPUT PACKAGE')).toHaveLength(2);
+    expect(prompted[0]!.split('REVIEW SOURCE (')).toHaveLength(2);
+    expect(prompted[0]!.split('BLIND INPUT PACKAGE (')).toHaveLength(2);
+    expect(prompted[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
     expect(prompted[0]).toContain(`Base: ${BASE}  Target: ${TARGET}`);
     expect(prompted[0]).toContain('File src/feature.ts (at the target):\n```\nexport const feature = 1;\n\n```');
     // A resumed session was briefed at its first spawn: no second copy.
@@ -632,21 +652,64 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-resumed-'));
     cleanupDirs.push(sessionDir);
     const resumedJob = 'j-blind-resumed';
-    const resumedWait = await resumed.recoveredMinionWait({ sessionFile: join(sessionDir, 'reviewer.jsonl'), jobId: resumedJob });
+    const resumedWait = await resumed.recoveredMinionWait({ review: true, sessionFile: join(sessionDir, 'reviewer.jsonl'), jobId: resumedJob });
     resumed.admitBlind(resumedJob, fixtureRepo().path);
     expect(await claimProviderRecoveryContinuation(resumed.deps(), resumedWait, 'silas')).toMatchObject({ outcome: 'continued', path: 'resumed' });
     expect([...resumed.registry.handles.values()].flatMap((handle) => handle.prompts).join('\n')).not.toContain('BLIND INPUT PACKAGE');
-    // An attested package that was never kept fails the fresh continuation by
-    // name: no replacement is briefed without its input.
+    // An attested package that was never kept refuses the fresh continuation
+    // by name before the claim: the wait is cancelled and nothing spawns.
     const unkept = new ClaimHarness();
     const unkeptJob = 'j-blind-unkept';
-    const unkeptWait = await unkept.recoveredMinionWait({ jobId: unkeptJob });
+    const unkeptWait = await unkept.recoveredMinionWait({ review: true, jobId: unkeptJob });
     unkept.admitBlind(unkeptJob, fixtureRepo().path, false);
     const failed = await claimProviderRecoveryContinuation(unkept.deps(), unkeptWait, 'silas');
-    expect(failed.outcome).not.toBe('continued');
-    expect([...unkept.registry.handles.values()].flatMap((handle) => handle.prompts)).toEqual([]);
+    expect(failed).toMatchObject({ outcome: 'skipped', why: expect.stringMatching(/^fresh reviewer input unavailable: .*was not kept/u) });
+    expect(unkept.registry.spawnCalls).toEqual([]);
+    expect(unkept.ledger.getProviderWait(unkeptWait)?.status).toBe('cancelled');
+    expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.recovery-claimed')).toBeNull();
     expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.continuation-failed')?.payload)
-      .toMatchObject({ stage: 'spawn', error: expect.stringMatching(/its attested blind input package was not kept/u) });
+      .toMatchObject({ stage: 'input', error: expect.stringMatching(/its attested blind input package was not kept/u) });
+  });
+
+  it('a review job\'s empty or header-only session file is a fresh session that gets its input once, not a resume', async () => {
+    const header = `${JSON.stringify({ type: 'session', version: 3, id: 'reviewer-session', timestamp: '2026-10-24T00:00:00.000Z', cwd: '/wt' })}\n`;
+    for (const [shape, content] of [['0-byte', ''], ['header-only', header]] as const) {
+      const h = new ClaimHarness();
+      const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-empty-'));
+      cleanupDirs.push(sessionDir);
+      const sessionFile = join(sessionDir, 'reviewer.jsonl');
+      const jobId = `j-blind-${shape}`;
+      const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId, writeSession: false });
+      writeFileSync(sessionFile, content);
+      h.admitBlind(jobId, fixtureRepo().path);
+      expect(await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas'), shape).toMatchObject({ outcome: 'continued', path: 'redispatched' });
+      expect(h.registry.spawnCalls, shape).toEqual([{ resumeFile: null }]);
+      const prompted = [...h.registry.handles.values()].flatMap((handle) => handle.prompts);
+      expect(prompted, shape).toHaveLength(1);
+      expect(prompted[0]!.split('BLIND INPUT PACKAGE (your review input'), shape).toHaveLength(2);
+      expect(prompted[0], shape).toContain('this brief is READ-ONLY');
+    }
+  });
+
+  it('a git fault reading a fresh reviewer\'s input leaves the wait for the next pass, never cancelled', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-blind-git-fault';
+    const waitId = await h.recoveredMinionWait({ review: true, jobId });
+    const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+    h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId, payload: {
+      object_store: '/recorded/store', target_sha: execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim(),
+      target_base: null, range_commits: null, inputs: [], source: 'repository', package_sha256: null,
+    } });
+    h.admitBlind(jobId, fixtureRepo().path);
+    const path = process.env['PATH'];
+    process.env['PATH'] = join(lane.path, 'no-git-here');
+    let result: Awaited<ReturnType<typeof claimProviderRecoveryContinuation>>;
+    try { result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas'); }
+    finally { process.env['PATH'] = path; }
+    expect(result).toMatchObject({ outcome: 'skipped', why: expect.stringMatching(/^fresh reviewer input could not be read: .*git cannot read lane/u) });
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('recovered-pending');
+    expect(h.registry.spawnCalls).toEqual([]);
+    expect(h.ledger.latestJobEvent(jobId, 'provider.continuation-failed')).toBeNull();
   });
 
   it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying #contract:blind-resumed-turn-scan:pi', async () => {
@@ -655,7 +718,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
     const jobId = 'j-blind-prohibited';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
     // The prohibited read is written BY the resumed turn, not pre-written: a
     // scan that ran before the prompt would read a clean session and pass.
@@ -677,7 +740,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
     const jobId = 'j-blind-claude';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
     resumeTurnThatReads(h, sessionFile, PROHIBITED, claudeToolResult);
     expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
@@ -694,7 +757,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
     const jobId = 'j-blind-clean';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
     resumeTurnThatReads(h, sessionFile, 'src/feature.ts:1:export const feature = 1;');
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
@@ -712,7 +775,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
     const jobId = 'j-blind-retry-read';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
     // The FIRST delivery reads nothing; the supervisor-scheduled retry turn
     // reads the prohibited file DURING settlement, after the prompt settled.
@@ -739,7 +802,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
     const jobId = 'j-blind-exhausted';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
     resumeTurnThatReads(h, sessionFile, PROHIBITED);
     let settlementAsked = 0;
@@ -762,7 +825,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
     const jobId = 'j-blind-inband';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const waitId = await h.recoveredMinionWait({ review: true, sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
     h.registry.spawnImpl = (resumeFile) => {
       const handle = new FakeHandle('minion', `agent-blind-inband-${h.registry.handles.size + 1}`, resumeFile);

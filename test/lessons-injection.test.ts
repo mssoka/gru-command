@@ -89,6 +89,13 @@ describe('progressive-disclosure injection', () => {
       '- read /tmp/gru-bible/chapters/ops-restarts.md#shell-hang (why: task mentions restart, shell)',
     );
     expect(briefing).not.toContain(BODY_SENTINEL);
+    const blind = renderMinionBriefing({
+      jobId: 'review-blind', repoName: 'repo', branch: 'gru/review-blind',
+      worktreePath: '/tmp/wt', sha: 'abc123', briefing: 'Review only the frozen source.',
+      deliverable: 'review', reviewRole: 'blind', lessons: [POINTER],
+    });
+    expect(blind).not.toContain('RELEVANT LESSONS');
+    expect(blind).not.toContain('/tmp/gru-bible/chapters/ops-restarts.md');
   });
 
   it('renders deliverable-specific closing orders (E19)', () => {
@@ -190,6 +197,31 @@ describe('progressive-disclosure injection', () => {
     expect(prompt).toContain('RELEVANT LESSONS');
     expect(prompt).toContain('- read /tmp/gru-bible/chapters/ops-restarts.md#shell-hang');
     expect(prompt).not.toContain(BODY_SENTINEL);
+    const blind = renderRebriefPrompt({
+      jobId: 'review-blind', briefing: 'frozen-source-only contract',
+      note: 'continue from the package', reviewRole: 'blind', lessons: [POINTER],
+    });
+    expect(blind).not.toContain('RELEVANT LESSONS');
+    expect(blind).not.toContain('/tmp/gru-bible/chapters/ops-restarts.md');
+    const blindWithoutBriefing = renderRebriefPrompt({
+      jobId: 'review-blind', briefing: null, note: 'continue from the package', reviewRole: 'blind',
+    });
+    expect(blindWithoutBriefing).toContain('(no additional briefing text is attached)');
+    expect(blindWithoutBriefing).not.toContain('read the job note on the board');
+    // A blind reviewer's re-brief carries the read-only review orders, never
+    // the implementer's commit/build/PR orders.
+    expect(prompt).toContain('commit your work to the branch');
+    expect(blind).toContain('this brief is READ-ONLY — change nothing, commit');
+    expect(blind).not.toContain('commit your work to the branch');
+    expect(blind).not.toContain('never merge your own pull request');
+    // So does every other review job: a claims reviewer and a role-less one.
+    for (const reviewer of [
+      renderRebriefPrompt({ jobId: 'review-claims', briefing: 'contract', note: 'n', reviewRole: 'claims' }),
+      renderRebriefPrompt({ jobId: 'review-plain', briefing: 'contract', note: 'n', deliverable: 'review' }),
+    ]) {
+      expect(reviewer).toContain('this brief is READ-ONLY — change nothing, commit');
+      expect(reviewer).not.toContain('commit your work to the branch');
+    }
   });
 
   it('re-briefs from the original contract when an evicted minion transcript cannot resume', async () => {

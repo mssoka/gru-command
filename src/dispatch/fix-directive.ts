@@ -1,14 +1,16 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
+import { closeSync, openSync, readSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import type { Role } from '../config.js';
-import type { LedgerApi } from '../ledger/api.js';
+import type { JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
-import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { appendWorkerRules, READ_ONLY_REVIEW_ORDERS, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { withRevisionContinuation } from './work-revision.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
@@ -17,6 +19,9 @@ import type { WorktreePort } from './worktree-port.js';
 import { readGitState } from '../verify/scheduler.js';
 import { readDirectiveSessionHeader } from '../runtime/directive-checkpoint.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
+import { admittedBlindPackage, BlindPackageRecordError, isAdmittedBlind, renderBlindPackageBlock } from './blind-review.js';
+import { laneMissingObjects, renderReviewSourceBlock, ReviewSourceRecordError, verifiedReviewSource } from './review-source.js';
+import type { ReviewRole } from './blind-input.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -29,7 +34,8 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
 /** The product-owned identity + GC-mediated child tools for a
  * (re)dispatched parent session (issue #161). A fresh physical session
  * still belongs to its recorded logical minion; only a job without an
- * implementer record mints an identity. */
+ * implementer record mints an identity. An admitted blind reviewer gets no
+ * child tools: a child holds neither its package nor its isolation rule. */
 function parentIdentitySpawnOptions(
   input: {
     readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
@@ -37,11 +43,12 @@ function parentIdentitySpawnOptions(
   },
   jobId: string,
   resumeFile: string | null,
+  blindReview: boolean,
 ): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
   const implementers = input.ledger.listImplementerMinions(jobId);
   const original = implementers.find((agent) => resumeFile !== null && agent.sessionFile === resumeFile) ?? implementers[0];
   const agentId = original?.id ?? `minion_${randomUUID()}`;
-  const nativeTools = input.parentTools?.(agentId) ?? [];
+  const nativeTools = blindReview ? [] : input.parentTools?.(agentId) ?? [];
   return {
     agentId,
     // A runtime that cannot host parent tools returns none: no empty array
@@ -63,7 +70,7 @@ export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
   readonly ledger: Pick<
     LedgerApi,
-    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'
+    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent' | 'latestJobEvent'
   >;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
@@ -130,6 +137,114 @@ export class DirectiveDispatchDeferredError extends Error {
  * code, not a retry. */
 export class DirectiveRoutingContractError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveRoutingContractError'; }
+}
+
+/** A caller's admission re-check (`beforeWriterSideEffect`) refused at a
+ * post-wait boundary — after pacing, around spawn/resume or immediately
+ * before the prompt, each of which precedes that boundary's prompt (#364) —
+ * or the route refused before any disposal or spawn. It is a positive
+ * no-effect only when directive-progress's promptRefusalUnproven finds no
+ * reason against it (returns null); then the request fails by name instead
+ * of staying live for reconciliation and fencing the lane. */
+export class DirectivePromptRefusedError extends Error {
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'DirectivePromptRefusedError'; }
+}
+
+/** A fresh reviewer's recorded input cannot be re-delivered: a legacy blind
+ * admission that never kept its package, a malformed record, or a lane
+ * whose object store is not the verified one. Raised before any disposal or
+ * spawn: a replacement briefed without its input would review nothing it
+ * was given. */
+export class ReviewInputUnavailableError extends DirectivePromptRefusedError {
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'ReviewInputUnavailableError'; }
+}
+
+/** Whether the job is an admitted blind review. The durable role decides
+ * what a (re)briefed session is given, so a ledger that cannot answer is
+ * refused by name, never read as an ordinary job. */
+function admittedBlind(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): boolean {
+  if (typeof ledger.latestJobEvent !== 'function') {
+    throw new DirectiveRoutingContractError(`job "${jobId}": routing needs the ledger's latestJobEvent — without it a blind reviewer's admitted role cannot be read`);
+  }
+  return isAdmittedBlind(ledger, jobId);
+}
+
+/** A fresh session's review input, re-rendered from the durable records as
+ * at its first briefing: the verified REVIEW SOURCE block (any review whose
+ * dispatch recorded one, once the lane is shown to read its objects), then
+ * an admitted blind reviewer's frozen package. Empty for any other job. Only
+ * a record that cannot be re-delivered refuses by name; any other fault (a
+ * git failure among them) propagates, so its request stays for
+ * reconciliation. */
+export function freshReviewInput(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string, lanePath: string): readonly string[] {
+  try {
+    const source = verifiedReviewSource(ledger, jobId);
+    if (source !== null) {
+      const missing = laneMissingObjects(lanePath, [
+        { oid: source.targetSha, type: 'commit' },
+        ...(source.targetBase === null ? [] : [{ oid: source.targetBase, type: 'commit' as const }]),
+        ...source.inputs.map((input) => ({ oid: input.blob, type: 'blob' as const })),
+      ]);
+      if (missing.length > 0) {
+        throw new ReviewInputUnavailableError(`fresh reviewer refused before any effect: job "${jobId}": lane ${lanePath} cannot read the verified objects ${missing.join(', ')}`);
+      }
+    }
+    const pkg = admittedBlindPackage(ledger, jobId);
+    return [...(source === null ? [] : [renderReviewSourceBlock(source).join('\n')]), ...(pkg === null ? [] : [renderBlindPackageBlock(pkg).join('\n')])];
+  } catch (error) {
+    if (error instanceof BlindPackageRecordError || error instanceof ReviewSourceRecordError) {
+      throw new ReviewInputUnavailableError(`fresh reviewer refused before any effect: ${error.message}`, { cause: error });
+    }
+    throw error;
+  }
+}
+
+/** One transcript line that is a user or assistant message: a Pi `message`
+ * entry or a claude-code `user`/`assistant` frame. A torn or foreign line is
+ * none. Parsed here, without the Pi SDK, so routing stays dependency-light. */
+function conversationLine(line: string): boolean {
+  let entry: unknown;
+  try { entry = JSON.parse(line); } catch { return false; }
+  if (typeof entry !== 'object' || entry === null) return false;
+  const { type, message } = entry as { readonly type?: unknown; readonly message?: unknown };
+  if (typeof message !== 'object' || message === null) return false;
+  if (type === 'message') { const role = (message as { readonly role?: unknown }).role; return role === 'user' || role === 'assistant'; }
+  return type === 'user' || type === 'assistant';
+}
+
+/** Whether a recorded session transcript holds a conversation (a user or
+ * assistant entry). A missing, empty or header-only file opens as a new,
+ * empty session. Reads only as far as the first such entry; a read fault
+ * other than a missing file propagates. */
+export function holdsConversation(sessionFile: string): boolean {
+  let fd: number;
+  try { fd = openSync(sessionFile, 'r'); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const conversation = (lines: string): boolean => lines.split('\n').some(conversationLine);
+  try {
+    const decoder = new StringDecoder('utf8');
+    const chunk = Buffer.alloc(64 * 1024);
+    let pending = '';
+    for (let read = readSync(fd, chunk); read > 0; read = readSync(fd, chunk)) {
+      pending += decoder.write(chunk.subarray(0, read));
+      const end = pending.lastIndexOf('\n');
+      if (end < 0) continue;
+      if (conversation(pending.slice(0, end + 1))) return true;
+      pending = pending.slice(end + 1);
+    }
+    return conversation(pending + decoder.end());
+  } finally { closeSync(fd); }
+}
+
+/** `text` with the review input appended exactly once: copies of its exact
+ * blocks already in `text` (a captured briefing that carried them) are
+ * removed first. */
+function withReviewInput(text: string, blocks: readonly string[]): string {
+  if (blocks.length === 0) return text;
+  const stripped = blocks.reduce((rest, block) => rest.split(block).join(''), text);
+  return `${stripped}\n\n${blocks.join('\n\n')}`;
 }
 
 /** Route a directive to the implementing minion: the live job minion
@@ -212,10 +327,26 @@ export async function routeFixDirectiveToMinion(
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
+  const blindReview = admittedBlind(input.ledger, input.jobId);
+  const reviewJob = input.ledger.getJob(input.jobId)?.deliverable === 'review';
+  // A fresh session (nothing resumed) gets its review input exactly once,
+  // resolved before any disposal or spawn so a refusal has no effect.
+  const reviewInputs = new Map<string, readonly string[]>();
+  const resolveReviewInput = (lanePath: string): readonly string[] => {
+    let blocks = reviewInputs.get(lanePath);
+    if (blocks === undefined) { blocks = freshReviewInput(input.ledger, input.jobId, lanePath); reviewInputs.set(lanePath, blocks); }
+    return blocks;
+  };
+  // A fresh reviewer is told it is read-only; a re-brief prompt (the fresh
+  // session route) carries its own orders.
+  const freshReviewerPrompt = (text: string, lanePath: string): string => withReviewInput(
+    reviewJob && input.freshSession !== true ? `${text}\n\n${READ_ONLY_REVIEW_ORDERS.join('\n')}` : text,
+    resolveReviewInput(lanePath),
+  );
   const compose = (revisionText: string): string => appendWorkerRules(
     appendLessonPointers(
       withRevisionContinuation(input.directive, revisionText),
-      input.lessons?.referencesFor(input.directive) ?? [],
+      blindReview ? [] : input.lessons?.referencesFor(input.directive) ?? [],
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
@@ -236,6 +367,7 @@ export async function routeFixDirectiveToMinion(
     await handle.endBackgroundWait();
   };
   if (input.freshSession === true) {
+    if (assignedLane !== undefined) resolveReviewInput(assignedLane.path);
     for (const minion of minions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
@@ -387,17 +519,26 @@ export async function routeFixDirectiveToMinion(
     const fallback = evictedSessionFile === null
       ? (minions.find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
       : null;
-    const resumeFile = evictedSessionFile ?? fallback;
+    const recordedSession = evictedSessionFile ?? fallback;
+    // A reviewer's recorded session is resumed only while its transcript
+    // holds a conversation: a runtime opens a missing, empty or header-only
+    // file as a new, empty session, which must be briefed as fresh.
+    const resumeFile = reviewJob && recordedSession !== null && !holdsConversation(recordedSession) ? null : recordedSession;
     // Issue #161: the (re)dispatched parent keeps one product-owned id
     // (its recorded row's id, even without a transcript) and receives the
     // child tools bound to it — re-briefed parents stay able to commission.
-    const identity = parentIdentitySpawnOptions(input, input.jobId, resumeFile);
+    const identity = parentIdentitySpawnOptions(input, input.jobId, resumeFile, blindReview);
     // A brand-new session (nothing to resume) has no memory of the contract:
     // brief it with the effective contract like the resume fallback below
     // (owner rule 4) — when the caller supplied one.
     const freshPrompt = (contract: string): string =>
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
-    let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
+    let prompt = resumeFile === null
+      ? freshReviewerPrompt(input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive, lane.path)
+      : directive;
+    // A failed resume falls back to a fresh session: its input is resolved
+    // before the resume attempt, so a refusal spawns nothing.
+    if (resumeFile !== null && input.directiveTurn === undefined) resolveReviewInput(lane.path);
     try {
       assertHandoff();
       assertAdmissible();
@@ -415,15 +556,15 @@ export async function routeFixDirectiveToMinion(
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
+      // A fresh session has no memory of accepted amendments: brief it with
+      // the EFFECTIVE contract (original + amendments), never the original
+      // alone (owner rule 4).
+      prompt = freshReviewerPrompt(freshPrompt(contract), lane.path);
       assertHandoff();
       assertAdmissible();
       guard();
       nativeAttempted = true;
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
-      // A fresh session has no memory of accepted amendments: brief it with
-      // the EFFECTIVE contract (original + amendments), never the original
-      // alone (owner rule 4).
-      prompt = freshPrompt(contract);
     }
     assertAdmissible();
     guard();
@@ -693,8 +834,12 @@ export function renderRebriefPrompt(input: {
   workRevision?: number | null;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
+  /** Host-admitted review role; blind contexts cannot receive lesson pointers. */
+  reviewRole?: ReviewRole | null;
+  /** The job's deliverable kind: a review job gets the read-only orders. */
+  deliverable?: JobDeliverable | null;
 }): string {
-  const lessonsSection = renderLessonsSection(input.lessons ?? []);
+  const lessonsSection = input.reviewRole === 'blind' ? '' : renderLessonsSection(input.lessons ?? []);
   return [
     `Re-brief — job ${input.jobId}`,
     '',
@@ -708,14 +853,20 @@ export function renderRebriefPrompt(input: {
       ? 'CONTRACT (the original briefing plus any accepted amendments):'
       : `CONTRACT — revision ${input.workRevision} (the original briefing plus every accepted amendment; ` +
         `the service records this turn's delivery as contract revision ${input.workRevision} — name it in your completion report):`,
-    input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
+    input.briefing ?? (input.reviewRole === 'blind'
+      ? '(no additional briefing text is attached)'
+      : '(the job row carries no stored briefing — read the job note on the board)'),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
-    'Execute the briefing inside this worktree. Standing orders: work only',
-    'inside this tree; commit your work to the branch; verify it (build,',
-    'tests, lint — whatever this project calls green) before finishing;',
-    'never merge your own pull request. End with a completion report.',
+    ...(input.deliverable === 'review' || (input.reviewRole ?? null) !== null
+      ? READ_ONLY_REVIEW_ORDERS
+      : [
+          'Execute the briefing inside this worktree. Standing orders: work only',
+          'inside this tree; commit your work to the branch; verify it (build,',
+          'tests, lint — whatever this project calls green) before finishing;',
+          'never merge your own pull request. End with a completion report.',
+        ]),
   ].join('\n');
 }
 
@@ -739,7 +890,8 @@ export function flipJobToWorking(
  * a new minion is spawned rooted in the SAME worktree with the re-brief.
  * Restart recovery may pass `resumeFile` to re-enter the interrupted
  * worker's session (the #42 orphan-cure shape: resume, then re-deliver the
- * pending prompt) instead of minting a fresh one. */
+ * pending prompt) instead of minting a fresh one. A fresh reviewer is also
+ * briefed with its recorded review input (#360 R5-B3). */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
     readonly ledger: Pick<LedgerApi, 'setAgentState' | 'getAgent'>;
@@ -789,6 +941,11 @@ export async function rebriefFreshMinion(
   }
   const assertHandoff = capturePortLaneHandoff(input.worktrees, lane);
   const cwd = requireSpawnCwd('minion', lane.path);
+  // A fresh session gets its review input exactly once (a resumed one
+  // already holds it), resolved before any disposal or spawn.
+  const blindReview = admittedBlind(input.ledger, input.jobId);
+  const reviewInput = (input.resumeFile ?? null) === null ? freshReviewInput(input.ledger, input.jobId, lane.path) : [];
+  const briefing = reviewInput.length === 0 ? input.briefing : input.briefing === null ? reviewInput.join('\n\n') : withReviewInput(input.briefing, reviewInput);
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
     lease = await input.workerGate.acquireWorkerTurn({
@@ -825,6 +982,7 @@ export async function rebriefFreshMinion(
       input,
       input.jobId,
       input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
+      blindReview,
     );
     const handle = await input.registry.spawn('minion', {
       cwd,
@@ -847,10 +1005,12 @@ export async function rebriefFreshMinion(
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
       prompt = renderRebriefPrompt({
         jobId: input.jobId,
-        briefing: input.briefing,
+        briefing,
         note: input.note,
+        reviewRole: blindReview ? 'blind' : null,
+        deliverable: input.ledger.getJob(input.jobId)?.deliverable ?? null,
         ...(input.workRevision !== undefined ? { workRevision: input.workRevision } : {}),
-        ...(input.lessons !== undefined
+        ...(!blindReview && input.lessons !== undefined
           ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
           : {}),
       });
