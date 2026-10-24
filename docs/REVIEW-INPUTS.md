@@ -473,23 +473,22 @@ lifecycle fact — so a settled report read as independent coverage.
   written, and any other path as that literal. A path that itself opens with
   `"` counts as "any other", so a leading quote always marks the escaped form.
   The package bytes are kept (`review.blind-input-package`, written before the
-  admission), so a fresh
-  replacement reviewer spawned by provider recovery gets the same block; a resumed
-  session already holds it. An attested reviewer whose package was not kept (one
-  admitted before packages were kept) fails that fresh continuation by name —
-  never a replacement briefed without its input.
+  admission), so a fresh replacement reviewer (provider recovery, a Silas
+  re-brief, or a directive whose session cannot resume) gets the same REVIEW
+  SOURCE and package blocks, once; a resumed session already holds them. An
+  attested reviewer whose package was not kept (one admitted before packages were
+  kept) is refused by name before any session is stopped or spawned — never a
+  replacement briefed without its input.
 - **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
   refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
-- **Role-specific host context.** The durable admitted role is checked before
-  provider prompt construction. A blind reviewer receives no automatic Book of
-  Lessons lookup, chapter pointer or other GC-injected out-of-package reading
-  obligation, on initial dispatch, native directive continuation, fresh
-  re-brief or provider-recovery-created fresh session. Fresh blind sessions keep
-  the admitted frozen package/source; the role boundary filters lesson pointers
-  before rendering as well as at the renderer. Ordinary workers and `claims`
-  reviewers continue to receive the generic lesson references. This does not
-  alter native runtime, credentials, workflow authority, package attestation or
-  observed-access checks.
+- **Role-specific host context.** The admitted role decides what GC adds to a
+  reviewer's prompt. A blind reviewer gets no Book of Lessons lookup or pointer on
+  any path (dispatch, directive, re-brief, provider recovery), a re-brief gives it
+  the read-only review orders, and its briefing offers no child workers: a
+  `request_child_worker` call from an admitted blind job is refused as
+  `parent_not_permitted`, since a child holds neither the package nor the
+  isolation rule and its reads are not observed. Ordinary workers and `claims`
+  reviewers keep the lesson references.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 
@@ -533,8 +532,8 @@ terminal report). A blind commission for a target whose blind coverage is
 already `qualifying` under the same parent answers `409 blind_coverage_owned`
 naming the job to reuse (or `409 blind_coverage_unreadable` naming a sibling
 whose recorded blind-access facts cannot be counted — repair them in the ledger
-first). After prohibited access has invalidated a terminal report, the existing
-API permits a fresh blind commission for that same parent and target; its new
-admission records the replaced sibling. The old report remains preserved and
-invalidated and never counts as blind coverage.
+first). A blocked, parked or binned sibling is skipped. Any other blind sibling
+whose coverage is not `qualifying` (`invalidated`, `unattested` or `unobserved`,
+terminal or not) may be replaced: the new admission lists it in `replaces`, and
+its report stays exactly as recorded.
 
