@@ -50,7 +50,6 @@ interface Harness {
   port: number;
   ledger: LedgerApi;
   prompts: string[];
-  reports: string[];
   spawnCount: () => number;
   repo: FixtureRepo;
 }
@@ -81,7 +80,6 @@ async function boot(opts: {
   const ledger = new LedgerApi(db.handle, { bus });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const prompts: string[] = [];
-  const reports: string[] = [];
   let spawns = 0;
   const spawner = async (role: Role, _options?: SpawnOptions): Promise<AgentHandle> => {
     spawns += 1;
@@ -95,7 +93,6 @@ async function boot(opts: {
       async prompt(text: string) {
         if (role !== 'minion') return;
         prompts.push(text);
-        if (text.includes('BLIND INPUT PACKAGE')) reports.push('No findings.');
         if (opts.rejectPromptOf !== undefined && text.includes(opts.rejectPromptOf)) throw new Error('provider closed the stream mid-turn');
       },
       async steer() {}, async followUp() {},
@@ -130,7 +127,7 @@ async function boot(opts: {
     db.close();
   });
   const repo = makeFixtureRepo('fixture-blind');
-  return { port: (http.address() as AddressInfo).port, ledger, prompts, reports, spawnCount: () => spawns, repo };
+  return { port: (http.address() as AddressInfo).port, ledger, prompts, spawnCount: () => spawns, repo };
 }
 
 async function call(port: number, method: string, path: string, body?: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
@@ -286,12 +283,14 @@ describe('blind review commissioning (issue #316)', () => {
   });
 
   it('isolates the actual blind provider prompt while ordinary and claims prompts retain generic lessons', async () => {
+    let lookups = 0;
     const h = await boot({
-      lessons: { referencesFor: () => [BOOK_CANARY] },
+      lessons: { referencesFor: () => { lookups += 1; return [BOOK_CANARY]; } },
       sessionToolResults: () => [{ index: 0, toolName: 'bash', text: 'src/feature.ts:1:export const feature = 1;' }],
     });
     await dispatchParent(h);
     expect(h.prompts[0]).toContain('/synthetic-book/chapters/synthetic-canary.md');
+    expect(lookups).toBe(1);
 
     const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-isolated', {
       repo_path: h.repo.path, input_package: validPackage(),
@@ -301,7 +300,8 @@ describe('blind review commissioning (issue #316)', () => {
     const blindPrompt = h.prompts.find((prompt) => prompt.includes('BLIND INPUT PACKAGE'))!;
     expect(blindPrompt).toContain('File src/feature.ts (at the target):');
     expect(blindPrompt).not.toContain('/synthetic-book/chapters/synthetic-canary.md');
-    expect(h.reports).toContain('No findings.');
+    // No Book of Lessons lookup is made for a blind reviewer at all.
+    expect(lookups).toBe(1);
     expect(h.ledger.latestJobEvent('rev-isolated', 'review.blind-access-observed')?.payload).toMatchObject({ prohibited: [] });
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-isolated/blind-coverage')).json).toMatchObject({
       state: 'qualifying', qualifying: true, accessObserved: true, prohibitedAccess: 0,
@@ -314,6 +314,7 @@ describe('blind review commissioning (issue #316)', () => {
     await waitFor(() => h.ledger.latestJobEvent('rev-claims-context', 'job.delivered') !== null);
     const claimsPrompt = h.prompts.find((prompt) => prompt.includes('rev-claims-context'))!;
     expect(claimsPrompt).toContain('/synthetic-book/chapters/synthetic-canary.md');
+    expect(lookups).toBe(2);
   });
 
   it('briefs a blind reviewer without the child-worker tools an ordinary parent is offered', async () => {
@@ -331,7 +332,7 @@ describe('blind review commissioning (issue #316)', () => {
     expect(blindPrompt).not.toContain('request_child_worker');
   });
 
-  it('does not launder an attempted forbidden read through a delivered no-findings report', async () => {
+  it('a forbidden read in a blind turn invalidates its coverage although the turn delivered', async () => {
     const h = await boot({
       lessons: { referencesFor: () => [BOOK_CANARY] },
       sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/lessons/synthetic-canary.md:1:synthetic forbidden result' }],
@@ -342,12 +343,11 @@ describe('blind review commissioning (issue #316)', () => {
     }));
     expect(created.status).toBe(202);
     await waitFor(() => h.ledger.latestJobEvent('rev-forbidden-read', 'job.delivered') !== null);
-    expect(h.reports).toContain('No findings.');
     expect(h.ledger.latestJobEvent('rev-forbidden-read', 'review.blind-access-observed')?.payload).toMatchObject({
       prohibited: [expect.objectContaining({ path: '_bmad-output/lessons/synthetic-canary.md' })],
     });
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-forbidden-read/blind-coverage')).json).toMatchObject({
-      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1, reportPreserved: true,
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
     });
   });
 
