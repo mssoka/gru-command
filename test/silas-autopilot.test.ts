@@ -933,7 +933,9 @@ describe('pr-conflict-rebase (rule hit and rule miss)', () => {
     expect(otherHead.decisions).toBe(1);
 
     // An owner abandonment for this head is an unknown outcome, never a
-    // spent attempt: one alone stops the automatic retry, by name.
+    // spent attempt: one alone, with no failure beside it, stops the
+    // automatic retry.
+    ledger.state.failedDirectives = ledger.state.failedDirectives.filter((record) => record.requestId !== 'req-1');
     ledger.state.failedDirectives.push({ jobId: 'job-conflict', requestId: 'req-abandoned',
       payload: JSON.stringify({ directive: 'x', blocker_fingerprint: fingerprint }), abandonedAt: '2026-10-24T00:00:00.000Z' });
     const fourth = fakeOps();
