@@ -365,6 +365,20 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
   });
 
+  it('refuses a pin moved past a whitespace line before creating a branch', async () => {
+    const f = makeFixture();
+    f.repo.commitFile('requirements.txt', '  \nfixture-dep==1.0.0\n');
+    f.repo.git(['push', '--quiet', 'origin', 'main']);
+    const made = f.makePackage({ jobId: 'job-whitespace-move', content: 'fixture-dep==2.0.0\n  \n' });
+    await expect(dispatch(f, 'job-whitespace-move', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-whitespace-move', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'content_invalid' });
+    expect(f.ledger.latestJobEvent('job-whitespace-move', 'worktree.prebootstrap-patch-started')).toBeNull();
+    expect(f.ledger.getWorktree('job-whitespace-move')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-whitespace-move'])).toBe('');
+    expect(creationReceipt(f, 'job-whitespace-move')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+  });
+
   it('serializes concurrent identical initial dispatches and admits at most one worker', async () => {
     const f = makeFixture();
     const made = f.makePackage();

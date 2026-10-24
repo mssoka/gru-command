@@ -309,7 +309,7 @@ const PINS: Record<string, number> = {
   'pipeline-service.test.ts': 31,
   'pi-adapter.test.ts': 249,
   'pr-creation-policy.test.ts': 5,
-  'prebootstrap-patch.test.ts': 29,
+  'prebootstrap-patch.test.ts': 30,
   'provider-recovery-admission.test.ts': 4,
   'provider-recovery-classify.test.ts': 25,
   'provider-recovery-composition.test.ts': 9,

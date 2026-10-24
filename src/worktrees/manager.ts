@@ -1624,8 +1624,6 @@ export class WorktreeManager {
     if (changed !== 'requirements.txt' || untracked !== '' || staged !== '') {
       throw new PreBootstrapPatchError('changed_paths', `prebootstrap patch produced unapproved tracked/untracked changes (tracked=${JSON.stringify(changed)}, staged=${JSON.stringify(staged)}, untracked=${JSON.stringify(untracked)})`);
     }
-    const check = spawnGit(worktreePath, ['diff', '--check', '--', 'requirements.txt']);
-    if (check.status !== 0) throw new PreBootstrapPatchError('content_invalid', 'applied requirements patch failed git diff --check');
     const afterTree = gitTreeWithRequirementsPatch(worktreePath, custody.sha, afterBytes);
     this.assertPreBootstrapAuthority(jobId, patch);
     this.opts.ledger.appendCustomEvent({
