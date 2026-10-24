@@ -349,6 +349,11 @@ A pending re-brief marker generation of unknown custody has the same exit:
 It deletes the generation's markers with one `silas.rebrief-abandoned`
 audit, under the same refusals, hold and closures.
 
+One state has no exit: a job carrying both a live directive and pending
+re-brief markers (legacy history only; the single-writer rule refuses it
+now). Each abandonment sees the other control as live and refuses: it is
+an owner-escalation dead end that no route here closes.
+
 ## Activation rules
 
 - Routine live approved recovery uses the guarded Gru decision described
