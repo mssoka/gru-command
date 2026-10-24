@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -621,15 +621,15 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     const jobId = 'j-blind-fresh';
     // The interrupted turn was the dispatch briefing itself, which already
     // carried the REVIEW SOURCE and package blocks.
-    const binding = { objectStore: '', repoPath: fixtureRepo().path, targetSha: TARGET, targetBase: BASE, rangeCommits: 1, inputs: [], source: 'repository' as const, packageSha256: null };
+    // The verified source is the lane's own commit, which the lane can read.
+    const head = execFileSync('git', ['-C', fixtureRepo().path, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    const binding = { objectStore: '', repoPath: fixtureRepo().path, targetSha: head, targetBase: null, rangeCommits: null, inputs: [], source: 'repository' as const, packageSha256: null };
     const waitId = await h.recoveredMinionWait({ jobId, promptText: renderMinionBriefing({
-      jobId, repoName: 'fixture', branch: `gru/${jobId}`, worktreePath: '/wt', sha: BASE, briefing: 'do the work',
+      jobId, repoName: 'fixture', branch: `gru/${jobId}`, worktreePath: '/wt', sha: head, briefing: 'do the work',
       deliverable: 'review', reviewRole: 'blind', reviewSource: binding, blindPackage: BLIND_PACKAGE,
     }) });
-    const lane = h.worktrees.listWorktrees({ jobId })[0]!;
-    const objectStore = realpathSync(execFileSync('git', ['-C', lane.path, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf-8' }).trim());
     h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId, payload: {
-      object_store: objectStore, target_sha: TARGET, target_base: BASE, range_commits: 1, inputs: [], source: 'repository', package_sha256: null,
+      object_store: '/recorded/store', target_sha: head, target_base: null, range_commits: null, inputs: [], source: 'repository', package_sha256: null,
     } });
     h.admitBlind(jobId, fixtureRepo().path);
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
@@ -664,6 +664,27 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.recovery-claimed')).toBeNull();
     expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.continuation-failed')?.payload)
       .toMatchObject({ stage: 'input', error: expect.stringMatching(/its attested blind input package was not kept/u) });
+  });
+
+  it('a git fault reading a fresh reviewer\'s input leaves the wait for the next pass, never cancelled', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-blind-git-fault';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+    h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId, payload: {
+      object_store: '/recorded/store', target_sha: execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim(),
+      target_base: null, range_commits: null, inputs: [], source: 'repository', package_sha256: null,
+    } });
+    h.admitBlind(jobId, fixtureRepo().path);
+    const path = process.env['PATH'];
+    process.env['PATH'] = join(lane.path, 'no-git-here');
+    let result: Awaited<ReturnType<typeof claimProviderRecoveryContinuation>>;
+    try { result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas'); }
+    finally { process.env['PATH'] = path; }
+    expect(result).toMatchObject({ outcome: 'skipped', why: expect.stringMatching(/^fresh reviewer input could not be read: .*git cannot read lane/u) });
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('recovered-pending');
+    expect(h.registry.spawnCalls).toEqual([]);
+    expect(h.ledger.latestJobEvent(jobId, 'provider.continuation-failed')).toBeNull();
   });
 
   it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying #contract:blind-resumed-turn-scan:pi', async () => {

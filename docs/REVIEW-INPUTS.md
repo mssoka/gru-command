@@ -474,16 +474,18 @@ lifecycle fact — so a settled report read as independent coverage.
   `"` counts as "any other", so a leading quote always marks the escaped form.
   The package bytes are kept (`review.blind-input-package`, written before the
   admission), so a fresh replacement reviewer (provider recovery, a Silas
-  re-brief, or a directive whose session cannot resume or whose session file is
-  gone) gets the package block again, once, even when its carried-over prompt
-  already held it; a resumed session already holds it. Any review job whose
-  dispatch recorded `job.review-source-verified` gets its REVIEW SOURCE block
-  back the same way, after checking that the lane still uses the verified object
-  store. A package that was not kept (one admitted before packages were kept), a
-  malformed record or a different object store is refused by name before the
-  lane is cleared, any session is stopped or spawned, or a provider wait is
-  claimed (that wait is cancelled) — never a replacement briefed without its
-  input.
+  re-brief, or a directive whose session cannot resume or whose transcript is
+  missing, empty or holds no conversation) gets the package block again, once,
+  even when its carried-over prompt already held it; a resumed session already
+  holds it. Any review job whose dispatch recorded `job.review-source-verified`
+  gets its REVIEW SOURCE block back the same way, after checking that the lane
+  can still read the verified target, base and input objects (a moved and
+  repaired repository still can). A package that was not kept (one admitted
+  before packages were kept), a malformed record or objects the lane cannot read
+  are refused by name before the lane is cleared, any session is stopped or
+  spawned, or a provider wait is claimed (that wait is cancelled) — never a
+  replacement briefed without its input. A git failure is a fault, not a
+  refusal: the request or the wait stays for a later pass.
 - **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
   refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
 - **Role-specific host context.** The admitted role decides what GC adds to a

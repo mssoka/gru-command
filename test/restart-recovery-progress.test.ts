@@ -3755,6 +3755,21 @@ it('P35 a blind reviewer\'s checkpoint continuation is spawned without the child
   await service.dispose();
 });
 
+it('a re-brief whose fresh reviewer input git cannot read stays for reconciliation', async () => {
+  const f = await fixture('rebrief', true, true);
+  f.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: f.intent.jobId, payload: {
+    object_store: '/recorded/store', target_sha: resolveGitCommit(f.lane.path, 'HEAD'), target_base: null, range_commits: null, inputs: [], source: 'repository', package_sha256: null,
+  } });
+  rmSync(f.lane.path, { recursive: true, force: true });
+  const cleared: string[] = [];
+  await executeAcceptedDirective({ ...f.deps, clearLaneForWriter: async ({ writer }) => { cleared.push(writer); } }, f.intent.requestId);
+  expect(cleared).toEqual([]);
+  expect(f.spawns).toEqual([]);
+  const row = f.ledger.getDirective(f.intent.requestId)!;
+  expect(row.state).not.toBe('failed');
+  expect(row.failReason).toMatch(/^reconcile: .*git cannot read lane/u);
+});
+
 it('a re-brief whose fresh reviewer input cannot be re-delivered fails by name before the lane is cleared for it', async () => {
   const f = await fixture('rebrief'); admitFixtureAsBlind(f, false);
   const cleared: string[] = [];

@@ -1,6 +1,7 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { closeSync, openSync, readSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import type { Role } from '../config.js';
 import type { JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -19,8 +20,9 @@ import { readGitState } from '../verify/scheduler.js';
 import { readDirectiveSessionHeader } from '../runtime/directive-checkpoint.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { admittedBlindPackage, BlindPackageRecordError, isAdmittedBlind, renderBlindPackageBlock } from './blind-review.js';
-import { laneObjectStore, renderReviewSourceBlock, ReviewSourceRecordError, verifiedReviewSource } from './review-source.js';
+import { laneMissingObjects, renderReviewSourceBlock, ReviewSourceRecordError, verifiedReviewSource } from './review-source.js';
 import type { ReviewRole } from './blind-input.js';
+import { parseTranscriptContent } from '../transcripts/service.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -170,17 +172,22 @@ function admittedBlind(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string)
 
 /** A fresh session's review input, re-rendered from the durable records as
  * at its first briefing: the verified REVIEW SOURCE block (any review whose
- * dispatch recorded one, checked against the lane's object store), then an
- * admitted blind reviewer's frozen package. Empty for any other job. Only a
- * record that cannot be re-delivered refuses by name; any other fault
- * propagates, so its request stays for reconciliation. */
+ * dispatch recorded one, once the lane is shown to read its objects), then
+ * an admitted blind reviewer's frozen package. Empty for any other job. Only
+ * a record that cannot be re-delivered refuses by name; any other fault (a
+ * git failure among them) propagates, so its request stays for
+ * reconciliation. */
 export function freshReviewInput(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string, lanePath: string): readonly string[] {
   try {
     const source = verifiedReviewSource(ledger, jobId);
     if (source !== null) {
-      const store = laneObjectStore(lanePath);
-      if (store !== source.objectStore) {
-        throw new ReviewInputUnavailableError(`fresh reviewer refused before any effect: job "${jobId}": lane ${lanePath} uses object store ${store ?? 'unknown'}, not the verified ${source.objectStore}`);
+      const missing = laneMissingObjects(lanePath, [
+        { oid: source.targetSha, type: 'commit' },
+        ...(source.targetBase === null ? [] : [{ oid: source.targetBase, type: 'commit' as const }]),
+        ...source.inputs.map((input) => ({ oid: input.blob, type: 'blob' as const })),
+      ]);
+      if (missing.length > 0) {
+        throw new ReviewInputUnavailableError(`fresh reviewer refused before any effect: job "${jobId}": lane ${lanePath} cannot read the verified objects ${missing.join(', ')}`);
       }
     }
     const pkg = admittedBlindPackage(ledger, jobId);
@@ -191,6 +198,33 @@ export function freshReviewInput(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobI
     }
     throw error;
   }
+}
+
+/** Whether a recorded session transcript holds a conversation (a user or
+ * assistant entry). A missing, empty or header-only file opens as a new,
+ * empty session. Reads only as far as the first such entry; a read fault
+ * other than a missing file propagates. */
+function holdsConversation(sessionFile: string): boolean {
+  let fd: number;
+  try { fd = openSync(sessionFile, 'r'); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const conversation = (lines: string): boolean =>
+    parseTranscriptContent(lines).entries.some((entry) => entry.kind === 'user' || entry.kind === 'assistant');
+  try {
+    const decoder = new StringDecoder('utf8');
+    const chunk = Buffer.alloc(64 * 1024);
+    let pending = '';
+    for (let read = readSync(fd, chunk); read > 0; read = readSync(fd, chunk)) {
+      pending += decoder.write(chunk.subarray(0, read));
+      const end = pending.lastIndexOf('\n');
+      if (end < 0) continue;
+      if (conversation(pending.slice(0, end + 1))) return true;
+      pending = pending.slice(end + 1);
+    }
+    return conversation(pending + decoder.end());
+  } finally { closeSync(fd); }
 }
 
 /** `text` with the review input appended exactly once: copies of its exact
@@ -475,10 +509,10 @@ export async function routeFixDirectiveToMinion(
       ? (minions.find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
       : null;
     const recordedSession = evictedSessionFile ?? fallback;
-    // A reviewer's recorded session is resumed only while its file exists: a
-    // runtime may open a missing one as a new, empty session, which must be
-    // briefed as fresh.
-    const resumeFile = reviewJob && recordedSession !== null && !existsSync(recordedSession) ? null : recordedSession;
+    // A reviewer's recorded session is resumed only while its transcript
+    // holds a conversation: a runtime opens a missing, empty or header-only
+    // file as a new, empty session, which must be briefed as fresh.
+    const resumeFile = reviewJob && recordedSession !== null && !holdsConversation(recordedSession) ? null : recordedSession;
     // Issue #161: the (re)dispatched parent keeps one product-owned id
     // (its recorded row's id, even without a transcript) and receives the
     // child tools bound to it — re-briefed parents stay able to commission.

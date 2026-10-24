@@ -270,7 +270,8 @@ export const gitReviewSourcePreflight: ReviewSourcePreflight = (request) => {
 /** The reviewer lane must share the exact object store the preflight
  * proved — never "whatever happens to be in the reviewer worktree". */
 export function assertLaneUsesBoundStore(jobId: string, binding: ReviewSourceBinding, lanePath: string): void {
-  const laneStore = laneObjectStore(lanePath);
+  const lane = git(lanePath, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  const laneStore = lane.ok ? realpathSync(lane.out) : null;
   if (laneStore !== binding.objectStore) {
     throw new ReviewSourceUnavailableError(
       jobId,
@@ -281,11 +282,19 @@ export function assertLaneUsesBoundStore(jobId: string, binding: ReviewSourceBin
   }
 }
 
-/** The canonical object store (git common dir) a lane's checkout uses;
- * null = it cannot be read. */
-export function laneObjectStore(lanePath: string): string | null {
-  const lane = git(lanePath, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-  return lane.ok ? realpathSync(lane.out) : null;
+/** The objects among `objects` that a lane's checkout cannot read as the
+ * named type (`git cat-file --batch-check`). The objects, not the store's
+ * path, are the identity: a moved repository whose lane was repaired still
+ * reads them. A git failure is a fault and throws with git's own text. */
+export function laneMissingObjects(lanePath: string, objects: readonly { readonly oid: string; readonly type: 'commit' | 'blob' }[]): readonly string[] {
+  const result = spawnSync('git', ['cat-file', '--batch-check'], {
+    cwd: lanePath, encoding: 'utf-8', env: cleanGitEnv(), input: objects.map(({ oid }) => `${oid}\n`).join(''), maxBuffer: 1024 * 1024,
+  });
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`git cannot read lane ${lanePath}: ${(result.error?.message ?? result.stderr ?? '').trim() || `exit ${String(result.status)}`}`);
+  }
+  const lines = (result.stdout ?? '').split('\n');
+  return objects.filter((object, index) => lines[index]?.split(' ')[1] !== object.type).map(({ oid }) => oid);
 }
 
 /** What the REVIEW SOURCE block binds: the target, range and inputs. */
@@ -300,20 +309,18 @@ export class ReviewSourceRecordError extends Error {
  * `job.review-source-verified` record so a fresh session on the same lane
  * is bound to the same objects. null = no preflight ran for the job; a
  * malformed record throws ReviewSourceRecordError. */
-export function verifiedReviewSource(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): (ReviewSourceBlock & Pick<ReviewSourceBinding, 'objectStore'>) | null {
+export function verifiedReviewSource(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): ReviewSourceBlock | null {
   const event = ledger.latestJobEvent(jobId, 'job.review-source-verified');
   if (event === null) return null;
-  const payload = event.payload as { object_store?: unknown; target_sha?: unknown; target_base?: unknown; range_commits?: unknown; inputs?: unknown };
+  const payload = event.payload as { target_sha?: unknown; target_base?: unknown; range_commits?: unknown; inputs?: unknown };
   const inputs = Array.isArray(payload.inputs) ? payload.inputs as readonly Partial<Record<keyof ReviewBoundInput, unknown>>[] : null;
-  if (typeof payload.object_store !== 'string' || typeof payload.target_sha !== 'string' ||
-      (payload.target_base !== null && typeof payload.target_base !== 'string') ||
+  if (typeof payload.target_sha !== 'string' || (payload.target_base !== null && typeof payload.target_base !== 'string') ||
       (payload.range_commits !== null && typeof payload.range_commits !== 'number') || inputs === null ||
       !inputs.every((input) => typeof input.path === 'string' && typeof input.blob === 'string' &&
         (REVIEW_INPUT_LENSES as readonly unknown[]).includes(input.lens))) {
     throw new ReviewSourceRecordError(`job "${jobId}": its verified review source record (event ${String(event.seq)}) is malformed — the reviewer's source cannot be re-bound`);
   }
   return {
-    objectStore: payload.object_store,
     targetSha: payload.target_sha,
     targetBase: payload.target_base,
     rangeCommits: payload.range_commits,
