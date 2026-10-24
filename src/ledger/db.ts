@@ -1174,4 +1174,23 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
     `,
   },
+  {
+    // A live retirement's write-boundary context (recovery obligation
+    // generation/plan revision/state, control epoch, approved work revision
+    // and contract) lives on the row beside `retire_expected_state`/`_head`,
+    // so reading a retired row never scans events. Rows retired earlier keep
+    // NULL: their context was never recorded. Additive and nullable.
+    // LANDING COLLISION (same convention as migrations 10-31): renumber ONLY
+    // this never-applied migration if main lands id 32 first.
+    id: 32,
+    name: 'directive-retirement-context',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_generation INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_plan_revision INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_obligation_state TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_authority_epoch INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_work_revision INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_contract_sha256 TEXT;
+    `,
+  },
 ];

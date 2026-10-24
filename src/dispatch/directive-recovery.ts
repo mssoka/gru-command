@@ -8,11 +8,12 @@
  * durable ledger state.
  *
  * The caller's expectations are binding inputs, never evidence: a wrong
- * job/state/payload hash, recovery generation, current authority epoch,
- * work revision or contract digest is refused by the ledger, and a head that
- * does not match the fresh `git rev-parse` is refused before any write.
- * Every failure is a typed `DirectiveRetirementError` (or `RecordNotFound`)
- * and leaves the row, events and holds untouched. The whole path from
+ * job/state/payload hash, recovery obligation generation/plan/state, current
+ * authority epoch, work revision or contract digest is refused by the
+ * ledger, and a head that does not match the fresh `git rev-parse` is
+ * refused before any write. Every refusal is a typed
+ * `DirectiveRetirementError` (or `RecordNotFound`) and leaves the row,
+ * events and holds untouched. The whole path from
  * evidence read to transaction commit is synchronous, so no producer can
  * interleave between the check and the state flip in this single-process
  * service.
@@ -21,7 +22,9 @@
 import { RecordNotFound, type LedgerApi } from '../ledger/api.js';
 import {
   DirectiveRetirementError,
+  type DIRECTIVE_RETIREMENT_CONTEXT,
   type DirectiveRequestRecord,
+  type DirectiveRetirementIntent,
   type LiveDirectiveState,
 } from '../ledger/directives.js';
 import type { PacingGate } from '../runtime/pacing.js';
@@ -42,10 +45,9 @@ export interface DirectiveRetirementRequest {
     readonly state: LiveDirectiveState;
     readonly payloadHash: string;
     readonly head: string;
-    readonly generation?: number | null;
-    readonly authorityEpoch?: number;
-    readonly workRevision?: number;
-    readonly contractSha256?: string;
+    /** The write-boundary context: all six, or none for the replay of a
+     * row retired before it existed. */
+    readonly context: Partial<Pick<DirectiveRetirementIntent, keyof typeof DIRECTIVE_RETIREMENT_CONTEXT>>;
   };
   readonly reason: string;
   readonly by: string;
@@ -98,10 +100,7 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
       expectedState: input.expected.state,
       expectedPayloadHash: input.expected.payloadHash,
       expectedHead: input.expected.head,
-      ...(input.expected.generation === undefined ? {} : { expectedGeneration: input.expected.generation }),
-      ...(input.expected.authorityEpoch === undefined ? {} : { expectedAuthorityEpoch: input.expected.authorityEpoch }),
-      ...(input.expected.workRevision === undefined ? {} : { expectedWorkRevision: input.expected.workRevision }),
-      ...(input.expected.contractSha256 === undefined ? {} : { expectedContractSha256: input.expected.contractSha256 }),
+      ...input.expected.context,
       ...(lane !== undefined ? { lane } : {}),
       reason: input.reason,
       by: input.by,

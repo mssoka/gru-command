@@ -1,4 +1,4 @@
-import { bindOriginalRebriefSdkOwner, directiveRetirementFreshness, directiveRetirementInputs, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, directiveRetirementFreshness, directiveRetirementInputs, markHistoricalDirectiveFixture, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
@@ -2458,11 +2458,23 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     await service.dispose();
   });
 
-  it('terminal jobs never revive or infer completion from bookkeeping', async () => {
-    const f = await fixture(); f.seed(); f.ledger.setJobStatus(f.intent.jobId, 'done');
-    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
-    expect(f.spawns).toEqual([]); expect(f.ledger.getJob(f.intent.jobId)?.status).toBe('done');
-    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching');
+  it('terminal jobs never revive or infer completion from bookkeeping, and their live requests stay visible', async () => {
+    // A merge is accepted over a live request; done and binned predate the
+    // refusal of those writes (legacy history).
+    for (const terminal of ['merged', 'done', 'binned'] as const) {
+      const f = await fixture(); f.seed();
+      if (terminal === 'merged') { f.ledger.setJobStatus(f.intent.jobId, 'in-review'); f.ledger.setJobStatus(f.intent.jobId, 'merged'); }
+      else markLegacyTerminalJobFixture(f.ledger, f.intent.jobId, terminal);
+      const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+      expect(f.spawns, terminal).toEqual([]); expect(f.ledger.getJob(f.intent.jobId)?.status, terminal).toBe(terminal);
+      // Exact native admission is bookkeeping and is restored; completion is never inferred.
+      expect(f.ledger.getDirective(f.intent.requestId)?.state, terminal).toBe('admitted');
+      const card = f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active');
+      expect(card, terminal).toMatchObject({ routing: 'action-required', agentId: null,
+        title: `Directive ${f.intent.requestId} is still admitted on ${terminal} job ${f.intent.jobId}` });
+      expect(card?.detail, terminal).toContain(`POST /api/silas/directives/${f.intent.requestId}/retire`);
+      await service.dispose();
+    }
   });
 
   it('actual native admission callback replay binds once, with strict actor/request/hash identity', async () => {
@@ -3683,7 +3695,7 @@ it('P28 genuine ordinary settlement rolls back debt and control together on stor
 it('P28 terminal legacy cancellation closes late routine recovery debt administratively without inventing successful completion', async () => {
   const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
   const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old interrupted request', briefing: 'original' });
-  f.ledger.setJobStatus(f.intent.jobId, 'binned'); const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late recovery observation');
+  markLegacyTerminalJobFixture(f.ledger, f.intent.jobId, 'binned'); const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late recovery observation');
   expect(debt.state).toBe('open');
   const result = f.ledger.retirePendingRebriefs({ jobId: f.intent.jobId, reason: 'actual terminal job control', candidates: markers });
   expect(result.retired).toHaveLength(2); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
@@ -3736,7 +3748,7 @@ it('P35 a checkpoint continuation restores the original agent\'s nonempty parent
 async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {
   const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
   const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old interrupted request', briefing: 'original' });
-  f.ledger.setJobStatus(f.intent.jobId, 'binned');
+  markLegacyTerminalJobFixture(f.ledger, f.intent.jobId, 'binned');
   const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late terminal original context');
   const retire = (ledger: LedgerApi) => ledger.retirePendingRebriefs({ jobId: f.intent.jobId, reason: 'actual terminal administrative cancellation', candidates: markers });
   if (mode === 'suspended') f.ledger.suspendObligation(debt.id, 'original context remains held');

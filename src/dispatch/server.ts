@@ -4,8 +4,8 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
-import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
-import { isJobTerminal } from '../ledger/states.js';
+import { DIRECTIVE_RETIREMENT_CONTEXT, DirectiveRetirementError, directiveAdmissionClass, type DirectiveRequestRecord, type DirectiveRetirementIntent, type LiveDirectiveState } from '../ledger/directives.js';
+import { isJobTerminal, isObligationState } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
 import type { PipelineService } from './pipeline.js';
@@ -145,6 +145,81 @@ function optStrFieldStrict(body: Record<string, unknown>, field: string): string
     throw new Error(`${field} must be a string when present`);
   }
   return value.trim() === '' ? undefined : value;
+}
+
+/** The six write-boundary expectations of a retirement body. A live row
+ * needs all of them (a 400 names the missing ones). A row retired before
+ * they existed (its recorded authority epoch is null) replays with none, or
+ * all null. Generation, plan revision and obligation state are null together
+ * when no recovery obligation exists. Hashes are lowercased like every other
+ * digest. */
+function retirementContextFields(body: Record<string, unknown>, row: DirectiveRequestRecord):
+  Partial<Pick<DirectiveRetirementIntent, keyof typeof DIRECTIVE_RETIREMENT_CONTEXT>> {
+  const fields = Object.values(DIRECTIVE_RETIREMENT_CONTEXT);
+  if (row.state === 'retired' && row.retireExpectedAuthorityEpoch === null &&
+      fields.every((field) => body[field] === undefined || body[field] === null)) return {};
+  const missing = fields.filter((field) => body[field] === undefined);
+  if (missing.length > 0) throw new Error(`directive retirement requires ${missing.join(', ')} from fresh readback`);
+  const count = (field: string, nullable: boolean): number | null => {
+    const value = body[field];
+    if (nullable && value === null) return null;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`${field} must be a non-negative safe integer${nullable ? ' or null' : ''}`);
+    }
+    return value;
+  };
+  const generation = count('expected_generation', true);
+  const planRevision = count('expected_plan_revision', true);
+  const obligationState = body['expected_obligation_state'];
+  if (obligationState !== null && (typeof obligationState !== 'string' || !isObligationState(obligationState))) {
+    throw new Error('expected_obligation_state must be an obligation state or null');
+  }
+  if ((generation === null) !== (planRevision === null) || (generation === null) !== (obligationState === null)) {
+    throw new Error('expected_generation, expected_plan_revision and expected_obligation_state are null together (no recovery obligation) or all set');
+  }
+  const contract = body['expected_contract_sha256'];
+  const contractSha256 = typeof contract === 'string' ? contract.trim().toLowerCase() : '';
+  if (!/^[a-f0-9]{64}$/u.test(contractSha256)) throw new Error('expected_contract_sha256 must be a SHA-256 hex digest');
+  return { expectedGeneration: generation, expectedPlanRevision: planRevision, expectedObligationState: obligationState,
+    expectedAuthorityEpoch: count('expected_authority_epoch', false) as number, expectedWorkRevision: count('expected_work_revision', false) as number,
+    expectedContractSha256: contractSha256 };
+}
+
+/** The recorded retirement facts every retired-row readback carries, so a
+ * lost-response retry rebuilds the exact intent from any of them. */
+function retirementReadback(record: DirectiveRequestRecord): Record<string, unknown> {
+  return {
+    admission_class: directiveAdmissionClass(record),
+    retired_at: record.retiredAt,
+    retired_by: record.retiredBy,
+    retire_reason: record.retireReason,
+    retire_expected_state: record.retireExpectedState,
+    retire_expected_head: record.retireExpectedHead,
+    retire_expected_generation: record.retireExpectedGeneration,
+    retire_expected_plan_revision: record.retireExpectedPlanRevision,
+    retire_expected_obligation_state: record.retireExpectedObligationState,
+    retire_expected_authority_epoch: record.retireExpectedAuthorityEpoch,
+    retire_expected_work_revision: record.retireExpectedWorkRevision,
+    retire_expected_contract_sha256: record.retireExpectedContractSha256,
+    hold_released_by: record.holdReleasedBy,
+    hold_released_at: record.holdReleasedAt,
+  };
+}
+
+/** A typed retirement refusal or missing request as its HTTP
+ * answer; false for any other error. An incomplete context is a malformed
+ * body (400); every other refusal is a 409 naming its live ownership. */
+function directiveControlRefusal(res: ServerResponse, error: unknown): boolean {
+  if (error instanceof DirectiveRetirementError) {
+    if (error.code === 'incomplete_context') json(res, 400, { error: 'bad_request', detail: error.message });
+    else json(res, 409, { error: error.code, detail: error.message, ...(error.blockers.length > 0 ? { blockers: error.blockers } : {}) });
+    return true;
+  }
+  if (error instanceof RecordNotFound) {
+    json(res, 404, { error: 'not_found', detail: error.message });
+    return true;
+  }
+  return false;
 }
 
 /** Issue #161: the wire shape of one tracked child worker (snake_case,
@@ -1414,18 +1489,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           // A caller who only uses this replay path learns the same
           // retirement facts the GET readback exposes — the id is consumed
           // and why/when, never a success or no-effect claim.
-          ...(intent.state === 'retired'
-            ? {
-                admission_class: directiveAdmissionClass(intent),
-                retired_at: intent.retiredAt,
-                retired_by: intent.retiredBy,
-                retire_reason: intent.retireReason,
-                retire_expected_state: intent.retireExpectedState,
-                retire_expected_head: intent.retireExpectedHead,
-                hold_released_by: intent.holdReleasedBy,
-                hold_released_at: intent.holdReleasedAt,
-              }
-            : {}),
+          ...(intent.state === 'retired' ? retirementReadback(intent) : {}),
           note:
             intent.state === 'retired'
               ? 'this request id was retired after server-verified writer cessation — it never re-runs; submit changed work under a new request id'
@@ -1731,29 +1795,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 404, { error: 'not_found', detail: `directive request "${requestId}" not found` });
         return true;
       }
-      const expectedGenerationRaw = body['expected_generation'];
-      const expectedAuthorityEpochRaw = body['expected_authority_epoch'];
-      const expectedWorkRevisionRaw = body['expected_work_revision'];
-      const expectedContractSha256Raw = body['expected_contract_sha256'];
-      const rawAuthorityContext = [expectedGenerationRaw, expectedAuthorityEpochRaw, expectedWorkRevisionRaw, expectedContractSha256Raw];
-      const legacyRetirementWithoutContext = currentRow.state === 'retired' && currentRow.retireExpectedAuthorityEpoch === null &&
-        rawAuthorityContext.every((value) => value === undefined || value === null);
-      const hasAuthorityContext = !legacyRetirementWithoutContext && rawAuthorityContext.some((value) => value !== undefined);
-      const liveRequest = currentRow.state === 'dispatching' || currentRow.state === 'admitted';
-      if (liveRequest && (!hasAuthorityContext ||
-          !(expectedGenerationRaw === null || typeof expectedGenerationRaw === 'number' && Number.isSafeInteger(expectedGenerationRaw) && expectedGenerationRaw >= 0) ||
-          typeof expectedAuthorityEpochRaw !== 'number' || !Number.isSafeInteger(expectedAuthorityEpochRaw) || expectedAuthorityEpochRaw < 0 ||
-          typeof expectedWorkRevisionRaw !== 'number' || !Number.isSafeInteger(expectedWorkRevisionRaw) || expectedWorkRevisionRaw < 0 ||
-          typeof expectedContractSha256Raw !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedContractSha256Raw))) {
-        throw new Error('live directive retirement requires expected_generation (number or null), expected_authority_epoch, expected_work_revision, and expected_contract_sha256 from fresh readback');
-      }
-      if (hasAuthorityContext &&
-          (!(expectedGenerationRaw === null || typeof expectedGenerationRaw === 'number' && Number.isSafeInteger(expectedGenerationRaw) && expectedGenerationRaw >= 0) ||
-          typeof expectedAuthorityEpochRaw !== 'number' || !Number.isSafeInteger(expectedAuthorityEpochRaw) || expectedAuthorityEpochRaw < 0 ||
-          typeof expectedWorkRevisionRaw !== 'number' || !Number.isSafeInteger(expectedWorkRevisionRaw) || expectedWorkRevisionRaw < 0 ||
-          typeof expectedContractSha256Raw !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedContractSha256Raw))) {
-        throw new Error('retirement authority expectations must be complete safe integers and a lowercase SHA-256 digest');
-      }
+      // A settled/failed row is refused by the ledger before any expectation
+      // is read: its body context is not validated here.
+      const context = currentRow.state === 'settled' || currentRow.state === 'failed' ? {} : retirementContextFields(body, currentRow);
       const reason = strField(body, 'reason');
       const by = strField(body, 'by');
       let outcome: ReturnType<typeof retireInterruptedDirectiveFromRoute>;
@@ -1769,29 +1813,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             state: expectedState,
             payloadHash: expectedPayloadHash,
             head: expectedHead,
-            ...(hasAuthorityContext ? {
-              generation: expectedGenerationRaw as number | null,
-              authorityEpoch: expectedAuthorityEpochRaw as number,
-              workRevision: expectedWorkRevisionRaw as number,
-              contractSha256: expectedContractSha256Raw as string,
-            } : {}),
+            context,
           },
           reason,
           by,
         });
       } catch (error) {
-        if (error instanceof DirectiveRetirementError) {
-          json(res, 409, {
-            error: error.code,
-            detail: error.message,
-            ...(error.blockers.length > 0 ? { blockers: error.blockers } : {}),
-          });
-          return true;
-        }
-        if (error instanceof RecordNotFound) {
-          json(res, 404, { error: 'not_found', detail: error.message });
-          return true;
-        }
+        if (directiveControlRefusal(res, error)) return true;
         throw error;
       }
       const record = outcome.record;
@@ -1800,20 +1828,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         job_id: record.jobId,
         state: record.state,
         idempotent: outcome.idempotent,
-        admission_class: directiveAdmissionClass(record),
         admission_seq: record.admissionSeq,
         minion_id: record.admissionMinion,
-        retired_at: record.retiredAt,
-        retired_by: record.retiredBy,
-        retire_reason: record.retireReason,
-        retire_expected_state: record.retireExpectedState,
-        retire_expected_head: record.retireExpectedHead,
-        retire_expected_generation: record.retireExpectedGeneration,
-        retire_expected_authority_epoch: record.retireExpectedAuthorityEpoch,
-        retire_expected_work_revision: record.retireExpectedWorkRevision,
-        retire_expected_contract_sha256: record.retireExpectedContractSha256,
-        hold_released_by: record.holdReleasedBy,
-        hold_released_at: record.holdReleasedAt,
+        ...retirementReadback(record),
         phase_handoff_closed: outcome.phaseClosed,
         note:
           'control ownership closed after server-verified writer cessation — no delivery and no no-effect outcome is claimed; ' +
@@ -1858,22 +1875,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         recovery_owner: options.ledger.recoveryOwnerReadback('directive', requestId),
         recovery_subject_sha256: options.ledger.recoverySubject('directive', requestId).snapshotSha256,
         recovery_obligation: options.ledger.recoveryObligation(record.jobId, 'directive', record.requestId),
-        ...(record.state === 'retired'
-          ? {
-              admission_class: directiveAdmissionClass(record),
-              retired_at: record.retiredAt,
-              retired_by: record.retiredBy,
-              retire_reason: record.retireReason,
-              retire_expected_state: record.retireExpectedState,
-              retire_expected_head: record.retireExpectedHead,
-              retire_expected_generation: record.retireExpectedGeneration,
-              retire_expected_authority_epoch: record.retireExpectedAuthorityEpoch,
-              retire_expected_work_revision: record.retireExpectedWorkRevision,
-              retire_expected_contract_sha256: record.retireExpectedContractSha256,
-              hold_released_by: record.holdReleasedBy,
-              hold_released_at: record.holdReleasedAt,
-            }
-          : {}),
+        ...(record.state === 'retired' ? retirementReadback(record) : {}),
         states: {
           dispatching:
             'accepted; a dispatch claim was taken before any side effect — native admission not yet recorded (or unknown after a crash)',

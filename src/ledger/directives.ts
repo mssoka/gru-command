@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { DirectiveNativeBinding } from '../runtime/directive-checkpoint.js';
+import type { ObligationState } from './states.js';
 
 /**
  * Durable directive requests — typed vocabulary (phase 3 slice).
@@ -62,10 +63,11 @@ export function directiveAdmissionClass(record: Pick<DirectiveRequestRecord, 'ad
   return record.admissionSeq === null ? 'admission-unknown' : 'admitted-without-terminal';
 }
 
-/** Typed refusals of the guarded retirement transition. Every code maps to
- * HTTP 409 at the route: the request is real and the caller must change
- * state or evidence, never retry blindly. `blockers` names the live
- * ownership the service found (never caller-supplied). */
+/** Typed refusals of the guarded retirement transition.
+ * Every code maps to HTTP 409 at the route except `incomplete_context`, a
+ * 400: the request is real and the caller must change state or evidence,
+ * never retry blindly. `blockers` names the live ownership the service found
+ * (never caller-supplied). */
 export const DIRECTIVE_RETIREMENT_REFUSAL_CODES = [
   'directive_not_live',
   'retire_conflict',
@@ -77,6 +79,7 @@ export const DIRECTIVE_RETIREMENT_REFUSAL_CODES = [
   'stale_authority',
   'lane_unavailable',
   'live_work',
+  'incomplete_context',
 ] as const;
 export type DirectiveRetirementRefusalCode = (typeof DIRECTIVE_RETIREMENT_REFUSAL_CODES)[number];
 
@@ -95,18 +98,21 @@ export class DirectiveRetirementError extends Error {
 /** The canonical retirement intent: the caller's request/lane binding and
  * current generation/approved-authority expectations plus audit provenance.
  * The fingerprint over exactly these fields is the replay identity — a replay
- * with changed content is a conflict, never a second transition. The optional
- * context exists only to preserve exact replay of pre-context retired rows;
- * a live transition requires the complete context. */
+ * with changed content is a conflict, never a second transition. The context
+ * is all present (every live transition) or all absent (only the replay of a
+ * row retired before the context existed). */
 export interface DirectiveRetirementIntent {
   readonly requestId: string;
   readonly expectedJobId: string;
   readonly expectedState: LiveDirectiveState;
   readonly expectedPayloadHash: string;
   readonly expectedHead: string;
-  /** Current directive-recovery generation, or null when no recovery debt exists. */
+  /** The recovery obligation's generation, plan revision and state, each
+   * null when no recovery obligation exists. */
   readonly expectedGeneration?: number | null;
-  /** Fresh write-boundary authority context; omitted only for replay of a legacy retirement. */
+  readonly expectedPlanRevision?: number | null;
+  readonly expectedObligationState?: ObligationState | null;
+  /** The current control epoch and approved work inputs. */
   readonly expectedAuthorityEpoch?: number;
   readonly expectedWorkRevision?: number;
   readonly expectedContractSha256?: string;
@@ -114,12 +120,32 @@ export interface DirectiveRetirementIntent {
   readonly by: string;
 }
 
-export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent): string {
-  const context = [intent.expectedGeneration, intent.expectedAuthorityEpoch, intent.expectedWorkRevision, intent.expectedContractSha256];
-  const hasContext = context.some((value) => value !== undefined);
-  if (hasContext && context.some((value) => value === undefined)) {
-    throw new Error('directive retirement identity requires a complete generation/authority context');
+/** The write-boundary context of a live retirement, in fingerprint order,
+ * with the HTTP field each one arrives in. */
+export const DIRECTIVE_RETIREMENT_CONTEXT = {
+  expectedGeneration: 'expected_generation',
+  expectedPlanRevision: 'expected_plan_revision',
+  expectedObligationState: 'expected_obligation_state',
+  expectedAuthorityEpoch: 'expected_authority_epoch',
+  expectedWorkRevision: 'expected_work_revision',
+  expectedContractSha256: 'expected_contract_sha256',
+} as const;
+const CONTEXT_KEYS = Object.keys(DIRECTIVE_RETIREMENT_CONTEXT) as (keyof typeof DIRECTIVE_RETIREMENT_CONTEXT)[];
+
+/** Whether an intent carries the context: all of it, or none of it. A
+ * partial context is a typed `incomplete_context` refusal naming the gaps. */
+export function directiveRetirementHasContext(intent: DirectiveRetirementIntent): boolean {
+  const missing = CONTEXT_KEYS.filter((key) => intent[key] === undefined);
+  if (missing.length === CONTEXT_KEYS.length) return false;
+  if (missing.length > 0) {
+    throw new DirectiveRetirementError('incomplete_context',
+      `directive retirement context is partial — missing ${missing.map((key) => DIRECTIVE_RETIREMENT_CONTEXT[key]).join(', ')}`);
   }
+  return true;
+}
+
+export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent): string {
+  const context = directiveRetirementHasContext(intent) ? CONTEXT_KEYS.map((key) => intent[key]) : [];
   return createHash('sha256')
     .update(
       JSON.stringify([
@@ -128,7 +154,7 @@ export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent
         intent.expectedState,
         intent.expectedPayloadHash,
         intent.expectedHead,
-        ...(hasContext ? context : []),
+        ...context,
         intent.reason,
         intent.by,
       ]),
@@ -175,10 +201,15 @@ export interface DirectiveRequestRecord {
    * lost-response retry can reconstruct the identical canonical intent. */
   readonly retireExpectedState: LiveDirectiveState | null;
   readonly retireExpectedHead: string | null;
-  /** Fresh generation/current authority expectations are preserved in the
-   * retirement audit event (no mutable row-side duplicate). Null means no
-   * recovery obligation existed at the write boundary. */
+  /** The write-boundary context the retirement bound, so a lost-response
+   * retry can rebuild the exact intent. A null `retireExpectedAuthorityEpoch`
+   * marks a row retired before the context existed: every field is then
+   * "not recorded" and only the original context-free intent replays.
+   * Otherwise null generation, plan revision and obligation state mean no
+   * recovery obligation existed. */
   readonly retireExpectedGeneration: number | null;
+  readonly retireExpectedPlanRevision: number | null;
+  readonly retireExpectedObligationState: ObligationState | null;
   readonly retireExpectedAuthorityEpoch: number | null;
   readonly retireExpectedWorkRevision: number | null;
   readonly retireExpectedContractSha256: string | null;

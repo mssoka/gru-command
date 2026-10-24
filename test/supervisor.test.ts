@@ -2203,14 +2203,16 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     vi.useFakeTimers();
     const f = await deferredRestart();
     try {
-      f.rig.api.setJobStatus(f.jobId, 'binned');
+      // Its pending re-brief markers refuse binning; a merge is an observed fact.
+      f.rig.api.setJobStatus(f.jobId, 'in-review');
+      f.rig.api.setJobStatus(f.jobId, 'merged');
       f.releaseSpawn(f.replacement);
       await flushMicrotasks();
       expect(f.replacement.disposed).toBe(true);
       expect(f.register).not.toHaveBeenCalled();
       expect(f.swapped).not.toHaveBeenCalled();
       expect(f.replacement.promptCalls).toEqual([]);
-      expect(f.rig.api.getJob(f.jobId)?.status).toBe('binned');
+      expect(f.rig.api.getJob(f.jobId)?.status).toBe('merged');
       expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
@@ -3001,7 +3003,9 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       const jobId = 'idle-terminal-job';
       freshHandoffJob(rig, jobId);
       const idle = adoptIdle(rig, 'idle-terminal', jobId, null);
-      rig.api.setJobStatus(jobId, 'done');
+      // Its live directive refuses `done`; a merge is an observed fact.
+      rig.api.setJobStatus(jobId, 'in-review');
+      rig.api.setJobStatus(jobId, 'merged');
       rig.registry.spawnImpl = async () => new FakeHandle('minion', 'idle-terminal-should-not-run', null);
       idle.emit({ type: 'error', error: 'idle session stream died', fatal: true });
       await flushMicrotasks();

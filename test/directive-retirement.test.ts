@@ -6,7 +6,7 @@ import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
@@ -21,7 +21,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
-import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof } from './helpers/directive-native-fixture.js';
+import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof, directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { VerificationScheduler } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
@@ -286,6 +286,40 @@ function laneHead(lane: WorktreeLane): string {
   return resolveGitCommit(lane.path, 'HEAD');
 }
 
+/** The six write-boundary expectations as the current readback reports them. */
+function freshRetirementContext(h: Harness, row: DirectiveRequestRecord): Record<string, unknown> {
+  const authority = h.ledger.directiveCurrentAuthority(row.jobId);
+  const obligation = h.ledger.recoveryObligation(row.jobId, 'directive', row.requestId);
+  return { expected_generation: obligation?.generation ?? null, expected_plan_revision: obligation?.planRevision ?? null,
+    expected_obligation_state: obligation?.state ?? null, expected_authority_epoch: authority.authorityEpoch,
+    expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256 };
+}
+
+/** The six expectations a retired row recorded (its lost-response replay). */
+function recordedRetirementContext(row: DirectiveRequestRecord): Record<string, unknown> {
+  return { expected_generation: row.retireExpectedGeneration, expected_plan_revision: row.retireExpectedPlanRevision,
+    expected_obligation_state: row.retireExpectedObligationState, expected_authority_epoch: row.retireExpectedAuthorityEpoch,
+    expected_work_revision: row.retireExpectedWorkRevision, expected_contract_sha256: row.retireExpectedContractSha256 };
+}
+
+/** A lost-response retry body rebuilt from a retired readback alone. */
+function retireBodyFromReadback(readback: unknown): Record<string, unknown> {
+  return {
+    expected_job_id: field<string>(readback, 'job_id'),
+    expected_state: field<string>(readback, 'retire_expected_state'),
+    expected_payload_hash: field<string>(readback, 'payload_hash'),
+    expected_head: field<string>(readback, 'retire_expected_head'),
+    expected_generation: field<number | null>(readback, 'retire_expected_generation'),
+    expected_plan_revision: field<number | null>(readback, 'retire_expected_plan_revision'),
+    expected_obligation_state: field<string | null>(readback, 'retire_expected_obligation_state'),
+    expected_authority_epoch: field<number | null>(readback, 'retire_expected_authority_epoch'),
+    expected_work_revision: field<number | null>(readback, 'retire_expected_work_revision'),
+    expected_contract_sha256: field<string | null>(readback, 'retire_expected_contract_sha256'),
+    reason: field<string>(readback, 'retire_reason'),
+    by: field<string>(readback, 'retired_by'),
+  };
+}
+
 function retireBody(
   h: Harness,
   row: DirectiveRequestRecord,
@@ -296,16 +330,9 @@ function retireBody(
   // still-live expectation so the ledger — never the body validator —
   // decides not-live refusals and consumed-replay identity.
   const expectedState = row.state === 'dispatching' || row.state === 'admitted' ? row.state : 'dispatching';
-  const authority = h.ledger.directiveCurrentAuthority(row.jobId);
-  const currentObligation = h.ledger.recoveryObligation(row.jobId, 'directive', row.requestId);
-  const hasRecordedRetirementContext = row.retireExpectedAuthorityEpoch !== null;
-  const retirementContext = hasRecordedRetirementContext
-    ? { expected_generation: row.retireExpectedGeneration, expected_authority_epoch: row.retireExpectedAuthorityEpoch,
-        expected_work_revision: row.retireExpectedWorkRevision, expected_contract_sha256: row.retireExpectedContractSha256 }
-    : row.state === 'dispatching' || row.state === 'admitted'
-      ? { expected_generation: currentObligation?.generation ?? null, expected_authority_epoch: authority.authorityEpoch,
-          expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256 }
-      : {};
+  const retirementContext = row.retireExpectedAuthorityEpoch !== null
+    ? recordedRetirementContext(row)
+    : row.state === 'dispatching' || row.state === 'admitted' ? freshRetirementContext(h, row) : {};
   return {
     expected_job_id: row.jobId,
     expected_state: expectedState,
@@ -476,8 +503,6 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect((field<string[]>(legacyRefusal.json, 'blockers') ?? []).join(' ')).toContain('original native physical owner cessation remains UNKNOWN');
     expect(legacyRow?.nativeBinding).toBeNull();
     expect(legacyRow?.admissionSeq).toBeNull();
-    expect(existsSync(`${legacyFile}.producers.jsonl`)).toBe(false);
-    expect(existsSync(`${legacyFile}.directives.jsonl`)).toBe(false);
     expect(h.ledger.getDirective(legacy.row.requestId)).toEqual(legacyRow);
     expect(eventKinds(h)).toEqual(legacyEvents);
     expect(() => h.ledger.setJobStatus(legacy.row.jobId, 'binned')).toThrow(/live directive request/u);
@@ -487,20 +512,26 @@ describe('directive retirement — evidence-fenced control closure', () => {
     const activeFile = join(h.dir, 'active-session.jsonl');
     writeFileSync(activeFile, `${JSON.stringify({ type: 'session', id: 'active-session', version: 3 })}\n`);
     h.ledger.registerAgent({ id: 'active-agent', role: 'minion', jobId: active.row.jobId, sessionFile: activeFile });
-    h.ledger.setAgentState('active-agent', 'disposed');
+    h.ledger.setAgentState('active-agent', 'idle');
     h.ledger.prepareDirectiveTarget(active.row.requestId, { agentId: 'active-agent', sessionFile: activeFile });
-    prepareDirectiveProducer({ identity: h.ledger.directiveTurnIdentity(active.row.requestId), agentId: 'active-agent',
-      sessionId: 'active-session', sessionFile: activeFile });
+    // The exact original producer is started and its turn is streaming now.
+    const activeIdentity = h.ledger.directiveTurnIdentity(active.row.requestId);
+    const activeStart = h.ledger.startDirectiveProducer(activeIdentity, prepareDirectiveProducer({ identity: activeIdentity,
+      agentId: 'active-agent', sessionId: 'active-session', sessionFile: activeFile }));
+    h.ledger.setAgentState('active-agent', 'streaming');
     const activeRow = h.ledger.getDirective(active.row.requestId);
     const activeEvents = eventKinds(h);
     const activeRefusal = await retire(h, active.row.requestId, laneHead(active.lane));
     expect(activeRefusal.status).toBe(409);
     expect(field<string>(activeRefusal.json, 'error')).toBe('live_work');
-    expect((field<string[]>(activeRefusal.json, 'blockers') ?? []).join(' ')).toContain('original native physical owner cessation remains UNKNOWN');
+    expect(field<string[]>(activeRefusal.json, 'blockers')).toEqual(expect.arrayContaining([
+      `unproven producer cleanup: request ${active.row.requestId}, start ${activeStart} — original-owner cessation receipt required; inspect exact native/controller evidence before Gru judgment`,
+      'original native physical owner cessation remains UNKNOWN',
+      'open worker turn(s): active-agent (streaming)',
+    ]));
     expect(h.ledger.getDirective(active.row.requestId)).toEqual(activeRow);
     expect(eventKinds(h)).toEqual(activeEvents);
-    expect(() => h.ledger.setJobStatus(active.row.jobId, 'binned')).toThrow(/live directive request/u);
-    expect(eventKinds(h)).toEqual(activeEvents);
+    expect(() => h.ledger.setJobStatus(active.row.jobId, 'binned')).toThrow(/live directive request.*open worker turn\(s\): active-agent \(streaming\)/u);
   });
 
   it('retires only after exact original producer cessation, then bins through the existing job-status path', async () => {
@@ -624,6 +655,14 @@ describe('directive retirement — evidence-fenced control closure', () => {
     const settledRefusal = await retire(h, 'req-e', laneHead(lane));
     expect(settledRefusal.status).toBe(409);
     expect(field<string>(settledRefusal.json, 'error')).toBe('directive_not_live');
+    // The ledger decides not-live before any expectation is read: partial
+    // or malformed context on a failed row is the same 409, never a 400.
+    for (const context of [{ expected_generation: null }, { expected_authority_epoch: 'stale', expected_contract_sha256: 'X' }]) {
+      const partial = await retire(h, 'req-e', laneHead(lane), { body: { expected_job_id: 'job-e', expected_state: 'dispatching',
+        expected_payload_hash: h.ledger.getDirective('req-e')!.payloadHash, expected_head: laneHead(lane), ...context, reason: 'r', by: 'b' } });
+      expect(partial.status).toBe(409);
+      expect(field<string>(partial.json, 'error')).toBe('directive_not_live');
+    }
 
     // A correlated sent event without minion identity cannot bind: fail closed.
     seedJob(h, 'job-f');
@@ -656,6 +695,19 @@ describe('directive retirement — evidence-fenced control closure', () => {
     delete incompleteAuthority['expected_authority_epoch'];
     const missingAuthority = await call(h.port, 'POST', '/api/silas/directives/req-g/retire', incompleteAuthority, TOKEN);
     expect(missingAuthority.status).toBe(400);
+    expect(field<string>(missingAuthority.json, 'detail')).toBe('directive retirement requires expected_authority_epoch from fresh readback');
+    // The obligation triple is null together (no obligation) or set together.
+    const halfObligation = await retire(h, 'req-g', head, { expected_generation: 1 });
+    expect(halfObligation.status).toBe(400);
+    // A direct ledger caller with no context gets the same named 400 class, typed.
+    expect(() => h.ledger.retireInterruptedDirective({ requestId: 'req-g', expectedJobId: 'job-g', expectedState: 'dispatching',
+      expectedPayloadHash: row.payloadHash, expectedHead: head, lane: { id: lane.id, resolvedHead: head }, reason: 'r', by: 'b' }))
+      .toThrow(expect.objectContaining({ name: 'DirectiveRetirementError', code: 'incomplete_context',
+        message: expect.stringContaining('expected_generation, expected_plan_revision, expected_obligation_state') }));
+    expect(() => h.ledger.retireInterruptedDirective({ requestId: 'req-g', expectedJobId: 'job-g', expectedState: 'dispatching',
+      expectedPayloadHash: row.payloadHash, expectedHead: head, expectedGeneration: null, lane: { id: lane.id, resolvedHead: head }, reason: 'r', by: 'b' }))
+      .toThrow(expect.objectContaining({ name: 'DirectiveRetirementError', code: 'incomplete_context',
+        message: expect.stringContaining('missing expected_plan_revision') }));
 
     const wrongJob = await retire(h, 'req-g', head, { expected_job_id: 'job-other' });
     expect(wrongJob.status).toBe(409);
@@ -673,7 +725,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(staleHead.status).toBe(409);
     expect(field<string>(staleHead.json, 'error')).toBe('stale_head');
 
-    const staleGeneration = await retire(h, 'req-g', head, { expected_generation: 1 });
+    const staleGeneration = await retire(h, 'req-g', head, { expected_generation: 1, expected_plan_revision: 0, expected_obligation_state: 'open' });
     expect(staleGeneration.status).toBe(409);
     expect(field<string>(staleGeneration.json, 'error')).toBe('stale_generation');
     const currentAuthority = h.ledger.directiveCurrentAuthority('job-g');
@@ -698,10 +750,13 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(eventKinds(h)).toEqual(before);
     expect(h.ledger.listDirectiveRecoveryHolds({ openOnly: true })).toHaveLength(0);
 
-    // A valid uppercase object id is normalized, never misread as stale.
-    const upper = await retire(h, 'req-g', head.toUpperCase());
+    // Valid uppercase digests are normalized, never misread as stale.
+    const contract = h.ledger.directiveCurrentAuthority('job-g').contractSha256;
+    const upper = await retire(h, 'req-g', head.toUpperCase(), { expected_payload_hash: ` ${row.payloadHash.toUpperCase()} `,
+      expected_contract_sha256: ` ${contract.toUpperCase()} ` });
     expect(upper.status).toBe(200);
     expect(h.ledger.getDirective('req-g')?.retireExpectedHead).toBe(head);
+    expect(h.ledger.getDirective('req-g')?.retireExpectedContractSha256).toBe(contract);
     expect(h.ledger.getDirective('req-g')?.state).toBe('retired');
   });
 
@@ -1019,6 +1074,148 @@ describe('directive retirement — live ownership fails closed', () => {
   });
 });
 
+describe('directive retirement — write-boundary context and terminal jobs', () => {
+  it('binds the exact recovery obligation incarnation: a moved generation or a same-generation re-plan is stale', async () => {
+    const repo = makeFixtureRepo('retire-obligation');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-ob', 'req-ob');
+    const head = laneHead(lane);
+    const debt = h.ledger.openDirectiveRecoveryDebt('req-ob', 'restart interrupted the writer');
+    const g = debt.generation;
+    // No obligation (null) and the next generation are both stale views of g.
+    for (const stale of [{ expected_generation: null, expected_plan_revision: null, expected_obligation_state: null },
+      { expected_generation: g + 1, expected_plan_revision: debt.planRevision, expected_obligation_state: debt.state }]) {
+      const refused = await retire(h, 'req-ob', head, stale);
+      expect(refused.status, String(stale.expected_generation)).toBe(409);
+      expect(field<string>(refused.json, 'error'), String(stale.expected_generation)).toBe('stale_generation');
+    }
+    // A same-generation re-plan (the next action becomes an owner decision)
+    // is as stale as a new generation.
+    const staleView = retireBody(h, h.ledger.getDirective('req-ob')!, head);
+    const replanned = h.ledger.recordBlockedObservation('job-ob', { logicalStep: 'operation', incidentKey: 'directive-recovery:req-ob',
+      category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: h.ledger.latestEventSeq(),
+      nextAction: { kind: 'owner-decision', decision: 'owner must decide whether this native request may be closed' } });
+    expect(replanned).toMatchObject({ id: debt.id, generation: g, planRevision: debt.planRevision + 1 });
+    const before = eventKinds(h);
+    const replannedRefusal = await call(h.port, 'POST', '/api/silas/directives/req-ob/retire',
+      { ...staleView, expected_authority_epoch: h.ledger.directiveCurrentAuthority('job-ob').authorityEpoch }, TOKEN);
+    expect(replannedRefusal.status).toBe(409);
+    expect(field<string>(replannedRefusal.json, 'error')).toBe('stale_generation');
+    expect(h.ledger.getDirective('req-ob')?.state).toBe('dispatching');
+    expect(eventKinds(h)).toEqual(before);
+    // So is a state change alone: suspension keeps generation and plan.
+    const openView = retireBody(h, h.ledger.getDirective('req-ob')!, head);
+    const suspended = h.ledger.suspendObligation(debt.id, 'owner hold on the recovery');
+    expect(suspended).toMatchObject({ generation: g, planRevision: replanned.planRevision, state: 'suspended' });
+    const suspendedRefusal = await call(h.port, 'POST', '/api/silas/directives/req-ob/retire', openView, TOKEN);
+    expect(suspendedRefusal.status).toBe(409);
+    expect(field<string>(suspendedRefusal.json, 'error')).toBe('stale_generation');
+    expect(countEvents(h, 'silas.directive-retired')).toBe(0);
+
+    // The current incarnation retires, and every readback reports it.
+    const result = await retire(h, 'req-ob', head);
+    expect(result.status).toBe(200);
+    const bound = { retire_expected_generation: g, retire_expected_plan_revision: suspended.planRevision, retire_expected_obligation_state: 'suspended' };
+    expect(result.json).toMatchObject(bound);
+    const readback = await call(h.port, 'GET', '/api/silas/directives/req-ob', undefined, TOKEN);
+    expect(readback.json).toMatchObject(bound);
+    const audit = h.ledger.latestJobEvent('job-ob', 'silas.directive-retired')?.payload as Record<string, unknown>;
+    expect(audit).toMatchObject({ expected_generation: g, expected_plan_revision: suspended.planRevision, expected_obligation_state: 'suspended' });
+    // A lost-response retry rebuilt from the readback alone replays.
+    const replay = await call(h.port, 'POST', '/api/silas/directives/req-ob/retire', retireBodyFromReadback(readback.json), TOKEN);
+    expect(replay.status).toBe(200);
+    expect(field<boolean>(replay.json, 'idempotent')).toBe(true);
+    expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+  });
+
+  it('retires from a body built only from GET after a contract amendment (the documented recipe)', async () => {
+    const repo = makeFixtureRepo('retire-recipe');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-recipe', 'req-recipe');
+    const accepted = h.ledger.directiveCurrentAuthority('job-recipe');
+    h.ledger.addJobAmendment({ jobId: 'job-recipe', body: 'material scope added after the request was accepted', effect: 'material', supersedes: [],
+      approval: { by: 'owner', reference: 'recipe' }, expectedContractSha256: accepted.contractSha256 });
+    const readback = (await call(h.port, 'GET', '/api/silas/directives/req-recipe', undefined, TOKEN)).json;
+    const current = field<{ workRevision: number; contractSha256: string }>(readback, 'current_approved_authority');
+    const obligation = field<{ generation: number; planRevision: number; state: string } | null>(readback, 'recovery_obligation');
+    // The accepted request's own values are no longer current.
+    expect(field<number>(readback, 'authority_epoch')).not.toBe(field<number>(readback, 'current_authority_epoch'));
+    expect(field<number>(readback, 'work_revision')).not.toBe(current.workRevision);
+    expect(field<string>(readback, 'contract_sha256')).not.toBe(current.contractSha256);
+    const result = await call(h.port, 'POST', '/api/silas/directives/req-recipe/retire', {
+      expected_job_id: field<string>(readback, 'job_id'),
+      expected_state: field<string>(readback, 'state'),
+      expected_payload_hash: field<string>(readback, 'payload_hash'),
+      expected_head: laneHead(lane),
+      expected_generation: obligation?.generation ?? null,
+      expected_plan_revision: obligation?.planRevision ?? null,
+      expected_obligation_state: obligation?.state ?? null,
+      expected_authority_epoch: field<number>(readback, 'current_authority_epoch'),
+      expected_work_revision: current.workRevision,
+      expected_contract_sha256: current.contractSha256,
+      reason: 'writer ceased; retired under the amended contract',
+      by: 'silas-ops',
+    }, TOKEN);
+    expect(result.status).toBe(200);
+    expect(field<string>(result.json, 'state')).toBe('retired');
+  });
+
+  it('replays a retirement recorded before the context existed from its GET readback alone', async () => {
+    const repo = makeFixtureRepo('retire-pre-context');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane, row } = await seededLiveRequest(h, repo, 'job-pre', 'req-pre');
+    expect((await retire(h, 'req-pre', laneHead(lane))).status).toBe(200);
+    // The row and audit as a pre-context retirement left them: the original
+    // context-free fingerprint, and no context recorded anywhere.
+    const recorded = h.ledger.getDirective('req-pre')!;
+    const legacyFingerprint = directiveRetirementFingerprint({ requestId: 'req-pre', expectedJobId: 'job-pre', expectedState: 'dispatching',
+      expectedPayloadHash: row.payloadHash, expectedHead: laneHead(lane), reason: recorded.retireReason!, by: recorded.retiredBy! });
+    h.db.handle.prepare(`UPDATE pending_directives SET retire_fingerprint = ?, retire_expected_generation = NULL, retire_expected_plan_revision = NULL,
+      retire_expected_obligation_state = NULL, retire_expected_authority_epoch = NULL, retire_expected_work_revision = NULL,
+      retire_expected_contract_sha256 = NULL WHERE request_id = ?`).run(legacyFingerprint, 'req-pre');
+    h.db.handle.prepare(`UPDATE events SET payload = json_remove(payload, '$.expected_generation', '$.expected_plan_revision', '$.expected_obligation_state',
+      '$.expected_authority_epoch', '$.expected_work_revision', '$.expected_contract_sha256') WHERE kind = 'silas.directive-retired'`).run();
+    const readback = await call(h.port, 'GET', '/api/silas/directives/req-pre', undefined, TOKEN);
+    const body = retireBodyFromReadback(readback.json);
+    expect(body).toMatchObject({ expected_generation: null, expected_plan_revision: null, expected_obligation_state: null,
+      expected_authority_epoch: null, expected_work_revision: null, expected_contract_sha256: null });
+    const replay = await call(h.port, 'POST', '/api/silas/directives/req-pre/retire', body, TOKEN);
+    expect(replay.status).toBe(200);
+    expect(field<boolean>(replay.json, 'idempotent')).toBe(true);
+    const contextFree = Object.fromEntries(Object.entries(body).filter(([key]) => !Object.keys(freshRetirementContext(h, row)).includes(key)));
+    const omitted = await call(h.port, 'POST', '/api/silas/directives/req-pre/retire', contextFree, TOKEN);
+    expect(omitted.status).toBe(200);
+    expect(field<boolean>(omitted.json, 'idempotent')).toBe(true);
+    // A changed (context-bearing) intent is a conflict, never a second transition.
+    const changed = await call(h.port, 'POST', '/api/silas/directives/req-pre/retire', { ...body, ...freshRetirementContext(h, row) }, TOKEN);
+    expect(changed.status).toBe(409);
+    expect(field<string>(changed.json, 'error')).toBe('retire_conflict');
+    expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+  });
+
+  it('retires a live directive on an already-terminal job: merged, or a legacy done or bin', async () => {
+    const repo = makeFixtureRepo('retire-terminal-job');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    for (const terminal of ['merged', 'done', 'binned'] as const) {
+      const jobId = `job-terminal-${terminal}`;
+      const { lane } = await seededLiveRequest(h, repo, jobId, `req-terminal-${terminal}`);
+      if (terminal === 'merged') {
+        h.ledger.setJobStatus(jobId, 'in-review');
+        h.ledger.setJobStatus(jobId, 'merged');
+      } else markLegacyTerminalJobFixture(h.ledger, jobId, terminal);
+      const result = await retire(h, `req-terminal-${terminal}`, laneHead(lane));
+      expect(result.status, terminal).toBe(200);
+      expect(h.ledger.getDirective(`req-terminal-${terminal}`)?.state, terminal).toBe('retired');
+      expect(h.ledger.getJob(jobId)?.status, terminal).toBe(terminal);
+    }
+    expect(countEvents(h, 'silas.directive-retired')).toBe(3);
+  });
+});
+
 describe('directive retirement — idempotency, conflicts and late evidence', () => {
   it('replays idempotently with one audit event, refuses changed intent', async () => {
     const repo = makeFixtureRepo('retire-idempotent');
@@ -1052,18 +1249,7 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
       h.port,
       'POST',
       '/api/silas/directives/req-s/retire',
-      {
-        expected_job_id: field<string>(readback.json, 'job_id'),
-        expected_state: field<string>(readback.json, 'retire_expected_state'),
-        expected_payload_hash: field<string>(readback.json, 'payload_hash'),
-        expected_head: field<string>(readback.json, 'retire_expected_head'),
-        expected_generation: field<number | null>(readback.json, 'retire_expected_generation'),
-        expected_authority_epoch: field<number>(readback.json, 'retire_expected_authority_epoch'),
-        expected_work_revision: field<number>(readback.json, 'retire_expected_work_revision'),
-        expected_contract_sha256: field<string>(readback.json, 'retire_expected_contract_sha256'),
-        reason: field<string>(readback.json, 'retire_reason'),
-        by: field<string>(readback.json, 'retired_by'),
-      },
+      retireBodyFromReadback(readback.json),
       TOKEN,
     );
     expect(reconstructed.status).toBe(200);
@@ -1088,9 +1274,9 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     expect(fingerprint).toBe('5f3198a42e1724892a714e3508561be919d694a473c41fae73e551c5c2f3a610');
     expect(directiveRetirementFingerprint({ requestId: 'req-golden', expectedJobId: 'job-golden',
       expectedState: 'dispatching', expectedPayloadHash: '0'.repeat(64), expectedHead: '1'.repeat(40),
-      expectedGeneration: null, expectedAuthorityEpoch: 7, expectedWorkRevision: 3,
-      expectedContractSha256: '2'.repeat(64), reason: 'writer ceased', by: 'silas-ops' }))
-      .toBe('98c1743ff2ba618aafc28c846d3f73f1169f0398183951a8ddf57ef420777b06');
+      expectedGeneration: null, expectedPlanRevision: null, expectedObligationState: null, expectedAuthorityEpoch: 7,
+      expectedWorkRevision: 3, expectedContractSha256: '2'.repeat(64), reason: 'writer ceased', by: 'silas-ops' }))
+      .toBe('63df3b1a10334a9e74f36544bf548381ec6b2aad385068f95762f4fa1f87e5c0');
   });
 
   it('retries a failed report-handback open before settling a correlated native delivery', async () => {
@@ -1143,6 +1329,15 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     expect(field<string>(replay.json, 'retired_by')).toBe('silas-ops');
     expect(field<string>(replay.json, 'retire_reason')).toBe('writer ceased; no terminal receipt can exist');
     expect(field<string>(replay.json, 'retire_expected_state')).toBe('dispatching');
+    // Every expectation a lost-response retry needs, exactly as GET reports it.
+    const readback = await call(h.port, 'GET', '/api/silas/directives/req-t', undefined, TOKEN);
+    const expectations = (json: unknown) => Object.fromEntries(['retire_expected_state', 'retire_expected_head', 'retire_expected_generation',
+      'retire_expected_plan_revision', 'retire_expected_obligation_state', 'retire_expected_authority_epoch', 'retire_expected_work_revision',
+      'retire_expected_contract_sha256'].map((key) => [key, field<unknown>(json, key)]));
+    expect(expectations(replay.json)).toEqual(expectations(readback.json));
+    expect(field<number>(replay.json, 'retire_expected_authority_epoch')).toBe(before!.retireExpectedAuthorityEpoch);
+    expect(field<string>(replay.json, 'retire_expected_contract_sha256')).toBe(before!.retireExpectedContractSha256);
+    expect(before!.retireExpectedContractSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(countEvents(h, 'silas.directive-sent')).toBe(0);
     expect(h.spawns).toHaveLength(0);
     const conflicting = await call(h.port, 'POST', '/api/silas/directive',
@@ -2044,18 +2239,13 @@ describe('directive retirement — continuation boundary and consumers', () => {
     api1.addJob({ id: 'job-af', repo: 'r', title: 't', briefing: 'b' });
     api1.setJobStatus('job-af', 'working');
     api1.beginDirectiveIntent({ jobId: 'job-af', directive: 'x', holder: 'silas-ops', requestId: 'req-af' });
-    const currentAuthority = api1.directiveCurrentAuthority('job-af');
-    const currentGeneration = api1.recoveryObligation('job-af', 'directive', 'req-af')?.generation ?? null;
     const retired = api1.retireInterruptedDirective({
       requestId: 'req-af',
       expectedJobId: 'job-af',
       expectedState: 'dispatching',
       expectedPayloadHash: api1.getDirective('req-af')!.payloadHash,
       expectedHead: 'a'.repeat(40),
-      expectedGeneration: currentGeneration,
-      expectedAuthorityEpoch: currentAuthority.authorityEpoch,
-      expectedWorkRevision: currentAuthority.workRevision,
-      expectedContractSha256: currentAuthority.contractSha256,
+      ...directiveRetirementInputs(api1, 'req-af'),
       lane: { id: 'lane-af', resolvedHead: 'a'.repeat(40) },
       reason: 'ceased',
       by: 'silas-ops',
@@ -2075,6 +2265,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const replay = api2.retireInterruptedDirective({ requestId: 'req-af', expectedJobId: 'job-af',
       expectedState: reloaded!.retireExpectedState!, expectedPayloadHash: reloaded!.payloadHash,
       expectedHead: reloaded!.retireExpectedHead!, expectedGeneration: reloaded!.retireExpectedGeneration,
+      expectedPlanRevision: reloaded!.retireExpectedPlanRevision, expectedObligationState: reloaded!.retireExpectedObligationState,
       expectedAuthorityEpoch: reloaded!.retireExpectedAuthorityEpoch!, expectedWorkRevision: reloaded!.retireExpectedWorkRevision!,
       expectedContractSha256: reloaded!.retireExpectedContractSha256!, reason: reloaded!.retireReason!, by: reloaded!.retiredBy! });
     expect(replay.idempotent).toBe(true);

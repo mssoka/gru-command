@@ -485,6 +485,30 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
     ...(row.admissionMinion === null ? {} : { agentId: row.admissionMinion }), dedupe: 'active' });
 }
 
+/** A live request on a terminal job never runs again: the job merged, or
+ * went terminal before live directives refused a terminal status write
+ * (a legacy bin or done). Completion still settles from exact native
+ * evidence (bookkeeping only); otherwise the request stays visible on an
+ * unbound card, never hidden behind the terminal status. */
+export function observeTerminalJobDirective(deps: DirectiveProgressDeps, requestId: string): void {
+  const row = deps.ledger.getDirective(requestId);
+  const job = row === null ? null : deps.ledger.getJob(row.jobId);
+  if (row === null || isDirectiveTerminal(row.state) || job === null || !isJobTerminal(job.status)) return;
+  let evidence = 'no exact native completion evidence';
+  if (row.nativeTarget !== null) {
+    try {
+      if (settleNativeDirective(deps, deps.ledger.directiveTurnIdentity(requestId))) return;
+    } catch (error) { evidence = String(error); }
+  }
+  const current = deps.ledger.getDirective(requestId) ?? row;
+  postRecoveryIncident(deps.notifications, { kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
+    title: `Directive ${requestId} is still ${current.state} on ${job.status} job ${row.jobId}`,
+    detail: `Request ${requestId} (payload_hash ${row.payloadHash}) has no terminal receipt, but job ${row.jobId} is ${job.status}: it never runs again ` +
+      `and its outcome stays UNKNOWN (${evidence}). Inspect GET /api/silas/directives/${requestId}. Retire it with POST /api/silas/directives/${requestId}/retire ` +
+      'when the service can verify cessation; retirement claims neither completion nor no effect.',
+    dedupe: 'active' });
+}
+
 /** One service owns all background continuations. Bounded round-robin
  * reconsideration never abandons other lanes behind an ambiguous prefix. */
 export class DirectiveProgressService {
@@ -517,6 +541,12 @@ export class DirectiveProgressService {
     for (const row of rows) {
       cursor = this.deps.ledger.directiveRowid(row.requestId) ?? cursor;
       if (this.active.has(row.requestId) || this.deps.ledger.listJobAdmissions(row.jobId).length > 0) continue;
+      const job = this.deps.ledger.getJob(row.jobId);
+      if (job === null) continue;
+      if (isJobTerminal(job.status)) {
+        observeTerminalJobDirective(this.deps, row.requestId);
+        continue;
+      }
       // Publication may run inside synchronous intake before its HTTP owner
       // reserves. Observe only after that turn, rechecking ownership; this
       // never provides no-effect proof or permission to dispatch a null target.
@@ -528,8 +558,6 @@ export class DirectiveProgressService {
         });
         continue;
       }
-      const job = this.deps.ledger.getJob(row.jobId);
-      if (job === null || isJobTerminal(job.status)) continue;
       if (this.deps.ledger.recoveryOwnerBasis('directive', row.requestId).owned) {
         surfaceRecoveryOwnerTransfer(this.deps, 'directive', row.requestId);
         continue;
