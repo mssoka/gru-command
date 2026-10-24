@@ -8,7 +8,7 @@ import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessio
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { lineSafeLiteral } from './line-safe.js';
-import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, flipJobToWorking, freshReviewInput, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { isAdmittedBlind } from './blind-review.js';
 import { observePendingRebriefs, postRecoveryIncident, type RecoveryNotifications } from './rebrief-recovery.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -231,6 +231,9 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
     const lanes = deps.worktrees.listWorktrees({ jobId: identity.jobId }).filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
     if (lanes.length === 1) { const { id, path, branch } = lanes[0]!; originalLane = { id, path, branch }; }
     dispatchStartSeq = deps.ledger.latestJobEventByRequestId(row.jobId, 'silas.directive-dispatch-started', requestId)!.seq;
+    // A re-brief's fresh reviewer input is resolved before the lane is
+    // cleared for it: a refusal leaves the lane's reviews as they are.
+    if (row.requestKind === 'rebrief' && originalLane !== undefined) freshReviewInput(deps.ledger, row.jobId, originalLane.path);
     if (row.requestKind === 'rebrief' && deps.clearLaneForWriter !== undefined) {
       check(deps, identity);
       try { await deps.clearLaneForWriter({ jobId: row.jobId, writer: `rebrief ${requestId}` }); }
@@ -239,7 +242,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
     }
     const payload = JSON.parse(row.payload) as { directive: string };
     const directive = row.requestKind === 'rebrief' ? renderRebriefPrompt({ jobId: row.jobId, note: payload.directive, briefing: row.contractSnapshot, workRevision: identity.workRevision,
-      reviewRole: isAdmittedBlind(deps.ledger, row.jobId) ? 'blind' : null }) : payload.directive;
+      reviewRole: isAdmittedBlind(deps.ledger, row.jobId) ? 'blind' : null, deliverable: deps.ledger.getJob(row.jobId)?.deliverable ?? null }) : payload.directive;
     const result = await routeFixDirectiveToMinion({ ...deps, jobId: row.jobId, directive, freshSession: row.requestKind === 'rebrief',
       contract: row.contractSnapshot, owner: `silas-directive:${requestId}`,
       ...(row.contractSnapshot === null || row.requestKind === 'rebrief' ? {} : { continuation: {

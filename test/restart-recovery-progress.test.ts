@@ -17,6 +17,7 @@ import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCh
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { admitBlindReview, recordBlindAdmission } from '../src/dispatch/blind-review.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
@@ -3728,6 +3729,34 @@ it('P35 a checkpoint continuation restores the original agent\'s nonempty parent
   expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file, nativeTools: [capability] });
   expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
   await service.dispose();
+});
+
+/** Admit the fixture job as an attested blind review; `keepPackage: false`
+ * is the legacy shape, admitted before packages were kept. */
+function admitFixtureAsBlind(f: Awaited<ReturnType<typeof fixture>>, keepPackage = true): void {
+  const targetSha = 'f'.repeat(40);
+  const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
+  const admission = admitBlindReview({ ledger: f.ledger, jobId: f.intent.jobId, title: 'review (blind)', deliverable: 'review',
+    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture', inputPackage });
+  if (admission === null) throw new Error('the fixture job was not admitted as a blind review');
+  recordBlindAdmission(f.ledger, f.intent.jobId, admission, keepPackage ? inputPackage : undefined);
+}
+
+it('a re-brief whose fresh reviewer input cannot be re-delivered fails by name before the lane is cleared for it', async () => {
+  const f = await fixture('rebrief'); admitFixtureAsBlind(f, false);
+  const cleared: string[] = [];
+  await executeAcceptedDirective({ ...f.deps, clearLaneForWriter: async ({ writer }) => { cleared.push(writer); } }, f.intent.requestId);
+  expect(cleared).toEqual([]);
+  expect(f.spawns).toEqual([]);
+  expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', failReason: expect.stringMatching(/^refused before any prompt: fresh reviewer refused before any effect: .*was not kept/u) });
+});
+
+it('a review job\'s durable re-brief gives the fresh reviewer the read-only orders', async () => {
+  const f = await fixture('rebrief', true, true);
+  await executeAcceptedDirective(f.deps, f.intent.requestId);
+  expect(f.native.prompts).toHaveLength(1);
+  expect(f.native.prompts[0]).toContain('this brief is READ-ONLY');
+  expect(f.native.prompts[0]).not.toContain('commit your work to the branch');
 });
 
 async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {

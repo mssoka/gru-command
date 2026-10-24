@@ -5,7 +5,7 @@ import type {
   ProviderWaitRecord,
 } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
-import { rebriefFreshMinion } from '../dispatch/fix-directive.js';
+import { freshReviewInput, rebriefFreshMinion, ReviewInputUnavailableError } from '../dispatch/fix-directive.js';
 import { renderRevisionContinuation, withRevisionContinuation } from '../dispatch/work-revision.js';
 import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
@@ -264,6 +264,23 @@ async function claimJobMinion(
     wait.sessionFile !== null && wait.sessionFile !== '' && existsSync(wait.sessionFile)
       ? wait.sessionFile
       : null;
+  // A fresh reviewer's recorded input is resolved before the claim: one that
+  // cannot be re-delivered cancels the wait by name, with nothing claimed,
+  // re-opened or spawned.
+  if (resumeFile === null) {
+    try {
+      freshReviewInput(deps.ledger, job.id, lane.path);
+    } catch (error) {
+      if (!(error instanceof ReviewInputUnavailableError)) throw error;
+      const why = `fresh reviewer input unavailable: ${error.message}`;
+      deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why, by });
+      deps.ledger.appendCustomEvent({ kind: 'provider.continuation-failed', jobId: wait.jobId, agentId: wait.agentId,
+        payload: { wait_id: wait.id, by, stage: 'input', error: String(error).slice(0, 300) } });
+      blockReopenedLane(deps.ledger, wait.jobId, `provider recovery continuation refused: ${why}`);
+      deps.log?.('error', 'provider continuation refused — the fresh reviewer input cannot be re-delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
+      return { outcome: 'skipped', waitId: wait.id, why };
+    }
+  }
   const continuationPrompt = wait.continuation?.promptText ?? null;
   const note =
     continuationPrompt !== null && continuationPrompt.trim() !== ''

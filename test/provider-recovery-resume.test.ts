@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +29,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { Role } from '../src/config.js';
+import { renderMinionBriefing } from '../src/dispatch/service.js';
 
 /**
  * The guarded eligible-state transition (acceptance 7): one recovered wait
@@ -224,7 +226,7 @@ class ClaimHarness {
   /** A job with a lane, a minion agent, and a recovered wait on it. Each
    * call mints a unique job id (the shared fixture repo's worktree
    * branches collide otherwise). */
-  async recoveredMinionWait(opts: { sessionFile?: string | null; jobId?: string; writeSession?: boolean } = {}): Promise<string> {
+  async recoveredMinionWait(opts: { sessionFile?: string | null; jobId?: string; writeSession?: boolean; promptText?: string } = {}): Promise<string> {
     const jobId = opts.jobId ?? `job-${++ClaimHarness.jobs}`;
     const repo = fixtureRepo();
     this.ledger.addJob({
@@ -255,7 +257,7 @@ class ClaimHarness {
       agentId: `agent-${jobId}`,
       slotId: null,
       sessionFile,
-      continuation: { promptText: 'continue the work', promptOwner: 'minion-brief', hadOpenTurn: true },
+      continuation: { promptText: opts.promptText ?? 'continue the work', promptOwner: 'minion-brief', hadOpenTurn: true },
       incidentId: 'incident-1',
       incidentGeneration: 1,
       reasonClass: 'temporary-recoverable:429',
@@ -614,17 +616,30 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     };
   }
 
-  it('a FRESH replacement blind reviewer is briefed with the package it was admitted with; a resumed one already holds it (#360 R5-B3)', async () => {
+  it('a FRESH replacement blind reviewer is briefed with its source and package once; a resumed one already holds them (#360 R5-B3)', async () => {
     const h = new ClaimHarness();
     const jobId = 'j-blind-fresh';
-    const waitId = await h.recoveredMinionWait({ jobId });
+    // The interrupted turn was the dispatch briefing itself, which already
+    // carried the REVIEW SOURCE and package blocks.
+    const binding = { objectStore: '', repoPath: fixtureRepo().path, targetSha: TARGET, targetBase: BASE, rangeCommits: 1, inputs: [], source: 'repository' as const, packageSha256: null };
+    const waitId = await h.recoveredMinionWait({ jobId, promptText: renderMinionBriefing({
+      jobId, repoName: 'fixture', branch: `gru/${jobId}`, worktreePath: '/wt', sha: BASE, briefing: 'do the work',
+      deliverable: 'review', reviewRole: 'blind', reviewSource: binding, blindPackage: BLIND_PACKAGE,
+    }) });
+    const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+    const objectStore = realpathSync(execFileSync('git', ['-C', lane.path, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf-8' }).trim());
+    h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId, payload: {
+      object_store: objectStore, target_sha: TARGET, target_base: BASE, range_commits: 1, inputs: [], source: 'repository', package_sha256: null,
+    } });
     h.admitBlind(jobId, fixtureRepo().path);
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
     expect(result).toMatchObject({ outcome: 'continued', path: 'redispatched' });
     const prompted = [...h.registry.handles.values()].flatMap((handle) => handle.prompts);
     expect(prompted).toHaveLength(1);
     expect(prompted[0]).toContain('do the work');
-    expect(prompted[0]!.split('BLIND INPUT PACKAGE')).toHaveLength(2);
+    expect(prompted[0]!.split('REVIEW SOURCE (')).toHaveLength(2);
+    expect(prompted[0]!.split('BLIND INPUT PACKAGE (')).toHaveLength(2);
+    expect(prompted[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
     expect(prompted[0]).toContain(`Base: ${BASE}  Target: ${TARGET}`);
     expect(prompted[0]).toContain('File src/feature.ts (at the target):\n```\nexport const feature = 1;\n\n```');
     // A resumed session was briefed at its first spawn: no second copy.
@@ -636,17 +651,19 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     resumed.admitBlind(resumedJob, fixtureRepo().path);
     expect(await claimProviderRecoveryContinuation(resumed.deps(), resumedWait, 'silas')).toMatchObject({ outcome: 'continued', path: 'resumed' });
     expect([...resumed.registry.handles.values()].flatMap((handle) => handle.prompts).join('\n')).not.toContain('BLIND INPUT PACKAGE');
-    // An attested package that was never kept fails the fresh continuation by
-    // name: no replacement is briefed without its input.
+    // An attested package that was never kept refuses the fresh continuation
+    // by name before the claim: the wait is cancelled and nothing spawns.
     const unkept = new ClaimHarness();
     const unkeptJob = 'j-blind-unkept';
     const unkeptWait = await unkept.recoveredMinionWait({ jobId: unkeptJob });
     unkept.admitBlind(unkeptJob, fixtureRepo().path, false);
     const failed = await claimProviderRecoveryContinuation(unkept.deps(), unkeptWait, 'silas');
-    expect(failed.outcome).not.toBe('continued');
-    expect([...unkept.registry.handles.values()].flatMap((handle) => handle.prompts)).toEqual([]);
+    expect(failed).toMatchObject({ outcome: 'skipped', why: expect.stringMatching(/^fresh reviewer input unavailable: .*was not kept/u) });
+    expect(unkept.registry.spawnCalls).toEqual([]);
+    expect(unkept.ledger.getProviderWait(unkeptWait)?.status).toBe('cancelled');
+    expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.recovery-claimed')).toBeNull();
     expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.continuation-failed')?.payload)
-      .toMatchObject({ stage: 'spawn', error: expect.stringMatching(/its attested blind input package was not kept/u) });
+      .toMatchObject({ stage: 'input', error: expect.stringMatching(/its attested blind input package was not kept/u) });
   });
 
   it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying #contract:blind-resumed-turn-scan:pi', async () => {

@@ -1,16 +1,16 @@
 import { standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BlindInputUnavailableError, DirectiveDispatchDeferredError, DirectivePromptRefusedError, DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, ReviewInputUnavailableError, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { renderReviewSourceBlock } from '../src/dispatch/review-source.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi, type ObligationRecord } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
-import type { AgentHandle, AgentRuntime } from '../src/runtime/types.js';
+import type { AgentHandle, AgentRuntime, SpawnOptions } from '../src/runtime/types.js';
 import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -1390,42 +1390,59 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
   });
 });
 
-describe('a fresh blind reviewer session gets its admitted input (#503)', () => {
-  const JOB = 'job-fresh-blind';
+describe('a fresh reviewer session gets its recorded input once (#503)', () => {
+  const JOB = 'job-fresh-review';
   const TARGET = 'a'.repeat(40);
+  const SOURCE_HEADER = 'REVIEW SOURCE (';
   const HEADER = 'BLIND INPUT PACKAGE (your review input';
   const FILE_LINE = 'File src/feature.ts (at the target):';
-  const SOURCE = { targetSha: TARGET, targetBase: 'b'.repeat(40), rangeCommits: 2, inputs: [] };
+  const READ_ONLY = 'this brief is READ-ONLY';
+  const CLAIMS_INPUTS = [{ path: 'docs/claims.md', lens: 'claims' as const, blob: 'c'.repeat(40) }];
   const CANARY: LessonPointer = {
     chapter: 'synthetic-book-canary', lesson: 'outside-package',
     path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
   };
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
 
-  /** A real ledger holding an attested blind admission (its package kept
-   * unless `keepPackage: false`, the legacy shape) and its verified source. */
-  function blindLane(opts: { readonly keepPackage?: boolean; readonly priorSession?: boolean } = {}) {
-    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-blind-'));
+  /** A real ledger and a real git lane for a review job: an attested blind
+   * admission (its package kept unless `keepPackage: false`, the legacy
+   * shape) or a claims reviewer, and the verified review source its
+   * dispatch recorded. */
+  function reviewLane(opts: {
+    readonly blind?: boolean;
+    readonly keepPackage?: boolean;
+    readonly priorSession?: 'file' | 'missing' | 'none';
+    readonly source?: 'lane' | 'other-store' | 'malformed';
+  } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-review-'));
     cleanupDirs.push(dir);
+    execFileSync('git', ['init', '-q', dir]);
     const db = new LedgerDb(dir);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    ledger.addJob({ id: JOB, repo: 'fixture', title: 'review (blind)', briefing: 'Review the BLIND INPUT PACKAGE (quoted) read-only.' });
+    const blind = opts.blind !== false;
+    ledger.addJob({ id: JOB, repo: 'fixture', title: 'review', deliverable: 'review', briefing: 'Review the BLIND INPUT PACKAGE (quoted) read-only.' });
     ledger.setJobStatus(JOB, 'working');
     const priorSession = join(dir, 'prior.jsonl');
-    writeFileSync(priorSession, '{}\n', 'utf-8');
-    ledger.registerAgent({ id: 'prior-reviewer', role: 'minion', jobId: JOB, sessionFile: opts.priorSession === false ? null : priorSession });
+    if (opts.priorSession !== 'missing') writeFileSync(priorSession, '{}\n', 'utf-8');
+    ledger.registerAgent({ id: 'prior-reviewer', role: 'minion', jobId: JOB, sessionFile: opts.priorSession === 'none' ? null : priorSession });
+    const source = { targetSha: TARGET, targetBase: 'b'.repeat(40), rangeCommits: 2, inputs: blind ? [] : CLAIMS_INPUTS };
     ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: JOB, payload: {
-      object_store: join(dir, '.git'), target_sha: SOURCE.targetSha, target_base: SOURCE.targetBase, range_commits: SOURCE.rangeCommits,
-      inputs: SOURCE.inputs, source: 'repository', package_sha256: null,
+      object_store: opts.source === 'other-store' ? join(tmpdir(), 'another-clone', '.git') : realpathSync(join(dir, '.git')),
+      target_sha: source.targetSha, target_base: source.targetBase, range_commits: source.rangeCommits,
+      inputs: opts.source === 'malformed' ? [{ path: 'docs/claims.md', lens: 'unknown-lens', blob: 'c'.repeat(40) }] : source.inputs,
+      source: 'repository', package_sha256: null,
     } });
-    const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
-    const admission = admitBlindReview({
-      ledger, jobId: JOB, title: 'review (blind)', deliverable: 'review',
-      briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture', inputPackage,
-    });
-    if (admission === null) throw new Error(`job "${JOB}" was not admitted as a blind review`);
-    recordBlindAdmission(ledger, JOB, admission, opts.keepPackage === false ? undefined : inputPackage);
+    if (blind) {
+      const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
+      const admission = admitBlindReview({
+        ledger, jobId: JOB, title: 'review (blind)', deliverable: 'review',
+        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture', inputPackage,
+      });
+      if (admission === null) throw new Error(`job "${JOB}" was not admitted as a blind review`);
+      recordBlindAdmission(ledger, JOB, admission, opts.keepPackage === false ? undefined : inputPackage);
+    }
     const prompts: string[] = [];
-    const spawned: { readonly resumeFile?: string }[] = [];
+    const spawned: SpawnOptions[] = [];
     const disposed: string[] = [];
     const handle = (id: string): AgentHandle => ({
       id, role: 'minion', sessionFile: join(dir, `${id}.jsonl`),
@@ -1437,18 +1454,21 @@ describe('a fresh blind reviewer session gets its admitted input (#503)', () => 
       async dispose() { disposed.push(id); },
       cessationEvidence: () => 'ceased' as const,
     });
-    return { ledger, dir, prompts, spawned, disposed, handle, dispose: () => db.close() };
+    const sourceBlock = renderReviewSourceBlock(source).join('\n');
+    return { ledger, dir, priorSession, prompts, spawned, disposed, handle, sourceBlock, dispose: () => db.close() };
   }
 
-  it('the production fresh re-brief carries the verified source and the package exactly once, no lesson pointer', async () => {
-    const h = blindLane();
+  it('the production fresh re-brief carries the verified source and the package exactly once, reviewer orders, no lesson pointer', async () => {
+    const h = reviewLane();
     const prior = h.handle('prior-reviewer');
     let lookups = 0;
+    let fenced = 0;
+    const prepared: string[] = [];
     try {
       // Exactly the composition directive-progress hands the route for a
       // durable rebrief; the contract quotes the package header.
       const contract = h.ledger.effectiveContract(JOB)!.text;
-      const directive = renderRebriefPrompt({ jobId: JOB, note: 'continue the review', briefing: contract, workRevision: 0, reviewRole: 'blind' });
+      const directive = renderRebriefPrompt({ jobId: JOB, note: 'continue the review', briefing: contract, workRevision: 0, reviewRole: 'blind', deliverable: 'review' });
       const result = await routeFixDirectiveToMinion({
         jobId: JOB, directive, freshSession: true, contract, signal: new AbortController().signal,
         ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
@@ -1458,22 +1478,63 @@ describe('a fresh blind reviewer session gets its admitted input (#503)', () => 
           disposeHandle: async (handle) => { await handle.dispose(); },
         },
         lessons: { referencesFor: () => { lookups += 1; return [CANARY]; } },
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+        onPrepared: (handle) => { prepared.push(handle.id); },
+        beforeTurnSideEffect: () => { fenced += 1; },
       });
       expect(result).toMatchObject({ delivered: true, minionId: 'fresh-reviewer' });
       expect(h.disposed).toContain('prior-reviewer');
+      expect(prepared).toEqual(['fresh-reviewer']);
+      expect(fenced).toBeGreaterThan(0);
       expect(h.prompts).toHaveLength(1);
       const prompt = h.prompts[0]!;
-      expect(prompt.split(HEADER)).toHaveLength(2);
-      expect(prompt.split(FILE_LINE)).toHaveLength(2);
-      expect(prompt.split(renderReviewSourceBlock(SOURCE).join('\n'))).toHaveLength(2);
-      expect(prompt.indexOf('REVIEW SOURCE (')).toBeLessThan(prompt.indexOf(HEADER));
+      expect(count(prompt, SOURCE_HEADER)).toBe(1);
+      expect(count(prompt, h.sourceBlock)).toBe(1);
+      expect(count(prompt, HEADER)).toBe(1);
+      expect(count(prompt, FILE_LINE)).toBe(1);
+      expect(prompt.indexOf(SOURCE_HEADER)).toBeLessThan(prompt.indexOf(HEADER));
+      expect(count(prompt, READ_ONLY)).toBe(1);
+      expect(prompt).not.toContain('commit your work to the branch');
       expect(lookups).toBe(0);
       expect(prompt).not.toContain(CANARY.path);
     } finally { h.dispose(); }
   });
 
-  it('a resume-failed fallback is briefed with the package exactly once', async () => {
-    const h = blindLane();
+  it('a fresh replacement on the native directive path gets the input once and reviewer orders', async () => {
+    const h = reviewLane({ priorSession: 'none' });
+    try {
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'Please re-check finding 2.', contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+        onPrepared: () => {},
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: 'fresh-reviewer' });
+      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([null]);
+      const prompt = h.prompts[0]!;
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 1, 1]);
+    } finally { h.dispose(); }
+  });
+
+  it('a recorded session whose file is gone is briefed as fresh, not resumed', async () => {
+    const h = reviewLane({ priorSession: 'missing' });
+    try {
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'continue the review', contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        // A runtime may open a missing session file as a new, empty session.
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('reopened'); }, disposeHandle: async () => {} },
+      });
+      expect(result).toMatchObject({ delivered: true });
+      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([null]);
+      const prompt = h.prompts[0]!;
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 1, 1]);
+    } finally { h.dispose(); }
+  });
+
+  it('a resume-failed fallback is briefed with the input once and reviewer orders', async () => {
+    const h = reviewLane();
     try {
       const result = await routeFixDirectiveToMinion({
         jobId: JOB, directive: 'Re-check what the BLIND INPUT PACKAGE (as quoted earlier) shows.',
@@ -1491,16 +1552,35 @@ describe('a fresh blind reviewer session gets its admitted input (#503)', () => 
         lessons: { referencesFor: () => [CANARY] },
       });
       expect(result).toMatchObject({ delivered: true, minionId: 'fallback-reviewer' });
-      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([join(h.dir, 'prior.jsonl'), null]);
+      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([h.priorSession, null]);
       expect(h.prompts).toHaveLength(1);
-      expect(h.prompts[0]!.split(HEADER)).toHaveLength(2);
-      expect(h.prompts[0]!.split(FILE_LINE)).toHaveLength(2);
-      expect(h.prompts[0]).not.toContain(CANARY.path);
+      const prompt = h.prompts[0]!;
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, FILE_LINE), count(prompt, READ_ONLY)]).toEqual([1, 1, 1, 1]);
+      expect(prompt).not.toContain(CANARY.path);
+    } finally { h.dispose(); }
+  });
+
+  it("a claims reviewer's fresh re-brief gets its verified source with its inputs, reviewer orders and no package", async () => {
+    const h = reviewLane({ blind: false });
+    try {
+      const contract = h.ledger.effectiveContract(JOB)!.text;
+      const directive = renderRebriefPrompt({ jobId: JOB, note: 'continue the review', briefing: contract, workRevision: 0, reviewRole: null, deliverable: 'review' });
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive, freshSession: true, contract, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+      });
+      expect(result).toMatchObject({ delivered: true });
+      const prompt = h.prompts[0]!;
+      expect(count(prompt, h.sourceBlock)).toBe(1);
+      expect(prompt).toContain(`Required claims input: docs/claims.md @ ${TARGET} (blob ${'c'.repeat(40)})`);
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 0, 1]);
+      expect(prompt).not.toContain('commit your work to the branch');
     } finally { h.dispose(); }
   });
 
   it('a package that was never kept refuses by name before any disposal or spawn', async () => {
-    const fresh = blindLane({ keepPackage: false });
+    const fresh = reviewLane({ keepPackage: false });
     const prior = fresh.handle('prior-reviewer');
     try {
       const refusal = await routeFixDirectiveToMinion({
@@ -1512,15 +1592,16 @@ describe('a fresh blind reviewer session gets its admitted input (#503)', () => 
           disposeHandle: async (handle) => { await handle.dispose(); },
         },
       }).then(() => null, (error: unknown) => error);
-      expect(refusal).toBeInstanceOf(BlindInputUnavailableError);
+      expect(refusal).toBeInstanceOf(ReviewInputUnavailableError);
       expect(refusal).toBeInstanceOf(DirectivePromptRefusedError);
       expect(String(refusal)).toMatch(/its attested blind input package was not kept/u);
       expect(fresh.disposed).toEqual([]);
       expect(fresh.spawned).toEqual([]);
       expect(fresh.prompts).toEqual([]);
     } finally { fresh.dispose(); }
-    // The resume-failed fallback refuses before its fresh spawn too.
-    const fallback = blindLane({ keepPackage: false });
+    // A non-native directive that could fall back refuses before even the
+    // resume attempt.
+    const fallback = reviewLane({ keepPackage: false });
     try {
       const refusal = await routeFixDirectiveToMinion({
         jobId: JOB, directive: 'continue', contract: 'c', signal: new AbortController().signal,
@@ -1535,14 +1616,68 @@ describe('a fresh blind reviewer session gets its admitted input (#503)', () => 
           disposeHandle: async () => {},
         },
       }).then(() => null, (error: unknown) => error);
-      expect(refusal).toBeInstanceOf(BlindInputUnavailableError);
-      expect(fallback.spawned.map((options) => options.resumeFile ?? null)).toEqual([join(fallback.dir, 'prior.jsonl')]);
+      expect(refusal).toBeInstanceOf(ReviewInputUnavailableError);
+      expect(fallback.spawned).toEqual([]);
       expect(fallback.prompts).toEqual([]);
     } finally { fallback.dispose(); }
   });
 
+  it('a lane on another object store, or a malformed source record, refuses by name before any disposal or spawn', async () => {
+    for (const [source, reason] of [['other-store', /lane .* uses object store .*, not the verified .*another-clone/u], ['malformed', /verified review source record .* is malformed/u]] as const) {
+      const h = reviewLane({ source });
+      const prior = h.handle('prior-reviewer');
+      try {
+        const refusal = await routeFixDirectiveToMinion({
+          jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+          ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+          registry: {
+            getHandle: () => prior,
+            spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+            disposeHandle: async (handle) => { await handle.dispose(); },
+          },
+        }).then(() => null, (error: unknown) => error);
+        expect(refusal, source).toBeInstanceOf(ReviewInputUnavailableError);
+        expect(String(refusal), source).toMatch(reason);
+        expect(h.disposed, source).toEqual([]);
+        expect(h.spawned, source).toEqual([]);
+      } finally { h.dispose(); }
+    }
+  });
+
+  it('a transient ledger fault while reading the input propagates for reconciliation, never as a refusal', async () => {
+    const h = reviewLane();
+    const prior = h.handle('prior-reviewer');
+    const busy = new Proxy(h.ledger, {
+      get(target, key) {
+        if (key === 'latestJobEvent') {
+          return (jobId: string, kind: string) => {
+            if (kind === 'review.blind-input-package') throw new Error('SQLITE_BUSY: database is locked');
+            return target.latestJobEvent(jobId, kind);
+          };
+        }
+        const value = Reflect.get(target, key) as unknown;
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    try {
+      const fault = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+        ledger: busy, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => prior,
+          spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+          disposeHandle: async (handle) => { await handle.dispose(); },
+        },
+      }).then(() => null, (error: unknown) => error);
+      expect(String(fault)).toMatch(/SQLITE_BUSY/u);
+      expect(fault).not.toBeInstanceOf(DirectivePromptRefusedError);
+      expect(h.disposed).toEqual([]);
+      expect(h.spawned).toEqual([]);
+    } finally { h.dispose(); }
+  });
+
   it('a ledger that cannot read the admitted role is refused by name, never routed as an ordinary job', async () => {
-    const h = blindLane();
+    const h = reviewLane();
     try {
       const withoutRoleLookup = {
         listImplementerMinions: h.ledger.listImplementerMinions.bind(h.ledger), listAgents: h.ledger.listAgents.bind(h.ledger),

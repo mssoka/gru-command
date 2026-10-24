@@ -214,6 +214,14 @@ describe('progressive-disclosure injection', () => {
     expect(blind).toContain('this brief is READ-ONLY — change nothing, commit');
     expect(blind).not.toContain('commit your work to the branch');
     expect(blind).not.toContain('never merge your own pull request');
+    // So does every other review job: a claims reviewer and a role-less one.
+    for (const reviewer of [
+      renderRebriefPrompt({ jobId: 'review-claims', briefing: 'contract', note: 'n', reviewRole: 'claims' }),
+      renderRebriefPrompt({ jobId: 'review-plain', briefing: 'contract', note: 'n', deliverable: 'review' }),
+    ]) {
+      expect(reviewer).toContain('this brief is READ-ONLY — change nothing, commit');
+      expect(reviewer).not.toContain('commit your work to the branch');
+    }
   });
 
   it('re-briefs from the original contract when an evicted minion transcript cannot resume', async () => {

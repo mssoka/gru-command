@@ -49,8 +49,9 @@ export function appendWorkerRules(text: string): string {
 }
 
 /** A review job's closing standing orders (E19): its deliverable is its
- * findings, so it commits nothing. One list for the dispatch briefing and a
- * blind reviewer's re-brief, so a reviewer is never told to commit. */
+ * findings, so it commits nothing. One list for a reviewer's dispatch
+ * briefing, re-brief and fresh directive session, so a reviewer is never
+ * told to commit. */
 export const READ_ONLY_REVIEW_ORDERS: readonly string[] = [
   'Execute the briefing inside this worktree. Standing orders: work only',
   'inside this tree; this brief is READ-ONLY — change nothing, commit',

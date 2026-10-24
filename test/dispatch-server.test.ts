@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -2119,6 +2119,12 @@ if (argv.includes('--method') && argv.includes('POST')) {
       await call(h.port, 'POST', '/api/dispatch', { job_id: 'reb-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
       await waitForDelivery(h, 'reb-blind');
       admitJobAsBlind(h.ledger, 'reb-blind');
+      // The source its dispatch verified, on the store this lane uses.
+      const lanePath = h.worktrees.listWorktrees({ jobId: 'reb-blind' })[0]!.path;
+      const objectStore = realpathSync(execFileSync('git', ['-C', lanePath, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf-8' }).trim());
+      h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: 'reb-blind', payload: {
+        object_store: objectStore, target_sha: 'f'.repeat(40), target_base: 'a'.repeat(40), range_commits: 1, inputs: [], source: 'repository', package_sha256: null,
+      } });
       expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
       contaminate = true;
       const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'reb-blind', note: 'try again' }, TOKEN);
@@ -2135,10 +2141,12 @@ if (argv.includes('--method') && argv.includes('POST')) {
       });
       expect(h.ledger.listJobEvents('reb-blind').filter((event) => event.kind === 'job.delivered' &&
         (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
-      // The fresh reviewer gets its package once, the reviewer's orders and
-      // no lesson pointer.
+      // The fresh reviewer gets its source and package once, the reviewer's
+      // orders and no lesson pointer.
       const rebriefTexts = h.minionTurnTexts.filter((text) => text.startsWith('Re-brief —'));
       expect(rebriefTexts).toHaveLength(1);
+      expect(rebriefTexts[0]!.split('REVIEW SOURCE (')).toHaveLength(2);
+      expect(rebriefTexts[0]).toContain(`Range: ${'a'.repeat(40)}..${'f'.repeat(40)} (1 commits)`);
       expect(rebriefTexts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
       expect(rebriefTexts[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
       expect(rebriefTexts[0]).toContain('this brief is READ-ONLY');
@@ -2164,7 +2172,7 @@ if (argv.includes('--method') && argv.includes('POST')) {
       expect(res.status).toBe(202);
       const row = await awaitDirectiveTerminal(h, field<string>(res.json, 'request_id'));
       expect(row.state).toBe('failed');
-      expect(row.failReason).toMatch(/^refused before any prompt: fresh blind reviewer refused before any effect: .*its attested blind input package was not kept/u);
+      expect(row.failReason).toMatch(/^refused before any prompt: fresh reviewer refused before any effect: .*its attested blind input package was not kept/u);
       expect(h.disposedHandles).not.toContain(priorId);
       expect(h.spawns.length).toBe(beforeSpawns);
     } finally { await h.close(); }

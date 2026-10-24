@@ -270,8 +270,7 @@ export const gitReviewSourcePreflight: ReviewSourcePreflight = (request) => {
 /** The reviewer lane must share the exact object store the preflight
  * proved — never "whatever happens to be in the reviewer worktree". */
 export function assertLaneUsesBoundStore(jobId: string, binding: ReviewSourceBinding, lanePath: string): void {
-  const lane = git(lanePath, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-  const laneStore = lane.ok ? realpathSync(lane.out) : null;
+  const laneStore = laneObjectStore(lanePath);
   if (laneStore !== binding.objectStore) {
     throw new ReviewSourceUnavailableError(
       jobId,
@@ -282,25 +281,39 @@ export function assertLaneUsesBoundStore(jobId: string, binding: ReviewSourceBin
   }
 }
 
+/** The canonical object store (git common dir) a lane's checkout uses;
+ * null = it cannot be read. */
+export function laneObjectStore(lanePath: string): string | null {
+  const lane = git(lanePath, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  return lane.ok ? realpathSync(lane.out) : null;
+}
+
 /** What the REVIEW SOURCE block binds: the target, range and inputs. */
 export type ReviewSourceBlock = Pick<ReviewSourceBinding, 'targetSha' | 'targetBase' | 'rangeCommits' | 'inputs'>;
+
+/** A job's verified review source record cannot be read back. */
+export class ReviewSourceRecordError extends Error {
+  constructor(message: string) { super(message); this.name = 'ReviewSourceRecordError'; }
+}
 
 /** The review source a job's dispatch verified, read back from its durable
  * `job.review-source-verified` record so a fresh session on the same lane
  * is bound to the same objects. null = no preflight ran for the job; a
- * malformed record throws by name. */
-export function verifiedReviewSource(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): ReviewSourceBlock | null {
+ * malformed record throws ReviewSourceRecordError. */
+export function verifiedReviewSource(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): (ReviewSourceBlock & Pick<ReviewSourceBinding, 'objectStore'>) | null {
   const event = ledger.latestJobEvent(jobId, 'job.review-source-verified');
   if (event === null) return null;
-  const payload = event.payload as { target_sha?: unknown; target_base?: unknown; range_commits?: unknown; inputs?: unknown };
+  const payload = event.payload as { object_store?: unknown; target_sha?: unknown; target_base?: unknown; range_commits?: unknown; inputs?: unknown };
   const inputs = Array.isArray(payload.inputs) ? payload.inputs as readonly Partial<Record<keyof ReviewBoundInput, unknown>>[] : null;
-  if (typeof payload.target_sha !== 'string' || (payload.target_base !== null && typeof payload.target_base !== 'string') ||
+  if (typeof payload.object_store !== 'string' || typeof payload.target_sha !== 'string' ||
+      (payload.target_base !== null && typeof payload.target_base !== 'string') ||
       (payload.range_commits !== null && typeof payload.range_commits !== 'number') || inputs === null ||
       !inputs.every((input) => typeof input.path === 'string' && typeof input.blob === 'string' &&
         (REVIEW_INPUT_LENSES as readonly unknown[]).includes(input.lens))) {
-    throw new Error(`job "${jobId}": its verified review source record (event ${String(event.seq)}) is malformed — the reviewer's source cannot be re-bound`);
+    throw new ReviewSourceRecordError(`job "${jobId}": its verified review source record (event ${String(event.seq)}) is malformed — the reviewer's source cannot be re-bound`);
   }
   return {
+    objectStore: payload.object_store,
     targetSha: payload.target_sha,
     targetBase: payload.target_base,
     rangeCommits: payload.range_commits,
