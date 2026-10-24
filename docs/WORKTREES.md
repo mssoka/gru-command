@@ -598,26 +598,36 @@ body is exactly `{ "job_id": "…", "request_id": "…" }`; it reuses the
 original job row, unique `job.handoff`, immutable briefing, branch, retained
 receipt, fixed base and `base_source`. It does not call `addJob`, append a new
 handoff, or accept caller-supplied source/briefing/base fields. A job with an
-accepted amendment, previous phase-handoff, report/PR target, worker, lane or
-admission is outside this initial-dispatch control and is refused rather than
-silently losing its contract. Ordinary `POST /api/dispatch` is unchanged.
+accepted amendment, previous phase-handoff, report/PR target, worker, lane,
+admission, live directive or pending re-brief is outside this control and is
+refused, as is a request id that names a directive request. The handoff
+path's canonical realpath must name the job's recorded repository; a refusal
+names both.
 
-Before accepting, GC requires an exact manager read-only inspection and a
-positive `job.creation-producer-settled` event written only after Node reports
-`close` for the original service-owned Git child. The receipt token is bound
-by its SHA-256 digest; the raw token is never placed in the ledger readback.
-Receipt host/PID, a missing PID, service restart and ref commitment are not
-producer-cessation evidence. If the original producer close was never durably
-observed, the request is refused and custody remains UNKNOWN.
+Every job branch creation, ordinary dispatch included, journals one
+`job.creation-producer-settled` event per receipt token when its Git child's
+own `close` shows that the child and every descendant holding its pipes
+stopped. A child that exited while a descendant still holds the pipes is
+watched for up to ten minutes; a close caused by GC releasing those pipes
+proves nothing. A failed write is logged and never fails the creation. The
+receipt token is bound by its SHA-256 digest; the raw token never reaches the
+readback, and a dispatch failure's job note and events redact it. Receipt
+host/PID, a missing PID, service restart and ref commitment are not
+producer-cessation evidence. Without the settlement the request is refused and
+custody remains UNKNOWN.
 
-The creation step calls WorktreeManager's existing guarded reconciliation
-with a strict retained-only policy. It requires the receipt and exact direct
-branch ref to remain present and unchanged, including the receipt-matched
-reflog and repository/worktree-holder fences. Missing receipt/ref cannot clear
-the receipt and fall through to the ordinary new-base branch; mismatch, lock,
-symbolic ref, foreign checkout/admin/holder and unreadable evidence refuse
-without continuation cleanup. After registration, the lane goes through the
-ordinary disk floor, worker pacing gate, spawn and delivery path.
+A continuation waits at the ordinary disk floor (the owner may bin or park the
+job meanwhile), then takes the job admission and calls WorktreeManager's
+guarded reconciliation with a strict retained-only policy. The receipt must be
+the one the request accepted (same token digest and settlement), and it and
+the exact direct branch ref must remain present and unchanged, including the
+receipt-matched reflog and repository/worktree-holder fences. Missing
+receipt/ref cannot clear the receipt and fall through to the ordinary
+new-base branch; mismatch, lock, symbolic ref, foreign checkout/admin/holder
+and unreadable evidence refuse without continuation cleanup. A failure after
+adoption, a failing `[[setup]]` included, keeps the ref, receipt and any
+partial checkout and reads back `failed`. A registered lane goes through the
+ordinary worker pacing gate, spawn and delivery path.
 
 The durable request history names its generation and payload digest and
 readback distinguishes `accepted`, `queued`, `admitted`, `delivered`, `failed`,
@@ -625,18 +635,21 @@ readback distinguishes `accepted`, `queued`, `admitted`, `delivered`, `failed`,
 `GET /api/dispatch/creation-continuation?job_id=…&request_id=…` (same bearer
 authorization). Readback reports the original handoff/briefing digest, branch,
 base/provenance, producer-settlement event, registered worktree, queue,
-spawn and correlated delivery evidence. It never reports a prompt as delivered
-from acceptance or job status alone.
+spawn and correlated delivery evidence. The delivery is correlated by
+`creation_continuation_request_id` and `creation_continuation_generation` on
+`job.delivered`, never the `request_id` that directive correlation reads. It
+never reports a prompt as delivered from acceptance or job status alone.
 
 Exact POST retries return the durable readback and never relaunch. A different
 request cannot compete with an accepted, queued, admitted or custody-unknown
-generation. If process ownership is lost before an actual admission/delivery
-receipt settles the request, readback reports `custody-unknown`; neither GET
-nor retry resumes it. The unknown request remains a stop, not an automatic
-replay invitation. This route is not a generic retry/migration command, does
-not recover historical directives, and does not itself authorize continuation
-of any live target. Re-read every target's exact producer, receipt/ref/reflog,
-checkout, holder and admission guards immediately before owner-authorized use.
+generation. If process ownership is lost before the delivery receipt, or
+shutdown cancels the automatic retries of a sent prompt, readback reports
+`custody-unknown`; neither GET nor retry resumes it. The unknown request
+remains a stop, not an automatic replay invitation. This route is not a
+generic retry/migration command, does not recover historical directives, and
+does not itself authorize continuation of any live target. Re-read every
+target's exact producer, receipt/ref/reflog, checkout, holder and admission
+guards immediately before owner-authorized use.
 
 ## 5. Concurrency (18e)
 
