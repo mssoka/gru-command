@@ -8,7 +8,7 @@ import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
-import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { appendWorkerRules, READ_ONLY_REVIEW_ORDERS, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { withRevisionContinuation } from './work-revision.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
@@ -778,10 +778,14 @@ export function renderRebriefPrompt(input: {
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
-    'Execute the briefing inside this worktree. Standing orders: work only',
-    'inside this tree; commit your work to the branch; verify it (build,',
-    'tests, lint — whatever this project calls green) before finishing;',
-    'never merge your own pull request. End with a completion report.',
+    ...(input.reviewRole === 'blind'
+      ? READ_ONLY_REVIEW_ORDERS
+      : [
+          'Execute the briefing inside this worktree. Standing orders: work only',
+          'inside this tree; commit your work to the branch; verify it (build,',
+          'tests, lint — whatever this project calls green) before finishing;',
+          'never merge your own pull request. End with a completion report.',
+        ]),
   ].join('\n');
 }
 

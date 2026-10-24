@@ -9,6 +9,7 @@ import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { lineSafeLiteral } from './line-safe.js';
 import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { isAdmittedBlind } from './blind-review.js';
 import { observePendingRebriefs, postRecoveryIncident, type RecoveryNotifications } from './rebrief-recovery.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
@@ -237,7 +238,8 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
       check(deps, identity); // review clearance is not native admission or permission
     }
     const payload = JSON.parse(row.payload) as { directive: string };
-    const directive = row.requestKind === 'rebrief' ? renderRebriefPrompt({ jobId: row.jobId, note: payload.directive, briefing: row.contractSnapshot, workRevision: identity.workRevision }) : payload.directive;
+    const directive = row.requestKind === 'rebrief' ? renderRebriefPrompt({ jobId: row.jobId, note: payload.directive, briefing: row.contractSnapshot, workRevision: identity.workRevision,
+      reviewRole: isAdmittedBlind(deps.ledger, row.jobId) ? 'blind' : null }) : payload.directive;
     const result = await routeFixDirectiveToMinion({ ...deps, jobId: row.jobId, directive, freshSession: row.requestKind === 'rebrief',
       contract: row.contractSnapshot, owner: `silas-directive:${requestId}`,
       ...(row.contractSnapshot === null || row.requestKind === 'rebrief' ? {} : { continuation: {

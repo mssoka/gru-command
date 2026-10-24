@@ -23,6 +23,7 @@ import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { PUBLICATION_ABSENT_EVENT, PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_RECEIPT_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT, pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { LessonsReferencePort } from '../src/lessons/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
@@ -114,6 +115,7 @@ async function boot(opts: {
   observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   /** The actual native fixture path, not a second unrelated fake transcript. */
   minionPromptEffect?: (text: string, sessionFile: string) => void;
+  lessons?: LessonsReferencePort;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -231,6 +233,7 @@ async function boot(opts: {
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.observeBlindTurn !== undefined ? { observeBlindTurn: opts.observeBlindTurn } : {}),
+    ...(opts.lessons !== undefined ? { lessons: opts.lessons } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -2108,6 +2111,7 @@ if (argv.includes('--method') && argv.includes('POST')) {
         if (contaminate) appendFileSync(file, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`);
       },
       observeBlindTurn: (jobId, file) => { if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, file); },
+      lessons: { referencesFor: () => [{ chapter: 'synthetic-canary', lesson: 'outside-package', path: '/synthetic-book/chapters/synthetic-canary.md', why: 'synthetic fixture only' }] },
     });
     ledgerRef = h.ledger;
     const repo = makeFixtureRepo('fixture-silas-rebrief-blind'); cleanupRepos.push(repo);
@@ -2131,6 +2135,15 @@ if (argv.includes('--method') && argv.includes('POST')) {
       });
       expect(h.ledger.listJobEvents('reb-blind').filter((event) => event.kind === 'job.delivered' &&
         (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+      // The fresh reviewer gets its package once, the reviewer's orders and
+      // no lesson pointer.
+      const rebriefTexts = h.minionTurnTexts.filter((text) => text.startsWith('Re-brief —'));
+      expect(rebriefTexts).toHaveLength(1);
+      expect(rebriefTexts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
+      expect(rebriefTexts[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
+      expect(rebriefTexts[0]).toContain('this brief is READ-ONLY');
+      expect(rebriefTexts[0]).not.toContain('commit your work to the branch');
+      expect(rebriefTexts[0]).not.toContain('/synthetic-book/chapters/synthetic-canary.md');
     } finally { await h.close(); }
   });
 

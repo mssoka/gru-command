@@ -19,7 +19,7 @@ import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import type { DiskFloorGate, FloorAdmission } from '../maintenance/disk.js';
 import type { EventBus } from '../events/bus.js';
-import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { READ_ONLY_REVIEW_ORDERS, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import {
   assertLaneUsesBoundStore,
   blobText,
@@ -242,13 +242,7 @@ export function renderMinionBriefing(input: {
         ]
       : []),
     ...(input.deliverable === 'review'
-      ? [
-          'Execute the briefing inside this worktree. Standing orders: work only',
-          'inside this tree; this brief is READ-ONLY — change nothing, commit',
-          'nothing (an unmodified tree is the expected result); read the named',
-          'immutable head and diff via git show/git diff inside your tree; never',
-          'merge; end with your findings and a completion report.',
-        ]
+      ? READ_ONLY_REVIEW_ORDERS
       : input.deliverable === 'artifact' || input.deliverable === 'investigation'
         ? [
             'Execute the briefing inside this worktree. Standing orders: work only',

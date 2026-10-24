@@ -1332,6 +1332,8 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
       expect(prompts).toHaveLength(1);
       expect(prompts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
       expect(prompts[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
+      expect(prompts[0]).toContain('this brief is READ-ONLY');
+      expect(prompts[0]).not.toContain('commit your work to the branch');
       expect(prompts[0]).not.toContain('/synthetic-book/chapters/synthetic-book-canary.md');
     } finally {
       h.dispose();

@@ -208,6 +208,12 @@ describe('progressive-disclosure injection', () => {
     });
     expect(blindWithoutBriefing).toContain('(no additional briefing text is attached)');
     expect(blindWithoutBriefing).not.toContain('read the job note on the board');
+    // A blind reviewer's re-brief carries the read-only review orders, never
+    // the implementer's commit/build/PR orders.
+    expect(prompt).toContain('commit your work to the branch');
+    expect(blind).toContain('this brief is READ-ONLY — change nothing, commit');
+    expect(blind).not.toContain('commit your work to the branch');
+    expect(blind).not.toContain('never merge your own pull request');
   });
 
   it('re-briefs from the original contract when an evicted minion transcript cannot resume', async () => {
