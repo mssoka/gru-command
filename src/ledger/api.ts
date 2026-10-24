@@ -1477,14 +1477,18 @@ export class LedgerApi {
     ).all(roundId) as Row[]).map((row) => this.eventFromRow(row));
   }
 
-  /** One job's events, newest first (ops digest scans; bounded). */
-  listJobEvents(jobId: string, opts: { limit?: number } = {}): readonly EventRecord[] {
+  /** One job's bounded event window, newest first by default (ops digests).
+   * Evidence surfaces may narrow kinds, cap the rows and request oldest-first
+   * without scanning a moving global tail that can omit the job's receipts. */
+  listJobEvents(jobId: string, opts: { readonly limit?: number; readonly kinds?: readonly string[]; readonly order?: 'asc' | 'desc' } = {}): readonly EventRecord[] {
     const limit = opts.limit ?? 200;
-    return (
-      this.db
-        .prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT ?')
-        .all(jobId, limit) as Row[]
-    ).map((row) => this.eventFromRow(row));
+    const order = opts.order === 'asc' ? 'ASC' : 'DESC';
+    const kinds = opts.kinds;
+    const where = kinds === undefined || kinds.length === 0
+      ? 'job_id = ?'
+      : `job_id = ? AND kind IN (${kinds.map(() => '?').join(', ')})`;
+    return (this.db.prepare(`SELECT * FROM events WHERE ${where} ORDER BY seq ${order} LIMIT ?`)
+      .all(jobId, ...(kinds ?? []), limit) as Row[]).map((row) => this.eventFromRow(row));
   }
 
   /** R8-2 (gh-169, corrected by j-1594 native-verification-history-search):

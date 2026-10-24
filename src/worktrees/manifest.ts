@@ -310,13 +310,18 @@ export interface ApplyManifestOptions {
   readonly env?: Readonly<Record<string, string>>;
   /** Told each setup command's pid, which leads its own process group, so
    * a caller can end the group later (#427 onboarding proof). */
-  readonly onSpawn?: (pid: number) => void;
+  readonly onSpawn?: (pid: number, index: number, command: string) => void;
+  /** Durable setup-owner receipt before a configured command can run. */
+  readonly onCommandStart?: (index: number, command: string) => void;
+  /** The shell child's exit (code, signal, timeout, stop) once it closed;
+   * not proof that its process group ended. */
+  readonly onCommandOutcome?: (index: number, command: string, result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
 }
 
 /**
  * Apply a bootstrap manifest to a fresh worktree. Order: links, copies,
- * setup commands. Any failure rejects — the caller rolls the worktree
- * back; a half-bootstrapped tree is never handed to an agent. Async by
+ * setup commands. Any failure rejects — the caller applies its custody
+ * policy; a half-bootstrapped tree is never handed to an agent. Async by
  * contract: setup commands run as child processes OFF the event loop, so
  * a slow `npm ci` never freezes chat/supervision while dispatch awaits
  * the lane (the 2026-09-29 wall-clock-gap incident).
@@ -360,10 +365,12 @@ export async function applyWorktreeManifest(
 
   for (const [index, entry] of manifest.setup.entries()) {
     const started = Date.now();
+    opts.onCommandStart?.(index, entry.command);
     await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
       ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.env !== undefined ? { env: opts.env } : {}),
-      ...(opts.onSpawn !== undefined ? { onSpawn: opts.onSpawn } : {}),
+      ...(opts.onSpawn !== undefined ? { onSpawn: (pid) => opts.onSpawn?.(pid, index, entry.command) } : {}),
+      ...(opts.onCommandOutcome !== undefined ? { onOutcome: (result) => opts.onCommandOutcome?.(index, entry.command, result) } : {}),
     });
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
@@ -439,6 +446,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   readonly signal?: AbortSignal;
   readonly env?: Readonly<Record<string, string>>;
   readonly onSpawn?: (pid: number) => void;
+  readonly onOutcome?: (result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
 }): Promise<void> {
   const { signal } = opts;
   if (signal?.aborted === true) throw new Error(`worktree setup command was stopped before it started: ${command}`);
@@ -453,7 +461,6 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   } catch (error) {
     throw new Error(`worktree setup command failed to spawn (${command}): ${String(error)}`);
   }
-  if (child.pid !== undefined) opts.onSpawn?.(child.pid);
   const stdout = new OutputTail();
   const stderr = new OutputTail();
   child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
@@ -495,6 +502,16 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     // A command that ignores SIGTERM must not hold the dispatch forever.
     forceKillTimer ??= setTimeout(() => signalTree('SIGKILL'), SETUP_KILL_GRACE_MS);
   };
+  if (child.pid !== undefined) {
+    try {
+      opts.onSpawn?.(child.pid);
+    } catch (error) {
+      end();
+      try { await closed; } catch { /* the durable start receipt remains incomplete */ }
+      if (forceKillTimer !== undefined && !groupAlive()) clearTimeout(forceKillTimer);
+      throw new Error(`worktree setup process ownership receipt failed for ${command}`, { cause: error });
+    }
+  }
   const killTimer = setTimeout(() => {
     timedOut = true;
     end();
@@ -518,6 +535,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     if (forceKillTimer !== undefined && !((stopped || timedOut) && groupAlive())) clearTimeout(forceKillTimer);
   }
 
+  opts.onOutcome?.({ code: outcome.code, signal: outcome.signal, timedOut, stopped });
   const output = { stdout: stdout.stream(), stderr: stderr.stream() };
   const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
   const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);

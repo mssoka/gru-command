@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
+import type { ChildWorkerRecord, EventRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -15,6 +15,7 @@ import { IntakePartialFailure, type IntakeApprovalService } from '../intake/appr
 import type { IntakeSlicingService } from '../intake/slicing.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
+import { parsePreBootstrapPatchReference, PreBootstrapPatchError, type PreBootstrapPatchReference } from '../worktrees/prebootstrap-patch.js';
 import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
@@ -120,6 +121,10 @@ export interface DispatchServer {
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function strField(body: Record<string, unknown>, field: string): string {
@@ -545,8 +550,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // malformed is a named refusal, never a silent drop.
       const reviewRole = optStrFieldStrict(body, 'review_role');
       const parentContractSha256 = optStrFieldStrict(body, 'parent_contract_sha256');
+      let preBootstrapPatch: PreBootstrapPatchReference | undefined;
       let outcome: Awaited<ReturnType<DispatchService['dispatch']>>;
       try {
+        preBootstrapPatch = Object.hasOwn(body, 'prebootstrap_patch') ? parsePreBootstrapPatchReference(body['prebootstrap_patch']) : undefined;
         const inputPackage = Object.hasOwn(body, 'input_package') ? parseBlindInputPackage(body['input_package']) : undefined;
         outcome = await options.dispatch.dispatch({
           jobId: strField(body, 'job_id'),
@@ -554,7 +561,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           title: strField(body, 'title'),
           ...(displayName !== undefined ? { displayName } : {}),
           ...(deliverable !== undefined ? { deliverable } : {}),
-          ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
+          // A PR lane ignores the by-derived debtor, so it never makes a
+          // patched lane look like report metadata; an explicit one still does.
+          ...(commissioner !== undefined ? { commissioner } : by !== undefined && preBootstrapPatch === undefined ? { commissioner: by } : {}),
           ...(targetRef !== undefined ? { targetRef } : {}),
           ...(targetSha !== undefined ? { targetSha } : {}),
           ...(targetBase !== undefined ? { targetBase } : {}),
@@ -566,11 +575,34 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(reviewRole !== undefined ? { reviewRole } : {}),
           ...(inputPackage !== undefined ? { inputPackage } : {}),
           ...(parentContractSha256 !== undefined ? { parentContractSha256 } : {}),
+          ...(preBootstrapPatch !== undefined ? { preBootstrapPatch } : {}),
         });
       } catch (error) {
         // Issue #317: the selected source cannot provide the named review
         // inputs. No job, lane or reviewer exists; this is a refusal, not a
         // report, and grants no automatic retry.
+        if (error instanceof PreBootstrapPatchError) {
+          if (error.code === 'dispatch_failed') {
+            const jobId = typeof body['job_id'] === 'string' ? body['job_id'] : null;
+            log('warn', 'prebootstrap dependency patch dispatch failed after job admission', { job: jobId, code: error.code, detail: error.message });
+            json(res, 409, {
+              error: 'prebootstrap_patch_dispatch_failed',
+              code: error.code,
+              ...(jobId !== null ? { job_id: jobId, readback: `/api/dispatch/jobs/${encodeURIComponent(jobId)}/prebootstrap-patch` } : {}),
+              detail: error.message,
+              retry_authorized: false,
+            });
+            return true;
+          }
+          log('warn', 'prebootstrap dependency patch refused dispatch', { code: error.code, detail: error.message });
+          json(res, error.code === 'request_invalid' ? 400 : 422, {
+            error: 'prebootstrap_patch_refused',
+            code: error.code,
+            detail: error.message,
+            retry_authorized: false,
+          });
+          return true;
+        }
         if (error instanceof ReviewSourceUnavailableError) {
           log('warn', 'review source preflight refused dispatch', { problems: error.problems });
           json(res, 422, {
@@ -1113,6 +1145,171 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         return true;
       }
       json(res, 200, options.dispatch.observeBlindAccess(jobId, results) as unknown as Record<string, unknown>);
+      return true;
+    }
+    const preBootstrapReadbackMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/prebootstrap-patch$/.exec(path);
+    if (req.method === 'GET' && preBootstrapReadbackMatch !== null) {
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(preBootstrapReadbackMatch[1] ?? '');
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      const eventKinds = [
+        'job.prebootstrap-patch-admitted',
+        'worktree.prebootstrap-patch-creation-claimed',
+        'worktree.prebootstrap-patch-started',
+        'worktree.prebootstrap-patch-applied',
+        'worktree.prebootstrap-patch-failed',
+        'worktree.prebootstrap-setup-started',
+        'worktree.prebootstrap-setup-spawned',
+        'worktree.prebootstrap-setup-process-settled',
+        'worktree.prebootstrap-setup-succeeded',
+        'worktree.prebootstrap-setup-failed',
+        'worktree.prebootstrap-publication-failed',
+        'job.prebootstrap-patch-dispatch-failed',
+        'job.minion-spawned',
+      ];
+      const events = options.ledger.listJobEvents(jobId, { kinds: eventKinds, limit: 10_000, order: 'asc' });
+      const allOfKind = (kind: string) => events.filter((event) => event.kind === kind);
+      const admitted = allOfKind('job.prebootstrap-patch-admitted');
+      const admissionPayload = admitted.at(-1)?.payload;
+      const admissionRecord = isRecord(admissionPayload) ? admissionPayload : null;
+      const expectedPackageSha = typeof admissionPayload === 'object' && admissionPayload !== null
+        ? (admissionPayload as Record<string, unknown>)['package_sha256'] : null;
+      const expectedRequestSha = typeof admissionPayload === 'object' && admissionPayload !== null
+        ? (admissionPayload as Record<string, unknown>)['request_payload_sha256'] : null;
+      const scopedEvents = events.filter((event) => {
+        if (event.kind === 'job.prebootstrap-patch-admitted' || event.kind === 'job.minion-spawned') return true;
+        if (typeof expectedPackageSha !== 'string' || typeof expectedRequestSha !== 'string') return false;
+        const payload = event.payload;
+        return isRecord(payload) && payload['package_sha256'] === expectedPackageSha && payload['request_payload_sha256'] === expectedRequestSha;
+      });
+      const ofKind = (kind: string) => scopedEvents.filter((event) => event.kind === kind);
+      const unmatchedReceiptCount = events.filter((event) => event.kind !== 'job.prebootstrap-patch-admitted' && event.kind !== 'job.minion-spawned' && !scopedEvents.includes(event)).length;
+      const creationClaimed = ofKind('worktree.prebootstrap-patch-creation-claimed');
+      const patchStarted = ofKind('worktree.prebootstrap-patch-started');
+      const patchApplied = ofKind('worktree.prebootstrap-patch-applied');
+      const patchFailed = ofKind('worktree.prebootstrap-patch-failed');
+      const setupFailed = ofKind('worktree.prebootstrap-setup-failed');
+      const setupSucceeded = ofKind('worktree.prebootstrap-setup-succeeded');
+      const publicationFailed = ofKind('worktree.prebootstrap-publication-failed');
+      const dispatchFailed = ofKind('job.prebootstrap-patch-dispatch-failed');
+      const setupStarted = ofKind('worktree.prebootstrap-setup-started');
+      const workerSpawned = allOfKind('job.minion-spawned');
+      const startedIndexes = setupStarted.map((event) => isRecord(event.payload) ? event.payload['setup_index'] : null);
+      const setupProducerReceipts = setupStarted.map((started) => {
+        const payload = isRecord(started.payload) ? started.payload : {};
+        const index = payload['setup_index'];
+        const matches = (event: EventRecord): boolean => {
+          const candidate = isRecord(event.payload) ? event.payload : null;
+          return candidate !== null && candidate['setup_index'] === index && candidate['worktree_path'] === payload['worktree_path'] &&
+            candidate['command_sha256'] === payload['command_sha256'];
+        };
+        const spawns = ofKind('worktree.prebootstrap-setup-spawned').filter(matches);
+        const outcomes = ofKind('worktree.prebootstrap-setup-process-settled').filter(matches);
+        const spawn = spawns.length === 1 ? spawns[0] : undefined;
+        const settled = outcomes.length === 1 ? outcomes[0] : undefined;
+        const conflicting = spawns.length > 1 || outcomes.length > 1;
+        return {
+          setup_started_seq: started.seq,
+          spawn_seq: spawn?.seq ?? null,
+          outcome_seq: settled?.seq ?? null,
+          setup_index: index,
+          command_sha256: payload['command_sha256'] ?? null,
+          spawn: spawn?.payload ?? null,
+          outcome: settled?.payload ?? null,
+          producer_state: conflicting ? 'conflicting_receipts_unknown' : settled !== undefined ? 'child_exit_result_recorded_group_state_unknown'
+            : spawn !== undefined ? 'unknown' : 'spawn_receipt_missing_state_unknown',
+        };
+      });
+      const setupSpawned = ofKind('worktree.prebootstrap-setup-spawned');
+      const setupSettled = ofKind('worktree.prebootstrap-setup-process-settled');
+      const laneReceiptEvents = [
+        ...patchStarted, ...patchApplied, ...patchFailed, ...setupStarted, ...setupSpawned, ...setupSettled,
+        ...setupSucceeded, ...setupFailed, ...publicationFailed,
+      ];
+      const laneReference = patchStarted[0]?.payload ?? patchApplied[0]?.payload ?? patchFailed[0]?.payload;
+      const laneReferencePayload = isRecord(laneReference) ? laneReference : null;
+      const laneIdentityConflict = laneReferencePayload !== null && laneReceiptEvents.some((event) => {
+        const payload = event.payload;
+        return !isRecord(payload) || payload['worktree_path'] !== laneReferencePayload['worktree_path'] || payload['branch'] !== laneReferencePayload['branch'] ||
+          payload['base_sha'] !== laneReferencePayload['base_sha'];
+      });
+      const claimPayload = creationClaimed[0]?.payload;
+      const claimRecord = isRecord(claimPayload) ? claimPayload : null;
+      const firstPatchStart = isRecord(patchStarted[0]?.payload) ? patchStarted[0]!.payload as Record<string, unknown> : null;
+      const claimConflict = laneReceiptEvents.length > 0 && (creationClaimed.length !== 1 || claimRecord === null || admissionRecord === null ||
+        laneReferencePayload === null || claimRecord['repository_path'] !== admissionRecord['repository_path'] ||
+        claimRecord['expected_base_sha'] !== laneReferencePayload['base_sha'] ||
+        claimRecord['expected_base_tree'] !== admissionRecord['expected_base_tree'] ||
+        firstPatchStart !== null && firstPatchStart['base_tree'] !== admissionRecord['expected_base_tree']);
+      const setupProducerConflict = setupProducerReceipts.some((receipt) => receipt['producer_state'] === 'conflicting_receipts_unknown') ||
+        [...setupSpawned, ...setupSettled].some((event) => setupStarted.filter((started) => {
+          const start = isRecord(started.payload) ? started.payload : null;
+          const candidate = isRecord(event.payload) ? event.payload : null;
+          return start !== null && candidate !== null && candidate['setup_index'] === start['setup_index'] &&
+            candidate['worktree_path'] === start['worktree_path'] && candidate['command_sha256'] === start['command_sha256'];
+        }).length !== 1);
+      const successOutcomeConflict = setupSucceeded.length === 1 && setupProducerReceipts.some((receipt) => {
+        const outcome = receipt['outcome'];
+        return !isRecord(outcome) || !Number.isSafeInteger(outcome['setup_index']) ||
+          outcome['exit_code'] !== 0 || outcome['signal'] !== null || outcome['timed_out'] !== false || outcome['stopped'] !== false;
+      });
+      const producerOrderConflict = setupProducerReceipts.some((receipt) => {
+        const startSeq = receipt['setup_started_seq'];
+        const spawnSeq = receipt['spawn_seq'];
+        const outcomeSeq = receipt['outcome_seq'];
+        return typeof startSeq !== 'number' || (typeof spawnSeq === 'number' && spawnSeq <= startSeq) ||
+          (typeof outcomeSeq === 'number' && (outcomeSeq <= startSeq || typeof spawnSeq === 'number' && outcomeSeq <= spawnSeq));
+      });
+      const orderingConflict = (patchApplied[0] !== undefined && (patchStarted.length !== 1 || patchStarted[0]!.seq >= patchApplied[0].seq)) ||
+        (setupStarted.some((started) => patchApplied[0] === undefined || started.seq <= patchApplied[0].seq)) ||
+        (setupSucceeded.length > 0 && patchApplied.length !== 1) ||
+        (setupFailed.length > 0 && (patchApplied.length !== 1 || setupFailed[0]!.seq <= patchApplied[0]!.seq)) ||
+        (setupSucceeded[0] !== undefined && (patchApplied[0] === undefined || patchApplied[0].seq >= setupSucceeded[0].seq ||
+          producerOrderConflict || setupProducerReceipts.some((receipt) => receipt['outcome_seq'] === null ||
+            typeof receipt['outcome_seq'] === 'number' && receipt['outcome_seq'] >= setupSucceeded[0]!.seq))) ||
+        (publicationFailed[0] !== undefined && (setupSucceeded[0] === undefined || publicationFailed[0].seq <= setupSucceeded[0].seq)) ||
+        (workerSpawned[0] !== undefined && (setupSucceeded[0] === undefined || workerSpawned[0]!.seq <= setupSucceeded[0].seq));
+      const contradictoryReceipts = (patchApplied.length > 0 && patchFailed.length > 0) || (setupSucceeded.length > 0 && setupFailed.length > 0) ||
+        (workerSpawned.length > 0 && (setupSucceeded.length !== 1 || setupFailed.length > 0 || patchFailed.length > 0 || publicationFailed.length > 0 ||
+          dispatchFailed.some((failure) => failure.seq <= workerSpawned[0]!.seq)));
+      const receiptConflict = unmatchedReceiptCount > 0 || new Set(startedIndexes).size !== startedIndexes.length ||
+        startedIndexes.some((index) => !Number.isSafeInteger(index) || (index as number) < 0) || setupProducerConflict || successOutcomeConflict ||
+        orderingConflict || contradictoryReceipts || laneIdentityConflict || claimConflict || creationClaimed.length > 1 ||
+        [patchStarted, patchApplied, patchFailed, setupFailed, setupSucceeded, publicationFailed, dispatchFailed, workerSpawned]
+          .some((receipts) => receipts.length > 1);
+      const state = admitted.length !== 1 ? admitted.length === 0 ? 'no_admission_receipt' : 'conflicted_admission_receipts'
+        : receiptConflict ? 'conflicted_receipts_unknown'
+          : patchFailed.length > 0 ? 'patch_failed'
+          : setupFailed.length > 0 ? 'setup_failed'
+            : publicationFailed.length > 0 ? 'setup_succeeded_publication_failed'
+              : setupSucceeded.length > 0 && dispatchFailed.length > 0 ? 'setup_succeeded_dispatch_failed'
+                : setupSucceeded.length > 0 ? 'setup_succeeded'
+                  : dispatchFailed.length > 0 ? 'worktree_admission_failed'
+                    : patchApplied.length > 0 ? 'setup_in_progress_or_unknown'
+                      : patchStarted.length > 0 ? 'patch_in_progress_or_unknown'
+                        : creationClaimed.length > 0 ? 'creation_claimed_not_started_or_unknown' : 'admitted_not_started_or_unknown';
+      json(res, 200, {
+        job_id: jobId,
+        state,
+        admission: admitted.at(-1)?.payload ?? null,
+        patch: patchFailed.at(-1)?.payload ?? patchApplied.at(-1)?.payload ?? patchStarted.at(-1)?.payload ?? null,
+        setup: setupFailed.at(-1)?.payload ?? setupSucceeded.at(-1)?.payload ?? null,
+        setup_producers: setupProducerReceipts,
+        // A dispatch failure after the spawn means the worker was refused
+        // before its briefing; that is not a recorded admission.
+        worker_admission: workerSpawned.length === 0 ? 'unproven' : workerSpawned.length !== 1 ? 'conflicted'
+          : dispatchFailed.length > 0 ? 'refused_after_spawn' : 'recorded',
+        dispatch_failure: dispatchFailed.at(-1)?.payload ?? null,
+        unmatched_receipt_count: unmatchedReceiptCount,
+        events: events.map((event) => ({ seq: event.seq, kind: event.kind, payload: event.payload })),
+        recovery: admitted.length === 0 ? 'No prebootstrap admission receipt is present; absence does not prove that no producer or source effect exists. Inspect the job, worktree creation custody and ledger before any new action.'
+          : state === 'setup_succeeded' && workerSpawned.length === 1 ? 'Configured setup success and ordinary worker admission are recorded; this endpoint is observational only.'
+            : state === 'setup_succeeded' ? 'Configured setup success is recorded but worker admission is unproven. This endpoint grants no continuation or retry; inspect job, lane and worker custody. Any new attempt requires a separately authorized fresh job/request.'
+              : 'Do not replay this request, reapply the patch, rerun setup, clean the lane, or infer producer cessation. Inspect the retained lane, creation receipt and setup process records; only a separately authorized fresh job/request can retry.',
+      });
       return true;
     }
     // Canonical job amendments (owner ruling j-969): authenticated,

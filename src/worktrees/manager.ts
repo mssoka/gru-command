@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
+import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, pendingLaneHandoffPublished, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
 import { CreationIntentError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -6,6 +6,7 @@ import {
   chmodSync,
   closeSync,
   copyFileSync,
+  fsyncSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -15,10 +16,12 @@ import {
   readFileSync,
   readSync,
   realpathSync,
+  renameSync,
   rmdirSync,
   rmSync,
   statSync,
   utimesSync,
+  writeFileSync,
   type Dirent,
   type Stats,
 } from 'node:fs';
@@ -33,7 +36,7 @@ import {
   rm as rmAsync,
   symlink as symlinkAsync,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
@@ -45,6 +48,7 @@ import { oneLineErrorText } from '../property/error-text.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
 import { readLaneTokens, readProcessFacts, type LaneTokenRead, type LaneTokenReader, type ProcessFacts } from './lane-provenance.js';
 import type { ManagedRepoPath } from '../repos/managed-names.js';
+import { assertSafeRequirementsPatch, originIdentitySha256, readPreBootstrapDependencyPatchPackage, PreBootstrapPatchError, type LoadedPreBootstrapPatch } from './prebootstrap-patch.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -663,6 +667,8 @@ export interface WorktreeManagerOptions {
   readonly preserveRoot: string;
   /** One-time setup command budget per worktree bootstrap. */
   readonly setupTimeoutMs: number;
+  /** Private instance-owned package root required for pre-bootstrap edits. */
+  readonly preBootstrapPatchRoot?: string;
   /** Grace between the acknowledged SIGTERM and the SIGKILL (ms). */
   readonly killGraceMs?: number;
   /** Fetch budget for origin base resolution (default 30 s) — a network
@@ -859,6 +865,65 @@ const GC_GIT_IDENTITY = {
   GIT_COMMITTER_NAME: 'Gru Command',
   GIT_COMMITTER_EMAIL: 'gru-command@localhost',
 } as const;
+
+function preBootstrapSha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function syncPatchDirectory(path: string): void {
+  const fd = openSync(path, 'r');
+  try {
+    try { fsyncSync(fd); } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EINVAL' && code !== 'ENOTSUP') throw error;
+    }
+  } finally { closeSync(fd); }
+}
+
+function gitTreeWithRequirementsPatch(repoPath: string, baseSha: string, requirementsBytes: Buffer): string {
+  // Compute the virtual tree hash without a temporary index or writing any
+  // blobs/trees into the source repository's shared object store.
+  const format = runGit(repoPath, ['rev-parse', '--show-object-format']);
+  if (format !== 'sha1' && format !== 'sha256') throw new Error(`unsupported Git object format ${format}`);
+  const listing = spawnSync('git', ['ls-tree', '-z', baseSha], {
+    cwd: repoPath,
+    encoding: null,
+    timeout: 10_000,
+    maxBuffer: 64 * 1024 * 1024,
+    env: repositoryGitEnv(false),
+  });
+  if (listing.status !== 0 || listing.stdout === null) {
+    throw new Error(`git ls-tree failed while computing the prebootstrap tree (${String(listing.stderr ?? listing.error ?? 'unknown error')})`);
+  }
+  const hashObject = (type: 'blob' | 'tree', body: Buffer): Buffer => createHash(format)
+    .update(`${type} ${body.length}\0`, 'ascii').update(body).digest();
+  const replacementBlob = hashObject('blob', requirementsBytes);
+  const entries: Buffer[] = [];
+  let offset = 0;
+  let replaced = false;
+  while (offset < listing.stdout.length) {
+    const end = listing.stdout.indexOf(0, offset);
+    if (end < 0) throw new Error('git ls-tree returned a truncated NUL-delimited listing');
+    const record = listing.stdout.subarray(offset, end);
+    const tab = record.indexOf(0x09);
+    if (tab < 0) throw new Error('git ls-tree returned a malformed entry');
+    const [mode, type, objectId] = record.subarray(0, tab).toString('ascii').split(' ');
+    const name = record.subarray(tab + 1);
+    if (mode === undefined || type === undefined || objectId === undefined) throw new Error('git ls-tree returned an incomplete entry header');
+    const objectBytes = name.equals(Buffer.from('requirements.txt', 'utf8'))
+      ? (() => {
+          if (type !== 'blob' || replaced) throw new Error('base tree has an invalid requirements.txt entry');
+          replaced = true;
+          return replacementBlob;
+        })()
+      : Buffer.from(objectId, 'hex');
+    const serializedMode = mode === '040000' ? '40000' : mode;
+    entries.push(Buffer.concat([Buffer.from(`${serializedMode} `, 'ascii'), name, Buffer.from([0]), objectBytes]));
+    offset = end + 1;
+  }
+  if (!replaced) throw new Error('base tree has no root requirements.txt entry');
+  return hashObject('tree', Buffer.concat(entries)).toString('hex');
+}
 
 function runGit(repoPath: string, args: readonly string[], opts: SpawnGitOptions = {}): string {
   const { status, stdout, stderr, error } = spawnGit(repoPath, args, opts);
@@ -1412,45 +1477,355 @@ export class WorktreeManager {
     return { repoPath: canonical, repoName: basename(canonical) };
   }
 
+  private assertPreBootstrapAuthority(jobId: string, patch: LoadedPreBootstrapPatch): void {
+    const expected = patch.package.authority;
+    const current = this.opts.ledger.directiveCurrentAuthority(jobId);
+    if (current.contractSha256 !== expected.contractSha256 || current.workRevision !== expected.workRevision || current.authorityEpoch !== expected.authorityEpoch) {
+      throw new PreBootstrapPatchError('authority_mismatch', `job "${jobId}" prebootstrap contract/revision/authority changed`);
+    }
+    if (this.opts.ledger.getJob(jobId)?.status !== 'working') {
+      throw new PreBootstrapPatchError('authority_mismatch', `job "${jobId}" is no longer working; prebootstrap patch refused`);
+    }
+  }
+
+  private assertPreBootstrapAdmission(jobId: string, patch: LoadedPreBootstrapPatch): void {
+    const rows = this.opts.ledger.listJobEvents(jobId, { kinds: ['job.prebootstrap-patch-admitted'], limit: 10 });
+    const event = rows.at(-1);
+    const payload = event?.payload as Record<string, unknown> | null;
+    const pkg = patch.package;
+    if (event === undefined || rows.length !== 1 || typeof payload !== 'object' || payload === null ||
+        payload['version'] !== 1 || payload['package_file'] !== patch.reference.packageFile ||
+        payload['package_sha256'] !== patch.packageBytesSha256 ||
+        payload['request_payload_sha256'] !== patch.requestPayloadSha256 ||
+        payload['intake_identity_sha256'] !== patch.intakeIdentitySha256 ||
+        payload['repository_path'] !== pkg.repository.path || payload['origin_sha256'] !== pkg.repository.originSha256 ||
+        payload['expected_base_sha'] !== pkg.base.commit || payload['expected_base_tree'] !== pkg.base.tree ||
+        payload['contract_sha256'] !== pkg.authority.contractSha256 || payload['work_revision'] !== pkg.authority.workRevision ||
+        payload['authority_epoch'] !== pkg.authority.authorityEpoch || JSON.stringify(payload['allowlist']) !== JSON.stringify(pkg.allowlist)) {
+      throw new PreBootstrapPatchError('admission_receipt_mismatch', `job "${jobId}" has no exact durable prebootstrap admission receipt`);
+    }
+  }
+
+  private assertPreBootstrapSource(repoPath: string, patch: LoadedPreBootstrapPatch, baseSha?: string, baseTree?: string, baseSource?: WorktreeBaseSource | null): string {
+    const pkg = patch.package;
+    if (realpathSync(repoPath) !== pkg.repository.path) {
+      throw new PreBootstrapPatchError('source_mismatch', 'prebootstrap package names a different canonical repository path');
+    }
+    const origin = spawnGit(repoPath, ['remote', 'get-url', 'origin'], { noPrompt: true });
+    if (origin.status !== 0 || origin.stdout.trim() === '') throw new PreBootstrapPatchError('source_mismatch', 'prebootstrap patch requires the repository origin identity');
+    const originSha256 = originIdentitySha256(origin.stdout);
+    if (originSha256 !== pkg.repository.originSha256) throw new PreBootstrapPatchError('source_mismatch', 'prebootstrap package names a different repository origin');
+    if (baseSha !== undefined && (baseSource !== 'origin' || baseSha !== pkg.base.commit)) {
+      throw new PreBootstrapPatchError('base_mismatch', 'prebootstrap package base is not the exact freshly fetched origin head');
+    }
+    const actualSha = baseSha ?? pkg.base.commit;
+    const actualTree = baseTree ?? runGit(repoPath, ['rev-parse', '--verify', `${actualSha}^{tree}`]);
+    if (actualTree !== pkg.base.tree) throw new PreBootstrapPatchError('base_mismatch', 'prebootstrap package tree does not match its exact base commit');
+    return originSha256;
+  }
+
+  private assertPreBootstrapBaseFile(repoPath: string, baseSha: string, patch: LoadedPreBootstrapPatch): void {
+    const treeEntry = spawnGit(repoPath, ['ls-tree', '-z', baseSha, '--', 'requirements.txt']);
+    const treeRecord = treeEntry.stdout.split('\u0000')[0] ?? '';
+    const treeHeader = treeRecord.split('\t', 1)[0] ?? '';
+    const [mode, type] = treeHeader.split(' ');
+    if (treeEntry.status !== 0 || type !== 'blob' || mode !== '100644' && mode !== '100755') {
+      throw new PreBootstrapPatchError('file_mismatch', 'exact base requirements.txt must be a tracked regular Git blob, not a symlink or special file');
+    }
+    const entry = patch.package.files[0];
+    const baseFile = spawnGit(repoPath, ['show', `${baseSha}:requirements.txt`], { maxBuffer: 1024 * 1024 });
+    if (baseFile.status !== 0) throw new PreBootstrapPatchError('file_mismatch', 'exact base does not contain a readable requirements.txt');
+    const before = Buffer.from(baseFile.stdout, 'utf8');
+    if (preBootstrapSha256(before) !== entry.beforeSha256) throw new PreBootstrapPatchError('file_mismatch', 'exact base requirements.txt does not match before_sha256');
+    assertSafeRequirementsPatch(before.toString('utf8'), entry.content);
+  }
+
+  private applyPreBootstrapPatch(input: {
+    readonly repoPath: string;
+    readonly worktreePath: string;
+    readonly jobId: string;
+    readonly custody: CreationCustody;
+    readonly patch: LoadedPreBootstrapPatch;
+  }): { readonly beforeTree: string; readonly afterTree: string; readonly beforeSha256: string; readonly afterSha256: string } {
+    const { repoPath, worktreePath, jobId, custody, patch } = input;
+    this.assertPreBootstrapAuthority(jobId, patch);
+    this.assertPreBootstrapAdmission(jobId, patch);
+    this.assertCreationIdentity(worktreePath, custody);
+    this.assertCreationCustody(repoPath, worktreePath, custody);
+    if (this.opts.preBootstrapPatchRoot === undefined) throw new PreBootstrapPatchError('package_unavailable', 'private prebootstrap package root is not wired');
+    const current = readPreBootstrapDependencyPatchPackage(this.opts.preBootstrapPatchRoot, patch.reference);
+    if (current.packageBytesSha256 !== patch.packageBytesSha256 || JSON.stringify(current.package) !== JSON.stringify(patch.package) ||
+        current.requestPayloadSha256 !== patch.requestPayloadSha256 || current.intakeIdentitySha256 !== patch.intakeIdentitySha256) {
+      throw new PreBootstrapPatchError('package_changed', 'prebootstrap package changed after admission');
+    }
+    const baseTree = runGit(worktreePath, ['rev-parse', '--verify', `${custody.sha}^{tree}`]);
+    this.assertPreBootstrapSource(repoPath, patch, custody.sha, baseTree, custody.baseSource);
+    const manifestBefore = spawnGit(worktreePath, ['rev-parse', '--verify', '--quiet', `${custody.sha}:${MANIFEST_PATH}`]);
+    const manifestBlob = manifestBefore.status === 0 ? manifestBefore.stdout.trim() : null;
+    const filePath = join(worktreePath, 'requirements.txt');
+    let fileStat: Stats;
+    try { fileStat = lstatSync(filePath); } catch (error) { throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt is unavailable', { cause: error }); }
+    if (!fileStat.isFile() || fileStat.isSymbolicLink()) throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt is not a regular non-symlink file');
+    if (realpathSync(filePath) !== join(realpathSync(worktreePath), 'requirements.txt')) {
+      throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt escapes the owned worktree');
+    }
+    const before = readFileSync(filePath);
+    const entry = patch.package.files[0];
+    if (preBootstrapSha256(before) !== entry.beforeSha256) throw new PreBootstrapPatchError('file_mismatch', 'base requirements.txt bytes do not match the package before_sha256');
+    assertSafeRequirementsPatch(before.toString('utf8'), entry.content);
+    const afterBytes = Buffer.from(entry.content, 'utf8');
+    const beforeTree = runGit(worktreePath, ['rev-parse', '--verify', `${custody.sha}^{tree}`]);
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.prebootstrap-patch-started',
+      jobId,
+      payload: {
+        version: 1,
+        package_sha256: patch.packageBytesSha256,
+        request_payload_sha256: patch.requestPayloadSha256,
+        intake_identity_sha256: patch.intakeIdentitySha256,
+        worktree_path: worktreePath,
+        branch: custody.branch,
+        base_sha: custody.sha,
+        base_tree: beforeTree,
+        manifest_blob: manifestBlob,
+        allowlist: ['requirements.txt'],
+        producer_host: hostname(),
+        producer_pid: process.pid,
+        creation_token_sha256: preBootstrapSha256(custody.token),
+        file_before_sha256: entry.beforeSha256,
+        file_after_sha256: entry.afterSha256,
+      },
+    });
+
+    const tempPath = join(worktreePath, `.requirements.txt.prebootstrap-${randomUUID()}.tmp`);
+    let renamed = false;
+    try {
+      const fd = openSync(tempPath, 'wx', fileStat.mode & 0o777);
+      try {
+        writeFileSync(fd, afterBytes);
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      renameSync(tempPath, filePath);
+      renamed = true;
+      syncPatchDirectory(worktreePath);
+    } finally {
+      if (!renamed) {
+        try { rmSync(tempPath, { force: true }); } catch { /* keep the primary patch failure; the lane receipt remains */ }
+      }
+    }
+
+    this.assertCreationIdentity(worktreePath, custody);
+    this.assertCreationCustody(repoPath, worktreePath, custody);
+    const after = readFileSync(filePath);
+    if (preBootstrapSha256(after) !== entry.afterSha256) throw new PreBootstrapPatchError('file_mismatch', 'applied requirements.txt bytes do not match the package after_sha256');
+    const listed = (args: readonly string[]): readonly string[] => runGit(worktreePath, args).split('\n').filter((line) => line !== '');
+    const changed = listed(['diff', '--name-only', '--no-ext-diff', '--no-textconv', 'HEAD', '--']);
+    const untracked = listed(['ls-files', '--others', '--exclude-standard']);
+    const staged = listed(['diff', '--cached', '--name-only', '--']);
+    // The receipt records this measured set, so it can never claim a set the
+    // lane did not have.
+    const changedPaths = [...changed, ...staged, ...untracked];
+    if (changed.length !== 1 || changed[0] !== 'requirements.txt' || staged.length > 0 || untracked.length > 0) {
+      throw new PreBootstrapPatchError('changed_paths', `prebootstrap patch produced unapproved tracked/untracked changes (tracked=${JSON.stringify(changed)}, staged=${JSON.stringify(staged)}, untracked=${JSON.stringify(untracked)})`);
+    }
+    const afterTree = gitTreeWithRequirementsPatch(worktreePath, custody.sha, afterBytes);
+    this.assertPreBootstrapAuthority(jobId, patch);
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.prebootstrap-patch-applied',
+      jobId,
+      payload: {
+        version: 1,
+        package_sha256: patch.packageBytesSha256,
+        request_payload_sha256: patch.requestPayloadSha256,
+        intake_identity_sha256: patch.intakeIdentitySha256,
+        worktree_path: worktreePath,
+        branch: custody.branch,
+        base_sha: custody.sha,
+        before_tree: beforeTree,
+        after_tree: afterTree,
+        manifest_blob: manifestBlob,
+        changed_paths: changedPaths,
+        file_before_sha256: entry.beforeSha256,
+        file_after_sha256: entry.afterSha256,
+        producer_host: hostname(),
+        producer_pid: process.pid,
+        creation_token_sha256: preBootstrapSha256(custody.token),
+      },
+    });
+    return { beforeTree, afterTree, beforeSha256: entry.beforeSha256, afterSha256: entry.afterSha256 };
+  }
+
+  private setupAudit(jobId: string, patch: LoadedPreBootstrapPatch, custody: CreationCustody, worktreePath: string): {
+    readonly onCommandStart: (index: number, command: string) => void;
+    readonly onSpawn: (pid: number, index: number, command: string) => void;
+    readonly onCommandOutcome: (index: number, command: string, result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
+  } {
+    const base = {
+      version: 1,
+      package_sha256: patch.packageBytesSha256,
+      request_payload_sha256: patch.requestPayloadSha256,
+      intake_identity_sha256: patch.intakeIdentitySha256,
+      worktree_path: worktreePath,
+      branch: custody.branch,
+      base_sha: custody.sha,
+      producer_host: hostname(),
+      producer_pid: process.pid,
+      creation_token_sha256: preBootstrapSha256(custody.token),
+    } as const;
+    return {
+      onCommandStart: (index, command) => {
+        this.assertPreBootstrapAuthority(jobId, patch);
+        this.opts.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-started', jobId,
+          payload: { ...base, setup_index: index, command_sha256: preBootstrapSha256(command) } });
+      },
+      onSpawn: (pid, index, command) => this.opts.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-spawned', jobId,
+        payload: { ...base, setup_index: index, command_sha256: preBootstrapSha256(command), pid, process_group_id: pid } }),
+      onCommandOutcome: (index, command, result) => this.opts.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-process-settled', jobId,
+        payload: { ...base, setup_index: index, command_sha256: preBootstrapSha256(command), exit_code: result.code,
+          signal: result.signal, timed_out: result.timedOut, stopped: result.stopped } }),
+    };
+  }
+
+  private async publishPreBootstrapFailureLane(input: {
+    readonly repo: { readonly repoPath: string; readonly repoName: string };
+    readonly branch: string;
+    readonly path: string;
+    readonly sha: string;
+    readonly base: ResolvedBase;
+    readonly custody: CreationCustody;
+    readonly jobId: string;
+  }): Promise<WorktreeRecord> {
+    const existing = this.opts.ledger.getWorktree(input.jobId);
+    if (existing !== null) return existing;
+    this.assertCreationIdentity(input.path, input.custody);
+    const completion = this.assertCreationCustody(input.repo.repoPath, input.path, input.custody);
+    const lane = { id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: input.repo.repoPath,
+      path: input.path, branch: input.branch, sha: input.sha } as const;
+    // A failed registration may follow this creation's own published receipt.
+    if (!pendingLaneHandoffPublished(lane, completion, input.custody.token)) beginLaneHandoff(lane, completion, input.custody.token);
+    const record = this.opts.ledger.registerWorktree({
+      id: input.jobId, kind: 'job', repoPath: input.repo.repoPath, repoName: input.repo.repoName,
+      path: input.path, branch: input.branch, sha: input.sha, baseSource: input.base.baseSource, jobId: input.jobId,
+    });
+    // A consumed pre-bootstrap request never spends its creation receipt on
+    // patch/setup failure: it is part of the retained recovery evidence and
+    // prevents any later manager from adopting or replaying this lane.
+    this.handoffLane(input.repo.repoPath, input.path, input.custody, record);
+    this.recordRepoIdentity(record);
+    return record;
+  }
+
+  /** Spends a patched lane's creation receipt once dispatch recorded the
+   * lane's worker. Anything short of that exact proof refuses by name and
+   * keeps the receipt. */
+  completePreBootstrapWorkerAdmission(input: { repoPath: string; jobId: string }): void {
+    const repo = this.assertRepo(input.repoPath);
+    const branch = `gru/${input.jobId}`;
+    const record = this.opts.ledger.getWorktree(input.jobId);
+    const spawned = this.opts.ledger.latestJobEvent(input.jobId, 'job.minion-spawned');
+    const spawnedPayload = spawned?.payload as Record<string, unknown> | null | undefined;
+    if (record === null || record.kind !== 'job' || record.status !== 'active' || record.repoPath !== repo.repoPath || record.branch !== branch ||
+        spawnedPayload?.['worktree'] !== record.path || spawnedPayload['branch'] !== branch) {
+      throw new PreBootstrapPatchError('admission_unproven', `job "${input.jobId}" has no recorded worker on its patched lane; its creation receipt is kept`);
+    }
+    const common = this.creationCommonDirectory(repo.repoPath);
+    const receipt = readCreationIntent(common, branch);
+    if (receipt === null || receipt.lane.id !== input.jobId || receipt.lane.path !== record.path || receipt.sha !== record.sha) {
+      throw new PreBootstrapPatchError('creation_receipt_mismatch', `job "${input.jobId}" patched lane has no exact retained creation receipt`);
+    }
+    clearCreationIntent(common, branch, receipt.token);
+  }
+
   /**
    * Branch-for-jobs (ruling 18d): one worktree per job, on its own
    * branch `gru/<jobId>`, created at the FETCHED origin head —
    * sequential per repo (ruling 18e), manifest auto-applied (18a),
    * registry row written (18b) with the base's provenance (18b).
    */
-  async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeRecord> {
+  createJobWorktreeWithPreBootstrapPatch(input: { repoPath: string; jobId: string; preBootstrapPatch: LoadedPreBootstrapPatch }): Promise<WorktreeRecord> {
+    return this.createJobWorktree(input);
+  }
+
+  async createJobWorktree(input: { repoPath: string; jobId: string; preBootstrapPatch?: LoadedPreBootstrapPatch }): Promise<WorktreeRecord> {
     if (input.jobId === '') throw new Error('job id must be non-empty');
     return this.withRepoLock(input.repoPath, async () => {
       const repo = this.assertRepo(input.repoPath);
+      const patch = input.preBootstrapPatch;
       const branch = `gru/${input.jobId}`;
       const path = join(this.opts.root, repo.repoName, `job-${input.jobId}`);
       const lane = { id: input.jobId, kind: 'job' as const, jobId: input.jobId, roundId: null, path };
-      // Issue #453: an interrupted earlier attempt may have committed the ref
-      // without its checkout. Only its own retained receipt may be adopted; a
-      // ref nobody can attribute stays a refusal.
-      const retained = await this.reconcileInterruptedCreation(repo.repoPath, lane, branch);
+      if (patch !== undefined) {
+        if (this.opts.preBootstrapPatchRoot === undefined) throw new PreBootstrapPatchError('package_unavailable', 'private prebootstrap package root is not wired');
+        if (this.opts.ledger.getWorktree(input.jobId) !== null) throw new PreBootstrapPatchError('foreign_lane', `job "${input.jobId}" already owns a worktree; prebootstrap patch requires a fresh lane`);
+        const receipt = readCreationIntent(this.creationCommonDirectory(repo.repoPath), branch);
+        if (receipt !== null) throw new PreBootstrapPatchError('foreign_receipt', `branch ${branch} has a retained creation receipt; prebootstrap patch will not adopt or replay it`);
+        const currentPackage = readPreBootstrapDependencyPatchPackage(this.opts.preBootstrapPatchRoot, patch.reference);
+        if (currentPackage.packageBytesSha256 !== patch.packageBytesSha256 || JSON.stringify(currentPackage.package) !== JSON.stringify(patch.package)) {
+          throw new PreBootstrapPatchError('package_changed', 'prebootstrap package changed before worktree creation');
+        }
+        this.assertPreBootstrapAdmission(input.jobId, patch);
+        this.assertPreBootstrapAuthority(input.jobId, patch);
+      }
+      // An interrupted ordinary creation may be adopted by its exact receipt.
+      // Patch lanes are intentionally different: any prior receipt is a hard
+      // refusal above, never an invitation to replay the consumed package.
+      const retained = patch === undefined ? await this.reconcileInterruptedCreation(repo.repoPath, lane, branch) : null;
       if (retained === null) {
         const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
         if (existing.status === 0) {
+          if (patch !== undefined) throw new PreBootstrapPatchError('foreign_ref', `branch ${branch} already exists — prebootstrap patch will not adopt or overwrite a held branch`);
           throw new Error(`branch ${branch} already exists — one lane per job, never a reused held branch`);
         }
         if (existsSync(path)) {
+          if (patch !== undefined) throw new PreBootstrapPatchError('foreign_lane', `worktree path already exists: ${path} — prebootstrap patch will not adopt or overwrite it`);
           throw new Error(`worktree path already exists: ${path}`);
         }
       }
+      if (patch !== undefined) {
+        // One claim per request: the request is bound to its job id, and
+        // dispatch creates that job row once, so no second claim can follow.
+        this.opts.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-creation-claimed', jobId: input.jobId,
+          payload: { version: 1, package_sha256: patch.packageBytesSha256, request_payload_sha256: patch.requestPayloadSha256,
+            intake_identity_sha256: patch.intakeIdentitySha256, repository_path: repo.repoPath,
+            expected_base_sha: patch.package.base.commit, expected_base_tree: patch.package.base.tree,
+            producer_host: hostname(), producer_pid: process.pid } });
+      }
       // The base is resolved ONCE, and the SAME sha is branched from and
-      // recorded: the registry row can never name a commit the lane did
-      // not actually branch from (the 'freshHead lie' of 2026-09-23). A
-      // retained receipt keeps ITS fixed base — reconciliation never
-      // re-bases an interrupted creation onto a moved head.
+      // recorded. A patch package is bound to this exact fetched origin tip
+      // and tree; local fallback is not an authorized substitute.
       const base = retained !== null ? this.adoptedBase(retained) : this.resolveBase(repo.repoPath);
       const sha = base.sha;
+      if (patch !== undefined) {
+        const tree = runGit(repo.repoPath, ['rev-parse', '--verify', `${sha}^{tree}`]);
+        this.assertPreBootstrapSource(repo.repoPath, patch, sha, tree, base.baseSource);
+        this.assertPreBootstrapBaseFile(repo.repoPath, sha, patch);
+      }
       const custody = retained !== null ? this.adoptedCustody(retained, lane) : this.creationCustody(branch, sha, lane, base.baseSource);
       let record;
       let bootstrapped: LaneBootstrap | null;
+      let patchConsumed = false;
+      let phase: 'patch' | 'setup' | 'publication' = 'patch';
       try {
         await this.addLane(repo.repoPath, path, custody);
-        bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha);
+        if (patch !== undefined) {
+          this.assertCreationIdentity(path, custody);
+          this.assertCreationCustody(repo.repoPath, path, custody);
+          // Set before publishing the start event: if its transaction's
+          // acknowledgement is lost, neither retry nor rollback is safe.
+          patchConsumed = true;
+          const patchReceipt = this.applyPreBootstrapPatch({ repoPath: repo.repoPath, worktreePath: path, jobId: input.jobId, custody, patch });
+          phase = 'setup';
+          this.assertPreBootstrapAuthority(input.jobId, patch);
+          bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha, this.setupAudit(input.jobId, patch, custody, path));
+          this.opts.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-succeeded', jobId: input.jobId,
+            payload: { version: 1, package_sha256: patch.packageBytesSha256, request_payload_sha256: patch.requestPayloadSha256,
+              intake_identity_sha256: patch.intakeIdentitySha256, worktree_path: path, branch, base_sha: custody.sha,
+              before_tree: patchReceipt.beforeTree, patched_tree: patchReceipt.afterTree,
+              manifest_blob: bootstrapped?.blob ?? null, setup_made: bootstrapped?.setupMade ?? [] } });
+          phase = 'publication';
+        } else {
+          bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha);
+        }
         this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
         beginLaneHandoff({ id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
@@ -1466,8 +1841,32 @@ export class WorktreeManager {
           baseSource: base.baseSource,
           jobId: input.jobId,
         });
-        this.clearCreationIntent(repo.repoPath, custody);
+        // A patched lane keeps its receipt until dispatch records its worker
+        // (completePreBootstrapWorkerAdmission): a later failure retains both.
+        if (patch === undefined) this.clearCreationIntent(repo.repoPath, custody);
       } catch (error) {
+        if (patchConsumed) {
+          const errorText = error instanceof Error ? error.message : String(error);
+          try {
+            this.opts.ledger.appendCustomEvent({
+              kind: phase === 'patch' ? 'worktree.prebootstrap-patch-failed' : phase === 'setup' ? 'worktree.prebootstrap-setup-failed' : 'worktree.prebootstrap-publication-failed',
+              jobId: input.jobId,
+              payload: { version: 1, package_sha256: patch!.packageBytesSha256, request_payload_sha256: patch!.requestPayloadSha256,
+                intake_identity_sha256: patch!.intakeIdentitySha256, worktree_path: path, branch, base_sha: custody.sha,
+                stage: phase, error_class: error instanceof Error ? error.name : typeof error,
+                error_sha256: preBootstrapSha256(errorText) },
+            });
+          } catch { /* the prior consumed/start event remains the honest unknown state */ }
+          if (this.opts.ledger.getWorktree(input.jobId) === null) {
+            try {
+              record = await this.publishPreBootstrapFailureLane({ repo, branch, path, sha, base, custody, jobId: input.jobId });
+            } catch (publishError) {
+              throw new AggregateError([error, publishError], `prebootstrap lane ${input.jobId} failed and its owned lane could not be published; creation custody is retained`);
+            }
+            this.log('warn', 'prebootstrap worktree setup failed; lane retained without worker admission', { job: input.jobId, path, phase });
+          }
+          throw error;
+        }
         if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error; // committed publication retains unresolved custody
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         // Only a proven ownership is spent with the rollback. An unproven
@@ -1674,7 +2073,7 @@ export class WorktreeManager {
   /** Bootstrap manifest (18a): auto-apply at creation; missing = no-op.
    * Async: setup commands run off the event loop, so a slow bootstrap
    * (npm ci) never freezes chat/supervision while dispatch awaits the lane. */
-  private async bootstrap(sourceRoot: string, worktreePath: string, sha: string): Promise<LaneBootstrap | null> {
+  private async bootstrap(sourceRoot: string, worktreePath: string, sha: string, setupAudit?: ReturnType<WorktreeManager['setupAudit']>): Promise<LaneBootstrap | null> {
     // The lane's own committed manifest is applied (#427): a job lane is
     // fresh from origin, so a merged manifest takes effect before the user's
     // checkout pulls it, and an uncommitted local one never does. Its
@@ -1692,6 +2091,7 @@ export class WorktreeManager {
       worktreePath,
       setupTimeoutMs: this.opts.setupTimeoutMs,
       log: this.log,
+      ...(setupAudit ?? {}),
     });
     const after = await presentReclaimEntries(worktreePath, reclaim);
     // The blob at the commit the lane was made from, read in the source

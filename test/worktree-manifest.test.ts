@@ -282,6 +282,35 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     }
   });
 
+  it('ends the setup process group and rejects when the spawn receipt cannot be recorded', async () => {
+    const repo = makeFixtureRepo('fixture-spawn-receipt');
+    try {
+      mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+      // Outlives the test's budget unless the failed receipt ends the group.
+      writeFileSync(manifestFile(repo.path), `[[setup]]\ncommand = '''sh -c 'sleep 60' & wait'''\n`);
+      const manifest = loadWorktreeManifest(repo.path);
+      const worktreePath = join(repo.path, '..', 'fixture-spawn-receipt-wt');
+      repo.git(['worktree', 'add', worktreePath, 'HEAD']);
+      let groupId = 0;
+      const applied = applyWorktreeManifest(manifest!, { sourceRoot: repo.path, worktreePath, setupTimeoutMs: 60_000,
+        onSpawn: (pid) => {
+          groupId = pid;
+          throw new Error('synthetic spawn receipt failure');
+        } });
+      await expect(applied).rejects.toThrow(expect.objectContaining({
+        message: expect.stringContaining('process ownership receipt failed'),
+        cause: expect.objectContaining({ message: 'synthetic spawn receipt failure' }),
+      }));
+      expect(groupId).toBeGreaterThan(0);
+      await vi.waitFor(() => {
+        expect(() => process.kill(-groupId, 0)).toThrow();
+      }, { timeout: 5_000 });
+      repo.git(['worktree', 'remove', '--force', worktreePath]);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
   it('refuses to overwrite anything already present in the worktree', async () => {
     const repo = makeFixtureRepo('fixture-clash');
     try {

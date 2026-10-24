@@ -29,17 +29,29 @@ stranger could execute: goal, boundaries, acceptance, verification.
 
 ## 2. Ops handoff (dispatch)
 
-`POST /api/dispatch` `{job_id, repo_path, title, briefing, display_name?}` — the
+`POST /api/dispatch` `{job_id, repo_path, title, briefing, display_name?, prebootstrap_patch?}` — the
 mechanical handoff behind the chat surface. `display_name` is an optional
 short heist label authored at handoff; it does not replace the full title or
-worker identity. Older jobs without it use a shortened title on minion cards:
+worker identity. Older jobs without it use a shortened title on minion cards.
+`prebootstrap_patch` is an optional, narrowly scoped, hash-pinned dependency
+package reference; its authorization, schema and failure/readback contract are
+specified in [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
+It is not a setup-skip switch or arbitrary source-write API.
 
 1. **Job row** — briefing recorded verbatim; status `dispatched`.
-2. **Lane** — one git worktree per job on branch `gru/<job>` at the
-   FETCHED origin default-branch head (worktree manager, below; a fetch
+2. **Disk floor and lane** — one git worktree per job on branch `gru/<job>` at
+   the FETCHED origin default-branch head (worktree manager, below; a fetch
    failure degrades to local HEAD with `base_source:
-   'local-head-fallback'` recorded, never silently). Status `working`.
-3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
+   'local-head-fallback'` recorded, never silently). A pre-bootstrap patch
+   refuses that fallback and must name this exact fetched base.
+3. **Optional patch, then unchanged setup** — only an explicitly contracted
+   exact package may change the allowlisted dependency file inside the new
+   owned lane. The committed manifest, links/copies and setup commands remain
+   unchanged and must all succeed. Without a package this step is the existing
+   setup path. A patch/setup failure blocks the job and retains the patch lane,
+   its creation receipt and the evidence; no worker starts and no automatic
+   retry runs.
+4. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
    project conventions remain applicable there). New jobs receive the
    GC-owned workflow plus explicit registered job/private artifact context;
@@ -48,8 +60,10 @@ worker identity. Older jobs without it use a shortened title on minion cards:
    ([GC-WORKFLOWS.md](./GC-WORKFLOWS.md)). The briefing prompt is
    delivered as the session's first turn.
 
-Failures are loud and leave no half lanes: a spawn failure sweeps the
-fresh worktree back out and blocks the job with a note.
+Failures are loud. A regular spawn failure sweeps the fresh worktree back out
+and blocks the job with a note. A consumed pre-bootstrap patch is different:
+any failure before its worker is admitted keeps the lane, its creation receipt
+and the readback evidence; see [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
 
 ## 3. Lifecycle on the board
 

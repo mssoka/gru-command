@@ -67,6 +67,7 @@ export interface WorktreeSweepSwept {
 export type WorktreeSweepResult = WorktreeSweepPaused | WorktreeSweepSwept;
 
 import type { WorktreeBaseSource } from '../ledger/api.js';
+import type { LoadedPreBootstrapPatch } from '../worktrees/prebootstrap-patch.js';
 
 /** The worktree subsystem the dispatch flow rides on. */
 export interface WorktreePort {
@@ -85,6 +86,13 @@ export interface WorktreePort {
     readonly trackingRef: string | null;
   }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
+  /** Optional explicit capability: an implementation must apply the admitted
+   * package inside its owned lane and finish unchanged setup before returning.
+   * The lane keeps its creation receipt until completePreBootstrapWorkerAdmission. */
+  createJobWorktreeWithPreBootstrapPatch?(input: { repoPath: string; jobId: string; preBootstrapPatch: LoadedPreBootstrapPatch }): Promise<WorktreeLane>;
+  /** Spends a patched lane's creation receipt once dispatch recorded its
+   * worker (`job.minion-spawned`); every earlier failure keeps it. */
+  completePreBootstrapWorkerAdmission?(input: { repoPath: string; jobId: string }): void;
   createReviewWorktree(input: {
     repoPath: string;
     roundId: string;
@@ -134,6 +142,12 @@ export class UnavailableWorktreePort implements WorktreePort {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createJobWorktree(): Promise<WorktreeLane> {
+    throw new Error(WORKTREE_PORT_UNAVAILABLE);
+  }
+  async createJobWorktreeWithPreBootstrapPatch(): Promise<WorktreeLane> {
+    throw new Error(WORKTREE_PORT_UNAVAILABLE);
+  }
+  completePreBootstrapWorkerAdmission(): void {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createReviewWorktree(): Promise<WorktreeLane> {

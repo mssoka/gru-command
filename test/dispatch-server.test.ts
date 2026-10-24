@@ -17,6 +17,7 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { GhPrPoster, WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { PreBootstrapPatchError } from '../src/worktrees/prebootstrap-patch.js';
 import { admitBlindReview, blindCoverageOf, observeBlindSessionAccess, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
@@ -82,6 +83,7 @@ interface ServerHarness {
   disposedHandles: string[];
   notifications: NotificationCenter;
   worktrees: InMemoryWorktreePort;
+  dispatch: DispatchService;
   reviewArtifactRoot: string;
   close: () => Promise<void>;
 }
@@ -267,6 +269,7 @@ async function boot(opts: {
     disposedHandles,
     notifications,
     worktrees,
+    dispatch,
     reviewArtifactRoot,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
@@ -3247,4 +3250,223 @@ describe('silas firing-rule provenance (issue #117)', () => {
       await h.close();
     }
   }, 90_000);
+});
+
+/** Real-shaped receipts for one patched lane, as the manager records them. */
+const PATCH_IDENTITY = { package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64) } as const;
+const PATCH_LANE = { worktree_path: '/tmp/lane', branch: 'gru/job-patch-table', base_sha: 'e'.repeat(40) } as const;
+
+function seedPatchAdmission(h: ServerHarness, jobId: string): void {
+  h.ledger.addJob({ id: jobId, repo: 'fixture', title: 'patch readback', briefing: 'synthetic' });
+  h.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId, payload: {
+    version: 1, package_file: 'fixture.json', ...PATCH_IDENTITY, repository_path: '/tmp/fixture', origin_sha256: 'd'.repeat(64),
+    expected_base_sha: 'e'.repeat(40), expected_base_tree: 'f'.repeat(40), contract_sha256: '1'.repeat(64),
+    work_revision: 0, authority_epoch: 0, allowlist: ['requirements.txt'], request_path: '/tmp/fixture',
+  } });
+}
+
+function seedPatchClaim(h: ServerHarness, jobId: string): void {
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-creation-claimed', jobId, payload: {
+    version: 1, ...PATCH_IDENTITY, repository_path: '/tmp/fixture', expected_base_sha: 'e'.repeat(40), expected_base_tree: 'f'.repeat(40),
+    producer_host: 'fixture-host', producer_pid: 17,
+  } });
+}
+
+function seedPatchedSetup(h: ServerHarness, jobId: string): void {
+  const producer = { version: 1, ...PATCH_IDENTITY, ...PATCH_LANE, producer_host: 'fixture-host', producer_pid: 17, creation_token_sha256: '3'.repeat(64) };
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-started', jobId, payload: { ...producer, base_tree: 'f'.repeat(40) } });
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-applied', jobId, payload: { ...producer, before_tree: 'f'.repeat(40), after_tree: '4'.repeat(40), changed_paths: ['requirements.txt'] } });
+  const command = { setup_index: 0, command_sha256: '2'.repeat(64) };
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-started', jobId, payload: { ...producer, ...command } });
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-spawned', jobId, payload: { ...producer, ...command, pid: 19, process_group_id: 19 } });
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-process-settled', jobId, payload: { ...producer, ...command, exit_code: 0, signal: null, timed_out: false, stopped: false } });
+  h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-succeeded', jobId, payload: { version: 1, ...PATCH_IDENTITY, ...PATCH_LANE,
+    before_tree: 'f'.repeat(40), patched_tree: '4'.repeat(40), manifest_blob: null, setup_made: [] } });
+}
+
+async function patchReadback(h: ServerHarness, jobId: string): Promise<Record<string, unknown>> {
+  const response = await call(h.port, 'GET', `/api/dispatch/jobs/${jobId}/prebootstrap-patch`, undefined, TOKEN);
+  expect(response.status).toBe(200);
+  return response.json as Record<string, unknown>;
+}
+
+describe('prebootstrap dependency patch readback', () => {
+  it('reads two admission receipts as conflicted_admission_receipts', async () => {
+    const h = await boot();
+    try {
+      seedPatchAdmission(h, 'job-patch-table');
+      h.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId: 'job-patch-table', payload: { version: 1, ...PATCH_IDENTITY } });
+      expect(await patchReadback(h, 'job-patch-table')).toMatchObject({ state: 'conflicted_admission_receipts', worker_admission: 'unproven' });
+    } finally { await h.close(); }
+  });
+
+  it('reads a creation claim with no lane receipt as creation_claimed_not_started_or_unknown', async () => {
+    const h = await boot();
+    try {
+      seedPatchAdmission(h, 'job-patch-table');
+      seedPatchClaim(h, 'job-patch-table');
+      const body = await patchReadback(h, 'job-patch-table');
+      expect(body).toMatchObject({ state: 'creation_claimed_not_started_or_unknown', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+      expect(String(body['recovery'])).toMatch(/^Do not replay/u);
+    } finally { await h.close(); }
+  });
+
+  it('counts a lane receipt for another package as unmatched and reads the lane as conflicted', async () => {
+    const h = await boot();
+    try {
+      seedPatchAdmission(h, 'job-patch-table');
+      seedPatchClaim(h, 'job-patch-table');
+      seedPatchedSetup(h, 'job-patch-table');
+      expect(await patchReadback(h, 'job-patch-table')).toMatchObject({ state: 'setup_succeeded', unmatched_receipt_count: 0 });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-failed', jobId: 'job-patch-table', payload: {
+        version: 1, ...PATCH_IDENTITY, package_sha256: '9'.repeat(64), ...PATCH_LANE, stage: 'patch', error_class: 'Error', error_sha256: '5'.repeat(64) } });
+      expect(await patchReadback(h, 'job-patch-table')).toMatchObject({ state: 'conflicted_receipts_unknown', unmatched_receipt_count: 1 });
+    } finally { await h.close(); }
+  });
+
+  it('reads two worker spawns as a conflicted worker admission', async () => {
+    const h = await boot();
+    try {
+      seedPatchAdmission(h, 'job-patch-table');
+      seedPatchClaim(h, 'job-patch-table');
+      seedPatchedSetup(h, 'job-patch-table');
+      const spawned = { worktree: PATCH_LANE.worktree_path, branch: PATCH_LANE.branch };
+      h.ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'job-patch-table', payload: { agentId: 'minion-1', ...spawned } });
+      expect(await patchReadback(h, 'job-patch-table')).toMatchObject({ state: 'setup_succeeded', worker_admission: 'recorded' });
+      h.ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'job-patch-table', payload: { agentId: 'minion-2', ...spawned } });
+      expect(await patchReadback(h, 'job-patch-table')).toMatchObject({ state: 'conflicted_receipts_unknown', worker_admission: 'conflicted' });
+    } finally { await h.close(); }
+  });
+
+
+  it('returns authenticated append-only state without inferring producer cessation or replay authority', async () => {
+    const h = await boot();
+    try {
+      h.ledger.addJob({ id: 'job-patch-readback', repo: 'fixture', title: 'patch readback', briefing: 'synthetic' });
+      h.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId: 'job-patch-readback', payload: {
+        version: 1, package_file: 'fixture.json', package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64),
+        intake_identity_sha256: 'c'.repeat(64), repository_path: '/tmp/fixture', origin_sha256: 'd'.repeat(64),
+        expected_base_sha: 'e'.repeat(40), expected_base_tree: 'f'.repeat(40), contract_sha256: '1'.repeat(64),
+        work_revision: 0, authority_epoch: 0, allowlist: ['requirements.txt'],
+      } });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-creation-claimed', jobId: 'job-patch-readback', payload: {
+        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64),
+        intake_identity_sha256: 'c'.repeat(64), repository_path: '/tmp/fixture',
+        expected_base_sha: 'e'.repeat(40), expected_base_tree: 'f'.repeat(40),
+      } });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-started', jobId: 'job-patch-readback', payload: {
+        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64),
+        worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40), base_tree: 'f'.repeat(40),
+      } });
+      const unauthenticated = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch');
+      expect(unauthenticated.status).toBe(401);
+      const response = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);
+      expect(response.status).toBe(200);
+      expect(field(response.json, 'state')).toBe('patch_in_progress_or_unknown');
+      expect(field(response.json, 'worker_admission')).toBe('unproven');
+      expect(field<readonly unknown[]>(response.json, 'setup_producers')).toHaveLength(0);
+      expect(String(field(response.json, 'recovery'))).toMatch(/Do not replay/u);
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-applied', jobId: 'job-patch-readback', payload: {
+        version: 1, package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64),
+        worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+        base_tree: 'f'.repeat(40),
+      } });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-started', jobId: 'job-patch-readback', payload: {
+        setup_index: 0, command_sha256: '2'.repeat(64), producer_host: 'fixture-host', producer_pid: 17,
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), worktree_path: '/tmp/lane',
+        branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+      } });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-spawned', jobId: 'job-patch-readback', payload: {
+        setup_index: 0, command_sha256: '2'.repeat(64), worktree_path: '/tmp/lane', pid: 19, process_group_id: 19, producer_host: 'fixture-host',
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+      } });
+      const inProgress = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);
+      expect(field(inProgress.json, 'state')).toBe('setup_in_progress_or_unknown');
+      const producers = field<readonly Record<string, unknown>[]>(inProgress.json, 'setup_producers');
+      expect(producers[0]).toMatchObject({ producer_state: 'unknown', setup_index: 0, spawn: { pid: 19, process_group_id: 19 }, outcome: null });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-process-settled', jobId: 'job-patch-readback', payload: {
+        setup_index: 0, command_sha256: '2'.repeat(64), worktree_path: '/tmp/lane', exit_code: 9, signal: null, timed_out: false, stopped: false,
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+      } });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-failed', jobId: 'job-patch-readback', payload: {
+        setup_index: 0, worktree_path: '/tmp/lane', branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), error_sha256: '2'.repeat(64),
+      } });
+      const failed = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);
+      expect(field(failed.json, 'state')).toBe('setup_failed');
+      expect(field(failed.json, 'worker_admission')).toBe('unproven');
+      const failedProducers = field<readonly Record<string, unknown>[]>(failed.json, 'setup_producers');
+      expect(failedProducers[0]).toMatchObject({ producer_state: 'child_exit_result_recorded_group_state_unknown', outcome: { exit_code: 9, timed_out: false } });
+      h.ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-setup-succeeded', jobId: 'job-patch-readback', payload: {
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64), intake_identity_sha256: 'c'.repeat(64), worktree_path: '/tmp/lane',
+        branch: 'gru/job-patch-readback', base_sha: 'e'.repeat(40),
+      } });
+      const contradictory = await call(h.port, 'GET', '/api/dispatch/jobs/job-patch-readback/prebootstrap-patch', undefined, TOKEN);
+      expect(field(contradictory.json, 'state')).toBe('conflicted_receipts_unknown');
+      const missing = await call(h.port, 'GET', '/api/dispatch/jobs/missing/prebootstrap-patch', undefined, TOKEN);
+      expect(missing.status).toBe(404);
+    } finally { await h.close(); }
+  });
+});
+
+describe('prebootstrap dependency patch request admission', () => {
+  it('returns an observational readback link rather than a pre-admission refusal after dispatch failure', async () => {
+    const h = await boot();
+    try {
+      h.ledger.addJob({ id: 'http-patch-dispatch-failed', repo: 'fixture', title: 'patch failure', briefing: 'authorized' });
+      h.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId: 'http-patch-dispatch-failed', payload: {
+        package_sha256: 'a'.repeat(64), request_payload_sha256: 'b'.repeat(64),
+      } });
+      vi.spyOn(h.dispatch, 'dispatch').mockRejectedValue(new PreBootstrapPatchError('dispatch_failed',
+        'pre-bootstrap dispatch failed (WorktreeSetupError; error_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc); use authenticated prebootstrap readback'));
+      const response = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-patch-dispatch-failed', repo_path: '/tmp/synthetic', title: 'patch failure', briefing: 'authorized',
+        prebootstrap_patch: { package_file: 'fixture.json', package_sha256: 'a'.repeat(64) },
+      }, TOKEN);
+      expect(response.status).toBe(409);
+      expect(field(response.json, 'error')).toBe('prebootstrap_patch_dispatch_failed');
+      expect(field(response.json, 'readback')).toBe('/api/dispatch/jobs/http-patch-dispatch-failed/prebootstrap-patch');
+      expect(field(response.json, 'retry_authorized')).toBe(false);
+      const readback = await call(h.port, 'GET', '/api/dispatch/jobs/http-patch-dispatch-failed/prebootstrap-patch', undefined, TOKEN);
+      expect(field(readback.json, 'state')).toBe('admitted_not_started_or_unknown');
+    } finally { await h.close(); }
+  });
+
+  it('refuses an explicit commissioner on a patched lane but not the request\'s by', async () => {
+    const h = await boot();
+    try {
+      const request = { repo_path: '/tmp/synthetic', title: 'patch', briefing: 'explicit',
+        prebootstrap_patch: { package_file: 'fixture.json', package_sha256: 'a'.repeat(64) } };
+      const withBy = await call(h.port, 'POST', '/api/dispatch', { ...request, job_id: 'http-patch-by', by: 'gru' }, TOKEN);
+      expect(withBy.status).toBe(422);
+      expect(field<string>(withBy.json, 'code')).toBe('package_unavailable');
+      const explicit = await call(h.port, 'POST', '/api/dispatch', { ...request, job_id: 'http-patch-commissioner', commissioner: 'gru' }, TOKEN);
+      expect(explicit.status).toBe(422);
+      expect(field<string>(explicit.json, 'code')).toBe('lane_unsupported');
+      expect(h.ledger.getJob('http-patch-by')).toBeNull();
+      expect(h.ledger.getJob('http-patch-commissioner')).toBeNull();
+    } finally { await h.close(); }
+  });
+
+  it('validates the optional package reference before any job row is created', async () => {
+    const h = await boot();
+    try {
+      const invalid = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-patch-invalid', repo_path: '/tmp/synthetic', title: 'patch', briefing: 'explicit',
+        prebootstrap_patch: { package_file: '../outside.json', package_sha256: 'a'.repeat(64) },
+      }, TOKEN);
+      expect(invalid.status).toBe(400);
+      expect(field<string>(invalid.json, 'error')).toBe('prebootstrap_patch_refused');
+      expect(h.ledger.getJob('http-patch-invalid')).toBeNull();
+
+      const unavailable = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-patch-root-unwired', repo_path: '/tmp/synthetic', title: 'patch', briefing: 'explicit',
+        prebootstrap_patch: { package_file: 'fixture.json', package_sha256: 'a'.repeat(64) },
+      }, TOKEN);
+      expect(unavailable.status).toBe(422);
+      expect(field<string>(unavailable.json, 'code')).toBe('package_unavailable');
+      expect(field<boolean>(unavailable.json, 'retry_authorized')).toBe(false);
+      expect(h.ledger.getJob('http-patch-root-unwired')).toBeNull();
+    } finally { await h.close(); }
+  });
 });

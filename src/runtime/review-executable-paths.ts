@@ -2797,6 +2797,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/worktrees/lane-provenance.js",
   "dist/worktrees/manager.js",
   "dist/worktrees/manifest.js",
+  "dist/worktrees/prebootstrap-patch.js",
   "dist/worktrees/reclaim.js",
   "dist/worktrees/server.js",
   "dist/worktrees/slimming.js",
