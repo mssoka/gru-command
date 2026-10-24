@@ -1271,7 +1271,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         (publicationFailed[0] !== undefined && (setupSucceeded[0] === undefined || publicationFailed[0].seq <= setupSucceeded[0].seq)) ||
         (workerSpawned[0] !== undefined && (setupSucceeded[0] === undefined || workerSpawned[0]!.seq <= setupSucceeded[0].seq));
       const contradictoryReceipts = (patchApplied.length > 0 && patchFailed.length > 0) || (setupSucceeded.length > 0 && setupFailed.length > 0) ||
-        (workerSpawned.length > 0 && (setupSucceeded.length !== 1 || setupFailed.length > 0 || patchFailed.length > 0 || publicationFailed.length > 0 || dispatchFailed.length > 0));
+        (workerSpawned.length > 0 && (setupSucceeded.length !== 1 || setupFailed.length > 0 || patchFailed.length > 0 || publicationFailed.length > 0 ||
+          dispatchFailed.some((failure) => failure.seq <= workerSpawned[0]!.seq)));
       const receiptConflict = unmatchedReceiptCount > 0 || new Set(startedIndexes).size !== startedIndexes.length ||
         startedIndexes.some((index) => !Number.isSafeInteger(index) || (index as number) < 0) || setupProducerConflict || successOutcomeConflict ||
         orderingConflict || contradictoryReceipts || laneIdentityConflict || claimConflict || creationClaimed.length > 1 ||
@@ -1295,7 +1296,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         patch: patchFailed.at(-1)?.payload ?? patchApplied.at(-1)?.payload ?? patchStarted.at(-1)?.payload ?? null,
         setup: setupFailed.at(-1)?.payload ?? setupSucceeded.at(-1)?.payload ?? null,
         setup_producers: setupProducerReceipts,
-        worker_admission: workerSpawned.length === 0 ? 'unproven' : workerSpawned.length === 1 ? 'recorded' : 'conflicted',
+        // A dispatch failure after the spawn means the worker was refused
+        // before its briefing; that is not a recorded admission.
+        worker_admission: workerSpawned.length === 0 ? 'unproven' : workerSpawned.length !== 1 ? 'conflicted'
+          : dispatchFailed.length > 0 ? 'refused_after_spawn' : 'recorded',
         dispatch_failure: dispatchFailed.at(-1)?.payload ?? null,
         unmatched_receipt_count: unmatchedReceiptCount,
         events: events.map((event) => ({ seq: event.seq, kind: event.kind, payload: event.payload })),

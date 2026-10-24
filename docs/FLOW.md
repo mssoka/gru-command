@@ -48,8 +48,9 @@ It is not a setup-skip switch or arbitrary source-write API.
    exact package may change the allowlisted dependency file inside the new
    owned lane. The committed manifest, links/copies and setup commands remain
    unchanged and must all succeed. Without a package this step is the existing
-   setup path. A patch/setup failure blocks the job and retains the patch lane
-   and custody evidence; no worker starts and no automatic retry runs.
+   setup path. A patch/setup failure blocks the job and retains the patch lane,
+   its creation receipt and the evidence; no worker starts and no automatic
+   retry runs.
 4. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
    project conventions remain applicable there). New jobs receive the
@@ -61,8 +62,8 @@ It is not a setup-skip switch or arbitrary source-write API.
 
 Failures are loud. A regular spawn failure sweeps the fresh worktree back out
 and blocks the job with a note. A consumed pre-bootstrap patch is different:
-patch/setup failure or interruption preserves its lane and exact custody/readback
-evidence; see [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
+any failure before its worker is admitted keeps the lane, its creation receipt
+and the readback evidence; see [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
 
 ## 3. Lifecycle on the board
 

@@ -408,7 +408,7 @@ export class DispatchService {
         throw new PreBootstrapPatchError('package_unavailable', `job "${input.jobId}": private prebootstrap package root is not wired — refusing to admit a package that cannot be verified`);
       }
       preBootstrapPatch = readPreBootstrapDependencyPatchPackage(this.opts.preBootstrapPatchRoot, input.preBootstrapPatch);
-      if (this.opts.worktrees.createJobWorktreeWithPreBootstrapPatch === undefined) {
+      if (this.opts.worktrees.createJobWorktreeWithPreBootstrapPatch === undefined || this.opts.worktrees.completePreBootstrapWorkerAdmission === undefined) {
         throw new PreBootstrapPatchError('capability_unavailable', 'the selected worktree manager does not implement guarded prebootstrap dependency-patch custody');
       }
       assertPreBootstrapPatchDispatchBinding(preBootstrapPatch, {
@@ -677,7 +677,8 @@ export class DispatchService {
         });
         try {
           assertHandoff();
-        assertAdmissible();
+          assertAdmissible();
+          if (preBootstrapPatch !== null) assertPreBootstrapAuthority(preBootstrapPatch, job.id, this.opts.ledger);
         } catch (error) {
           await handle.dispose();
           throw error;
@@ -890,10 +891,16 @@ export class DispatchService {
         ...(lessons.length > 0 ? { lessons } : {}),
       });
       // A synchronous spawn listener can change job state before briefing.
-      // No await separates this last check from actual prompt delivery.
+      // No await separates this last check from actual prompt delivery. A
+      // patched lane's creation receipt is spent only here, once its worker
+      // is recorded and still admissible.
       try {
         assertHandoff();
         assertAdmissible();
+        if (preBootstrapPatch !== null) {
+          assertPreBootstrapAuthority(preBootstrapPatch, job.id, this.opts.ledger);
+          this.opts.worktrees.completePreBootstrapWorkerAdmission!({ repoPath: input.repoPath, jobId: job.id });
+        }
       } catch (error) {
         await handle.dispose();
         this.opts.ledger.setAgentState(handle.id, 'disposed');
@@ -925,7 +932,7 @@ export class DispatchService {
       const errorHash = createHash('sha256').update(rawError).digest('hex');
       const failureDetail = preBootstrapPatch === null ? String(error)
         : `pre-bootstrap dispatch failed (${error instanceof PreBootstrapPatchError ? error.code : error instanceof Error ? error.name : typeof error}; error_sha256=${errorHash}); use authenticated prebootstrap readback`;
-      if (preBootstrapPatch !== null && this.opts.ledger.latestJobEvent(job.id, 'job.minion-spawned') === null) {
+      if (preBootstrapPatch !== null) {
         try {
           this.opts.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-dispatch-failed', jobId: job.id,
             payload: { version: 1, package_sha256: preBootstrapPatch.packageBytesSha256,

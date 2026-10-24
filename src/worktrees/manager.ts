@@ -1711,6 +1711,27 @@ export class WorktreeManager {
     return record;
   }
 
+  /** Spends a patched lane's creation receipt once dispatch recorded the
+   * lane's worker. Anything short of that exact proof refuses by name and
+   * keeps the receipt. */
+  completePreBootstrapWorkerAdmission(input: { repoPath: string; jobId: string }): void {
+    const repo = this.assertRepo(input.repoPath);
+    const branch = `gru/${input.jobId}`;
+    const record = this.opts.ledger.getWorktree(input.jobId);
+    const spawned = this.opts.ledger.latestJobEvent(input.jobId, 'job.minion-spawned');
+    const spawnedPayload = spawned?.payload as Record<string, unknown> | null | undefined;
+    if (record === null || record.kind !== 'job' || record.status !== 'active' || record.repoPath !== repo.repoPath || record.branch !== branch ||
+        spawnedPayload?.['worktree'] !== record.path || spawnedPayload['branch'] !== branch) {
+      throw new PreBootstrapPatchError('admission_unproven', `job "${input.jobId}" has no recorded worker on its patched lane; its creation receipt is kept`);
+    }
+    const common = this.creationCommonDirectory(repo.repoPath);
+    const receipt = readCreationIntent(common, branch);
+    if (receipt === null || receipt.lane.id !== input.jobId || receipt.lane.path !== record.path || receipt.sha !== record.sha) {
+      throw new PreBootstrapPatchError('creation_receipt_mismatch', `job "${input.jobId}" patched lane has no exact retained creation receipt`);
+    }
+    clearCreationIntent(common, branch, receipt.token);
+  }
+
   /**
    * Branch-for-jobs (ruling 18d): one worktree per job, on its own
    * branch `gru/<jobId>`, created at the FETCHED origin head —
@@ -1819,7 +1840,9 @@ export class WorktreeManager {
           baseSource: base.baseSource,
           jobId: input.jobId,
         });
-        this.clearCreationIntent(repo.repoPath, custody);
+        // A patched lane keeps its receipt until dispatch records its worker
+        // (completePreBootstrapWorkerAdmission): a later failure retains both.
+        if (patch === undefined) this.clearCreationIntent(repo.repoPath, custody);
       } catch (error) {
         if (patchConsumed) {
           const errorText = error instanceof Error ? error.message : String(error);

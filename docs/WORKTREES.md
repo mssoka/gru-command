@@ -161,8 +161,10 @@ error class/code and digest, not raw setup output. Read the authenticated
 Missing spawn/result receipts mean **unknown**, never process cessation or
 no-effects. A recorded child exit/result is not proof that the entire process
 group ceased; the readback keeps group state explicitly unknown. A consumed
-request is never replayed. Interrupted, partial or failed
-patch/setup retains the lane, creation receipt and evidence; do not retry it, rerun setup, clean
+request is never replayed. A patched lane keeps its creation receipt until its
+worker is admitted (`job.minion-spawned`, then the last pre-briefing check), so
+any earlier failure, including one after setup succeeded, retains the lane, the
+receipt and the evidence; do not retry it, rerun setup, clean
 the lane or infer that an unknown producer stopped. Inspect custody and process
 records; any future attempt requires a separately authorized fresh job and
 request. The endpoint offers no retry or cleanup action.
