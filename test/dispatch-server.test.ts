@@ -56,13 +56,13 @@ const PR_URL = 'https://git.example.invalid/fixture-owner/fixture-app/pull/5';
 
 function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
   const targetSha = 'f'.repeat(40);
+  const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
   const admission = admitBlindReview({
     ledger, jobId, title: 'review (blind)', deliverable: 'review',
-    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture',
-    inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture', inputPackage,
   });
   if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-  recordBlindAdmission(ledger, jobId, admission);
+  recordBlindAdmission(ledger, jobId, admission, inputPackage);
 }
 
 const cleanupDirs: string[] = [];
