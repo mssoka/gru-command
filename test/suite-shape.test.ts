@@ -193,7 +193,7 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
-  'blind-input-dispatch.test.ts': 26,
+  'blind-input-dispatch.test.ts': 27,
   'blind-input.test.ts': 34,
   'blind-observer-service.test.ts': 2,
   'blind-review.test.ts': 18,
@@ -407,7 +407,7 @@ const PINS: Record<string, number> = {
   'assert-formal-verdicts-baseline.test.ts': 5,
   'publication-evidence.test.ts': 13,
   'board-runtime-truth.test.ts': 14,
-  'child-workers.test.ts': 35,
+  'child-workers.test.ts': 36,
   'creation-intent.test.ts': 4,
   'directive-markers.test.ts': 15,
   'escalation-identity.test.ts': 7,

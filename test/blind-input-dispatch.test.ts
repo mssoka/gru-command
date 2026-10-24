@@ -17,7 +17,7 @@ import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
 import type { RetrySettlement } from '../src/runtime/pacing.js';
 import { BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { Role } from '../src/config.js';
-import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, NativeAgentTool, SpawnOptions } from '../src/runtime/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { gitReviewSourcePreflight } from '../src/dispatch/review-source.js';
 import type { LessonPointer, LessonsReferencePort } from '../src/lessons/types.js';
@@ -68,6 +68,7 @@ async function boot(opts: {
   stopSignal?: AbortSignal;
   log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
   lessons?: LessonsReferencePort;
+  parentTools?: (agentId: string) => readonly NativeAgentTool[];
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-blind-'));
   cleanupDirs.push(dir);
@@ -109,6 +110,7 @@ async function boot(opts: {
     spawner,
     ...(opts.sessionToolResults !== undefined ? { sessionToolResults: opts.sessionToolResults } : {}),
     ...(opts.lessons !== undefined ? { lessons: opts.lessons } : {}),
+    ...(opts.parentTools !== undefined ? { parentTools: opts.parentTools } : {}),
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.stopSignal !== undefined ? { stopSignal: opts.stopSignal } : {}),
@@ -312,6 +314,21 @@ describe('blind review commissioning (issue #316)', () => {
     await waitFor(() => h.ledger.latestJobEvent('rev-claims-context', 'job.delivered') !== null);
     const claimsPrompt = h.prompts.find((prompt) => prompt.includes('rev-claims-context'))!;
     expect(claimsPrompt).toContain('/synthetic-book/chapters/synthetic-canary.md');
+  });
+
+  it('briefs a blind reviewer without the child-worker tools an ordinary parent is offered', async () => {
+    const tool: NativeAgentTool = { name: 'request_child_worker', description: 'fixture', inputSchema: {}, async execute() { return { text: '{}' }; } };
+    const h = await boot({ parentTools: () => [tool] });
+    await dispatchParent(h);
+    expect(h.prompts[0]).toContain('`request_child_worker`');
+    const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-no-children', {
+      repo_path: h.repo.path, input_package: validPackage(),
+    }));
+    expect(created.status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-no-children', 'job.delivered') !== null);
+    const blindPrompt = h.prompts.find((prompt) => prompt.includes('rev-no-children'))!;
+    expect(blindPrompt).toContain('BLIND INPUT PACKAGE (');
+    expect(blindPrompt).not.toContain('request_child_worker');
   });
 
   it('does not launder an attempted forbidden read through a delivered no-findings report', async () => {

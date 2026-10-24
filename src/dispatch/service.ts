@@ -226,7 +226,9 @@ export function renderMinionBriefing(input: {
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
-    ...(input.childWorkerTools === true
+    // A blind reviewer commissions no child: a child holds neither its
+    // package nor its isolation rule, and its reads are never observed.
+    ...(input.childWorkerTools === true && input.reviewRole !== 'blind'
       ? [
           'Independent capacity (ad-hoc helper work only): if the briefing calls',
           'for one independent helper (e.g. read-only verification), use the',
