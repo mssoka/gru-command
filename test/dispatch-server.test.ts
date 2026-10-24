@@ -54,7 +54,8 @@ const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[e
 const TOKEN = 'test-token-éphémeral';
 const PR_URL = 'https://git.example.invalid/fixture-owner/fixture-app/pull/5';
 
-function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
+/** `keepPackage: false` = the legacy shape, admitted before packages were kept. */
+function admitJobAsBlind(ledger: LedgerApi, jobId: string, keepPackage = true): void {
   const targetSha = 'f'.repeat(40);
   const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
   const admission = admitBlindReview({
@@ -62,7 +63,7 @@ function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
     briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture', inputPackage,
   });
   if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-  recordBlindAdmission(ledger, jobId, admission, inputPackage);
+  recordBlindAdmission(ledger, jobId, admission, keepPackage ? inputPackage : undefined);
 }
 
 const cleanupDirs: string[] = [];
@@ -2130,6 +2131,29 @@ if (argv.includes('--method') && argv.includes('POST')) {
       });
       expect(h.ledger.listJobEvents('reb-blind').filter((event) => event.kind === 'job.delivered' &&
         (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+    } finally { await h.close(); }
+  });
+
+  it('/api/silas/rebrief refuses a blind review whose package was never kept by name, before any disposal or spawn', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-rebrief-unkept'); cleanupRepos.push(repo);
+    const jobId = 'reb-unkept';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, jobId);
+      admitJobAsBlind(h.ledger, jobId, false);
+      const priorId = h.ledger.listAgents().find((row) => row.jobId === jobId)!.id;
+      h.liveHandles.set(priorId, { role: 'minion', id: priorId, sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        async prompt() { throw new Error('the prior reviewer must not be prompted'); }, async steer() {}, async followUp() {},
+        subscribe: () => () => {}, health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), async dispose() {} });
+      const beforeSpawns = h.spawns.length;
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'try again' }, TOKEN);
+      expect(res.status).toBe(202);
+      const row = await awaitDirectiveTerminal(h, field<string>(res.json, 'request_id'));
+      expect(row.state).toBe('failed');
+      expect(row.failReason).toMatch(/^refused before any prompt: fresh blind reviewer refused before any effect: .*its attested blind input package was not kept/u);
+      expect(h.disposedHandles).not.toContain(priorId);
+      expect(h.spawns.length).toBe(beforeSpawns);
     } finally { await h.close(); }
   });
 

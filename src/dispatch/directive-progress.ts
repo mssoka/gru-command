@@ -8,7 +8,7 @@ import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessio
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { lineSafeLiteral } from './line-safe.js';
-import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { observePendingRebriefs, postRecoveryIncident, type RecoveryNotifications } from './rebrief-recovery.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
@@ -39,15 +39,7 @@ function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): vo
   if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — directive recovery cancelled');
   deps.ledger.assertDirectiveAuthority(identity);
 }
-/** A caller's admission re-check (`beforeWriterSideEffect`) refused at a
- * post-wait boundary — after pacing, around spawn/resume or immediately
- * before the prompt, each of which precedes that boundary's prompt (#364).
- * It is a positive no-effect only when {@link promptRefusalIsNoEffect}
- * holds; then the request fails by name instead of staying live for
- * reconciliation and fencing the lane. */
-export class DirectivePromptRefusedError extends Error {
-  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'DirectivePromptRefusedError'; }
-}
+export { DirectivePromptRefusedError };
 
 /** #364: an admission refusal fails the request by name only when nothing
  * can have reached the minion — no native admission was bound this turn,

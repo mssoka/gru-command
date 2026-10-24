@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import type { LedgerApi } from '../ledger/api.js';
 
 /**
  * Review-source preflight (issue #317). A report-review job is admitted
@@ -281,8 +282,34 @@ export function assertLaneUsesBoundStore(jobId: string, binding: ReviewSourceBin
   }
 }
 
+/** What the REVIEW SOURCE block binds: the target, range and inputs. */
+export type ReviewSourceBlock = Pick<ReviewSourceBinding, 'targetSha' | 'targetBase' | 'rangeCommits' | 'inputs'>;
+
+/** The review source a job's dispatch verified, read back from its durable
+ * `job.review-source-verified` record so a fresh session on the same lane
+ * is bound to the same objects. null = no preflight ran for the job; a
+ * malformed record throws by name. */
+export function verifiedReviewSource(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): ReviewSourceBlock | null {
+  const event = ledger.latestJobEvent(jobId, 'job.review-source-verified');
+  if (event === null) return null;
+  const payload = event.payload as { target_sha?: unknown; target_base?: unknown; range_commits?: unknown; inputs?: unknown };
+  const inputs = Array.isArray(payload.inputs) ? payload.inputs as readonly Partial<Record<keyof ReviewBoundInput, unknown>>[] : null;
+  if (typeof payload.target_sha !== 'string' || (payload.target_base !== null && typeof payload.target_base !== 'string') ||
+      (payload.range_commits !== null && typeof payload.range_commits !== 'number') || inputs === null ||
+      !inputs.every((input) => typeof input.path === 'string' && typeof input.blob === 'string' &&
+        (REVIEW_INPUT_LENSES as readonly unknown[]).includes(input.lens))) {
+    throw new Error(`job "${jobId}": its verified review source record (event ${String(event.seq)}) is malformed — the reviewer's source cannot be re-bound`);
+  }
+  return {
+    targetSha: payload.target_sha,
+    targetBase: payload.target_base,
+    rangeCommits: payload.range_commits,
+    inputs: inputs.map((input) => ({ path: input.path as string, lens: input.lens as ReviewInputLens, blob: input.blob as string })),
+  };
+}
+
 /** Briefing block binding the exact target/range/inputs for the reviewer. */
-export function renderReviewSourceBlock(binding: ReviewSourceBinding): readonly string[] {
+export function renderReviewSourceBlock(binding: ReviewSourceBlock): readonly string[] {
   return [
     'REVIEW SOURCE (preflight-verified in the object store this worktree uses):',
     `Target commit: ${binding.targetSha}`,

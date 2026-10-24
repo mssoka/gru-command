@@ -4,7 +4,8 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DirectiveDispatchDeferredError, DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { BlindInputUnavailableError, DirectiveDispatchDeferredError, DirectivePromptRefusedError, DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { renderReviewSourceBlock } from '../src/dispatch/review-source.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi, type ObligationRecord } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
@@ -698,7 +699,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
         spawn: async (role: string) => { spawned.push(role); throw new Error('no spawn is expected'); },
       };
       const ledger = {
-        getAgent: () => null, listAgents: () => [], registerAgent: () => {}, getJob: () => ({ briefing: 'original contract' }),
+        getAgent: () => null, listAgents: () => [], registerAgent: () => {}, getJob: () => ({ briefing: 'original contract' }), latestJobEvent: () => null,
         listImplementerMinions: () => [{ id: 'minion-prior', role: 'minion', jobId: 'job-deferral', sessionFile: '/sessions/prior.jsonl' }],
       };
       let guards = 0;
@@ -737,6 +738,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
+      latestJobEvent: () => null,
     };
     const outcome = await routeFixDirectiveToMinion({
       registry: registry as never, ledger: ledger as never, worktrees,
@@ -761,6 +763,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
+      latestJobEvent: () => null,
     };
     await routeFixDirectiveToMinion({
       registry: registry as never, ledger: ledger as never, worktrees,
@@ -798,6 +801,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
+        latestJobEvent: () => null,
       } as never,
       worktrees: { listWorktrees: () => [] } as never,
       jobId: 'job-live',
@@ -840,6 +844,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
+        latestJobEvent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -879,6 +884,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
+        latestJobEvent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -912,6 +918,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
           registerAgent: () => { throw registrationError; },
           getJob: () => activeJobRecord('job-regfail'),
           getAgent: () => null,
+          latestJobEvent: () => null,
         },
         worktrees: { listWorktrees: () => [lane] } as never,
         jobId: 'job-regfail',
@@ -940,6 +947,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -980,6 +988,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         },
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id, state) => { states.push(`${id}:${state}`); return minionRecord(id, 'job-cancel', null); },
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1028,6 +1037,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1057,6 +1067,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1090,6 +1101,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1127,6 +1139,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1283,7 +1296,7 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
     }
   });
 
-  it('keeps the frozen package and excludes lesson pointers in a fresh blind re-brief context', async () => {
+  it('briefs a fresh blind re-brief with its frozen package exactly once, reviewer orders and no lesson pointer', async () => {
     const jobId = 'job-blind-fresh-rebrief-context';
     const agentId = 'fresh-blind-context-minion';
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-rebrief-context-'));
@@ -1310,14 +1323,15 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
       const result = await rebriefFreshMinion({
         registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
         ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
-        jobId, note: 'continue only from the frozen source', briefing: 'Review the admitted package read-only.',
+        // A briefing that names the package header is still given the package.
+        jobId, note: 'continue only from the frozen source', briefing: 'Review the BLIND INPUT PACKAGE (below) read-only.',
         lessons: { referencesFor: () => { referenceLookups += 1; return [canary]; } },
       });
       expect(result.outcome).toBe('completed');
       expect(referenceLookups).toBe(0);
       expect(prompts).toHaveLength(1);
-      expect(prompts[0]).toContain('BLIND INPUT PACKAGE (your review input');
-      expect(prompts[0]).toContain('File src/feature.ts (at the target):');
+      expect(prompts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
+      expect(prompts[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
       expect(prompts[0]).not.toContain('/synthetic-book/chapters/synthetic-book-canary.md');
     } finally {
       h.dispose();
@@ -1371,6 +1385,178 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
     } finally {
       h.dispose();
     }
+  });
+});
+
+describe('a fresh blind reviewer session gets its admitted input (#503)', () => {
+  const JOB = 'job-fresh-blind';
+  const TARGET = 'a'.repeat(40);
+  const HEADER = 'BLIND INPUT PACKAGE (your review input';
+  const FILE_LINE = 'File src/feature.ts (at the target):';
+  const SOURCE = { targetSha: TARGET, targetBase: 'b'.repeat(40), rangeCommits: 2, inputs: [] };
+  const CANARY: LessonPointer = {
+    chapter: 'synthetic-book-canary', lesson: 'outside-package',
+    path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
+  };
+
+  /** A real ledger holding an attested blind admission (its package kept
+   * unless `keepPackage: false`, the legacy shape) and its verified source. */
+  function blindLane(opts: { readonly keepPackage?: boolean; readonly priorSession?: boolean } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-blind-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    ledger.addJob({ id: JOB, repo: 'fixture', title: 'review (blind)', briefing: 'Review the BLIND INPUT PACKAGE (quoted) read-only.' });
+    ledger.setJobStatus(JOB, 'working');
+    const priorSession = join(dir, 'prior.jsonl');
+    writeFileSync(priorSession, '{}\n', 'utf-8');
+    ledger.registerAgent({ id: 'prior-reviewer', role: 'minion', jobId: JOB, sessionFile: opts.priorSession === false ? null : priorSession });
+    ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: JOB, payload: {
+      object_store: join(dir, '.git'), target_sha: SOURCE.targetSha, target_base: SOURCE.targetBase, range_commits: SOURCE.rangeCommits,
+      inputs: SOURCE.inputs, source: 'repository', package_sha256: null,
+    } });
+    const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
+    const admission = admitBlindReview({
+      ledger, jobId: JOB, title: 'review (blind)', deliverable: 'review',
+      briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture', inputPackage,
+    });
+    if (admission === null) throw new Error(`job "${JOB}" was not admitted as a blind review`);
+    recordBlindAdmission(ledger, JOB, admission, opts.keepPackage === false ? undefined : inputPackage);
+    const prompts: string[] = [];
+    const spawned: { readonly resumeFile?: string }[] = [];
+    const disposed: string[] = [];
+    const handle = (id: string): AgentHandle => ({
+      id, role: 'minion', sessionFile: join(dir, `${id}.jsonl`),
+      async prompt(text: string) { prompts.push(text); },
+      capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+      async steer() {}, async followUp() {},
+      subscribe() { return () => {}; },
+      health() { return { state: 'idle' as const, lastActivity: null, sessionFile: join(dir, `${id}.jsonl`) }; },
+      async dispose() { disposed.push(id); },
+      cessationEvidence: () => 'ceased' as const,
+    });
+    return { ledger, dir, prompts, spawned, disposed, handle, dispose: () => db.close() };
+  }
+
+  it('the production fresh re-brief carries the verified source and the package exactly once, no lesson pointer', async () => {
+    const h = blindLane();
+    const prior = h.handle('prior-reviewer');
+    let lookups = 0;
+    try {
+      // Exactly the composition directive-progress hands the route for a
+      // durable rebrief; the contract quotes the package header.
+      const contract = h.ledger.effectiveContract(JOB)!.text;
+      const directive = renderRebriefPrompt({ jobId: JOB, note: 'continue the review', briefing: contract, workRevision: 0, reviewRole: 'blind' });
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive, freshSession: true, contract, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: (id) => (id === 'prior-reviewer' && !h.disposed.includes(id) ? prior : null),
+          spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+          disposeHandle: async (handle) => { await handle.dispose(); },
+        },
+        lessons: { referencesFor: () => { lookups += 1; return [CANARY]; } },
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: 'fresh-reviewer' });
+      expect(h.disposed).toContain('prior-reviewer');
+      expect(h.prompts).toHaveLength(1);
+      const prompt = h.prompts[0]!;
+      expect(prompt.split(HEADER)).toHaveLength(2);
+      expect(prompt.split(FILE_LINE)).toHaveLength(2);
+      expect(prompt.split(renderReviewSourceBlock(SOURCE).join('\n'))).toHaveLength(2);
+      expect(prompt.indexOf('REVIEW SOURCE (')).toBeLessThan(prompt.indexOf(HEADER));
+      expect(lookups).toBe(0);
+      expect(prompt).not.toContain(CANARY.path);
+    } finally { h.dispose(); }
+  });
+
+  it('a resume-failed fallback is briefed with the package exactly once', async () => {
+    const h = blindLane();
+    try {
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'Re-check what the BLIND INPUT PACKAGE (as quoted earlier) shows.',
+        contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async (_role, options) => {
+            h.spawned.push(options ?? {});
+            if (options?.resumeFile !== undefined) throw new Error('the prior session cannot resume');
+            return h.handle('fallback-reviewer');
+          },
+          disposeHandle: async () => {},
+        },
+        lessons: { referencesFor: () => [CANARY] },
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: 'fallback-reviewer' });
+      expect(h.spawned.map((options) => options.resumeFile ?? null)).toEqual([join(h.dir, 'prior.jsonl'), null]);
+      expect(h.prompts).toHaveLength(1);
+      expect(h.prompts[0]!.split(HEADER)).toHaveLength(2);
+      expect(h.prompts[0]!.split(FILE_LINE)).toHaveLength(2);
+      expect(h.prompts[0]).not.toContain(CANARY.path);
+    } finally { h.dispose(); }
+  });
+
+  it('a package that was never kept refuses by name before any disposal or spawn', async () => {
+    const fresh = blindLane({ keepPackage: false });
+    const prior = fresh.handle('prior-reviewer');
+    try {
+      const refusal = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+        ledger: fresh.ledger, worktrees: { listWorktrees: () => [laneAt(fresh.dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => prior,
+          spawn: async (_role, options) => { fresh.spawned.push(options ?? {}); return fresh.handle('fresh-reviewer'); },
+          disposeHandle: async (handle) => { await handle.dispose(); },
+        },
+      }).then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(BlindInputUnavailableError);
+      expect(refusal).toBeInstanceOf(DirectivePromptRefusedError);
+      expect(String(refusal)).toMatch(/its attested blind input package was not kept/u);
+      expect(fresh.disposed).toEqual([]);
+      expect(fresh.spawned).toEqual([]);
+      expect(fresh.prompts).toEqual([]);
+    } finally { fresh.dispose(); }
+    // The resume-failed fallback refuses before its fresh spawn too.
+    const fallback = blindLane({ keepPackage: false });
+    try {
+      const refusal = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'continue', contract: 'c', signal: new AbortController().signal,
+        ledger: fallback.ledger, worktrees: { listWorktrees: () => [laneAt(fallback.dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async (_role, options) => {
+            fallback.spawned.push(options ?? {});
+            if (options?.resumeFile !== undefined) throw new Error('the prior session cannot resume');
+            return fallback.handle('fallback-reviewer');
+          },
+          disposeHandle: async () => {},
+        },
+      }).then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(BlindInputUnavailableError);
+      expect(fallback.spawned.map((options) => options.resumeFile ?? null)).toEqual([join(fallback.dir, 'prior.jsonl')]);
+      expect(fallback.prompts).toEqual([]);
+    } finally { fallback.dispose(); }
+  });
+
+  it('a ledger that cannot read the admitted role is refused by name, never routed as an ordinary job', async () => {
+    const h = blindLane();
+    try {
+      const withoutRoleLookup = {
+        listImplementerMinions: h.ledger.listImplementerMinions.bind(h.ledger), listAgents: h.ledger.listAgents.bind(h.ledger),
+        registerAgent: h.ledger.registerAgent.bind(h.ledger), getJob: h.ledger.getJob.bind(h.ledger), getAgent: h.ledger.getAgent.bind(h.ledger),
+      };
+      const refusal = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'continue', contract: 'c', signal: new AbortController().signal,
+        ledger: withoutRoleLookup as unknown as LedgerApi, worktrees: { listWorktrees: () => [laneAt(h.dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        lessons: { referencesFor: () => [CANARY] },
+      }).then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DirectiveRoutingContractError);
+      expect(String(refusal)).toMatch(/latestJobEvent/u);
+      expect(h.spawned).toEqual([]);
+      expect(h.prompts).toEqual([]);
+    } finally { h.dispose(); }
   });
 });
 
@@ -1716,6 +1902,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
           listImplementerMinions: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           registerAgent: () => {},
           getJob: () => activeJobRecord('job-queued'),
+          latestJobEvent: () => null,
         } as never,
         worktrees: { listWorktrees: () => [] } as never,
         jobId: 'job-queued',
