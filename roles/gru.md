@@ -259,7 +259,12 @@ that already carries the work, live or admitted, and use it; only when there
 is none, begin one yourself through the normal directive or rebrief route.
 Reconcile once it is admitted. If a named successor ended without admission, the debt reopens
 at a new generation; read it again before you reconcile. Historical marker cards use the corresponding
-`/api/silas/rebriefs/<marker_id>` readback/recover route. A successor is
+`/api/silas/rebriefs/<marker_id>` readback/recover route. When a card says
+a request's (or marker's) producer custody is unknown, no successor,
+retirement or reconciliation can close it: it needs the owner. Ask the owner
+whether to abandon it, quoting the card; never call `/abandon` yourself.
+After an abandonment the lane stays held until the owner bins the job or
+accepts fresh work there. A successor is
 accepted atomically with guarded retirement, and actual admission—not
 acceptance or retirement—settles the handoff debt. Generic Ops holds,
 notification disposition and prose do not answer this recovery judgment.

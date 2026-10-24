@@ -44,10 +44,11 @@ the caller supplies expectations only:
   `recovery_obligation` (`generation`, `planRevision`, `state`); they are not
   inferred from a prior decision or from the accepted prompt alone.
 - **Known custody**: a row from before native producer identity (no
-  producer identity or journal), or one whose admission minion never
-  registered, has unknown custody. Retirement refuses it (`live_work`,
-  `original producer custody UNKNOWN: …`). Waiting never clears that; the
-  owner exit is [abandonment](#owner-abandonment-unknown-custody).
+  producer identity or journal), or one whose admission minion has no
+  registration on the job, has unknown custody. Retirement and a Gru
+  successor refuse it (`live_work`, `original producer custody UNKNOWN:
+  …`), the successor before any review is stopped. Waiting never clears
+  that; the owner's exit is [abandonment](#owner-abandonment-unknown-custody).
 - **Lane identity/head**: exactly one non-swept job lane for the job, and
   its freshly resolved checkout `HEAD` must equal the caller's
   `expected_head` (a registered branch tip is not checkout evidence).
@@ -125,10 +126,14 @@ with the identical canonical intent return `idempotent: true` and append
 nothing; a lost-response retry reconstructs the identical intent from the
 retired readback (`retire_expected_state`, `retire_expected_head`, the six
 `retire_expected_*` context fields, plus the exposed job/payload hash) or
-from the `POST /api/silas/directive` replay of the id, and a replay of a
-phase-closing retirement reports the same `phase_handoff_closed` id. A row
-retired before the context existed reads all six as `null` ("not
-recorded") and replays its original intent with them `null` or absent.
+from the `POST /api/silas/directive` replay of the id (it carries
+`payload_hash`, also on a terminal lane), and a replay of a phase-closing
+retirement reports the same `phase_handoff_closed` id. A row retired before
+the context existed reads all six as `null` ("not recorded") and replays
+its original intent with them `null` or absent; any other body against a
+retired row is a `retire_conflict`. Retirement resolves the request's
+`silas.directive-unreconciled` card (an open recovery debt still reaches
+Gru through the obligation mailbox; a suspended one keeps its card).
 
 ### Refusals (all leave the record byte-identical)
 
@@ -283,11 +288,12 @@ A deliberate job discard is a separate operation from directive retirement.
 Use the existing authenticated `POST /api/jobs/<id>/status` surface with
 `{"status":"binned"}` only after every live directive request has settled,
 been retired through this cessation-fenced path, or been abandoned by the
-owner. The status transaction refuses, by name, any directive still
-`dispatching` or `admitted` and any pending re-brief marker; a caller cannot
-make an unknown native request disappear by binning its job. The same write
-refuses `done` over a live directive; `merged` is an observed fact and is
-recorded, and the reconcilers keep processing the request. Other live-work
+owner, and every pending re-brief marker likewise. The status transaction
+refuses each one by name; a caller cannot make an unknown native request
+disappear by binning its job. `done` and closeout refuse them the same way.
+`merged` is an observed fact and is recorded; the reconcilers keep
+processing a live request on it, and a merge never retires a marker whose
+producer custody is unproven (it stays on a card instead). Other live-work
 blockers remain in force.
 
 Binning records only the terminal administrative discard. It does not
@@ -297,34 +303,51 @@ and does not clean retained resources.
 ### Owner abandonment (unknown custody)
 
 When the service cannot establish a live request's producer custody (no
-producer identity or journal, an unregistered minion, no or several lanes,
-unproven cleanup), retirement stays refused. The owner exit is
-`POST /api/silas/directives/{request_id}/abandon`, under the same bearer
-authority as binning:
+producer identity or journal, a minion with no registration on the job, no
+or several lanes, unproven cleanup), retirement stays refused. The exit is
+the owner's decision, never Gru's: Gru asks the owner and never calls it.
 
 ```json
+POST /api/silas/directives/{request_id}/abandon
 {
   "expected_job_id": "<job_id>",
   "expected_state": "admitted",
   "expected_payload_hash": "<payload_hash>",
   "reason": "original producer identity and journal are missing",
-  "by": "owner"
+  "by": "owner",
+  "confirm_intent": true
 }
 ```
+
+Without `by: "owner"` and `confirm_intent: true` it is a 400. It refuses
+(409 `live_work`, by name) any producer known to be live or about to run: a
+lane process, a provider continuation, a native session lock, a re-brief or
+another request owning the lane, an open turn, an admission, a child, a
+review round, a verification run, a queued turn, or a supervised restart,
+retry or open turn (or a supervisor it cannot read). Only producer-custody
+uncertainty may be abandoned. It also refuses a request settlement owns
+(`terminal_receipt_present`), a stale view (`request_mismatch`), a request
+that is not live (`directive_not_live`), and one whose cessation the service
+can verify (`retirement_available`: retire it instead).
 
 It records the request `failed` with `fail_reason` "abandoned by the owner;
 outcome and producer custody unknown: …" and appends one
 `silas.directive-abandoned` event whose `unknown` and `retirement_refused`
-name what stays unknown and why retirement was refused. It claims no
-completion, no effect and no cessation, clears no producer-uncertainty
-record and leaves no continuation hold; binning can follow. Every readback
-reports the request `abandoned`. A replay of the id returns the recorded
-abandonment (`idempotent: true`). It refuses (409) a request settlement owns
-(`terminal_receipt_present`), a producer still visibly running (open turn,
-admission, child, review round, verification run or queued turn:
-`live_work`), a stale view (`request_mismatch`), a request that is not live
-(`directive_not_live`), and one whose cessation the service can verify
-(`retirement_available`: retire it instead).
+name what stays unknown and why retirement was refused. It closes the
+request's own recovery debt and its card as outcome-unknown, and leaves an
+open continuation hold: automation stays off the lane, and only binning or
+a fresh request the owner accepts (`by: "owner"`, `confirm_intent: true` on
+`POST /api/silas/directive` or `/api/silas/rebrief`) releases it. It claims
+no completion, no effect and no cessation, and clears no
+producer-uncertainty record. Every reader reports the request `abandoned`,
+never as a no-effect failure. A replay rebuilt from GET (`expected_state:
+"abandoned"`) returns the recorded abandonment (`idempotent: true`).
+
+A pending re-brief marker generation of unknown custody has the same exit:
+`POST /api/silas/rebriefs/{marker_id}/abandon` with `expected_job_id`,
+`expected_payload_hash`, `reason`, `by: "owner"` and `confirm_intent: true`.
+It deletes the generation's markers with one `silas.rebrief-abandoned`
+audit, under the same refusals, hold and closures.
 
 ## Activation rules
 

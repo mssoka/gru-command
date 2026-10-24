@@ -83,12 +83,11 @@ lens:   pending → live → done | error               (terminal: the last two)
   non-terminal children, pending/live rounds, unsettled verification
   runs, active initial dispatch or provider-recovery admissions that have
   not registered their worker yet, every live directive request and every
-  pending re-brief marker, each by name; a live directive first settles, is
-  retired through its evidence-fenced path, or (custody unknown) is
-  abandoned by the owner, and cannot be hidden by binning. The same write
-  refuses `done` over a live directive; `merged` is an observed fact and is
-  recorded, and the directive reconcilers keep processing a live request on
-  a terminal job. An idle `working` job can still be binned when those
+  pending re-brief marker, each by name; each first settles, is retired
+  through its evidence-fenced path, or (custody unknown) is abandoned by the
+  owner, and cannot be hidden by binning. The same write refuses `done`
+  over either; `merged` is an observed fact and is recorded, and the
+  directive reconcilers keep processing a live request on a terminal job. An idle `working` job can still be binned when those
   controls are terminal. Claimed provider waits are not perpetual runtime
   blockers after the attempt settles; last-side-effect guards also refuse
   late prompts if a job became terminal during an asynchronous boundary. Gru's shipped role
@@ -113,16 +112,17 @@ lens:   pending → live → done | error               (terminal: the last two)
   explicit expected status + PR url + head, the job's LATEST recorded
   `github.branch-state` observation to say the PR is CLOSED and not
   merged at exactly that url/head, and no target-owned live work (live
-  directive requests, spawning/streaming worker turns, non-terminal child
-  workers, pending/live rounds, unsettled verification runs). ONE transaction
+  directive requests, pending re-brief markers, spawning/streaming worker
+  turns, non-terminal child workers, pending/live rounds, unsettled
+  verification runs). ONE transaction
   appends the `job.admin-closeout` audit (request evidence + the cited
   observation seq), records the direct status hop, and closes the
   applicable obligations `job-terminal` (abandonment, never a success
   claim). A repeated identical request returns the recorded closeout
   idempotently; a changed request is refused — the recorded one is never
   overwritten. Idle/historical bookkeeping rows are not read; a live
-  directive request refuses by name; no directive/re-brief control row is
-  rewritten.
+  directive request or pending re-brief marker refuses by name; no control
+  row is rewritten.
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
   posted verdict IS that state (and a verdict on a still-`pending` round
   fails loud, machine and all, leaving no trace).
@@ -366,7 +366,7 @@ is ADMISSION-UNKNOWN — never read as safe to retry. States:
 | `settled` | the correlated `job.delivered` terminal receipt was recorded |
 | `failed` | a durable positive no-effect failure was recorded; resubmit changed work under a NEW request id |
 | `retired` | **control ownership closed** by the guarded, evidence-fenced retirement after server-verified writer cessation; no delivery and no no-effect outcome is claimed, the work remains unfinished, and the request id is consumed |
-| `abandoned` | readback of an owner abandonment, stored `failed`: producer custody was unknown; no completion, no no-effect and no cessation is claimed |
+| `abandoned` | an owner abandonment, stored `failed`: producer custody was unknown; no completion, no no-effect and no cessation is claimed, and a continuation hold stays until binning or a fresh request the owner accepts |
 
 `POST /api/silas/directive` returns **202** with the stable `request_id`
 once the durable intent is accepted — accepted ≠ admitted. The async
@@ -684,18 +684,22 @@ The migration also moves the rows that sweeps left `live` under
 already-swept trees, with one audited event per tree. The directive
 producer fence counts only `live` rows of lanes that are not swept.
 
-### Lane tokens and processes reaped by them (#486)
+### Retirement context and owner abandonment (#493)
 
-Migration 32 (`directive-retirement-context`) is additive/nullable. A live
+Migration 32 (`directive-retirement-context`) is additive. A live
 retirement's six context expectations live on the row beside
 `retire_expected_state`/`_head`, so reading a retired row scans no events;
 a row retired earlier keeps NULL ("not recorded") and replays its original
-intent. `abandoned_at`/`_by`/`abandon_reason` record an owner abandonment:
-`POST /api/silas/directives/{request_id}/abandon` closes a live request
-whose custody the service cannot establish as `failed`, with one
-`silas.directive-abandoned` audit naming what stays unknown and why
-retirement was refused. It claims nothing, leaves no hold, and every
-readback reports it `abandoned` ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md)).
+intent. `abandoned_at`/`_by`/`abandon_reason` record an owner abandonment of
+a live request whose custody the service cannot establish: stored `failed`,
+read `abandoned`, with one `silas.directive-abandoned` audit naming what
+stays unknown and why retirement was refused, and an open continuation hold
+on the existing `hold_released_*` columns. `rebrief_abandonments` keeps the
+same facts and hold for an abandoned re-brief marker generation, whose
+markers are deleted. Neither claims anything; see
+[DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-abandonment-unknown-custody).
+
+### Lane tokens and processes reaped by them (#486)
 
 Migration 31 (`worktree-lane-token`) adds `worktrees.lane_token`: a random
 128-bit hex token per lane incarnation, minted when the row is registered,
