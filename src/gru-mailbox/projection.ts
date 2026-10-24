@@ -33,6 +33,13 @@ function notificationBasis(ledger: LedgerApi, row: NotificationRecord, reportSou
     delivery === null ? null : [delivery.seq, delivery.payload]]);
 }
 
+/** A hold as the restriction it is on an item; a pre-family hold (#503)
+ * says that it covers only pre-#503 signals, so it never reads as current. */
+function holdRestriction(decision: DecisionRecord): string {
+  return decision.coversScheme === 'pre-family'
+    ? `${decision.by} (pre-family hold: covers only pre-#503 signals): ${decision.reason}` : `${decision.by}: ${decision.reason}`;
+}
+
 export function mailboxBasis(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
@@ -202,7 +209,7 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
         references.push({ kind: 'decision', id: decision.id });
         if (decision.by === 'gru' && decision.recheckAt !== null) gruFollowUps.push(decision);
         if (decision.recheckAt !== null) followUpAt.push(decision.recheckAt);
-        if (decision.decision === 'hold') restrictions.push(`${decision.by}: ${decision.reason}`);
+        if (decision.decision === 'hold') restrictions.push(holdRestriction(decision));
       }
       if (decisions.length < 200) break;
     }
@@ -280,7 +287,7 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       const page = ledger.listDecisions({ subject, activeOnly: true, limit: 200, offset });
       for (const decision of page) {
         references.push({ kind: 'decision', id: decision.id });
-        if (decision.decision === 'hold') restrictions.push(`${decision.by}: ${decision.reason}`);
+        if (decision.decision === 'hold') restrictions.push(holdRestriction(decision));
         if (decision.recheckAt !== null) followUpAt.push(decision.recheckAt);
       }
       if (page.length < 200) break;

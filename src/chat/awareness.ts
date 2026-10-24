@@ -106,14 +106,14 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'a disposition: fix its cause and leave it open — it closes itself when its producer succeeds. When the right outcome is a hold or "needs no ' +
   'action", record that decision FIRST with POST /api/decisions (subject, covers, ' +
   'basis_fingerprint, recheck_at, by: "gru") and then disposition the alert — unless it is ' +
-  'producer-resolved, which stays open even under a hold (R10-02) — a hold ' +
-  'recorded as state keeps the incident from re-waking you; prose does not. Use the ' +
+  'producer-resolved, which stays open even under a hold (R10-02). A hold recorded as state ' +
+  'is memory; prose is not. On a mailbox item a hold is a restriction, never a deferral: the item stays quiet only ' +
+  'under its exact-basis mailbox disposition, and hold coverage defers only FYI rows. Use the ' +
   'subject the wake path consults: for job-scoped alert kinds that is "job:<job id>" — for those ' +
   'job-scoped kinds use the head SHA as basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>); ' +
-  'for a hold that should keep deferring re-detections, omit basis_fingerprint for kinds without a SHA (github.pr-conflict:<job>), ' +
-  'and name covers with the signal family ("ci-failed", "pr-conflict", "phase-handback", "supervision.turn-orphaned"). ' +
-  'A decision that backs a mailbox resolved disposition instead takes the item\'s subject, its exact basis as basis_fingerprint ' +
-  'and every reasons[].signal copied verbatim into covers. Recovery cards and provider walls are hard floors: no hold defers them. ' +
+  'omit basis_fingerprint entirely for kinds without a SHA (github.pr-conflict:<job>), and name ' +
+  'covers with the signal family ("ci-failed", "pr-conflict", "rebrief-unreconciled"); ' +
+  'for a mailbox item copy each reasons[].signal verbatim. ' +
   'A red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>) has no lane: diagnose ' +
   'the run, open a fix heist from the current head, and hold "incident:github.default-branch-ci-failed:<owner>/<repo>" ' +
   '(covers "ci-failed") with no basis_fingerprint, so the hold reaches every later head and later red heads of that ' +
@@ -2045,6 +2045,7 @@ export class GruAwareness {
           covers: decision.covers.join(','),
           basis_fingerprint: decision.basisFingerprint,
           recheck_at: decision.recheckAt,
+          ...(decision.coversScheme === 'pre-family' ? { covers_scheme: 'pre-family' as const } : {}),
         });
         try {
           const open = subjects.flatMap((subject) => this.ledger.listDecisions!({ subject, activeOnly: true, limit: 4 }));

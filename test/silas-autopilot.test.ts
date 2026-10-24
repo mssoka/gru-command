@@ -10,7 +10,9 @@ import {
   canonicalJson,
   AUTOPILOT_SOURCE,
   autopilotRuleMode,
+  decisionHold,
   runSilasAutopilot,
+  sweepAckHold,
   type AutopilotLedger,
   type SilasAutopilotOps,
 } from '../src/dispatch/silas-autopilot.js';
@@ -29,6 +31,7 @@ import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.j
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { nativeSeams } from './helpers/silas-native-seams.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { seedPreFamilyDecisions } from './helpers/pre-family-decisions.js';
 import type { SilasAutopilotConfig } from '../src/config.js';
 import {
   computeSilasDigest,
@@ -3567,5 +3570,20 @@ describe('enforce-mode writer admission gaps (PR349 independent review)', () => 
     await opsFor(ledger, wave).sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'r' });
     await vi.waitFor(() => expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).toBe('failed'));
     expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.failReason).toMatch(/refused before any prompt.*verification/);
+  });
+});
+
+describe('autopilot decision holds across the signal-family cutover (#503)', () => {
+  it('a hold recorded before signal families still holds the autopilot on its unchanged signal', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-autopilot-prefamily-'));
+    seedPreFamilyDecisions(dir, [{ subject: 'job:job-x', covers: ['sweep-ack'], by: 'silas', reason: 'owner releases this lane by hand' }]);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const [hold] = ledger.listDecisions({ subject: 'job:job-x', activeOnly: true });
+      expect(hold?.coversScheme).toBe('pre-family');
+      expect(decisionHold(ledger, 'job-x', sweepAckHold({ status: 'merged' }))).toBe(`an active decision (${hold!.id}) covers sweep-ack`);
+      expect(decisionHold(ledger, 'job-y', sweepAckHold({ status: 'merged' }))).toBeNull();
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

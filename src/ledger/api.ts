@@ -149,6 +149,7 @@ import {
   decisionFromRowValues,
   DECISION_ACTORS,
   isDecisionActor,
+  RetiredDecisionSignalError,
   validateDecisionReason,
   validateDecisionSignal,
   type CanonicalDecisionInput,
@@ -156,6 +157,7 @@ import {
   type DecisionKind,
   type DecisionRecord,
 } from './decision-memory.js';
+import { retiredSignalFamily } from '../chat/incident.js';
 
 const VERIFICATION_KIND = 'verification.completed';
 const MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS = 4_096;
@@ -765,6 +767,23 @@ export class DirectiveRequestIdError extends Error {
   constructor(what: string, value: string) {
     super(`${what} "${value}" must be a safe request id: 1-128 characters of [A-Za-z0-9._-] starting with a letter or digit (no ":") — choose a new id`);
     this.name = 'DirectiveRequestIdError';
+  }
+}
+
+/** The Silas current-inspection rule id (`src/dispatch/silas-rules.ts`). */
+const CURRENT_INSPECTION_RULE_ID = 'current-inspection';
+
+/** #503: a current inspection already has a stored request (live or
+ * terminal) for this blocker fingerprint: one inspection per historical
+ * delivery. Names the stored request, which a pre-#503 caller may have
+ * stored under the fingerprint itself. */
+export class CurrentInspectionExistsError extends Error {
+  constructor(readonly blockerFingerprint: string, readonly storedRequestId: string, readonly storedState: string) {
+    super(`current inspection "${blockerFingerprint}" already has request "${storedRequestId}" (${storedState}) — ` +
+      (isDirectiveTerminal(storedState as DirectiveRequestRecord['state'])
+        ? 'it is terminal: the inspection is owed to the chief, never a second request'
+        : `retry that request_id verbatim with the directive and blocker_fingerprint GET /api/silas/directives/${storedRequestId} returns`));
+    this.name = 'CurrentInspectionExistsError';
   }
 }
 
@@ -8424,7 +8443,8 @@ export class LedgerApi {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
     if (input.requestId !== undefined) {
-      this.requireAdmissibleRequestId(input.requestId, input.kind === 'rebrief' ? 're-brief request_id' : 'directive request_id');
+      this.requireAdmissibleRequestId(input.requestId, input.kind === 'rebrief' ? 're-brief request_id' : 'directive request_id',
+        input.kind === 'rebrief' ? undefined : { jobId: input.jobId, directive: input.directive });
       const reserved = this.reservedInspectionClosure(input.requestId);
       if (reserved !== undefined) {
         const closure = this.eventFromRow(reserved);
@@ -8475,6 +8495,15 @@ export class LedgerApi {
           }
           return { record: existing, created: false }; // durable replay — the accepted request, unchanged
         }
+      }
+      // #503: one current inspection per historical delivery, whatever id a
+      // caller chose (a request stored before #503 used the fingerprint as
+      // its id). Live or terminal, the stored request answers it.
+      if (input.blockerFingerprint !== undefined &&
+          (sourceContext?.ruleId === CURRENT_INSPECTION_RULE_ID || input.blockerFingerprint.startsWith(`${CURRENT_INSPECTION_RULE_ID}:`))) {
+        const stored = this.db.prepare(`SELECT request_id, state FROM pending_directives WHERE job_id = ?
+          AND json_extract(payload, '$.blocker_fingerprint') = ? ORDER BY created_at, rowid LIMIT 1`).get(input.jobId, input.blockerFingerprint) as Row | undefined;
+        if (stored !== undefined) throw new CurrentInspectionExistsError(input.blockerFingerprint, str(stored.request_id), str(stored.state));
       }
       // Fail CLOSED while ANY live request for the job exists: the lane is
       // single-writer, so a DIFFERENT request id must never start a second
@@ -8564,11 +8593,18 @@ export class LedgerApi {
   }
 
   /** #503: a request id about to be stored meets the safe request-id rule,
-   * unless the ledger already holds it — a stored request (a replay) or an
-   * inspection identity a control closure reserved, possibly before the
-   * rule. Throws DirectiveRequestIdError naming the rule. */
-  requireAdmissibleRequestId(requestId: string, what: string): void {
-    if (this.getDirective(requestId) !== null || this.reservedInspectionClosure(requestId) !== undefined) return;
+   * unless the ledger already holds it: a stored request (a replay), or —
+   * for the exact `directive` it reserves on its own job — an inspection
+   * identity a control closure reserved, possibly before the rule. Any
+   * other route, job or text gets the rule. Throws DirectiveRequestIdError
+   * naming the rule. */
+  requireAdmissibleRequestId(requestId: string, what: string, directive?: { readonly jobId: string; readonly directive: string }): void {
+    if (this.getDirective(requestId) !== null) return;
+    const reserved = directive === undefined ? undefined : this.reservedInspectionClosure(requestId);
+    if (reserved !== undefined) {
+      const closure = this.eventFromRow(reserved);
+      if (closure.jobId === directive!.jobId && (closure.payload as { inspection_directive?: unknown }).inspection_directive === directive!.directive) return;
+    }
     requireNewDirectiveRequestId(requestId, what);
   }
 
@@ -11079,10 +11115,21 @@ export class LedgerApi {
     },
   ): DecisionRecord {
     const canonical: CanonicalDecisionInput = canonicalizeDecisionInput(input);
+    for (const signal of canonical.covers) {
+      const family = retiredSignalFamily(signal);
+      if (family !== null) throw new RetiredDecisionSignalError(signal, family);
+    }
     return this.transaction(() => {
       if (input.clientKey !== undefined) {
         const existing = this.decisionByClientKey(input.clientKey);
         if (existing !== null) {
+          // #503: replaying it would return an inert row as success.
+          if (existing.coversScheme === 'pre-family') {
+            throw new DecisionConflictError(
+              `decision client_key "${input.clientKey}" names pre-family decision "${existing.id}", recorded before signal families (#503): ` +
+                'it matches only pre-#503 signals — record the decision again under a new client_key',
+            );
+          }
           this.assertDecisionReplayMatches(existing, canonical, input.clientKey);
           return existing;
         }
@@ -11230,9 +11277,9 @@ export class LedgerApi {
     // must still be found (bounded per subject, newest first).
     const pageSize = 500;
     for (let offset = 0; ; offset += pageSize) {
-      const page = this.listCoverageDecisions(opts.subject, pageSize, offset);
-      for (const { record: row, preFamilyScheme } of page) {
-        const signal = preFamilyScheme ? preFamily : opts.signal;
+      const page = this.listDecisions({ subject: opts.subject, activeOnly: true, limit: pageSize, offset });
+      for (const row of page) {
+        const signal = row.coversScheme === 'pre-family' ? preFamily : opts.signal;
         if (signal === null || !row.covers.includes(signal)) continue;
         if (row.basisFingerprint !== null && row.basisFingerprint !== opts.basis) return null;
         if (row.recheckAt !== null) {
@@ -11246,14 +11293,6 @@ export class LedgerApi {
       }
       if (page.length < pageSize) return null;
     }
-  }
-
-  /** Active decisions on one subject, newest first (listDecisions' order),
-   * each with whether it was recorded under the pre-family scheme (#503). */
-  private listCoverageDecisions(subject: string, limit: number, offset: number): readonly { readonly record: DecisionRecord; readonly preFamilyScheme: boolean }[] {
-    return (this.db.prepare(`SELECT * FROM decisions WHERE subject = ? AND cleared_at IS NULL
-      ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(subject, limit, offset) as Row[])
-      .map((row) => ({ record: this.decisionFromRow(row), preFamilyScheme: str(row.covers_scheme) === 'pre-family' }));
   }
 
   private decisionByClientKey(clientKey: string): DecisionRecord | null {
@@ -11294,6 +11333,7 @@ export class LedgerApi {
       cleared_at: nstr(row.cleared_at),
       cleared_by: nstr(row.cleared_by),
       cleared_reason: nstr(row.cleared_reason),
+      covers_scheme: str(row.covers_scheme),
     });
   }
 

@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_DECISIONS_CONFIG, loadConfig, type DecisionsConfig } from '../src/config.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
+import { seedPreFamilyDecisions } from './helpers/pre-family-decisions.js';
 import {
   backtestRecordFromReport,
   countRecordedResponses,
@@ -84,6 +85,35 @@ describe('escalation-triage case extractor (issue #223)', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('#503 decision memory marks pre-family holds when the ledger has the scheme, and reads a pre-migration ledger as recorded', () => {
+    const seedWake = (handle: LedgerDb['handle']) => {
+      handle.prepare('INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload) VALUES (?, ?, NULL, NULL, NULL, NULL, ?)')
+        .run('2026-10-01T02:00:00.000Z', 'gru.wake', JSON.stringify({ notification_ids: ['n1'], count: 1, mode: 'action-required' }));
+      handle.prepare('INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload) VALUES (?, ?, NULL, NULL, NULL, NULL, ?)')
+        .run('2026-10-01T02:05:00.000Z', 'notification.resolved', JSON.stringify({ id: 'n1', by: 'gru', detail: 'duplicate of a covered item — nothing actionable' }));
+      handle.prepare('INSERT INTO notifications (id, ts, kind, routing, severity, title, detail) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run('n1', '2026-10-01T01:59:00.000Z', 'silas.escalated:job-1', 'action', 'error', 'typecheck failed', 'ONE scheduled typecheck RAN');
+    };
+    const memoryOf = (handle: LedgerDb['handle']) => (JSON.parse(extractEscalationTriageCases(handle as never)[0]!.state) as { open_decisions?: readonly Record<string, unknown>[] }).open_decisions;
+    const migrated = temp('gru-backtest-prefamily-');
+    seedPreFamilyDecisions(migrated, [{ subject: 'job:job-1', covers: ['typecheck'], reason: 'held before the cutover', by: 'owner' }]);
+    const db = new LedgerDb(migrated);
+    try {
+      seedWake(db.handle);
+      expect(memoryOf(db.handle)).toEqual([expect.objectContaining({ reason: 'held before the cutover', covers: 'typecheck', covers_scheme: 'pre-family' })]);
+    } finally { db.close(); }
+    const before = temp('gru-backtest-premigration-');
+    const old = new LedgerDb(before, { migrations: MIGRATIONS.slice(0, 31) });
+    try {
+      seedWake(old.handle);
+      old.handle.prepare(`INSERT INTO decisions (id, subject, decision, covers, basis_fingerprint, reason, by, client_key, created_at, recheck_at)
+        VALUES ('d1', 'job:job-1', 'hold', '["typecheck"]', NULL, 'held on an old ledger', 'owner', NULL, '2026-09-01T00:00:00.000Z', NULL)`).run();
+      const memory = memoryOf(old.handle);
+      expect(memory).toEqual([expect.objectContaining({ reason: 'held on an old ledger', covers: 'typecheck' })]);
+      expect(memory![0]).not.toHaveProperty('covers_scheme');
+    } finally { old.close(); }
   });
 
   it('requires a linked dispatch and ignores unrelated Silas actions in the same wake window', () => {

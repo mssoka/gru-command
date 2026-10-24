@@ -1180,6 +1180,10 @@ export const MIGRATIONS: readonly Migration[] = [
     // 'pre-family' and matches only the signal the pre-family derivation
     // gave a row. A bare family token in an old decision matched nothing
     // then and stays inert, instead of starting to defer wakes.
+    // LANDING COLLISION (same convention as migrations 10-21): id 32 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature (#493
+    // also claims 32); whichever lands second re-numbers ONLY its own
+    // never-applied migration to 33 (never a hole).
     id: 32,
     name: 'decision-covers-scheme',
     sql: `

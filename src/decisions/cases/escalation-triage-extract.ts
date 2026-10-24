@@ -84,18 +84,22 @@ function decisionMemoryAtWake(db: InstanceType<typeof DatabaseSync>, subjects: r
       covers: (JSON.parse(String(row['covers'] ?? '[]')) as readonly string[]).join(','),
       basis_fingerprint: typeof row['basis_fingerprint'] === 'string' ? (row['basis_fingerprint'] as string) : null,
       recheck_at: typeof row['recheck_at'] === 'string' ? (row['recheck_at'] as string) : null,
+      // A ledger before migration 32 has no column: its decisions were read as recorded.
+      ...(row['covers_scheme'] === 'pre-family' ? { covers_scheme: 'pre-family' as const } : {}),
     });
+    const scheme = (db.prepare('PRAGMA table_info(decisions)').all() as { name?: unknown }[]).some((column) => column.name === 'covers_scheme')
+      ? ', covers_scheme' : '';
     const cut = wakeTs === null ? '' : ' AND created_at <= ?';
     const args = wakeTs === null ? [] : [wakeTs];
     const open: DecisionMemoryFacts[] = [];
     const recent: DecisionMemoryFacts[] = [];
     for (const subject of subjects) {
       for (const row of db.prepare(
-        `SELECT decision, reason, by, covers, basis_fingerprint, recheck_at FROM decisions
+        `SELECT decision, reason, by, covers, basis_fingerprint, recheck_at${scheme} FROM decisions
          WHERE subject = ? AND cleared_at IS NULL${cut} ORDER BY created_at LIMIT 4`,
       ).all(subject, ...args) as Record<string, unknown>[]) open.push(toFacts(row));
       for (const row of db.prepare(
-        `SELECT decision, reason, by, covers, basis_fingerprint, recheck_at FROM decisions
+        `SELECT decision, reason, by, covers, basis_fingerprint, recheck_at${scheme} FROM decisions
          WHERE subject = ?${cut} ORDER BY created_at DESC LIMIT 3`,
       ).all(subject, ...args) as Record<string, unknown>[]) recent.push(toFacts(row));
     }

@@ -2232,6 +2232,15 @@ describe('legacy proven completion without fabricated historical delivery', () =
     const debt = h.ledger.listObligations({ jobId: f.jobId }).find((row) => row.incidentKey === `rebrief-current-inspection:${f.marker.id}`)!;
     expect(debt.state).toBe('open');
     const instruction = (audit.payload as { inspection_directive: string }).inspection_directive;
+    // The exemption is the directive route's, for the reservation's own job and exact text only.
+    seedJob(h, 'other-inspection-job');
+    for (const [path, body] of [['/api/silas/rebrief', { job_id: f.jobId, note: instruction }], ['/api/silas/directive', { job_id: 'other-inspection-job', directive: instruction }],
+      ['/api/silas/directive', { job_id: f.jobId, directive: `${instruction} (rewritten)` }]] as const) {
+      const refused = await call(h.port, 'POST', path, { ...body, request_id: reserved }, TOKEN);
+      expect(refused.status, `${path} ${body.job_id}`).toBe(400);
+      expect(refused.json).toMatchObject({ error: 'invalid_request_id' });
+    }
+    expect(h.ledger.getDirective(reserved)).toBeNull();
     const admitted = await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: reserved, directive: instruction }, TOKEN);
     expect(admitted.status, JSON.stringify(admitted.json)).toBe(202);
     await waitFor(() => h.ledger.getDirective(reserved)?.state === 'settled', 'reserved pre-rule inspection');
@@ -2785,7 +2794,9 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     const rebrief = async (requestId: string) => {
       if (requestId.includes(':')) {
         storedBeforeRule(h, h.ledger.beginRebriefIntent({ jobId, note, holder: 'silas-ops', requestId: 'rebrief-before-rename' }).record.requestId, requestId);
-        // The stored ':' id replays through the rebrief route; the accepted request then runs.
+        // The rebrief route replays the stored ':' id and starts nothing; the
+        // fixture then runs the accepted request directly (no producer
+        // blockers here), standing in for the service's reconcile pass.
         const replayed = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note, request_id: requestId }, TOKEN);
         expect(replayed.status, JSON.stringify(replayed.json)).toBe(202);
         expect(replayed.json).toMatchObject({ request_id: requestId, replay: true });
@@ -2854,6 +2865,41 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     expect(h.ledger.latestEventSeq()).toBe(events);
     const readback = await call(h.port, 'GET', `/api/silas/directives/${encodeURIComponent(stuck.requestId)}`, undefined, TOKEN);
     expect(readback.json).toMatchObject({ state: 'retired', recovery_decision: { successorId: null, eventSeq: decision.seq } });
+  });
+
+  it('#503 one current inspection per delivery: a second request with the fingerprint is refused naming the stored one, which replays verbatim', async () => {
+    const h = await boot(); const repo = makeFixtureRepo('one-inspection'); cleanupRepos.push(repo);
+    const jobId = 'inspected-job'; seedJob(h, jobId); await seedLane(h, repo, jobId);
+    const fingerprint = `current-inspection:${jobId}:41`;
+    const directive = 'Deliver your current candidate';
+    const body = (requestId: string, seq = 41) => ({ job_id: jobId, directive, blocker_fingerprint: `current-inspection:${jobId}:${seq}`,
+      rule_id: 'current-inspection', request_id: requestId });
+    // A request stored before #503 under the fingerprint itself.
+    const stored = storedBeforeRule(h, h.ledger.beginDirectiveIntent({ jobId, requestId: 'inspection-before-rename', directive, blockerFingerprint: fingerprint,
+      sourceContext: { ruleId: 'current-inspection' }, holder: 'silas-ops' }).record.requestId, fingerprint);
+    const readback = await call(h.port, 'GET', `/api/silas/directives/${encodeURIComponent(stored.requestId)}`, undefined, TOKEN);
+    expect(readback.json).toMatchObject({ request_id: fingerprint, directive, blocker_fingerprint: fingerprint });
+    const second = await call(h.port, 'POST', '/api/silas/directive', body('current-inspection-41'), TOKEN);
+    expect(second.status).toBe(409);
+    expect(second.json).toMatchObject({ error: 'inspection_exists', stored_request_id: fingerprint, stored_state: 'dispatching' });
+    expect(h.ledger.getDirective('current-inspection-41')).toBeNull();
+    // The fingerprint alone names an inspection, with or without its rule id.
+    const { rule_id: _rule, ...unruled } = body('current-inspection-41');
+    expect((await call(h.port, 'POST', '/api/silas/directive', unruled, TOKEN)).json).toMatchObject({ error: 'inspection_exists', stored_request_id: fingerprint });
+    // Resent verbatim from the readback, the stored request replays and starts nothing.
+    const replay = await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, directive: field<string>(readback.json, 'directive'),
+      blocker_fingerprint: field<string>(readback.json, 'blocker_fingerprint'), rule_id: 'current-inspection', request_id: fingerprint }, TOKEN);
+    expect(replay.status, JSON.stringify(replay.json)).toBe(202);
+    expect(replay.json).toMatchObject({ request_id: fingerprint, replay: true });
+    // Terminal, it is owed to the chief: still refused, never a second inspection.
+    h.ledger.failDirective({ requestId: fingerprint, reason: 'fixture: positively never dispatched' });
+    const terminal = await call(h.port, 'POST', '/api/silas/directive', body('current-inspection-41'), TOKEN);
+    expect(terminal.status).toBe(409);
+    expect(terminal.json).toMatchObject({ error: 'inspection_exists', stored_request_id: fingerprint, stored_state: 'failed',
+      detail: expect.stringContaining('owed to the chief') });
+    // Another historical delivery is another inspection.
+    expect((await call(h.port, 'POST', '/api/silas/directive', body('current-inspection-42', 42), TOKEN)).status).toBe(202);
+    await waitFor(() => h.ledger.getDirective('current-inspection-42')?.state === 'settled', 'the next inspection');
   });
 
   it('orphan settlement refuses a later admission that carries a lower work revision', async () => {

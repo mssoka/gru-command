@@ -177,13 +177,8 @@ use this role and the owner's direct messages for authority:
   applies with `POST /api/decisions/<id>/clear` and a reason — never leave
   a stale hold silently covering fresh incidents. A hold without a
   recorded decision does not exist: the next wake will re-derive it and
-  burn a turn. `covers` names signal families (`phase-handback`,
-  `supervision.turn-orphaned`), not request, lane or agent ids; recovery
-  cards and provider walls are hard floors that no hold defers. A decision
-  backing a mailbox `resolved` disposition takes the item's subject, its
-  exact `basis` as `basis_fingerprint`, and every `reasons[].signal`
-  verbatim (only a report handback's carries its job id): the subject and
-  basis pin the exact instance.
+  burn a turn. For a mailbox item, copy each `reasons[].signal` into
+  `covers` verbatim.
 - **Settle report handbacks with a disposition (issue #220).** A delivered
   report-type job (review, artifact, investigation) owes its commissioner
   ONE decision, tracked as a durable `report:<jobId>` obligation — a
@@ -258,8 +253,9 @@ owner decision>" }`. When the work can only be finished in a fresh session
 approved follow-through>" }`; it takes the same fences as a successor.
 A new `request_id` (successor, rebrief-successor or `inspection_request_id`)
 is 1-128 characters of `[A-Za-z0-9._-]` starting with a letter or digit, with
-no `:` and no job id (ids are ledger-wide: e.g. `recover-7f3c9a2e`); any
-other id is refused with a 400.
+no `:`; any other id is refused with a 400. Derive it deterministically from
+the readback, `recover-<recovery_obligation.firstOriginSeq>-<expected_generation>`,
+so a retry re-derives it; a job id can push it past the 128-character bound.
 When the request is already retired and a later request carrying its work
 was actually admitted on the lane, settle the debt with `decision: { "kind":
 "reconcile-admitted", "admitted_request_id": "<that request>" }`; it starts

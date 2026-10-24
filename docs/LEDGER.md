@@ -629,51 +629,70 @@ exhaustive for the subject (pages past any listing window).
 
 **Signal families (#503).** `incidentSignalOf` (`src/chat/incident.ts`)
 derives the signal from an alert kind. Kinds are `<namespace>.<family>`,
-scoped to an instance by `:` (`github.ci-failed:<job>:<sha>`,
-`silas.phase-handback.phase-handoff:<job>:<source>:<n>`) or by more `.`
-segments (`silas.directive-unreconciled.<request id>`,
-`supervision.provider-wall.<agent>.<class>`). The family is the first two
-dot segments before any `:`, with the `github.`/`silas.` namespace dropped:
+scoped to an instance by `:` (`github.ci-failed:<job>:<sha>`, a marked
+phase hand-back `silas.phase-handback.phase-handoff:<job>:<source>:<n>`) or
+by more `.` segments (`silas.directive-unreconciled.<request id>`, a
+blocked-lane hand-back `silas.phase-handback.<job>@<seq>`,
+`supervision.provider-wall.<agent>.<class>`,
+`supervision.turn-orphaned.<agent>`). The family is the first two dot
+segments before any `:`, with the `github.`/`silas.` namespace dropped:
 `ci-failed`, `directive-unreconciled`, `phase-handback`,
 `supervision.provider-wall`, `supervision.turn-orphaned`. No instance id
 enters a signal, so a caller-chosen id can never overrun the 64-character
 bound and make an exact disposition unrecordable. Two rulings stand apart:
 a red default branch is `ci-failed` (#446), and a report handback keeps the
-exact `report-handback.<job id>` (#314).
+exact `report-handback.<job id>` (#314). A new decision naming a token no
+row can raise any more — one instance of a family
+(`supervision.turn-orphaned.<agent>`, `directive-unreconciled.<request>`) —
+is refused at the write (`RetiredDecisionSignalError`, a 400 naming the
+family to cover); it would be stored and never match.
 
 Exactness lives in the subject and the basis. A dot-scoped kind keeps its
 whole kind in the subject (`incident:<kind>:<title>`), so a decision on one
-instance's subject never names another. A colon-scoped kind's subject is
-the segment between its first and second `:` (`job:<job>`), shared by every
-instance on that job, and its basis is everything after the second `:`
-(the head SHA, or `fix:1` for a marked phase hand-back; the whole kind when
-there is no second `:`): a decision pinned to a basis covers
-that one instance, and a null-basis family hold on the job covers every
-instance of the family on the job, as a `ci-failed` hold covers every head.
-A directive request id stored with a `:` before the id rule (below) is
-colon-scoped the same way and is not exact: `a:J:3` and `b:J:3` share
-subject `job:J`, signal and basis `3`; both are hard floors, so no hold
-defers either wake. Hard floors (`isHardFloorRow`) match kinds, not
-signals, so a family hold never defers one.
+instance's subject never names another: a family decision on `job:X` never
+reaches a blocked-lane hand-back or a turn-orphaned row (agent-scoped) at
+all. A colon-scoped kind's subject is the segment between its first and
+second `:` (`job:<job>`), shared by every instance on that job, and its
+basis is everything after the second `:` (the head SHA, or `fix:1` for a
+marked phase hand-back), or the whole kind when there is only one `:`. A
+decision pinned to a basis covers that one instance; a null-basis family
+decision on the job covers every instance of the family on the job, as a
+`ci-failed` hold covers every head. A directive request id stored with a
+`:` before the id rule (below) is colon-scoped the same way and is not
+exact: `a:J:3` and `b:J:3` share subject `job:J`, signal and basis `3`; both
+are hard floors, so no hold defers either wake. Hard floors
+(`isHardFloorRow`) match kinds, not signals, so a family hold never defers
+one.
+
+**Where coverage runs.** Production always wires the Gru mailbox, which owns
+admission for action-required rows: `coveringDecision` never runs for them,
+and a hold on a mailbox item is a restriction, never a deferral — the item
+stays quiet only under its exact-basis mailbox disposition. Hold coverage
+defers FYI wakes (`[chat].notify_wake = "all"`) and gates the Silas
+autopilot (`decisionHold`: `sweep-ack`, `delivered-pr-register`, the verdict
+rungs). A mailbox-less embedding also defers action-required rows.
 
 **The cutover (migration 32).** Every decision recorded before signal
-families is flagged `covers_scheme = 'pre-family'` and keeps the meaning it
-was written with: `coveringDecision` matches it only against the signal the
-pre-family derivation gave the row (`preFamilyIncidentSignalOf`, e.g.
-`supervision.turn-orphaned.<lane>`), never against the family. An old hold
-naming an old exact token keeps covering; an old hold naming a bare family
-token (`phase-handback` on `job:X`), which matched nothing then, stays
-inert. Decisions recorded since match families only. Both schemes compete in
-the one newest-first scan. The mailbox needs no flag: an item's basis hashes
-its reason signals, so an item carrying a changed signal has a new basis no
-pre-#503 exact-basis decision matches, and an old null-basis follow-up hold
-can only reach a reason whose presence already makes the item owe Gru. So
-every live mailbox item carrying a changed signal (a directive card, phase
-hand-back, provider wall, turn-orphaned, provider recovery-off or
-false-recovery reason) reopens once as `needs-gru` after the upgrade and
-wakes Gru once; its waiting, delegated or resolved disposition drops and is
-recorded again at the new basis.
-Its decisions stay listed and clearable.
+families is flagged `covers_scheme = 'pre-family'` (`coversScheme` on the
+record, in `GET /api/decisions`, on a mailbox restriction and in the
+escalation-triage facts) and keeps the meaning it was written with:
+`coveringDecision` matches it only against the signal the pre-family
+derivation gave the row (`preFamilyIncidentSignalOf`, e.g.
+`provider.waiting.<route>`), never against the family. An old decision
+naming an old exact token keeps covering; one naming a bare family token,
+which matched nothing then, stays inert. Decisions recorded since match
+families only. Both schemes compete in the one newest-first scan. A
+`client_key` replay of a pre-family decision is a `DecisionConflictError`
+(409 `decision_conflict`): record it again under a new key. The mailbox
+needs no flag: an item's basis hashes its reason signals, so an item
+carrying a changed signal has a new basis no pre-#503 exact-basis decision
+matches, and an old null-basis follow-up hold can only reach a reason whose
+presence already makes the item owe Gru. So every live mailbox item
+carrying a changed signal (a directive card, phase hand-back, provider
+wall, turn-orphaned, provider recovery-off or false-recovery reason)
+reopens once as `needs-gru` after the upgrade and wakes Gru once; its
+waiting, delegated or resolved disposition drops and is recorded again at
+the new basis. Its decisions stay listed and clearable.
 
 New directive and re-brief request ids follow the safe record-id rule
 (1-128 characters, no `:`; `docs/DIRECTIVE-RECOVERY.md`). A directive card's

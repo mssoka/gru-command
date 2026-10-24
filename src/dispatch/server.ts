@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, DirectiveRequestIdError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, CurrentInspectionExistsError, DirectiveConflictError, DirectiveRequestIdError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -1361,7 +1361,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (requestIdField === undefined || options.ledger.getDirective(requestIdField) === null) {
         try {
           // A new id meets the safe-id rule before any lane gate answers.
-          if (requestIdField !== undefined) options.ledger.requireAdmissibleRequestId(requestIdField, 'directive request_id');
+          if (requestIdField !== undefined) options.ledger.requireAdmissibleRequestId(requestIdField, 'directive request_id', { jobId, directive });
         } catch (error) {
           if (!(error instanceof DirectiveRequestIdError)) throw error;
           json(res, 400, { error: 'invalid_request_id', detail: error.message });
@@ -1394,6 +1394,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
         });
       } catch (error) {
+        if (error instanceof CurrentInspectionExistsError) {
+          json(res, 409, { error: 'inspection_exists', stored_request_id: error.storedRequestId, stored_state: error.storedState, detail: error.message });
+          return true;
+        }
         if (error instanceof AmbiguousDirectiveError) {
           json(res, 409, { error: 'ambiguous_repeat', detail: error.message });
           return true;
@@ -1806,11 +1810,16 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 404, { error: 'not_found', detail: `no directive request "${requestId}"` });
         return true;
       }
+      // The accepted text and fingerprint (#503), so a retry under this id
+      // can resend them verbatim and replay instead of conflicting.
+      const accepted = JSON.parse(record.payload) as { readonly directive?: unknown; readonly blocker_fingerprint?: unknown };
       json(res, 200, {
         request_id: record.requestId,
         job_id: record.jobId,
         state: record.state,
         payload_hash: record.payloadHash,
+        directive: accepted.directive,
+        blocker_fingerprint: accepted.blocker_fingerprint ?? null,
         accepted_at: record.createdAt,
         updated_at: record.updatedAt,
         admission_seq: record.admissionSeq,

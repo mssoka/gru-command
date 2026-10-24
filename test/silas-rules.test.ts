@@ -135,9 +135,10 @@ describe('parseSilasActionRuleId (request-boundary validation)', () => {
 });
 
 describe('prescribed request ids (#503)', () => {
-  // Worst-case placeholders: a 128-character job (or chosen) id, the largest event seq.
-  const instantiate = (template: string): string =>
-    template.replace(/<[^>]+>/gu, (name) => (/seq/iu.test(name) ? String(Number.MAX_SAFE_INTEGER) : `j${'x'.repeat(127)}`));
+  // Worst-case placeholders: the largest seq or generation, a round uuid, and a
+  // 128-character job (or chosen) id for anything else.
+  const instantiate = (template: string): string => template.replace(/<[^>]+>/gu, (name) =>
+    /seq|generation/iu.test(name) ? String(Number.MAX_SAFE_INTEGER) : /round/iu.test(name) ? '0b1c2d3e-0000-4000-8000-000000000503' : `j${'x'.repeat(127)}`);
   const ROLE_PATHS = ['gru.md', 'silas.md'].map((name) => join(import.meta.dirname, '..', 'roles', name));
 
   it('every request_id the rule registry, the ops skill and the roles prescribe meets the safe request-id rule at its longest', () => {
@@ -146,7 +147,7 @@ describe('prescribed request ids (#503)', () => {
     const documents = [SKILL_PATH, ...ROLE_PATHS].map((path) => readFileSync(path, 'utf8'));
     // JSON request bodies, and the prose id examples (backticked, by GC's id prefixes).
     const fromJson = documents.flatMap((text) => [...text.matchAll(/"(?:inspection_)?request_id": ?"([^"]+)"/gu)].map((match) => match[1]!));
-    const fromProse = documents.flatMap((text) => [...text.matchAll(/`((?:revision-continuation|rebrief|recover|current-inspection)[-:][^`\s]*)`/gu)].map((match) => match[1]!));
+    const fromProse = documents.flatMap((text) => [...text.matchAll(/`((?:revision-continuation|rebrief|recover|current-inspection|verdict-rung-directive)[-:][^`\s]*)`/gu)].map((match) => match[1]!));
     expect(fromJson.length).toBeGreaterThan(0);
     expect(fromProse.length).toBeGreaterThan(0);
     for (const template of [...fromRules, ...fromJson, ...fromProse]) {

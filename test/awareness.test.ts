@@ -16,7 +16,8 @@ import { DECISION_SURFACE_ESCALATION_TRIAGE } from '../src/decisions/questions.j
 import type { DecisionService } from '../src/decisions/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
-import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { seedPreFamilyDecisions } from './helpers/pre-family-decisions.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { DefaultBranchCiWatch } from '../src/repos/default-branch-ci.js';
 import type { RepoOverviewRunRaw } from '../src/repos/overview.js';
@@ -1717,6 +1718,27 @@ describe('escalation-triage review fixes (issue #224 review)', () => {
     expect(fake.asks[0]?.state).toContain('basis_fingerprint');
   });
 
+  it('#503 the escalation memory marks a hold recorded before signal families as pre-family', async () => {
+    const fake = fakeDecisions();
+    const dir = tmpDir();
+    seedPreFamilyDecisions(dir, [{ subject: 'job:job-bound', covers: ['flaky-lane'], reason: 'owner hold from before the cutover', by: 'owner' }]);
+    const rig = boot({ dir, wakeMode: 'action-required', ...shadowWiring(fake.decide) });
+    rig.api.addJob({ id: 'job-bound', repo: 'acme/app', title: 'bound lane', briefing: 'b' });
+    rig.api.registerAgent({ id: 'minion-esc', role: 'minion', jobId: 'job-bound' });
+    rig.api.recordDecision({ subject: 'job:job-bound', decision: 'hold', covers: ['flaky-lane'], reason: 'owner hold after the cutover', by: 'owner' });
+    rig.notifications.post({ kind: 'silas.escalation', routing: 'action-required', severity: 'error', title: 'lane needs a ruling', detail: null, agentId: 'minion-esc' });
+    await flush();
+    expect(fake.asks).toHaveLength(1);
+    // Each fact is one flat object: the old hold carries the marker, the new one never does.
+    const facts = fake.asks[0]!.state.match(/\{[^{}]*owner hold (?:from before|after) the cutover[^{}]*\}/gu) ?? [];
+    const before = facts.filter((fact) => fact.includes('from before the cutover'));
+    const after = facts.filter((fact) => fact.includes('after the cutover'));
+    expect(before.length).toBeGreaterThan(0);
+    expect(after.length).toBeGreaterThan(0);
+    for (const fact of before) expect(fact).toContain('"covers_scheme":"pre-family"');
+    for (const fact of after) expect(fact).not.toContain('covers_scheme');
+  });
+
   it('unrelated escalat-kind notifications never consume asks', async () => {
     const fake = fakeDecisions();
     const rig = boot({
@@ -1857,7 +1879,7 @@ describe('gru awareness — wake rework (issue #219)', () => {
       // A hold covering the provider-wall incident and the breaker subject.
       rig.api.recordDecision({
         subject: 'incident:supervision.provider-wall.a1.quota_wall:agent-a1-stopped-quota-wall',
-        decision: 'hold', covers: ['supervision.provider-wall.a1.quota_wall'], basisFingerprint: null,
+        decision: 'hold', covers: ['supervision.provider-wall'], basisFingerprint: null,
         reason: 'known provider condition', by: 'owner', clientKey: 'hold-wall',
       });
       rig.notifications.post({ kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent a1 stopped: quota wall' });
@@ -1923,26 +1945,15 @@ describe('gru awareness — wake rework (issue #219)', () => {
     }
   });
 
-  /** A ledger written before migration 32: decisions recorded here are pre-family. */
-  function preFamilyLedger(record: (api: LedgerApi) => void): string {
-    const dir = tmpDir();
-    const db = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 31) });
-    try { record(new LedgerApi(db.handle)); } finally { db.close(); }
-    return dir;
-  }
-
-  it('#503 a hold recorded before signal families keeps covering by its exact old token', () => {
+  // Mailbox-less coverage path (production wires the mailbox, which never
+  // runs hold coverage for action-required rows; see the GH-305 rig below).
+  it('#503 without a mailbox: a hold recorded before signal families keeps covering by its exact old token', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-10-05T12:00:00'));
-      let holdId = '';
-      const dir = preFamilyLedger((api) => {
-        holdId = api.recordDecision({
-          subject: 'incident:supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
-          decision: 'hold', covers: ['supervision.turn-orphaned.lane-a'], basisFingerprint: 'supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
-          reason: 'recorded before signal families', by: 'gru', clientKey: 'legacy-hold-lane-a',
-        }).id;
-      });
+      const dir = tmpDir();
+      const [holdId] = seedPreFamilyDecisions(dir, [{ subject: 'incident:supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a',
+        covers: ['supervision.turn-orphaned.lane-a'], basisFingerprint: 'supervision.turn-orphaned.lane-a:interrupted-turn-on-lane-a' }]);
       const rig = boot({ dir, wakeMode: 'action-required' });
       rig.notifications.post({ kind: 'supervision.turn-orphaned.lane-a', routing: 'action-required', severity: 'error', title: 'Interrupted turn on lane-a' });
       expect(rig.woke).toHaveLength(0);
@@ -1952,18 +1963,19 @@ describe('gru awareness — wake rework (issue #219)', () => {
     }
   });
 
-  it('#503 a bare-family hold recorded before signal families stays inert; a later one defers', () => {
+  it('#503 without a mailbox: a bare-family hold recorded before signal families stays inert; a later one defers', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-10-05T12:00:00'));
-      const hold = { subject: 'job:job-x', decision: 'hold' as const, covers: ['phase-handback'], basisFingerprint: null, by: 'gru' as const };
+      const dir = tmpDir();
       // It matched nothing when recorded: the old signal was phase-handback.phase-handoff.
-      const dir = preFamilyLedger((api) => { api.recordDecision({ ...hold, reason: 'dormant pre-family hold', clientKey: 'pre-family-phase' }); });
+      seedPreFamilyDecisions(dir, [{ subject: 'job:job-x', covers: ['phase-handback'], reason: 'dormant pre-family hold' }]);
       const rig = boot({ dir, wakeMode: 'action-required' });
       rig.notifications.post({ kind: 'silas.phase-handback.phase-handoff:job-x:fix:1', routing: 'action-required', severity: 'info', title: 'Phase completed on job job-x — Gru decision owed' });
       expect(rig.woke).toHaveLength(1);
       expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
-      const later = rig.api.recordDecision({ ...hold, reason: 'phase hand-backs parked under the fix lane', clientKey: 'family-phase' });
+      const later = rig.api.recordDecision({ subject: 'job:job-x', decision: 'hold', covers: ['phase-handback'], basisFingerprint: null, by: 'gru',
+        reason: 'phase hand-backs parked under the fix lane', clientKey: 'family-phase' });
       rig.notifications.post({ kind: 'silas.phase-handback.phase-handoff:job-x:review:2', routing: 'action-required', severity: 'info', title: 'Phase completed on job job-x — Gru decision owed' });
       expect(rig.woke).toHaveLength(1);
       expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered', decision_id: later.id });
@@ -2433,8 +2445,9 @@ describe('gru awareness — wake rework review fixes (issue #219)', () => {
 
 
 describe('GH-305 mailbox reconciliation through existing awareness gates', () => {
-  function mailboxRig(mode: NotifyWakeMode = 'action-required', count = 0, minSeverity: WakeMinSeverity = 'info') {
+  function mailboxRig(mode: NotifyWakeMode = 'action-required', count = 0, minSeverity: WakeMinSeverity = 'info', seed?: (dir: string) => void) {
     const dir = tmpDir();
+    seed?.(dir);
     const db = new LedgerDb(dir);
     const bus = new EventBus();
     const api = new LedgerApi(db.handle, { bus });
@@ -2457,6 +2470,56 @@ describe('GH-305 mailbox reconciliation through existing awareness gates', () =>
     return { dir, bus, api, mailbox, awareness, delivered, receive, turns: () => turns,
       close: () => { awareness.dispose(); db.close(); } };
   }
+
+  it('#503 production path: a family hold is a restriction on an action-required item, never a deferral', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const rig = mailboxRig();
+    try {
+      rig.awareness.setWakeSink(rig.receive);
+      rig.api.recordDecision({ subject: 'incident:supervision.turn-orphaned.agent-a:interrupted-turn-on-agent-a', decision: 'hold',
+        covers: ['supervision.turn-orphaned'], basisFingerprint: null, reason: 'agent-a is being re-briefed', by: 'gru' });
+      new NotificationCenter({ ledger: rig.api, bus: rig.bus }).post({ kind: 'supervision.turn-orphaned.agent-a', routing: 'action-required', severity: 'error', title: 'Interrupted turn on agent-a' });
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(1);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] }).filter((event) => (event.payload as { reason?: unknown }).reason === 'covered')).toEqual([]);
+      expect(rig.mailbox.snapshot().items.find((item) => item.subject.startsWith('incident:supervision.turn-orphaned.agent-a'))?.restrictions)
+        .toEqual(['gru: agent-a is being re-briefed']);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
+
+  it('#503 production path: FYI coverage keeps an old exact hold, keeps an old bare-family hold inert and honours a new family hold', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const subject = (route: string) => `incident:provider.waiting.${route}:provider-${route}-waiting`;
+    let exactHold = '';
+    const rig = mailboxRig('all', 0, 'info', (dir) => {
+      [exactHold] = seedPreFamilyDecisions(dir, [
+        { subject: subject('route-a'), covers: ['provider.waiting.route-a'] },
+        { subject: subject('route-b'), covers: ['provider.waiting'], reason: 'dormant pre-family hold' },
+      ]) as [string, string];
+    });
+    try {
+      rig.awareness.setWakeSink(rig.receive);
+      const notifications = new NotificationCenter({ ledger: rig.api, bus: rig.bus });
+      const covered = () => rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })
+        .filter((event) => (event.payload as { reason?: unknown }).reason === 'covered').map((event) => (event.payload as { decision_id?: unknown }).decision_id);
+      const wait = (route: string) => notifications.post({ kind: `provider.waiting.${route}`, routing: 'fyi', severity: 'info', title: `Provider ${route} waiting` });
+      wait('route-a');
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(0);
+      expect(covered()).toEqual([exactHold]);
+      wait('route-b');
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(1);
+      const family = rig.api.recordDecision({ subject: subject('route-c'), decision: 'hold', covers: ['provider.waiting'], basisFingerprint: null,
+        reason: 'provider route-c is recovering', by: 'gru' });
+      wait('route-c');
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(1);
+      expect(covered()).toEqual([exactHold, family.id]);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
 
   it('a red default branch wakes; the repository hold is a restriction on a later red head, which still wakes (#446)', () => {
     vi.useFakeTimers();

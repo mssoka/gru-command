@@ -6,6 +6,7 @@ import {
   incidentSubjectOf,
   isHardFloorRow,
   preFamilyIncidentSignalOf,
+  retiredSignalFamily,
   normalizeIncidentTitle,
 } from '../src/chat/incident.js';
 import { validateDecisionSignal, validateDecisionSubject } from '../src/ledger/decision-memory.js';
@@ -212,6 +213,25 @@ describe('incident identity — signal families (issue #503)', () => {
     expect(preFamilyIncidentSignalOf(row('silas.rebrief-unreconciled.j-42'))).toBe('rebrief-unreconciled');
     expect(preFamilyIncidentSignalOf(row('silas.report-handback.review-old'))).toBe('report-handback.review-old');
     expect(preFamilyIncidentSignalOf(row('supervision.breaker'))).toBe('supervision.breaker');
+  });
+
+  it('a retired token is an old instance-bearing signal; no signal a row raises today is retired', () => {
+    const kinds = [`silas.directive-unreconciled.${request}`, 'silas.phase-handback.j-1@17', 'silas.phase-handback.phase-handoff:job-a:fix:1',
+      'silas.rebrief-unreconciled.j-42', `silas.recovery-owner-transfer.directive.${request}.3`, `supervision.provider-wall.${agent}.quota_wall`,
+      'supervision.turn-orphaned.a2', 'provider.false-recovery.route-x', 'provider.waiting.route-x', `provider-recovery.recovery-off.${request}`,
+      `gru.wake-failed-escalation.${request}`, 'decisions.degraded.provider-unreachable', 'github.ci-failed:j-1:abc', 'github.pr-conflict:j-7',
+      'github.default-branch-ci-failed:acme/alpha:7:abc', `silas.report-handback.Review-${'A'.repeat(121)}`, 'silas.report-handback.rt-648.review-1', 'supervision.breaker',
+      'lessons.dream-failed', 'review-escalation', 'silas.escalation', 'job-stop-unproven:j-1'];
+    for (const kind of kinds) {
+      const family = incidentSignalOf(row(kind));
+      expect(retiredSignalFamily(family), kind).toBeNull();
+      const old = preFamilyIncidentSignalOf(row(kind));
+      // Every storable old token the family replaced is retired, naming its family.
+      if (old !== null && old !== family) expect(retiredSignalFamily(old), kind).toBe(family);
+    }
+    for (const signal of ['blocked', 'worker-error', 'obligation', 'sweep-ack', 'delivered-pr-register', 'verdict-rung-directive', 'verification-failure']) {
+      expect(retiredSignalFamily(signal), signal).toBeNull();
+    }
   });
 
   it('a family never widens hard floors; the subject or the basis keeps instances apart', () => {

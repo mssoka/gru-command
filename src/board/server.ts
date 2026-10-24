@@ -6,7 +6,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, MachineDispositionRefusedError, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, DecisionConflictError, MachineDispositionRefusedError, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { parseDecisionOptions, parseNotificationDecision, serializeNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
@@ -954,6 +954,10 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         const refused = error instanceof AdminCloseoutRefusal;
         if (error instanceof MailboxConflictError) {
           json(res, 409, { error: 'mailbox_conflict', detail: message });
+          return;
+        }
+        if (error instanceof DecisionConflictError) {
+          json(res, 409, { error: 'decision_conflict', detail: message });
           return;
         }
         if (error instanceof NotificationDecisionRefusal) {

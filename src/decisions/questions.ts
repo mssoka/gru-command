@@ -338,6 +338,9 @@ export interface DecisionMemoryFacts {
   readonly covers: string;
   readonly basis_fingerprint: string | null;
   readonly recheck_at: string | null;
+  /** Present only for a decision recorded before signal families (#503):
+   * its covers match only pre-#503 signals. */
+  readonly covers_scheme?: 'pre-family';
 }
 
 export interface EscalationTriageInput {

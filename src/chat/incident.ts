@@ -137,6 +137,28 @@ export function incidentSignalOf(row: IncidentRow): string {
   return family === '' ? row.kind : family;
 }
 
+/** The `silas.`/`github.` families whose kinds name an instance after the
+ * family (`silas.directive-unreconciled.<request>`): their pre-#503 signals
+ * were `<family>.<instance>`. */
+const NAMESPACED_INSTANCE_FAMILIES: readonly string[] = ['directive-unreconciled', 'phase-handback', 'rebrief-unreconciled', 'recovery-owner-transfer'];
+
+/**
+ * #503: the family to name instead, when `token` is an instance-bearing
+ * signal the current derivation can no longer produce — a namespaced
+ * family with an instance (`directive-unreconciled.<request>`), or any
+ * token of three or more dot segments (`supervision.turn-orphaned.<agent>`),
+ * which no family has. Null for every token a row can raise today; the
+ * report handback's exact job identity (#314) stays. A decision naming a
+ * retired token would be stored and never match: the write boundary
+ * refuses it instead.
+ */
+export function retiredSignalFamily(token: string): string | null {
+  if (token.startsWith(REPORT_HANDBACK_KIND_PREFIX.slice('silas.'.length))) return null;
+  const segments = token.split('.');
+  if (segments.length >= 2 && NAMESPACED_INSTANCE_FAMILIES.includes(segments[0]!)) return segments[0]!;
+  return segments.length >= 3 ? segments.slice(0, 2).join('.') : null;
+}
+
 /** The pre-#503 derivation, verbatim: the default branch and the re-brief
  * producer were families already; every other kind kept its instance. */
 function preFamilySignalOf(kind: string): string {

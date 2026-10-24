@@ -26,6 +26,7 @@ import type { MailboxItem } from '../src/ledger/mailbox.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { seedPreFamilyDecisions } from './helpers/pre-family-decisions.js';
 import { incidentSubjectOf } from '../src/chat/incident.js';
 import type { NotificationRecord } from '../src/ledger/api.js';
 
@@ -46,6 +47,8 @@ async function boot(
     heartbeatMs: number;
     repoOverview: () => RepoOverviewView | null;
     onNotificationDisposition: (id: string, detail: string) => { readonly ok: boolean; readonly reason?: string } | void;
+    /** Writes into the instance dir before the ledger opens (e.g. a pre-migration ledger). */
+    seed: (dir: string) => void;
   }> = {},
 ): Promise<{
   port: number;
@@ -70,10 +73,11 @@ async function boot(
     'utf-8',
   );
   const cfg = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
+  overrides.seed?.(dir);
   const db = new LedgerDb(dir);
   const bus = new EventBus();
   const api = new LedgerApi(db.handle, { bus });
-  const { repoOverview, ...serverOverrides } = overrides;
+  const { repoOverview, seed: _seed, ...serverOverrides } = overrides;
   const engine = new BoardEngine({
     ledger: api,
     bus,
@@ -1750,6 +1754,33 @@ describe('board server — id-bearing incident signal families (issue #503)', ()
       expect(reopened.basis).not.toBe(item.basis);
       expect(reopened.state).toBe('needs-gru');
       expect(harness.api.getDirective(request)).toEqual(directive);
+    } finally { await harness.close(); }
+  });
+
+  it('decisions show their covers scheme; a pre-family client_key replay and a retired instance token are refused by name', async () => {
+    const harness = await boot(token, { seed: (dir) => {
+      seedPreFamilyDecisions(dir, [{ subject: 'job:held-job', covers: ['pr-conflict'], reason: 'owner rebases by hand', by: 'silas', clientKey: 'hold-held-job' }]);
+    } });
+    try {
+      const listed = await getJson(harness.port, `/api/decisions?subject=${encodeURIComponent('job:held-job')}`, token);
+      expect(listed.body).toMatchObject({ decisions: [{ subject: 'job:held-job', covers: ['pr-conflict'], coversScheme: 'pre-family' }] });
+      const hold = { subject: 'job:held-job', decision: 'hold', covers: ['pr-conflict'], reason: 'owner rebases by hand', by: 'silas' };
+      const replay = await postJson(harness.port, '/api/decisions', token, { ...hold, client_key: 'hold-held-job' });
+      expect(replay.status).toBe(409);
+      expect(replay.body).toMatchObject({ error: 'decision_conflict', detail: expect.stringContaining('record the decision again under a new client_key') });
+      const again = await postJson(harness.port, '/api/decisions', token, { ...hold, client_key: 'hold-held-job-family' });
+      expect(again.status).toBe(201);
+      expect(again.body).toMatchObject({ coversScheme: 'family' });
+      const retired = await postJson(harness.port, '/api/decisions', token, { ...hold, covers: ['supervision.turn-orphaned.minion-2'], client_key: 'retired' });
+      expect(retired.status).toBe(400);
+      expect(retired.body).toMatchObject({ error: 'bad_request', detail: expect.stringContaining('cover "supervision.turn-orphaned"') });
+      // The pre-family hold reads as such on its mailbox item.
+      harness.api.addJob({ id: 'held-job', repo: 'r', title: 'held' });
+      harness.api.setJobStatus('held-job', 'blocked');
+      const page = await getJson(harness.port, '/api/mailbox', token);
+      const item = (page.body as { items: MailboxItem[] }).items.find((row) => row.subject === 'job:held-job')!;
+      expect(item.restrictions).toContain('silas (pre-family hold: covers only pre-#503 signals): owner rebases by hand');
+      expect(item.restrictions).toContain('silas: owner rebases by hand');
     } finally { await harness.close(); }
   });
 

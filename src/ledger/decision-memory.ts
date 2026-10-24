@@ -26,6 +26,11 @@ export type DecisionKind = 'hold' | 'dismissed' | 'acted' | 'superseded' | 'cove
  * supervisor, the owner, or deterministic code. */
 export type DecisionActor = 'gru' | 'silas' | 'owner' | 'code';
 
+/** How a decision's `covers` is read (#503, migration 32): `family` since
+ * signal families; `pre-family` for every decision recorded before, which
+ * matches only the signal the pre-family derivation gave a row. */
+export type DecisionCoversScheme = 'family' | 'pre-family';
+
 export const DECISION_KINDS: readonly DecisionKind[] = ['hold', 'dismissed', 'acted', 'superseded', 'covered'];
 export const DECISION_ACTORS: readonly DecisionActor[] = ['gru', 'silas', 'owner', 'code'];
 
@@ -65,6 +70,9 @@ export interface DecisionRecord {
   readonly clearedAt: string | null;
   readonly clearedBy: string | null;
   readonly clearedReason: string | null;
+  /** How `covers` is read (#503): a `pre-family` decision matches only
+   * pre-family signals, so its family-looking tokens may cover nothing. */
+  readonly coversScheme: DecisionCoversScheme;
 }
 
 /** Bounds — every write boundary validates against these. */
@@ -128,6 +136,17 @@ export function validateDecisionSignal(value: string): string {
     throw new Error(`decision signal must be a lowercase token of [a-z0-9._-], got "${value}"`);
   }
   return value;
+}
+
+/** #503: a new decision names a signal no row can raise any more — one
+ * instance of a family (`supervision.turn-orphaned.<agent>`). It would be
+ * stored and never match; the caller covers the family instead. */
+export class RetiredDecisionSignalError extends Error {
+  constructor(readonly signal: string, readonly family: string) {
+    super(`decision signal "${signal}" names one instance of the signal family "${family}" (#503): cover "${family}" — ` +
+      'the subject and basis pin the instance');
+    this.name = 'RetiredDecisionSignalError';
+  }
 }
 
 /** Whether `value` passes validateDecisionSignal: the write boundary, and so
@@ -257,12 +276,16 @@ export function decisionFromRowValues(values: {
   cleared_at: string | null;
   cleared_by: string | null;
   cleared_reason: string | null;
+  covers_scheme: string;
 }): DecisionRecord {
   if (!isDecisionKind(values.decision)) {
     throw new Error(`decision row "${values.id}" carries unknown decision kind "${values.decision}"`);
   }
   if (!isDecisionActor(values.by)) {
     throw new Error(`decision row "${values.id}" carries unknown actor "${values.by}"`);
+  }
+  if (values.covers_scheme !== 'family' && values.covers_scheme !== 'pre-family') {
+    throw new Error(`decision row "${values.id}" carries unknown covers scheme "${values.covers_scheme}"`);
   }
   return {
     id: values.id,
@@ -278,5 +301,6 @@ export function decisionFromRowValues(values: {
     clearedAt: values.cleared_at,
     clearedBy: values.cleared_by,
     clearedReason: values.cleared_reason,
+    coversScheme: values.covers_scheme,
   };
 }
