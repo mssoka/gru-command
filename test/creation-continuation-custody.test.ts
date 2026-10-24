@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { DispatchService } from '../src/dispatch/service.js';
 import { JobExecutionStop } from '../src/dispatch/job-stop.js';
@@ -156,18 +156,32 @@ describe('retained-creation continuation custody', () => {
     expect(api.spawns).toHaveLength(1);
   });
 
-  it('keeps everything and reads custody-unknown when setup processes outlive a setup timeout', async () => {
-    const h = await retainedFixture('setup-survivor', {
-      manager: { setupTimeoutMs: 300 },
-      prepare: (repo) => { repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "(trap \'\' TERM; exec sleep 3) >/dev/null 2>&1 & sleep 30"\n', 'setup with a survivor'); },
-    });
-    const api = await httpHarness(h);
-    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'setup-survivor' })).status).toBe(202);
-    const unknown = await waitForState(api.base, api.jobId, 'setup-survivor', 'custody-unknown');
-    expect(unknown['reason']).toMatch(/worktree setup command timed out after 300ms/u);
-    expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`))).toBe(true);
-    expect(receiptFiles(api.repo)).toHaveLength(1);
-    expect(api.spawns).toHaveLength(0);
+  it('keeps everything and reads custody-unknown when a failed setup leaves a process of any step running', async () => {
+    const signals = directory();
+    const survivor = (name: string): string => `sh -c 'echo $$ > ${join(signals, name)}; exec sleep 6' >/dev/null 2>&1 &`;
+    for (const [name, manifest, reason] of [
+      ['timeout', '[[setup]]\ncommand = "(trap \'\' TERM; exec sleep 3) >/dev/null 2>&1 & sleep 30"\n', /worktree setup command timed out after 300ms/u],
+      ['nonzero', `[[setup]]\ncommand = "${survivor('nonzero.pid')} sleep 0.3; exit 3"\n`, /worktree setup command exited 3/u],
+      ['earlier-step', `[[setup]]\ncommand = "${survivor('earlier-step.pid')} sleep 0.3"\n\n[[setup]]\ncommand = "exit 4"\n`, /worktree setup command exited 4/u],
+    ] as const) {
+      const h = await retainedFixture(`setup-survivor-${name}`, {
+        manager: { setupTimeoutMs: name === 'timeout' ? 300 : 30_000 },
+        prepare: (repo) => { repo.commitFile('.gru-command/worktree.toml', manifest, `setup leaving a process (${name})`); },
+      });
+      try {
+        const api = await httpHarness(h);
+        expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: name })).status, name).toBe(202);
+        const unknown = await waitForState(api.base, api.jobId, name, 'custody-unknown');
+        expect(unknown['reason'], name).toMatch(reason);
+        expect(existsSync(join(h.root, basename(h.repo.path), `job-${api.jobId}`)), name).toBe(true);
+        expect(receiptFiles(api.repo), name).toHaveLength(1);
+        expect(api.spawns, name).toHaveLength(0);
+      } finally {
+        if (existsSync(join(signals, `${name}.pid`))) {
+          try { process.kill(Number(readFileSync(join(signals, `${name}.pid`), 'utf8'))); } catch { /* already gone */ }
+        }
+      }
+    }
   });
 
   it('reads back refused, with everything retained, when a custody guard refuses after adoption', async () => {
@@ -218,7 +232,7 @@ describe('retained-creation continuation custody', () => {
     expect((later.body['readback'] as Record<string, unknown>)['reason']).toMatch(/^retained creation receipt for branch gru\/admitted-write is absent/u);
   });
 
-  it('keeps the original post-spawn error and marks the agent disposed when the disposal itself fails', async () => {
+  it('keeps the original post-spawn error, the agent row and the lane when the disposal itself fails', async () => {
     const h = managerFixture('dispose-fails');
     const original = h.ledger.appendCustomEvent.bind(h.ledger);
     h.ledger.appendCustomEvent = ((input: Parameters<typeof original>[0]) => {
@@ -231,10 +245,23 @@ describe('retained-creation continuation custody', () => {
     const error = await dispatch.dispatch({ jobId: 'dispose-fails', repoPath: h.repo.path, title: 'dispose', briefing: 'dispose briefing' }).then(() => null, (failure: unknown) => failure);
     expect(error).toBeInstanceOf(AggregateError);
     expect((error as AggregateError).errors.map(String)).toEqual(['Error: synthetic spawn-event write failure', 'Error: synthetic dispose failure']);
-    expect(h.ledger.getAgent('dispose-fails-minion')?.state).toBe('disposed');
-    // The minion may still run: its lane is not swept.
+    // The minion may still run: its row is not marked disposed and its lane is not swept.
+    expect(h.ledger.getAgent('dispose-fails-minion')?.state).toBe('spawning');
     expect(h.ledger.getWorktree('dispose-fails')?.status).toBe('active');
     expect(h.ledger.getJob('dispose-fails')?.note).toMatch(/^dispatch failed: AggregateError: Error: synthetic spawn-event write failure/u);
+
+    // A continuation reads that back as custody-unknown.
+    const retained = await retainedFixture('dispose-fails-continuation');
+    const record = retained.ledger.recordCreationContinuationState.bind(retained.ledger);
+    retained.ledger.recordCreationContinuationState = (input) => {
+      if (input.state === 'admitted') throw new Error('synthetic admitted-state write failure');
+      return record(input);
+    };
+    const api = await httpHarness(retained, { disposeFailure: new Error('synthetic dispose failure') });
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'dispose-fails' })).status).toBe(202);
+    const unknown = await waitForState(api.base, api.jobId, 'dispose-fails', 'custody-unknown');
+    expect(unknown).toMatchObject({ custody: { status: 'active' }, admission: { agent_id: 'fixture-minion-1' } });
+    expect(api.ledger.getAgent('fixture-minion-1')?.state).toBe('spawning');
   });
 
   it('settles the job delivered when only the continuation delivered-state write fails', async () => {
@@ -476,6 +503,71 @@ describe('retained-creation continuation custody', () => {
       expect(accepted.timeline.state, guard).toBe('refused');
       expect((accepted.timeline.events[0]!.payload as Record<string, unknown>)['reason'], guard).toMatch(reason);
     }
+  });
+
+  it('reads failed before the manager when the repository is gone at the floor, and a later request proceeds once it is back', async () => {
+    const h = await retainedFixture('repo-moved-at-floor');
+    const held = heldFloor();
+    const api = await httpHarness(h, { service: { diskFloor: held.floor } });
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'moved' })).status).toBe(202);
+    await waitForState(api.base, api.jobId, 'moved', 'queued');
+    const moved = `${h.repo.path}-moved`;
+    renameSync(h.repo.path, moved);
+    held.release();
+    const failed = await waitForState(api.base, api.jobId, 'moved', 'failed');
+    expect((failed['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'failed', stage: 'failed-before-manager' });
+    expect(failed['reason']).toMatch(/ENOENT/u);
+    renameSync(moved, h.repo.path);
+    expect(api.ledger.getJob(api.jobId)?.status).toBe('blocked');
+    const later = await httpHarness(h);
+    expect((await request(later.base, 'POST', { job_id: api.jobId, request_id: 'restored' })).status).toBe(202);
+    await waitForState(later.base, api.jobId, 'restored', 'delivered');
+    expect(later.spawns).toHaveLength(1);
+  });
+
+  it('reads failed before the manager when the handoff symlink is gone at the floor, and a later request proceeds once it is back', async () => {
+    const h = managerFixture('symlink-gone-at-floor');
+    const alias = join(directory(), 'linked-checkout');
+    symlinkSync(h.repo.path, alias);
+    const jobId = 'symlink-gone-at-floor';
+    const original = new DispatchService({ ledger: h.ledger, worktrees: h.worktrees, spawner: async () => fakeHandle('never-spawned', []) });
+    const restore = committedStall();
+    await expect(original.dispatch({ jobId, repoPath: alias, title: 'alias', briefing: 'Original briefing alias' })).rejects.toThrow(/did not close within 1000ms/u);
+    vi.stubEnv('PATH', restore);
+    const job = h.ledger.getJob(jobId)!;
+    const inspection = await h.worktrees.inspectRetainedJobCreation({ repoPath: alias, jobId });
+    const held = heldFloor();
+    const api = await httpHarness({ ...h, job, inspection }, { service: { diskFloor: held.floor } });
+    expect((await request(api.base, 'POST', { job_id: jobId, request_id: 'gone' })).status).toBe(202);
+    await waitForState(api.base, jobId, 'gone', 'queued');
+    rmSync(alias);
+    held.release();
+    const failed = await waitForState(api.base, jobId, 'gone', 'failed');
+    expect((failed['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'failed', stage: 'failed-before-manager' });
+    symlinkSync(h.repo.path, alias);
+    const later = await httpHarness({ ...h, job, inspection });
+    expect((await request(later.base, 'POST', { job_id: jobId, request_id: 'back' })).status).toBe(202);
+    await waitForState(later.base, jobId, 'back', 'delivered');
+  });
+
+  it('sweeps the lane and reads failed before the prompt when the last pre-prompt check disposes the minion', async () => {
+    const h = await retainedFixture('last-check');
+    // The owner parks the job between the admission record and the prompt.
+    const record = h.ledger.recordCreationContinuationState.bind(h.ledger);
+    h.ledger.recordCreationContinuationState = (input) => {
+      const timeline = record(input);
+      if (input.state === 'admitted') h.ledger.setJobStatus(h.job.id, 'parked');
+      return timeline;
+    };
+    const api = await httpHarness(h);
+    expect((await request(api.base, 'POST', { job_id: api.jobId, request_id: 'last-check' })).status).toBe(202);
+    const failed = await waitForState(api.base, api.jobId, 'last-check', 'failed');
+    expect((failed['timeline'] as readonly Record<string, unknown>[]).at(-1)).toMatchObject({ state: 'failed', stage: 'failed-before-prompt' });
+    expect(failed).toMatchObject({ custody: { status: 'swept' }, delivery: null, reason: expect.stringMatching(/is parked/u) });
+    expect(api.prompts).toHaveLength(0);
+    expect(api.disposed).toEqual(['fixture-minion-1']);
+    expect(api.ledger.getAgent('fixture-minion-1')?.state).toBe('disposed');
+    expect(api.ledger.getJob(api.jobId)?.status).toBe('parked');
   });
 
   it('starts one owner for concurrent identical requests (a client timeout retry)', async () => {

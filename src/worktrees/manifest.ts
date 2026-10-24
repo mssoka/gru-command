@@ -358,18 +358,38 @@ export async function applyWorktreeManifest(
     log('info', 'worktree manifest: copy applied', { source, dest });
   }
 
+  // Every step's process group: a failure names any member still running
+  // in the worktree, an earlier step's included.
+  const groups: number[] = [];
   for (const [index, entry] of manifest.setup.entries()) {
     const started = Date.now();
-    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
-      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
-      ...(opts.env !== undefined ? { env: opts.env } : {}),
-      ...(opts.onSpawn !== undefined ? { onSpawn: opts.onSpawn } : {}),
-    });
+    try {
+      await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+        ...(opts.env !== undefined ? { env: opts.env } : {}),
+        onSpawn: (pid) => { groups.push(pid); opts.onSpawn?.(pid); },
+      });
+    } catch (error) {
+      if (!groups.some(processGroupAlive)) throw error;
+      const noOutput = { text: '', truncated: false, startsAtLine: true };
+      throw new WorktreeSetupError(error instanceof Error ? error.message : String(error),
+        error instanceof WorktreeSetupError ? error.output : { stdout: noOutput, stderr: noOutput }, true);
+    }
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
       index,
       ms: Date.now() - started,
     });
+  }
+}
+
+/** A member of this process group still lives. */
+function processGroupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -427,7 +447,7 @@ export class WorktreeSetupError extends Error {
   constructor(
     message: string,
     readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail },
-    /** A stopped or timed-out command's process group still had a member. */
+    /** A setup step's process group still had a member when it failed. */
     readonly processesRemain = false,
   ) {
     super(message);
@@ -483,15 +503,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     }
   };
   /** A member of the setup group still lives (the shell may be gone). */
-  const groupAlive = (): boolean => {
-    if (child.pid === undefined) return false;
-    try {
-      process.kill(-child.pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const groupAlive = (): boolean => child.pid !== undefined && processGroupAlive(child.pid);
   let timedOut = false;
   let stopped = false;
   let forceKillTimer: NodeJS.Timeout | undefined;
@@ -525,8 +537,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
 
   const output = { stdout: stdout.stream(), stderr: stderr.stream() };
   const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
-  const failed = (what: string): WorktreeSetupError =>
-    new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output, (stopped || timedOut) && groupAlive());
+  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);
   if (stopped) throw failed('worktree setup command was stopped (its caller aborted)');
   if (timedOut) throw failed(`worktree setup command timed out after ${timeoutMs}ms`);
   if (outcome.code === null) throw failed(`worktree setup command was killed by ${String(outcome.signal)}`);

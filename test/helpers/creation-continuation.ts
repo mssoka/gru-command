@@ -168,6 +168,7 @@ export function syntheticRetained(h: ReturnType<typeof managerFixture>, jobId: s
 
 export function fakeHandle(id: string, prompts: string[], options: {
   readonly prompt?: (text: string) => Promise<void>; readonly disposed?: string[]; readonly health?: AgentHandle['health'];
+  readonly disposeFailure?: Error;
 } = {}): AgentHandle {
   const capabilities = {
     streaming: true, steer: 'native' as const, resume: 'file' as const,
@@ -178,7 +179,10 @@ export function fakeHandle(id: string, prompts: string[], options: {
     async prompt(text) { prompts.push(text); await options.prompt?.(text); },
     async steer() {}, async followUp() {}, subscribe() { return () => {}; },
     health: options.health ?? (() => ({ state: 'idle', lastActivity: null, sessionFile: null })),
-    async dispose() { options.disposed?.push(id); },
+    async dispose() {
+      if (options.disposeFailure !== undefined) throw options.disposeFailure;
+      options.disposed?.push(id);
+    },
   };
 }
 
@@ -187,6 +191,7 @@ export interface HarnessOptions {
   /** Runs after each prompt is recorded: hold it, or reject the turn. */
   readonly prompt?: (text: string) => Promise<void>;
   readonly health?: AgentHandle['health'];
+  readonly disposeFailure?: Error;
   readonly service?: Partial<Omit<DispatchServiceOptions, 'ledger' | 'worktrees' | 'spawner'>>;
   readonly serverLog?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -210,6 +215,7 @@ export async function httpHarness(h: HarnessSource, options: HarnessOptions = {}
       spawns.push(id);
       return fakeHandle(id, prompts, {
         disposed, ...(options.prompt === undefined ? {} : { prompt: options.prompt }), ...(options.health === undefined ? {} : { health: options.health }),
+        ...(options.disposeFailure === undefined ? {} : { disposeFailure: options.disposeFailure }),
       });
     },
   });

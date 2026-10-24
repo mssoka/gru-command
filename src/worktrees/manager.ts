@@ -1451,13 +1451,20 @@ export class WorktreeManager {
   }
 
   /** The only creation entry that requires an existing exact receipt: the
-   * one, with the settlement, that the continuation accepted. */
-  async createRetainedJobWorktree(input: { repoPath: string; jobId: string; expected: RetainedReceiptExpectation }): Promise<WorktreeRecord> {
-    return this.createJobWorktreeUsingReceiptPolicy(input, input.expected);
+   * one, with the settlement, that the continuation accepted. `adopting` is
+   * called once every check passed, before the first checkout work. */
+  async createRetainedJobWorktree(input: {
+    repoPath: string; jobId: string; expected: RetainedReceiptExpectation; adopting?: () => void;
+  }): Promise<WorktreeRecord> {
+    return this.createJobWorktreeUsingReceiptPolicy(input, { expected: input.expected, adopting: input.adopting ?? (() => {}) });
   }
 
-  private async createJobWorktreeUsingReceiptPolicy(input: { repoPath: string; jobId: string }, expected: RetainedReceiptExpectation | null): Promise<WorktreeRecord> {
-    const requireRetained = expected !== null;
+  private async createJobWorktreeUsingReceiptPolicy(
+    input: { repoPath: string; jobId: string },
+    retainedPolicy: { readonly expected: RetainedReceiptExpectation; readonly adopting: () => void } | null,
+  ): Promise<WorktreeRecord> {
+    const requireRetained = retainedPolicy !== null;
+    const expected = retainedPolicy?.expected ?? null;
     if (input.jobId === '') throw new Error('job id must be non-empty');
     return this.withRepoLock(input.repoPath, async () => {
       const repo = this.assertRepo(input.repoPath);
@@ -1500,6 +1507,7 @@ export class WorktreeManager {
       const custody = retained !== null ? this.adoptedCustody(retained, lane) : this.creationCustody(branch, sha, lane, base.baseSource);
       let record;
       let bootstrapped: LaneBootstrap | null;
+      retainedPolicy?.adopting();
       try {
         await this.addLane(repo.repoPath, path, custody, undefined, asRefusal);
         bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha);

@@ -804,11 +804,14 @@ export class DispatchService {
       // retained-receipt manager method; it can never resolve a fresh base.
       let worktree: WorktreeLane;
       try {
-        if (input.creationContinuation !== undefined) input.creationContinuation.custodyAttempted();
         if (input.creationContinuation !== undefined) {
           const createRetained = this.opts.worktrees.createRetainedJobWorktree;
           if (createRetained === undefined) throw new Error('strict retained-creation manager path is not wired');
-          worktree = await createRetained.call(this.opts.worktrees, { repoPath: input.repoPath, jobId: job.id, expected: input.creationContinuation.expected });
+          // A failure before the manager starts adopting has touched nothing.
+          worktree = await createRetained.call(this.opts.worktrees, {
+            repoPath: input.repoPath, jobId: job.id, expected: input.creationContinuation.expected,
+            adopting: input.creationContinuation.custodyAttempted,
+          });
           input.creationContinuation.custodyAdopted(worktree);
         } else {
           worktree = await this.opts.worktrees.createJobWorktree({ repoPath: input.repoPath, jobId: job.id });
@@ -893,8 +896,24 @@ export class DispatchService {
       // a precondition — dispatch must not depend on listener ordering.
       // Issue #161: a dispatched minion is explicitly TOP-LEVEL (legacy
       // rows stay unknown; the marker is never retro-fitted).
-      // A throw from any write after the spawn disposes the live handle and
-      // its agent row: no unprompted minion outlives a failed dispatch.
+      // A minion abandoned before its prompt is disposed. Its row says so and
+      // its lane is released as a refused spawn's is only once the disposal
+      // resolved; a failed one may leave it running, so nothing is released.
+      const abandonBeforePrompt = async (error: unknown, agentRow: boolean): Promise<never> => {
+        try {
+          await handle.dispose();
+        } catch (disposeFailure) {
+          this.log('error', 'minion disposal before its prompt failed', { job: job.id, agent: handle.id, error: String(disposeFailure) });
+          throw new AggregateError([error, disposeFailure], `${String(error)}; disposing the spawned minion also failed: ${String(disposeFailure)}`);
+        }
+        if (agentRow) this.opts.ledger.setAgentState(handle.id, 'disposed');
+        input.creationContinuation?.disposedBeforePrompt();
+        releaseWorker();
+        await this.sweepQuietly(worktree.id);
+        throw error;
+      };
+      // A throw from any write after the spawn abandons the minion: no
+      // unprompted minion outlives a failed dispatch.
       let registered = false;
       try {
         this.opts.ledger.registerAgent({
@@ -934,23 +953,7 @@ export class DispatchService {
           });
         }
       } catch (error) {
-        let disposeFailure: unknown = null;
-        try {
-          await handle.dispose();
-        } catch (failure) {
-          disposeFailure = failure;
-        } finally {
-          if (registered) this.opts.ledger.setAgentState(handle.id, 'disposed');
-        }
-        if (disposeFailure !== null) {
-          this.log('error', 'minion disposal after a failed post-spawn write also failed', { job: job.id, agent: handle.id, error: String(disposeFailure) });
-          throw new AggregateError([error, disposeFailure], `${String(error)}; disposing the spawned minion also failed: ${String(disposeFailure)}`);
-        }
-        // Disposed before any prompt: release the lane as a refused spawn does.
-        input.creationContinuation?.disposedBeforePrompt();
-        releaseWorker();
-        await this.sweepQuietly(worktree.id);
-        throw error;
+        await abandonBeforePrompt(error, registered);
       }
       this.log('info', 'minion dispatched', {
         job: job.id,
@@ -1157,9 +1160,7 @@ export class DispatchService {
         assertHandoff();
         assertAdmissible();
       } catch (error) {
-        await handle.dispose();
-        this.opts.ledger.setAgentState(handle.id, 'disposed');
-        throw error;
+        await abandonBeforePrompt(error, true);
       }
       const promptRun: Promise<unknown> =
         handle.promptWithVerdict !== undefined

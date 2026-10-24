@@ -626,18 +626,21 @@ guarded reconciliation with a strict retained-only policy. The receipt must be
 the one the request accepted (same token digest and settlement), and it and
 the exact direct branch ref must remain present and unchanged, including the
 receipt-matched reflog and repository/worktree-holder fences. Missing
-receipt/ref cannot clear the receipt and fall through to the ordinary
-new-base branch; mismatch, lock, symbolic ref, foreign checkout/admin/holder
-and unreadable evidence refuse without continuation cleanup, before adoption or
+receipt/ref cannot clear the receipt and fall through to the ordinary new-base
+branch; mismatch, lock, symbolic ref, foreign checkout/admin/holder and
+unreadable evidence refuse without continuation cleanup, before adoption or
 after it. Any other failure before registration, a failing `[[setup]]`
 included, rolls the checkout back under the receipt's own token and keeps the
 ref and receipt: readback says `failed` with the retained custody, and a later
-request adopts them again. A setup whose processes outlive it keeps everything
-and reads `custody-unknown`, as does an unconfirmed rollback. A failure after
+request adopts them again. A setup step that fails while a process of any step
+still runs keeps everything and reads `custody-unknown`, as does an
+unconfirmed rollback. A failure before the manager starts adopting (the
+repository path gone, say) touches nothing and reads `failed`. A failure after
 registration reads `custody-unknown`: the registry row holds the lane and the
-receipt may already be spent. A registered lane goes through the ordinary worker pacing
-gate, spawn and delivery path; a minion GC disposes before its prompt has its
-lane swept and reads `failed`.
+receipt may already be spent. A registered lane goes through the ordinary
+worker pacing gate, spawn and delivery path. A minion GC disposes before its
+prompt has its lane swept and reads `failed` once the disposal resolved; a
+failed disposal leaves the agent row as it was and reads `custody-unknown`.
 
 The durable request history names its generation and payload digest and
 readback distinguishes `accepted`, `queued`, `admitted`, `delivered`, `failed`,

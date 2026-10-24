@@ -104,6 +104,8 @@ export interface WorktreePort {
     readonly repoPath: string;
     readonly jobId: string;
     readonly expected: { readonly receiptTokenSha256: string; readonly producerSettlementSeq: number };
+    /** Called once every check passed, before the first checkout work. */
+    readonly adopting?: () => void;
   }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
     repoPath: string;
