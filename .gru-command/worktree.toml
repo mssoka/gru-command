@@ -10,10 +10,6 @@ command = "npm ci"
 [verify]
 full = "npm test"
 
-# Focused regression gate for the guarded pre-bootstrap dependency patch;
-# real Git/setup fixtures use the declared heavy-test configuration.
-prebootstrap-patch = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/prebootstrap-patch.test.ts test/dispatch-server.test.ts && npx vitest run test/ledger-api.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
-
 typecheck = "npm run typecheck"
 managed-repositories-docs = "npm run build && npm run config:docs"
 managed-repositories-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/config.test.ts test/config-generate.test.ts test/intake.test.ts test/intake-approval.test.ts test/intake-server.test.ts test/github-poll.test.ts test/managed-repositories-runtime.test.ts test/repo-overview.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/bmad-onboarding.test.ts test/intake-approval-packaged.test.ts test/workflow-runtime-packaged.test.ts test/wizard.test.ts test/wizard-interactive.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/repo-overview.test.ts"
