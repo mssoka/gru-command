@@ -277,6 +277,12 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(() => readPreBootstrapDependencyPatchPackage(rootLink, made.reference)).toThrow(/root is unavailable/u);
     chmodSync(made.path, 0o644);
     expect(() => readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference)).toThrow(/owner-only/u);
+    chmodSync(made.path, 0o600);
+    chmodSync(f.packageRoot, 0o755);
+    expect(() => readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference))
+      .toThrow(expect.objectContaining({ code: 'package_unavailable', message: expect.stringContaining('root is unavailable or is not owner-only') }));
+    chmodSync(f.packageRoot, 0o700);
+    expect(readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference).package).toEqual(made.package);
   });
 
   it('refuses malformed schema, unknown files, unsupported revision, and non-dependency syntax', () => {
@@ -293,6 +299,15 @@ describe('pre-bootstrap dependency patch package fences', () => {
     ((otherFile['files'] as Record<string, unknown>[])[0]!)['path'] = '.gru-command/worktree.toml';
     const otherFileBytes = Buffer.from(JSON.stringify(otherFile));
     expect(() => parsePreBootstrapDependencyPatchPackage(otherFileBytes, sha(otherFileBytes))).toThrow(/exactly requirements.txt/u);
+    const wider = JSON.parse(readFileSync(made.path, 'utf8')) as Record<string, unknown>;
+    wider['allowlist'] = ['requirements.txt', 'setup.py'];
+    const widerBytes = Buffer.from(JSON.stringify(wider));
+    expect(() => parsePreBootstrapDependencyPatchPackage(widerBytes, sha(widerBytes))).toThrow(/allowlist must be exactly \["requirements.txt"\]/u);
+    const unbound = JSON.parse(readFileSync(made.path, 'utf8')) as Record<string, unknown>;
+    ((unbound['files'] as Record<string, unknown>[])[0]!)['after_sha256'] = sha('some other content');
+    const unboundBytes = Buffer.from(JSON.stringify(unbound));
+    expect(() => parsePreBootstrapDependencyPatchPackage(unboundBytes, sha(unboundBytes)))
+      .toThrow(expect.objectContaining({ code: 'package_hash_mismatch', message: expect.stringContaining('does not match its after_sha256') }));
     expect(() => assertSafeRequirementsPatch(OLD_REQUIREMENTS, 'fixture-dep==2.0.0\n--index-url https://example.invalid\n')).toThrow(/pinned distribution/u);
     expect(() => assertSafeRequirementsPatch(OLD_REQUIREMENTS, '# changed comment\nfixture-dep==2.0.0\nshared-lib==4.2.0\n')).toThrow(/comments and blank lines/u);
   });
@@ -393,11 +408,12 @@ describe('pre-bootstrap dependency patch package fences', () => {
     const f = makeFixture();
     const made = f.makePackage({ jobId: 'job-unapproved-content', content: '-e /tmp/foreign\n' });
     await expect(dispatch(f, 'job-unapproved-content', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
-    expect(f.ledger.latestJobEvent('job-unapproved-content', 'job.prebootstrap-patch-dispatch-failed')).not.toBeNull();
+    expect(f.ledger.latestJobEvent('job-unapproved-content', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'content_invalid' });
     expect(f.ledger.getWorktree('job-unapproved-content')).toBeNull();
     expect(f.repo.git(['branch', '--list', 'gru/job-unapproved-content'])).toBe('');
     expect(f.spawns).toHaveLength(0);
     expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    expect(await readback(f, 'job-unapproved-content')).toMatchObject({ state: 'worktree_admission_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
   });
 
   it('refuses a pin moved past a whitespace line before creating a branch', async () => {
@@ -437,6 +453,9 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(f.ledger.listJobEvents('job-no-patch', { kinds: ['job.prebootstrap-patch-admitted'] })).toHaveLength(0);
     expect(f.repo.head()).toBe(f.sourceHead);
     expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    const body = await readback(f, 'job-no-patch');
+    expect(body).toMatchObject({ state: 'no_admission_receipt', worker_admission: 'recorded' });
+    expect(String(body['recovery'])).toMatch(/^No prebootstrap admission receipt is present/u);
   });
 
   it('fails unchanged setup without a patch, then applies only the package in a new lane before that same setup and worker admission', async () => {
@@ -521,6 +540,7 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(readCreationIntent(repositoryCommonDirectory(f.repo.path), 'gru/job-authority-changed')).not.toBeNull();
     expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
     append.mockRestore();
+    expect(await readback(f, 'job-authority-changed')).toMatchObject({ state: 'setup_succeeded_dispatch_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
   });
 
   it('retains a patched lane on setup failure and never spawns a worker', async () => {
@@ -534,6 +554,9 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(f.ledger.latestJobEvent('job-setup-failure', 'worktree.prebootstrap-setup-failed')?.payload).toMatchObject({ error_class: 'WorktreeSetupError', stage: 'setup' });
     expect(readCreationIntent(repositoryCommonDirectory(f.repo.path), 'gru/job-setup-failure')).not.toBeNull();
     expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    const body = await readback(f, 'job-setup-failure');
+    expect(body).toMatchObject({ state: 'setup_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+    expect(body['setup_producers']).toMatchObject([{ setup_index: 0, producer_state: 'child_exit_result_recorded_group_state_unknown', outcome: { exit_code: 7, timed_out: false } }]);
   });
 
   it('consumes an interrupted patch request, preserves the lane, and refuses a same-job replay at the job row', async () => {
@@ -558,6 +581,7 @@ describe('pre-bootstrap dependency patch package fences', () => {
     expect(f.ledger.latestJobEvent('job-interrupted', 'worktree.prebootstrap-setup-started')).toBeNull();
     expect(readCreationIntent(repositoryCommonDirectory(f.repo.path), 'gru/job-interrupted')).not.toBeNull();
     append.mockRestore();
+    expect(await readback(f, 'job-interrupted')).toMatchObject({ state: 'patch_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
     f.restart();
     expect(f.ledger.getWorktree('job-interrupted')?.path).toBe(lane!.path);
     expect(f.ledger.latestJobEvent('job-interrupted', 'worktree.prebootstrap-patch-started')).not.toBeNull();
@@ -625,6 +649,9 @@ describe('pre-bootstrap worker admission custody', () => {
     expect(creationReceipt(f, 'job-admitted')).toBeNull();
     const body = await readback(f, 'job-admitted');
     expect(body).toMatchObject({ state: 'setup_succeeded', worker_admission: 'recorded', unmatched_receipt_count: 0 });
+    expect(body['setup_producers']).toMatchObject([{ setup_index: 0, producer_state: 'child_exit_result_recorded_group_state_unknown',
+      spawn: { process_group_id: expect.any(Number) }, outcome: { exit_code: 0, signal: null, timed_out: false, stopped: false } }]);
+    expect(String(body['recovery'])).toMatch(/^Configured setup success and ordinary worker admission are recorded/u);
   });
 
   it('keeps the lane and its receipt when authority changes while the lane queues for a worker slot', async () => {
@@ -754,6 +781,21 @@ describe('pre-bootstrap worker admission custody', () => {
 });
 
 describe('pre-bootstrap failure receipts', () => {
+  it('keeps setup output and raw error text out of the error, the job, its events and the readback', async () => {
+    const marker = 'PRIVATE-SETUP-MARKER-4c1e';
+    const f = makeFixture(`node -e "console.log('${marker}'); console.error('${marker}'); process.exit(7)"`);
+    const made = f.makePackage({ jobId: 'job-private-output' });
+    let thrown: unknown = null;
+    try { await dispatch(f, 'job-private-output', made.reference); } catch (error) { thrown = error; }
+    expect(thrown).toMatchObject({ code: 'dispatch_failed' });
+    expect((thrown as Error).cause).toMatchObject({ name: 'WorktreeSetupError', message: expect.stringContaining(marker) });
+    expect(String(thrown)).not.toContain(marker);
+    expect(JSON.stringify(f.ledger.getJob('job-private-output'))).not.toContain(marker);
+    expect(f.ledger.getJob('job-private-output')?.note).toMatch(/^dispatch failed: pre-bootstrap dispatch failed \(WorktreeSetupError; error_sha256=[0-9a-f]{64}\)/u);
+    expect(JSON.stringify(f.ledger.listJobEvents('job-private-output', { limit: 10_000 }))).not.toContain(marker);
+    expect(JSON.stringify(await readback(f, 'job-private-output'))).not.toContain(marker);
+  });
+
   it('retries a failed registration over its own pending handoff and keeps the lane', async () => {
     const f = makeFixture();
     const made = f.makePackage({ jobId: 'job-publication' });
