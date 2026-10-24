@@ -147,7 +147,7 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
     async spawn(_role, options = {}) {
       spawns.push(options);
       if (spawnGate !== null) await spawnGate;
-      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, [], store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? FIXTURE_MINION, () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
+      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, (options.nativeTools ?? []).map((tool) => tool.name), store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? FIXTURE_MINION, () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
       handle.subscribe((event) => { if (event.type === 'state' && ledger.getAgent(handle!.id) !== null) ledger.setAgentState(handle!.id, event.state); });
       return handle;
     },
@@ -156,10 +156,13 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   const stop = new AbortController();
   let supervised: readonly string[] = [];
   const deps = { ledger, registry, worktrees, notifications, signal: stop.signal, pendingProducerBlockers: () => supervised };
-  /** `beforeReceipt` writes what Pi appends between the baseline and the user receipt. */
-  const seed = (text = 'accepted native prompt', beforeReceipt?: () => void) => {
+  /** `beforeReceipt` writes what Pi appends between the baseline and the user
+   * receipt; `nativeTools` is the tool set the binding records (absent = a
+   * binding from before tool sets were recorded). */
+  const seed = (text = 'accepted native prompt', beforeReceipt?: () => void, nativeTools?: readonly string[]) => {
     ledger.prepareDirectiveTarget(intent.requestId, { agentId: 'logical-minion', sessionFile: file });
-    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file, text, authorityManifest: manifest });
+    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file, text, authorityManifest: manifest,
+      ...(nativeTools === undefined ? {} : { nativeTools }) });
     beforeReceipt?.();
     native.append({ role: 'user', content: [{ type: 'text', text }] });
     recordDirectiveProducerCessation(prepareDirectiveProducer({ identity, agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file }));
@@ -3742,17 +3745,39 @@ function admitFixtureAsBlind(f: Awaited<ReturnType<typeof fixture>>, keepPackage
   recordBlindAdmission(f.ledger, f.intent.jobId, admission, keepPackage ? inputPackage : undefined);
 }
 
-it('P35 a blind reviewer\'s checkpoint continuation is spawned without the child-worker tools', async () => {
-  const f = await fixture(); f.seed(); admitFixtureAsBlind(f);
+it('P35 a blind reviewer\'s checkpoint continuation resumes with the tool set its binding recorded', async () => {
   const capability = { name: 'request_child_worker', description: 'request a child worker for the original parent', inputSchema: { type: 'object' },
     authorityManifest: 'original-parent:logical-minion', execute: async () => ({ text: 'ok' }) };
-  const service = new DirectiveProgressService({ ...f.deps, parentTools: () => [capability] });
-  service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
-  expect(f.native.continuations).toBe(1);
-  expect(f.spawns).toHaveLength(1);
-  expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file });
-  expect(f.spawns[0]!.nativeTools).toBeUndefined();
-  await service.dispose();
+  // A session bound before tool sets were recorded had the parent tools; one
+  // bound with none resumes with none.
+  for (const [recorded, expected] of [[undefined, [capability]], [[], undefined]] as const) {
+    const f = await fixture(); f.seed(undefined, undefined, recorded); admitFixtureAsBlind(f);
+    const service = new DirectiveProgressService({ ...f.deps, parentTools: () => [capability] });
+    service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+    expect(f.native.continuations).toBe(1);
+    expect(f.spawns).toHaveLength(1);
+    expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file });
+    expect(f.spawns[0]!.nativeTools).toEqual(expected);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    await service.dispose();
+  }
+});
+
+it('a native directive binding records the tool set its session was spawned with', async () => {
+  const capability = { name: 'request_child_worker', description: 'request a child worker for the parent', inputSchema: { type: 'object' },
+    authorityManifest: 'parent:logical-minion', execute: async () => ({ text: 'ok' }) };
+  for (const [blind, expected] of [[false, ['request_child_worker']], [true, []]] as const) {
+    const f = await fixture('rebrief');
+    if (blind) admitFixtureAsBlind(f);
+    await executeAcceptedDirective({ ...f.deps, parentTools: () => [capability] }, f.intent.requestId);
+    expect(f.native.prompts).toHaveLength(1);
+    expect(readDirectiveBinding(f.file, f.intent.requestId)?.nativeTools).toEqual(expected);
+  }
+  // A recorded tool set that is not a list of names is a malformed binding.
+  const malformed = await fixture(); malformed.seed(undefined, undefined, ['request_child_worker']);
+  const journal = `${malformed.file}.directives.jsonl`;
+  writeFileSync(journal, readFileSync(journal, 'utf-8').replace('"nativeTools":["request_child_worker"]', '"nativeTools":[7]'));
+  expect(() => readDirectiveBinding(malformed.file, malformed.intent.requestId)).toThrow(/directive native association is malformed/);
 });
 
 it('a re-brief whose fresh reviewer input git cannot read stays for reconciliation', async () => {

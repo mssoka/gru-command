@@ -27,6 +27,10 @@ export interface DirectiveNativeBinding {
   readonly promptHash: string;
   readonly userEntryId: string | null;
   readonly authorityManifest: string;
+  /** The product-native tools the session was spawned with, by name: a
+   * checkpoint continuation resumes with exactly these. Absent = bound
+   * before tool sets were recorded. */
+  readonly nativeTools?: readonly string[];
 }
 export type DirectiveCheckpoint =
   | { readonly state: 'unknown'; readonly reason: string }
@@ -419,6 +423,7 @@ export function prepareDirectiveBinding(input: {
   readonly identity: DirectiveTurnIdentity; readonly runtime: DirectiveNativeBinding['runtime'];
   readonly agentId: string; readonly sessionId: string; readonly sessionFile: string;
   readonly text: string; readonly authorityManifest?: string; readonly images?: readonly { readonly mediaType: string; readonly data: string }[];
+  readonly nativeTools?: readonly string[];
 }): DirectiveNativeBinding {
   validateDirectiveIdentity(input.identity);
   if (!input.authorityManifest) throw new DirectiveCheckpointError('directive requires a bound native role/cwd/tool/model authority manifest');
@@ -439,7 +444,8 @@ export function prepareDirectiveBinding(input: {
     ...(input.images ?? []).map((image) => ({ type: 'image', data: image.data, mimeType: image.mediaType })) ];
   const binding: DirectiveNativeBinding = { identity: input.identity, runtime: input.runtime, agentId: input.agentId,
     sessionId: input.sessionId, sessionFile: input.sessionFile, baseline,
-    promptHash: contentHash(content), userEntryId: null, authorityManifest: input.authorityManifest };
+    promptHash: contentHash(content), userEntryId: null, authorityManifest: input.authorityManifest,
+    ...(input.nativeTools === undefined ? {} : { nativeTools: [...input.nativeTools].sort() }) };
   appendBinding(binding);
   return binding;
 }
@@ -458,7 +464,8 @@ function readDirectiveBindings(file: string): readonly DirectiveNativeBinding[] 
         [row.agentId, row.sessionId, row.authorityManifest].some((value) => typeof value !== 'string' || value.trim() === '') ||
         typeof row.promptHash !== 'string' || !/^[a-f0-9]{64}$/.test(row.promptHash) ||
         !(row.baseline === null || typeof row.baseline === 'string' && row.baseline !== '') ||
-        !(row.userEntryId === null || typeof row.userEntryId === 'string' && row.userEntryId !== '')) {
+        !(row.userEntryId === null || typeof row.userEntryId === 'string' && row.userEntryId !== '') ||
+        !(row.nativeTools === undefined || Array.isArray(row.nativeTools) && row.nativeTools.every((name) => typeof name === 'string'))) {
       throw new DirectiveCheckpointError('directive native association is malformed');
     }
     const prior = latest.get(row.identity.requestId);

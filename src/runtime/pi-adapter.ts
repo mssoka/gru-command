@@ -1845,7 +1845,8 @@ export class PiAgentHandle implements AgentHandle {
       directive.beforeAdmission();
       this.prepareDirectiveProducer(directive.identity);
       prepareDirectiveBinding({ identity: directive.identity, runtime: 'pi', agentId: this.id, sessionId: this.nativeSessionId,
-        sessionFile: this.sessionFile, text, authorityManifest: this.directiveAuthorityManifest?.(), ...(images !== undefined ? { images } : {}) });
+        sessionFile: this.sessionFile, text, authorityManifest: this.directiveAuthorityManifest?.(), nativeTools: this.reviewTools ?? [],
+        ...(images !== undefined ? { images } : {}) });
     }
     this.liveOwner = owner;
     this.livePromptText = text;

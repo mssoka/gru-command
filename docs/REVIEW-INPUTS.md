@@ -491,7 +491,8 @@ lifecycle fact — so a settled report read as independent coverage.
 - **Role-specific host context.** The admitted role decides what GC adds to a
   reviewer's prompt. A blind reviewer gets no Book of Lessons lookup or pointer on
   any path (dispatch, directive, re-brief, provider recovery), and no child
-  workers: its sessions are spawned without the child-worker tools and a
+  workers: a new session is spawned without the child-worker tools (a checkpoint
+  continuation keeps the tools its session was bound with) and a
   `request_child_worker` call from an admitted blind job is refused as
   `parent_not_permitted`, since a child holds neither the package nor the
   isolation rule and its reads are not observed. Every review job's re-brief and
