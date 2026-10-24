@@ -266,7 +266,7 @@ const PINS: Record<string, number> = {
   'lane-provenance.test.ts': 22,
   'cleanup-repair.test.ts': 41,
   'disk-budget.test.ts': 39,
-  'ledger-api.test.ts': 100,
+  'ledger-api.test.ts': 101,
   'ledger-pipeline.test.ts': 22,
   'ledger-db.test.ts': 12,
   'ledger-job-parent.test.ts': 5,

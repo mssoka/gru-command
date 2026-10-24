@@ -1698,6 +1698,27 @@ describe('report-job closure (issue #220)', () => {
     }
   });
 
+  it('a commissioner disposition refuses by name while a directive is live on the report lane, and changes nothing', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-live', { targetRef: 'https://x/pull/8', targetSha: 's1' });
+      const live = api.beginDirectiveIntent({ jobId: 'rep-live', directive: 'follow-up on the report lane', holder: 'fixture', requestId: 'rep-live-directive' }).record;
+      const obligation = api.findReportObligation('rep-live')!;
+      const events = api.listJobEvents('rep-live');
+      expect(() => api.settleReportDisposition({ jobId: 'rep-live', outcome: 'dismissed', note: 'not actionable' }))
+        .toThrow(`live directive request(s): ${live.requestId} (dispatching)`);
+      expect(api.getJob('rep-live')?.status).toBe('delivered');
+      expect(api.getObligation(obligation.id)).toEqual(obligation);
+      expect(api.listJobEvents('rep-live')).toEqual(events);
+      // Once the directive settles through its own path, the same disposition closes the report.
+      api.failDirective({ requestId: live.requestId, reason: 'fixture no-effect proof' });
+      expect(api.settleReportDisposition({ jobId: 'rep-live', outcome: 'dismissed', note: 'not actionable' }).job.status).toBe('done');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('auto-supersede waits for a live directive with one durable note, never a refusal every pass', () => {
     const { api, db, dir } = freshDb();
     try {
