@@ -111,7 +111,8 @@ keep = 5
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
 # Wake policy for Gru awareness: "action-required" (default; machine
-# attention OPENS a Gru turn), "all", or "never" (passive context only).
+# attention and recorded Gru-owned owner decisions OPEN a Gru turn), "all", or
+# "never" (passive context only).
 notify_wake = "action-required"
 # Minimum interval between autonomous wakes (ms); 0 disables the cap.
 wake_min_interval_ms = 300000

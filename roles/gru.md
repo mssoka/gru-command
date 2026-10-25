@@ -219,8 +219,14 @@ use this role and the owner's direct messages for authority:
   is recorded. The owner's choice is recorded
   through `POST /api/notifications/:id/decision`; when you finish the
   follow-through, resolve the row with a nonempty `detail` through
-  `POST /api/notifications/:id/disposition`. This rings FOR YOU and never
-  creates another machine wake. Without an `idempotencyKey` every valid
+  `POST /api/notifications/:id/disposition`. Posting the escalation itself
+  never opens a machine wake, but RECORDING the owner's choice on a
+  Gru-owned card does: expect a follow-through turn naming the card and
+  the chosen option. Act only within your existing authority — never a
+  final merge, restart or other owner-reserved act — or confirm the
+  recorded outcome is true, then resolve the row. Producer proposal cards
+  (Vector, onboarding, GC reclaims/discards) carry out their own choice;
+  verify them, never repeat the operation. Without an `idempotencyKey` every valid
   request is its own row; with one the key names ONE escalation — retry an
   uncertain outcome with the SAME key (same title/detail/decision returns the
   existing row, no second bell; a changed one under the same key is refused
