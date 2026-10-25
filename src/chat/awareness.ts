@@ -11,6 +11,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { DecisionRecord, EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
+import { producerFollowsDecisionThrough } from '../notifications/attention.js';
 import {
   incidentBasisOf,
   incidentKeyOf,
@@ -51,6 +52,19 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *      wake), persistence, and the timer that releases a deferred wake.
  *      Every opened wake is logged and appended to the ledger as
  *      `gru.wake` so the board / self-heal trackers can count them.
+ *
+ *      Issue #506: a RECORDED owner decision is its own wake reason. The
+ *      card keeps its `needs-owner` routing (it still belongs on the
+ *      FOR YOU surface), but the chosen option's follow-through is Gru's
+ *      debt, so the policy bypasses only the routing gate for
+ *      reason 'owner-decision'. The claim identity is the pair
+ *      (card id, decided_at): a replay or restart cannot wake twice, a
+ *      decision never spends the card's incident key, and a decision
+ *      recorded while the service was down is seeded at boot. Producer-
+ *      carried proposal decisions (Vector, onboarding, GC) are excluded:
+ *      their own service executes and resolves the choice, and a Gru wake
+ *      would invite a duplicate operation or a premature resolution. Mode
+ *      ('never') and the severity floor still apply.
  *
  *      Issue #219 reworks the wake on three axes. INCIDENT DEDUPE: the
  *      policy claims incident KEYS (see incident.ts), so a re-detected
@@ -116,9 +130,14 @@ export const AWARENESS_WAKE_INSTRUCTION =
   '(covers "ci-failed") with no basis_fingerprint, so the hold reaches every later head and later red heads of that ' +
   'repository carry the in-flight fix as a restriction; disposition each item as waiting on the fix job; a later red ' +
   'head is a new item that resolves the earlier head\'s item and wakes once. It resolves itself when a newer run of ' +
-  'that workflow passes or the failing run is re-run green. In all mode, ' +
+  'that workflow passes or the failing run is re-run green. A decided owner card that wakes you is follow-through debt: ' +
+  'carry out its recorded option only within your existing authority (never a final PR merge, restart or destructive ' +
+  'act reserved to the owner); otherwise verify that the recorded outcome is true, then resolve the card with ' +
+  'POST /api/notifications/{id}/disposition and the action detail; never Ack it, record a different choice, or re-open ' +
+  'the question. If the card names a producer that carries out its own decision (shown on the line), verify only — ' +
+  'do not repeat the operation or resolve it. In all mode, ' +
   'FYI and needs-owner rows can also wake you; do not act on or Ack an owner-only stop on the ' +
-  'owner’s behalf. Escalate decisions that are theirs; if nothing is actionable, say so briefly.';
+  'owner’s behalf — that rule never authorizes skipping a recorded owner decision. Escalate decisions that are theirs; if nothing is actionable, say so briefly.';
 
 export interface AwarenessLimits {
   /** Newest digest events per block (older overflow is dropped). */
@@ -277,6 +296,31 @@ interface DeliveryDebt {
 const MAILBOX_KEY_PREFIX = '\u0000mailbox:';
 const NOTIFICATION_KEY_PREFIX = '\u0000notification:';
 const FAILURE_BASIS_PREFIX = '\u0000mailbox-failure:';
+/** Owner-decision wake claim (#506): one identity per (card, decided_at).
+ * The card keeps its `needs-owner` routing; the synthetic key is what the
+ * wake policy claims so a card's creation wake (all mode) cannot swallow
+ * the later follow-through obligation, and a replayed decision cannot
+ * burn a second turn. */
+const OWNER_DECISION_KEY_PREFIX = '\u0000owner-decision:';
+
+function ownerDecisionKey(notificationId: string, decidedAt: string): string {
+  return OWNER_DECISION_KEY_PREFIX + JSON.stringify([notificationId, decidedAt]);
+}
+
+function parseOwnerDecisionKey(key: string): { readonly notificationId: string; readonly decidedAt: string } | null {
+  if (!key.startsWith(OWNER_DECISION_KEY_PREFIX)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(key.slice(OWNER_DECISION_KEY_PREFIX.length));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 2) return null;
+  const [notificationId, decidedAt] = parsed;
+  if (typeof notificationId !== 'string' || notificationId === '') return null;
+  if (typeof decidedAt !== 'string' || decidedAt === '') return null;
+  return { notificationId, decidedAt };
+}
 
 class MailboxDeliveryRecoveryError extends Error {
   constructor(batchId: string, key: string) {
@@ -415,6 +459,27 @@ function clampLine(line: string, max: number): string {
   const safe = line.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, (char) =>
     char === '\n' ? '\\n' : char === '\r' ? '\\r' : char === '\t' ? '\\t' : `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
   return safe.length > max ? `${safe.slice(0, max - 1)}…` : safe;
+}
+
+/** The recorded owner choice on a card's rendered line (#506): which card
+ * (the line already carries id + title), which option, and what follow-through
+ * is owed. Empty for an undecided row. A producer-followed card says so
+ * explicitly: waking Gru must never repeat that producer's operation. */
+function ownerDecisionNote(row: NotificationRecord): string {
+  if (row.decidedAt === null || row.decidedOption === null) return '';
+  const option = row.decision?.options.find((candidate) => candidate.id === row.decidedOption) ?? null;
+  const label = option?.label ?? row.decidedOption;
+  const producerFollowed = producerFollowsDecisionThrough(row.kind);
+  // The obligation leads and the audit metadata trails: the line is
+  // byte/char bounded, so a long title or label must never clip the fact
+  // that an option was chosen and its follow-through is owed. The card's
+  // consequence stays on the authenticated row, one read away.
+  return ` — OWNER DECISION RECORDED: ${JSON.stringify(promptSafe(label))} ` +
+    `(option ${JSON.stringify(promptSafe(row.decidedOption))}) — ` +
+    (producerFollowed
+      ? 'its producer carries this out and closes the card; verify only, do not repeat or resolve'
+      : 'follow-through owed; act or confirm, then resolve') +
+    ` (decided ${row.decidedAt})`;
 }
 
 /**
@@ -855,8 +920,51 @@ export class GruAwareness {
   }
 
   private attentionRow(id: string): NotificationRecord | null {
+    const ownerDecision = parseOwnerDecisionKey(id);
+    if (ownerDecision !== null) return this.ledger.getNotification(ownerDecision.notificationId);
     if (id.startsWith(MAILBOX_KEY_PREFIX)) return this.mailbox?.getAttentionRow(id.slice(MAILBOX_KEY_PREFIX.length)) ?? null;
     return this.ledger.getNotification(id.startsWith(NOTIFICATION_KEY_PREFIX) ? id.slice(NOTIFICATION_KEY_PREFIX.length) : id);
+  }
+
+  /** The policy candidate for one pending/delivered key. Decision keys keep
+   * their reason so the routing gate and incident dedupe stay reason-aware
+   * (#506); every other key is the ordinary notification class. */
+  private wakeCandidate(id: string, row: NotificationRecord): WakeCandidate {
+    return {
+      id,
+      incidentKey: incidentKeyOf(row),
+      routing: row.routing,
+      severity: row.severity,
+      ...(parseOwnerDecisionKey(id) === null ? {} : { reason: 'owner-decision' as const }),
+    };
+  }
+
+  /** The wake obligation a recorded owner choice creates (#506). A card
+   * never accepts a second decision, so (card id, decided_at) names exactly
+   * one follow-through; null for undecided or non-owner rows. */
+  private ownerDecisionCandidate(row: NotificationRecord): WakeCandidate | null {
+    if (row.routing !== 'needs-owner' || row.decidedAt === null || row.decidedOption === null) return null;
+    // The producer executes its own proposal decisions; Gru must not race it.
+    if (producerFollowsDecisionThrough(row.kind)) return null;
+    return {
+      id: ownerDecisionKey(row.id, row.decidedAt),
+      incidentKey: incidentKeyOf(row),
+      routing: row.routing,
+      severity: row.severity,
+      reason: 'owner-decision',
+    };
+  }
+
+  /** The identity a rendered card is delivered under (#506): a decided
+   * Gru-owned card is delivered as its per-decision claim even when a bare
+   * creation/triage key carried it into the batch, so the receipt claims the
+   * obligation and no sibling key stays pending for a second turn. */
+  private deliveredIdentity(id: string, row: NotificationRecord): string {
+    if (parseOwnerDecisionKey(id) !== null) return id;
+    if (row.routing === 'needs-owner' && row.decidedAt !== null && !producerFollowsDecisionThrough(row.kind)) {
+      return ownerDecisionKey(row.id, row.decidedAt);
+    }
+    return id;
   }
 
   private failureKey(id: string): string {
@@ -886,7 +994,9 @@ export class GruAwareness {
 
   private reconcileMailboxAttention(): void {
     if (this.disposed || this.mailbox === null) return;
-    try { this.seedBacklog(); } catch (error) {
+    // Decision backlog is a boot/live-event obligation, not a per-mailbox-
+    // event scan: skip it on routine reconciliations (#506 review).
+    try { this.seedBacklog({ seedDecisions: false }); } catch (error) {
       this.log('error', 'mailbox reconciliation failed', { error: String(error) });
     }
   }
@@ -1024,21 +1134,43 @@ export class GruAwareness {
     const seenIds = new Set<string>();
     const addNote = (id: string): void => {
       if (seenIds.has(id) || notes.length >= this.limits.maxActionNotes) return;
-      seenIds.add(id);
       const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
+      // A decided Gru-owned card is DELIVERED under its per-decision identity
+      // whichever key carried it into the batch: a batch prepared after the
+      // decision then claims the obligation (and cannot leave the sibling
+      // pending for a second turn). Producer-carried cards stay bare.
+      const effectiveId = this.deliveredIdentity(id, row);
+      if (seenIds.has(effectiveId)) return;
+      const decision = parseOwnerDecisionKey(effectiveId);
+      // The same card can arrive as its own notification AND as a recorded
+      // decision (all mode). Render it once, preferring the decision line.
+      if (decision !== null && seenIds.has(decision.notificationId)) return;
+      if (decision === null && [...seenIds].some((seen) => parseOwnerDecisionKey(seen)?.notificationId === row.id)) return;
       // A stop reclassified while a wake was waiting must never ride a
-      // machine-only turn; all mode explicitly opts into owner context.
-      if (exclusiveWake && this.wakeMode === 'action-required' && row.routing !== 'action-required') return;
+      // machine-only turn; all mode explicitly opts into owner context. A
+      // recorded owner decision is the one owner row that IS machine work.
+      // A skipped bare row must not block its decision key: the decision
+      // line is the one that belongs in this batch.
+      if (exclusiveWake && this.wakeMode === 'action-required' && row.routing !== 'action-required' && decision === null) return;
+      seenIds.add(id);
+      seenIds.add(effectiveId);
+      const decisionNote = ownerDecisionNote(row);
       const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(promptSafe(row.detail))}` : '';
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
-      renderedRows.set(id, row);
+      renderedRows.set(effectiveId, row);
       if (this.mailbox?.captureRow(row) != null) {
         const item = JSON.parse(row.detail!) as MailboxItem;
-        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify(promptSafeDeep({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }))}` });
+        notes.push({ id: effectiveId, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify(promptSafeDeep({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }))}` });
         return;
       }
-      notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})` });
+      // A decided card leads with the choice, not the title: the line is
+      // bounded, so a long title must never clip away the option and the
+      // owed follow-through. The detail stays one authenticated read away.
+      const line = decisionNote === ''
+        ? `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})`
+        : `- ${icon} [${row.id}]${decisionNote} title=${JSON.stringify(promptSafe(row.title))} (routing: ${row.routing})`;
+      notes.push({ id: effectiveId, displayId: row.id, mailbox: false, line });
     };
     const addReceipt = (id: string): void => {
       if (receiptNotes.length >= this.limits.maxActionNotes) return;
@@ -1098,7 +1230,13 @@ export class GruAwareness {
     if (owners === null || machine === null) {
       this.pendingRotationAdvance = null;
     } else {
-      const renderedIds = new Set(rendered?.ids ?? []);
+      // A decided card renders/delivers under its per-decision identity, but
+      // the queue candidates are keyed by the bare row. Expand so the
+      // rotation still consumes the row it actually rendered (#506).
+      const renderedIds = new Set((rendered?.ids ?? []).flatMap((id) => {
+        const decision = parseOwnerDecisionKey(id);
+        return decision === null ? [id] : [id, decision.notificationId];
+      }));
       this.pendingRotationAdvance = {
         owner: this.advancePastRendered(owners.offset, ownerCandidates, renderedIds),
         machine: machineCandidates.length > 0
@@ -1178,12 +1316,7 @@ export class GruAwareness {
       // members are claimed by design): a row re-triaged below the
       // severity floor or out of wake routing during the spawn must not
       // ride the prompt (issue #219 review, admission gate).
-      const gateSkip = this.wakePolicy.gate({
-        id: this.rowKey(row),
-        incidentKey: incidentKeyOf(row),
-        routing: row.routing,
-        severity: row.severity,
-      });
+      const gateSkip = this.wakePolicy.gate(this.wakeCandidate(id, row));
       if (gateSkip !== null) {
         this.log('debug', 'gru wake batch member no longer gate-eligible', {
           notification_id: id, reason: gateSkip,
@@ -1229,7 +1362,17 @@ export class GruAwareness {
   noteWakeOutcome(ok: boolean, detail?: string, injection?: AwarenessInjection): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
-    const delivered = active.filter((id) => (injection?.attentionKeys ?? injection?.notificationIds)?.includes(id));
+    const deliveredKeys = new Set(injection?.attentionKeys ?? injection?.notificationIds ?? []);
+    // A batch prepared after a decision renders/delivers the decision
+    // identity even when the composed batch held the bare card key (#506).
+    const delivered = active
+      .map((id) => {
+        if (deliveredKeys.has(id)) return id;
+        const row = this.attentionRow(id);
+        const identity = row === null ? id : this.deliveredIdentity(id, row);
+        return deliveredKeys.has(identity) ? identity : null;
+      })
+      .filter((id): id is string => id !== null);
     this.activeWakeIds = null;
     if (ok && delivered.length > 0) {
       const at = this.now();
@@ -1347,7 +1490,7 @@ export class GruAwareness {
         this.pendingWakeIds.add(id);
         const row = this.attentionRow(id);
         this.wakePolicy.forget(id);
-        if (row !== null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
+        if (row !== null && parseOwnerDecisionKey(id) === null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
       }
       this.persistWakeState();
       this.failedRetryAtMs = this.now() + 5_000;
@@ -1422,9 +1565,12 @@ export class GruAwareness {
   }
 
   private recordWakeFailure(reason: string, ids: readonly string[]): void {
-    this.log('error', 'gru wake turn failed', { error: reason, notification_ids: ids });
+    // Keep the audit's notification_ids real: a decision claim identity is a
+    // synthetic attention key, not a notification id (docs/CHAT.md).
+    const notificationIds = ids.map((id) => parseOwnerDecisionKey(id) === null ? id : this.attentionRow(id)?.id ?? id);
+    this.log('error', 'gru wake turn failed', { error: reason, notification_ids: notificationIds });
     try {
-      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason, notification_ids: ids } });
+      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason, notification_ids: notificationIds } });
     } catch (error) {
       this.log('error', 'gru wake failure event failed', { error: String(error) });
     }
@@ -1467,7 +1613,8 @@ export class GruAwareness {
     const sanitized = incidentKey.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
     const escalationId = `gru-wake-failed:${sanitized}`;
     const kind = `gru.wake-failed-escalation.${sanitized}`;
-    const idList = open.map(({ id }) => id).join(', ');
+    // Name the card(s), never the internal per-decision claim identity.
+    const idList = open.map(({ id }) => this.attentionRow(id)?.id ?? id).join(', ');
     try {
       const existing = this.attentionRow(escalationId);
       if (existing !== null && (existing.kind !== kind || existing.routing !== 'needs-owner')) {
@@ -1506,7 +1653,7 @@ export class GruAwareness {
         this.wakeFailures.delete(this.failureKey(id));
         this.pendingWakeIds.add(id);
         this.wakePolicy.forget(id);
-        this.wakePolicy.forgetIncident(incidentKeyOf(row));
+        if (parseOwnerDecisionKey(id) === null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
       }
       this.persistWakeState();
       this.failedRetryAtMs = this.now() + 5_000;
@@ -1618,8 +1765,16 @@ export class GruAwareness {
     if (batch.source === 'chat') return;
     for (const id of batch.ids) {
       this.pendingWakeIds.delete(id);
+      // A delivered decision identity also supersedes any restored bare
+      // candidate for the same card (#506).
+      const decision = parseOwnerDecisionKey(id);
+      if (decision !== null) this.pendingWakeIds.delete(decision.notificationId);
     }
     const keys = batch.ids.flatMap((id) => {
+      // A decision delivery claims only its per-decision identity (#506).
+      // Spending the card's incident key here would suppress a genuinely
+      // new machine alert for the same incident.
+      if (parseOwnerDecisionKey(id) !== null) return [];
       const capture = batch.deliveries?.find((delivery) => MAILBOX_KEY_PREFIX + delivery.deliveryKey === id);
       if (capture !== undefined) return [capture.deliveryKey];
       const row = this.attentionRow(id);
@@ -1947,11 +2102,21 @@ export class GruAwareness {
         // recorded deferrals/escalations must not re-fire stale guards.
         // (Mutate BEFORE the persist so the sidecar never keeps a spent debt.)
         const hadFailure = this.wakeFailures.delete(closedKey);
+        // Issue #506: a closed card spends the claims of every decision
+        // recorded on it — the follow-through is done, so the per-decision
+        // identities must not keep the dedupe set (or a retry) alive.
+        let decisionChanged = false;
+        for (const key of [...this.pendingWakeIds, ...this.wakePolicy.snapshot().woken]) {
+          if (parseOwnerDecisionKey(key)?.notificationId !== closedId) continue;
+          this.pendingWakeIds.delete(key);
+          this.wakeFailures.delete(key);
+          if (this.wakePolicy.forget(key)) decisionChanged = true;
+        }
         for (const [key, entry] of this.deferredRechecks) {
           if (entry.notificationId === closedKey) this.deferredRechecks.delete(key);
         }
         const wasDelivered = this.wakePolicy.forget(closedKey);
-        if (wasDelivered || hadFailure) this.persistWakeState();
+        if (wasDelivered || hadFailure || decisionChanged) this.persistWakeState();
         // Close any historical timeout follow-up on explicit Gru disposition.
         if (row?.routing === 'action-required') {
           const followUp = this.attentionRow(this.followUpId(closedId));
@@ -1964,11 +2129,18 @@ export class GruAwareness {
     }
     if (this.mailbox !== null && /^(job\.|round\.|lens\.|agent\.|notification\.|decision\.|obligation\.|directive\.|silas\.directive-|supervision\.|mailbox\.disposition|github\.)/.test(event.kind)) {
       this.queueMailboxReconciliation();
-      if (event.kind.startsWith('notification.')) {
+      // Owner decisions use the machine wake sink even when the routing
+      // split would keep the card passive (#506); the row lookup below
+      // enforces the real eligibility.
+      if (event.kind.startsWith('notification.') && event.kind !== 'notification.decision') {
         const id = textOf(payloadOf(event)['id']);
         const row = id === null ? null : this.ledger.getNotification(id);
         if (this.wakeMode !== 'all' || row?.routing === 'action-required') return;
       }
+    }
+    if (event.kind === 'notification.decision') {
+      this.considerOwnerDecision(textOf(payloadOf(event)['id']));
+      return;
     }
     if (this.wakeMode === 'never') return;
     if (event.kind !== 'notification.created' && event.kind !== 'notification.triaged') return;
@@ -1984,12 +2156,38 @@ export class GruAwareness {
       if (this.pendingWakeIds.delete(row.id)) this.persistWakeState();
       return;
     }
+    // A decided owner card's obligation is its per-decision candidate, never
+    // the bare creation/triage identity. A late triage event must not queue
+    // a second, unclaimed candidate for the same card (#506).
+    if (row.routing === 'needs-owner' && row.decidedAt !== null) {
+      this.considerOwnerDecision(row.id);
+      return;
+    }
     this.considerCandidate({
       id: this.rowKey(row),
       incidentKey: incidentKeyOf(row),
       routing: row.routing,
       severity: row.severity,
     });
+  }
+
+  /** A recorded owner decision opens a follow-through turn (#506): the
+   * card stays on the FOR YOU surface, but Gru owes the chosen option's
+   * operation and the card's eventual resolution. The persisted row is
+   * the authority (the event payload carries no decided_at); a replay or
+   * a boot re-seed is deduped by the per-decision claim key. */
+  private considerOwnerDecision(notificationId: string | null): void {
+    if (notificationId === null || this.wakeMode === 'never') return;
+    const row = this.ledger.getNotification(notificationId);
+    if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
+    if (this.isReceiptNotification(row.agentId)) return;
+    const candidate = this.ownerDecisionCandidate(row);
+    if (candidate === null) return;
+    // One card, one obligation: a still-pending creation/triage identity is
+    // superseded by its recorded decision (it renders the same line), so a
+    // coalesced batch can never leave one identity unclaimed and re-wake.
+    this.pendingWakeIds.delete(row.id);
+    this.considerCandidate(candidate);
   }
 
   /** Issue #224 escalation-triage SHADOW ask, fired at the delivery
@@ -2337,6 +2535,7 @@ export class GruAwareness {
         if (missing.length === 0) continue;
         for (const id of missing) known.add(id);
         const keys = missing
+          .filter((id) => parseOwnerDecisionKey(id) === null) // a decision claim never spends the card's incident key
           .map((id) => this.attentionRow(id))
           .filter((row): row is NotificationRecord => row !== null)
           .map((row) => incidentKeyOf(row));
@@ -2353,7 +2552,7 @@ export class GruAwareness {
    * Seeding goes through the ordinary admission path (issue #219): a seed
    * whose incident is a duplicate or whose subject a decision covers
    * defers exactly as a fresh bus-event candidate would. */
-  private seedBacklog(): void {
+  private seedBacklog(options: { readonly seedDecisions?: boolean } = {}): void {
     if (this.disposed || (this.wakeMode === 'never' && this.mailbox === null)) return;
     let seeded = false;
     // Keep every still-open receipt (no 256-ID eviction), but discard
@@ -2375,6 +2574,16 @@ export class GruAwareness {
       }
     }
     const before = this.pendingWakeIds.size;
+    // Recorded owner decisions are follow-through debt in EVERY non-never
+    // mode (#506), not owner row volume: seed them before the mailbox
+    // early-return so an action-required boot still owes them.
+    if (options.seedDecisions !== false && this.wakeMode !== 'never') {
+      try {
+        this.seedOwnerDecisionBacklog();
+      } catch (error) {
+        this.log('error', 'gru owner-decision backlog scan failed', { error: String(error) });
+      }
+    }
     if (this.mailbox !== null) {
       for (const row of this.mailbox.admissionRows(MAX_BACKLOG_SEED)) {
         const candidate = { id: this.rowKey(row), incidentKey: row.kind, routing: row.routing, severity: row.severity };
@@ -2401,6 +2610,9 @@ export class GruAwareness {
         }
         for (const row of live) {
           if (this.mailbox !== null && row.routing === 'action-required') continue;
+          // A decided owner row is seeded as its decision obligation above;
+          // the bare creation candidate here would duplicate that turn.
+          if (row.routing === 'needs-owner' && row.decidedAt !== null) continue;
           const candidate = {
             id: this.rowKey(row),
             incidentKey: incidentKeyOf(row),
@@ -2419,6 +2631,29 @@ export class GruAwareness {
     }
     if (seeded || this.pendingWakeIds.size !== before) this.persistWakeState();
     this.flushPendingWakes();
+  }
+
+  /** Seed recorded decisions whose follow-through wake was never delivered
+   * (boot, a lost sidecar, or a decision recorded while the service was
+   * down) — #506. The per-decision claim key makes this a no-op after a
+   * delivered wake and after a receipt replay; resolved cards never appear
+   * because the scan is unacked-only. */
+  private seedOwnerDecisionBacklog(): void {
+    for (let offset = 0;; offset += MAX_BACKLOG_SEED) {
+      const rows = this.ledger.listNotifications({
+        unackedOnly: true, routing: 'needs-owner', limit: MAX_BACKLOG_SEED, offset,
+      });
+      for (const row of rows) {
+        if (row.decidedAt === null || row.decidedOption === null) continue;
+        if (this.isReceiptNotification(row.agentId)) continue;
+        const candidate = this.ownerDecisionCandidate(row);
+        if (candidate === null) continue;
+        // The decision identity replaces any restored bare candidate.
+        this.pendingWakeIds.delete(row.id);
+        if (this.admitPath(candidate).action === 'admit') this.pendingWakeIds.add(candidate.id);
+      }
+      if (rows.length < MAX_BACKLOG_SEED) break;
+    }
   }
 
   private recordMailboxAdmissionDeferral(candidate: WakeCandidate): void {
@@ -2490,10 +2725,12 @@ export class GruAwareness {
     }
     if (this.wakeSink === null) return; // boot binds this later
     this.cancelWakeTimer();
-    // GH-116: machine stops lead the batch. Pending ids keep insertion order
-    // within a priority class (stable sort), so FYI/owner volume in all mode
-    // cannot starve an older action-required id behind five-minute spacing.
-    const priority = (id: string): number => this.attentionRow(id)?.routing === 'action-required' ? 0 : 1;
+    // GH-116: machine stops lead the batch. A recorded owner decision is a
+    // follow-through obligation, not owner-row volume, so it ranks with
+    // machine stops rather than behind sustained FYI/owner traffic. Pending
+    // ids keep insertion order within a priority class (stable sort).
+    const priority = (id: string): number =>
+      this.attentionRow(id)?.routing === 'action-required' || parseOwnerDecisionKey(id) !== null ? 0 : 1;
     this.activeWakeIds = [...this.pendingWakeIds]
       .map((id, index) => ({ id, index, rank: priority(id) }))
       .sort((left, right) => left.rank - right.rank || left.index - right.index)
@@ -2519,9 +2756,14 @@ export class GruAwareness {
     let changed = false;
     for (const id of this.pendingWakeIds) {
       const row = this.attentionRow(id);
+      // (#506) A decision identity supersedes the card's bare creation/triage
+      // identity. Leaving both pending would deliver (and claim) only one and
+      // re-wake the other on the next interval.
+      const supersededByDecision = row !== null && parseOwnerDecisionKey(id) === null &&
+        row.routing === 'needs-owner' && row.decidedAt !== null;
       const openAndEligible =
-        row !== null && row.ackedAt === null && row.resolvedAt === null && this.mailboxWakeEligible(id, row) &&
-        this.wakePolicy.gate({ id, incidentKey: incidentKeyOf(row), routing: row.routing, severity: row.severity }) === null;
+        !supersededByDecision && row !== null && row.ackedAt === null && row.resolvedAt === null && this.mailboxWakeEligible(id, row) &&
+        this.wakePolicy.gate(this.wakeCandidate(id, row)) === null;
       if (openAndEligible && !this.wakePolicy.claimed(id)) continue;
       this.pendingWakeIds.delete(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) this.wakeFailures.delete(id);

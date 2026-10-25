@@ -220,7 +220,9 @@ metadata and a recorded decision (`decision_json`, `decided_at/by/option`).
 a `notification.created` / `notification.shown` / `notification.acked` /
 `notification.decision` / `notification.resolved` event and publishes on
 the bus — the board pushes, machine-attention rows wake Gru, owner rows
-surface in chat, and the breaker re-arm rides the disposition. Legacy
+surface in chat, a recorded owner decision opens its follow-through wake
+(one claim per `(id, decided_at)`), and the breaker re-arm rides the
+disposition. Legacy
 owner rows are re-triaged to Gru at boot with a recorded note — never by
 age or display; `notification.resolved` with Gru's action detail closes
 machine work and a decided owner row's follow-through, while only a

@@ -13,13 +13,20 @@ import type { NotifyWakeMode, QuietHours } from '../config.js';
  *     notification; `"never"` is passive-only. 'needs-owner' rows are the
  *     human's business — under the routing split they ring the owner bell
  *     and never burn a machine turn (only the explicit 'all' mode wakes
- *     for them too).
+ *     for them too). The one exception is a RECORDED owner decision
+ *     (reason 'owner-decision', #506): the card stays on the owner
+ *     surface, but Gru now owes follow-through, so the routing gate does
+ *     not apply (mode and severity still do).
  *   - SEVERITY GATE — `wake_min_severity` raises the bar for a wake
  *     without changing routing ('error' wakes only on error-severity
  *     rows).
  *   - DEDUPE — one wake per notification id; a repeated event for the
  *     same unacked row (or a restart) never burns a second turn. IDs of
  *     open incidents persist; terminal rows are pruned by awareness.
+ *     Owner-decision wakes claim a per-decision identity
+ *     (card id + decided_at) instead: each recorded choice is its own
+ *     follow-through obligation, and a decision wake never spends the
+ *     card's incident key.
  *   - RATE LIMIT — `wake_min_interval_ms` (default 5 min) bounds
  *     autonomous turns; candidates inside the window coalesce into ONE
  *     trailing wake (the awareness layer batches their ids).
@@ -34,6 +41,12 @@ import type { NotifyWakeMode, QuietHours } from '../config.js';
 
 export type WakeSeverity = 'info' | 'error';
 
+/** Why a wake is owed (issue #506). Absent = the ordinary notification
+ * class. 'owner-decision' = the owner recorded a choice on a typed card and
+ * Gru owes its follow-through; the card itself stays `needs-owner`, so the
+ * routing gate is deliberately bypassed for this reason only. */
+export type WakeReason = 'notification' | 'owner-decision';
+
 /** Minimal routing shape the policy consumes (the ledger's union). */
 export interface WakeCandidate {
   readonly id: string;
@@ -43,6 +56,8 @@ export interface WakeCandidate {
   readonly incidentKey: string;
   readonly routing: 'fyi' | 'action-required' | 'needs-owner';
   readonly severity: WakeSeverity;
+  /** Absent means 'notification'. See {@link WakeReason}. */
+  readonly reason?: WakeReason;
 }
 
 export type WakeSkipReason = 'mode' | 'routing' | 'severity' | 'dedupe' | 'duplicate-incident';
@@ -152,16 +167,21 @@ function candidateGate(
   wokenIncidents: { readonly has: (key: string) => boolean },
 ): WakeDecision {
   if (config.mode === 'never') return { action: 'skip', reason: 'mode' };
+  const ownerDecision = candidate.reason === 'owner-decision';
+  // A recorded owner decision is follow-through debt, not an owner stop:
+  // it wakes even though the card keeps its human routing.
   const routingWakes =
-    candidate.routing === 'action-required' || config.mode === 'all';
+    ownerDecision || candidate.routing === 'action-required' || config.mode === 'all';
   if (!routingWakes) return { action: 'skip', reason: 'routing' };
   if (SEVERITY_RANK[candidate.severity] < SEVERITY_RANK[config.minSeverity]) {
     return { action: 'skip', reason: 'severity' };
   }
-  // ID dedupe (a repeated event for the same row) and incident dedupe
-  // (issue #219: a re-detected incident under a new row ID) both hold.
+  // ID dedupe (a repeated event for the same row) always holds. Incident
+  // dedupe (issue #219: a re-detected incident under a new row ID) holds
+  // only for notifications — two cards of the same incident that the owner
+  // decided separately are two follow-through obligations (#506).
   if (woken.has(candidate.id)) return { action: 'skip', reason: 'dedupe' };
-  if (wokenIncidents.has(candidate.incidentKey)) {
+  if (!ownerDecision && wokenIncidents.has(candidate.incidentKey)) {
     return { action: 'skip', reason: 'duplicate-incident' };
   }
   return { action: 'wake' };
@@ -200,7 +220,7 @@ export class WakePolicy {
   gate(candidate: WakeCandidate): WakeSkipReason | null {
     if (this.config.mode === 'never') return 'mode';
     const routingWakes =
-      candidate.routing === 'action-required' || this.config.mode === 'all';
+      candidate.reason === 'owner-decision' || candidate.routing === 'action-required' || this.config.mode === 'all';
     if (!routingWakes) return 'routing';
     if (SEVERITY_RANK[candidate.severity] < SEVERITY_RANK[this.config.minSeverity]) return 'severity';
     return null;

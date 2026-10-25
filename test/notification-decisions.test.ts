@@ -11,7 +11,7 @@ import {
   serializeNotificationDecision,
   type NotificationDecision,
 } from '../src/ledger/notification-decision.js';
-import { ownerAttentionFor, requiresTypedDecision, resolveNotificationRouting } from '../src/notifications/attention.js';
+import { ownerAttentionFor, producerFollowsDecisionThrough, requiresTypedDecision, resolveNotificationRouting } from '../src/notifications/attention.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { reconcileLegacyOwnerAttention } from '../src/notifications/legacy-owner.js';
 
@@ -98,6 +98,22 @@ describe('owner attention registry (Silas → Gru → owner)', () => {
     }
     expect(requiresTypedDecision('gru.owner-escalation')).toBe(true);
     expect(requiresTypedDecision('port-squat')).toBe(false);
+    // #506: producer services execute these recorded choices themselves, so
+    // their decided cards must not wake Gru into a duplicate operation.
+    for (const kind of [
+      'vector.raid-proposal',
+      'vector.fix-proposal',
+      'onboarding.proposal',
+      'worktree.preserve-expiry',
+      'worktree.repo-mismatch',
+      'disk.reclaim-proposal',
+      'worktree-sweep-paused:lane-1:3',
+    ]) {
+      expect(producerFollowsDecisionThrough(kind), kind).toBe(true);
+    }
+    for (const kind of ['gru.owner-escalation', 'lessons.proposal', 'test.unregistered']) {
+      expect(producerFollowsDecisionThrough(kind), kind).toBe(false);
+    }
   });
 
   it('resolves routing: owner-required forces owner, machine requests downgrade to Gru, ordinary requests pass through', () => {

@@ -388,7 +388,8 @@ frame_log_max_bytes = 8388608
 frame_log_keep = 3
 # Gru awareness wake policy. Wakes OPEN a Gru turn so a critical alert
 # is acted on without the user pinging. "action-required" (default) wakes
-# for machine-attention rows; "all" also for FYI/needs-owner; "never"
+# for machine-attention rows and for a recorded owner decision Gru owns
+# whose follow-through is owed; "all" also for FYI/needs-owner; "never"
 # injects context passively before the next turn only (no autonomous
 # turn). Each wake is a full model turn (provider tokens + latency).
 notify_wake = "action-required"

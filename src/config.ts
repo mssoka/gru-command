@@ -197,8 +197,9 @@ export interface ChatConfig {
    * 'never' injects escalations + a ledger digest passively before the
    * next turn at no turn cost by itself; 'action-required' (default,
    * owner ruling 2026-09-23) wakes a turn for machine-attention rows so
-   * a critical alert is acted on without the user pinging; 'all' wakes
-   * for every notification. Each wake is a full model turn — see
+   * a critical alert is acted on without the user pinging, and for a
+   * RECORDED owner decision Gru owns whose follow-through is owed (#506); 'all'
+   * wakes for every notification. Each wake is a full model turn — see
    * CONFIG.md. */
   readonly notifyWake: NotifyWakeMode;
   /** Minimum interval between autonomous wake turns (ms); candidates
