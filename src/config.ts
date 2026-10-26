@@ -358,7 +358,9 @@ export interface BriefingReviewConfig {
 
 export const DEFAULT_BRIEFING_REVIEW_CONFIG: BriefingReviewConfig = {
   enabled: true,
-  stage: 1,
+  // The owner wants the gate active immediately: high and medium are enforced,
+  // low stays advisory. Stage 1/2 remain configurable for a relaxed rollout.
+  stage: 3,
 };
 
 /** What GC does about a managed repository whose origin default branch has
@@ -1934,7 +1936,7 @@ export function loadConfig(
       const stage = table['stage'];
       if (stage !== undefined && (typeof stage !== 'number' || !(BRIEFING_REVIEW_STAGES as readonly number[]).includes(stage))) {
         throw new ConfigError(
-          `briefing_review.stage must be 1 or 2 (1 = record provenance, 2 = refuse a high-tier dispatch without a READY review or push-back), got: ${JSON.stringify(stage)}`,
+          `briefing_review.stage must be 1, 2 or 3 (1 = record provenance, 2 = refuse a high-tier dispatch without a READY review or push-back, 3 = enforce medium as well), got: ${JSON.stringify(stage)}`,
           file,
           'briefing_review.stage',
         );

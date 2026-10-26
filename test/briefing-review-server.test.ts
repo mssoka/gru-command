@@ -47,7 +47,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(options: { stage?: 1 | 2; disabled?: boolean; hosted?: boolean } = {}): Promise<Harness> {
+async function boot(options: { stage?: 1 | 2 | 3; disabled?: boolean; hosted?: boolean } = {}): Promise<Harness> {
   const repo = makeFixtureRepo('refunds-api');
   cleanups.push(() => repo.cleanup());
   const dir = mkdtempSync(join(tmpdir(), 'gru-briefing-review-http-'));
@@ -287,6 +287,39 @@ describe('Nefario HTTP surface', () => {
     const dispatchedPrompt = h.prompts.at(-1)!;
     expect(dispatchedPrompt).toContain('Dispatch briefing — job job-refunds');
     expect(dispatchedPrompt).toContain(BRIEFING);
+    await h.close();
+  });
+
+  it('enforces a medium-tier review at stage 3: pending is held, READY admits, and the refusal names the medium tier', async () => {
+    const h = await boot({ stage: 3 });
+    const commissioned = await call(h.port, 'POST', '/api/briefing-review', commissionBody(h, { tier: 'medium' }));
+    expect(commissioned.status).toBe(202);
+    const armed = armedOf(h);
+    const dispatchBody = {
+      job_id: 'job-medium',
+      repo_path: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+    };
+    const held = await call(h.port, 'POST', '/api/dispatch', dispatchBody);
+    expect(held.status).toBe(409);
+    expect(held.json).toMatchObject({ error: 'briefing_review_pending' });
+    expect(h.ledger.getJob('job-medium')).toBeNull();
+    expect(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_REFUSED] })[0]!.payload).toMatchObject({ tier: 'medium', reason: 'pending' });
+    for (const lens of armed.lenses) {
+      const submitted = await call(h.port, 'POST', '/api/briefing-review/result', {
+        repoPath: h.repo.path,
+        briefingSha256: armed.briefingSha256,
+        jobId: lensJobId(armed.reviewId, lens),
+        lens,
+        verdict: 'READY',
+        findings: [],
+      });
+      expect(submitted.status).toBe(200);
+    }
+    const admitted = await call(h.port, 'POST', '/api/dispatch', dispatchBody);
+    expect(admitted.status).toBe(202);
+    expect(admitted.json).toMatchObject({ job_id: 'job-medium' });
     await h.close();
   });
 

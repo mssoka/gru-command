@@ -352,6 +352,15 @@ describe('Nefario briefing-review card (GH-505)', () => {
       ['briefingReview.caught', 4, false],
       ['briefingReview.refusalsToday', 1, true],
     ]);
+    // Stage 3 enforces medium as well as high; refusals stay the alert fact.
+    const medium = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ stage: 'medium', tier: 'medium', refusalsToday: 2 }) }), NOW), 'nefario');
+    expect(medium.aside).toBe('round 3 · medium');
+    expect(medium.facts.map((fact) => [fact.kpi, fact.value, fact.alert])).toEqual([
+      ['briefingReview.verdictsToday', 1, false],
+      ['briefingReview.caught', 4, false],
+      ['briefingReview.refusalsToday', 2, true],
+    ]);
+    expect(medium.asideTitle).toContain('stage 3 holds a high- or medium-tier dispatch');
     // Nothing live: the aside says so, and the zeros still render (faded).
     const quiet = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ armed: 0, round: null, tier: null, verdictsToday: 0, caught: 0, stage: 'high' }) }), NOW), 'nefario');
     expect(quiet.aside).toBe('no pass live');

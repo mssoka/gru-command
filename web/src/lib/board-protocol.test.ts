@@ -846,6 +846,7 @@ describe('Nefario briefing-review block (GH-505)', () => {
     expect(isValidSnapshot({ ...snapshot(), briefingReview: null })).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), briefingReview: review() })).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), armed: 0, round: null, tier: null, stage: 'high' } })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), armed: 0, round: null, tier: null, stage: 'medium' } })).toBe(true);
   });
 
   it('rejects a malformed block, one field at a time: a guessed count or stage never renders', () => {

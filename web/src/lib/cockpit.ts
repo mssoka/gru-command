@@ -272,19 +272,24 @@ function nefarioCard(snapshot: BoardSnapshot): CockpitCard | null {
   }
   const live = review.round !== null && review.tier !== null;
   const stageSuffix = review.stage === 'advisory' ? ' · advisory' : '';
+  const stageTitle = review.stage === 'advisory'
+    ? 'stage 1 records provenance and refuses only a false claim'
+    : review.stage === 'high'
+      ? 'stage 2 holds a high-tier dispatch until its exact briefing is READY or pushed back'
+      : 'stage 3 holds a high- or medium-tier dispatch until its exact briefing is READY or pushed back';
   return {
     id: 'nefario',
     label: 'NEFARIO',
     aside: live ? `round ${review.round} · ${review.tier}${stageSuffix}` : `no pass live${stageSuffix}`,
     asideTitle: live
-      ? `The newest live briefing review is round ${review.round} at ${review.tier} tier; ${review.stage === 'advisory' ? 'stage 1 records provenance and refuses only a false claim' : 'stage 2 holds a high-tier dispatch until its exact briefing is READY or pushed back'}.`
-      : `No briefing review is live; ${review.stage === 'advisory' ? 'stage 1 records provenance and refuses only a false claim' : 'stage 2 holds a high-tier dispatch until its exact briefing is READY or pushed back'}.`,
+      ? `The newest live briefing review is round ${review.round} at ${review.tier} tier; ${stageTitle}.`
+      : `No briefing review is live; ${stageTitle}.`,
     headline: { kpi: 'briefingReview.armed', value: String(review.armed), unit: 'under test', title: `${pluralCount(review.armed, 'briefing')} under review` },
     facts: [
       fact('briefingReview.verdictsToday', review.verdictsToday, review.verdictsToday === 1 ? 'verdict today' : 'verdicts today', `${pluralCount(review.verdictsToday, 'briefing verdict')} posted today`),
       fact('briefingReview.caught', review.caught, 'caught', `${pluralCount(review.caught, 'blocking finding')} caught before dispatch today`),
-      ...(review.stage === 'high'
-        ? [fact('briefingReview.refusalsToday', review.refusalsToday, review.refusalsToday === 1 ? 'refusal today' : 'refusals today', `${pluralCount(review.refusalsToday, 'high-tier dispatch')} held back today`, true)]
+      ...(review.stage !== 'advisory'
+        ? [fact('briefingReview.refusalsToday', review.refusalsToday, review.refusalsToday === 1 ? 'refusal today' : 'refusals today', `${pluralCount(review.refusalsToday, 'tiered dispatch')} held back today`, true)]
         : []),
     ],
     notes: [],

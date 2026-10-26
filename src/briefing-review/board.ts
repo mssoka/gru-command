@@ -36,8 +36,10 @@ export interface BriefingReviewBoardCounts {
   readonly refusalsToday: number;
 }
 
+export type BriefingReviewStageName = 'advisory' | 'high' | 'medium';
+
 export interface BriefingReviewBoardView extends BriefingReviewBoardCounts {
-  readonly stage: 'advisory' | 'high';
+  readonly stage: BriefingReviewStageName;
 }
 
 export const EMPTY_BRIEFING_REVIEW_COUNTS: BriefingReviewBoardCounts = {
@@ -49,8 +51,8 @@ export const EMPTY_BRIEFING_REVIEW_COUNTS: BriefingReviewBoardCounts = {
   refusalsToday: 0,
 };
 
-export function briefingReviewStageName(stage: BriefingReviewStage): 'advisory' | 'high' {
-  return stage === 2 ? 'high' : 'advisory';
+export function briefingReviewStageName(stage: BriefingReviewStage): BriefingReviewStageName {
+  return stage === 1 ? 'advisory' : stage === 2 ? 'high' : 'medium';
 }
 
 function localDayStart(now: Date): number {

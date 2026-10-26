@@ -37,8 +37,9 @@ export type BriefingReviewProvenanceVerdict = (typeof BRIEFING_REVIEW_PROVENANCE
 
 /** Rollout stage: 1 records provenance and enforces only truthfulness of a
  * claim; 2 also refuses a high-tier dispatch without a READY review or a
- * recorded push-back. Medium/low stay advisory in both stages. */
-export const BRIEFING_REVIEW_STAGES = [1, 2] as const;
+ * recorded push-back; 3 enforces medium as well. Low stays advisory at every
+ * stage. */
+export const BRIEFING_REVIEW_STAGES = [1, 2, 3] as const;
 export type BriefingReviewStage = (typeof BRIEFING_REVIEW_STAGES)[number];
 
 /** Finding severities: `blocking` forces CHANGES-NEEDED, `advisory` does not. */
@@ -169,6 +170,14 @@ export function lensJobId(reviewId: string, lens: BriefingReviewLens): string {
 
 export function tierRank(tier: BriefingReviewTier): number {
   return BRIEFING_REVIEW_TIERS.indexOf(tier);
+}
+
+/** Which tiers a rollout stage holds to readiness: stage 1 none, stage 2
+ * high only, stage 3 high and medium. Low is advisory at every stage. */
+export function tierEnforcedAt(tier: BriefingReviewTier, stage: BriefingReviewStage): boolean {
+  if (stage === 1) return false;
+  if (stage === 2) return tier === 'high';
+  return tier === 'high' || tier === 'medium';
 }
 
 export function isBriefingReviewTier(value: unknown): value is BriefingReviewTier {

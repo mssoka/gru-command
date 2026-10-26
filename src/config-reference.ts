@@ -806,7 +806,7 @@ export function renderReferenceConfig(
 function briefingReviewSection(preserved: GruCommandConfig | null | undefined): string[] {
   const active = preserved !== null && preserved !== undefined;
   const enabled = preserved?.briefingReview.enabled ?? true;
-  const stage = preserved?.briefingReview.stage ?? 1;
+  const stage = preserved?.briefingReview.stage ?? 3;
   return [
     active ? '[briefing_review]' : '# [briefing_review]',
     '# Nefario (docs/BRIEFING-REVIEW.md): Gru commissions a zero-context review',
@@ -820,8 +820,9 @@ function briefingReviewSection(preserved: GruCommandConfig | null | undefined): 
     active ? `enabled = ${String(enabled)}` : '# enabled = true',
     '# stage = 1 records provenance and refuses only a FALSE provenance claim;',
     '# stage = 2 also refuses a high-tier dispatch whose exact briefing sha has',
-    '# no READY review or recorded push-back. Medium/low stay advisory.',
-    active ? `stage = ${String(stage)}` : '# stage = 1',
+    '# no READY review or recorded push-back; stage = 3 enforces medium too.',
+    '# Low tier stays advisory at every stage.',
+    active ? `stage = ${String(stage)}` : '# stage = 3',
   ];
 }
 

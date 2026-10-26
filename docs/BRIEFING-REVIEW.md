@@ -156,10 +156,10 @@ block is supplied:
 | a verdict the review does not hold | 409 `briefing_review_pending` (a false claim is never accepted, **in stage 1 too**) |
 | the review was pushed back and the block is still supplied | 400 `briefing_review_invalid_request`; dispatch with no block so the push-back is auto-attached |
 | matching READY | admitted, recorded |
-| matching CHANGES-NEEDED, stage 1 | admitted, recorded (advisory) |
-| matching CHANGES-NEEDED, stage 2 | 409 `briefing_review_not_ready` |
+| matching CHANGES-NEEDED, stage 1 or an advisory tier | admitted, recorded (advisory) |
+| matching CHANGES-NEEDED, enforced tier at stage 2 or 3 | 409 `briefing_review_not_ready` |
 
-**Stage 1** (`stage = 1`, the default) never refuses a dispatch for review
+**Stage 1** (`stage = 1`) never refuses a dispatch for review
 readiness — including a high-tier review that is pending or CHANGES-NEEDED. A
 READY review or a recorded push-back attaches by itself even when the caller
 omits the block. **Stage 2** also refuses a high-tier dispatch whose exact
@@ -167,9 +167,10 @@ briefing sha has no READY verdict and no push-back, **before any job row,
 worktree or spawn**, with 409 `briefing_review_pending` (no verdict yet),
 `briefing_review_not_ready` (CHANGES-NEEDED) or `briefing_review_required` (an
 older round covers the chain but not this sha), plus one
-`briefing.review-refused` event. Medium and low tiers stay advisory in both
-stages, and a heist with no armed review is admitted — the server cannot infer
-an undeclared tier, so the role canon carries that obligation.
+`briefing.review-refused` event. **Stage 3** enforces medium as well as high;
+low stays advisory at every stage, and a heist with no armed review is admitted
+— the server cannot infer an undeclared tier, so the role canon carries that
+obligation.
 
 Every admitted dispatch that carries provenance records one
 `briefing.review-dispatched` event and the job holds the exact reviewed text, so
@@ -177,8 +178,10 @@ the ledger proves the minion received what was reviewed. Auto-attach is by exact
 `reviewId`, which binds the repository: a foreign repository's review for the
 same briefing text is never attached.
 
-Cutover: stage 2 is code-complete but promoted by the owner after the stage-1
-data. Before the flip, in-flight high-tier reviews are revised or pushed back.
+Cutover: the default is stage 3 — high and medium are enforced immediately;
+low stays advisory. Set `stage = 1` (advisory) or `stage = 2` (high only) to
+relax the gate. Before a flip, in-flight reviews at the newly enforced tier are
+revised or pushed back.
 
 ## Lens sessions
 
@@ -203,7 +206,7 @@ attribution are in `resources/gc-workflows/NOTICE.md`.
 ```toml
 [briefing_review]
 enabled = true   # false is the stop state: commission 503, gate admits, zeroed card
-stage = 1        # 1 = record provenance; 2 = also refuse a high-tier dispatch
+stage = 3        # 1 = record provenance; 2 = also refuse high tier; 3 = high + medium (default)
 ```
 
 Both keys are validated loudly (`docs/CONFIG.md`). `enabled = false` stops

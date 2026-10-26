@@ -4,6 +4,7 @@ import {
   briefingSha256Of,
   invalidRequest,
   isBriefingReviewVerdict,
+  tierEnforcedAt,
   type BriefingReviewProvenanceVerdict,
   type BriefingReviewStage,
   type BriefingReviewTier,
@@ -171,13 +172,13 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
         null,
       );
     }
-    if (requested.verdict === 'CHANGES-NEEDED' && stage === 2) {
+    if (requested.verdict === 'CHANGES-NEEDED' && tierEnforcedAt(exact.tier, stage)) {
       return refused(
         input,
         'briefing_review_not_ready',
         409,
-        `review ${exact.reviewId} holds CHANGES-NEEDED: fix the briefing and re-commission at this tier, escalate to the owner, ` +
-          'or record a push-back with POST /api/briefing-review/pushback and dispatch without the block',
+        `review ${exact.reviewId} holds CHANGES-NEEDED and stage ${String(stage)} enforces ${exact.tier}-tier readiness: fix the briefing and re-commission at this tier, ` +
+          'escalate to the owner, or record a push-back with POST /api/briefing-review/pushback and dispatch without the block',
         'changes-needed',
       );
     }
@@ -190,10 +191,9 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
   if (exact !== null && exactPushback !== null) {
     return { admitted: true, provenance: provenance(exact, 'PUSHED-BACK', exactPushback.reason) };
   }
-  // Medium and low tiers stay advisory at stage 2; so does a heist with no
-  // armed review for this sha until the chain scan below finds a high-tier
-  // round that covers only an older revision.
-  if (stage === 1 || (exact !== null && exact.tier !== 'high')) {
+  // Low tiers always stay advisory, and a medium tier is still advisory at
+  // stage 2. Stage 3 enforces medium as well as high.
+  if (stage === 1 || (exact !== null && !tierEnforcedAt(exact.tier, stage))) {
     return { admitted: true, provenance: null };
   }
   if (exact !== null && exactVerdict === 'CHANGES-NEEDED') {
@@ -201,7 +201,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
       input,
       'briefing_review_not_ready',
       409,
-      `high-tier review ${exact.reviewId} holds CHANGES-NEEDED at stage 2: fix the briefing, escalate to the owner, ` +
+      `stage ${String(stage)} review ${exact.reviewId} holds CHANGES-NEEDED: fix the briefing, escalate to the owner, ` +
         'or record a push-back with POST /api/briefing-review/pushback',
       'changes-needed',
     );
@@ -211,18 +211,18 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
       input,
       'briefing_review_pending',
       409,
-      `high-tier review ${exact.reviewId} has no verdict yet at stage 2; dispatch after it reaches READY, or record a push-back`,
+      `stage ${String(stage)} review ${exact.reviewId} has no verdict yet; dispatch after it reaches READY, or record a push-back`,
       'pending',
     );
   }
-  const older = input.chain.filter((review) => review.tier === 'high');
+  const older = input.chain.filter((review) => tierEnforcedAt(review.tier, stage));
   if (older.length > 0) {
     const newest = older[older.length - 1]!;
     return refused(
       input,
       'briefing_review_required',
       409,
-      `this stage-2 install reviewed this heist's chain (newest: ${newest.reviewId}, round ${String(newest.round)}) but this exact briefing ` +
+      `this stage-${String(stage)} install reviewed this heist's chain (newest: ${newest.reviewId}, round ${String(newest.round)}) but this exact briefing ` +
         'has no review; commission POST /api/briefing-review for the revised briefing before dispatching it',
       'missing',
     );

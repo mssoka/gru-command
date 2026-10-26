@@ -724,6 +724,28 @@ describe('[onboarding] mode (#427)', () => {
   });
 });
 
+describe('[briefing_review] (GH-505)', () => {
+  it('defaults to enabled stage 1, parses enabled/stage 1–3, and rejects invalid values and keys', () => {
+    const fresh = tmpHome();
+    writeConfig(fresh, '');
+    expect(loadConfig({ GRU_COMMAND_HOME: fresh }, '/home/tester').briefingReview).toEqual({ enabled: true, stage: 3 });
+    for (const stage of [1, 2, 3]) {
+      const home = tmpHome();
+      writeConfig(home, `[briefing_review]\nstage = ${String(stage)}\n`);
+      expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').briefingReview).toEqual({ enabled: true, stage });
+    }
+    const off = tmpHome();
+    writeConfig(off, '[briefing_review]\nenabled = false\nstage = 3\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: off }, '/home/tester').briefingReview).toEqual({ enabled: false, stage: 3 });
+    const badStage = tmpHome();
+    writeConfig(badStage, '[briefing_review]\nstage = 4\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: badStage }, '/home/tester')).toThrow(/briefing_review\.stage must be 1, 2 or 3/);
+    const unknown = tmpHome();
+    writeConfig(unknown, '[briefing_review]\nmode = "high"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: unknown }, '/home/tester')).toThrow(/unknown key `mode` in \[briefing_review\]/);
+  });
+});
+
 describe('docs/example.config.toml', () => {
   it('parses and validates through the loader (docs drift guard)', () => {
     const example = readFileSync(join(import.meta.dirname, '..', 'docs', 'example.config.toml'), 'utf-8');

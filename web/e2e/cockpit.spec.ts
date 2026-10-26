@@ -544,6 +544,7 @@ const BRIEFING_REVIEW_ON: Record<string, unknown> = {
 };
 
 const BRIEFING_REVIEW_STAGE2: Record<string, unknown> = { ...BRIEFING_REVIEW_ON, refusalsToday: 2, stage: 'high' };
+const BRIEFING_REVIEW_STAGE3: Record<string, unknown> = { ...BRIEFING_REVIEW_ON, tier: 'medium', refusalsToday: 3, stage: 'medium' };
 
 const RAIDS_ON: Record<string, unknown> = {
   enabled: true,
@@ -717,6 +718,11 @@ test('Nefario: the live pass renders after raids, an absent block renders no car
   await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_STAGE2 }));
   await expect(nefario.locator('.cockpit-card__aside')).toHaveText('round 3 · high');
   await expect(nefario.locator('[data-kpi="briefingReview.refusalsToday"]')).toHaveText('2');
+  await expect(nefario.locator('.cockpit-fact--alert [data-kpi="briefingReview.refusalsToday"]')).toHaveCount(1);
+  // Stage 3 also enforces medium; the card still shows the aggregate pass.
+  await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_STAGE3 }));
+  await expect(nefario.locator('.cockpit-card__aside')).toHaveText('round 3 · medium');
+  await expect(nefario.locator('[data-kpi="briefingReview.refusalsToday"]')).toHaveText('3');
   await expect(nefario.locator('.cockpit-fact--alert [data-kpi="briefingReview.refusalsToday"]')).toHaveCount(1);
   // An older server sends no block: no card at all (never a card of zeros).
   await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON }));

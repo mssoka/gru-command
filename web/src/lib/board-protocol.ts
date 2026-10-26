@@ -639,7 +639,7 @@ export interface RepoOverviewView {
 
 /** The rollout stages the server can send (mirrors `BRIEFING_REVIEW_STAGES`
  * through the engine's 1→advisory / 2→high mapping). */
-export const BRIEFING_REVIEW_STAGE_NAMES = ['advisory', 'high'] as const;
+export const BRIEFING_REVIEW_STAGE_NAMES = ['advisory', 'high', 'medium'] as const;
 
 export type BriefingReviewStageName = (typeof BRIEFING_REVIEW_STAGE_NAMES)[number];
 

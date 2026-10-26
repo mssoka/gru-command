@@ -683,8 +683,9 @@ run_timeout_ms = 1800000
 # enabled = true
 # stage = 1 records provenance and refuses only a FALSE provenance claim;
 # stage = 2 also refuses a high-tier dispatch whose exact briefing sha has
-# no READY review or recorded push-back. Medium/low stay advisory.
-# stage = 1
+# no READY review or recorded push-back; stage = 3 enforces medium too.
+# Low tier stays advisory at every stage.
+# stage = 3
 
 # ── Jev decisions (optional) ─────────────────────────────────────────
 # Jev is a small, cheap "System One" decision model (TypeSafe, via OpenRouter).
@@ -969,7 +970,7 @@ largest lanes and how much of the disk is not GC's. The row closes itself once
 the condition clears. `0` turns the budget or the floor off; the board's disk
 row and `GET /api/disk` still show the numbers.
 
-### Nefario's briefing review: stage 1 or 2
+### Nefario's briefing review: stage 1, 2 or 3
 
 `[briefing_review]` configures Nefario, the pre-dispatch review of a heist
 briefing ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)). Two keys:
@@ -979,18 +980,23 @@ briefing ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)). Two keys:
   everything, and the cockpit card shows zeros. Nothing else changes: Perkins,
   intake approval, merge authority and the verbatim-briefing contract are
   untouched either way.
-- **`stage`** (exactly `1` or `2`, default `1`). Stage 1 records provenance and
-  refuses only a **false** provenance claim — a dispatch that says "READY" for a
-  review that holds no verdict, or names a sha it is not dispatching. Stage 2
+- **`stage`** (exactly `1`, `2` or `3`, default `3`). Stage 1 records provenance
+  and refuses only a **false** provenance claim — a dispatch that says "READY" for
+  a review that holds no verdict, or names a sha it is not dispatching. Stage 2
   also refuses a **high-tier** dispatch whose exact briefing sha has no `READY`
-  review and no recorded push-back, before any job row exists. Medium and low
-  tiers stay advisory in both stages.
+  review and no recorded push-back, before any job row exists. Stage 3 enforces
+  **medium** as well as high. Low stays advisory at every stage.
+
+The default is **stage 3**: high and medium are enforced immediately; set
+`stage = 1` (advisory) or `stage = 2` (high only) to relax the gate. Promotion
+is a config change, not a code change. Before a flip, in-flight reviews at the
+newly enforced tier are revised or pushed back.
 
 The section is emitted **as a commented example** in a freshly generated config
 so a default config stays parseable by a pre-Nefario build after `gru roll`; a
 re-run re-emits it active, like `[env]` and `[pacing]`. An install that has
 enabled it and wants to roll back must remove the block first. Invalid values
-fail loud: `briefing_review.stage must be 1 or 2 …`.
+fail loud: `briefing_review.stage must be 1, 2 or 3 …`.
 
 ### Mailbox recovery cadence
 

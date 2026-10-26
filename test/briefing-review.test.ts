@@ -62,7 +62,7 @@ interface Harness {
 
 function harness(options: {
   readonly enabled?: boolean;
-  readonly stage?: 1 | 2;
+  readonly stage?: 1 | 2 | 3;
   readonly failOnce?: string;
   readonly workflow?: BriefingReviewServiceOptions['workflow'];
 } = {}): Harness {
@@ -647,6 +647,60 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     expect(refusals[2]!.payload).toMatchObject({ repo_path: h.repo.path, title: 'Refunds endpoint', job_id: 'job-9', tier: 'high' });
     // A build that never reached the service leaves no job row behind.
     expect(h.ledger.getJob('job-9')).toBeNull();
+  });
+
+  it('stage 3 enforces medium as well as high; low stays advisory, and stage 2 leaves medium advisory', async () => {
+    // Stage 2: a pending medium review is advisory, and a truthful
+    // CHANGES-NEEDED block for it is admitted and recorded (not a 409).
+    const s2 = harness({ stage: 2 });
+    await s2.service.commission(commission(s2, { tier: 'medium' }));
+    const m2 = armedOf(s2);
+    expect(s2.service.admitDispatch({
+      jobId: 'job-medium-s2',
+      repoPath: s2.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toBeNull();
+    s2.service.submitResult(result(s2, { lens: 'stranger', findings: [blocking()] }));
+    expect(s2.service.admitDispatch({
+      jobId: 'job-medium-s2-changes',
+      repoPath: s2.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: { rounds: 1, verdict: 'CHANGES-NEEDED', briefingSha256: m2.briefingSha256 },
+    })).toMatchObject({ verdict: 'CHANGES-NEEDED', tier: 'medium', round: 1 });
+
+    // Stage 3: the same medium review is held pending, then CHANGES-NEEDED.
+    const s3 = harness({ stage: 3 });
+    await s3.service.commission(commission(s3, { tier: 'medium' }));
+    expect(() => s3.service.admitDispatch({
+      jobId: 'job-medium-s3',
+      repoPath: s3.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
+    s3.service.submitResult(result(s3, { lens: 'stranger', findings: [blocking()] }));
+    expect(() => s3.service.admitDispatch({
+      jobId: 'job-medium-s3',
+      repoPath: s3.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    expect(s3.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_REFUSED] })[0]!.payload).toMatchObject({ tier: 'medium', reason: 'pending' });
+
+    // Low is advisory even at stage 3: a pending low review never holds a dispatch.
+    const low = harness({ stage: 3 });
+    await low.service.commission(commission(low, { tier: 'low' }));
+    expect(low.service.admitDispatch({
+      jobId: 'job-low-s3',
+      repoPath: low.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toBeNull();
   });
 
   it('stage 2 admits the exact READY sha or a recorded push-back, and never auto-attaches another repository\'s review', async () => {
