@@ -352,7 +352,22 @@ audit, under the same refusals, hold and closures.
 One state has no exit: a job carrying both a live directive and pending
 re-brief markers (legacy history only; the single-writer rule refuses it
 now). Each abandonment sees the other control as live and refuses: it is
-an owner-escalation dead end that no route here closes.
+an owner-escalation dead end that no route here closes; the owner must bin
+the job.
+
+### The shared bearer and owner-only fields
+
+The HTTP bearer token is shared: Gru and the owner authenticate with the
+same secret, so a `by: "owner"` field is the only barrier between an
+automation decision and an owner decision. Every refusal that names an
+owner-only exit therefore says *ask the owner*, never the request body that
+would take it; `roles/gru.md` forbids Gru from reconstructing one from a
+refusal's wording or from the examples below. For the same reason an owner
+acceptance of a fresh request refuses while the abandoned control's
+original producer cleanup is still unproven: releasing the hold there would
+strand a `dispatching` request whose own claim refuses on unproven
+cessation, so binning — the one exit that needs no cessation — stays the
+answer until the cleanup blockers clear.
 
 ## Activation rules
 

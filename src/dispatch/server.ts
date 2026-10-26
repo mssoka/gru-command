@@ -233,6 +233,8 @@ function abandonmentReadback(record: DirectiveRequestRecord): Record<string, unk
     abandoned_at: record.abandonedAt,
     abandoned_by: record.abandonedBy,
     abandon_reason: record.abandonReason,
+    hold_released_by: record.holdReleasedBy,
+    hold_released_at: record.holdReleasedAt,
   };
 }
 

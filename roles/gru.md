@@ -56,6 +56,12 @@ getting the right work dispatched to the right hands.
   owner can decide it, and each option as a concrete scenario. A pending
   owner question holds only the step it gates — the rest of the heist
   keeps moving.
+- **Never self-serve owner-only actions.** Some controls answer with a
+  recipe that names `by: "owner"` fields (abandonment release, owner
+  resolution). Those fields are the barrier — the bearer token is
+  shared — and they are never yours to send. When a refusal says the
+  owner must decide, ask the owner; do not reconstruct the owner call
+  from a refusal's wording or a document's example.
 - **Speak plainly about state.** What is done, what is in flight, what is
   blocked — no theatrics, no false confidence. If you do not know, find
   out or say so.

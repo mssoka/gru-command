@@ -5160,7 +5160,14 @@ export class LedgerApi {
       // Its producer-issued recovery pointer correlates only the routine card;
       // it is not authority/effect evidence and never releases an owner hold.
       const correlated = debts.some((debt) => card?.detail?.includes(`/api/silas/rebriefs/${marker.id}, then POST its /recover with expected_generation ${debt.generation}, expected_payload_hash ${marker.payloadHash},`));
-      if (correlated && card?.routing === 'action-required' && (card.agentId === null || card.agentId === marker.agentId)) this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
+      // An abandonment-advice card (unproven custody) never carries that
+      // correlate string, so a transient blocker's card would wake Gru
+      // forever once the markers later retire or settle. Resolve it too when
+      // this job has no pending marker left and no open recovery debt.
+      const staleAdvice = card?.detail?.includes('owner decision: ask the owner to abandon the unknown custody') === true &&
+        this.listPendingRebriefs({ jobId: marker.jobId }).length === 0 &&
+        this.listObligations({ jobId: marker.jobId }).every((debt) => debt.state !== 'open' && debt.state !== 'waiting');
+      if ((correlated || staleAdvice) && card?.routing === 'action-required' && (card.agentId === null || card.agentId === marker.agentId)) this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
     }
   }
 
@@ -9594,7 +9601,7 @@ export class LedgerApi {
       category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: row.baselineSeq,
       description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
       nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId).length > 0
-        ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, report the missing restart capability — never replay or infer cessation'
+        ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, ask the owner — the owner may abandon the unknown custody (the owner-only exit that holds the lane for a fresh owner-accepted request) or bin the job; never replay or infer cessation'
         : 'inspect exact native request evidence; choose a guarded fresh successor (rebrief-successor when the work needs a fresh session) or name the reserved owner decision; ' +
           'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request' } }));
   }
@@ -11025,7 +11032,19 @@ export class LedgerApi {
     const abandoned = holds.filter((hold) => hold.releasedBy === null && hold.kind !== 'retired');
     if (abandoned.length > 0 && !ownerAccepted) {
       throw new LaneWriterConflictError(`job "${jobId}" is held by the owner's abandonment of ${abandoned.map((hold) => hold.requestId).join(', ')} — ` +
-        'its producer custody is unknown: only a fresh request the owner accepts (by "owner", confirm_intent true) or binning releases the lane');
+        'its producer custody is unknown: the lane stays held for the owner; ask the owner to resolve it (or bin the job) — no self-service release exists');
+    }
+    if (abandoned.length > 0 && ownerAccepted) {
+      // The owner accepted, but an abandoned control's original producer may
+      // still be live: releasing now would admit a fresh request whose own
+      // dispatch later refuses on unproven cessation, stranding it. Refuse
+      // while any cleanup blocker remains, naming each and pointing at
+      // binning — the one exit that does not need that producer.
+      const blockers = this.directiveCleanupBlockers(jobId);
+      if (blockers.length > 0) {
+        throw new LaneWriterConflictError(`job "${jobId}" is held by the owner's abandonment of ${abandoned.map((hold) => hold.requestId).join(', ')} and its original producer cleanup is still unproven (${blockers.join('; ')}) — ` +
+          'the owner must bin the job instead: a fresh accepted request cannot dispatch while cessation is unproven');
+      }
     }
     const ts = nowIso();
     this.db

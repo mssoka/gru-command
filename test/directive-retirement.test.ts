@@ -1516,7 +1516,11 @@ describe('directive retirement — owner abandonment never discards known live w
       ['/api/silas/rebrief', { job_id: 'job-hold', note: 'fresh work', request_id: 'req-hold-rebrief' }]] as const) {
       const refused = await call(h.port, 'POST', path, body, TOKEN);
       expect(refused.status, path).toBe(409);
-      expect(field<string>(refused.json, 'detail'), path).toContain('only a fresh request the owner accepts');
+      // The lane stays held for the owner, and the refusal never spells the
+      // owner's own request body: the shared bearer makes that the barrier.
+      expect(field<string>(refused.json, 'detail'), path).toContain('the lane stays held for the owner; ask the owner');
+      expect(field<string>(refused.json, 'detail'), path).not.toContain('confirm_intent');
+      expect(field<string>(refused.json, 'detail'), path).not.toContain('by "owner"');
     }
     expect(() => h.ledger.beginDirectiveIntent({ jobId: 'job-hold', directive: 'gru work', holder: 'gru', requestId: 'req-hold-gru' })).toThrow(/owner's abandonment of req-hold/u);
     h.ledger.setJobStatus('job-hold', 'working');
@@ -1548,7 +1552,7 @@ describe('directive retirement — owner abandonment never discards known live w
       settlement: { kind: 'cancelled', reason: `abandoned by the owner (event ${seq}); outcome unknown — no successor and no no-effect claim` } });
     expect(card('req-debt')).toBeNull();
     expect(h.ledger.recoveryObligation('job-debt', 'directive', 'req-debt')).toBeNull();
-    expect(row.state).toBe('dispatching');
+    expect(h.ledger.getDirective('req-debt')).toMatchObject({ state: 'failed' });
 
     // Retirement resolves the card of a request it closes; a recovery debt
     // that still owes a decision keeps its card as the pointer.
@@ -1740,6 +1744,29 @@ describe('re-brief markers — done and closeout refuse them; the owner abandons
     expect(countEvents(h, 'silas.rebrief-abandoned')).toBe(1);
     expect(() => h.ledger.beginDirectiveIntent({ jobId: 'job-markers', directive: 'x', holder: 'silas-ops' })).toThrow(/owner's abandonment/u);
     expect(h.ledger.setJobStatus('job-markers', 'binned').status).toBe('binned');
+  });
+
+  it('refuses marker abandonment while a live directive owns the lane, naming it (the legacy dead end)', async () => {
+    const repo = makeFixtureRepo('rebrief-directive-dead-end');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    seedJob(h, 'job-dead-end');
+    await seedLane(h, repo, 'job-dead-end');
+    // Legacy history only: the single-writer rule refuses to create this now,
+    // so the marker is written directly. Each control must see the other as
+    // live — neither exit may silently close the other's custody.
+    h.ledger.beginDirectiveIntent({ jobId: 'job-dead-end', directive: 'legacy live directive', holder: 'silas-ops', requestId: 'req-dead-end' });
+    h.db.handle.prepare(`INSERT INTO pending_rebriefs (id, job_id, kind, payload, payload_hash, baseline_seq, requested_at, updated_at)
+      VALUES (?, 'job-dead-end', ?, '{"note":"n","briefing":"b"}', 'dead-end-hash', 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`)
+      .run('legacy-marker', 'silas.rebrief');
+    const marker = h.ledger.listPendingRebriefs({ jobId: 'job-dead-end' })[0]!;
+    const abandonMarker = await call(h.port, 'POST', `/api/silas/rebriefs/${marker.id}/abandon`,
+      { expected_job_id: 'job-dead-end', expected_payload_hash: marker.payloadHash, reason: 'custody unknown', by: 'owner', confirm_intent: true }, TOKEN);
+    expect(abandonMarker.status).toBe(409);
+    expect(field<string[]>(abandonMarker.json, 'blockers')).toContain('other live directive request(s): req-dead-end (dispatching)');
+    // …and the directive side refuses too, so nothing was half-closed.
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-dead-end' })).toHaveLength(1);
+    expect(h.ledger.getDirective('req-dead-end')).not.toBeNull();
   });
 });
 

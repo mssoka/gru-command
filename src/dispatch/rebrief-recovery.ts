@@ -1,4 +1,4 @@
-import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import { LIVE_DIRECTIVE_STATES, isProducerCustodyUncertainty } from '../ledger/directives.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { PendingRebriefNoLongerCurrent } from '../ledger/api.js';
@@ -596,6 +596,13 @@ function escalateRecoveryFailure(
   const marker = group.find((marker) => marker.kind === 'silas.rebrief') ?? group[0];
   const job = deps.ledger.getJob(jobId);
   const debt = marker === undefined || job === null || isJobTerminal(job.status) ? null : deps.ledger.openRebriefRecoveryDebt(marker.id, String(error));
+  // Unknown producer custody changes the exit: every /recover successor and
+  // reconcile path refuses it, so the card names the owner's abandonment
+  // exit instead of teaching a route that cannot succeed. A live producer
+  // blocker is not that case — it keeps the ordinary recovery route.
+  const lane = deps.worktrees.listWorktrees({ jobId }).find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+  const unprovenCustody = marker === undefined ? []
+    : deps.ledger.rebriefProgressBlockers(marker.id, lane?.id ?? '').filter(isProducerCustodyUncertainty);
   // Bind the row to the CURRENTLY recorded re-brief worker when one exists
   // (existing agentId semantics) so the escalation is classified as a
   // closed receipt once the lane goes terminal; the in-memory group is a
@@ -615,7 +622,12 @@ function escalateRecoveryFailure(
       severity: 'error',
       title: `Re-brief recovery failed: job ${jobId}`,
       detail:
-        `A re-brief request was mid-flight at service restart and boot recovery could not ` +
+        unprovenCustody.length > 0
+          ? `A re-brief request was mid-flight at service restart and boot recovery could not ` +
+            `safely complete the request: ${String(error)}. Pending markers (${kinds}) remain, and this marker's original producer custody is unproven (${unprovenCustody.join('; ')}) — ` +
+            `every /recover and reconcile path refuses it, and the original prompt is never replayed. Read GET /api/silas/rebriefs/${marker?.id ?? 'unknown'} for the authenticated evidence. This is an owner decision: ask the owner to abandon the unknown custody ` +
+            `(the owner-only exit — it closes only unknown custody and holds the lane for a fresh owner-accepted request) or to prove the original producer's cessation. `
+          : `A re-brief request was mid-flight at service restart and boot recovery could not ` +
         `safely complete the request: ${String(error)}. Pending markers (${kinds}) remain; the ` +
         `original prompt is never replayed. Concrete Gru decision: GET /api/silas/rebriefs/${marker?.id ?? 'unknown'}, then POST its /recover with expected_generation ${debt?.generation ?? 'unknown'}, expected_payload_hash ${marker?.payloadHash ?? 'unknown'}, expected_receipt_evidence_sha256 from that authenticated readback, fresh HEAD, epoch and approved revision/contract. This evidence hash only fences stale intent; lone delivery is partial history, not completion/no effects. If exact original completion lacks original delivery facts, choose legacy-only reconcile-completed with a distinct inspection_request_id: close old control without execution/fabrication and leave a concrete current-inspection obligation, then separately use its existing directive/verification APIs. Suspended/incoherent generations may only transfer exact unknown context to a real job-wide owner hold; successor remains forbidden. A generic hold/prose disposition does not answer this debt.`,
       dedupe: 'unacked',
