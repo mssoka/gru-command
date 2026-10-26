@@ -220,7 +220,13 @@ describe('dream distiller protocol (one Bob pass)', () => {
     // the parser refused the file.
     expect(prompt).toContain('return ONLY the lessons this pass adds or merges');
     expect(prompt).toContain('a lesson that needs no change is left out');
-    expect(prompt).toContain('Do not return the whole book; the host keeps every existing');
+    // Retention is scoped: the cap can trim or drop a lesson, and retiring a
+    // chapter deletes it unless its live lessons are carried.
+    expect(prompt).toContain('Do not return the whole book; in a chapter you keep, the host');
+    expect(prompt).toContain('retains every lesson you do not mention (the cap may still trim or drop');
+    expect(prompt).toContain('Retiring a chapter deletes it: carry its live');
+    // An unconditional "keeps every existing lesson" promise would be false.
+    expect(prompt).not.toContain('the host keeps every existing');
     // Provenance is this batch's, never the existing lesson's.
     expect(prompt).toContain('every lesson in the output cites at least one journal id');
     expect(prompt).toContain("from this batch — never an existing lesson's provenance");
