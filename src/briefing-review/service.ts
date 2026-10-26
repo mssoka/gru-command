@@ -13,13 +13,14 @@ import {
   armedByBriefingSha,
   BRIEFING_REVIEW_OBLIGATION_ACTION,
   armedChain,
-  armedGenerations,
   BRIEFING_REVIEW_ARMED,
   BRIEFING_REVIEW_PUSHBACK,
   BRIEFING_REVIEW_REFUSED,
   BRIEFING_REVIEW_VERDICT,
   caughtByRevision,
   decisiveVerdict,
+  everyLensReady,
+  latestArmed,
   latestLensVerdict,
   reviewPushbacks,
   reviewVerdicts,
@@ -210,7 +211,7 @@ export class BriefingReviewService {
   /** The ledger's newest armed record as this service reads it (fresh from
    * the durable events, never a cached copy). */
   private latest(reviewId: string): ArmedReview | null {
-    return armedGenerations(this.ledger, reviewId).at(-1) ?? null;
+    return latestArmed(this.ledger, reviewId);
   }
 
   private arm(input: {
@@ -500,9 +501,7 @@ export class BriefingReviewService {
     // One decisive verdict per (reviewId, generation): a later lens result is
     // recorded but never re-decides a review that already has one.
     const alreadyDecided = decisiveVerdict(verdicts, armed.generation) !== null;
-    const othersReady = armed.lenses
-      .filter((lens) => lens !== request.lens)
-      .every((lens) => latestLensVerdict(verdicts, lens)?.verdict === 'READY');
+    const othersReady = everyLensReady(verdicts, armed.lenses.filter((lens) => lens !== request.lens));
     const aggregate: BriefingReviewVerdict | null = alreadyDecided
       ? null
       : request.verdict === 'CHANGES-NEEDED'
@@ -684,9 +683,13 @@ export class BriefingReviewService {
   }): BriefingReviewProvenance | null {
     if (!this.options.config.enabled) {
       // The stop state is the whole gate off: nothing to verify, nothing to
-      // claim, nothing attached.
+      // claim, nothing attached. A caller that still sends its (now stale)
+      // provenance block is admitted and the block is ignored, never turned
+      // into a 503 that a rollback would inflict on every dispatch.
       if (input.requested !== undefined) {
-        throw disabled();
+        this.options.log?.('warn', 'ignoring briefing_review provenance while the briefing review is disabled', {
+          job: input.jobId,
+        });
       }
       return null;
     }

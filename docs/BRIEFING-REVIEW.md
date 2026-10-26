@@ -101,11 +101,11 @@ re-commission of a decided review still converges.
   `severity` (`blocking` | `advisory`), `evidence` and `why_it_blocks`
   (1–1000). At most 50 findings per result; unknown fields are a 400.
 - **`evidence` must be a verbatim span** of the reviewed briefing, 8–2000
-  characters after trimming end whitespace. The span is read from the exact
-  text stored on that lens job row between the review's markers
-  `<<<NEFARIO-BRIEFING <reviewId>>>` and `<<<END NEFARIO-BRIEFING <reviewId>>>>`,
-  so a quote from the helper or the standing orders cannot pass. A non-span is
-  400 naming the finding index.
+  characters after trimming end whitespace, for every finding (blocking and
+  advisory alike). The span is read from the exact text stored on that lens job
+  row between the review's markers `<<<NEFARIO-BRIEFING <reviewId>>>` and
+  `<<<END NEFARIO-BRIEFING <reviewId>>>>`, so a quote from the helper or the
+  standing orders cannot pass. A non-span is 400 naming the finding index.
 - `READY` with a blocking finding, or `CHANGES-NEEDED` without one, is a 400.
 - The job id must be that lens's deterministic job (409
   `briefing_review_job_mismatch`), the row must exist (409
@@ -154,6 +154,7 @@ block is supplied:
 | no armed review for that `reviewId` | 409 `briefing_review_unknown` |
 | `rounds` differs from the record | 409 `briefing_review_mismatch` |
 | a verdict the review does not hold | 409 `briefing_review_pending` (a false claim is never accepted, **in stage 1 too**) |
+| the review was pushed back and the block is still supplied | 400 `briefing_review_invalid_request`; dispatch with no block so the push-back is auto-attached |
 | matching READY | admitted, recorded |
 | matching CHANGES-NEEDED, stage 1 | admitted, recorded (advisory) |
 | matching CHANGES-NEEDED, stage 2 | 409 `briefing_review_not_ready` |
@@ -226,7 +227,7 @@ There are no per-lens chips.
 | `briefing_review_not_hosted` | 503 | the review is not wired on this service |
 | `briefing_review_disabled` | 503 | `[briefing_review] enabled = false` |
 | `briefing_review_workflow_unavailable` | 503 | the verified lens helper is missing or unreadable |
-| `briefing_review_invalid_request` | 400 | malformed commission/result/push-back, unknown field, out-of-bound value |
+| `briefing_review_invalid_request` | 400 | malformed commission/result/push-back, unknown field, out-of-bound value, or a block supplied on a pushed-back review |
 | `briefing_review_not_found` | 404 | unknown subpath |
 | `briefing_review_not_commissioned` | 409 | a result or push-back with no armed review |
 | `briefing_review_not_dispatched` | 409 | the result's lens job row (or its marked briefing) is missing |

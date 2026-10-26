@@ -1,7 +1,6 @@
 import type { EventRecord, LedgerApi } from '../ledger/api.js';
 import {
   BRIEFING_REVIEW_LENSES,
-  BRIEFING_REVIEW_TIERS,
   blockingFindings,
   isBriefingReviewLens,
   isBriefingReviewTier,
@@ -28,14 +27,6 @@ export const BRIEFING_REVIEW_VERDICT = 'briefing.review-verdict';
 export const BRIEFING_REVIEW_REFUSED = 'briefing.review-refused';
 export const BRIEFING_REVIEW_PUSHBACK = 'briefing.review-pushback';
 export const BRIEFING_REVIEW_DISPATCHED = 'briefing.review-dispatched';
-
-export const BRIEFING_REVIEW_EVENT_KINDS = [
-  BRIEFING_REVIEW_ARMED,
-  BRIEFING_REVIEW_VERDICT,
-  BRIEFING_REVIEW_REFUSED,
-  BRIEFING_REVIEW_PUSHBACK,
-  BRIEFING_REVIEW_DISPATCHED,
-] as const;
 
 /** The action recorded when an accepted lens result settles its own job's
  * report debt, so a commission never leaves one action-required row per lens. */
@@ -101,19 +92,6 @@ export interface PushbackEvent {
   readonly generation: number;
   readonly reason: string;
   readonly by: string;
-  readonly seq: number;
-  readonly ts: string;
-}
-
-export interface DispatchedEvent {
-  readonly jobId: string;
-  readonly reviewId: string;
-  readonly briefingSha256: string;
-  readonly round: number;
-  readonly generation: number;
-  readonly verdict: string;
-  readonly tier: BriefingReviewTier;
-  readonly pushbackReason: string | null;
   readonly seq: number;
   readonly ts: string;
 }
@@ -242,32 +220,6 @@ export function readPushback(event: EventRecord): PushbackEvent | null {
   return { reviewId, briefingSha256, generation, reason, by, seq: event.seq, ts: event.ts };
 }
 
-export function readDispatched(event: EventRecord): DispatchedEvent | null {
-  const p = payloadOf(event);
-  const jobId = text(p['job_id']);
-  const reviewId = text(p['review_id']);
-  const briefingSha256 = text(p['briefing_sha_256']);
-  const round = count(p['round']);
-  const generation = count(p['generation']);
-  const verdict = text(p['verdict']);
-  const tier = p['tier'];
-  const pushbackReason = p['pushback_reason'];
-  if (jobId === null || reviewId === null || briefingSha256 === null || round === null ||
-      generation === null || verdict === null || !isBriefingReviewTier(tier)) return null;
-  return {
-    jobId,
-    reviewId,
-    briefingSha256,
-    round,
-    generation,
-    verdict,
-    tier,
-    pushbackReason: typeof pushbackReason === 'string' ? pushbackReason : null,
-    seq: event.seq,
-    ts: event.ts,
-  };
-}
-
 /** The ledger surface the briefing review reads: existing APIs only. */
 export type BriefingReviewLedgerPort = Pick<LedgerApi, 'listEventsAfter' | 'latestEventByPayloadField'>;
 
@@ -342,7 +294,6 @@ export function everyLensReady(
 ): boolean {
   return lenses.every((lens) => latestLensVerdict(verdicts, lens)?.verdict === 'READY');
 }
-
 /** The blocking findings an accepted READY revision superseded: the sum
  * over the latest verdict of every lens of the immediately preceding
  * CHANGES-NEEDED round of the same chain. 0 when nothing was superseded. */
@@ -379,5 +330,3 @@ export function trailingChangesNeeded(ledger: BriefingReviewLedgerPort, chainKey
   return trailing;
 }
 
-/** The tier vocabulary the board and the config validation share. */
-export const KNOWN_TIERS = BRIEFING_REVIEW_TIERS;

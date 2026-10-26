@@ -356,21 +356,17 @@ export function assertFindingEvidence(input: {
   let blocking = 0;
   input.findings.forEach((finding, index) => {
     const evidence = finding.evidence.replace(/\s+$/u, '');
-    if (finding.severity === 'blocking') {
-      if (evidence.length < BRIEFING_REVIEW_EVIDENCE_MIN || evidence.length > BRIEFING_REVIEW_EVIDENCE_MAX) {
-        throw invalidRequest(
-          `findings[${String(index)}].evidence must be ${String(BRIEFING_REVIEW_EVIDENCE_MIN)}–${String(BRIEFING_REVIEW_EVIDENCE_MAX)} characters after trimming end whitespace`,
-        );
-      }
-      if (!trimmed.includes(evidence)) {
-        throw invalidRequest(
-          `findings[${String(index)}].evidence is not a verbatim span of the reviewed briefing between the review markers`,
-        );
-      }
-      blocking += 1;
-    } else if (evidence.length > BRIEFING_REVIEW_EVIDENCE_MAX) {
-      throw invalidRequest(`findings[${String(index)}].evidence must be at most ${String(BRIEFING_REVIEW_EVIDENCE_MAX)} characters`);
+    if (evidence.length < BRIEFING_REVIEW_EVIDENCE_MIN || evidence.length > BRIEFING_REVIEW_EVIDENCE_MAX) {
+      throw invalidRequest(
+        `findings[${String(index)}].evidence must be ${String(BRIEFING_REVIEW_EVIDENCE_MIN)}–${String(BRIEFING_REVIEW_EVIDENCE_MAX)} characters after trimming end whitespace`,
+      );
     }
+    if (!trimmed.includes(evidence)) {
+      throw invalidRequest(
+        `findings[${String(index)}].evidence is not a verbatim span of the reviewed briefing between the review markers`,
+      );
+    }
+    if (finding.severity === 'blocking') blocking += 1;
   });
   if (input.verdict === 'READY' && blocking > 0) {
     throw invalidRequest('a READY verdict may not carry a blocking finding');

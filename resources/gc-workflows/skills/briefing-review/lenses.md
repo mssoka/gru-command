@@ -27,7 +27,7 @@ findings; the briefing's owner decides what to do with them.
 - Every finding quotes the briefing. `evidence` is an exact span copied from
   between the markers, 8 to 2000 characters, one span per finding. A quote from
   this helper, the standing orders or the repository is not evidence and is
-  refused.
+  refused. This applies to advisory findings too, not only blocking ones.
 - `blocking` means a lane that started from this briefing would build the wrong
   thing, build it twice, or be unable to prove it finished. Everything else is
   `advisory`.
@@ -51,7 +51,7 @@ Submit the result exactly as the briefing's submission contract says, and end
 with a completion report naming the review, your lens and your verdict. Change
 nothing, commit nothing, push nothing, open no pull request, implement nothing.
 
-The five lens sections follow. Your briefing names yours; read only that one.
+Your briefing names your lens; only that lens's section is included below.
 
 ## Lens: stranger
 

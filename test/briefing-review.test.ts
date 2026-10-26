@@ -702,6 +702,20 @@ describe('Nefario briefing review — stop state and missing helper', () => {
       briefing: BRIEFING,
       requested: undefined,
     })).toBeNull();
+    // A stale provenance block is ignored, not turned into a 503: the stop
+    // state admits every dispatch (a rollback must not break dispatch).
+    expect(h.service.admitDispatch({
+      jobId: 'job-2',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: { rounds: 1, verdict: 'READY', briefingSha256: 'a'.repeat(64) },
+    })).toBeNull();
+    expect(h.log).toHaveBeenCalledWith(
+      'warn',
+      'ignoring briefing_review provenance while the briefing review is disabled',
+      { job: 'job-2' },
+    );
     expect(h.service.boardView()).toEqual({
       armed: 0,
       round: null,

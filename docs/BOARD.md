@@ -117,7 +117,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   the round's aggregate verdict only, never per-lens chips; a server that
   could not read the events sends `null` and the card renders dashed
   `unavailable`, while an older server sends no block and no card renders.
-  Seven cards still fill one row on the wide board (`data-count='7'`). Every count is a `data-kpi` span tied to the same derivations
+  Seven cards still fill one row on the wide board (`data-count='7'`). Every
+  count is a `data-kpi` span tied to the same derivations
   the v4 strip used; a headline number stands alone and grows freely, fact
   counts reserve a two-digit slot (`tabular-nums` + a floor), so crossing
   9→10 never reflows a label. At ≥1100px it is three panes — chat (~30%, collapsible,
