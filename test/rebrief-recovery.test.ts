@@ -1920,7 +1920,10 @@ describe('terminal re-brief retirement', () => {
     expect(cards).toHaveLength(1);
     expect(cards[0]).toMatchObject({ agentId: null, routing: 'action-required', title: `Re-brief markers still pending on merged job ${jobId}` });
     expect(cards[0]!.detail).toContain('a merge is not custody evidence');
-    expect(cards[0]!.detail).toContain('never call /abandon yourself');
+    // The card names the owner exit but never spells the owner's own request
+    // body (the shared bearer makes that body the only barrier).
+    expect(cards[0]!.detail).toContain('Never call /abandon yourself');
+    expect(cards[0]!.detail).not.toContain('confirm_intent');
     const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
     h.ledger.abandonPendingRebrief({ markerId: marker.id, expectedJobId: jobId, expectedPayloadHash: marker.payloadHash, lane: { unavailable: 'none' },
       routeBlockers: [], reason: 'marker custody unknown', by: 'owner' });

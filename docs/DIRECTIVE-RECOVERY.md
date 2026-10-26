@@ -350,6 +350,14 @@ A pending re-brief marker generation of unknown custody has the same exit:
 It deletes the generation's markers with one `silas.rebrief-abandoned`
 audit, under the same refusals, hold and closures.
 
+A merge is an observed fact, never custody evidence: a merged job's pending
+re-brief markers whose original producer custody is unproven are **not**
+retired on boot or on a status change. They stay visible, unretired, behind
+one active action-required card per job that names the owner's abandonment
+exit; the card never spells the owner's own request body. Only bound, proven
+custody lets a terminal job retire its markers administratively (`exact
+terminal legacy control administratively retired, not completed`).
+
 One state has no exit: a job carrying both a live directive and pending
 re-brief markers (legacy history only; the single-writer rule refuses it
 now). Each abandonment sees the other control as live and refuses: it is

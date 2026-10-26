@@ -580,8 +580,8 @@ function surfaceUnprovenMergedRebriefs(deps: ReconcileRebriefDeps, jobId: string
     title: `Re-brief markers still pending on merged job ${jobId}`,
     detail: `Pending re-brief markers ${group.map((row) => `${row.id} (${row.kind})`).join(', ')} remain on merged job ${jobId} with no proof that their ` +
       `original producer ceased (${unproven.join('; ')}); a merge is not custody evidence, so they are not retired. Inspect GET /api/silas/rebriefs/${marker.id}. ` +
-      `If their producer custody is unknown, ask the owner whether to abandon them (POST /api/silas/rebriefs/${marker.id}/abandon with by "owner" and confirm_intent true); ` +
-      'never call /abandon yourself.',
+      `If their producer custody is unknown this is an owner decision: ask the owner whether to abandon them — the owner-only exit, which holds the lane for a fresh owner-accepted request. ` +
+      'Never call /abandon yourself, and never reconstruct the owner\'s request body from this card.',
     dedupe: 'active' });
   return true;
 }

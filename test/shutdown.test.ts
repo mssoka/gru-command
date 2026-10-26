@@ -224,7 +224,7 @@ describe('graceful shutdown', () => {
     expect(stderr).toContain(configPathFor(home));
   });
 
-  it('boot reconciliation summary pins the actual counter mapping (examined markers, retired jobs)', async () => {
+  it('boot reconciliation summary pins the actual counter mapping (examined markers; merged unknown custody is never retired)', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-command-rebrief-summary-'));
     cleanupDirs.push(home);
     writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
@@ -261,21 +261,30 @@ describe('graceful shutdown', () => {
       expect(summary?.['examined']).toBe(4);
       expect(summary?.['completed']).toBe(0);
       expect(summary?.['redispatched']).toBe(0);
-      expect(summary?.['retired']).toBe(2);
+      // A merge is an observed fact, never custody evidence (#493): these
+      // markers have no bound producer, so their custody is UNKNOWN and the
+      // boot pass surfaces them as owner decisions instead of retiring them.
+      expect(summary?.['retired']).toBe(0);
 
       const exitCode = await new Promise<number | null>((resolveExit) => {
         child.on('exit', (code) => resolveExit(code));
         child.kill('SIGTERM');
       });
       expect(exitCode).toBe(0);
-      // The boot pass itself did the retirement: markers gone, one audit
-      // per job carrying that job's terminal status.
+      // The boot pass left the unknown-custody markers alone and named the
+      // owner's only exit: each job keeps its pair and carries one active
+      // action-required card. Nothing was retired and nothing was invented.
       const verifyDb = new LedgerDb(home);
       const verify = new LedgerApi(verifyDb.handle);
       for (const jobId of ['merged-pr-one', 'merged-pr-two']) {
-        expect(verify.listPendingRebriefs({ jobId })).toHaveLength(0);
-        const audit = verify.latestJobEvent(jobId, 'silas.rebrief-retired');
-        expect((audit?.payload as { job_status?: string }).job_status).toBe('merged');
+        expect(verify.listPendingRebriefs({ jobId }).length).toBeGreaterThan(0);
+        expect(verify.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+        const card = verify.findNotificationByKindAndRouting(`silas.rebrief-unreconciled.${jobId}`, 'action-required', 'active');
+        expect(card, jobId).not.toBeNull();
+        // The card names the owner's exit without teaching the owner's own
+        // request body: the shared bearer makes that body the barrier.
+        expect(card?.detail ?? '').toContain('ask the owner whether to abandon them');
+        expect(card?.detail ?? '').not.toContain('confirm_intent');
       }
       verifyDb.close();
     } finally {
