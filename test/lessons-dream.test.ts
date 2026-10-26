@@ -232,6 +232,14 @@ describe('dream distiller protocol (one Bob pass)', () => {
     expect(prompt).toContain("from this batch — never an existing lesson's provenance");
     // The retired permissive sentence let an unchanged lesson ride along.
     expect(prompt).not.toContain('Every new lesson cites at least one journal id');
+    // A carry out of a retired chapter is rebuilt under this batch's
+    // provenance. Without this, Bob echoes the lesson's old journal ids
+    // and the batch guard refuses the whole file — or invents a citation.
+    expect(prompt).toContain('carry its live lessons into other chapters and set "retire": true — a');
+    expect(prompt).toContain("carried lesson is rebuilt under this batch's provenance: cite the id");
+    expect(prompt).toContain('its old ids cannot travel');
+    expect(prompt).toContain('do not invent a citation — let it go');
+    expect(prompt).toContain('the owner reviews what retirement removes');
   });
 
   it('parses a valid update and rejects invented provenance / malformed shapes', () => {
