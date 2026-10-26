@@ -1,0 +1,1008 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
+import { loadConfig } from '../src/config.js';
+import { createDispatchServer } from '../src/dispatch/server.js';
+import type { WaveRunner } from '../src/dispatch/perkins.js';
+import { EventBus } from '../src/events/bus.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { DispatchService } from '../src/dispatch/service.js';
+import type { Role } from '../src/config.js';
+import { WorktreeManager } from '../src/worktrees/manager.js';
+import { readCreationIntent, writeCreationIntent } from '../src/worktrees/creation-intent.js';
+import { repositoryCommonDirectory } from '../src/worktrees/handoff.js';
+import {
+  assertSafeRequirementsPatch,
+  originIdentitySha256,
+  parsePreBootstrapDependencyPatchPackage,
+  parsePreBootstrapPatchReference,
+  preBootstrapPackageContentSha256,
+  preBootstrapRequestPayloadSha256,
+  PREBOOTSTRAP_PATCH_AUTHORIZATION,
+  readPreBootstrapDependencyPatchPackage,
+} from '../src/worktrees/prebootstrap-patch.js';
+import type { LoadedPreBootstrapPatch, PreBootstrapDependencyPatchPackage } from '../src/worktrees/prebootstrap-patch.js';
+import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import { PacingGate } from '../src/runtime/pacing.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+
+const CAPABILITIES: AgentCapabilities = {
+  streaming: true, steer: 'native', resume: 'file', images: false, thinking: false,
+  thinkingLevelControl: false, followUp: false,
+};
+const AUTHORIZED_BRIEFING = `Repair the pinned dependency.\n${PREBOOTSTRAP_PATCH_AUTHORIZATION}\n`;
+const OLD_REQUIREMENTS = 'fixture-dep==1.0.0\nshared-lib==4.2.0\n';
+const NEW_REQUIREMENTS = 'fixture-dep==2.0.0\nshared-lib==4.2.0\n';
+
+interface PatchFixture {
+  readonly repo: FixtureRepo;
+  readonly origin: string;
+  readonly root: string;
+  readonly packageRoot: string;
+  readonly ledger: LedgerApi;
+  readonly db: LedgerDb;
+  readonly manager: WorktreeManager;
+  readonly service: DispatchService;
+  readonly sourceHead: string;
+  readonly sourceRequirements: string;
+  readonly spawns: { readonly role: string; readonly cwd: string | undefined }[];
+  /** Runs inside the spawner before the handle exists; a throw fails the spawn. */
+  beforeSpawn: (() => void) | null;
+  readonly disposed: string[];
+  readonly makePackage: (input?: { readonly jobId?: string; readonly briefing?: string; readonly content?: string; readonly mutate?: (pkg: Record<string, unknown>) => void }) => { readonly reference: { readonly packageFile: string; readonly packageSha256: string }; readonly loaded: LoadedPreBootstrapPatch; readonly path: string; readonly package: PreBootstrapDependencyPatchPackage };
+  readonly lanePath: (jobId: string) => string;
+  readonly restart: () => void;
+  readonly close: () => void;
+}
+
+const sha = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
+
+interface FixtureOptions {
+  readonly workerGate?: PacingGate;
+  readonly stopSignal?: AbortSignal;
+  /** A second configured setup command, after the first. */
+  readonly secondSetupCommand?: string;
+}
+
+function fixture(setupCommand?: string, options: FixtureOptions = {}): PatchFixture {
+  const repo = makeFixtureRepo('fixture-prebootstrap');
+  repo.commitFile('requirements.txt', OLD_REQUIREMENTS);
+  const commandProgram = `const fs=require('node:fs'); const text=fs.readFileSync('requirements.txt','utf8'); if(!text.includes('fixture-dep==2.0.0')) process.exit(9); fs.writeFileSync('setup-succeeded','same-configured-setup\\n');`;
+  const second = options.secondSetupCommand === undefined ? '' : `[[setup]]\ncommand = ${JSON.stringify(options.secondSetupCommand)}\n`;
+  repo.commitFile('.gru-command/worktree.toml', `[[setup]]\ncommand = ${JSON.stringify(setupCommand ?? `node -e ${JSON.stringify(commandProgram)}`)}\n${second}`);
+  const origin = attachBareOrigin(repo);
+  repo.git(['push', '--quiet', 'origin', 'main']);
+  const sourceHead = repo.head();
+  const sourceRequirements = readFileSync(join(repo.path, 'requirements.txt'), 'utf8');
+  const root = join(dirname(repo.path), 'gc-private');
+  const packageRoot = join(root, 'prebootstrap-patches');
+  mkdirSync(packageRoot, { recursive: true, mode: 0o700 });
+  let db = new LedgerDb(join(root, 'ledger'));
+  let ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+  const worktreeRoot = join(root, 'worktrees');
+  const preserveRoot = join(root, 'preserve');
+  mkdirSync(worktreeRoot, { recursive: true });
+  mkdirSync(preserveRoot, { recursive: true });
+  const makeManager = (): WorktreeManager => new WorktreeManager({ ledger, root: worktreeRoot, preserveRoot, setupTimeoutMs: 10_000,
+    preBootstrapPatchRoot: packageRoot, enumerateProcesses: () => [], });
+  let manager = makeManager();
+  const spawns: { role: string; cwd: string | undefined }[] = [];
+  const disposed: string[] = [];
+  const hooks: { beforeSpawn: (() => void) | null } = { beforeSpawn: null };
+  const spawner = async (role: Role, spawnOptions?: SpawnOptions): Promise<AgentHandle> => {
+    hooks.beforeSpawn?.();
+    spawns.push({ role, cwd: spawnOptions?.cwd });
+    const id = `fake-${String(spawns.length)}`;
+    const handle: AgentHandle = {
+      role,
+      id,
+      sessionFile: null,
+      capabilities: CAPABILITIES,
+      async prompt() {},
+      async steer() {},
+      async followUp() {},
+      subscribe() { return () => {}; },
+      health() { return { state: 'idle', lastActivity: new Date().toISOString(), sessionFile: null }; },
+      async dispose() { disposed.push(id); },
+    };
+    return handle;
+  };
+  const makeService = (): DispatchService => new DispatchService({ ledger, worktrees: manager, spawner, preBootstrapPatchRoot: packageRoot,
+    ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+    ...(options.stopSignal !== undefined ? { stopSignal: options.stopSignal } : {}) });
+  let service = makeService();
+  const makePackage = (input: { readonly jobId?: string; readonly briefing?: string; readonly content?: string; readonly mutate?: (pkg: Record<string, unknown>) => void } = {}) => {
+    const jobId = input.jobId ?? 'job-prebootstrap';
+    const briefing = input.briefing ?? AUTHORIZED_BRIEFING;
+    const content = input.content ?? NEW_REQUIREMENTS;
+    const packageFile = `${jobId}.json`;
+    const baseCommit = repo.head();
+    const baseTree = repo.git(['rev-parse', `${baseCommit}^{tree}`]);
+    const originUrl = repo.git(['remote', 'get-url', 'origin']);
+    const identity = {
+      jobId,
+      repoPath: repo.path,
+      title: 'Synthetic dependency repair',
+      displayName: null,
+      deliverable: 'pr',
+      briefing,
+      completionHandoff: null,
+      packageFile,
+    } as const;
+    const pkg: Record<string, unknown> = {
+      version: 1,
+      repository: { path: realpathSync(repo.path), origin_sha256: originIdentitySha256(originUrl) },
+      base: { commit: baseCommit, tree: baseTree },
+      authority: {
+        contract_sha256: sha(briefing),
+        work_revision: 0,
+        authority_epoch: 0,
+        request_sha256: preBootstrapRequestPayloadSha256(identity),
+      },
+      allowlist: ['requirements.txt'],
+      files: [{ path: 'requirements.txt', before_sha256: sha(readFileSync(join(repo.path, 'requirements.txt'))), after_sha256: preBootstrapPackageContentSha256(content), content }],
+    };
+    input.mutate?.(pkg);
+    const bytes = Buffer.from(JSON.stringify(pkg), 'utf8');
+    const path = join(packageRoot, packageFile);
+    writeFileSync(path, bytes, { mode: 0o600 });
+    const reference = { packageFile, packageSha256: sha(bytes) };
+    const loaded = readPreBootstrapDependencyPatchPackage(packageRoot, reference);
+    return { reference, loaded, path, package: loaded.package };
+  };
+  return {
+    repo, origin, root, packageRoot, get ledger() { return ledger; }, get db() { return db; }, get manager() { return manager; }, get service() { return service; },
+    sourceHead, sourceRequirements, spawns, disposed, makePackage,
+    lanePath: (jobId) => join(worktreeRoot, basename(realpathSync(repo.path)), `job-${jobId}`),
+    get beforeSpawn() { return hooks.beforeSpawn; },
+    set beforeSpawn(hook) { hooks.beforeSpawn = hook; },
+    restart() {
+      db.close();
+      db = new LedgerDb(join(root, 'ledger'));
+      ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      manager = makeManager();
+      service = makeService();
+    },
+    close() { db.close(); repo.cleanup(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+const active: PatchFixture[] = [];
+afterEach(() => { vi.restoreAllMocks(); while (active.length > 0) active.pop()!.close(); });
+function makeFixture(setupCommand?: string, options?: FixtureOptions): PatchFixture { const value = fixture(setupCommand, options); active.push(value); return value; }
+
+async function dispatch(f: PatchFixture, jobId = 'job-prebootstrap', reference?: { packageFile: string; packageSha256: string }, briefing = AUTHORIZED_BRIEFING) {
+  return f.service.dispatch({ jobId, repoPath: f.repo.path, title: 'Synthetic dependency repair', briefing,
+    ...(reference === undefined ? {} : { preBootstrapPatch: reference }) });
+}
+
+/** Runs `action` once, right after the first `kind` receipt is recorded. */
+function afterReceipt(f: PatchFixture, kind: string, action: () => void): void {
+  const original = f.ledger.appendCustomEvent.bind(f.ledger);
+  let fired = false;
+  vi.spyOn(f.ledger, 'appendCustomEvent').mockImplementation((input) => {
+    const event = original(input);
+    if (!fired && input.kind === kind) {
+      fired = true;
+      action();
+    }
+    return event;
+  });
+}
+
+function amendContract(f: PatchFixture, jobId: string): void {
+  const result = f.ledger.addJobAmendment({ jobId, body: 'material scope change', effect: 'material', supersedes: [],
+    approval: { by: 'owner', reference: 'prebootstrap-test' }, expectedContractSha256: f.ledger.directiveCurrentAuthority(jobId).contractSha256 });
+  expect(result.status).toBe('accepted');
+}
+
+const creationReceipt = (f: PatchFixture, jobId: string) => readCreationIntent(repositoryCommonDirectory(f.repo.path), `gru/${jobId}`);
+
+/** A refused patched lane is kept on disk, registered, with its receipt. */
+function expectRetainedLane(f: PatchFixture, jobId: string): void {
+  const lane = f.ledger.getWorktree(jobId);
+  expect(lane?.status).toBe('active');
+  expect(readFileSync(join(lane!.path, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+  expect(creationReceipt(f, jobId)).toMatchObject({ branch: `gru/${jobId}`, lane: { id: jobId, path: lane!.path } });
+  expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+}
+
+/** Records each `kind` receipt with `edit` applied to its payload. */
+function editReceipts(f: PatchFixture, kind: string, edit: (payload: Record<string, unknown>) => Record<string, unknown>): void {
+  const original = f.ledger.appendCustomEvent.bind(f.ledger);
+  vi.spyOn(f.ledger, 'appendCustomEvent').mockImplementation((input) =>
+    original(input.kind === kind ? { ...input, payload: edit(input.payload as Record<string, unknown>) } : input));
+}
+
+/** The admission receipt dispatch records for `loaded` (service.ts). */
+function admissionPayload(f: PatchFixture, loaded: LoadedPreBootstrapPatch): Record<string, unknown> {
+  const pkg = loaded.package;
+  return { version: 1, package_file: loaded.reference.packageFile, package_sha256: loaded.packageBytesSha256,
+    request_payload_sha256: loaded.requestPayloadSha256, intake_identity_sha256: loaded.intakeIdentitySha256,
+    repository_path: pkg.repository.path, origin_sha256: pkg.repository.originSha256,
+    expected_base_sha: pkg.base.commit, expected_base_tree: pkg.base.tree, contract_sha256: pkg.authority.contractSha256,
+    work_revision: pkg.authority.workRevision, authority_epoch: pkg.authority.authorityEpoch, allowlist: [...pkg.allowlist], request_path: f.repo.path };
+}
+
+/** A working job row, as dispatch leaves it before the manager runs. */
+function addWorkingJob(f: PatchFixture, jobId: string): void {
+  f.ledger.addJob({ id: jobId, repo: basename(f.repo.path), title: 'Synthetic dependency repair', briefing: AUTHORIZED_BRIEFING });
+  f.ledger.setJobStatus(jobId, 'working');
+}
+
+const READBACK_TOKEN = 'prebootstrap-readback-token';
+async function readback(f: PatchFixture, jobId: string): Promise<Record<string, unknown>> {
+  const home = mkdtempSync(join(tmpdir(), 'prebootstrap-readback-'));
+  writeFileSync(join(home, 'config.toml'), `[auth]\ntoken = "${READBACK_TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`);
+  const server = createDispatchServer({ config: loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), dispatch: f.service,
+    wave: {} as WaveRunner, ledger: f.ledger, pendingProducerBlockers: () => [] });
+  const http = createServer((req, res) => {
+    if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolveListen) => http.listen(0, '127.0.0.1', resolveListen));
+  try {
+    const { port } = http.address() as AddressInfo;
+    const response = await fetch(`http://127.0.0.1:${String(port)}/api/dispatch/jobs/${encodeURIComponent(jobId)}/prebootstrap-patch`,
+      { headers: { authorization: `Bearer ${READBACK_TOKEN}` } });
+    expect(response.status).toBe(200);
+    return await response.json() as Record<string, unknown>;
+  } finally {
+    await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+describe('pre-bootstrap dependency patch package fences', () => {
+  it('reads only hash-matched bounded package files beneath the private package root', () => {
+    const f = makeFixture();
+    const made = f.makePackage();
+    expect(parsePreBootstrapPatchReference({ package_file: made.reference.packageFile, package_sha256: made.reference.packageSha256 })).toEqual(made.reference);
+    expect(readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference).package).toEqual(made.package);
+    expect(() => parsePreBootstrapPatchReference({ package_file: '../escape.json', package_sha256: made.reference.packageSha256 })).toThrow(/basename/u);
+    expect(() => parsePreBootstrapDependencyPatchPackage(Buffer.from('{}'), '0'.repeat(64))).toThrow(/SHA-256/u);
+    expect(() => parsePreBootstrapDependencyPatchPackage(Buffer.alloc(1024 * 1024 + 1), '0'.repeat(64))).toThrow(/exceeds/u);
+    const link = join(f.packageRoot, 'linked.json');
+    symlinkSync(made.path, link);
+    expect(() => readPreBootstrapDependencyPatchPackage(f.packageRoot, { packageFile: 'linked.json', packageSha256: made.reference.packageSha256 })).toThrow(/regular file|symlink/u);
+    const rootLink = join(f.root, 'package-root-link');
+    symlinkSync(f.packageRoot, rootLink);
+    expect(() => readPreBootstrapDependencyPatchPackage(rootLink, made.reference)).toThrow(/root is unavailable/u);
+    chmodSync(made.path, 0o644);
+    expect(() => readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference)).toThrow(/owner-only/u);
+    chmodSync(made.path, 0o600);
+    chmodSync(f.packageRoot, 0o755);
+    expect(() => readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference))
+      .toThrow(expect.objectContaining({ code: 'package_unavailable', message: expect.stringContaining('root is unavailable or is not owner-only') }));
+    chmodSync(f.packageRoot, 0o700);
+    expect(readPreBootstrapDependencyPatchPackage(f.packageRoot, made.reference).package).toEqual(made.package);
+  });
+
+  it('refuses malformed schema, unknown files, unsupported revision, and non-dependency syntax', () => {
+    const f = makeFixture();
+    const made = f.makePackage();
+    expect(() => parsePreBootstrapDependencyPatchPackage(Buffer.from('{"version":1}'), sha('{"version":1}'))).toThrow(/exactly/u);
+    const duplicate = Buffer.from('{"version":1,"version":1}');
+    expect(() => parsePreBootstrapDependencyPatchPackage(duplicate, sha(duplicate))).toThrow(/duplicate JSON key/u);
+    const unsupported = JSON.parse(readFileSync(made.path, 'utf8')) as Record<string, unknown>;
+    (unsupported['authority'] as Record<string, unknown>)['work_revision'] = 1;
+    const bytes = Buffer.from(JSON.stringify(unsupported));
+    expect(() => parsePreBootstrapDependencyPatchPackage(bytes, sha(bytes))).toThrow(/revision 0/u);
+    const otherFile = JSON.parse(readFileSync(made.path, 'utf8')) as Record<string, unknown>;
+    ((otherFile['files'] as Record<string, unknown>[])[0]!)['path'] = '.gru-command/worktree.toml';
+    const otherFileBytes = Buffer.from(JSON.stringify(otherFile));
+    expect(() => parsePreBootstrapDependencyPatchPackage(otherFileBytes, sha(otherFileBytes))).toThrow(/exactly requirements.txt/u);
+    const wider = JSON.parse(readFileSync(made.path, 'utf8')) as Record<string, unknown>;
+    wider['allowlist'] = ['requirements.txt', 'setup.py'];
+    const widerBytes = Buffer.from(JSON.stringify(wider));
+    expect(() => parsePreBootstrapDependencyPatchPackage(widerBytes, sha(widerBytes))).toThrow(/allowlist must be exactly \["requirements.txt"\]/u);
+    const unbound = JSON.parse(readFileSync(made.path, 'utf8')) as Record<string, unknown>;
+    ((unbound['files'] as Record<string, unknown>[])[0]!)['after_sha256'] = sha('some other content');
+    const unboundBytes = Buffer.from(JSON.stringify(unbound));
+    expect(() => parsePreBootstrapDependencyPatchPackage(unboundBytes, sha(unboundBytes)))
+      .toThrow(expect.objectContaining({ code: 'package_hash_mismatch', message: expect.stringContaining('does not match its after_sha256') }));
+    expect(() => assertSafeRequirementsPatch(OLD_REQUIREMENTS, 'fixture-dep==2.0.0\n--index-url https://example.invalid\n')).toThrow(/pinned distribution/u);
+    expect(() => assertSafeRequirementsPatch(OLD_REQUIREMENTS, '# changed comment\nfixture-dep==2.0.0\nshared-lib==4.2.0\n')).toThrow(/comments and blank lines/u);
+  });
+
+  it('refuses a too-deeply nested package by name instead of overflowing the stack', () => {
+    const deep = Buffer.from(`{"version":${'['.repeat(100_000)}${']'.repeat(100_000)}}`);
+    let refusal: unknown = null;
+    try { parsePreBootstrapDependencyPatchPackage(deep, sha(deep)); } catch (error) { refusal = error; }
+    expect(refusal).toMatchObject({ name: 'PreBootstrapPatchError', code: 'package_invalid', message: expect.stringContaining('nests deeper than 16 levels') });
+  });
+
+  it('lets a patch change pinned versions only, refusing by name', () => {
+    const before = '# core\nfoo==1.0\n\n# extra\nbar==2.0\n';
+    expect(() => assertSafeRequirementsPatch(before, '# core\nfoo==1.1\n\n# extra\nbar==2.0\n')).not.toThrow();
+    const refusal = (after: string): unknown => {
+      try { assertSafeRequirementsPatch(before, after); } catch (error) { return error; }
+      return null;
+    };
+    expect(refusal('# core\n\n# extra\nfoo==1.1\nbar==2.0\nevil-pkg==0.0.1\n'))
+      .toMatchObject({ name: 'PreBootstrapPatchError', code: 'content_invalid', message: expect.stringContaining('adds distribution evil-pkg') });
+    expect(refusal('# core\nfoo==1.1\n\n# extra\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('removes the pin for bar') });
+    expect(refusal('# core\n\n# extra\nfoo==1.1\nbar==2.0\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('moves distribution foo') });
+    expect(refusal('# core\nbar==2.0\n\n# extra\nfoo==1.1\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('moves distribution foo') });
+    expect(refusal('# core\nfoo[cli]==1.1\n\n# extra\nbar==2.0\n'))
+      .toMatchObject({ code: 'content_invalid', message: expect.stringContaining('changes more than the version of foo') });
+  });
+
+  it('rejects an unapproved or mismatched contract before creating a job or lane', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ briefing: 'Missing the explicit authorization.' });
+    await expect(dispatch(f, 'job-no-authorization', made.reference, 'Missing the explicit authorization.')).rejects.toThrow(/work contract must contain exactly one/u);
+    expect(f.ledger.getJob('job-no-authorization')).toBeNull();
+    expect(f.ledger.getWorktree('job-no-authorization')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+    const valid = f.makePackage({ jobId: 'job-contract', briefing: AUTHORIZED_BRIEFING });
+    await expect(dispatch(f, 'job-contract', valid.reference, `${AUTHORIZED_BRIEFING}changed`)).rejects.toThrow(/different work contract/u);
+    expect(f.ledger.getJob('job-contract')).toBeNull();
+    expect(f.repo.head()).toBe(f.sourceHead);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('refuses report and nested lanes before creating a job or lane', async () => {
+    const f = makeFixture();
+    const report = f.makePackage({ jobId: 'job-report' });
+    await expect(f.service.dispatch({ jobId: 'job-report', repoPath: f.repo.path, title: 'report', briefing: AUTHORIZED_BRIEFING,
+      deliverable: 'artifact', preBootstrapPatch: report.reference })).rejects.toThrow(/only for an ordinary PR-owing implementation lane/u);
+    const nested = f.makePackage({ jobId: 'job-nested' });
+    await expect(f.service.dispatch({ jobId: 'job-nested', repoPath: f.repo.path, title: 'nested', briefing: AUTHORIZED_BRIEFING,
+      parentJobId: 'parent-job', preBootstrapPatch: nested.reference })).rejects.toThrow(/fresh top-level job lane/u);
+    expect(f.ledger.getJob('job-report')).toBeNull();
+    expect(f.ledger.getJob('job-nested')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('binds package admission to the exact normalized dispatch payload', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-request-mismatch' });
+    await expect(f.service.dispatch({ jobId: 'job-request-mismatch', repoPath: f.repo.path, title: 'Changed title',
+      briefing: AUTHORIZED_BRIEFING, preBootstrapPatch: made.reference })).rejects.toThrow(/different dispatch payload/u);
+    expect(f.ledger.getJob('job-request-mismatch')).toBeNull();
+    const handoff = f.makePackage({ jobId: 'job-handoff-mismatch' });
+    await expect(f.service.dispatch({ jobId: 'job-handoff-mismatch', repoPath: f.repo.path, title: 'Synthetic dependency repair',
+      briefing: AUTHORIZED_BRIEFING, completionHandoff: { kind: 'gru-decision', decision: 'unbound intent' },
+      preBootstrapPatch: handoff.reference })).rejects.toThrow(/different dispatch payload/u);
+    expect(f.ledger.getJob('job-handoff-mismatch')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('refuses missing/hash-invalid packages before a job or lane exists', async () => {
+    const f = makeFixture();
+    const missing = { packageFile: 'missing.json', packageSha256: 'a'.repeat(64) };
+    await expect(dispatch(f, 'job-missing-package', missing)).rejects.toThrow(/unavailable/u);
+    expect(f.ledger.getJob('job-missing-package')).toBeNull();
+    const made = f.makePackage({ jobId: 'job-wrong-package-hash' });
+    await expect(dispatch(f, 'job-wrong-package-hash', { packageFile: made.reference.packageFile, packageSha256: '0'.repeat(64) })).rejects.toThrow(/SHA-256/u);
+    expect(f.ledger.getJob('job-wrong-package-hash')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('rejects mismatched old dependency bytes before creating a branch', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-old-bytes-mismatch', mutate: (pkg) => {
+      ((pkg['files'] as Record<string, unknown>[])[0]!)['before_sha256'] = '0'.repeat(64);
+    } });
+    await expect(dispatch(f, 'job-old-bytes-mismatch', made.reference)).rejects.toThrow(/file_mismatch/u);
+    expect(f.ledger.getWorktree('job-old-bytes-mismatch')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-old-bytes-mismatch'])).toBe('');
+    expect(f.spawns).toHaveLength(0);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('rejects command/config content before creating a branch or writing source', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-unapproved-content', content: '-e /tmp/foreign\n' });
+    await expect(dispatch(f, 'job-unapproved-content', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-unapproved-content', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'content_invalid' });
+    expect(f.ledger.getWorktree('job-unapproved-content')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-unapproved-content'])).toBe('');
+    expect(f.spawns).toHaveLength(0);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    expect(await readback(f, 'job-unapproved-content')).toMatchObject({ state: 'worktree_admission_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+  });
+
+  it('refuses a pin moved past a whitespace line before creating a branch', async () => {
+    const f = makeFixture();
+    f.repo.commitFile('requirements.txt', '  \nfixture-dep==1.0.0\n');
+    f.repo.git(['push', '--quiet', 'origin', 'main']);
+    const made = f.makePackage({ jobId: 'job-whitespace-move', content: 'fixture-dep==2.0.0\n  \n' });
+    await expect(dispatch(f, 'job-whitespace-move', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-whitespace-move', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'content_invalid' });
+    expect(f.ledger.latestJobEvent('job-whitespace-move', 'worktree.prebootstrap-patch-started')).toBeNull();
+    expect(f.ledger.getWorktree('job-whitespace-move')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-whitespace-move'])).toBe('');
+    expect(creationReceipt(f, 'job-whitespace-move')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('serializes concurrent identical initial dispatches and admits at most one worker', async () => {
+    const f = makeFixture();
+    const made = f.makePackage();
+    const attempts = await Promise.allSettled([dispatch(f, 'job-prebootstrap', made.reference), dispatch(f, 'job-prebootstrap', made.reference)]);
+    const fulfilled = attempts.find((attempt): attempt is PromiseFulfilledResult<Awaited<ReturnType<typeof dispatch>>> => attempt.status === 'fulfilled');
+    expect(fulfilled).toBeDefined();
+    await fulfilled!.value.settled;
+    expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toHaveLength(1);
+    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toHaveLength(1);
+    expect(f.spawns).toHaveLength(1);
+    expect(f.ledger.listJobEvents('job-prebootstrap', { kinds: ['worktree.prebootstrap-patch-started'] })).toHaveLength(1);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('keeps ordinary no-patch dispatch behavior and emits no patch receipts', async () => {
+    const f = makeFixture('node -e "require(\'node:fs\').writeFileSync(\'ordinary-setup\', \'ok\\n\')"');
+    const outcome = await dispatch(f, 'job-no-patch');
+    await outcome.settled;
+    expect(f.spawns).toHaveLength(1);
+    expect(existsSync(join(f.spawns[0]!.cwd!, 'ordinary-setup'))).toBe(true);
+    expect(f.ledger.listJobEvents('job-no-patch', { kinds: ['job.prebootstrap-patch-admitted'] })).toHaveLength(0);
+    expect(f.repo.head()).toBe(f.sourceHead);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    const body = await readback(f, 'job-no-patch');
+    expect(body).toMatchObject({ state: 'no_admission_receipt', worker_admission: 'recorded' });
+    expect(String(body['recovery'])).toMatch(/^No prebootstrap admission receipt is present/u);
+  });
+
+  it('fails unchanged setup without a patch, then applies only the package in a new lane before that same setup and worker admission', async () => {
+    const f = makeFixture();
+    await expect(dispatch(f, 'job-unpatched')).rejects.toThrow(/exited 9/u);
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.getWorktree('job-unpatched')).toBeNull();
+    expect(f.repo.head()).toBe(f.sourceHead);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+
+    const sourceRefs = f.repo.git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/main', 'refs/remotes/origin/main']);
+    const made = f.makePackage({ jobId: 'job-patched' });
+    const outcome = await dispatch(f, 'job-patched', made.reference);
+    expect(f.spawns).toHaveLength(1);
+    expect(existsSync(join(f.spawns[0]!.cwd!, 'setup-succeeded'))).toBe(true);
+    expect(readFileSync(join(f.spawns[0]!.cwd!, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+    expect(readFileSync(join(f.spawns[0]!.cwd!, '.gru-command', 'worktree.toml'), 'utf8'))
+      .toBe(readFileSync(join(f.repo.path, '.gru-command', 'worktree.toml'), 'utf8'));
+    const setupSucceeded = f.ledger.latestJobEvent('job-patched', 'worktree.prebootstrap-setup-succeeded');
+    const minionSpawned = f.ledger.latestJobEvent('job-patched', 'job.minion-spawned');
+    expect(setupSucceeded).not.toBeNull();
+    expect(minionSpawned).not.toBeNull();
+    expect(setupSucceeded!.seq).toBeLessThan(minionSpawned!.seq);
+    expect(f.ledger.latestJobEvent('job-patched', 'worktree.prebootstrap-setup-started')).not.toBeNull();
+    expect(f.ledger.latestJobEvent('job-patched', 'worktree.prebootstrap-setup-spawned')).not.toBeNull();
+    expect(f.ledger.latestJobEvent('job-patched', 'worktree.prebootstrap-setup-process-settled')).not.toBeNull();
+    const patchEvent = f.ledger.latestJobEvent('job-patched', 'worktree.prebootstrap-patch-applied')?.payload as Record<string, unknown>;
+    expect(patchEvent).toMatchObject({ changed_paths: ['requirements.txt'] });
+    const alternateIndex = join(f.root, 'verification-index');
+    const indexEnv = { ...process.env, GIT_INDEX_FILE: alternateIndex };
+    execFileSync('git', ['read-tree', 'HEAD'], { cwd: outcome.worktree.path, env: indexEnv });
+    execFileSync('git', ['add', '--', 'requirements.txt'], { cwd: outcome.worktree.path, env: indexEnv });
+    const independentlyComputedTree = execFileSync('git', ['write-tree'], { cwd: outcome.worktree.path, env: indexEnv, encoding: 'utf8' }).trim();
+    expect(patchEvent['after_tree']).toBe(independentlyComputedTree);
+    expect(outcome.agentId).toBe('fake-1');
+    await outcome.settled;
+    expect(f.repo.head()).toBe(f.sourceHead);
+    expect(f.repo.git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/main', 'refs/remotes/origin/main'])).toBe(sourceRefs);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    expect(f.ledger.directiveCurrentAuthority('job-patched')).toMatchObject({ workRevision: 0, authorityEpoch: 0 });
+  });
+
+  it('refuses a worktree capability that returns without exact patch/setup receipts', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-no-setup-proof' });
+    vi.spyOn(f.manager, 'createJobWorktreeWithPreBootstrapPatch').mockResolvedValue({
+      id: 'job-no-setup-proof', kind: 'job', repoPath: f.repo.path, repoName: f.repo.path.split('/').filter(Boolean).at(-1) ?? 'fixture',
+      path: join(f.root, 'fake-lane'), branch: 'gru/job-no-setup-proof', sha: f.sourceHead, baseSource: 'origin',
+      jobId: 'job-no-setup-proof', roundId: null, status: 'active', note: null,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), laneToken: null,
+    });
+    await expect(dispatch(f, 'job-no-setup-proof', made.reference)).rejects.toThrow(/setup_receipt_mismatch/u);
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.getWorktree('job-no-setup-proof')).toBeNull();
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('refuses worker admission when contract authority changes after successful setup', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-authority-changed' });
+    const originalAppend = f.ledger.appendCustomEvent.bind(f.ledger);
+    const append = vi.spyOn(f.ledger, 'appendCustomEvent');
+    const originalAuthority = f.ledger.directiveCurrentAuthority.bind(f.ledger);
+    let authorityChanged = false;
+    append.mockImplementation((input) => {
+      const event = originalAppend(input);
+      if (input.kind === 'worktree.prebootstrap-setup-succeeded') authorityChanged = true;
+      return event;
+    });
+    vi.spyOn(f.ledger, 'directiveCurrentAuthority').mockImplementation((jobId) => {
+      const current = originalAuthority(jobId);
+      return authorityChanged ? { ...current, workRevision: current.workRevision + 1 } : current;
+    });
+    await expect(dispatch(f, 'job-authority-changed', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-authority-changed', 'worktree.prebootstrap-setup-succeeded')).not.toBeNull();
+    expect(f.ledger.latestJobEvent('job-authority-changed', 'job.prebootstrap-patch-dispatch-failed')).not.toBeNull();
+    const retained = f.ledger.getWorktree('job-authority-changed');
+    expect(retained?.status).toBe('active');
+    expect(retained !== null && existsSync(retained.path)).toBe(true);
+    expect(retained === null ? '' : readFileSync(join(retained.path, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+    expect(readCreationIntent(repositoryCommonDirectory(f.repo.path), 'gru/job-authority-changed')).not.toBeNull();
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    append.mockRestore();
+    expect(await readback(f, 'job-authority-changed')).toMatchObject({ state: 'setup_succeeded_dispatch_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+  });
+
+  it('retains a patched lane on setup failure and never spawns a worker', async () => {
+    const f = makeFixture('node -e "process.exit(7)"');
+    const made = f.makePackage({ jobId: 'job-setup-failure' });
+    await expect(dispatch(f, 'job-setup-failure', made.reference)).rejects.toThrow(/\(WorktreeSetupError; error_sha256=[0-9a-f]{64}\)/u);
+    expect(f.spawns).toHaveLength(0);
+    const lane = f.ledger.getWorktree('job-setup-failure');
+    expect(lane).not.toBeNull();
+    expect(readFileSync(join(lane!.path, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+    expect(f.ledger.latestJobEvent('job-setup-failure', 'worktree.prebootstrap-setup-failed')?.payload).toMatchObject({ error_class: 'WorktreeSetupError', stage: 'setup' });
+    expect(readCreationIntent(repositoryCommonDirectory(f.repo.path), 'gru/job-setup-failure')).not.toBeNull();
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+    const body = await readback(f, 'job-setup-failure');
+    expect(body).toMatchObject({ state: 'setup_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+    expect(body['setup_producers']).toMatchObject([{ setup_index: 0, producer_state: 'child_exit_result_recorded_group_state_unknown', outcome: { exit_code: 7, timed_out: false } }]);
+  });
+
+  it('consumes an interrupted patch request, preserves the lane, and refuses a same-job replay at the job row', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-interrupted' });
+    const append = vi.spyOn(f.ledger, 'appendCustomEvent');
+    let interrupted = false;
+    append.mockImplementation((input) => {
+      if (!interrupted && input.kind === 'worktree.prebootstrap-patch-applied') {
+        interrupted = true;
+        throw new Error('simulated receipt interruption');
+      }
+      return Object.getPrototypeOf(f.ledger).appendCustomEvent.call(f.ledger, input);
+    });
+    await expect(dispatch(f, 'job-interrupted', made.reference)).rejects.toThrow(/\(Error; error_sha256=[0-9a-f]{64}\)/u);
+    expect(f.ledger.latestJobEvent('job-interrupted', 'worktree.prebootstrap-patch-failed')?.payload).toMatchObject({ stage: 'patch', error_class: 'Error' });
+    expect(f.spawns).toHaveLength(0);
+    const lane = f.ledger.getWorktree('job-interrupted');
+    expect(lane).not.toBeNull();
+    expect(readFileSync(join(lane!.path, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+    expect(f.ledger.latestJobEvent('job-interrupted', 'worktree.prebootstrap-patch-started')).not.toBeNull();
+    expect(f.ledger.latestJobEvent('job-interrupted', 'worktree.prebootstrap-setup-started')).toBeNull();
+    expect(readCreationIntent(repositoryCommonDirectory(f.repo.path), 'gru/job-interrupted')).not.toBeNull();
+    append.mockRestore();
+    expect(await readback(f, 'job-interrupted')).toMatchObject({ state: 'patch_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+    f.restart();
+    expect(f.ledger.getWorktree('job-interrupted')?.path).toBe(lane!.path);
+    expect(f.ledger.latestJobEvent('job-interrupted', 'worktree.prebootstrap-patch-started')).not.toBeNull();
+    await expect(dispatch(f, 'job-interrupted', made.reference)).rejects.toThrow('job "job-interrupted" already exists');
+    expect(readFileSync(join(lane!.path, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('rejects a changed repository origin before creating a lane', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-origin-mismatch' });
+    f.repo.git(['remote', 'set-url', 'origin', join(dirname(f.repo.path), 'different-origin.git')]);
+    await expect(dispatch(f, 'job-origin-mismatch', made.reference)).rejects.toThrow(/source_mismatch/u);
+    expect(f.ledger.getWorktree('job-origin-mismatch')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-origin-mismatch'])).toBe('');
+    expect(f.spawns).toHaveLength(0);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+  });
+
+  it('rejects a symlinked source dependency file before creating the branch or applying content', async () => {
+    const f = makeFixture();
+    const target = join(f.repo.path, 'requirements-target.txt');
+    writeFileSync(target, OLD_REQUIREMENTS);
+    f.repo.git(['rm', '--quiet', 'requirements.txt']);
+    symlinkSync('requirements-target.txt', join(f.repo.path, 'requirements.txt'));
+    f.repo.git(['add', 'requirements.txt', 'requirements-target.txt']);
+    f.repo.git(['commit', '--quiet', '-m', 'synthetic symlink requirements']);
+    f.repo.git(['push', '--quiet', 'origin', 'main']);
+    const made = f.makePackage({ jobId: 'job-symlink-requirements' });
+    await expect(dispatch(f, 'job-symlink-requirements', made.reference)).rejects.toThrow(/file_mismatch/u);
+    expect(f.ledger.getWorktree('job-symlink-requirements')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-symlink-requirements'])).toBe('');
+    expect(readFileSync(target, 'utf8')).toBe(OLD_REQUIREMENTS);
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('rejects stale base and foreign branch receipts before applying content', async () => {
+    const f = makeFixture();
+    const stale = f.makePackage({ jobId: 'job-stale-base' });
+    f.repo.commitFile('src/new-head.ts', 'export const newer = true;\n');
+    f.repo.git(['push', '--quiet', 'origin', 'main']);
+    await expect(dispatch(f, 'job-stale-base', stale.reference)).rejects.toThrow(/\(base_mismatch; error_sha256=[0-9a-f]{64}\)/u);
+    expect(f.ledger.latestJobEvent('job-stale-base', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'base_mismatch' });
+    expect(f.ledger.getWorktree('job-stale-base')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+    expect(readFileSync(join(f.repo.path, 'requirements.txt'), 'utf8')).toBe(f.sourceRequirements);
+
+    const foreign = f.makePackage({ jobId: 'job-foreign-branch' });
+    f.repo.git(['branch', 'gru/job-foreign-branch', 'HEAD']);
+    await expect(dispatch(f, 'job-foreign-branch', foreign.reference)).rejects.toThrow(/foreign_ref/u);
+    expect(f.ledger.getWorktree('job-foreign-branch')).toBeNull();
+    expect(f.spawns).toHaveLength(0);
+  });
+});
+
+describe('pre-bootstrap worker admission custody', () => {
+  it('spends the creation receipt only once the worker is admitted', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-admitted' });
+    let receiptAtSpawn: unknown = 'unread';
+    f.beforeSpawn = () => { receiptAtSpawn = creationReceipt(f, 'job-admitted'); };
+    const outcome = await dispatch(f, 'job-admitted', made.reference);
+    await outcome.settled;
+    expect(receiptAtSpawn).toMatchObject({ branch: 'gru/job-admitted' });
+    expect(creationReceipt(f, 'job-admitted')).toBeNull();
+    const body = await readback(f, 'job-admitted');
+    expect(body).toMatchObject({ state: 'setup_succeeded', worker_admission: 'recorded', unmatched_receipt_count: 0 });
+    expect(body['setup_producers']).toMatchObject([{ setup_index: 0, producer_state: 'child_exit_result_recorded_group_state_unknown',
+      spawn: { process_group_id: expect.any(Number) }, outcome: { exit_code: 0, signal: null, timed_out: false, stopped: false } }]);
+    expect(String(body['recovery'])).toMatch(/^Configured setup success and ordinary worker admission are recorded/u);
+  });
+
+  it('keeps the lane and its receipt when authority changes while the lane queues for a worker slot', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const f = makeFixture(undefined, { workerGate: gate });
+    const made = f.makePackage({ jobId: 'job-queued' });
+    const pending = dispatch(f, 'job-queued', made.reference);
+    await vi.waitFor(() => expect(gate.workerTurnsFor('job-queued').queued).toBe(1), { timeout: 20_000, interval: 20 });
+    amendContract(f, 'job-queued');
+    holder.release();
+    await expect(pending).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-queued', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expectRetainedLane(f, 'job-queued');
+  });
+
+  it('keeps the lane and its receipt when the stop signal cancels the worker-slot wait', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const stop = new AbortController();
+    const f = makeFixture(undefined, { workerGate: gate, stopSignal: stop.signal });
+    const made = f.makePackage({ jobId: 'job-cancelled' });
+    const pending = dispatch(f, 'job-cancelled', made.reference);
+    await vi.waitFor(() => expect(gate.workerTurnsFor('job-cancelled').queued).toBe(1), { timeout: 20_000, interval: 20 });
+    stop.abort();
+    await expect(pending).rejects.toMatchObject({ code: 'dispatch_failed' });
+    holder.release();
+    expect(f.spawns).toHaveLength(0);
+    expectRetainedLane(f, 'job-cancelled');
+  });
+
+  it('refuses a contract change at setup success before taking a worker slot', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const acquire = vi.spyOn(gate, 'acquireWorkerTurn');
+    const f = makeFixture(undefined, { workerGate: gate });
+    const made = f.makePackage({ jobId: 'job-amended' });
+    afterReceipt(f, 'worktree.prebootstrap-setup-succeeded', () => amendContract(f, 'job-amended'));
+    await expect(dispatch(f, 'job-amended', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(acquire).not.toHaveBeenCalled();
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-amended', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expectRetainedLane(f, 'job-amended');
+  });
+
+  it('refuses an authority-epoch change that leaves the contract and revision alone', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-epoch' });
+    let before: ReturnType<LedgerApi['directiveCurrentAuthority']> | null = null;
+    afterReceipt(f, 'worktree.prebootstrap-setup-succeeded', () => {
+      before = f.ledger.directiveCurrentAuthority('job-epoch');
+      f.ledger.appendCustomEvent({ kind: 'silas.rebrief-control-closed', jobId: 'job-epoch', payload: { reason: 'synthetic control event' } });
+    });
+    await expect(dispatch(f, 'job-epoch', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    const after = f.ledger.directiveCurrentAuthority('job-epoch');
+    expect(after).toMatchObject({ contractSha256: before!.contractSha256, workRevision: before!.workRevision });
+    expect(after.authorityEpoch).toBeGreaterThan(before!.authorityEpoch);
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-epoch', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expectRetainedLane(f, 'job-epoch');
+  });
+
+  it('refuses a job that left working while its authority stayed the same', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-left-working' });
+    const authority: ReturnType<LedgerApi['directiveCurrentAuthority']>[] = [];
+    afterReceipt(f, 'worktree.prebootstrap-setup-succeeded', () => {
+      authority.push(f.ledger.directiveCurrentAuthority('job-left-working'));
+      f.ledger.setJobStatus('job-left-working', 'in-review');
+      authority.push(f.ledger.directiveCurrentAuthority('job-left-working'));
+    });
+    await expect(dispatch(f, 'job-left-working', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(authority).toHaveLength(2);
+    expect(authority[1]).toEqual(authority[0]);
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-left-working', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expectRetainedLane(f, 'job-left-working');
+  });
+
+  it('disposes a worker whose authority changed during its spawn and keeps the lane', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-spawn-amended' });
+    f.beforeSpawn = () => amendContract(f, 'job-spawn-amended');
+    await expect(dispatch(f, 'job-spawn-amended', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.spawns).toHaveLength(1);
+    expect(f.disposed).toEqual(['fake-1']);
+    expect(f.ledger.latestJobEvent('job-spawn-amended', 'job.minion-spawned')).toBeNull();
+    expect(f.ledger.latestJobEvent('job-spawn-amended', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expectRetainedLane(f, 'job-spawn-amended');
+  });
+
+  it('records a refusal after the recorded spawn and stops reading the worker as admitted', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-parked-after-spawn' });
+    afterReceipt(f, 'job.minion-spawned', () => { f.ledger.setJobStatus('job-parked-after-spawn', 'parked'); });
+    await expect(dispatch(f, 'job-parked-after-spawn', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.disposed).toEqual(['fake-1']);
+    const spawned = f.ledger.latestJobEvent('job-parked-after-spawn', 'job.minion-spawned');
+    const failed = f.ledger.latestJobEvent('job-parked-after-spawn', 'job.prebootstrap-patch-dispatch-failed');
+    expect(failed!.seq).toBeGreaterThan(spawned!.seq);
+    expectRetainedLane(f, 'job-parked-after-spawn');
+    const body = await readback(f, 'job-parked-after-spawn');
+    expect(body).toMatchObject({ state: 'setup_succeeded_dispatch_failed', worker_admission: 'refused_after_spawn', unmatched_receipt_count: 0 });
+    expect(String(body['recovery'])).toMatch(/^Do not replay/u);
+  });
+
+  it('refuses an authority change after the recorded spawn before the briefing', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-amended-after-spawn' });
+    afterReceipt(f, 'job.minion-spawned', () => amendContract(f, 'job-amended-after-spawn'));
+    await expect(dispatch(f, 'job-amended-after-spawn', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.disposed).toEqual(['fake-1']);
+    expect(f.ledger.latestJobEvent('job-amended-after-spawn', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expectRetainedLane(f, 'job-amended-after-spawn');
+  });
+
+  it('keeps the patched lane and its receipt when the worker spawn fails', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-spawn-failed' });
+    f.beforeSpawn = () => { throw new Error('synthetic spawn failure'); };
+    await expect(dispatch(f, 'job-spawn-failed', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-spawn-failed', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_class: 'Error', error_code: null });
+    expect(f.ledger.latestJobEvent('job-spawn-failed', 'worktree.swept')).toBeNull();
+    expectRetainedLane(f, 'job-spawn-failed');
+  });
+});
+
+describe('pre-bootstrap failure receipts', () => {
+  it('keeps setup output and raw error text out of the error, the job, its events and the readback', async () => {
+    const marker = 'PRIVATE-SETUP-MARKER-4c1e';
+    const f = makeFixture(`node -e "console.log('${marker}'); console.error('${marker}'); process.exit(7)"`);
+    const made = f.makePackage({ jobId: 'job-private-output' });
+    let thrown: unknown = null;
+    try { await dispatch(f, 'job-private-output', made.reference); } catch (error) { thrown = error; }
+    expect(thrown).toMatchObject({ code: 'dispatch_failed' });
+    expect((thrown as Error).cause).toMatchObject({ name: 'WorktreeSetupError', message: expect.stringContaining(marker) });
+    expect(String(thrown)).not.toContain(marker);
+    expect(JSON.stringify(f.ledger.getJob('job-private-output'))).not.toContain(marker);
+    expect(f.ledger.getJob('job-private-output')?.note).toMatch(/^dispatch failed: pre-bootstrap dispatch failed \(WorktreeSetupError; error_sha256=[0-9a-f]{64}\)/u);
+    expect(JSON.stringify(f.ledger.listJobEvents('job-private-output', { limit: 10_000 }))).not.toContain(marker);
+    expect(JSON.stringify(await readback(f, 'job-private-output'))).not.toContain(marker);
+  });
+
+  it('retries a failed registration over its own pending handoff and keeps the lane', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-publication' });
+    const original = f.ledger.registerWorktree.bind(f.ledger);
+    let calls = 0;
+    vi.spyOn(f.ledger, 'registerWorktree').mockImplementation((input) => {
+      calls += 1;
+      if (calls === 1) throw new Error('synthetic registry failure');
+      return original(input);
+    });
+    await expect(dispatch(f, 'job-publication', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(calls).toBe(2);
+    expect(f.spawns).toHaveLength(0);
+    expect(f.ledger.latestJobEvent('job-publication', 'worktree.prebootstrap-publication-failed')?.payload)
+      .toMatchObject({ stage: 'publication', error_class: 'Error' });
+    expectRetainedLane(f, 'job-publication');
+    expect(await readback(f, 'job-publication')).toMatchObject({ state: 'setup_succeeded_publication_failed', worker_admission: 'unproven', unmatched_receipt_count: 0 });
+  });
+});
+
+describe('pre-bootstrap source, package and lane guards', () => {
+  it('binds a consumed package to its own job: the same request on a new job is refused before a job row', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-first' });
+    const outcome = await dispatch(f, 'job-first', made.reference);
+    await outcome.settled;
+    await expect(dispatch(f, 'job-second', made.reference)).rejects.toMatchObject({ name: 'PreBootstrapPatchError', code: 'request_mismatch' });
+    expect(f.ledger.getJob('job-second')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-second'])).toBe('');
+    expect(f.spawns).toHaveLength(1);
+  });
+
+  it('serializes two patched jobs on one repository behind its creation lock', async () => {
+    const f = makeFixture();
+    const first = f.makePackage({ jobId: 'job-lock-a' });
+    const second = f.makePackage({ jobId: 'job-lock-b' });
+    const outcomes = await Promise.all([dispatch(f, 'job-lock-a', first.reference), dispatch(f, 'job-lock-b', second.reference)]);
+    await Promise.all(outcomes.map((outcome) => outcome.settled));
+    const claim = (jobId: string) => f.ledger.latestJobEvent(jobId, 'worktree.prebootstrap-patch-creation-claimed')!.seq;
+    const setup = (jobId: string) => f.ledger.latestJobEvent(jobId, 'worktree.prebootstrap-setup-succeeded')!.seq;
+    const [earlier, later] = claim('job-lock-a') < claim('job-lock-b') ? ['job-lock-a', 'job-lock-b'] : ['job-lock-b', 'job-lock-a'];
+    expect(claim(later!)).toBeGreaterThan(setup(earlier!));
+    expect(f.spawns).toHaveLength(2);
+  });
+
+  it('refuses a retained creation receipt for the branch before claiming or creating it', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-held-receipt' });
+    writeCreationIntent(repositoryCommonDirectory(f.repo.path), {
+      lane: { id: 'job-held-receipt', kind: 'job', jobId: 'job-held-receipt', roundId: null, path: f.lanePath('job-held-receipt') },
+      repoPath: realpathSync(f.repo.path), branch: 'gru/job-held-receipt', sha: f.sourceHead, baseSource: 'origin', token: `gru-creation:${randomUUID()}`,
+    });
+    await expect(dispatch(f, 'job-held-receipt', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-held-receipt', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'foreign_receipt' });
+    expect(f.ledger.latestJobEvent('job-held-receipt', 'worktree.prebootstrap-patch-creation-claimed')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-held-receipt'])).toBe('');
+  });
+
+  it('refuses a job id that already names a registered review lane before claiming it', async () => {
+    const f = makeFixture();
+    addWorkingJob(f, 'job-reviewed');
+    const round = f.ledger.addRound({ jobId: 'job-reviewed', lenses: ['correctness'], targetRef: f.sourceHead });
+    f.ledger.registerWorktree({ id: round.id, kind: 'review', repoPath: realpathSync(f.repo.path), repoName: basename(f.repo.path),
+      path: join(f.root, 'review-lane'), sha: f.sourceHead, roundId: round.id, jobId: 'job-reviewed' });
+    const made = f.makePackage({ jobId: round.id });
+    await expect(dispatch(f, round.id, made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent(round.id, 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'foreign_lane' });
+    expect(f.ledger.latestJobEvent(round.id, 'worktree.prebootstrap-patch-creation-claimed')).toBeNull();
+    expect(f.repo.git(['branch', '--list', `gru/${round.id}`])).toBe('');
+  });
+
+  it('refuses an existing lane path before claiming it', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-path-taken' });
+    mkdirSync(f.lanePath('job-path-taken'), { recursive: true });
+    await expect(dispatch(f, 'job-path-taken', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-path-taken', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'foreign_lane' });
+    expect(f.ledger.latestJobEvent('job-path-taken', 'worktree.prebootstrap-patch-creation-claimed')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-path-taken'])).toBe('');
+  });
+
+  it('refuses the local-head fallback when origin cannot be fetched, even at the package commit', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-local-fallback' });
+    renameSync(f.origin, `${f.origin}.unreachable`);
+    expect(f.repo.head()).toBe(made.package.base.commit);
+    await expect(dispatch(f, 'job-local-fallback', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-local-fallback', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'base_mismatch' });
+    expect(f.ledger.getWorktree('job-local-fallback')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-local-fallback'])).toBe('');
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('refuses a package naming another clone of the same origin before creating a branch', async () => {
+    const f = makeFixture();
+    const otherClone = join(f.root, 'other-clone');
+    execFileSync('git', ['clone', '--quiet', f.origin, otherClone]);
+    const made = f.makePackage({ jobId: 'job-other-clone', mutate: (pkg) => { (pkg['repository'] as Record<string, unknown>)['path'] = realpathSync(otherClone); } });
+    await expect(dispatch(f, 'job-other-clone', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-other-clone', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'source_mismatch' });
+    expect(f.ledger.latestJobEvent('job-other-clone', 'worktree.prebootstrap-patch-started')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-other-clone'])).toBe('');
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('refuses a manager call with no or an edited admission receipt before creating a branch', async () => {
+    const f = makeFixture();
+    const attempt = (jobId: string) => f.manager.createJobWorktreeWithPreBootstrapPatch({ repoPath: f.repo.path, jobId,
+      preBootstrapPatch: f.makePackage({ jobId }).loaded });
+    addWorkingJob(f, 'job-unadmitted');
+    await expect(attempt('job-unadmitted')).rejects.toMatchObject({ name: 'PreBootstrapPatchError', code: 'admission_receipt_mismatch' });
+    addWorkingJob(f, 'job-edited-admission');
+    const edited = f.makePackage({ jobId: 'job-edited-admission' }).loaded;
+    f.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId: 'job-edited-admission',
+      payload: { ...admissionPayload(f, edited), origin_sha256: '0'.repeat(64) } });
+    await expect(attempt('job-edited-admission')).rejects.toMatchObject({ code: 'admission_receipt_mismatch' });
+    for (const jobId of ['job-unadmitted', 'job-edited-admission']) {
+      expect(f.ledger.latestJobEvent(jobId, 'worktree.prebootstrap-patch-creation-claimed')).toBeNull();
+      expect(f.repo.git(['branch', '--list', `gru/${jobId}`])).toBe('');
+    }
+    addWorkingJob(f, 'job-exact-admission');
+    const exact = f.makePackage({ jobId: 'job-exact-admission' }).loaded;
+    f.ledger.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId: 'job-exact-admission', payload: admissionPayload(f, exact) });
+    const lane = await attempt('job-exact-admission');
+    expect(readFileSync(join(lane.path, 'requirements.txt'), 'utf8')).toBe(NEW_REQUIREMENTS);
+  });
+
+  it('refuses a package whose bytes changed after admission, before the claim', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-changed-at-start' });
+    afterReceipt(f, 'job.prebootstrap-patch-admitted', () => writeFileSync(made.path, `${readFileSync(made.path, 'utf8')} `, { mode: 0o600 }));
+    await expect(dispatch(f, 'job-changed-at-start', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-changed-at-start', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'package_hash_mismatch' });
+    expect(f.ledger.latestJobEvent('job-changed-at-start', 'worktree.prebootstrap-patch-creation-claimed')).toBeNull();
+    expect(f.repo.git(['branch', '--list', 'gru/job-changed-at-start'])).toBe('');
+  });
+
+  it('rereads the package at application and refuses changed bytes before writing the lane', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-changed-at-apply' });
+    afterReceipt(f, 'worktree.prebootstrap-patch-creation-claimed', () => writeFileSync(made.path, `${readFileSync(made.path, 'utf8')} `, { mode: 0o600 }));
+    await expect(dispatch(f, 'job-changed-at-apply', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-changed-at-apply', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'package_hash_mismatch' });
+    expect(f.ledger.latestJobEvent('job-changed-at-apply', 'worktree.prebootstrap-patch-started')).toBeNull();
+    const lane = f.ledger.getWorktree('job-changed-at-apply');
+    expect(readFileSync(join(lane!.path, 'requirements.txt'), 'utf8')).toBe(OLD_REQUIREMENTS);
+    expect(f.spawns).toHaveLength(0);
+  });
+
+  it('refuses a stray file in the lane by its measured changed-path set', async () => {
+    const f = makeFixture();
+    const made = f.makePackage({ jobId: 'job-stray-file' });
+    afterReceipt(f, 'worktree.prebootstrap-patch-started', () => writeFileSync(join(f.lanePath('job-stray-file'), 'stray.txt'), 'not in the package\n'));
+    await expect(dispatch(f, 'job-stray-file', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    expect(f.ledger.latestJobEvent('job-stray-file', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'changed_paths' });
+    expect(f.ledger.latestJobEvent('job-stray-file', 'worktree.prebootstrap-patch-applied')).toBeNull();
+    expect(f.ledger.latestJobEvent('job-stray-file', 'worktree.prebootstrap-patch-failed')?.payload).toMatchObject({ stage: 'patch' });
+    expect(f.spawns).toHaveLength(0);
+    expectRetainedLane(f, 'job-stray-file');
+  });
+
+  it('rechecks authority before each configured setup command', async () => {
+    const f = makeFixture(undefined, { secondSetupCommand: 'node -e "require(\'node:fs\').writeFileSync(\'second-setup-ran\', \'x\')"' });
+    const made = f.makePackage({ jobId: 'job-amended-mid-setup' });
+    afterReceipt(f, 'worktree.prebootstrap-setup-process-settled', () => amendContract(f, 'job-amended-mid-setup'));
+    await expect(dispatch(f, 'job-amended-mid-setup', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    const started = f.ledger.listJobEvents('job-amended-mid-setup', { kinds: ['worktree.prebootstrap-setup-started'] });
+    expect(started.map((event) => (event.payload as Record<string, unknown>)['setup_index'])).toEqual([0]);
+    expect(f.ledger.latestJobEvent('job-amended-mid-setup', 'worktree.prebootstrap-setup-failed')?.payload).toMatchObject({ stage: 'setup', error_class: 'PreBootstrapPatchError' });
+    expect(f.ledger.latestJobEvent('job-amended-mid-setup', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'authority_mismatch' });
+    expect(existsSync(join(f.lanePath('job-amended-mid-setup'), 'second-setup-ran'))).toBe(false);
+    expect(f.spawns).toHaveLength(0);
+    expectRetainedLane(f, 'job-amended-mid-setup');
+  });
+});
+
+describe('pre-bootstrap worker admission receipt proof', () => {
+  it('refuses real receipts that carry one wrong field, or record setup success before the patch', async () => {
+    const f = makeFixture();
+    const cases: readonly { readonly jobId: string; readonly kind: string; readonly field: string; readonly value: string }[] = [
+      { jobId: 'job-proof-package', kind: 'worktree.prebootstrap-patch-applied', field: 'package_sha256', value: '0'.repeat(64) },
+      { jobId: 'job-proof-request', kind: 'worktree.prebootstrap-setup-succeeded', field: 'request_payload_sha256', value: '0'.repeat(64) },
+      { jobId: 'job-proof-intake', kind: 'worktree.prebootstrap-setup-succeeded', field: 'intake_identity_sha256', value: '0'.repeat(64) },
+      { jobId: 'job-proof-path', kind: 'worktree.prebootstrap-patch-applied', field: 'worktree_path', value: '/elsewhere' },
+      { jobId: 'job-proof-branch', kind: 'worktree.prebootstrap-setup-succeeded', field: 'branch', value: 'gru/another-job' },
+      { jobId: 'job-proof-base', kind: 'worktree.prebootstrap-patch-applied', field: 'base_sha', value: '0'.repeat(40) },
+    ];
+    for (const { jobId, kind, field, value } of cases) {
+      const made = f.makePackage({ jobId });
+      editReceipts(f, kind, (payload) => ({ ...payload, [field]: value }));
+      await expect(dispatch(f, jobId, made.reference), `${kind}.${field}`).rejects.toMatchObject({ code: 'dispatch_failed' });
+      vi.restoreAllMocks();
+      expect(f.ledger.latestJobEvent(jobId, 'job.prebootstrap-patch-dispatch-failed')?.payload, `${kind}.${field}`).toMatchObject({ error_code: 'setup_receipt_mismatch' });
+      expectRetainedLane(f, jobId);
+    }
+    const made = f.makePackage({ jobId: 'job-proof-order' });
+    const original = f.ledger.appendCustomEvent.bind(f.ledger);
+    vi.spyOn(f.ledger, 'appendCustomEvent').mockImplementation((input) => {
+      if (input.kind === 'worktree.prebootstrap-patch-applied') {
+        original({ ...input, kind: 'worktree.prebootstrap-setup-succeeded' });
+        return original(input);
+      }
+      return original(input.kind === 'worktree.prebootstrap-setup-succeeded' ? { ...input, kind: 'test.setup-succeeded-withheld' } : input);
+    });
+    await expect(dispatch(f, 'job-proof-order', made.reference)).rejects.toMatchObject({ code: 'dispatch_failed' });
+    vi.restoreAllMocks();
+    expect(f.ledger.latestJobEvent('job-proof-order', 'job.prebootstrap-patch-dispatch-failed')?.payload).toMatchObject({ error_code: 'setup_receipt_mismatch' });
+    expect(f.spawns).toHaveLength(0);
+  });
+});

@@ -1,9 +1,12 @@
-import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { parseListeningPort } from '../src/wizard/main.js';
+import { originIdentitySha256, preBootstrapPackageContentSha256, preBootstrapRequestPayloadSha256, PREBOOTSTRAP_PATCH_AUTHORIZATION } from '../src/worktrees/prebootstrap-patch.js';
+import { attachBareOrigin, makeFixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * Uploads-dir scaffolding (E9 / SPEC ruling 19): boot creates
@@ -182,6 +185,139 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
       expect(exitCode).toBe(0);
     } finally {
       if (child.exitCode === null) child.kill('SIGKILL');
+    }
+  }, 30_000);
+});
+
+/** Boot the built service on `home` and wait for its listening port. */
+async function listeningService(home: string): Promise<{ readonly child: ChildProcess; readonly port: number; readonly stderr: () => string }> {
+  const child = spawn(process.execPath, [join(repoRoot, 'dist', 'main.js')], {
+    env: { ...process.env, GRU_COMMAND_HOME: home },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr!.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString('utf-8');
+  });
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const port = parseListeningPort(stderr);
+    if (port !== null) return { child, port, stderr: () => stderr };
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`service exited early — stderr:\n${stderr.slice(-1_000)}`);
+    if (Date.now() > deadline) {
+      child.kill('SIGKILL');
+      throw new Error(`service never listened — stderr:\n${stderr.slice(-1_000)}`);
+    }
+    await new Promise((wake) => setTimeout(wake, 150));
+  }
+}
+
+async function stopService(child: ChildProcess): Promise<number | null> {
+  return new Promise<number | null>((resolveExit) => {
+    child.on('exit', (code) => resolveExit(code));
+    child.kill('SIGTERM');
+  });
+}
+
+const PATCH_TOKEN = 'prebootstrap-root-token';
+const PATCH_CONFIG = `[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "${PATCH_TOKEN}"\n[worktrees]\nmin_free_disk_gb = 0\n`;
+
+describe('private prebootstrap package root (boot)', () => {
+  it('boot creates an owner-only package root that both dispatch and the worktree manager read', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-patch-root-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, 'config.toml'), PATCH_CONFIG, 'utf-8');
+    const repo = makeFixtureRepo('fixture-boot-prebootstrap');
+    const before = 'fixture-dep==1.0.0\n';
+    const after = 'fixture-dep==2.0.0\n';
+    repo.commitFile('requirements.txt', before);
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "node -e \\"process.exit(7)\\""\n');
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'main']);
+    const service = await listeningService(home);
+    try {
+      const root = join(home, 'prebootstrap-patches');
+      expect(lstatSync(root).isDirectory()).toBe(true);
+      expect(statSync(root).mode & 0o777).toBe(0o700);
+      expect(service.stderr()).toContain('"msg":"prebootstrap_patch_root"');
+      const post = (body: Record<string, unknown>) => fetch(`http://127.0.0.1:${String(service.port)}/api/dispatch`, {
+        method: 'POST', headers: { authorization: `Bearer ${PATCH_TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const briefing = `Repair the pinned dependency.\n${PREBOOTSTRAP_PATCH_AUTHORIZATION}\n`;
+      const request = { repo_path: repo.path, title: 'Boot dependency repair', briefing };
+
+      // The service reads the root: a missing package is named, not "not wired".
+      const missing = await post({ ...request, job_id: 'boot-missing-package', prebootstrap_patch: { package_file: 'missing.json', package_sha256: 'a'.repeat(64) } });
+      expect(missing.status).toBe(422);
+      expect(await missing.json()).toMatchObject({ code: 'package_unavailable', detail: expect.stringContaining('missing.json is unavailable') });
+
+      // The manager reads it too: the patch is applied and the unchanged setup runs (and fails here, before any worker).
+      const jobId = 'boot-patched';
+      const packageFile = `${jobId}.json`;
+      const head = repo.head();
+      const pkg = {
+        version: 1,
+        repository: { path: realpathSync(repo.path), origin_sha256: originIdentitySha256(origin) },
+        base: { commit: head, tree: repo.git(['rev-parse', `${head}^{tree}`]) },
+        authority: { contract_sha256: createHash('sha256').update(briefing).digest('hex'), work_revision: 0, authority_epoch: 0,
+          request_sha256: preBootstrapRequestPayloadSha256({ jobId, repoPath: repo.path, title: request.title, displayName: null, deliverable: 'pr',
+            briefing, completionHandoff: null, packageFile }) },
+        allowlist: ['requirements.txt'],
+        files: [{ path: 'requirements.txt', before_sha256: createHash('sha256').update(before).digest('hex'),
+          after_sha256: preBootstrapPackageContentSha256(after), content: after }],
+      };
+      const bytes = Buffer.from(JSON.stringify(pkg), 'utf8');
+      writeFileSync(join(root, packageFile), bytes, { mode: 0o600 });
+      const patched = await post({ ...request, job_id: jobId,
+        prebootstrap_patch: { package_file: packageFile, package_sha256: createHash('sha256').update(bytes).digest('hex') } });
+      expect(patched.status).toBe(409);
+      const readback = await fetch(`http://127.0.0.1:${String(service.port)}/api/dispatch/jobs/${jobId}/prebootstrap-patch`,
+        { headers: { authorization: `Bearer ${PATCH_TOKEN}` } });
+      expect(await readback.json()).toMatchObject({ state: 'setup_failed', worker_admission: 'unproven',
+        patch: { changed_paths: ['requirements.txt'] }, setup: { stage: 'setup', error_class: 'WorktreeSetupError' } });
+      expect(await stopService(service.child)).toBe(0);
+    } finally {
+      if (service.child.exitCode === null) service.child.kill('SIGKILL');
+      repo.cleanup();
+    }
+  }, 60_000);
+
+  it('boot refuses a symlinked package root, loud and named', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-patch-root-link-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, 'config.toml'), PATCH_CONFIG, 'utf-8');
+    mkdirSync(join(home, 'elsewhere'), { mode: 0o700 });
+    symlinkSync(join(home, 'elsewhere'), join(home, 'prebootstrap-patches'));
+    const child = spawn(process.execPath, [join(repoRoot, 'dist', 'main.js')], {
+      env: { ...process.env, GRU_COMMAND_HOME: home },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf-8');
+    });
+    const exitCode = await new Promise<number | null>((resolveExit) => {
+      child.on('exit', (code) => resolveExit(code));
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('private prebootstrap package directory creation failed');
+    expect(stderr).toContain('not a symlink');
+  }, 30_000);
+
+  it('boot hardens a pre-existing 0755 package root to 0700', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-patch-root-harden-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, 'config.toml'), PATCH_CONFIG, 'utf-8');
+    const loose = join(home, 'prebootstrap-patches');
+    mkdirSync(loose, { mode: 0o755 });
+    chmodSync(loose, 0o755);
+    expect(statSync(loose).mode & 0o777).toBe(0o755);
+    const service = await listeningService(home);
+    try {
+      expect(statSync(loose).mode & 0o777).toBe(0o700);
+      expect(await stopService(service.child)).toBe(0);
+    } finally {
+      if (service.child.exitCode === null) service.child.kill('SIGKILL');
     }
   }, 30_000);
 });

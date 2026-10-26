@@ -105,6 +105,47 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
 }
 
 describe('fresh fix worker association', () => {
+  it('refuses a directive that would spawn into a retained patched lane whose worker admission is unproven (#495)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-patched-lane-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Patched lane' });
+      // The patched dispatch failed after its lane was retained: the claim
+      // receipt exists, but no worker was ever admitted (no minion-spawned).
+      ledger.setJobStatus('job-1', 'blocked');
+      ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-creation-claimed', jobId: 'job-1', payload: { version: 1 } });
+      const spawn = vi.fn(async () => { throw new Error('spawn must not be reached'); });
+      await expect(routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'continue the work', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn, disposeHandle: async () => {} },
+      })).rejects.toThrow(/retains a patched lane whose worker admission is unproven.*prebootstrap-patch/u);
+      expect(spawn).not.toHaveBeenCalled();
+      // Once dispatch has admitted a worker, the same directive routes again:
+      // the guard reads the spawn receipt, not the patch receipt alone.
+      ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'job-1', payload: { agentId: 'minion-1' } });
+      const handle = {
+        id: 'minion-1', role: 'minion', sessionFile: null,
+        async prompt() {},
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const routed = await routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'continue the work', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+      });
+      expect(routed.delivered).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
   it('releases a paced existing-handle directive when job is binned while queued', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-pacing-bin-'));
     cleanupDirs.push(dir);
