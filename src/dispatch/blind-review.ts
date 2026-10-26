@@ -368,25 +368,32 @@ export function recordBlindAdmission(ledger: LedgerApi, jobId: string, admission
   ledger.appendCustomEvent({ kind: BLIND_ADMITTED_EVENT, jobId, payload: admission.payload });
 }
 
+/** An attested blind reviewer's kept package cannot be re-delivered: it was
+ * never kept (admitted before packages were kept) or its record is
+ * malformed. */
+export class BlindPackageRecordError extends Error {
+  constructor(message: string) { super(message); this.name = 'BlindPackageRecordError'; }
+}
+
 /** The package a blind reviewer was admitted with, or null when the job is
  * no attested blind review. An attested blind review whose package was not
- * kept (admitted before packages were kept) throws by name: a replacement
- * briefed without its input would review nothing it was given. */
-export function admittedBlindPackage(ledger: LedgerApi, jobId: string): BlindInputPackage | null {
+ * kept (admitted before packages were kept) throws BlindPackageRecordError: a
+ * replacement briefed without its input would review nothing it was given. */
+export function admittedBlindPackage(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): BlindInputPackage | null {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null || admitted.role !== 'blind' || !admitted.attested) return null;
   const event = ledger.latestJobEvent(jobId, BLIND_PACKAGE_EVENT);
   if (event === null) {
-    throw new Error(`job "${jobId}": its attested blind input package was not kept (admitted before packages were kept), so a fresh reviewer cannot be briefed with it — commission the blind review again`);
+    throw new BlindPackageRecordError(`job "${jobId}": its attested blind input package was not kept (admitted before packages were kept), so a fresh reviewer cannot be briefed with it — commission the blind review again`);
   }
   const payload = event.payload as { base_sha?: unknown; target_sha?: unknown; diff?: unknown; files?: unknown };
   if (typeof payload.base_sha !== 'string' || typeof payload.target_sha !== 'string' || (payload.diff !== null && typeof payload.diff !== 'string') || !Array.isArray(payload.files)) {
-    throw new Error(`job "${jobId}": its recorded blind input package (event ${String(event.seq)}) is malformed — the reviewer's input cannot be re-delivered`);
+    throw new BlindPackageRecordError(`job "${jobId}": its recorded blind input package (event ${String(event.seq)}) is malformed — the reviewer's input cannot be re-delivered`);
   }
   const files = payload.files.map((file: unknown) => {
     const f = file as { path?: unknown; content?: unknown };
     if (typeof f.path !== 'string' || typeof f.content !== 'string') {
-      throw new Error(`job "${jobId}": its recorded blind input package (event ${String(event.seq)}) holds a malformed file entry`);
+      throw new BlindPackageRecordError(`job "${jobId}": its recorded blind input package (event ${String(event.seq)}) holds a malformed file entry`);
     }
     return { path: f.path, content: f.content };
   });
@@ -417,7 +424,7 @@ export function renderBlindPackageBlock(pkg: BlindInputPackage): readonly string
   ];
 }
 
-function admittedOf(ledger: LedgerApi, jobId: string): AdmittedPayload | null {
+function admittedOf(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): AdmittedPayload | null {
   const event = ledger.latestJobEvent(jobId, BLIND_ADMITTED_EVENT);
   return event === null ? null : (event.payload as AdmittedPayload);
 }
@@ -640,7 +647,7 @@ function laneRootsOf(ledger: LedgerApi, jobId: string): readonly string[] {
 }
 
 /** Whether a job was admitted as a blind review (observation applies). */
-export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
+export function isAdmittedBlind(ledger: Pick<LedgerApi, 'latestJobEvent'>, jobId: string): boolean {
   return admittedOf(ledger, jobId)?.role === 'blind';
 }
 

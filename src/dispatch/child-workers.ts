@@ -10,6 +10,7 @@ import {
   type LedgerApi,
 } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
+import { isAdmittedBlind } from './blind-review.js';
 import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { adapterCessationEvidence } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
@@ -573,6 +574,15 @@ export class ChildWorkerService {
     const job = this.opts.ledger.getJob(jobId);
     if (job === null) {
       throw new ChildWorkerRefusal('invalid_request', 404, `unknown job "${jobId}"`);
+    }
+    // A child gets no blind package, no isolation rule and no blind-access
+    // observation: its report would carry reads the reviewer may not make.
+    if (isAdmittedBlind(this.opts.ledger, jobId)) {
+      throw new ChildWorkerRefusal(
+        'parent_not_permitted',
+        403,
+        `job "${jobId}" is an admitted blind review — a blind reviewer reads only its own input and commissions no child workers`,
+      );
     }
     if (isJobTerminal(job.status)) {
       throw new ChildWorkerRefusal(

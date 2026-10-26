@@ -73,6 +73,122 @@ or uncertain blocks require deliberate repair, never automatic cleanup. Existing
 jobs still resolve verification commands from their original manifests and keep
 their original runtime bindings and paths.
 
+## 1a. Guarded pre-bootstrap dependency patch
+
+A normal `POST /api/dispatch` has no pre-bootstrap edit and follows the existing
+path unchanged. A narrowly-scoped exception is available only when a fresh,
+top-level PR-owing job explicitly includes `prebootstrap_patch` and its
+immutable briefing contains exactly one line:
+
+```text
+GC PRE-BOOTSTRAP DEPENDENCY PATCH AUTHORIZATION: files=requirements.txt
+```
+
+The package must be staged by the trusted operator under the instance's private
+`<data_dir>/prebootstrap-patches/` directory (0700); its regular file must be
+owner-only. The bounded JSON package is at most 1 MiB and the UTF-8 dependency
+file at most 256 KiB. The request names only a plain `.json` basename and the
+SHA-256 of the exact package bytes:
+
+```json
+"prebootstrap_patch": {
+  "package_file": "repair-<request>.json",
+  "package_sha256": "<64 lowercase hex characters>"
+}
+```
+
+Package version 1 is a strict JSON object with no unknown keys:
+
+```json
+{
+  "version": 1,
+  "repository": { "path": "<canonical absolute repo path>", "origin_sha256": "<64 lowercase hex>" },
+  "base": { "commit": "<full fetched commit id>", "tree": "<full Git tree id>" },
+  "authority": {
+    "contract_sha256": "<exact briefing SHA-256>",
+    "work_revision": 0,
+    "authority_epoch": 0,
+    "request_sha256": "<normalized dispatch payload SHA-256>"
+  },
+  "allowlist": ["requirements.txt"],
+  "files": [{
+    "path": "requirements.txt",
+    "before_sha256": "<old content SHA-256>",
+    "after_sha256": "<new content SHA-256>",
+    "content": "<new UTF-8 text>"
+  }]
+}
+```
+
+`origin_sha256` is the SHA-256 of `git remote get-url origin` (so after any
+`insteadOf` rewrite) with surrounding whitespace trimmed. `request_sha256` is
+the SHA-256 of this exact JSON, keys in this order and no whitespace:
+
+```text
+{"version":1,"job_id":…,"repo_path":…,"title":…,"display_name":…,"deliverable":…,"briefing_sha256":…,"completion_handoff":…,"prebootstrap_package_file":…}
+```
+
+`repo_path` and `title` are as posted, `display_name` is the trimmed name or
+`null`, `deliverable` defaults to `"pr"`, `briefing_sha256` is the SHA-256 of
+the briefing, and `completion_handoff` is `{"kind":…,"decision":…}` or `null`.
+Escape every string exactly as ECMAScript `JSON.stringify` would (well-formed
+JSON: `"` and `\\` escaped, control characters as `\u00XX` short escapes,
+lone surrogates well-formed-escaped, all other characters raw) and take the
+SHA-256 over the UTF-8 bytes of that exact serialization — a hand-built
+mismatching digest is refused as `request_mismatch`, never re-derived.
+Report/review metadata is refused for this route. The digest leaves out only the
+package's own SHA-256, which would make it self-referential; the admission
+receipt joins the two digests as `intake_identity_sha256`, the SHA-256 of
+`{"version":1,"request_payload_sha256":…,"package_sha256":…}`. The source and
+package bytes are reread and rehashed at worktree application. Revision/epoch
+must be the initial 0/0 authority; the contract, revision, epoch and the job's
+`working` status are rechecked through setup and up to the briefing.
+
+The supported file grammar is intentionally small: root `requirements.txt`,
+blank/comment lines and pinned `distribution==version` declarations only.
+Existing comment/blank lines must remain identical, and every pin keeps its
+line, name and extras: only its `==version` may change, so no distribution is
+added, removed or moved. No include/constraint files,
+URLs, VCS/path references, options, environment expansion, secrets, manifests,
+setup commands, configuration or other file paths are accepted. Package
+content is never interpreted as a shell command or diff. The patch binds the
+canonical repository path, origin fingerprint, fetched origin commit and tree,
+initial contract, request and old/new content. Local-head fallback is refused.
+
+With the existing per-repository creation lock, GC proves the exact source,
+base/tree, dependency blob, fresh branch/path and no retained creation receipt
+before writing. It applies the one file atomically in the new owned worktree,
+checks the actual changed-path set and records before/after Git tree identities.
+The committed `.gru-command/worktree.toml` cannot be changed by this control;
+the exact existing links/copies/setup flow then runs normally. The worker is not
+spawned until every configured setup step succeeds and current authority still
+matches. Disk floor, repository identity, lane custody and worker pacing remain
+in force. No package means no change to the normal path.
+
+The ledger records `job.prebootstrap-patch-admitted`, the one-time
+`worktree.prebootstrap-patch-creation-claimed` consumption receipt, patch
+start/applied/failure, per-command setup start/spawn/result, setup
+success/failure, `worktree.prebootstrap-publication-failed` and dispatch
+failure. A POST failure after job admission is returned as
+`409 prebootstrap_patch_dispatch_failed` with the job id and readback path, not
+as a pre-admission refusal. Admission/claim receipts bind the request, package,
+authority and intended source; producer receipts add the owned lane path,
+branch and creation-token hash. A lane's failure receipt carries its `stage`,
+`error_class` and `error_sha256`; the dispatch failure receipt carries
+`error_class`, `error_code` and `error_sha256`. The ledger never stores the raw
+message or setup output. Read the authenticated
+`GET /api/dispatch/jobs/<job-id>/prebootstrap-patch` for durable event readback.
+Missing spawn/result receipts mean **unknown**, never process cessation or
+no-effects. A recorded child exit/result is not proof that the entire process
+group ceased; the readback keeps group state explicitly unknown. A consumed
+request is never replayed. A patched lane keeps its creation receipt until its
+worker is admitted (`job.minion-spawned`, then the last pre-briefing check), so
+any earlier failure, including one after setup succeeded, retains the lane, the
+receipt and the evidence; do not retry it, rerun setup, clean the lane or infer
+that an unknown producer stopped. Inspect custody and process records; any
+future attempt requires a separately authorized fresh job and request. The
+endpoint offers no retry or cleanup action.
+
 ## 2. Registry (18b)
 
 The ledger is the authoritative map job → worktree → branch → **processes**:
@@ -588,6 +704,94 @@ host and pid are diagnostic: they are never read as cessation OR liveness
 proof, so two service processes sharing one repository are not
 coordinated by this receipt (a pid namespace reset makes a recorded pid
 look live again, which is why it is not a gate).
+
+## 4b. Same-job retained initial-creation continuation
+
+`POST /api/dispatch/creation-continuation` is a narrow authenticated control
+for one already-recorded, blocked PR-owing initial dispatch whose branch ref
+was committed but whose checkout and lane registration did not complete. Its
+body is exactly `{ "job_id": "…", "request_id": "…" }`; it reuses the
+original job row, unique `job.handoff`, immutable briefing, branch, retained
+receipt, fixed base and `base_source`. It does not call `addJob`, append a new
+handoff, or accept caller-supplied source/briefing/base fields. A job with an
+accepted amendment, previous phase-handoff, report/PR target, worker, lane,
+admission, live directive or pending re-brief is outside this control and is
+refused, as is a request id that names a directive request. The handoff
+path's own leaf must be the job's recorded repository (dispatch derived it so,
+a symlinked path included) and the path must resolve to the repository the
+manager inspects; the continuation dispatches through that same path.
+
+A continuation never consults the briefing-review gate (GH-505): the gate
+admits or refuses a dispatch *before* any job row exists, and the job a
+continuation reuses was created by a dispatch that already passed it under
+the policy of that moment — the job's existence is the admission proof.
+Re-asking could only strand retained creations whose review policy changed
+or predated the gate. A fresh dispatch of the same briefing is still gated,
+and the continuation itself is gated by the retained receipt, not by review
+policy.
+
+Every job branch creation, ordinary dispatch included, journals one
+`job.creation-producer-settled` event per receipt token when its Git child's
+own `close` shows that the child exited and every holder released its pipes
+(a descendant that redirected its output can outlive that). A child that
+exited while something still holds the pipes is watched for up to ten
+minutes; a close caused by GC releasing those pipes proves nothing, and the
+producer then stays UNKNOWN. A failed write is logged and never fails the
+creation. The receipt token is bound by its SHA-256 digest; the raw token
+never reaches the readback, and a dispatch failure's job note, events, HTTP
+detail and log line redact it. Receipt
+host/PID, a missing PID, service restart and ref commitment are not
+producer-cessation evidence. Without the settlement the request is refused and
+custody remains UNKNOWN.
+
+A continuation waits at the ordinary disk floor (the owner may bin or park the
+job meanwhile), then takes the job admission, refuses a live directive or
+pending re-brief that started during the wait, and calls WorktreeManager's
+guarded reconciliation with a strict retained-only policy. The receipt must be
+the one the request accepted (same token digest and settlement), and it and
+the exact direct branch ref must remain present and unchanged, including the
+receipt-matched reflog and repository/worktree-holder fences. Missing
+receipt/ref cannot clear the receipt and fall through to the ordinary new-base
+branch; mismatch, lock, symbolic ref, foreign checkout/admin/holder and
+unreadable evidence refuse without continuation cleanup, before adoption or
+after it. Any other failure before registration, a failing `[[setup]]`
+included, rolls the checkout back under the receipt's own token and keeps the
+ref and receipt: readback says `failed` with the retained custody, and a later
+request adopts them again. A failure while a setup step's process group still
+has a member, or while any process is rooted in the checkout (a detached daemon
+a step started included), keeps everything and reads `custody-unknown`, as
+do a process listing that fails or cannot read the working directories (`lsof`
+or `/proc` failing; command lines alone miss a daemon tied only by its cwd)
+and an unconfirmed rollback. A daemon that leaves the checkout and does not
+name it is not seen. A failure before the manager starts adopting (the
+repository path gone, say) touches nothing and reads `failed`. A failure after
+registration reads `custody-unknown`: the registry row holds the lane and the
+receipt may already be spent. A registered lane goes through the ordinary
+worker pacing gate, spawn and delivery path. A minion GC disposes before its
+prompt has its lane swept and reads `failed` once the disposal resolved; a
+failed disposal leaves the agent row as it was and reads `custody-unknown`.
+
+The durable request history names its generation and payload digest and
+readback distinguishes `accepted`, `queued`, `admitted`, `delivered`, `failed`,
+`refused` and `custody-unknown`. Read back one exact request with
+`GET /api/dispatch/creation-continuation?job_id=…&request_id=…` (same bearer
+authorization). Readback reports the original handoff/briefing digest, branch,
+base/provenance, producer-settlement event, registered worktree, queue,
+spawn and correlated delivery evidence. The delivery is correlated by
+`creation_continuation_request_id` and `creation_continuation_generation` on
+`job.delivered`, never the `request_id` that directive correlation reads. It
+never reports a prompt as delivered from acceptance or job status alone.
+
+Exact POST retries return the durable readback and never relaunch. A different
+request cannot compete with an accepted, queued, admitted or custody-unknown
+generation. If process ownership is lost before the delivery receipt, or a
+sent prompt's turn fails while the service is stopping, readback reports
+`custody-unknown`; neither GET nor retry resumes it. The unknown request
+remains a stop, not an automatic replay invitation. This route is not a
+generic retry/migration command, does not recover historical directives, and
+does not itself authorize continuation of any live target. Re-read every
+target's exact producer, receipt/ref/reflog, checkout, holder and admission
+guards immediately before owner-authorized use.
 
 ## 5. Concurrency (18e)
 

@@ -5,14 +5,13 @@ import type {
   ProviderWaitRecord,
 } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
-import { rebriefFreshMinion } from '../dispatch/fix-directive.js';
+import { freshReviewInput, holdsConversation, rebriefFreshMinion, ReviewInputUnavailableError } from '../dispatch/fix-directive.js';
 import { renderRevisionContinuation, withRevisionContinuation } from '../dispatch/work-revision.js';
 import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { admittedBlindPackage, renderBlindPackageBlock } from '../dispatch/blind-review.js';
 import type { SlotReArmPort } from './sensor.js';
 import type { RetrySettlement } from '../runtime/pacing.js';
 
@@ -85,15 +84,6 @@ function freshBriefing(
       : []),
   ];
   return parts.length === 0 ? null : parts.join('\n\n');
-}
-
-/** A FRESH blind reviewer is briefed with the package it was admitted
- * with (#360 R5-B3), exactly as at its first spawn; a resumed session
- * already holds it. An attested package that was not kept throws by name
- * (admittedBlindPackage), failing the continuation loudly. */
-function withBlindPackage(briefing: string | null, pkg: ReturnType<typeof admittedBlindPackage>): string | null {
-  if (pkg === null) return briefing;
-  return [...(briefing === null ? [] : [briefing]), renderBlindPackageBlock(pkg).join('\n')].join('\n\n');
 }
 
 /** A continuation failure leaves the lane honestly non-working: when this
@@ -269,11 +259,35 @@ async function claimJobMinion(
 
   capturePortLaneHandoff(deps.worktrees, lane)();
   // One continuation: resume the interrupted session when it still exists,
-  // otherwise a fresh worker on the same lane (rebrief machinery).
-  const resumeFile =
+  // otherwise a fresh worker on the same lane (rebrief machinery). A review
+  // job's session is resumed only when its transcript holds a conversation:
+  // an empty or header-only file opens as a new, empty session.
+  const recordedSession =
     wait.sessionFile !== null && wait.sessionFile !== '' && existsSync(wait.sessionFile)
       ? wait.sessionFile
       : null;
+  const resumeFile = recordedSession !== null && job.deliverable === 'review' && !holdsConversation(recordedSession) ? null : recordedSession;
+  // A fresh reviewer's recorded input is resolved before the claim: one that
+  // cannot be re-delivered cancels the wait by name, with nothing claimed,
+  // re-opened or spawned. Any other fault (git unreadable) leaves the wait
+  // for the next pass.
+  if (resumeFile === null) {
+    try {
+      freshReviewInput(deps.ledger, job.id, lane.path);
+    } catch (error) {
+      if (!(error instanceof ReviewInputUnavailableError)) {
+        deps.log?.('error', 'provider continuation deferred — the fresh reviewer input could not be read', { wait_id: wait.id, job: wait.jobId, error: String(error) });
+        return { outcome: 'skipped', waitId: wait.id, why: `fresh reviewer input could not be read: ${String(error)}` };
+      }
+      const why = `fresh reviewer input unavailable: ${error.message}`;
+      deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why, by });
+      deps.ledger.appendCustomEvent({ kind: 'provider.continuation-failed', jobId: wait.jobId, agentId: wait.agentId,
+        payload: { wait_id: wait.id, by, stage: 'input', error: String(error).slice(0, 300) } });
+      blockReopenedLane(deps.ledger, wait.jobId, `provider recovery continuation refused: ${why}`);
+      deps.log?.('error', 'provider continuation refused — the fresh reviewer input cannot be re-delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
+      return { outcome: 'skipped', waitId: wait.id, why };
+    }
+  }
   const continuationPrompt = wait.continuation?.promptText ?? null;
   const note =
     continuationPrompt !== null && continuationPrompt.trim() !== ''
@@ -359,10 +373,11 @@ async function claimJobMinion(
       // A resumed session keeps its context: the interrupted prompt plus the
       // pending amendments. A FRESH session reads the effective contract
       // (owner rule 4) — which already carries every amendment — and the
-      // interrupted prompt it continues.
+      // interrupted prompt it continues; a fresh blind reviewer also gets
+      // its admitted input from rebriefFreshMinion.
       briefing: resumeFile !== null
         ? withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null
-        : withBlindPackage(freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState), admittedBlindPackage(deps.ledger, job.id)),
+        : freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState),
       ...(resumeFile !== null ? { resumeFile } : {}),
       ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
       ...(deps.observeBlindTurn !== undefined ? { observeBlindTurn: deps.observeBlindTurn } : {}),

@@ -1369,4 +1369,3 @@ export function startOnboarding(service: Pick<OnboardingService, 'start'>, log: 
     log('error', 'onboarding failed to start', { error: String(error) });
   }
 }
-

@@ -29,17 +29,29 @@ stranger could execute: goal, boundaries, acceptance, verification.
 
 ## 2. Ops handoff (dispatch)
 
-`POST /api/dispatch` `{job_id, repo_path, title, briefing, display_name?}` — the
+`POST /api/dispatch` `{job_id, repo_path, title, briefing, display_name?, prebootstrap_patch?}` — the
 mechanical handoff behind the chat surface. `display_name` is an optional
 short heist label authored at handoff; it does not replace the full title or
-worker identity. Older jobs without it use a shortened title on minion cards:
+worker identity. Older jobs without it use a shortened title on minion cards.
+`prebootstrap_patch` is an optional, narrowly scoped, hash-pinned dependency
+package reference; its authorization, schema and failure/readback contract are
+specified in [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
+It is not a setup-skip switch or arbitrary source-write API.
 
 1. **Job row** — briefing recorded verbatim; status `dispatched`.
-2. **Lane** — one git worktree per job on branch `gru/<job>` at the
-   FETCHED origin default-branch head (worktree manager, below; a fetch
+2. **Disk floor and lane** — one git worktree per job on branch `gru/<job>` at
+   the FETCHED origin default-branch head (worktree manager, below; a fetch
    failure degrades to local HEAD with `base_source:
-   'local-head-fallback'` recorded, never silently). Status `working`.
-3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
+   'local-head-fallback'` recorded, never silently). A pre-bootstrap patch
+   refuses that fallback and must name this exact fetched base.
+3. **Optional patch, then unchanged setup** — only an explicitly contracted
+   exact package may change the allowlisted dependency file inside the new
+   owned lane. The committed manifest, links/copies and setup commands remain
+   unchanged and must all succeed. Without a package this step is the existing
+   setup path. A patch/setup failure blocks the job and retains the patch lane,
+   its creation receipt and the evidence; no worker starts and no automatic
+   retry runs.
+4. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
    project conventions remain applicable there). New jobs receive the
    GC-owned workflow plus explicit registered job/private artifact context;
@@ -48,8 +60,10 @@ worker identity. Older jobs without it use a shortened title on minion cards:
    ([GC-WORKFLOWS.md](./GC-WORKFLOWS.md)). The briefing prompt is
    delivered as the session's first turn.
 
-Failures are loud and leave no half lanes: a spawn failure sweeps the
-fresh worktree back out and blocks the job with a note.
+Failures are loud. A regular spawn failure sweeps the fresh worktree back out
+and blocks the job with a note. A consumed pre-bootstrap patch is different:
+any failure before its worker is admitted keeps the lane, its creation receipt
+and the readback evidence; see [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
 
 ## 3. Lifecycle on the board
 
@@ -1055,8 +1069,22 @@ by itself, and the turn is expected to ACT.
 awareness layer batches, persists, and calls the chat wake sink.
 
 - **Routing gate** — `notify_wake = "action-required"` (default) wakes for
-  machine-attention rows; `"all"` also wakes for FYI/needs-owner; `"never"`
+  machine-attention rows and for a RECORDED owner decision (#506) whose
+  follow-through is owed; `"all"` also wakes for FYI/needs-owner; `"never"`
   stays passive-only (context rides the next human turn).
+- **Owner decisions wake (issue #506)** — recording a choice on a
+  Gru-owned typed `needs-owner` card opens a Gru turn even in the default
+  mode: the card stays in FOR YOU, but Gru owes the chosen option's
+  follow-through and the card's resolution. The turn names the card, the
+  recorded option and the owed follow-through. Proposal cards whose
+  producer service executes the choice itself (Vector raids/fixes,
+  onboarding, GC reclaim/preserve/lane discard/sweep-pause) stay passive —
+  waking Gru would duplicate the operation or let a premature resolution
+  hide it from its producer. The wake claim is per `(notification id,
+  decided_at)`, so a replay or restart cannot wake twice, a decision never
+  spends the card's incident key, and a decision recorded while the service
+  was down is seeded on boot. `notify_wake = "never"`, the severity floor,
+  the rate limit and quiet hours still apply.
 - **Severity gate** — `wake_min_severity = "info" | "error"` floors a wake
   without changing routing.
 - **Rate limit + coalescing** — `wake_min_interval_ms` (default 5 min)
@@ -1158,7 +1186,12 @@ owner's choice durably and idempotently — it never acks or resolves the
 row, and a decision receipt is not proof its follow-on operation ran; the
 row stays visible as "decision recorded — awaiting follow-through" until
 its owner records the follow-through (`POST /api/notifications/{id}/disposition`
-with the action detail; an undecided row is refused). A discussion-only
+with the action detail; an undecided row is refused). Recording the
+choice on a Gru-owned card opens a follow-through wake unless
+`notify_wake = "never"` (and subject to the severity floor, rate limit and
+quiet hours) (#506), so the operation does not wait for an unrelated turn;
+producer-owned proposal cards keep their producer's own follow-through.
+A discussion-only
 decision (no options yet) is settled through the supported bridge: Gru
 attaches the agreed options with
 `POST /api/notifications/{id}/decision-options` after the chat discussion —

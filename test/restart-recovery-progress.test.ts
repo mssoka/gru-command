@@ -17,6 +17,7 @@ import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCh
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { admitBlindReview, recordBlindAdmission } from '../src/dispatch/blind-review.js';
 import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
@@ -146,7 +147,7 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
     async spawn(_role, options = {}) {
       spawns.push(options);
       if (spawnGate !== null) await spawnGate;
-      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, [], store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? FIXTURE_MINION, () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
+      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, (options.nativeTools ?? []).map((tool) => tool.name), store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? FIXTURE_MINION, () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
       handle.subscribe((event) => { if (event.type === 'state' && ledger.getAgent(handle!.id) !== null) ledger.setAgentState(handle!.id, event.state); });
       return handle;
     },
@@ -155,10 +156,13 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   const stop = new AbortController();
   let supervised: readonly string[] = [];
   const deps = { ledger, registry, worktrees, notifications, signal: stop.signal, pendingProducerBlockers: () => supervised };
-  /** `beforeReceipt` writes what Pi appends between the baseline and the user receipt. */
-  const seed = (text = 'accepted native prompt', beforeReceipt?: () => void) => {
+  /** `beforeReceipt` writes what Pi appends between the baseline and the user
+   * receipt; `nativeTools` is the tool set the binding records (absent = a
+   * binding from before tool sets were recorded). */
+  const seed = (text = 'accepted native prompt', beforeReceipt?: () => void, nativeTools?: readonly string[]) => {
     ledger.prepareDirectiveTarget(intent.requestId, { agentId: 'logical-minion', sessionFile: file });
-    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file, text, authorityManifest: manifest });
+    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file, text, authorityManifest: manifest,
+      ...(nativeTools === undefined ? {} : { nativeTools }) });
     beforeReceipt?.();
     native.append({ role: 'user', content: [{ type: 'text', text }] });
     recordDirectiveProducerCessation(prepareDirectiveProducer({ identity, agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file }));
@@ -3760,6 +3764,84 @@ it('P35 a checkpoint continuation restores the original agent\'s nonempty parent
   expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file, nativeTools: [capability] });
   expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
   await service.dispose();
+});
+
+/** Admit the fixture job as an attested blind review; `keepPackage: false`
+ * is the legacy shape, admitted before packages were kept. */
+function admitFixtureAsBlind(f: Awaited<ReturnType<typeof fixture>>, keepPackage = true): void {
+  const targetSha = 'f'.repeat(40);
+  const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
+  const admission = admitBlindReview({ ledger: f.ledger, jobId: f.intent.jobId, title: 'review (blind)', deliverable: 'review',
+    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture', inputPackage });
+  if (admission === null) throw new Error('the fixture job was not admitted as a blind review');
+  recordBlindAdmission(f.ledger, f.intent.jobId, admission, keepPackage ? inputPackage : undefined);
+}
+
+it('P35 a blind reviewer\'s checkpoint continuation resumes with the tool set its binding recorded', async () => {
+  const capability = { name: 'request_child_worker', description: 'request a child worker for the original parent', inputSchema: { type: 'object' },
+    authorityManifest: 'original-parent:logical-minion', execute: async () => ({ text: 'ok' }) };
+  // A session bound before tool sets were recorded had the parent tools; one
+  // bound with none resumes with none.
+  for (const [recorded, expected] of [[undefined, [capability]], [[], undefined]] as const) {
+    const f = await fixture(); f.seed(undefined, undefined, recorded); admitFixtureAsBlind(f);
+    const service = new DirectiveProgressService({ ...f.deps, parentTools: () => [capability] });
+    service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+    expect(f.native.continuations).toBe(1);
+    expect(f.spawns).toHaveLength(1);
+    expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file });
+    expect(f.spawns[0]!.nativeTools).toEqual(expected);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    await service.dispose();
+  }
+});
+
+it('a native directive binding records the tool set its session was spawned with', async () => {
+  const capability = { name: 'request_child_worker', description: 'request a child worker for the parent', inputSchema: { type: 'object' },
+    authorityManifest: 'parent:logical-minion', execute: async () => ({ text: 'ok' }) };
+  for (const [blind, expected] of [[false, ['request_child_worker']], [true, []]] as const) {
+    const f = await fixture('rebrief');
+    if (blind) admitFixtureAsBlind(f);
+    await executeAcceptedDirective({ ...f.deps, parentTools: () => [capability] }, f.intent.requestId);
+    expect(f.native.prompts).toHaveLength(1);
+    expect(readDirectiveBinding(f.file, f.intent.requestId)?.nativeTools).toEqual(expected);
+  }
+  // A recorded tool set that is not a list of names is a malformed binding.
+  const malformed = await fixture(); malformed.seed(undefined, undefined, ['request_child_worker']);
+  const journal = `${malformed.file}.directives.jsonl`;
+  writeFileSync(journal, readFileSync(journal, 'utf-8').replace('"nativeTools":["request_child_worker"]', '"nativeTools":[7]'));
+  expect(() => readDirectiveBinding(malformed.file, malformed.intent.requestId)).toThrow(/directive native association is malformed/);
+});
+
+it('a re-brief whose fresh reviewer input git cannot read stays for reconciliation', async () => {
+  const f = await fixture('rebrief', true, true);
+  f.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: f.intent.jobId, payload: {
+    object_store: '/recorded/store', target_sha: resolveGitCommit(f.lane.path, 'HEAD'), target_base: null, range_commits: null, inputs: [], source: 'repository', package_sha256: null,
+  } });
+  rmSync(f.lane.path, { recursive: true, force: true });
+  const cleared: string[] = [];
+  await executeAcceptedDirective({ ...f.deps, clearLaneForWriter: async ({ writer }) => { cleared.push(writer); } }, f.intent.requestId);
+  expect(cleared).toEqual([]);
+  expect(f.spawns).toEqual([]);
+  const row = f.ledger.getDirective(f.intent.requestId)!;
+  expect(row.state).not.toBe('failed');
+  expect(row.failReason).toMatch(/^reconcile: .*git cannot read lane/u);
+});
+
+it('a re-brief whose fresh reviewer input cannot be re-delivered fails by name before the lane is cleared for it', async () => {
+  const f = await fixture('rebrief'); admitFixtureAsBlind(f, false);
+  const cleared: string[] = [];
+  await executeAcceptedDirective({ ...f.deps, clearLaneForWriter: async ({ writer }) => { cleared.push(writer); } }, f.intent.requestId);
+  expect(cleared).toEqual([]);
+  expect(f.spawns).toEqual([]);
+  expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', failReason: expect.stringMatching(/^refused before any prompt: fresh reviewer refused before any effect: .*was not kept/u) });
+});
+
+it('a review job\'s durable re-brief gives the fresh reviewer the read-only orders', async () => {
+  const f = await fixture('rebrief', true, true);
+  await executeAcceptedDirective(f.deps, f.intent.requestId);
+  expect(f.native.prompts).toHaveLength(1);
+  expect(f.native.prompts[0]).toContain('this brief is READ-ONLY');
+  expect(f.native.prompts[0]).not.toContain('commit your work to the branch');
 });
 
 async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {

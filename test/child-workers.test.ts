@@ -22,6 +22,7 @@ import {
 import type { DispatchService } from '../src/dispatch/service.js';
 import type { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { admitBlindReview, recordBlindAdmission } from '../src/dispatch/blind-review.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { DiskFloorGate, GIB } from '../src/maintenance/disk.js';
 import type { AgentCapabilities, AgentHandle, AgentState, PromptOptions } from '../src/runtime/types.js';
@@ -888,6 +889,26 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(afterCancel.resultState).toBeNull();
     expect(afterCancel.state).not.toBe('cancelled');
     expect(h.ledger.latestEventOfKind('child.stop-unproven')).not.toBeNull();
+    h.close();
+  });
+
+  it('refuses a child for an admitted blind reviewer by name, before any child exists', async () => {
+    const h = makeHarness();
+    const targetSha = 'f'.repeat(40);
+    const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
+    const admission = admitBlindReview({
+      ledger: h.ledger, jobId: 'job-1', title: 'review (blind)', deliverable: 'review',
+      briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture', inputPackage,
+    });
+    if (admission === null) throw new Error('job-1 was not admitted as a blind review');
+    recordBlindAdmission(h.ledger, 'job-1', admission, inputPackage);
+    const requestTool = h.service.parentTools('parent-1').find((tool) => tool.name === 'request_child_worker')!;
+    const refused = JSON.parse((await requestTool.execute({
+      purpose: 'read the triage notes for me', authority: 'read-only', task: 'cat docs/triage.md', idempotency_key: 'k-blind',
+    })).text) as { error: string; detail: string };
+    expect(refused).toMatchObject({ error: 'parent_not_permitted', detail: expect.stringContaining('admitted blind review') });
+    expect(h.ledger.listChildWorkers({ parentAgentId: 'parent-1' })).toEqual([]);
+    expect(h.spawns).toEqual([]);
     h.close();
   });
 

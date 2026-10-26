@@ -1,15 +1,16 @@
 import { standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DirectiveDispatchDeferredError, DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, DirectiveRoutingContractError, freshReviewInput, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, ReviewInputUnavailableError, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { renderReviewSourceBlock } from '../src/dispatch/review-source.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi, type ObligationRecord } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
-import type { AgentHandle, AgentRuntime } from '../src/runtime/types.js';
+import type { AgentHandle, AgentRuntime, SpawnOptions } from '../src/runtime/types.js';
 import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -17,6 +18,7 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate, RetrySettlementUnavailableError, type RetrySettlement } from '../src/runtime/pacing.js';
 import { admitBlindReview, blindCoverageOf, observeBlindSessionAccess, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { AgentRecord } from '../src/ledger/api.js';
+import type { LessonPointer } from '../src/lessons/types.js';
 
 /**
  * The follow-up delivery signal (R2 review B3): a settled directive or
@@ -103,6 +105,47 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
 }
 
 describe('fresh fix worker association', () => {
+  it('refuses a directive that would spawn into a retained patched lane whose worker admission is unproven (#495)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-patched-lane-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Patched lane' });
+      // The patched dispatch failed after its lane was retained: the claim
+      // receipt exists, but no worker was ever admitted (no minion-spawned).
+      ledger.setJobStatus('job-1', 'blocked');
+      ledger.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-creation-claimed', jobId: 'job-1', payload: { version: 1 } });
+      const spawn = vi.fn(async () => { throw new Error('spawn must not be reached'); });
+      await expect(routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'continue the work', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn, disposeHandle: async () => {} },
+      })).rejects.toThrow(/retains a patched lane whose worker admission is unproven.*prebootstrap-patch/u);
+      expect(spawn).not.toHaveBeenCalled();
+      // Once dispatch has admitted a worker, the same directive routes again:
+      // the guard reads the spawn receipt, not the patch receipt alone.
+      ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'job-1', payload: { agentId: 'minion-1' } });
+      const handle = {
+        id: 'minion-1', role: 'minion', sessionFile: null,
+        async prompt() {},
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const routed = await routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'continue the work', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+      });
+      expect(routed.delivered).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
   it('releases a paced existing-handle directive when job is binned while queued', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-pacing-bin-'));
     cleanupDirs.push(dir);
@@ -697,7 +740,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
         spawn: async (role: string) => { spawned.push(role); throw new Error('no spawn is expected'); },
       };
       const ledger = {
-        getAgent: () => null, listAgents: () => [], registerAgent: () => {}, getJob: () => ({ briefing: 'original contract' }),
+        getAgent: () => null, listAgents: () => [], registerAgent: () => {}, getJob: () => ({ briefing: 'original contract' }), latestJobEvent: () => null,
         listImplementerMinions: () => [{ id: 'minion-prior', role: 'minion', jobId: 'job-deferral', sessionFile: '/sessions/prior.jsonl' }],
       };
       let guards = 0;
@@ -736,6 +779,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
+      latestJobEvent: () => null,
     };
     const outcome = await routeFixDirectiveToMinion({
       registry: registry as never, ledger: ledger as never, worktrees,
@@ -760,6 +804,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
+      latestJobEvent: () => null,
     };
     await routeFixDirectiveToMinion({
       registry: registry as never, ledger: ledger as never, worktrees,
@@ -797,6 +842,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
+        latestJobEvent: () => null,
       } as never,
       worktrees: { listWorktrees: () => [] } as never,
       jobId: 'job-live',
@@ -839,6 +885,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
+        latestJobEvent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -878,6 +925,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
+        latestJobEvent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -911,6 +959,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
           registerAgent: () => { throw registrationError; },
           getJob: () => activeJobRecord('job-regfail'),
           getAgent: () => null,
+          latestJobEvent: () => null,
         },
         worktrees: { listWorktrees: () => [lane] } as never,
         jobId: 'job-regfail',
@@ -939,6 +988,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -979,6 +1029,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         },
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id, state) => { states.push(`${id}:${state}`); return minionRecord(id, 'job-cancel', null); },
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1027,6 +1078,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1056,6 +1108,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1089,6 +1142,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1126,6 +1180,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
         getAgent: () => null,
+        latestJobEvent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -1155,13 +1210,14 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
     // binding): it survives listImplementerMinions, so the directive router is
     // a real continuation seam for it.
     ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+    const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
     const admission = admitBlindReview({
       ledger, jobId, title: 'review (blind)', deliverable: 'review',
       briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
-      inputPackage: { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+      inputPackage,
     });
     if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-    recordBlindAdmission(ledger, jobId, admission);
+    recordBlindAdmission(ledger, jobId, admission, inputPackage);
     return { ledger, dispose: () => db.close() };
   }
 
@@ -1240,6 +1296,94 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
     }
   });
 
+  it('does not give a blind native directive continuation the automatic lesson pointer', async () => {
+    const jobId = 'job-blind-directive-context';
+    const agentId = 'blind-directive-context-minion';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-directive-context-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, agentId, sessionFile);
+    const canary: LessonPointer = {
+      chapter: 'synthetic-book-canary', lesson: 'outside-package',
+      path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
+    };
+    let referenceLookups = 0;
+    const prompts: string[] = [];
+    try {
+      const handle = {
+        id: agentId, role: 'minion', sessionFile,
+        async prompt(text: string) { prompts.push(text); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const result = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        lessons: { referencesFor: () => { referenceLookups += 1; return [canary]; } },
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+        onPrepared: () => {},
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: agentId });
+      expect(referenceLookups).toBe(0);
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).not.toContain('/synthetic-book/chapters/synthetic-book-canary.md');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('briefs a fresh blind re-brief with its frozen package exactly once, reviewer orders, no lesson pointer or child tools', async () => {
+    const jobId = 'job-blind-fresh-rebrief-context';
+    const agentId = 'fresh-blind-context-minion';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-rebrief-context-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, 'prior-blind-context-minion', join(dir, 'prior.jsonl'));
+    const canary: LessonPointer = {
+      chapter: 'synthetic-book-canary', lesson: 'outside-package',
+      path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
+    };
+    let referenceLookups = 0;
+    const prompts: string[] = [];
+    try {
+      const handle = {
+        id: agentId, role: 'minion', sessionFile,
+        async prompt(text: string) { prompts.push(text); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const spawned: SpawnOptions[] = [];
+      const result = await rebriefFreshMinion({
+        registry: { getHandle: () => null, spawn: async (_role, options) => { spawned.push(options ?? {}); return handle; }, disposeHandle: async () => {} },
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        // A briefing that names the package header is still given the package.
+        jobId, note: 'continue only from the frozen source', briefing: 'Review the BLIND INPUT PACKAGE (below) read-only.',
+        lessons: { referencesFor: () => { referenceLookups += 1; return [canary]; } },
+        parentTools: () => [{ name: 'request_child_worker', description: 'fixture', inputSchema: {}, async execute() { return { text: '{}' }; } }],
+      });
+      expect(result.outcome).toBe('completed');
+      expect(spawned.map((options) => options.nativeTools ?? null)).toEqual([null]);
+      expect(referenceLookups).toBe(0);
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
+      expect(prompts[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
+      expect(prompts[0]).toContain('this brief is READ-ONLY');
+      expect(prompts[0]).not.toContain('commit your work to the branch');
+      expect(prompts[0]).not.toContain('/synthetic-book/chapters/synthetic-book-canary.md');
+    } finally {
+      h.dispose();
+    }
+  });
+
   it('F4: a pre-aborted settlement observes its deferred retry tail and invalidates coverage', async () => {
     const jobId = 'job-blind-prebort';
     const agentId = 'minion-blind-prebort';
@@ -1290,6 +1434,386 @@ describe('directive-driven resume blind observation (issue #339 D1)', () => {
   });
 });
 
+describe('a fresh reviewer session gets its recorded input once (#503)', () => {
+  const JOB = 'job-fresh-review';
+  const SOURCE_HEADER = 'REVIEW SOURCE (';
+  const HEADER = 'BLIND INPUT PACKAGE (your review input';
+  const FILE_LINE = 'File src/feature.ts (at the target):';
+  const READ_ONLY = 'this brief is READ-ONLY';
+  const CANARY: LessonPointer = {
+    chapter: 'synthetic-book-canary', lesson: 'outside-package',
+    path: '/synthetic-book/chapters/synthetic-book-canary.md', why: 'synthetic fixture only',
+  };
+  const TOOL = { name: 'request_child_worker', description: 'fixture', inputSchema: {}, async execute() { return { text: '{}' }; } };
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync('git', ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', ...args], { cwd, encoding: 'utf-8' }).trim();
+
+  /** A real ledger and a real git lane for a review job: an attested blind
+   * admission (its package kept unless `keepPackage: false`, the legacy
+   * shape) or a claims reviewer, and the verified review source its
+   * dispatch recorded for the lane's real target, base and input objects.
+   * `movedRepo`: the lane is a worktree whose repository was then moved and
+   * the lane repaired (#427). */
+  function reviewLane(opts: {
+    readonly blind?: boolean;
+    readonly keepPackage?: boolean;
+    readonly priorSession?: 'conversation' | 'empty' | 'header-only' | 'missing' | 'none';
+    readonly source?: 'lane' | 'missing-object' | 'malformed';
+    readonly movedRepo?: boolean;
+  } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fresh-review-'));
+    cleanupDirs.push(dir);
+    const repo = opts.movedRepo === true ? join(dir, 'origin', 'repo') : dir;
+    mkdirSync(join(repo, 'docs'), { recursive: true });
+    git(repo, 'init', '-q');
+    writeFileSync(join(repo, 'docs', 'claims.md'), 'claim one\n');
+    git(repo, 'add', 'docs');
+    git(repo, 'commit', '-qm', 'base');
+    writeFileSync(join(repo, 'docs', 'claims.md'), 'claim one\nclaim two\n');
+    git(repo, 'commit', '-qam', 'target');
+    const target = git(repo, 'rev-parse', 'HEAD');
+    const base = git(repo, 'rev-parse', 'HEAD~1');
+    const blob = git(repo, 'rev-parse', 'HEAD:docs/claims.md');
+    const lane = opts.movedRepo === true ? join(dir, 'lane') : repo;
+    if (opts.movedRepo === true) git(repo, 'worktree', 'add', '-q', '-b', 'gru/review', lane);
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const blind = opts.blind !== false;
+    ledger.addJob({ id: JOB, repo: 'fixture', title: 'review', deliverable: 'review', briefing: 'Review the BLIND INPUT PACKAGE (quoted) read-only.' });
+    ledger.setJobStatus(JOB, 'working');
+    const priorSession = join(dir, 'prior.jsonl');
+    const transcript = {
+      conversation: `${JSON.stringify({ type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Review it.' }] } })}\n`,
+      empty: '',
+      'header-only': `${JSON.stringify({ type: 'session', version: 3, id: 'prior-session', timestamp: '2026-10-24T00:00:00.000Z', cwd: lane })}\n`,
+    } as const;
+    const session = opts.priorSession ?? 'conversation';
+    if (session !== 'missing' && session !== 'none') writeFileSync(priorSession, transcript[session], 'utf-8');
+    ledger.registerAgent({ id: 'prior-reviewer', role: 'minion', jobId: JOB, sessionFile: session === 'none' ? null : priorSession });
+    const source = { targetSha: target, targetBase: base, rangeCommits: 1, inputs: blind ? [] : [{ path: 'docs/claims.md', lens: 'claims' as const, blob }] };
+    ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: JOB, payload: {
+      object_store: realpathSync(join(repo, '.git')),
+      target_sha: opts.source === 'missing-object' ? 'e'.repeat(40) : source.targetSha, target_base: source.targetBase, range_commits: source.rangeCommits,
+      inputs: opts.source === 'malformed' ? [{ path: 'docs/claims.md', lens: 'unknown-lens', blob }] : source.inputs,
+      source: 'repository', package_sha256: null,
+    } });
+    if (opts.movedRepo === true) {
+      // The owner moves the repository folder; #427's repair reconnects the lane.
+      const moved = join(dir, 'moved', 'repo');
+      mkdirSync(join(dir, 'moved'));
+      renameSync(repo, moved);
+      git(moved, 'worktree', 'repair', lane);
+    }
+    if (blind) {
+      const inputPackage = { baseSha: base, targetSha: target, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
+      const admission = admitBlindReview({
+        ledger, jobId: JOB, title: 'review (blind)', deliverable: 'review',
+        briefing: 'Review the immutable package read-only.', targetSha: target, repoName: 'fixture', inputPackage,
+      });
+      if (admission === null) throw new Error(`job "${JOB}" was not admitted as a blind review`);
+      recordBlindAdmission(ledger, JOB, admission, opts.keepPackage === false ? undefined : inputPackage);
+    }
+    const prompts: string[] = [];
+    const spawned: SpawnOptions[] = [];
+    const disposed: string[] = [];
+    const handle = (id: string): AgentHandle => ({
+      id, role: 'minion', sessionFile: join(dir, `${id}.jsonl`),
+      async prompt(text: string) { prompts.push(text); },
+      capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+      async steer() {}, async followUp() {},
+      subscribe() { return () => {}; },
+      health() { return { state: 'idle' as const, lastActivity: null, sessionFile: join(dir, `${id}.jsonl`) }; },
+      async dispose() { disposed.push(id); },
+      cessationEvidence: () => 'ceased' as const,
+    });
+    const sourceBlock = renderReviewSourceBlock(source).join('\n');
+    return { ledger, dir, lane, target, blob, priorSession, prompts, spawned, disposed, handle, sourceBlock, dispose: () => db.close() };
+  }
+
+  it('the production fresh re-brief carries the verified source and the package exactly once, reviewer orders, no lesson pointer or child tools', async () => {
+    const h = reviewLane();
+    const prior = h.handle('prior-reviewer');
+    let lookups = 0;
+    let fenced = 0;
+    const prepared: string[] = [];
+    try {
+      // Exactly the composition directive-progress hands the route for a
+      // durable rebrief; the contract quotes the package header.
+      const contract = h.ledger.effectiveContract(JOB)!.text;
+      const directive = renderRebriefPrompt({ jobId: JOB, note: 'continue the review', briefing: contract, workRevision: 0, reviewRole: 'blind', deliverable: 'review' });
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive, freshSession: true, contract, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: (id) => (id === 'prior-reviewer' && !h.disposed.includes(id) ? prior : null),
+          spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+          disposeHandle: async (handle) => { await handle.dispose(); },
+        },
+        lessons: { referencesFor: () => { lookups += 1; return [CANARY]; } },
+        parentTools: () => [TOOL],
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+        onPrepared: (handle) => { prepared.push(handle.id); },
+        beforeTurnSideEffect: () => { fenced += 1; },
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: 'fresh-reviewer' });
+      expect(h.disposed).toContain('prior-reviewer');
+      expect(prepared).toEqual(['fresh-reviewer']);
+      expect(fenced).toBeGreaterThan(0);
+      expect(h.spawned).toHaveLength(1);
+      expect(h.spawned[0]!.nativeTools).toBeUndefined();
+      expect(h.prompts).toHaveLength(1);
+      const prompt = h.prompts[0]!;
+      expect(count(prompt, SOURCE_HEADER)).toBe(1);
+      expect(count(prompt, h.sourceBlock)).toBe(1);
+      expect(count(prompt, HEADER)).toBe(1);
+      expect(count(prompt, FILE_LINE)).toBe(1);
+      expect(prompt.indexOf(SOURCE_HEADER)).toBeLessThan(prompt.indexOf(HEADER));
+      expect(count(prompt, READ_ONLY)).toBe(1);
+      expect(prompt).not.toContain('commit your work to the branch');
+      expect(lookups).toBe(0);
+      expect(prompt).not.toContain(CANARY.path);
+    } finally { h.dispose(); }
+  });
+
+  it('a fresh replacement on the native directive path gets the input once and reviewer orders', async () => {
+    const h = reviewLane({ priorSession: 'none' });
+    try {
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'Please re-check finding 2.', contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        parentTools: () => [TOOL],
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+        onPrepared: () => {},
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: 'fresh-reviewer' });
+      expect(h.spawned.map((options) => [options.resumeFile ?? null, options.nativeTools ?? null])).toEqual([[null, null]]);
+      const prompt = h.prompts[0]!;
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 1, 1]);
+    } finally { h.dispose(); }
+  });
+
+  it('a recorded session whose transcript is gone, empty or header-only is briefed as fresh, not resumed', async () => {
+    for (const priorSession of ['missing', 'empty', 'header-only'] as const) {
+      const h = reviewLane({ priorSession });
+      try {
+        const result = await routeFixDirectiveToMinion({
+          jobId: JOB, directive: 'continue the review', contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
+          ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+          // A runtime opens such a file as a new, empty session.
+          registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('reopened'); }, disposeHandle: async () => {} },
+        });
+        expect(result, priorSession).toMatchObject({ delivered: true });
+        expect(h.spawned.map((options) => options.resumeFile ?? null), priorSession).toEqual([null]);
+        const prompt = h.prompts[0]!;
+        expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)], priorSession).toEqual([1, 1, 1]);
+      } finally { h.dispose(); }
+    }
+  });
+
+  it('a resume-failed fallback is briefed with the input once and reviewer orders', async () => {
+    const h = reviewLane();
+    try {
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'Re-check what the BLIND INPUT PACKAGE (as quoted earlier) shows.',
+        contract: h.ledger.effectiveContract(JOB)!.text, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async (_role, options) => {
+            h.spawned.push(options ?? {});
+            if (options?.resumeFile !== undefined) throw new Error('the prior session cannot resume');
+            return h.handle('fallback-reviewer');
+          },
+          disposeHandle: async () => {},
+        },
+        lessons: { referencesFor: () => [CANARY] },
+        parentTools: () => [TOOL],
+      });
+      expect(result).toMatchObject({ delivered: true, minionId: 'fallback-reviewer' });
+      expect(h.spawned.map((options) => [options.resumeFile ?? null, options.nativeTools ?? null])).toEqual([[h.priorSession, null], [null, null]]);
+      expect(h.prompts).toHaveLength(1);
+      const prompt = h.prompts[0]!;
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, FILE_LINE), count(prompt, READ_ONLY)]).toEqual([1, 1, 1, 1]);
+      expect(prompt).not.toContain(CANARY.path);
+    } finally { h.dispose(); }
+  });
+
+  it("a claims reviewer's fresh re-brief gets its verified source with its inputs, reviewer orders and no package", async () => {
+    const h = reviewLane({ blind: false });
+    try {
+      const contract = h.ledger.effectiveContract(JOB)!.text;
+      const directive = renderRebriefPrompt({ jobId: JOB, note: 'continue the review', briefing: contract, workRevision: 0, reviewRole: null, deliverable: 'review' });
+      const result = await routeFixDirectiveToMinion({
+        jobId: JOB, directive, freshSession: true, contract, signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        parentTools: () => [TOOL],
+      });
+      expect(result).toMatchObject({ delivered: true });
+      const prompt = h.prompts[0]!;
+      expect(count(prompt, h.sourceBlock)).toBe(1);
+      expect(prompt).toContain(`Required claims input: docs/claims.md @ ${h.target} (blob ${h.blob})`);
+      expect([count(prompt, SOURCE_HEADER), count(prompt, HEADER), count(prompt, READ_ONLY)]).toEqual([1, 0, 1]);
+      expect(prompt).not.toContain('commit your work to the branch');
+      // An ordinary reviewer keeps its child tools.
+      expect(h.spawned[0]!.nativeTools?.map((tool) => tool.name)).toEqual(['request_child_worker']);
+    } finally { h.dispose(); }
+  });
+
+  it('a package that was never kept refuses by name before any disposal or spawn', async () => {
+    const fresh = reviewLane({ keepPackage: false });
+    const prior = fresh.handle('prior-reviewer');
+    try {
+      const refusal = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+        ledger: fresh.ledger, worktrees: { listWorktrees: () => [laneAt(fresh.lane)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => prior,
+          spawn: async (_role, options) => { fresh.spawned.push(options ?? {}); return fresh.handle('fresh-reviewer'); },
+          disposeHandle: async (handle) => { await handle.dispose(); },
+        },
+      }).then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(ReviewInputUnavailableError);
+      expect(refusal).toBeInstanceOf(DirectivePromptRefusedError);
+      expect(String(refusal)).toMatch(/its attested blind input package was not kept/u);
+      expect(fresh.disposed).toEqual([]);
+      expect(fresh.spawned).toEqual([]);
+      expect(fresh.prompts).toEqual([]);
+    } finally { fresh.dispose(); }
+    // A non-native directive that could fall back refuses before even the
+    // resume attempt.
+    const fallback = reviewLane({ keepPackage: false });
+    try {
+      const refusal = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'continue', contract: 'c', signal: new AbortController().signal,
+        ledger: fallback.ledger, worktrees: { listWorktrees: () => [laneAt(fallback.lane)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async (_role, options) => {
+            fallback.spawned.push(options ?? {});
+            if (options?.resumeFile !== undefined) throw new Error('the prior session cannot resume');
+            return fallback.handle('fallback-reviewer');
+          },
+          disposeHandle: async () => {},
+        },
+      }).then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(ReviewInputUnavailableError);
+      expect(fallback.spawned).toEqual([]);
+      expect(fallback.prompts).toEqual([]);
+    } finally { fallback.dispose(); }
+  });
+
+  it('a moved and repaired repository keeps its input: the lane still reads the verified objects', () => {
+    const h = reviewLane({ blind: false, movedRepo: true });
+    try {
+      // The recorded object store path no longer exists; the objects do.
+      expect(freshReviewInput(h.ledger, JOB, h.lane)).toEqual([h.sourceBlock]);
+    } finally { h.dispose(); }
+  });
+
+  it('a git failure reading the lane propagates with its text, never as a refusal', async () => {
+    for (const fault of ['missing lane directory', 'git missing from PATH'] as const) {
+      const h = reviewLane();
+      const prior = h.handle('prior-reviewer');
+      const lanePath = fault === 'missing lane directory' ? join(h.dir, 'gone-lane') : h.lane;
+      const path = process.env['PATH'];
+      if (fault === 'git missing from PATH') process.env['PATH'] = join(h.dir, 'no-git-here');
+      try {
+        const error = await routeFixDirectiveToMinion({
+          jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+          ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(lanePath)] } as unknown as WorktreePort,
+          registry: {
+            getHandle: () => prior,
+            spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+            disposeHandle: async (handle) => { await handle.dispose(); },
+          },
+        }).then(() => null, (caught: unknown) => caught);
+        expect(String(error), fault).toMatch(/git cannot read lane .*ENOENT/u);
+        expect(error, fault).not.toBeInstanceOf(DirectivePromptRefusedError);
+        expect(h.disposed, fault).toEqual([]);
+        expect(h.spawned, fault).toEqual([]);
+      } finally { process.env['PATH'] = path; h.dispose(); }
+    }
+  });
+
+  it('a lane that cannot read the verified objects, or a malformed source record, refuses by name before any disposal or spawn', async () => {
+    for (const [source, reason] of [['missing-object', /lane .* cannot read the verified objects e{40}/u], ['malformed', /verified review source record .* is malformed/u]] as const) {
+      const h = reviewLane({ source });
+      const prior = h.handle('prior-reviewer');
+      try {
+        const refusal = await routeFixDirectiveToMinion({
+          jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+          ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+          registry: {
+            getHandle: () => prior,
+            spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+            disposeHandle: async (handle) => { await handle.dispose(); },
+          },
+        }).then(() => null, (error: unknown) => error);
+        expect(refusal, source).toBeInstanceOf(ReviewInputUnavailableError);
+        expect(String(refusal), source).toMatch(reason);
+        expect(h.disposed, source).toEqual([]);
+        expect(h.spawned, source).toEqual([]);
+      } finally { h.dispose(); }
+    }
+  });
+
+  it('a transient ledger fault while reading the input propagates for reconciliation, never as a refusal', async () => {
+    const h = reviewLane();
+    const prior = h.handle('prior-reviewer');
+    const busy = new Proxy(h.ledger, {
+      get(target, key) {
+        if (key === 'latestJobEvent') {
+          return (jobId: string, kind: string) => {
+            if (kind === 'review.blind-input-package') throw new Error('SQLITE_BUSY: database is locked');
+            return target.latestJobEvent(jobId, kind);
+          };
+        }
+        const value = Reflect.get(target, key) as unknown;
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    try {
+      const fault = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'rebrief', freshSession: true, contract: 'c', signal: new AbortController().signal,
+        ledger: busy, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => prior,
+          spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); },
+          disposeHandle: async (handle) => { await handle.dispose(); },
+        },
+      }).then(() => null, (error: unknown) => error);
+      expect(String(fault)).toMatch(/SQLITE_BUSY/u);
+      expect(fault).not.toBeInstanceOf(DirectivePromptRefusedError);
+      expect(h.disposed).toEqual([]);
+      expect(h.spawned).toEqual([]);
+    } finally { h.dispose(); }
+  });
+
+  it('a ledger that cannot read the admitted role is refused by name, never routed as an ordinary job', async () => {
+    const h = reviewLane();
+    try {
+      const withoutRoleLookup = {
+        listImplementerMinions: h.ledger.listImplementerMinions.bind(h.ledger), listAgents: h.ledger.listAgents.bind(h.ledger),
+        registerAgent: h.ledger.registerAgent.bind(h.ledger), getJob: h.ledger.getJob.bind(h.ledger), getAgent: h.ledger.getAgent.bind(h.ledger),
+      };
+      const refusal = await routeFixDirectiveToMinion({
+        jobId: JOB, directive: 'continue', contract: 'c', signal: new AbortController().signal,
+        ledger: withoutRoleLookup as unknown as LedgerApi, worktrees: { listWorktrees: () => [laneAt(h.lane)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async (_role, options) => { h.spawned.push(options ?? {}); return h.handle('fresh-reviewer'); }, disposeHandle: async () => {} },
+        lessons: { referencesFor: () => [CANARY] },
+      }).then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DirectiveRoutingContractError);
+      expect(String(refusal)).toMatch(/latestJobEvent/u);
+      expect(h.spawned).toEqual([]);
+      expect(h.prompts).toEqual([]);
+    } finally { h.dispose(); }
+  });
+});
+
 describe('directive continuation physical-tail observation (issue #339 D1 tail)', () => {
   const TARGET = 'a'.repeat(40);
   const PERMITTED = 'src/feature.ts:1:export const feature = 1;';
@@ -1304,13 +1828,13 @@ describe('directive continuation physical-tail observation (issue #339 D1 tail)'
     ledger.setJobStatus(jobId, 'working');
     ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
     if (opts.admit) {
+      const inputPackage = { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
       const admission = admitBlindReview({
         ledger, jobId, title: 'review (blind)', deliverable: 'review',
-        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
-        inputPackage: { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture', inputPackage,
       });
       if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-      recordBlindAdmission(ledger, jobId, admission);
+      recordBlindAdmission(ledger, jobId, admission, inputPackage);
     }
     return { ledger, dispose: () => db.close() };
   }
@@ -1632,6 +2156,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
           listImplementerMinions: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           registerAgent: () => {},
           getJob: () => activeJobRecord('job-queued'),
+          latestJobEvent: () => null,
         } as never,
         worktrees: { listWorktrees: () => [] } as never,
         jobId: 'job-queued',

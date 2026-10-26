@@ -13,6 +13,8 @@ import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
 import type { DiskBoardView } from '../maintenance/disk.js';
 import type { VectorBoardView } from '../vector/board.js';
+import { briefingReviewBoardView, type BriefingReviewBoardView } from '../briefing-review/board.js';
+import type { BriefingReviewStage } from '../briefing-review/types.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
 import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
 import {
@@ -313,6 +315,10 @@ export interface BoardSnapshot {
   /** Vector's raids at a glance (#351; null when unwired — the board then
    * shows no raids card). Sent with raids off too, as `enabled: false`. */
   readonly vector: VectorBoardView | null;
+  /** Nefario's live passes (GH-505): always present from this server; null
+   * when the event read fails or the bounded read hits its limit — logged,
+   * never a broken snapshot. */
+  readonly briefingReview: BriefingReviewBoardView | null;
   /** Provider pacing gate (limits, running, queued with reasons). Null when
    * the pacing feature is off — the pre-pacing snapshot shape. */
   readonly pacing: PacingGateView | null;
@@ -504,6 +510,12 @@ export interface BoardEngineOptions {
   readonly disk?: () => DiskBoardView | null;
   /** #351: the raids card (late-bound Vector service). */
   readonly vector?: () => VectorBoardView | null;
+  /** GH-505: Nefario's block (late-bound briefing-review service counts).
+   * Absent = no block (`null`); the effective stage maps 1→advisory,
+   * 2→high, 3/auto→high+medium. */
+  readonly briefingReview?: () => Parameters<typeof briefingReviewBoardView>[0]['counts'];
+  /** GH-505: the configured rollout stage the wire literal maps from. */
+  readonly briefingReviewStage?: BriefingReviewStage;
   /** Provider pacing: gate view (late-bound; null when the feature is off). */
   readonly pacing?: () => PacingGateView | null;
   /** Durable pipeline queue projection (late-bound; null when unwired). */
@@ -547,6 +559,8 @@ export class BoardEngine {
     this.verifyQueue = opts.verifyQueue ?? (() => null);
     this.disk = opts.disk ?? (() => null);
     this.vector = opts.vector ?? (() => null);
+    this.briefingReview = opts.briefingReview ?? (() => null);
+    this.briefingReviewStage = opts.briefingReviewStage ?? 'auto';
     this.pacing = opts.pacing ?? (() => null);
     this.pipeline = opts.pipeline ?? (() => null);
     this.selfHeal = opts.selfHeal ?? (() => null);
@@ -566,6 +580,8 @@ export class BoardEngine {
   private readonly verifyQueue: () => VerificationQueueView | null;
   private readonly disk: () => DiskBoardView | null;
   private readonly vector: () => VectorBoardView | null;
+  private readonly briefingReview: () => Parameters<typeof briefingReviewBoardView>[0]['counts'];
+  private readonly briefingReviewStage: BriefingReviewStage;
   private readonly pacing: () => PacingGateView | null;
   private readonly pipeline: () => PipelineBoardView | null;
   private readonly selfHeal: () => SelfHealView | null;
@@ -882,6 +898,7 @@ export class BoardEngine {
       verify: this.verifyQueue(),
       disk: this.diskView(),
       vector: this.vectorView(),
+      briefingReview: this.briefingReviewView(),
       pacing: this.pacing(),
       pipeline: this.pipeline(),
       selfHeal: this.selfHeal(),
@@ -909,6 +926,18 @@ export class BoardEngine {
       return this.vector();
     } catch (error) {
       this.log('error', 'vector view read failed', { error: String(error) });
+      return null;
+    }
+  }
+
+  /** Nefario's block (GH-505): the config stage maps onto the wire literal,
+   * and any failed or truncated read becomes `null` (the card then says it
+   * could not read), never a broken snapshot. */
+  private briefingReviewView(): BriefingReviewBoardView | null {
+    try {
+      return briefingReviewBoardView({ counts: this.briefingReview(), stage: this.briefingReviewStage });
+    } catch (error) {
+      this.log('error', 'briefing review view read failed', { error: String(error) });
       return null;
     }
   }

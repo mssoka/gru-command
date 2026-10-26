@@ -782,6 +782,20 @@ describe('ledger api — the record of state', () => {
     expect(api.latestJobEvent('scoped-events', 'never-happened')).toBeNull();
     expect(api.latestJobEvent('no-such-job', 'silas.wake')).toBeNull();
   });
+  it('listJobEvents narrows to kinds, reads oldest first on request, and keeps the oldest under its limit', () => {
+    api.addJob({ id: 'kinded-events', repo: 'billing-api', title: 'evidence window' });
+    const admitted = api.appendCustomEvent({ kind: 'job.prebootstrap-patch-admitted', jobId: 'kinded-events', payload: {} });
+    api.appendCustomEvent({ kind: 'silas.wake', jobId: 'kinded-events', payload: {} });
+    const started = api.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-started', jobId: 'kinded-events', payload: {} });
+    const applied = api.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-applied', jobId: 'kinded-events', payload: {} });
+    api.appendCustomEvent({ kind: 'worktree.prebootstrap-patch-started', jobId: 'fix-login-flow', payload: {} });
+    const kinds = ['job.prebootstrap-patch-admitted', 'worktree.prebootstrap-patch-started', 'worktree.prebootstrap-patch-applied'];
+    expect(api.listJobEvents('kinded-events', { kinds, order: 'asc' }).map((event) => event.seq)).toEqual([admitted.seq, started.seq, applied.seq]);
+    expect(api.listJobEvents('kinded-events', { kinds }).map((event) => event.seq)).toEqual([applied.seq, started.seq, admitted.seq]);
+    expect(api.listJobEvents('kinded-events', { kinds, order: 'asc', limit: 2 }).map((event) => event.seq)).toEqual([admitted.seq, started.seq]);
+    expect(api.listJobEvents('kinded-events', { kinds: [] }).map((event) => event.kind)).toContain('silas.wake');
+  });
+
   it('latestEventOfKinds/countEventsSince answer the board health cards (Silas wake + today)', () => {
     api.appendCustomEvent({ kind: 'silas.wake', payload: { marker: 'health-test' } });
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId: 'scoped-events', payload: { marker: 'health-test' } });

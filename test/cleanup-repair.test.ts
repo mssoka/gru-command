@@ -658,6 +658,7 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (id: string) => h.ledger.getJob(id),
         getAgent: () => null,
+        latestJobEvent: () => null,
       },
       worktrees: manager,
       jobId: 'job-moved',

@@ -49,6 +49,7 @@ describe('compiled service: the production blind observer is installed at startu
       ledger.addJob({ id: jobId, repo: 'fixture', title: 'blind review' });
       ledger.setJobStatus(jobId, 'working');
       ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+      const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
       const admission = admitBlindReview({
         ledger,
         jobId,
@@ -57,10 +58,10 @@ describe('compiled service: the production blind observer is installed at startu
         briefing: 'Review the immutable package read-only.',
         targetSha,
         repoName: 'fixture',
-        inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+        inputPackage,
       });
       if (admission === null) throw new Error('the job was not admitted as a blind review');
-      recordBlindAdmission(ledger, jobId, admission);
+      recordBlindAdmission(ledger, jobId, admission, inputPackage);
     } finally {
       db.close();
     }
@@ -123,9 +124,15 @@ describe('compiled service: the production blind observer is installed at startu
       const worktrees = new InMemoryWorktreePort(join(workspace, 'wtroot'), ledger);
       const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
       if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane);
-      writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 'blind-http-session', version: 3, cwd: lane.path })}\n`);
+      // The reviewer's session holds its conversation, so the directive
+      // resumes it.
+      writeFileSync(sessionFile, [
+        { type: 'session', id: 'blind-http-session', version: 3, cwd: lane.path },
+        { type: 'message', id: 'blind-http-briefing', parentId: null, message: { role: 'user', content: [{ type: 'text', text: 'Review the immutable package read-only.' }] } },
+      ].map((row) => `${JSON.stringify(row)}\n`).join(''));
       ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
       ledger.setAgentState(agentId, 'idle');
+      const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
       const admission = admitBlindReview({
         ledger,
         jobId,
@@ -134,10 +141,10 @@ describe('compiled service: the production blind observer is installed at startu
         briefing: 'Review the immutable package read-only.',
         targetSha,
         repoName: 'fixture',
-        inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+        inputPackage,
       });
       if (admission === null) throw new Error('the job was not admitted as a blind review');
-      recordBlindAdmission(ledger, jobId, admission);
+      recordBlindAdmission(ledger, jobId, admission, inputPackage);
     } finally {
       db.close();
     }

@@ -1040,6 +1040,236 @@ describe('gru awareness — wake policy', () => {
   });
 });
 
+describe('gru awareness — owner decisions open a follow-through wake (issue #506)', () => {
+  const ownerDecision = {
+    question: 'Merge the ready pull request?',
+    context: 'The exact head carries final native Perkins READY.',
+    recommendation: 'Merge it.',
+    reservedClass: 'merge',
+    whyNotDelegable: 'Every final PR merge is the owner’s call.',
+    options: [
+      { id: 'merge', label: 'Merge the PR', consequence: 'The PR merges and its loop closes.' },
+      { id: 'hold', label: 'Hold the PR', consequence: 'Nothing merges; the lane stays open.' },
+    ],
+    discussion: false,
+  } as const;
+
+  const postCard = (rig: Rig, title = 'Merge-ready decision', kind = 'gru.owner-escalation', severity: 'info' | 'error' = 'error') => rig.notifications.post({
+    kind,
+    routing: 'needs-owner',
+    severity,
+    title,
+    detail: 'evidence for the owner',
+    decision: ownerDecision,
+  });
+
+  it('opens a turn that names the card, the recorded option, and the owed follow-through', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const card = postCard(rig, 'Merge #785?');
+    expect(rig.woke).toHaveLength(0); // the undecided owner card stays passive
+    rig.notifications.decide(card.id, 'merge', 'owner');
+    expect(rig.woke).toHaveLength(1);
+    const text = rig.wakeBlocks[0]!;
+    expect(text).toContain(`[${card.id}]`);
+    expect(text).toContain('Merge #785?');
+    expect(text).toContain('OWNER DECISION RECORDED: "Merge the PR"');
+    expect(text).toContain('option "merge"');
+    expect(text).toContain('follow-through owed');
+    // The wake receipt is keyed to the decision, and still names the card.
+    const receipt = rig.api.listEventsAfter(0, { kinds: ['gru.wake'] })[0]!;
+    const payload = receipt.payload as { notification_ids: string[]; attention_keys: string[] };
+    expect(payload.notification_ids).toContain(card.id);
+    expect(payload.attention_keys.some((key) => key.startsWith('\u0000owner-decision:'))).toBe(true);
+    rig.awareness.dispose();
+  });
+
+  it("'never' stays passive-only, and the next block still reports the recorded choice", () => {
+    const rig = boot({ wakeMode: 'never' });
+    const card = postCard(rig, 'Merge #786?');
+    rig.notifications.decide(card.id, 'hold', 'owner');
+    expect(rig.woke).toHaveLength(0);
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain(`[${card.id}]`);
+    expect(block?.text).toContain('OWNER DECISION RECORDED: "Hold the PR"');
+    expect(block?.text).toContain('follow-through owed');
+    rig.awareness.dispose();
+  });
+
+  it('boot seeds a decision recorded while no wake path was listening', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const card = postCard(passive, 'Merge #787?');
+    passive.notifications.decide(card.id, 'merge', 'owner');
+    expect(passive.woke).toHaveLength(0);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'action-required' });
+    expect(active.woke).toHaveLength(1);
+    expect(active.wakeBlocks[0]).toContain(`[${card.id}]`);
+    expect(active.wakeBlocks[0]).toContain('OWNER DECISION RECORDED: "Merge the PR"');
+    active.awareness.dispose();
+  });
+
+  it('a delivered decision wake is never replayed after restart', () => {
+    const dir = tmpDir();
+    const first = boot({ dir, wakeMode: 'action-required' });
+    const card = postCard(first, 'Merge #788?');
+    first.notifications.decide(card.id, 'merge', 'owner');
+    expect(first.woke).toHaveLength(1);
+    first.awareness.dispose();
+    const restarted = boot({ dir, wakeMode: 'action-required' });
+    expect(restarted.woke).toHaveLength(0);
+    restarted.awareness.dispose();
+  });
+
+  it('resolving the card spends the decision claim; the same incident can decide again later', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const first = postCard(rig);
+    rig.notifications.decide(first.id, 'merge', 'owner');
+    expect(rig.woke).toHaveLength(1);
+    const claimed = JSON.parse(readFileSync(rig.awareness.file, 'utf-8')) as { wake: { woken: string[] } };
+    expect(claimed.wake.woken.some((key) => key.startsWith('\u0000owner-decision:'))).toBe(true);
+    rig.api.resolveOwnerDecision(first.id, 'merged the recorded head', { credential: 'internal', declaredActor: null });
+    const closed = JSON.parse(readFileSync(rig.awareness.file, 'utf-8')) as { wake: { woken: string[] } };
+    expect(closed.wake.woken.some((key) => key.startsWith('\u0000owner-decision:'))).toBe(false);
+    // Same kind + title (same incident key): the decision obligation is new.
+    const second = postCard(rig);
+    rig.notifications.decide(second.id, 'hold', 'owner');
+    expect(rig.woke).toHaveLength(2);
+    expect(rig.wakeBlocks[1]).toContain('OWNER DECISION RECORDED: "Hold the PR"');
+    rig.awareness.dispose();
+  });
+
+  it('a queued creation candidate never blocks or duplicates the decision line', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-25T09:00:00'));
+      // All mode + a rate cap: the owner card's creation wake queues behind
+      // an already-delivered machine wake, then its recorded decision lands
+      // in the same window. The decision identity SUPERSEDES the bare row,
+      // so the coalesced batch renders one line, claims one identity, and a
+      // later interval/restart cannot re-wake the card.
+      const dir = tmpDir();
+      const rig = boot({ dir, wakeMode: 'all', wakeMinIntervalMs: 300_000, now: () => Date.now() });
+      rig.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'First machine alert' });
+      expect(rig.woke).toHaveLength(1);
+      const card = postCard(rig, 'Merge #790?');
+      rig.notifications.decide(card.id, 'merge', 'owner');
+      expect(rig.woke).toHaveLength(1);
+      vi.advanceTimersByTime(300_000);
+      expect(rig.woke).toHaveLength(2);
+      const lines = rig.wakeBlocks[1]!.split('\n').filter((line) => line.includes(`[${card.id}]`));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('OWNER DECISION RECORDED: "Merge the PR"');
+      // The sibling identity was superseded, not left pending for a second turn.
+      vi.advanceTimersByTime(300_000);
+      expect(rig.woke).toHaveLength(2);
+      rig.awareness.dispose();
+      const restarted = boot({ dir, wakeMode: 'all', wakeMinIntervalMs: 300_000, now: () => Date.now() });
+      expect(restarted.woke).toHaveLength(0);
+      restarted.awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a decision recorded after a wake batch is composed is delivered under its decision identity', () => {
+    const rig = boot({ wakeMode: 'all' });
+    const injections: AwarenessInjection[] = [];
+    let release: (() => void) | null = null;
+    // Defer the turn's prepare() to emulate the real spawn window: the batch
+    // is composed under the card's bare identity, then the owner decides
+    // before the prompt is built.
+    rig.awareness.setWakeSink(() => {
+      release = () => {
+        const injection = rig.awareness.prepare('wake');
+        if (injection === null) return;
+        injections.push(injection);
+        rig.awareness.noteWakeOutcome(true, undefined, injection);
+      };
+    });
+    const card = postCard(rig, 'Merge #792?');
+    expect(release).not.toBeNull();
+    rig.notifications.decide(card.id, 'merge', 'owner');
+    release!();
+    expect(injections).toHaveLength(1);
+    expect(injections[0]!.attentionKeys?.[0]?.startsWith('\u0000owner-decision:')).toBe(true);
+    const lines = injections[0]!.text.split('\n').filter((line) => line.includes(`[${card.id}]`));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('OWNER DECISION RECORDED: "Merge the PR"');
+    const state = JSON.parse(readFileSync(rig.awareness.file, 'utf-8')) as {
+      wake: { pending: string[]; woken: string[] };
+    };
+    expect(state.wake.pending).toEqual([]);
+    expect(state.wake.woken.some((key) => key.startsWith('\u0000owner-decision:'))).toBe(true);
+    rig.awareness.dispose();
+  });
+
+  it('a long card title never clips the recorded option or the owed follow-through', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const card = postCard(rig, `Merge #791? ${'x'.repeat(300)}`);
+    rig.notifications.decide(card.id, 'merge', 'owner');
+    expect(rig.woke).toHaveLength(1);
+    const line = rig.wakeBlocks[0]!.split('\n').find((candidate) => candidate.includes(`[${card.id}]`))!;
+    expect(line).toContain('OWNER DECISION RECORDED: "Merge the PR"');
+    expect(line).toContain('option "merge"');
+    expect(line).toContain('follow-through owed');
+    rig.awareness.dispose();
+  });
+
+  it('a decided card still advances the passive owner rotation (GH-109)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-25T09:00:00Z'));
+      const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 2 }, now: () => Date.now() });
+      for (const [index, id] of ['older-1', 'older-2', 'older-3'].entries()) {
+        vi.setSystemTime(new Date(Date.parse('2026-10-25T09:00:00Z') + index * 1_000));
+        rig.notifications.post({ id, kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: `Older ${id}` });
+      }
+      vi.setSystemTime(new Date('2026-10-25T09:10:00Z'));
+      const decided = postCard(rig, 'Merge rotation?');
+      rig.notifications.decide(decided.id, 'merge', 'owner');
+      const first = rig.awareness.prepare();
+      expect(first?.text).toContain('OWNER DECISION RECORDED');
+      expect(first?.text).toContain('Older older-3');
+      rig.awareness.commit(first!);
+      const afterFirst = JSON.parse(readFileSync(rig.awareness.file, 'utf-8')) as { attention: { ownerOffset: number } };
+      expect(afterFirst.attention.ownerOffset).toBe(2);
+      // The next block rotates to the page the decided card would otherwise
+      // pin in place forever.
+      const second = rig.awareness.prepare();
+      expect(second?.text).toContain('Older older-2');
+      rig.awareness.commit(second!);
+      rig.awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a producer-carried proposal decision stays passive instead of racing its producer', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const card = postCard(rig, 'Launch the raid?', 'vector.raid-proposal', 'info');
+    rig.notifications.decide(card.id, 'merge', 'owner');
+    expect(rig.woke).toHaveLength(0);
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain(`[${card.id}]`);
+    expect(block?.text).toContain('its producer carries this out and closes the card');
+    expect(block?.text).not.toContain('follow-through owed');
+    rig.awareness.dispose();
+  });
+
+  it("all mode renders a decided card once, preferring the decision line", () => {
+    const rig = boot({ wakeMode: 'all' });
+    const card = postCard(rig, 'Merge #789?');
+    expect(rig.woke).toHaveLength(1); // all mode wakes the owner row itself
+    rig.notifications.decide(card.id, 'merge', 'owner');
+    expect(rig.woke).toHaveLength(2);
+    const lines = rig.wakeBlocks[1]!.split('\n').filter((line) => line.includes(`[${card.id}]`));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('OWNER DECISION RECORDED: "Merge the PR"');
+    rig.awareness.dispose();
+  });
+});
+
 describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
   it('owner preparation keeps overnight digest when a wake is queued and includes Gru disposition details', () => {
     vi.useFakeTimers();

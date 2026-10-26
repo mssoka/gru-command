@@ -310,13 +310,18 @@ export interface ApplyManifestOptions {
   readonly env?: Readonly<Record<string, string>>;
   /** Told each setup command's pid, which leads its own process group, so
    * a caller can end the group later (#427 onboarding proof). */
-  readonly onSpawn?: (pid: number) => void;
+  readonly onSpawn?: (pid: number, index: number, command: string) => void;
+  /** Durable setup-owner receipt before a configured command can run. */
+  readonly onCommandStart?: (index: number, command: string) => void;
+  /** The shell child's exit (code, signal, timeout, stop) once it closed;
+   * not proof that its process group ended. */
+  readonly onCommandOutcome?: (index: number, command: string, result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
 }
 
 /**
  * Apply a bootstrap manifest to a fresh worktree. Order: links, copies,
- * setup commands. Any failure rejects — the caller rolls the worktree
- * back; a half-bootstrapped tree is never handed to an agent. Async by
+ * setup commands. Any failure rejects — the caller applies its custody
+ * policy; a half-bootstrapped tree is never handed to an agent. Async by
  * contract: setup commands run as child processes OFF the event loop, so
  * a slow `npm ci` never freezes chat/supervision while dispatch awaits
  * the lane (the 2026-09-29 wall-clock-gap incident).
@@ -358,18 +363,43 @@ export async function applyWorktreeManifest(
     log('info', 'worktree manifest: copy applied', { source, dest });
   }
 
+  // Every step's process group: a failure names any member still running
+  // in the worktree, an earlier step's included.
+  const groups: number[] = [];
   for (const [index, entry] of manifest.setup.entries()) {
     const started = Date.now();
-    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
-      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
-      ...(opts.env !== undefined ? { env: opts.env } : {}),
-      ...(opts.onSpawn !== undefined ? { onSpawn: opts.onSpawn } : {}),
-    });
+    opts.onCommandStart?.(index, entry.command);
+    try {
+      await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+        ...(opts.env !== undefined ? { env: opts.env } : {}),
+        onSpawn: (pid) => {
+          groups.push(pid);
+          opts.onSpawn?.(pid, index, entry.command);
+        },
+        ...(opts.onCommandOutcome !== undefined ? { onOutcome: (result) => opts.onCommandOutcome?.(index, entry.command, result) } : {}),
+      });
+    } catch (error) {
+      if (!groups.some(processGroupAlive)) throw error;
+      const noOutput = { text: '', truncated: false, startsAtLine: true };
+      throw new WorktreeSetupError(error instanceof Error ? error.message : String(error),
+        error instanceof WorktreeSetupError ? error.output : { stdout: noOutput, stderr: noOutput }, true);
+    }
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
       index,
       ms: Date.now() - started,
     });
+  }
+}
+
+/** A member of this process group still lives. */
+function processGroupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -424,7 +454,12 @@ export interface SetupStreamTail {
  * with a short output tail; `output` keeps each stream's bounded raw tail
  * for a caller that redacts before it records (#427 onboarding proof). */
 export class WorktreeSetupError extends Error {
-  constructor(message: string, readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail }) {
+  constructor(
+    message: string,
+    readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail },
+    /** A setup step's process group still had a member when it failed. */
+    readonly processesRemain = false,
+  ) {
     super(message);
     this.name = 'WorktreeSetupError';
   }
@@ -439,6 +474,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   readonly signal?: AbortSignal;
   readonly env?: Readonly<Record<string, string>>;
   readonly onSpawn?: (pid: number) => void;
+  readonly onOutcome?: (result: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly timedOut: boolean; readonly stopped: boolean }) => void;
 }): Promise<void> {
   const { signal } = opts;
   if (signal?.aborted === true) throw new Error(`worktree setup command was stopped before it started: ${command}`);
@@ -453,7 +489,6 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   } catch (error) {
     throw new Error(`worktree setup command failed to spawn (${command}): ${String(error)}`);
   }
-  if (child.pid !== undefined) opts.onSpawn?.(child.pid);
   const stdout = new OutputTail();
   const stderr = new OutputTail();
   child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
@@ -478,15 +513,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     }
   };
   /** A member of the setup group still lives (the shell may be gone). */
-  const groupAlive = (): boolean => {
-    if (child.pid === undefined) return false;
-    try {
-      process.kill(-child.pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const groupAlive = (): boolean => child.pid !== undefined && processGroupAlive(child.pid);
   let timedOut = false;
   let stopped = false;
   let forceKillTimer: NodeJS.Timeout | undefined;
@@ -495,6 +522,16 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     // A command that ignores SIGTERM must not hold the dispatch forever.
     forceKillTimer ??= setTimeout(() => signalTree('SIGKILL'), SETUP_KILL_GRACE_MS);
   };
+  if (child.pid !== undefined) {
+    try {
+      opts.onSpawn?.(child.pid);
+    } catch (error) {
+      end();
+      try { await closed; } catch { /* the durable start receipt remains incomplete */ }
+      if (forceKillTimer !== undefined && !groupAlive()) clearTimeout(forceKillTimer);
+      throw new Error(`worktree setup process ownership receipt failed for ${command}`, { cause: error });
+    }
+  }
   const killTimer = setTimeout(() => {
     timedOut = true;
     end();
@@ -518,6 +555,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     if (forceKillTimer !== undefined && !((stopped || timedOut) && groupAlive())) clearTimeout(forceKillTimer);
   }
 
+  opts.onOutcome?.({ code: outcome.code, signal: outcome.signal, timedOut, stopped });
   const output = { stdout: stdout.stream(), stderr: stderr.stream() };
   const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
   const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);

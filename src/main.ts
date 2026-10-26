@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { bootServiceEnvironment, type ServiceEnvironment } from './service-environment.js';
 import { loadOrCreateIdentity } from './identity.js';
@@ -101,6 +101,8 @@ import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { startVectorHalves, VectorService } from './vector/service.js';
 import type { VectorBoardView } from './vector/board.js';
+import { BriefingReviewService } from './briefing-review/service.js';
+import type { BriefingReviewBoardCounts } from './briefing-review/board.js';
 import { createVectorServer } from './vector/server.js';
 import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
 import { onboardingProbesDir } from './onboarding/proof.js';
@@ -340,6 +342,7 @@ async function main(): Promise<number> {
   // root (ruling 7). Failure is loud and named (EACCES/ENOSPC never
   // surface as a raw stack).
   const uploadsDir = join(config.dataDir, 'uploads');
+  const preBootstrapPatchRoot = join(config.dataDir, 'prebootstrap-patches');
   try {
     // 0700 like every other instance dir (chat/, sessions/, ledger/) —
     // uploads will carry user material; not group/world traversable.
@@ -359,6 +362,21 @@ async function main(): Promise<number> {
   } catch (error) {
     logger.error('uploads dir creation failed — refusing to start (SPEC ruling 19)', {
       path: uploadsDir,
+      error: String(error),
+    });
+    return 1;
+  }
+  // Hash-pinned pre-bootstrap package material is private instance data,
+  // separate from project checkouts and protected at every service start.
+  try {
+    mkdirSync(preBootstrapPatchRoot, { recursive: true, mode: 0o700 });
+    const patchRootStat = lstatSync(preBootstrapPatchRoot);
+    if (!patchRootStat.isDirectory() || patchRootStat.isSymbolicLink()) throw new Error('prebootstrap package root must be a real directory, not a symlink');
+    if ((patchRootStat.mode & 0o777) !== 0o700) chmodSync(preBootstrapPatchRoot, 0o700);
+    logger.info('prebootstrap_patch_root', { path: preBootstrapPatchRoot });
+  } catch (error) {
+    logger.error('private prebootstrap package directory creation failed — refusing to start', {
+      path: preBootstrapPatchRoot,
       error: String(error),
     });
     return 1;
@@ -526,6 +544,9 @@ async function main(): Promise<number> {
   // The raids card (#351): late-bound too — the Vector service is built
   // after the engine.
   let vectorBoardView: () => VectorBoardView | null = () => null;
+  // Nefario's block (GH-505): late-bound too — the briefing-review service
+  // needs the dispatcher, which lands after the engine.
+  let briefingReviewBoardCounts: () => BriefingReviewBoardCounts | null = () => null;
   // Durable pipeline queue (owner approvals j-239/j-1064): late-bound too —
   // the mechanical consumer is constructed after the dispatcher it feeds.
   let pipelineView: () => import('./ledger/pipeline.js').PipelineBoardView | null = () => null;
@@ -591,6 +612,8 @@ async function main(): Promise<number> {
     verifyQueue: () => verificationView(),
     disk: () => diskBoardView(),
     vector: () => vectorBoardView(),
+    briefingReview: () => briefingReviewBoardCounts(),
+    briefingReviewStage: config.briefingReview.stage,
     pipeline: () => pipelineView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1162,6 +1185,7 @@ async function main(): Promise<number> {
     root: config.worktrees.root,
     preserveRoot: config.worktrees.preserveRoot,
     setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    preBootstrapPatchRoot,
     onBaseFallback: ({ repoName, worktreeId, defaultBranch, sha, detail }) => {
       // Degraded lane creation (owner incident 2026-09-23): origin could
       // not be fetched, so the lane branched from the host clone's local
@@ -1306,6 +1330,7 @@ async function main(): Promise<number> {
     bus,
     parentTools: parentToolsFor,
     reviewSource: gitReviewSourcePreflight,
+    preBootstrapPatchRoot,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1704,9 +1729,22 @@ async function main(): Promise<number> {
       ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
     }, input.requestId);
   };
+  // Nefario, the pre-dispatch briefing review (GH-505): a Gru-side, zero-
+  // context review of the exact briefing before POST /api/dispatch. Lens jobs
+  // ride the normal dispatch path; the cockpit block is late-bound above.
+  const briefingReview = new BriefingReviewService({
+    config: config.briefingReview,
+    ledger,
+    notifications,
+    dispatch: (input) => dispatcher.dispatch(input),
+    apiBase: () => config.server.port === 0 ? null : `http://${dialHost(config.server.host)}:${String(config.server.port)}`,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  briefingReviewBoardCounts = () => briefingReview.boardCounts();
   const dispatchServer = createDispatchServer({
     config,
     intake,
+    briefingReview,
     intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
     // Intake slicing (#429): a planning-only minion through the normal dispatch path.
     intakeSlicing: new IntakeSlicingService({

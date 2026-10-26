@@ -84,6 +84,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'real uv renders of the bundled BMAD runtime over git repositories and worktrees',
   },
   { file: 'branch-idle-guard.test.ts', workload: 'real service and git lane lifecycle' },
+  {
+    file: 'briefing-review-server.test.ts',
+    workload: 'real HTTP dispatch server over a real git fixture lane: Nefario commission, lens results, a gated dispatch and its recorded provenance',
+  },
   { file: 'claude-adapter.test.ts', workload: 'real CLI child processes over stdio per test' },
   { file: 'cleanup-repair.test.ts', workload: 'real git lanes released, moved with their repository and repaired, review and preserve expiry over real folders and refs, and gru-service reset over real worktrees' },
   { file: 'config-env-service.test.ts', workload: 'boots the compiled dist/main.js with an [env] table and a recording git, plus seven refused direct boots' },
@@ -92,6 +96,8 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'decisions-service-integration.test.ts',
     workload: 'boots and restarts the real service with compiled CLIs',
   },
+  { file: 'creation-continuation.test.ts', workload: 'same-job continuation over owned Git child closure, retained refs, linked worktrees, HTTP and durable SQLite state' },
+  { file: 'creation-continuation-custody.test.ts', workload: 'retained-creation custody over real Git children holding pipes, setup manifests, linked worktrees, HTTP and SQLite' },
   { file: 'dispatch-e2e.test.ts', workload: 'end-to-end dispatch arc over real git fixtures' },
   {
     file: 'dispatch-server.test.ts',
@@ -136,6 +142,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'perkins-review-convergence.test.ts',
     workload: 'whole review rounds over real git fixtures; observed 32.8s (over the 30s fast ceiling) under full-run co-tenant load vs 12.0-19.6s in the other preserved full runs',
   },
+  { file: 'prebootstrap-patch.test.ts', workload: 'guarded dependency patch dispatch over real Git worktrees, setup subprocesses and durable restart state' },
   {
     file: 'perkins-whole-review.test.ts',
     workload: 'whole-review engine over real worktrees and git',

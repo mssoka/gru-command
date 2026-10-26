@@ -19,6 +19,7 @@ import {
 import { supervisionGuidance } from '../decisions/effects.js';
 import {
   backoffDelayMs,
+  boundedErrorText,
   isRateLimitErrorText,
   pacingExhaustedPayload,
   pacingRecoveredPayload,
@@ -957,7 +958,8 @@ export class Supervisor {
       // Adapters emit `error` followed immediately by their sticky
       // `state:error`. The latter is the same failure, not recovery/new
       // activity; letting it advance the token would invalidate the bounded
-      // provider-wall decision started by the error event itself.
+      // decision started by the error event itself (a known wall stops
+      // without one, #492).
       const expectedFailureTerminal =
         agent.decisionPending &&
         agent.failureTerminalPending &&
@@ -1009,6 +1011,25 @@ export class Supervisor {
             });
             break;
           }
+          if (!event.fatal && event.nativeControl === 'directive-refusal' && event.typed === undefined) {
+            if (this.onDirectiveTurn(agent)) {
+              // GC's own directive fence refused the turn (#485). That is no
+              // provider response, and the directive's recovery path owns it:
+              // do not pace, classify, stop as a wall, or hand its accepted
+              // prompt to restart/replay recovery here.
+              this.log('info', 'native directive refusal retained for directive recovery; provider failure routing skipped', {
+                agent_id: agent.agentId,
+                error: event.error,
+              });
+              this.recordEvent('supervision.native-refusal-retained', agent.agentId, { ...boundedErrorText(event.error) });
+              break;
+            }
+            // Only a directive turn has a directive recovery path to own it.
+            this.log('warn', 'native directive refusal tag on a turn that carries no directive; routed as an ordinary failure', {
+              agent_id: agent.agentId,
+              error: event.error,
+            });
+          }
           // Publication can replay a startup error while its owner is still
           // settling the rung. Defer that exact error, never another spawn.
           const flight = [...this.restartingAgents.values()].find((item) => item.handle === agent.handle);
@@ -1017,8 +1038,8 @@ export class Supervisor {
             // later frame is nonfatal. Equally, generic exit noise must not
             // erase a known provider wall and cause a futile blind restart.
             const previous = flight.pendingError;
-            const previousClass = previous === null ? null : deterministicFailureClass(previous.error);
-            const nextClass = deterministicFailureClass(event.error);
+            const previousClass = previous === null ? null : deterministicFailureClass(previous.error, previous.typed);
+            const nextClass = deterministicFailureClass(event.error, event.typed);
             const selected = previous !== null &&
               (previousClass === 'authentication_wall' || previousClass === 'quota_wall') &&
               nextClass !== 'authentication_wall' && nextClass !== 'quota_wall' ? previous : event;
@@ -1793,7 +1814,7 @@ export class Supervisor {
    * authoritative: Jev classifies the signature only and can never grant a
    * restart past these guards — an `act`-band restart_advised with requireConfirm
    * still stops for a human, and known auth/quota walls always stop without
-   * burning rungs, whatever the model answers. */
+   * burning rungs: a known wall stops before any decision is asked (#492). */
   private async evaluateRecovery(
     agent: SupervisedAgent,
     reason: string,
@@ -1817,7 +1838,7 @@ export class Supervisor {
       this.abortIsolatedReviewAttempt(agent, reason);
       return;
     }
-    const deterministicClass = deterministicFailureClass(reason);
+    const deterministicClass = deterministicFailureClass(reason, source?.typed);
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
@@ -1825,6 +1846,35 @@ export class Supervisor {
       } else if (allowRestart) {
         await this.restartRung(agent, reason);
       }
+      return;
+    }
+    if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
+      // A known wall stops now, before any decision is awaited or queued
+      // behind a pending one (#492): no answer can change its action
+      // (supervisionGuidance stops on a wall unconditionally), and a
+      // directive's recovery can dispose the handle while one is pending,
+      // which left the stale answer to void the stop.
+      try {
+        this.ledger.appendCustomEvent({
+          kind: 'supervision.guidance',
+          agentId: agent.agentId,
+          payload: {
+            class: deterministicClass,
+            restart_advised: false,
+            restart_authorized: false,
+            source: 'deterministic_guard',
+            route: 'fallback',
+            requires_confirm: false,
+          },
+        });
+      } catch (error) {
+        // A failed guidance record alone doesn't hold up the stop.
+        this.log('error', 'supervision guidance record failed; stopping the known wall anyway', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      }
+      this.stopForGuidance(agent, deterministicClass, source, recovery);
       return;
     }
     if (agent.decisionPending) {
@@ -1854,6 +1904,7 @@ export class Supervisor {
     const expectedOpenControl = agent.openControl;
     const request = supervisionDecisionRequest({
       reason,
+      typed: source?.typed,
       agentId: agent.agentId,
       role: agent.role,
       restartCount: agent.restartRing.length,
@@ -1889,9 +1940,9 @@ export class Supervisor {
           class: failureClass,
           restart_advised: restartAdvised,
           restart_authorized: restartAuthorized,
-          source: deterministicWall ? 'deterministic_guard' : outcome.provenance.source,
-          route: deterministicWall ? 'fallback' : restartRoute.path,
-          requires_confirm: deterministicWall ? false : restartRoute.requiresConfirm,
+          source: outcome.provenance.source,
+          route: restartRoute.path,
+          requires_confirm: restartRoute.requiresConfirm,
         },
       });
       if (action.kind === 'stop') {
@@ -1913,8 +1964,8 @@ export class Supervisor {
         (runtimeError || agent.openControl === expectedOpenControl) &&
         !agent.breakerOpen
       ) {
-        if (deterministicWall) this.stopForGuidance(agent, deterministicClass, source, recovery);
-        else if (allowRestart) await this.restartRung(agent, reason);
+        // A known wall never reaches a decision (it stopped above).
+        if (allowRestart) await this.restartRung(agent, reason);
       }
     } finally {
       agent.decisionPending = false;
@@ -2748,6 +2799,19 @@ export class Supervisor {
     adopted.pendingRecovery = old.pendingRecovery;
     this.agents.delete(old.agentId);
     return adopted;
+  }
+
+  /** Whether the agent's live turn carries a native directive (#485). */
+  private onDirectiveTurn(agent: SupervisedAgent): boolean {
+    try {
+      return agent.handle?.pendingTurn?.()?.directive !== undefined;
+    } catch (error) {
+      this.log('warn', 'pending-turn read failed — a native directive refusal is routed as an ordinary failure', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+      return false;
+    }
   }
 
   /** Snapshot an open turn before a restart kills it. */

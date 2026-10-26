@@ -592,7 +592,7 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   const removeTemp = (failure: unknown): void => {
     try { unlinkSync(temp); } catch (cleanupError) {
       if (errnoOf(cleanupError) === 'ENOENT') return;
-      throw new Error(`lane administration ${admin} ${failure === null ? 'published its handoff receipt' : `cannot take a handoff receipt (${errnoOf(failure)})`} and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
+      throw new Error(`lane administration ${admin} ${failure === null ? 'published its handoff receipt' : `cannot take a handoff receipt (${errnoOf(failure)})`} and its temporary receipt could not be removed (${errnoOf(cleanupError)})`,
         { cause: failure === null ? cleanupError : new AggregateError([failure, cleanupError], 'handoff receipt and its cleanup failed') });
     }
   };
@@ -641,11 +641,26 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   const notDurable = `lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(undurable)})`;
   try { unlinkSync(temp); } catch (cleanupError) {
     if (errnoOf(cleanupError) !== 'ENOENT') {
-      throw new Error(`${notDurable}, and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
+      throw new Error(`${notDurable}, and its temporary receipt could not be removed (${errnoOf(cleanupError)})`,
         { cause: new AggregateError([cause, cleanupError], 'handoff receipt durability and its cleanup failed') });
     }
   }
   throw new Error(notDurable, { cause });
+}
+
+/** Whether this exact creation (same token and lane) already published its
+ * pending receipt, so a retried publication does not link a second one. Any
+ * other receipt in the administration is refused. */
+export function pendingLaneHandoffPublished(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoPath' | 'path' | 'branch' | 'sha' | 'jobId' | 'roundId'>, admin: string, token: string): boolean {
+  const file = join(admin, receiptName);
+  if (!present(file, 'handoff receipt')) return false;
+  const receipt = parseReceipt(readWorktreeMetadata(file));
+  if (receipt.state !== 'pending' || receipt.token !== token || receipt.id !== lane.id || receipt.kind !== lane.kind || receipt.jobId !== lane.jobId ||
+    receipt.roundId !== lane.roundId || receipt.admin !== admin || receipt.repo !== resolvedPath('repository', lane.repoPath) ||
+    receipt.path !== resolvedPath('checkout', lane.path) || receipt.branch !== lane.branch || receipt.sha !== lane.sha) {
+    throw new Error(`lane administration ${admin} holds a handoff receipt from another creation`);
+  }
+  return true;
 }
 
 export function assertPendingLaneHandoff(lane: WorktreeRecord, admin: string, token: string): Receipt {

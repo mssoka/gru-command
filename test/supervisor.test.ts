@@ -30,7 +30,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
-import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { MAX_PACING_ERROR_CHARS, PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
 import { directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
@@ -389,6 +389,17 @@ function rateLimitPolicy(overrides: Partial<RateLimitBackoffPolicy> = {}): RateL
 /** Emit an adapter-style in-band failure event for the handle. */
 function emitFailure(handle: FakeHandle, text: string): void {
   handle.emit({ type: 'error', error: text, fatal: false });
+}
+
+/** A live native directive turn for `agentId`, on its own working job. */
+function directiveTurn(h: Harness, agentId: string): PendingTurn {
+  const jobId = `job-${agentId}`;
+  h.api.addJob({ id: jobId, repo: 'fixture', title: jobId }); h.api.setJobStatus(jobId, 'working');
+  h.api.registerAgent({ id: agentId, role: 'minion', jobId });
+  const request = h.api.beginDirectiveIntent({ jobId, requestId: `request-${agentId}`, directive: 'repair the lane', holder: 'gru' }).record;
+  return { text: 'repair the lane', owner: `silas-directive:${request.requestId}`, directive: {
+    identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+  } };
 }
 
 /** Hang a handle: open a turn, go streaming, then let silence accrue. */
@@ -2638,12 +2649,16 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
           expect(f.rig.api.latestJobEvent(f.jobId, 'job.delivered')).toBeNull();
           return;
         }
+        // A known wall stops at once, while the generic failure's decision is still pending (#492).
+        if (kind === 'stop') expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
         answers[0]!(); await flushMicrotasks();
-        if (kind === 'queued' || kind === 'stop') {
+        if (kind === 'queued') {
           expect(answers).toHaveLength(2);
           expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
           answers[1]!(); await flushMicrotasks();
         }
+        // It needs no decision of its own.
+        if (kind === 'stop') expect(answers).toHaveLength(1);
       }
       if (kind === 'stop') {
         expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
@@ -2673,7 +2688,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
   it('preserves a newer controller while recovered429 generic guidance settles (GH-280 residual R11)', () => failedRecoveredRetry('newer'));
   it('awaits delayed default guidance before orphaning a recovered429 failed retry (GH-280 residual R11)', () => failedRecoveredRetry('delayed'));
   it('awaits queued default guidance before orphaning a recovered429 failed retry (GH-280 residual R11)', () => failedRecoveredRetry('queued'));
-  it('preserves queued provider-stop custody after a recovered429 failed retry (GH-280 residual R11)', () => failedRecoveredRetry('stop'));
+  it('stops a wall behind a pending decision at once and preserves provider-stop custody after a recovered429 failed retry (GH-280 residual R11, #492)', () => failedRecoveredRetry('stop'));
 
   it('retries a same-ID binding refusal once while preserving original unknown cleanup generation (GH-280 residual R11)', async () => {
     vi.useFakeTimers();
@@ -2759,10 +2774,13 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
           expect(f.replacement.promptCalls).toEqual([{ text: 'startup retry A', owner: `dispatch:${f.jobId}` }]);
           return;
         }
+        // A known wall stops at once, while the generic failure's decision is still pending (#492).
+        if (kind === 'stop') expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
         answers[0]!(); await flushMicrotasks();
-        expect(answers).toHaveLength(2);
+        // It needs no decision of its own.
+        expect(answers).toHaveLength(kind === 'stop' ? 1 : 2);
         expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
-        answers[1]!(); await flushMicrotasks();
+        answers[1]?.(); await flushMicrotasks();
       }
       if (kind === 'stop' || kind === 'exhausted' || kind === 'internal') {
         const wall = kind === 'stop' ? 'authentication_wall' : 'quota_wall';
@@ -2792,7 +2810,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
   it('retains bounded startup exhaustion quota-stop custody through owner re-arm (GH-280 residual R9)', () => failedStartupRetry('exhausted'));
   it('retains internally failed startup retry quota-stop custody through owner re-arm (GH-280 residual R9)', () => failedStartupRetry('internal'));
   it('awaits the full queued generic classification before startup-retry orphan settlement (GH-280 residual R9)', () => failedStartupRetry('queued'));
-  it('preserves newer queued provider-stop custody and owner re-arm after startup-retry failure (GH-280 residual R9)', () => failedStartupRetry('stop'));
+  it('stops a newer wall behind a pending decision at once and preserves provider-stop custody and owner re-arm after startup-retry failure (GH-280 residual R9, #492)', () => failedStartupRetry('stop'));
   it('preserves a newer intentional controller snapshot while old startup-retry guidance settles (GH-280 residual R9)', () => failedStartupRetry('newer'));
 
   it('refuses a queued startup retry after durable A-to-B rebind with unchanged native authority (GH-280 residual R9)', async () => {
@@ -3184,21 +3202,92 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
-  it('does not let the adapter error -> state:error -> turn_end sequence stale its pending wall classification', async () => {
-    let release!: () => void;
+  it('a wall on a directive turn still stops when directive recovery disposes the handle while a decision would be pending (#492)', async () => {
+    const answers: (() => void)[] = [];
     const decide = vi.fn((request: Parameters<DecisionService['decide']>[0]) =>
       new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
-        release = () => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+        answers.push(() => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled')));
       }));
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-directive-wall', null);
+    handle.pendingTurnSnapshot = { text: 'directive prompt', owner: 'silas-directive:wall-request' };
+    h.registry.adopt(handle);
+    handle.emit({ type: 'turn_start' });
+    handle.emit({ type: 'error', error: 'API Error: 401 Invalid authentication credentials', fatal: false });
+    // The directive's prompt rejected: its recovery disposes the handle at once.
+    await h.registry.disposeHandle(handle);
+    for (const answer of answers) answer();
+    await flushMicrotasks();
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    const kinds = h.api.listEvents({ limit: 50 }).filter((row) => row.agentId === handle.id).map((row) => row.kind);
+    expect(kinds).toEqual(expect.arrayContaining(['supervision.guidance', 'supervision.escalated']));
+    expect(h.api.listEvents({ limit: 50 }).find((row) => row.kind === 'supervision.guidance')?.payload).toEqual({
+      class: 'authentication_wall', restart_advised: false, restart_authorized: false,
+      source: 'deterministic_guard', route: 'fallback', requires_confirm: false,
+    });
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(decide).not.toHaveBeenCalled();
+    h.dispose();
+  });
+
+  it('a wall that follows a generic failure on a directive turn stops at once, though that failure\'s decision is pending and recovery disposes the handle (#492)', async () => {
+    const answers: (() => void)[] = [];
+    const decide = vi.fn((request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
+        answers.push(() => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled')));
+      }));
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-directive-generic-then-wall', null);
+    handle.pendingTurnSnapshot = { text: 'directive prompt', owner: 'silas-directive:generic-then-wall' };
+    h.registry.adopt(handle);
+    handle.emit({ type: 'turn_start' });
+    handle.emit({ type: 'error', error: 'tool runner hiccup', fatal: false });
+    expect(decide).toHaveBeenCalledTimes(1);
+    handle.emit({ type: 'error', error: 'API Error: 401 Invalid authentication credentials', fatal: false });
+    // Stopped at once, while the generic failure's decision is still pending.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    await h.registry.disposeHandle(handle);
+    for (const answer of answers) answer();
+    await flushMicrotasks();
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(decide).toHaveBeenCalledTimes(1);
+    h.dispose();
+  });
+
+  it('a failed guidance record alone does not hold up a known wall\'s stop, and is logged (#492)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    const logs: { level: string; msg: string }[] = [];
+    const h = boot({ decide } as unknown as DecisionService, { log: (level, msg) => { logs.push({ level, msg }); } });
+    const append = h.api.appendCustomEvent.bind(h.api);
+    vi.spyOn(h.api, 'appendCustomEvent').mockImplementation((event) => {
+      if (event.kind === 'supervision.guidance') throw new Error('SQLITE_BUSY: database is locked');
+      return append(event);
+    });
+    const handle = new FakeHandle('minion', 'minion-wall-guidance-busy', null);
+    h.registry.adopt(handle);
+    handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    expect(logs).toContainEqual({ level: 'error', msg: 'supervision guidance record failed; stopping the known wall anyway' });
+    expect(decide).not.toHaveBeenCalled();
+    h.dispose();
+  });
+
+  it('a known wall stops before any decision, and the adapter error -> state:error -> turn_end sequence cannot stale it (#492)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
     const h = boot({ decide } as unknown as DecisionService);
     const handle = new FakeHandle('perkins', 'perkins-error-state-pair', null);
     h.registry.adopt(handle);
     handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
-    await vi.waitFor(() => expect(decide).toHaveBeenCalledOnce());
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ breakerOpen: true, stopReason: 'authentication_wall' });
     handle.setState('error', 'HTTP 401 unauthorized');
     handle.emit({ type: 'turn_end' });
-    release();
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(decide).not.toHaveBeenCalled();
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
     h.dispose();
   });
@@ -3289,8 +3378,9 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.registry.adopt(handle);
     const spawns = h.registry.spawnCalls.length;
     handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
-    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    // The known wall is decided by code: the unsafe advice is never even asked for (#492).
+    expect(decide).not.toHaveBeenCalled();
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
     const guidance = h.api.listEvents({ limit: 50 }).find((row) => row.kind === 'supervision.guidance');
@@ -3306,6 +3396,153 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.supervisor.onNotificationDisposed(incident!.id);
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
+  });
+
+  it('a wall stays a wall on a directive turn, tagged or not, when typed or fatal; untagged, GC\'s refusal walls only in its old wording (#485)', async () => {
+    const providerAuth = 'HTTP 401 provider rejection: invalid x-api-key';
+    const oldRefusal = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+    const refusal = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed';
+    for (const { id, error, typed, tagged, fatal, walls } of [
+      { id: 'provider-auth', error: providerAuth, typed: true, tagged: false, fatal: false, walls: true },
+      // A typed provider response is never GC's refusal, whatever its tag says.
+      { id: 'provider-auth-tagged', error: providerAuth, typed: true, tagged: true, fatal: false, walls: true },
+      // A fatal error is never skipped as a refusal, tag or not.
+      { id: 'fatal-tagged', error: oldRefusal, typed: false, tagged: true, fatal: true, walls: true },
+      // Untagged, the old wording walled by itself: why GC's own text changed.
+      { id: 'old-refusal-untagged', error: oldRefusal, typed: false, tagged: false, fatal: false, walls: true },
+      { id: 'refusal-untagged', error: refusal, typed: false, tagged: false, fatal: false, walls: false },
+    ] as const) {
+      const h = boot();
+      try {
+        const handle = new FakeHandle('minion', id, null);
+        handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+        h.registry.adopt(handle);
+        const spawns = h.registry.spawnCalls.length;
+        handle.emit({ type: 'error', error, fatal, ...(tagged ? { nativeControl: 'directive-refusal' as const } : {}), ...(typed ? {
+          provider: 'synthetic-provider', model: 'synthetic-model', typed: { origin: 'provider-message' as const, status: 401 },
+        } : {}) });
+        if (walls) {
+          await vi.waitFor(() => expect(handle.disposed, id).toBe(true));
+          expect(h.supervisor.viewFor(id), id).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall', restarts: 0 });
+          expect(h.notificationsOfKind(`supervision.provider-wall.${id}.authentication_wall`), id).toHaveLength(1);
+        } else {
+          for (let i = 0; i < 16; i += 1) await Promise.resolve();
+          expect(handle.disposed, id).toBe(false);
+          expect(h.supervisor.viewFor(id), id).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+          expect(h.api.listNotifications({ limit: 100 }).some((row) => row.kind.includes('provider-wall')), id).toBe(false);
+        }
+        expect(h.registry.spawnCalls, id).toHaveLength(spawns);
+        expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained'), id).toBe(false);
+      } finally { h.dispose(); }
+    }
+  });
+
+  it('a tagged refusal on a directive turn skips pacing and the decision service, and leaves a bounded, marked durable trace (#485)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    const sleeper = new ManualSleeper();
+    const h = boot({ decide } as unknown as DecisionService, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-native-refusal', null);
+      handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+      h.registry.adopt(handle);
+      // Rate-limit-looking text: routed, it would start the automatic retry. The
+      // bound falls inside an emoji's surrogate pair: the cut keeps whole code points.
+      const head = 'DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work may proceed; ';
+      const error = `${head.padEnd(MAX_PACING_ERROR_CHARS - 1, 'x')}😀${'detail '.repeat(10)}`;
+      handle.emit({ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' });
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+      expect(sleeper.delays).toEqual([]);
+      expect(decide).not.toHaveBeenCalled();
+      const events = h.api.listEvents({ limit: 100 });
+      expect(events.some((event) => event.kind.startsWith('pacing.') || event.kind === 'supervision.guidance')).toBe(false);
+      expect(error.length).toBeGreaterThan(MAX_PACING_ERROR_CHARS);
+      expect(events.filter((event) => event.kind === 'supervision.native-refusal-retained')).toEqual([
+        expect.objectContaining({ agentId: handle.id, jobId: `job-${handle.id}`,
+          payload: { error: error.slice(0, MAX_PACING_ERROR_CHARS - 1), error_truncated: true, error_length: error.length } }),
+      ]);
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+      expect(handle.disposed).toBe(false);
+      expect(handle.promptCalls).toHaveLength(0);
+      // The same text untagged is routed: the automatic retry is scheduled.
+      handle.emit({ type: 'error', error, fatal: false });
+      expect(sleeper.delays).toEqual([100]);
+    } finally { h.dispose(); }
+  });
+
+  it('a tagged refusal whose pending turn cannot be read is logged loud and routed as an ordinary failure (#485)', async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const h = boot(undefined, { log: (level, msg) => logs.push({ level, msg }) });
+    try {
+      const handle = new FakeHandle('minion', 'minion-unreadable-turn', null);
+      handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+      Object.defineProperty(handle, 'pendingTurn', { value: () => { throw new Error('pending turn unreadable'); } });
+      h.registry.adopt(handle);
+      // Routed, GC's refusal text with the disk's words walls: the fallback is visible.
+      handle.emit({ type: 'error', error: 'directive refused: directive bookkeeping failed: transcript write: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' });
+      expect(logs).toContainEqual({ level: 'warn', msg: 'pending-turn read failed — a native directive refusal is routed as an ordinary failure' });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
+    } finally { h.dispose(); }
+  });
+
+  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall; as a quota-class text it walls with no pacing policy or once its budget is spent (#485)', async () => {
+    // 2.1.309's client-side capacity off-switch, as GC's adapter words it.
+    const error = 'Opus is experiencing high load. Switch to Sonnet. (rate_limit)';
+    const event = { type: 'error' as const, error, fatal: false, provider: 'anthropic-claude-native', model: 'claude-opus-5-5',
+      typed: { origin: 'provider-message' as const, bodyCode: 'rate_limit' } };
+    const sleeper = new ManualSleeper();
+    const paced = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-paced', null);
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-capacity' };
+      paced.registry.adopt(handle);
+      handle.emit(event);
+      expect(sleeper.delays).toEqual([100]);
+      expect(paced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(handle.disposed).toBe(false);
+    } finally { paced.dispose(); }
+    const spentSleeper = new ManualSleeper();
+    const spent = boot(undefined, { rateLimitBackoff: rateLimitPolicy({ maxRetries: 1 }), sleep: spentSleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-spent', null);
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-capacity' };
+      handle.promptHook = () => { handle.emit(event); };
+      spent.registry.adopt(handle);
+      handle.emit(event);
+      expect(spentSleeper.delays).toEqual([100]);
+      await spentSleeper.release(); // the one retry meets the off-switch again: the budget is spent
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(handle.promptCalls).toHaveLength(1);
+      expect(spent.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+    } finally { spent.dispose(); }
+    const unpaced = boot();
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-unpaced', null);
+      unpaced.registry.adopt(handle);
+      handle.emit(event);
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(unpaced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+    } finally { unpaced.dispose(); }
+  });
+
+  it('a refusal tag on a turn that carries no directive is logged loud and routed as an ordinary failure (#485)', async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0,
+      log: (level, msg) => logs.push({ level, msg }) });
+    try {
+      h.api.addJob({ id: 'job-dispatch-turn', repo: 'fixture', title: 'job-dispatch-turn' });
+      const handle = new FakeHandle('minion', 'minion-dispatch-turn', null);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-dispatch-turn' });
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-dispatch-turn' };
+      h.registry.adopt(handle);
+      handle.emit({ type: 'error', error: 'DirectiveCheckpointError: 429 rate limit — no work may proceed', fatal: false, nativeControl: 'directive-refusal' });
+      expect(sleeper.delays).toEqual([100]);
+      expect(logs).toContainEqual({ level: 'warn', msg: 'native directive refusal tag on a turn that carries no directive; routed as an ordinary failure' });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
+    } finally { h.dispose(); }
   });
 
   it('a legacy machine-routed provider-wall row dedupes the new machine stop: one row, Gru disposition re-arms', async () => {
