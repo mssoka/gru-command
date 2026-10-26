@@ -589,6 +589,94 @@ proof, so two service processes sharing one repository are not
 coordinated by this receipt (a pid namespace reset makes a recorded pid
 look live again, which is why it is not a gate).
 
+## 4b. Same-job retained initial-creation continuation
+
+`POST /api/dispatch/creation-continuation` is a narrow authenticated control
+for one already-recorded, blocked PR-owing initial dispatch whose branch ref
+was committed but whose checkout and lane registration did not complete. Its
+body is exactly `{ "job_id": "…", "request_id": "…" }`; it reuses the
+original job row, unique `job.handoff`, immutable briefing, branch, retained
+receipt, fixed base and `base_source`. It does not call `addJob`, append a new
+handoff, or accept caller-supplied source/briefing/base fields. A job with an
+accepted amendment, previous phase-handoff, report/PR target, worker, lane,
+admission, live directive or pending re-brief is outside this control and is
+refused, as is a request id that names a directive request. The handoff
+path's own leaf must be the job's recorded repository (dispatch derived it so,
+a symlinked path included) and the path must resolve to the repository the
+manager inspects; the continuation dispatches through that same path.
+
+A continuation never consults the briefing-review gate (GH-505): the gate
+admits or refuses a dispatch *before* any job row exists, and the job a
+continuation reuses was created by a dispatch that already passed it under
+the policy of that moment — the job's existence is the admission proof.
+Re-asking could only strand retained creations whose review policy changed
+or predated the gate. A fresh dispatch of the same briefing is still gated,
+and the continuation itself is gated by the retained receipt, not by review
+policy.
+
+Every job branch creation, ordinary dispatch included, journals one
+`job.creation-producer-settled` event per receipt token when its Git child's
+own `close` shows that the child exited and every holder released its pipes
+(a descendant that redirected its output can outlive that). A child that
+exited while something still holds the pipes is watched for up to ten
+minutes; a close caused by GC releasing those pipes proves nothing, and the
+producer then stays UNKNOWN. A failed write is logged and never fails the
+creation. The receipt token is bound by its SHA-256 digest; the raw token
+never reaches the readback, and a dispatch failure's job note, events, HTTP
+detail and log line redact it. Receipt
+host/PID, a missing PID, service restart and ref commitment are not
+producer-cessation evidence. Without the settlement the request is refused and
+custody remains UNKNOWN.
+
+A continuation waits at the ordinary disk floor (the owner may bin or park the
+job meanwhile), then takes the job admission, refuses a live directive or
+pending re-brief that started during the wait, and calls WorktreeManager's
+guarded reconciliation with a strict retained-only policy. The receipt must be
+the one the request accepted (same token digest and settlement), and it and
+the exact direct branch ref must remain present and unchanged, including the
+receipt-matched reflog and repository/worktree-holder fences. Missing
+receipt/ref cannot clear the receipt and fall through to the ordinary new-base
+branch; mismatch, lock, symbolic ref, foreign checkout/admin/holder and
+unreadable evidence refuse without continuation cleanup, before adoption or
+after it. Any other failure before registration, a failing `[[setup]]`
+included, rolls the checkout back under the receipt's own token and keeps the
+ref and receipt: readback says `failed` with the retained custody, and a later
+request adopts them again. A failure while a setup step's process group still
+has a member, or while any process is rooted in the checkout (a detached daemon
+a step started included), keeps everything and reads `custody-unknown`, as
+do a process listing that fails or cannot read the working directories (`lsof`
+or `/proc` failing; command lines alone miss a daemon tied only by its cwd)
+and an unconfirmed rollback. A daemon that leaves the checkout and does not
+name it is not seen. A failure before the manager starts adopting (the
+repository path gone, say) touches nothing and reads `failed`. A failure after
+registration reads `custody-unknown`: the registry row holds the lane and the
+receipt may already be spent. A registered lane goes through the ordinary
+worker pacing gate, spawn and delivery path. A minion GC disposes before its
+prompt has its lane swept and reads `failed` once the disposal resolved; a
+failed disposal leaves the agent row as it was and reads `custody-unknown`.
+
+The durable request history names its generation and payload digest and
+readback distinguishes `accepted`, `queued`, `admitted`, `delivered`, `failed`,
+`refused` and `custody-unknown`. Read back one exact request with
+`GET /api/dispatch/creation-continuation?job_id=…&request_id=…` (same bearer
+authorization). Readback reports the original handoff/briefing digest, branch,
+base/provenance, producer-settlement event, registered worktree, queue,
+spawn and correlated delivery evidence. The delivery is correlated by
+`creation_continuation_request_id` and `creation_continuation_generation` on
+`job.delivered`, never the `request_id` that directive correlation reads. It
+never reports a prompt as delivered from acceptance or job status alone.
+
+Exact POST retries return the durable readback and never relaunch. A different
+request cannot compete with an accepted, queued, admitted or custody-unknown
+generation. If process ownership is lost before the delivery receipt, or a
+sent prompt's turn fails while the service is stopping, readback reports
+`custody-unknown`; neither GET nor retry resumes it. The unknown request
+remains a stop, not an automatic replay invitation. This route is not a
+generic retry/migration command, does not recover historical directives, and
+does not itself authorize continuation of any live target. Re-read every
+target's exact producer, receipt/ref/reflog, checkout, holder and admission
+guards immediately before owner-authorized use.
+
 ## 5. Concurrency (18e)
 
 Same-repo creation is sequential (git index/refs contention); every

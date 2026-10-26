@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, CreationContinuationConflictError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound, requireSafeRecordId } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -14,10 +14,11 @@ import { IntakeError } from '../intake/types.js';
 import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
 import type { IntakeSlicingService } from '../intake/slicing.js';
 import type { NotificationCenter } from '../notifications/center.js';
-import type { DispatchService } from './service.js';
+import type { CreationContinuationRequestResult, DispatchService } from './service.js';
 import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
+import { redactCreationTokens } from '../worktrees/creation-intent.js';
 import type { DirectiveRegistry } from './fix-directive.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
@@ -518,6 +519,67 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           json(res, error.status, { error: error.code, detail: error.message, ...(error instanceof IntakePartialFailure ? { readback: error.readback } : {}) });
         } else if (error instanceof URIError) json(res, 400, { error: 'intake_invalid_request', detail: 'malformed percent escape in intake identity' });
         else json(res, 500, { error: 'intake_failed', detail: error instanceof Error ? error.message : String(error) });
+      }
+      return true;
+    }
+    if (path === '/api/dispatch/creation-continuation' && req.method === 'POST') {
+      if (!authed(req, res)) return true;
+      const body = await readBody(req);
+      if (Object.keys(body).some((key) => key !== 'job_id' && key !== 'request_id')) {
+        json(res, 400, { error: 'bad_request', detail: 'creation continuation accepts only job_id and request_id' });
+        return true;
+      }
+      let result: CreationContinuationRequestResult;
+      try {
+        result = await options.dispatch.requestCreationContinuation({
+          jobId: strField(body, 'job_id'), requestId: strField(body, 'request_id'),
+        });
+      } catch (error) {
+        if (error instanceof RecordNotFound) {
+          json(res, 404, { error: 'not_found', detail: error.message });
+          return true;
+        }
+        if (error instanceof CreationContinuationConflictError) {
+          json(res, 409, { error: 'creation_continuation_conflict', detail: error.message });
+          return true;
+        }
+        throw error;
+      }
+      if (result.readback.state === 'refused' || result.readback.state === 'custody-unknown') {
+        json(res, 409, { error: result.readback.state === 'refused' ? 'creation_continuation_refused' : 'creation_continuation_unknown', readback: result.readback });
+      } else {
+        json(res, result.created ? 202 : 200, { readback: result.readback });
+      }
+      return true;
+    }
+    if (path === '/api/dispatch/creation-continuation' && req.method === 'GET') {
+      if (!authed(req, res)) return true;
+      const query = new URL(req.url ?? path, 'http://localhost').searchParams;
+      const allowed = new Set(['job_id', 'request_id']);
+      for (const key of query.keys()) {
+        if (!allowed.has(key) || query.getAll(key).length !== 1) {
+          json(res, 400, { error: 'bad_request', detail: 'GET creation continuation requires one job_id and request_id only' });
+          return true;
+        }
+      }
+      const jobIds = query.getAll('job_id');
+      const requestIds = query.getAll('request_id');
+      if (jobIds.length !== 1 || requestIds.length !== 1 || !jobIds[0] || !requestIds[0]) {
+        json(res, 400, { error: 'bad_request', detail: 'GET creation continuation requires job_id and request_id' });
+        return true;
+      }
+      try {
+        requireSafeRecordId(jobIds[0], 'job id');
+        requireSafeRecordId(requestIds[0], 'request id');
+      } catch (error) {
+        json(res, 400, { error: 'bad_request', detail: error instanceof Error ? error.message : String(error) });
+        return true;
+      }
+      const readback = options.dispatch.getCreationContinuationReadback(jobIds[0], requestIds[0]);
+      if (readback === null) {
+        json(res, 404, { error: 'not_found', detail: `creation continuation ${requestIds[0]} for job ${jobIds[0]} not found` });
+      } else {
+        json(res, 200, { readback });
       }
       return true;
     }
@@ -2163,7 +2225,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           }
         })
         .catch((error: unknown) => {
-          const message = String(error instanceof Error ? error.message : error);
+          const message = redactCreationTokens(String(error instanceof Error ? error.message : error));
           log('error', 'dispatch api handler failed', { path, error: message });
           if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message });
         });
