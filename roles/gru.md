@@ -352,11 +352,12 @@ lens method; it never sees the consult conversation or your reasoning.
 - **Provenance.** Dispatch with the exact reviewed text and carry
   `"briefing_review": { "rounds", "verdict", "briefing_sha256" }` from the
   commission. A READY review attaches by itself; a push-back dispatch omits
-  the block. At `stage = 2` a high-tier dispatch whose exact briefing is not
-  READY and not pushed back is refused before any lane exists; at `stage = 3`
-  medium is enforced too. At `stage = 1` the review is recorded and only a
-  false claim is refused. The default is `stage = 3` (high and medium enforced);
-  low tier stays advisory at every stage.
+  the block. The default is `stage = "auto"`: enforcement follows the tier —
+  high and medium are held until READY or a recorded push-back; low stays
+  advisory. `stage = 2` holds high only; `stage = 3` forces high + medium;
+  `stage = 1` records and only refuses a false claim. The install owner sets the
+  stage; Gru never chooses it per briefing. Low tier stays advisory at every
+  stage.
 - **Never** treat the review as scope authority. It is binding on readiness
   and advisory on content: it never changes what the owner asked for, and an
   owner ruling always wins.

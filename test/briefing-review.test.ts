@@ -703,6 +703,54 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     })).toBeNull();
   });
 
+  it('stage 3 still enforces high, and the enforced-tier chain fallback cannot be bypassed by a medium revision', async () => {
+    // Stage 3 high: pending and CHANGES-NEEDED are held exactly like stage 2.
+    const high = harness({ stage: 3 });
+    await high.service.commission(commission(high, { tier: 'high' }));
+    expect(() => high.service.admitDispatch({
+      jobId: 'job-high-s3',
+      repoPath: high.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
+    high.service.submitResult(result(high, { lens: 'stranger', findings: [blocking()] }));
+    expect(() => high.service.admitDispatch({
+      jobId: 'job-high-s3',
+      repoPath: high.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+
+    // Stage 3 medium: a revised briefing under the reviewed chain is refused
+    // as required (with the medium tier on the refusal event), not admitted.
+    const medium = harness({ stage: 3 });
+    await medium.service.commission(commission(medium, { tier: 'medium' }));
+    medium.service.submitResult(result(medium, { lens: 'stranger', findings: [blocking()] }));
+    const revised = `${BRIEFING}\n- The empty history returns an empty array.`;
+    expect(() => medium.service.admitDispatch({
+      jobId: 'job-medium-revised-s3',
+      repoPath: medium.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revised,
+      requested: undefined,
+    })).toThrow(expect.objectContaining({ code: 'briefing_review_required', status: 409 }));
+    expect(medium.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_REFUSED] })[0]!.payload).toMatchObject({ tier: 'medium', reason: 'missing' });
+
+    // Stage 2 leaves medium advisory: the same revised briefing is admitted.
+    const s2 = harness({ stage: 2 });
+    await s2.service.commission(commission(s2, { tier: 'medium' }));
+    s2.service.submitResult(result(s2, { lens: 'stranger', findings: [blocking()] }));
+    expect(s2.service.admitDispatch({
+      jobId: 'job-medium-revised-s2',
+      repoPath: s2.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revised,
+      requested: undefined,
+    })).toBeNull();
+  });
+
   it('stage 2 admits the exact READY sha or a recorded push-back, and never auto-attaches another repository\'s review', async () => {
     const h = harness({ stage: 2 });
     await h.service.commission(commission(h, { tier: 'high' }));

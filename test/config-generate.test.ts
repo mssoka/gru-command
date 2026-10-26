@@ -613,6 +613,7 @@ describe('config-generate CLI', () => {
     expect(doc).toContain('<!-- BEGIN GENERATED CONFIG REFERENCE');
     expect(doc).toContain('<!-- END GENERATED CONFIG REFERENCE -->');
     expect(doc).toContain(renderConfigDocBlock());
+    expect(renderConfigDocBlock()).toContain('# stage = "auto"');
   });
 
   it('the rendered config reference describes the conflict cascade as the fyi mechanical tier', () => {

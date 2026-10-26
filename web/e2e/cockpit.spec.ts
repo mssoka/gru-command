@@ -544,7 +544,7 @@ const BRIEFING_REVIEW_ON: Record<string, unknown> = {
 };
 
 const BRIEFING_REVIEW_STAGE2: Record<string, unknown> = { ...BRIEFING_REVIEW_ON, refusalsToday: 2, stage: 'high' };
-const BRIEFING_REVIEW_STAGE3: Record<string, unknown> = { ...BRIEFING_REVIEW_ON, tier: 'medium', refusalsToday: 3, stage: 'medium' };
+const BRIEFING_REVIEW_STAGE3: Record<string, unknown> = { ...BRIEFING_REVIEW_ON, tier: 'medium', refusalsToday: 3, stage: 'high+medium' };
 
 const RAIDS_ON: Record<string, unknown> = {
   enabled: true,

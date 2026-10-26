@@ -276,7 +276,7 @@ function nefarioCard(snapshot: BoardSnapshot): CockpitCard | null {
     ? 'stage 1 records provenance and refuses only a false claim'
     : review.stage === 'high'
       ? 'stage 2 holds a high-tier dispatch until its exact briefing is READY or pushed back'
-      : 'stage 3 holds a high- or medium-tier dispatch until its exact briefing is READY or pushed back';
+      : 'the install holds high- and medium-tier dispatches until the exact briefing is READY or pushed back';
   return {
     id: 'nefario',
     label: 'NEFARIO',

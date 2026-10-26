@@ -806,7 +806,8 @@ export function renderReferenceConfig(
 function briefingReviewSection(preserved: GruCommandConfig | null | undefined): string[] {
   const active = preserved !== null && preserved !== undefined;
   const enabled = preserved?.briefingReview.enabled ?? true;
-  const stage = preserved?.briefingReview.stage ?? 3;
+  const stage = preserved?.briefingReview.stage ?? 'auto';
+  const stageLiteral = typeof stage === 'string' ? `"${stage}"` : String(stage);
   return [
     active ? '[briefing_review]' : '# [briefing_review]',
     '# Nefario (docs/BRIEFING-REVIEW.md): Gru commissions a zero-context review',
@@ -818,11 +819,10 @@ function briefingReviewSection(preserved: GruCommandConfig | null | undefined): 
     '# refusal, and a zeroed board card. Leave it out of a config an older',
     '# build must still parse.',
     active ? `enabled = ${String(enabled)}` : '# enabled = true',
-    '# stage = 1 records provenance and refuses only a FALSE provenance claim;',
-    '# stage = 2 also refuses a high-tier dispatch whose exact briefing sha has',
-    '# no READY review or recorded push-back; stage = 3 enforces medium too.',
-    '# Low tier stays advisory at every stage.',
-    active ? `stage = ${String(stage)}` : '# stage = 3',
+    '# stage = "auto" follows the tier: high and medium are enforced, low is',
+    '# advisory. stage = 1 records provenance and refuses only a FALSE claim;',
+    '# stage = 2 also refuses a high-tier dispatch; stage = 3 forces high + medium.',
+    active ? `stage = ${stageLiteral}` : '# stage = "auto"',
   ];
 }
 

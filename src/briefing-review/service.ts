@@ -611,8 +611,8 @@ export class BriefingReviewService {
     }
   }
 
-  /** Gru's third path: one durable reason that admits the exact sha at
-   * stage 2 without claiming the review said READY. */
+  /** Gru's third path: one durable reason that admits the exact sha at an
+   * enforced stage without claiming the review said READY. */
   pushback(value: unknown): BriefingReviewPushbackOutcome {
     const request = parsePushbackRequest(value);
     const armed = armedByBriefingSha(this.ledger, request.briefingSha256, request.repoPath);
@@ -672,8 +672,8 @@ export class BriefingReviewService {
     };
   }
 
-  /** The dispatch gate: admits or refuses one dispatch and, for a stage-2
-   * refusal, records the attempt before anything is created. */
+  /** The dispatch gate: admits or refuses one dispatch and, for a readiness
+   * refusal at an enforced stage, records the attempt before anything is created. */
   admitDispatch(input: {
     readonly jobId: string;
     readonly repoPath: string;

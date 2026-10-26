@@ -15,11 +15,12 @@ import {
  * The dispatch gate (CAP-6): a pure decision over records someone else read.
  *
  * Stage 1 is advisory: a dispatch is never refused for review readiness, and
- * only a FALSE provenance claim is stopped. Stage 2 also refuses a high-tier
+ * only a FALSE provenance claim is stopped. Stage 2 refuses a high-tier
  * dispatch whose exact briefing sha has no READY review and no recorded
- * push-back. Medium and low tiers stay advisory in both stages; a heist with
- * no armed review at all is admitted (the server cannot infer an undeclared
- * tier — the role canon carries that obligation).
+ * push-back. Stage 3 and the default `auto` enforce high and medium; low stays
+ * advisory at every stage. A heist with no armed review at all is admitted
+ * (the server cannot infer an undeclared tier — the role canon carries that
+ * obligation).
  */
 
 export interface BriefingReviewRequestedProvenance {
@@ -40,7 +41,7 @@ export interface BriefingReviewProvenance {
   readonly pushbackReason: string | null;
 }
 
-/** One review of this heist's chain, as the stage-2 fallback scan sees it. */
+/** One review of this heist's chain, as the enforced-tier fallback scan sees it. */
 export interface BriefingReviewChainReview {
   readonly reviewId: string;
   readonly tier: BriefingReviewTier;
@@ -101,6 +102,7 @@ function refused(
   status: number,
   detail: string,
   reason: BriefingReviewRefusalReason | null,
+  tier: BriefingReviewTier = input.exact?.tier ?? 'high',
 ): BriefingReviewGateResult {
   return {
     admitted: false,
@@ -112,7 +114,7 @@ function refused(
           title: input.title,
           briefingSha256: briefingSha256Of(input.briefing),
           jobId: input.jobId,
-          tier: input.exact?.tier ?? 'high',
+          tier,
           reason,
         },
   };
@@ -191,8 +193,8 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
   if (exact !== null && exactPushback !== null) {
     return { admitted: true, provenance: provenance(exact, 'PUSHED-BACK', exactPushback.reason) };
   }
-  // Low tiers always stay advisory, and a medium tier is still advisory at
-  // stage 2. Stage 3 enforces medium as well as high.
+  // Low tiers always stay advisory; `auto`/stage 3 also enforce medium, while
+  // stage 2 enforces high only.
   if (stage === 1 || (exact !== null && !tierEnforcedAt(exact.tier, stage))) {
     return { admitted: true, provenance: null };
   }
@@ -225,6 +227,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
       `this stage-${String(stage)} install reviewed this heist's chain (newest: ${newest.reviewId}, round ${String(newest.round)}) but this exact briefing ` +
         'has no review; commission POST /api/briefing-review for the revised briefing before dispatching it',
       'missing',
+      newest.tier,
     );
   }
   return { admitted: true, provenance: null };

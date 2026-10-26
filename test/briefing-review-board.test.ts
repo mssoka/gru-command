@@ -109,7 +109,7 @@ describe('Nefario board view — the pure derivation', () => {
     });
   });
 
-  it('has no live round or tier when nothing is live, and the stage maps 1→advisory, 2→high', () => {
+  it('has no live round or tier when nothing is live, and the stage maps 1→advisory, 2→high, auto/3→high+medium', () => {
     const empty = briefingReviewCounts({ armed: [], verdicts: [], refusals: [], now: NOW });
     expect(empty).toEqual({ armed: 0, round: null, tier: null, verdictsToday: 0, caught: 0, refusalsToday: 0 });
     const decided = briefingReviewCounts({
@@ -123,7 +123,9 @@ describe('Nefario board view — the pure derivation', () => {
     expect(decided.verdictsToday).toBe(1);
     expect(briefingReviewBoardView({ counts: empty, stage: 1 })).toEqual({ ...empty, stage: 'advisory' });
     expect(briefingReviewBoardView({ counts: decided, stage: 2 })).toMatchObject({ stage: 'high' });
-    expect(briefingReviewBoardView({ counts: decided, stage: 3 })).toMatchObject({ stage: 'medium' });
+    expect(briefingReviewBoardView({ counts: decided, stage: 3 })).toMatchObject({ stage: 'high+medium' });
+    expect(briefingReviewBoardView({ counts: decided, stage: 'auto' })).toMatchObject({ stage: 'high+medium' });
+    
     expect(briefingReviewBoardView({ counts: null, stage: 2 })).toBeNull();
     expect(EMPTY_BRIEFING_REVIEW_COUNTS).toEqual({ armed: 0, round: null, tier: null, verdictsToday: 0, caught: 0, refusalsToday: 0 });
   });

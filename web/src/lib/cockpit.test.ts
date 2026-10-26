@@ -335,7 +335,7 @@ describe('Nefario briefing-review card (GH-505)', () => {
     });
   });
 
-  it('shows the aggregate pass only: live round and tier, stage suffix, and refusals only at stage 2', () => {
+  it('shows the aggregate pass only: live round and tier, stage suffix, and refusals at every enforced stage', () => {
     const live = card(cockpitCards(snapshot([], [], null, { briefingReview: review() }), NOW), 'nefario');
     expect(live.off).toBe(false);
     expect(live.headline).toMatchObject({ kpi: 'briefingReview.armed', value: '2', unit: 'under test' });
@@ -353,14 +353,14 @@ describe('Nefario briefing-review card (GH-505)', () => {
       ['briefingReview.refusalsToday', 1, true],
     ]);
     // Stage 3 enforces medium as well as high; refusals stay the alert fact.
-    const medium = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ stage: 'medium', tier: 'medium', refusalsToday: 2 }) }), NOW), 'nefario');
+    const medium = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ stage: 'high+medium', tier: 'medium', refusalsToday: 2 }) }), NOW), 'nefario');
     expect(medium.aside).toBe('round 3 · medium');
     expect(medium.facts.map((fact) => [fact.kpi, fact.value, fact.alert])).toEqual([
       ['briefingReview.verdictsToday', 1, false],
       ['briefingReview.caught', 4, false],
       ['briefingReview.refusalsToday', 2, true],
     ]);
-    expect(medium.asideTitle).toContain('stage 3 holds a high- or medium-tier dispatch');
+    expect(medium.asideTitle).toContain('the install holds high- and medium-tier dispatches');
     // Nothing live: the aside says so, and the zeros still render (faded).
     const quiet = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ armed: 0, round: null, tier: null, verdictsToday: 0, caught: 0, stage: 'high' }) }), NOW), 'nefario');
     expect(quiet.aside).toBe('no pass live');

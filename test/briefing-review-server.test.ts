@@ -47,14 +47,17 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(options: { stage?: 1 | 2 | 3; disabled?: boolean; hosted?: boolean } = {}): Promise<Harness> {
+async function boot(options: { stage?: 1 | 2 | 3; disabled?: boolean; hosted?: boolean; defaults?: boolean } = {}): Promise<Harness> {
   const repo = makeFixtureRepo('refunds-api');
   cleanups.push(() => repo.cleanup());
   const dir = mkdtempSync(join(tmpdir(), 'gru-briefing-review-http-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const reviewTable = options.defaults === true
+    ? ''
+    : `[briefing_review]\nenabled = ${String(!(options.disabled ?? false))}\nstage = ${String(options.stage ?? 1)}\n`;
   writeFileSync(
     join(dir, 'config.toml'),
-    `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n[briefing_review]\nenabled = ${String(!(options.disabled ?? false))}\nstage = ${String(options.stage ?? 1)}\n`,
+    `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n${reviewTable}`,
     'utf-8',
   );
   const config = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
@@ -320,6 +323,37 @@ describe('Nefario HTTP surface', () => {
     const admitted = await call(h.port, 'POST', '/api/dispatch', dispatchBody);
     expect(admitted.status).toBe(202);
     expect(admitted.json).toMatchObject({ job_id: 'job-medium' });
+    await h.close();
+  });
+
+  it('uses the default auto config when no [briefing_review] block is present', async () => {
+    const h = await boot({ defaults: true });
+    const commissioned = await call(h.port, 'POST', '/api/briefing-review', commissionBody(h, { tier: 'medium' }));
+    expect(commissioned.status).toBe(202);
+    const armed = armedOf(h);
+    const dispatchBody = {
+      job_id: 'job-default-stage',
+      repo_path: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+    };
+    const held = await call(h.port, 'POST', '/api/dispatch', dispatchBody);
+    expect(held.status).toBe(409);
+    expect(held.json).toMatchObject({ error: 'briefing_review_pending' });
+    expect(h.ledger.getJob('job-default-stage')).toBeNull();
+    for (const lens of armed.lenses) {
+      const submitted = await call(h.port, 'POST', '/api/briefing-review/result', {
+        repoPath: h.repo.path,
+        briefingSha256: armed.briefingSha256,
+        jobId: lensJobId(armed.reviewId, lens),
+        lens,
+        verdict: 'READY',
+        findings: [],
+      });
+      expect(submitted.status).toBe(200);
+    }
+    const admitted = await call(h.port, 'POST', '/api/dispatch', dispatchBody);
+    expect(admitted.status).toBe(202);
     await h.close();
   });
 

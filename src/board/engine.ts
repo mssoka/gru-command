@@ -511,7 +511,8 @@ export interface BoardEngineOptions {
   /** #351: the raids card (late-bound Vector service). */
   readonly vector?: () => VectorBoardView | null;
   /** GH-505: Nefario's block (late-bound briefing-review service counts).
-   * Absent = no block (`null`); the stage is mapped 1→advisory, 2→high. */
+   * Absent = no block (`null`); the effective stage maps 1→advisory,
+   * 2→high, 3/auto→high+medium. */
   readonly briefingReview?: () => Parameters<typeof briefingReviewBoardView>[0]['counts'];
   /** GH-505: the configured rollout stage the wire literal maps from. */
   readonly briefingReviewStage?: BriefingReviewStage;
@@ -559,7 +560,7 @@ export class BoardEngine {
     this.disk = opts.disk ?? (() => null);
     this.vector = opts.vector ?? (() => null);
     this.briefingReview = opts.briefingReview ?? (() => null);
-    this.briefingReviewStage = opts.briefingReviewStage ?? 1;
+    this.briefingReviewStage = opts.briefingReviewStage ?? 'auto';
     this.pacing = opts.pacing ?? (() => null);
     this.pipeline = opts.pipeline ?? (() => null);
     this.selfHeal = opts.selfHeal ?? (() => null);

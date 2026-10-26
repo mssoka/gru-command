@@ -35,11 +35,9 @@ export type BriefingReviewVerdict = (typeof BRIEFING_REVIEW_VERDICTS)[number];
 export const BRIEFING_REVIEW_PROVENANCE_VERDICTS = ['READY', 'CHANGES-NEEDED', 'PUSHED-BACK'] as const;
 export type BriefingReviewProvenanceVerdict = (typeof BRIEFING_REVIEW_PROVENANCE_VERDICTS)[number];
 
-/** Rollout stage: 1 records provenance and enforces only truthfulness of a
- * claim; 2 also refuses a high-tier dispatch without a READY review or a
- * recorded push-back; 3 enforces medium as well. Low stays advisory at every
- * stage. */
-export const BRIEFING_REVIEW_STAGES = [1, 2, 3] as const;
+/** Enforcement: `auto` follows the tier (high + medium enforced, low
+ * advisory); 1/2/3 are explicit floor overrides. `auto` is the default. */
+export const BRIEFING_REVIEW_STAGES = ['auto', 1, 2, 3] as const;
 export type BriefingReviewStage = (typeof BRIEFING_REVIEW_STAGES)[number];
 
 /** Finding severities: `blocking` forces CHANGES-NEEDED, `advisory` does not. */
@@ -172,12 +170,13 @@ export function tierRank(tier: BriefingReviewTier): number {
   return BRIEFING_REVIEW_TIERS.indexOf(tier);
 }
 
-/** Which tiers a rollout stage holds to readiness: stage 1 none, stage 2
- * high only, stage 3 high and medium. Low is advisory at every stage. */
+/** Which tiers a stage holds to readiness: auto follows the tier (high +
+ * medium; low advisory), 1 enforces none, 2 high only, 3 high + medium. */
 export function tierEnforcedAt(tier: BriefingReviewTier, stage: BriefingReviewStage): boolean {
   if (stage === 1) return false;
   if (stage === 2) return tier === 'high';
-  return tier === 'high' || tier === 'medium';
+  if (stage === 3 || stage === 'auto') return tier === 'high' || tier === 'medium';
+  throw new Error(`unhandled briefing review stage ${String(stage)}`);
 }
 
 export function isBriefingReviewTier(value: unknown): value is BriefingReviewTier {

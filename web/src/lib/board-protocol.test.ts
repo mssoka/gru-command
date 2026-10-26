@@ -846,7 +846,8 @@ describe('Nefario briefing-review block (GH-505)', () => {
     expect(isValidSnapshot({ ...snapshot(), briefingReview: null })).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), briefingReview: review() })).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), armed: 0, round: null, tier: null, stage: 'high' } })).toBe(true);
-    expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), armed: 0, round: null, tier: null, stage: 'medium' } })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), stage: 'high' } })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), stage: 'high+medium' } })).toBe(true);
   });
 
   it('rejects a malformed block, one field at a time: a guessed count or stage never renders', () => {
@@ -862,6 +863,7 @@ describe('Nefario briefing-review block (GH-505)', () => {
       { ...review(), caught: Number.NaN },
       { ...review(), refusalsToday: '0' },
       { ...review(), stage: 'enforce' },
+      { ...review(), stage: 'medium' },
       { ...review(), stage: null },
     ];
     for (const block of broken) expect(isValidSnapshot({ ...snapshot(), briefingReview: block }), JSON.stringify(block)).toBe(false);

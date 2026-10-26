@@ -9,7 +9,7 @@ import { DECISION_SURFACES } from './decisions/questions.js';
 import { displayManagedRepoName, managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 import { SILAS_AUTOPILOT_RULE_IDS } from './dispatch/silas-rules.js';
-import { BRIEFING_REVIEW_STAGES, type BriefingReviewStage } from './briefing-review/types.js';
+import { type BriefingReviewStage } from './briefing-review/types.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -349,8 +349,8 @@ export const DEFAULT_VECTOR_CONFIG: VectorConfig = {
 
 /** Nefario, the pre-dispatch briefing review (GH-505, docs/BRIEFING-REVIEW.md).
  * `enabled = false` is the stop state: no commission, no readiness refusal and
- * an empty card. `stage` 1 records provenance (advisory) and 2 also refuses a
- * high-tier dispatch whose exact briefing has no READY review or push-back. */
+ * an empty card. `stage = auto` (the default) follows the tier: high and medium
+ * are enforced, low is advisory. `stage` 1/2/3 are explicit overrides. */
 export interface BriefingReviewConfig {
   readonly enabled: boolean;
   readonly stage: BriefingReviewStage;
@@ -358,9 +358,9 @@ export interface BriefingReviewConfig {
 
 export const DEFAULT_BRIEFING_REVIEW_CONFIG: BriefingReviewConfig = {
   enabled: true,
-  // The owner wants the gate active immediately: high and medium are enforced,
-  // low stays advisory. Stage 1/2 remain configurable for a relaxed rollout.
-  stage: 3,
+  // Auto by tier: high and medium are enforced, low is advisory. Stages 1/2/3
+  // remain explicit floor overrides for an install that needs them.
+  stage: 'auto',
 };
 
 /** What GC does about a managed repository whose origin default branch has
@@ -1934,9 +1934,10 @@ export function loadConfig(
         }
       }
       const stage = table['stage'];
-      if (stage !== undefined && (typeof stage !== 'number' || !(BRIEFING_REVIEW_STAGES as readonly number[]).includes(stage))) {
+      const validStage = stage === 'auto' || (typeof stage === 'number' && [1, 2, 3].includes(stage));
+      if (stage !== undefined && !validStage) {
         throw new ConfigError(
-          `briefing_review.stage must be 1, 2 or 3 (1 = record provenance, 2 = refuse a high-tier dispatch without a READY review or push-back, 3 = enforce medium as well), got: ${JSON.stringify(stage)}`,
+          `briefing_review.stage must be "auto", 1, 2 or 3 (auto follows the tier: high + medium enforced, low advisory; 1 = record only, 2 = high only, 3 = high + medium), got: ${JSON.stringify(stage)}`,
           file,
           'briefing_review.stage',
         );

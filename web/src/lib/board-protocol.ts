@@ -639,13 +639,13 @@ export interface RepoOverviewView {
 
 /** The rollout stages the server can send (mirrors `BRIEFING_REVIEW_STAGES`
  * through the engine's 1→advisory / 2→high mapping). */
-export const BRIEFING_REVIEW_STAGE_NAMES = ['advisory', 'high', 'medium'] as const;
+export const BRIEFING_REVIEW_STAGE_NAMES = ['advisory', 'high', 'high+medium'] as const;
 
 export type BriefingReviewStageName = (typeof BRIEFING_REVIEW_STAGE_NAMES)[number];
 
 /** Nefario's live passes (GH-505; server mirror of `BriefingReviewBoardView`).
- * `stage` is the wire literal; the server maps config stage 1→advisory and
- * 2→high. A disabled install sends this block with zeros. */
+ * `stage` is the effective enforcement: 1→advisory, 2→high, 3/auto→high+medium.
+ * A disabled install sends this block with zeros. */
 export interface BriefingReviewView {
   /** Reviews whose newest armed generation has no decisive verdict. */
   readonly armed: number;
