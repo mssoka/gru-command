@@ -166,6 +166,71 @@ reset failure.
 the adapter contract already recovers on the next turn. Only hangs and
 fatal errors climb.
 
+**A native directive refusal is not provider-routed (#485).** A refusal is a
+`DirectiveCheckpointError` GC raises for its own directive control:
+
+- its fences and authority checks (the directive is held, superseded or
+  terminal; a tool fence fails; on Pi, a compaction is still open at
+  admission);
+- its protocol checks (on Claude: an answer before the CLI's echo, a second
+  prompt, a lost frame, the permission channel's own deny). The channel has
+  a backstop for a GC bug in the host's refusal and turn-failure calls,
+  which don't throw in production: it logs, then fails the turn as a tagged
+  handling refusal, unless the turn has already reported a failure; if that
+  throws too, it ends the CLI;
+- its directive bookkeeping I/O inside a turn: transcript, binding, receipt
+  and producer-journal I/O, and the GC ledger calls made for the directive
+  (`beforeAdmission`, `onAdmitted`). A fault there, even one whose text names
+  a wall word such as `EDQUOT: disk quota exceeded`, or a GC bug inside those
+  calls, is converted where it happens into `directive bookkeeping failed:
+  <call>: <fault>`; directive recovery owns it, and it is still reported and
+  logged. Two kinds are not converted: the pre-turn checks (Claude's
+  `prepareDirectiveTurn`; Pi's `runTurn` opening and `resumeDirective`)
+  reject the prompt before any event and reach no supervision, and Pi's
+  `executeBash` controller receipt runs outside any turn;
+- the `AggregateError` that replaces one of these when its receipt cannot be
+  journaled.
+
+An error from code GC does not own (an extension hook, the SDK, the
+provider), or GC's wrapper around one, is never a refusal and always routes.
+GC runs each of its own bookkeeping calls by itself, never together with an
+extension hook, so a wrapper's cause is a refusal only when it is one.
+
+The adapter tags a refusal `nativeControl: 'directive-refusal'` (Pi by
+matching the failure to the refusal it recorded, Claude by the failure's
+cause). A directive turn reports its first failure: one still owed its report
+stays the turn's failure, with its own text, through GC's own later failures
+(a lost write, a second prompt, the channel's deny). A failure of the CLI
+process, or of the permission channel's transport or protocol (transport
+unavailable or failed, a foreign or repeated response, a result before
+initialization), reports itself, untagged, as before #485; the owed refusal
+stays durable in its guard receipt, and the channel's own failure texts name
+no wall word.
+No tool is allowed once the turn has a recorded failure: an allow is
+re-checked as it is written, and denied with a durable guard receipt. After a
+failure of the CLI process, or of the permission channel's transport or
+protocol, nothing is recorded: the allow is dropped at the stdin GC has
+ended, with no deny and no receipt, and no tool runs. GC's own texts name a
+thrown non-error value (`a non-error value was thrown: null`): verdicts,
+receipts and the events GC builds. On Pi, an event its SDK reduces from such
+a throw can still read a bare `null`.
+
+On a directive turn the supervisor neither paces a tagged, nonfatal,
+untyped error as a rate limit nor classifies it as a wall: the directive's
+recovery path owns it (it disposes the handle, fails or reconciles the
+directive, and surfaces the recovery to Gru). Each skipped refusal leaves a
+`supervision.native-refusal-retained` ledger event naming the agent, with
+`error` (at most 500 characters, cut on a code-point boundary; a cut one adds
+`error_truncated: true` and the original `error_length`). A fatal or typed
+tagged error is still routed, and a tag on a turn that carries no directive
+is logged as a warning and routed. After a refusal GC reports the last
+main-thread API error it saw, even one the CLI's own result would drop (a
+wall seen is a wall), unless a later real main-thread call cleared it (the
+CLI's own `<synthetic>` replies do not). It is reported untagged, with an
+error result's text when there is one, through the ordinary path's text
+helper; a subagent's API error, or a result error GC's own abort caused, is
+not reported.
+
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent
 is **stopped** (no further restarts), an **action-required** machine alert

@@ -108,7 +108,7 @@ export interface CockpitFact {
 export type CockpitStage = 'working' | 'in-review' | 'merged' | 'done';
 
 export interface CockpitCard {
-  readonly id: 'heists' | 'megaminions' | 'crew' | 'prs' | 'reviews' | 'raids';
+  readonly id: 'heists' | 'megaminions' | 'crew' | 'prs' | 'reviews' | 'raids' | 'nefario';
   readonly label: string;
   /** Short context beside the label (`round 3 live`). */
   readonly aside: string | null;
@@ -246,7 +246,56 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
   ];
   const raids = raidsCard(snapshot);
   if (raids !== null) cards.push(raids);
+  const nefario = nefarioCard(snapshot);
+  if (nefario !== null) cards.push(nefario);
   return cards;
+}
+
+/** GH-505: Nefario's card, only when the server sent its block (an older
+ * server's board shows no card rather than zeros). A block the server could
+ * not read (`null`) is unknown: a dashed card says so. The card shows the
+ * round's aggregate verdict only — never per-lens chips. */
+function nefarioCard(snapshot: BoardSnapshot): CockpitCard | null {
+  const review = snapshot.briefingReview;
+  if (review === undefined) return null;
+  if (review === null) {
+    return {
+      id: 'nefario',
+      label: 'NEFARIO',
+      aside: null,
+      headline: { kpi: null, value: '—', unit: 'unavailable', title: 'The server could not read the briefing reviews; the card returns with the next board update that can.' },
+      facts: [],
+      notes: ['the server could not read the briefing reviews'],
+      flow: null,
+      off: true,
+    };
+  }
+  const live = review.round !== null && review.tier !== null;
+  const stageSuffix = review.stage === 'advisory' ? ' · advisory' : '';
+  const stageTitle = review.stage === 'advisory'
+    ? 'stage 1 records provenance and refuses only a false claim'
+    : review.stage === 'high'
+      ? 'stage 2 holds a high-tier dispatch until its exact briefing is READY or pushed back'
+      : 'the install holds high- and medium-tier dispatches until the exact briefing is READY or pushed back';
+  return {
+    id: 'nefario',
+    label: 'NEFARIO',
+    aside: live ? `round ${review.round} · ${review.tier}${stageSuffix}` : `no pass live${stageSuffix}`,
+    asideTitle: live
+      ? `The newest live briefing review is round ${review.round} at ${review.tier} tier; ${stageTitle}.`
+      : `No briefing review is live; ${stageTitle}.`,
+    headline: { kpi: 'briefingReview.armed', value: String(review.armed), unit: 'under test', title: `${pluralCount(review.armed, 'briefing')} under review` },
+    facts: [
+      fact('briefingReview.verdictsToday', review.verdictsToday, review.verdictsToday === 1 ? 'verdict today' : 'verdicts today', `${pluralCount(review.verdictsToday, 'briefing verdict')} posted today`),
+      fact('briefingReview.caught', review.caught, 'caught', `${pluralCount(review.caught, 'blocking finding')} caught before dispatch today`),
+      ...(review.stage !== 'advisory'
+        ? [fact('briefingReview.refusalsToday', review.refusalsToday, review.refusalsToday === 1 ? 'refusal today' : 'refusals today', `${pluralCount(review.refusalsToday, 'tiered dispatch')} held back today`, true)]
+        : []),
+    ],
+    notes: [],
+    flow: null,
+    off: false,
+  };
 }
 
 /** #351: the raids card, only when the server sent its block (an older

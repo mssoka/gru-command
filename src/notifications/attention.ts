@@ -97,6 +97,28 @@ const DECISION_REQUIRED_KINDS: readonly string[] = [
   'disk.reclaim-proposal',
 ];
 
+/** Typed owner decisions whose PRODUCER service executes the recorded
+ * choice on its own `notification.decision` subscription / reconcile pass and
+ * then resolves the card (#506). These stay passive for Gru: a wake would
+ * invite a duplicate operation, and a Gru resolution before the producer's
+ * pass reads the card would hide the accepted work from its owner service.
+ * Every other typed decision (Gru escalations and unknown future kinds)
+ * creates Gru's follow-through debt. */
+const PRODUCER_FOLLOWED_DECISION_KINDS: readonly string[] = [
+  'vector.raid-proposal',
+  'vector.fix-proposal',
+  'onboarding.proposal',
+  'worktree.preserve-expiry',
+  'worktree.repo-mismatch',
+  'disk.reclaim-proposal',
+];
+const PRODUCER_FOLLOWED_DECISION_PREFIXES: readonly string[] = ['worktree-sweep-paused:'];
+
+export function producerFollowsDecisionThrough(kind: string): boolean {
+  return PRODUCER_FOLLOWED_DECISION_KINDS.includes(kind) ||
+    PRODUCER_FOLLOWED_DECISION_PREFIXES.some((prefix) => kind.startsWith(prefix));
+}
+
 export function ownerAttentionFor(kind: string): OwnerAttention {
   if (OWNER_REQUIRED_KINDS.includes(kind)) return 'owner-required';
   if (OWNER_REQUIRED_PREFIXES.some((prefix) => kind.startsWith(prefix))) return 'owner-required';

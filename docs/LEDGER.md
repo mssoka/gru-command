@@ -169,6 +169,11 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169). A never-live round whose no-spawn receipt the ledger refuses at startup recovery gets one too, its note naming the refusal (#466) |
 | `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
 | `job.review-source-verified` | the admission binding recorded AFTER the review-source preflight proves the actual selected object store, BEFORE any job row/worktree/spawn completes: `object_store` (canonical git common dir), `target_sha` (resolved full oid), `target_base`, `range_commits`, `inputs` (path/lens/blob), `source` (`repository`/`source-package`), `package_sha256` — issue #317 |
+| `briefing.review-armed` | Nefario's commission (GH-505, docs/BRIEFING-REVIEW.md): `review_id` (sha256 of briefing + repo), `commission_key` (tier-scoped), `chain_key` (repo + title), `briefing_sha_256`, `repo_path`, `title`, `tier`, `justification`, `round`, `generation`, `lenses`, `head_sha` (null when HEAD is unresolvable), and `upgraded_from` on a tier raise. The exact briefing text itself is durable on each lens job row between the review's markers, never in the event |
+| `briefing.review-verdict` | one lens result (or the decisive aggregate) : `review_id`, `chain_key`, `briefing_sha_256`, `lens`, `lens_verdict`, `findings` (code/severity/evidence/why_it_blocks), `round`, `generation`, and `decisive`/`aggregate`/`caught` (non-decisive submissions carry `aggregate: null`; a decisive READY always carries `caught`, 0 when nothing was superseded) |
+| `briefing.review-refused` | a readiness refusal at an enforced stage, recorded BEFORE any job row: `repo_path`, `title`, `briefing_sha_256`, `job_id`, `tier` (the review's tier; for `missing`, the chain's newest enforced review), `reason` (`missing` \| `pending` \| `changes-needed`) |
+| `briefing.review-pushback` | Gru's recorded override of a non-READY review: `review_id`, `briefing_sha_256`, `generation`, `reason`, `by`. Idempotent by reason; it admits the exact sha at an enforced stage and never changes the review's findings |
+| `briefing.review-dispatched` | the provenance a dispatched lane carries: `job_id`, `review_id`, `briefing_sha_256`, `round`, `generation`, `verdict` (`READY` \| `CHANGES-NEEDED` \| `PUSHED-BACK`), `tier`, and `pushback_reason` when pushed back |
 
 Events are appended for **state changes**; idempotent enrichment writes
 (re-registering an agent, same-state activity refreshes) update rows
@@ -220,7 +225,9 @@ metadata and a recorded decision (`decision_json`, `decided_at/by/option`).
 a `notification.created` / `notification.shown` / `notification.acked` /
 `notification.decision` / `notification.resolved` event and publishes on
 the bus — the board pushes, machine-attention rows wake Gru, owner rows
-surface in chat, and the breaker re-arm rides the disposition. Legacy
+surface in chat, a recorded owner decision opens its follow-through wake
+(one claim per `(id, decided_at)`), and the breaker re-arm rides the
+disposition. Legacy
 owner rows are re-triaged to Gru at boot with a recorded note — never by
 age or display; `notification.resolved` with Gru's action detail closes
 machine work and a decided owner row's follow-through, while only a

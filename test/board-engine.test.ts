@@ -12,6 +12,7 @@ import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { Role } from '../src/config.js';
 import type { DecisionRuntimeStatus } from '../src/decisions/runtime.js';
 import type { RepoOverviewView } from '../src/repos/overview.js';
+import type { BriefingReviewBoardCounts } from '../src/briefing-review/board.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1159,5 +1160,54 @@ describe('GH-305 shared mailbox board readback', () => {
       expect(engine.snapshot().mailbox.counts).toMatchObject({ threads: 1, incidents: 0, notifications: 0 });
       expect(engine.snapshot().mailbox).toEqual(engine.mailbox.snapshot());
     } finally { db.close(); }
+  });
+});
+
+describe('board engine — Nefario briefing-review wiring (GH-505)', () => {
+  it('maps the briefing-review counts onto the wire block with the configured stage, and sends null when unwired', () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    try {
+      const counts = (): BriefingReviewBoardCounts => ({ armed: 2, round: 3, tier: 'high', verdictsToday: 1, caught: 4, refusalsToday: 0 });
+      const stageOne = new BoardEngine({ ledger, bus, briefingReview: counts, briefingReviewStage: 1 });
+      expect(stageOne.snapshot().briefingReview).toEqual({ ...counts(), stage: 'advisory' });
+      const stageTwo = new BoardEngine({ ledger, bus, briefingReview: counts, briefingReviewStage: 2 });
+      expect(stageTwo.snapshot().briefingReview).toMatchObject({ stage: 'high' });
+      const stageThree = new BoardEngine({ ledger, bus, briefingReview: counts, briefingReviewStage: 3 });
+      expect(stageThree.snapshot().briefingReview).toMatchObject({ stage: 'high+medium' });
+      const stageAuto = new BoardEngine({ ledger, bus, briefingReview: counts, briefingReviewStage: 'auto' });
+      expect(stageAuto.snapshot().briefingReview).toMatchObject({ stage: 'high+medium' });
+      const stageDefault = new BoardEngine({ ledger, bus, briefingReview: counts });
+      expect(stageDefault.snapshot().briefingReview).toMatchObject({ stage: 'high+medium' });
+      // No wiring (a build without the review): the field is still present,
+      // as null, so an old client never reads a missing block as "all clear".
+      expect(new BoardEngine({ ledger, bus }).snapshot().briefingReview).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('sends null for a failed or truncated review read and still snapshots the rest of the board', () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    try {
+      ledger.addJob({ id: 'job-1', repo: 'demo', title: 'heist' });
+      const truncated = new BoardEngine({ ledger, bus, briefingReview: () => null });
+      expect(truncated.snapshot().briefingReview).toBeNull();
+      expect(truncated.snapshot().repos[0]?.jobs.map((job) => job.id)).toEqual(['job-1']);
+      const errors: string[] = [];
+      const throwing = new BoardEngine({
+        ledger,
+        bus,
+        briefingReview: () => { throw new Error('review events unreadable'); },
+        log: (level, message) => { if (level === 'error') errors.push(message); },
+      });
+      expect(throwing.snapshot().briefingReview).toBeNull();
+      expect(errors).toContain('briefing review view read failed');
+    } finally {
+      db.close();
+    }
   });
 });

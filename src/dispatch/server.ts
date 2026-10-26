@@ -42,6 +42,9 @@ import { childRefusalStatus, type ChildWorkerService } from './child-workers.js'
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
 import type { PropertyCampaignService } from './property-campaigns.js';
+import { parseBriefingReviewBlock, type BriefingReviewProvenance } from '../briefing-review/gate.js';
+import { BriefingReviewError } from '../briefing-review/types.js';
+import type { BriefingReviewService } from '../briefing-review/service.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -104,6 +107,10 @@ export interface DispatchServerOptions {
   readonly intakeSlicing?: IntakeSlicingService;
   /** Owner pairing-token actions only; never exposed as reviewer tools. */
   readonly propertyCampaigns?: PropertyCampaignService;
+  /** Nefario, the pre-dispatch briefing review (GH-505). Absent =
+   * /api/briefing-review* answers 503 (not hosted) and /api/dispatch gates
+   * nothing. */
+  readonly briefingReview?: BriefingReviewService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   /** Observe the actual continued physical session through the shared
@@ -569,6 +576,61 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       return true;
     }
+    // Nefario, the pre-dispatch briefing review (GH-505). Commission, lens
+    // result and Gru's recorded push-back live here; every refusal is a named
+    // `{ error, detail }` with the status that says what to fix.
+    if (path === '/api/briefing-review' || path.startsWith('/api/briefing-review/')) {
+      if (!authed(req, res)) return true;
+      const briefingReview = options.briefingReview;
+      if (briefingReview === undefined) {
+        json(res, 503, {
+          error: 'briefing_review_not_hosted',
+          detail: 'the briefing review is not hosted on this service',
+        });
+        return true;
+      }
+      try {
+        const readReviewBody = async (): Promise<Record<string, unknown>> => {
+          try {
+            return await readBody(req, false);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new BriefingReviewError(
+              'briefing_review_invalid_request',
+              message,
+              message.includes('exceeds 512 KiB') ? 413 : 400,
+            );
+          }
+        };
+        if (req.method === 'POST' && path === '/api/briefing-review') {
+          const outcome = await briefingReview.commission(await readReviewBody());
+          json(res, outcome.status, outcome.body);
+          return true;
+        }
+        if (req.method === 'POST' && path === '/api/briefing-review/result') {
+          json(res, 200, briefingReview.submitResult(await readReviewBody()));
+          return true;
+        }
+        if (req.method === 'POST' && path === '/api/briefing-review/pushback') {
+          json(res, 200, briefingReview.pushback(await readReviewBody()));
+          return true;
+        }
+        json(res, 404, { error: 'briefing_review_not_found', detail: 'unsupported briefing-review route' });
+      } catch (error) {
+        if (error instanceof BriefingReviewError) {
+          if (error.status === 413) {
+            res.setHeader('connection', 'close');
+            res.once('finish', () => req.socket.destroySoon());
+          }
+          json(res, error.status, { error: error.code, detail: error.message });
+          return true;
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        log('error', 'briefing review handler failed', { path, error: detail });
+        json(res, 500, { error: 'briefing_review_failed', detail });
+      }
+      return true;
+    }
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
@@ -600,6 +662,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // malformed is a named refusal, never a silent drop.
       const reviewRole = optStrFieldStrict(body, 'review_role');
       const parentContractSha256 = optStrFieldStrict(body, 'parent_contract_sha256');
+      // GH-505: optional briefing-review provenance. A present-but-malformed
+      // block is a named 400; the gate then runs BEFORE any job row, worktree
+      // or spawn, so a refusal creates nothing.
+      let provenance: BriefingReviewProvenance | null;
+      try {
+        provenance = options.briefingReview?.admitDispatch({
+          jobId: strField(body, 'job_id'),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          briefing: strField(body, 'briefing'),
+          requested: parseBriefingReviewBlock(body['briefing_review']),
+        }) ?? null;
+      } catch (error) {
+        if (error instanceof BriefingReviewError) {
+          log('warn', 'briefing review refused dispatch', { code: error.code, detail: error.message });
+          json(res, error.status, { error: error.code, detail: error.message });
+          return true;
+        }
+        throw error;
+      }
       let outcome: Awaited<ReturnType<DispatchService['dispatch']>>;
       try {
         const inputPackage = Object.hasOwn(body, 'input_package') ? parseBlindInputPackage(body['input_package']) : undefined;
@@ -621,6 +703,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(reviewRole !== undefined ? { reviewRole } : {}),
           ...(inputPackage !== undefined ? { inputPackage } : {}),
           ...(parentContractSha256 !== undefined ? { parentContractSha256 } : {}),
+          ...(provenance !== null ? { briefingReview: provenance } : {}),
         });
       } catch (error) {
         // Issue #317: the selected source cannot provide the named review
@@ -2124,7 +2207,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
       const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
-      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
+      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && path !== '/api/briefing-review' && !path.startsWith('/api/briefing-review/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
