@@ -20,6 +20,8 @@ import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type P
 import type { DiskFloorGate, FloorAdmission } from '../maintenance/disk.js';
 import type { EventBus } from '../events/bus.js';
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { BRIEFING_REVIEW_DISPATCHED } from '../briefing-review/events.js';
+import type { BriefingReviewProvenance } from '../briefing-review/gate.js';
 import {
   assertLaneUsesBoundStore,
   blobText,
@@ -208,6 +210,10 @@ export function renderMinionBriefing(input: {
   reviewSource?: ReviewSourceBinding;
   /** #360 R5-B3: an admitted blind reviewer's package — its input. */
   blindPackage?: BlindInputPackage;
+  /** Nefario lens jobs (GH-505): a read-only planning review. The standing
+   * orders say change nothing, commit nothing, push nothing, open no PR —
+   * the generic investigation order to commit must never be the last word. */
+  readOnly?: boolean;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -239,27 +245,35 @@ export function renderMinionBriefing(input: {
           '',
         ]
       : []),
-    ...(input.deliverable === 'review'
+    ...(input.readOnly === true
       ? [
           'Execute the briefing inside this worktree. Standing orders: work only',
           'inside this tree; this brief is READ-ONLY — change nothing, commit',
-          'nothing (an unmodified tree is the expected result); read the named',
-          'immutable head and diff via git show/git diff inside your tree; never',
-          'merge; end with your findings and a completion report.',
+          'nothing, push nothing, open no pull request and implement nothing (an',
+          'unmodified tree is the expected result); read the repository and the',
+          'reviewed briefing; end with your findings and a completion report.',
         ]
-      : input.deliverable === 'artifact' || input.deliverable === 'investigation'
+      : input.deliverable === 'review'
         ? [
             'Execute the briefing inside this worktree. Standing orders: work only',
-            'inside this tree; commit your work to the branch; verify it; hand back',
-            'the named artifact and end with a completion report; do not open a',
-            'pull request — this job owes an artifact handback, not a PR.',
+            'inside this tree; this brief is READ-ONLY — change nothing, commit',
+            'nothing (an unmodified tree is the expected result); read the named',
+            'immutable head and diff via git show/git diff inside your tree; never',
+            'merge; end with your findings and a completion report.',
           ]
-        : [
-            'Execute the briefing inside this worktree. Standing orders: work only',
-            'inside this tree; commit your work to the branch; verify it (build,',
-            'tests, lint — whatever this project calls green) before finishing;',
-            'never merge your own pull request. End with a completion report.',
-          ]),
+        : input.deliverable === 'artifact' || input.deliverable === 'investigation'
+          ? [
+              'Execute the briefing inside this worktree. Standing orders: work only',
+              'inside this tree; commit your work to the branch; verify it; hand back',
+              'the named artifact and end with a completion report; do not open a',
+              'pull request — this job owes an artifact handback, not a PR.',
+            ]
+          : [
+              'Execute the briefing inside this worktree. Standing orders: work only',
+              'inside this tree; commit your work to the branch; verify it (build,',
+              'tests, lint — whatever this project calls green) before finishing;',
+              'never merge your own pull request. End with a completion report.',
+            ]),
   ].join('\n');
 }
 
@@ -323,6 +337,13 @@ export class DispatchService {
      * validated completion owes the named decision durably. Omitted =
      * ordinary Silas completion. */
     completionHandoff?: CompletionHandoffIntent;
+    /** Nefario lens jobs (GH-505): a read-only planning review. The rendered
+     * standing orders agree with the lens briefing's own read-only orders. */
+    readOnly?: boolean;
+    /** The verified briefing-review provenance this dispatch carries
+     * (GH-505): recorded on the job as `briefing.review-dispatched` after
+     * `addJob`, so the ledger proves the minion received the reviewed text. */
+    briefingReview?: BriefingReviewProvenance;
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
@@ -433,6 +454,26 @@ export class DispatchService {
       ...(recordedTargetSha !== undefined ? { targetSha: recordedTargetSha } : {}),
       ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
+
+    if (input.briefingReview !== undefined) {
+      // GH-505: the job records which review admitted it and which exact
+      // briefing sha it received. A push-back dispatch carries no verdict
+      // block; its reason is the provenance.
+      this.opts.ledger.appendCustomEvent({
+        kind: BRIEFING_REVIEW_DISPATCHED,
+        jobId: job.id,
+        payload: {
+          job_id: job.id,
+          review_id: input.briefingReview.reviewId,
+          briefing_sha_256: input.briefingReview.briefingSha256,
+          round: input.briefingReview.round,
+          generation: input.briefingReview.generation,
+          verdict: input.briefingReview.verdict,
+          tier: input.briefingReview.tier,
+          ...(input.briefingReview.pushbackReason === null ? {} : { pushback_reason: input.briefingReview.pushbackReason }),
+        },
+      });
+    }
 
     if (reviewSource !== null) {
       this.opts.ledger.appendCustomEvent({
@@ -786,6 +827,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        ...(input.readOnly === true ? { readOnly: true } : {}),
         ...(reviewSource !== null ? { reviewSource } : {}),
         ...(blindAdmission?.payload.role === 'blind' && input.inputPackage !== undefined ? { blindPackage: input.inputPackage } : {}),
         agentId: handle.id,

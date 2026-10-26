@@ -637,6 +637,27 @@ export interface RepoOverviewView {
   readonly rows: readonly RepoOverviewRowView[];
 }
 
+/** The effective enforcement the server can send: 1→advisory, 2→high,
+ * 3/auto→high+medium. */
+export const BRIEFING_REVIEW_STAGE_NAMES = ['advisory', 'high', 'high+medium'] as const;
+
+export type BriefingReviewStageName = (typeof BRIEFING_REVIEW_STAGE_NAMES)[number];
+
+/** Nefario's live passes (GH-505; server mirror of `BriefingReviewBoardView`).
+ * `stage` is the effective enforcement: 1→advisory, 2→high, 3/auto→high+medium.
+ * A disabled install sends this block with zeros. */
+export interface BriefingReviewView {
+  /** Reviews whose newest armed generation has no decisive verdict. */
+  readonly armed: number;
+  /** The round of the newest live review; null when nothing is live. */
+  readonly round: number | null;
+  readonly tier: 'low' | 'medium' | 'high' | null;
+  readonly verdictsToday: number;
+  readonly caught: number;
+  readonly refusalsToday: number;
+  readonly stage: BriefingReviewStageName;
+}
+
 export interface BoardSnapshot {
   /** Absent means unavailable: eligibility must never be guessed by the browser. */
   readonly mailbox?: MailboxView | null;
@@ -672,6 +693,10 @@ export interface BoardSnapshot {
   /** #351: absent on older servers (the board then shows no raids card);
    * a present block is validated strictly. */
   readonly vector?: VectorView | null;
+  /** GH-505: absent on older servers (no Nefario card), null when the server
+   * could not read it (a dashed `unavailable` card). A present block is
+   * validated strictly. */
+  readonly briefingReview?: BriefingReviewView | null;
   /** Provider pacing gate (server mirror; absent on pre-pacing servers). */
   readonly pacing?: PacingGateView | null;
   /** Durable pipeline queue; absent on pre-upgrade servers (tolerated). */
@@ -1134,6 +1159,21 @@ function isVectorView(value: unknown): value is VectorView {
   );
 }
 
+export const BRIEFING_REVIEW_TIERS = ['low', 'medium', 'high'] as const;
+
+function isBriefingReviewView(value: unknown): value is BriefingReviewView {
+  return (
+    isRecord(value) &&
+    isCount(value.armed) &&
+    (value.round === null || isCount(value.round)) &&
+    (value.tier === null || (BRIEFING_REVIEW_TIERS as readonly unknown[]).includes(value.tier)) &&
+    isCount(value.verdictsToday) &&
+    isCount(value.caught) &&
+    isCount(value.refusalsToday) &&
+    (BRIEFING_REVIEW_STAGE_NAMES as readonly unknown[]).includes(value.stage)
+  );
+}
+
 function isPacingQueueEntryView(value: unknown): value is PacingQueueEntryView {
   return (
     isRecord(value) &&
@@ -1463,6 +1503,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
   if (value.disk !== undefined && value.disk !== null && !isDiskView(value.disk)) return false;
   if (value.vector !== undefined && value.vector !== null && !isVectorView(value.vector)) return false;
+  if (value.briefingReview !== undefined && value.briefingReview !== null && !isBriefingReviewView(value.briefingReview)) return false;
   if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
   if (value.pipeline !== undefined && value.pipeline !== null && !isPipelineView(value.pipeline)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;

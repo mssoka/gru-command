@@ -91,6 +91,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[concurrency]',
   '[review]',
   '[verify]',
+  '[briefing_review]',
   '[decisions.jev]',
   '[decisions.surfaces.event_triage]',
   '[decisions.surfaces.supervision_guidance]',
@@ -789,9 +790,40 @@ export function renderReferenceConfig(
     '# needed, and records the run as timed out / non-success.',
     `run_timeout_ms = ${preserved?.verify.runTimeoutMs ?? 1_800_000}`,
     '',
+    ...briefingReviewSection(preserved),
+    '',
     decisionsConfigFor(preserved?.decisions ?? null),
   );
   return `${lines.join('\n')}\n`;
+}
+
+/** `[briefing_review]` (GH-505): Nefario, the pre-dispatch briefing review.
+ * Emitted ACTIVE when a previously loaded config is being re-emitted (the
+ * `[env]`/`[pacing]` idiom: a re-run never silently drops or reverts user
+ * configuration), and as a commented example otherwise — a default config
+ * must stay parseable by a pre-Nefario build after `gru roll`, so roll that
+ * build back only from a config without the block. */
+function briefingReviewSection(preserved: GruCommandConfig | null | undefined): string[] {
+  const active = preserved !== null && preserved !== undefined;
+  const enabled = preserved?.briefingReview.enabled ?? true;
+  const stage = preserved?.briefingReview.stage ?? 'auto';
+  const stageLiteral = typeof stage === 'string' ? `"${stage}"` : String(stage);
+  return [
+    active ? '[briefing_review]' : '# [briefing_review]',
+    '# Nefario (docs/BRIEFING-REVIEW.md): Gru commissions a zero-context review',
+    '# of one briefing BEFORE POST /api/dispatch; tier picks the lenses (low =',
+    '# stranger, medium = +acceptance/verification, high = all five). The review',
+    '# is binding on readiness (it can hold a dispatch back) and advisory on',
+    '# content (it never changes scope or overrides an owner ruling).',
+    '# enabled = false is the stop state: no commission (503), no readiness',
+    '# refusal, and a zeroed board card. Leave it out of a config an older',
+    '# build must still parse.',
+    active ? `enabled = ${String(enabled)}` : '# enabled = true',
+    '# stage = "auto" follows the tier: high and medium are enforced, low is',
+    '# advisory. stage = 1 records provenance and refuses only a FALSE claim;',
+    '# stage = 2 also refuses a high-tier dispatch; stage = 3 forces high + medium.',
+    active ? `stage = ${stageLiteral}` : '# stage = "auto"',
+  ];
 }
 
 /** Values used for the generated docs/CONFIG.md reference block. */

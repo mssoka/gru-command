@@ -241,6 +241,14 @@ worker_budget = 0                 # total test workers across runs; 0 = auto (co
 lock_wait_timeout_ms = 900000     # queued request past this fails loud (never a silent hang)
 run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process group
 
+# [briefing_review]               # Nefario, the pre-dispatch briefing review (docs/BRIEFING-REVIEW.md)
+# Gru reviews one briefing before POST /api/dispatch; the tier picks the lenses
+# (low = stranger, medium = +acceptance/verification, high = all five). Binding
+# on readiness, advisory on content. Leave the block out of a config an older
+# build must still parse after `gru roll`.
+# enabled = true                  # false = stop state: no commission (503), no readiness refusal, zeroed card
+# stage = "auto"                  # auto follows the tier (high + medium enforced, low advisory); 1/2/3 are explicit overrides
+
 [decisions.jev]                   # Jev decisions (docs/jev-production-integration.md) — off by default
 # Keep a mode on every surface: without one, event_triage and supervision_guidance
 # act on Jev's answer with no backtest gate, and the other two are never asked.
