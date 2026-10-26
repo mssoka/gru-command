@@ -47,3 +47,15 @@ export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CAL
 export function appendWorkerRules(text: string): string {
   return `${text}\n\n${WORKER_RULE_BLOCKS.join('\n\n')}`;
 }
+
+/** A review job's closing standing orders (E19): its deliverable is its
+ * findings, so it commits nothing. One list for a reviewer's dispatch
+ * briefing, re-brief and fresh directive session, so a reviewer is never
+ * told to commit. */
+export const READ_ONLY_REVIEW_ORDERS: readonly string[] = [
+  'Execute the briefing inside this worktree. Standing orders: work only',
+  'inside this tree; this brief is READ-ONLY — change nothing, commit',
+  'nothing (an unmodified tree is the expected result); read the named',
+  'immutable head and diff via git show/git diff inside your tree; never',
+  'merge; end with your findings and a completion report.',
+];

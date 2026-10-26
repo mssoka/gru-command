@@ -19,7 +19,7 @@ import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import type { DiskFloorGate, FloorAdmission } from '../maintenance/disk.js';
 import type { EventBus } from '../events/bus.js';
-import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { READ_ONLY_REVIEW_ORDERS, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { BRIEFING_REVIEW_DISPATCHED } from '../briefing-review/events.js';
 import type { BriefingReviewProvenance } from '../briefing-review/gate.js';
 import {
@@ -48,7 +48,7 @@ import {
   renderBlindPackageBlock,
   type BlindCoverage,
 } from './blind-review.js';
-import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
+import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult, type ReviewRole } from './blind-input.js';
 
 /** A file's lines as a diff counts them (a final newline ends the last). */
 function fileLines(text: string): readonly string[] {
@@ -199,6 +199,8 @@ export function renderMinionBriefing(input: {
   agentId?: string;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
+  /** Host-admitted review role; blind contexts cannot receive lesson pointers. */
+  reviewRole?: ReviewRole | null;
   /** Issue #161: this parent has GC-mediated child-worker tools wired. */
   childWorkerTools?: boolean;
   /** The job's deliverable kind (E19). Non-PR kinds get their own closing
@@ -215,7 +217,7 @@ export function renderMinionBriefing(input: {
    * the generic investigation order to commit must never be the last word. */
   readOnly?: boolean;
 }): string {
-  const lessonsSection = renderLessonsSection(input.lessons ?? []);
+  const lessonsSection = input.reviewRole === 'blind' ? '' : renderLessonsSection(input.lessons ?? []);
   return [
     `Dispatch briefing — job ${input.jobId}`,
     `Repo: ${input.repoName}`,
@@ -230,7 +232,9 @@ export function renderMinionBriefing(input: {
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
-    ...(input.childWorkerTools === true
+    // A blind reviewer commissions no child: a child holds neither its
+    // package nor its isolation rule, and its reads are never observed.
+    ...(input.childWorkerTools === true && input.reviewRole !== 'blind'
       ? [
           'Independent capacity (ad-hoc helper work only): if the briefing calls',
           'for one independent helper (e.g. read-only verification), use the',
@@ -254,13 +258,7 @@ export function renderMinionBriefing(input: {
           'reviewed briefing; end with your findings and a completion report.',
         ]
       : input.deliverable === 'review'
-        ? [
-            'Execute the briefing inside this worktree. Standing orders: work only',
-            'inside this tree; this brief is READ-ONLY — change nothing, commit',
-            'nothing (an unmodified tree is the expected result); read the named',
-            'immutable head and diff via git show/git diff inside your tree; never',
-            'merge; end with your findings and a completion report.',
-          ]
+        ? READ_ONLY_REVIEW_ORDERS
         : input.deliverable === 'artifact' || input.deliverable === 'investigation'
           ? [
               'Execute the briefing inside this worktree. Standing orders: work only',
@@ -613,11 +611,13 @@ export class DispatchService {
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
         // reaches the session (the tools execute in the service process;
-        // a runtime that cannot host them returns none).
+        // a runtime that cannot host them returns none). An admitted blind
+        // reviewer gets none: a child holds neither its package nor its
+        // isolation rule.
         const parentAgentId =
           this.opts.parentTools === undefined ? undefined : `minion_${randomUUID()}`;
         const parentNativeTools =
-          parentAgentId === undefined ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
+          parentAgentId === undefined || blindAdmission?.payload.role === 'blind' ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
         handle = await this.opts.spawner('minion', {
           cwd,
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
@@ -671,7 +671,10 @@ export class DispatchService {
       // rate-limited turn stays pending until its bounded automatic retry
       // path concludes — never recorded as delivered while a retry could
       // still carry it, never disposed out from under that retry.
-      const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      const reviewRole = blindAdmission?.payload.role ?? null;
+      const lessons = reviewRole === 'blind'
+        ? []
+        : this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
       const settleTurn = async (
         failure: unknown | null,
         verdict: PromptTurnVerdict | null,
@@ -827,6 +830,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        reviewRole,
         ...(input.readOnly === true ? { readOnly: true } : {}),
         ...(reviewSource !== null ? { reviewSource } : {}),
         ...(blindAdmission?.payload.role === 'blind' && input.inputPackage !== undefined ? { blindPackage: input.inputPackage } : {}),
