@@ -354,8 +354,10 @@ restart_backoff_ms = 2000
 # Provider pacing: FIFO admission caps for minion and Perkins review
 # turns (queued waits are carried in the board snapshot data; live turns are never preempted),
 # plus bounded automatic retry for the rate-limit error class
-# (HTTP 429, "rate limit", "too many requests", throttling). Every
-# automatic retry is recorded as a pacing.auto-retry ledger event.
+# (HTTP 429, "rate limit", "too many requests", throttling and the
+# rate_limit token, so Claude Code's statusless "high load" off-switch
+# is retried too). Every automatic retry is recorded as a
+# pacing.auto-retry ledger event.
 # Full ledger vocabulary: pacing.queued, pacing.admitted,
 # pacing.wait-cancelled, pacing.queued-rollback, pacing.auto-retry,
 # pacing.auto-retry-recovered, pacing.auto-retry-exhausted.
@@ -388,7 +390,8 @@ frame_log_max_bytes = 8388608
 frame_log_keep = 3
 # Gru awareness wake policy. Wakes OPEN a Gru turn so a critical alert
 # is acted on without the user pinging. "action-required" (default) wakes
-# for machine-attention rows; "all" also for FYI/needs-owner; "never"
+# for machine-attention rows and for a recorded owner decision Gru owns
+# whose follow-through is owed; "all" also for FYI/needs-owner; "never"
 # injects context passively before the next turn only (no autonomous
 # turn). Each wake is a full model turn (provider tokens + latency).
 notify_wake = "action-required"
@@ -670,6 +673,21 @@ lock_wait_timeout_ms = 900000
 # needed, and records the run as timed out / non-success.
 run_timeout_ms = 1800000
 
+# [briefing_review]
+# Nefario (docs/BRIEFING-REVIEW.md): Gru commissions a zero-context review
+# of one briefing BEFORE POST /api/dispatch; tier picks the lenses (low =
+# stranger, medium = +acceptance/verification, high = all five). The review
+# is binding on readiness (it can hold a dispatch back) and advisory on
+# content (it never changes scope or overrides an owner ruling).
+# enabled = false is the stop state: no commission (503), no readiness
+# refusal, and a zeroed board card. Leave it out of a config an older
+# build must still parse.
+# enabled = true
+# stage = "auto" follows the tier: high and medium are enforced, low is
+# advisory. stage = 1 records provenance and refuses only a FALSE claim;
+# stage = 2 also refuses a high-tier dispatch; stage = 3 forces high + medium.
+# stage = "auto"
+
 # ── Jev decisions (optional) ─────────────────────────────────────────
 # Jev is a small, cheap "System One" decision model (TypeSafe, via OpenRouter).
 # Gru Command runs fully without it: with Jev off, deterministic code makes
@@ -722,6 +740,7 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #                         off or shadow today: no registered backtest, so enforce rejects every
 #                         Jev ask (the deterministic answer still serves) and opens an owner incident
 #                         (its host asks even with the master switch off, so this incident opens then too)
+#                         a known auth or quota wall stops at once, without asking
 #   escalation_triage     is a Silas escalation a ruling or a status report?
 #                         off or shadow today: it asks Jev only in shadow, so enforce never asks
 #   same_blocker          is this review blocker the same defect as last round?
@@ -952,6 +971,38 @@ When GC is over the budget or under the floor and nothing it can free remains
 largest lanes and how much of the disk is not GC's. The row closes itself once
 the condition clears. `0` turns the budget or the floor off; the board's disk
 row and `GET /api/disk` still show the numbers.
+
+### Nefario's briefing review: stage auto, 1, 2 or 3
+
+`[briefing_review]` configures Nefario, the pre-dispatch review of a heist
+briefing ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)). Two keys:
+
+- **`enabled`** (boolean, default `true`). `false` is the stop state: a
+  commission answers 503 `briefing_review_disabled`, the dispatch gate admits
+  everything, and the cockpit card shows zeros. Nothing else changes: Perkins,
+  intake approval, merge authority and the verbatim-briefing contract are
+  untouched either way.
+- **`stage`** (exactly `auto`, `1`, `2` or `3`, default `auto`). `auto` follows
+  the tier: high and medium are enforced, low is advisory. Stage 1 records
+  provenance and refuses only a **false** provenance claim — a dispatch that
+  says "READY" for a review that holds no verdict, or names a sha it is not
+  dispatching. Stage 2 refuses a **high-tier** dispatch whose exact briefing sha
+  has no `READY` review and no recorded push-back, before any job row exists.
+  Stage 3 forces high and medium enforcement. Low stays advisory at every stage.
+
+The default is **`stage = "auto"`**: enforcement follows the tier; every
+non-low tier is held (today high and medium), and low is advisory. Auto is
+forward-looking: a tier added later is enforced without a config edit; stage 3
+pins today's high + medium set. Set `stage = 1` (advisory), `2` (high only)
+or `3` (force high + medium) to override it. Promotion is a config change, not
+a code change. Before a flip, in-flight reviews at the newly enforced tier are
+revised or pushed back.
+
+The section is emitted **as a commented example** in a freshly generated config
+so a default config stays parseable by a pre-Nefario build after `gru roll`; a
+re-run re-emits it active, like `[env]` and `[pacing]`. An install that has
+enabled it and wants to roll back must remove the block first. Invalid values
+fail loud: `briefing_review.stage must be "auto", 1, 2 or 3 …`.
 
 ### Mailbox recovery cadence
 

@@ -54,7 +54,9 @@ ClaudeCodeRuntime.prototype.spawn = async function spawn(role, options = {}) {
       prepareDirectiveBinding({ identity: directive.identity, runtime: 'pi', agentId: minionId,
         sessionId: header.id, sessionFile, text, authorityManifest: 'deterministic G2 HTTP fixture' });
       const userId = randomUUID();
-      append({ type: 'message', id: userId, parentId: null, message: { role: 'user', content: [{ type: 'text', text }] } });
+      // The directive's user entry is a child of the session's last entry.
+      const parentId = readFileSync(sessionFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line)).filter((row) => row.type !== 'session').at(-1)?.id ?? null;
+      append({ type: 'message', id: userId, parentId, message: { role: 'user', content: [{ type: 'text', text }] } });
       const proof = inspectDirectiveCheckpoint(sessionFile, directive.identity);
       if (proof.state === 'unknown') throw new Error(proof.reason);
       directive.onAdmitted(proof.binding);

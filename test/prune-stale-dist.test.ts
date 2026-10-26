@@ -85,12 +85,13 @@ describe('prune-stale-dist', () => {
     // (dist/repos/gitlab-overview.js); #486 lane provenance and the paused
     // sweep's card and its follow-through (dist/worktrees/lane-provenance.js,
     // dist/worktrees/sweep-card.js, dist/worktrees/sweep-decisions.js); #494
-    // the service boot's [env] step (dist/service-environment.js); and the
+    // the service boot's [env] step (dist/service-environment.js); #505
+    // Nefario's briefing review (dist/briefing-review/*.js); and the
     // guarded pre-bootstrap dependency patch reader
     // (dist/worktrees/prebootstrap-patch.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5229);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5235);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('43d5ecd3b26b647526406d398bcfa5efe4c9d35683c93277ea97532d2d1fd508');
+      .toBe('038e4573980d8b081eec48cca8a744a873dca3e63aaca94502d09c5721397845');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

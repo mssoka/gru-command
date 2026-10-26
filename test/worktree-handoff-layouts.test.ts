@@ -457,7 +457,7 @@ describe('child lane parent custody, called directly (#373)', () => {
     // ...and when its temporary receipt cannot be removed either, that is named with its reason.
     fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
-      .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST) and its temporary receipt ${temp} could not be removed (EBUSY)`);
+      .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST) and its temporary receipt could not be removed (EBUSY)`);
     fsHooks.beforeUnlink = null;
     rmSync(temp);
     // A write that fails partway (the exclusive open made the file) still removes it.
@@ -495,7 +495,7 @@ describe('child lane parent custody, called directly (#373)', () => {
     rmSync(join(f.admin, 'gru-creation-handoff.json'));
     fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
-      .toThrow(`lane administration ${f.admin} published its handoff receipt and its temporary receipt ${temp} could not be removed (EBUSY)`);
+      .toThrow(`lane administration ${f.admin} published its handoff receipt and its temporary receipt could not be removed (EBUSY)`);
     fsHooks.beforeUnlink = null;
     rmSync(temp);
     // A receipt published but not made durable is named as published, never as untaken.
@@ -511,7 +511,7 @@ describe('child lane parent custody, called directly (#373)', () => {
     fsHooks.beforeFsync = failDirectorySync('EIO');
     fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
-      .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt ${temp} could not be removed (EBUSY)`);
+      .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt could not be removed (EBUSY)`);
     fsHooks.beforeFsync = null; fsHooks.beforeUnlink = null;
     rmSync(temp);
     // ...and with the directory's close failing too, every failure is in the cause.
@@ -527,7 +527,9 @@ describe('child lane parent custody, called directly (#373)', () => {
     const all = (() => { try { handoffProof.beginLaneHandoff(f.parent, f.admin, token); return null; } catch (error) { return error as Error; } })();
     fsHooks.beforeFsync = null; fsHooks.beforeClose = null; fsHooks.beforeUnlink = null;
     expect(all).not.toBeNull();
-    expect(all!.message).toBe(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt ${temp} could not be removed (EBUSY)`);
+    expect(all!.message).toBe(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt could not be removed (EBUSY)`);
+    // The temporary name carries the token's tail; no message names it.
+    expect(all!.message).not.toContain(token.slice(13));
     const [durability, cleanup] = (all!.cause as AggregateError).errors as [AggregateError, { code: string }];
     expect([(durability.errors as { code: string }[]).map((error) => error.code), cleanup.code]).toEqual([['EIO', 'EBADF'], 'EBUSY']);
     rmSync(temp);

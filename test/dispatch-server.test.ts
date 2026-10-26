@@ -24,6 +24,7 @@ import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { PUBLICATION_ABSENT_EVENT, PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_RECEIPT_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT, pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { LessonsReferencePort } from '../src/lessons/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
@@ -55,15 +56,16 @@ const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[e
 const TOKEN = 'test-token-éphémeral';
 const PR_URL = 'https://git.example.invalid/fixture-owner/fixture-app/pull/5';
 
-function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
+/** `keepPackage: false` = the legacy shape, admitted before packages were kept. */
+function admitJobAsBlind(ledger: LedgerApi, jobId: string, keepPackage = true): void {
   const targetSha = 'f'.repeat(40);
+  const inputPackage = { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
   const admission = admitBlindReview({
     ledger, jobId, title: 'review (blind)', deliverable: 'review',
-    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture',
-    inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture', inputPackage,
   });
   if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-  recordBlindAdmission(ledger, jobId, admission);
+  recordBlindAdmission(ledger, jobId, admission, keepPackage ? inputPackage : undefined);
 }
 
 const cleanupDirs: string[] = [];
@@ -115,6 +117,7 @@ async function boot(opts: {
   observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   /** The actual native fixture path, not a second unrelated fake transcript. */
   minionPromptEffect?: (text: string, sessionFile: string) => void;
+  lessons?: LessonsReferencePort;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -232,6 +235,7 @@ async function boot(opts: {
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.observeBlindTurn !== undefined ? { observeBlindTurn: opts.observeBlindTurn } : {}),
+    ...(opts.lessons !== undefined ? { lessons: opts.lessons } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -2110,6 +2114,7 @@ if (argv.includes('--method') && argv.includes('POST')) {
         if (contaminate) appendFileSync(file, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`);
       },
       observeBlindTurn: (jobId, file) => { if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, file); },
+      lessons: { referencesFor: () => [{ chapter: 'synthetic-canary', lesson: 'outside-package', path: '/synthetic-book/chapters/synthetic-canary.md', why: 'synthetic fixture only' }] },
     });
     ledgerRef = h.ledger;
     const repo = makeFixtureRepo('fixture-silas-rebrief-blind'); cleanupRepos.push(repo);
@@ -2117,6 +2122,12 @@ if (argv.includes('--method') && argv.includes('POST')) {
       await call(h.port, 'POST', '/api/dispatch', { job_id: 'reb-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
       await waitForDelivery(h, 'reb-blind');
       admitJobAsBlind(h.ledger, 'reb-blind');
+      // The source its dispatch verified: commits this lane can read.
+      const lanePath = h.worktrees.listWorktrees({ jobId: 'reb-blind' })[0]!.path;
+      const [target, base] = ['HEAD', 'HEAD~1'].map((ref) => execFileSync('git', ['-C', lanePath, 'rev-parse', ref], { encoding: 'utf-8' }).trim());
+      h.ledger.appendCustomEvent({ kind: 'job.review-source-verified', jobId: 'reb-blind', payload: {
+        object_store: '/recorded/store', target_sha: target, target_base: base, range_commits: 1, inputs: [], source: 'repository', package_sha256: null,
+      } });
       expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
       contaminate = true;
       const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'reb-blind', note: 'try again' }, TOKEN);
@@ -2133,6 +2144,40 @@ if (argv.includes('--method') && argv.includes('POST')) {
       });
       expect(h.ledger.listJobEvents('reb-blind').filter((event) => event.kind === 'job.delivered' &&
         (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+      // The fresh reviewer gets its source and package once, the reviewer's
+      // orders and no lesson pointer.
+      const rebriefTexts = h.minionTurnTexts.filter((text) => text.startsWith('Re-brief —'));
+      expect(rebriefTexts).toHaveLength(1);
+      expect(rebriefTexts[0]!.split('REVIEW SOURCE (')).toHaveLength(2);
+      expect(rebriefTexts[0]).toContain(`Range: ${base!}..${target!} (1 commits)`);
+      expect(rebriefTexts[0]!.split('BLIND INPUT PACKAGE (your review input')).toHaveLength(2);
+      expect(rebriefTexts[0]!.split('File src/feature.ts (at the target):')).toHaveLength(2);
+      expect(rebriefTexts[0]).toContain('this brief is READ-ONLY');
+      expect(rebriefTexts[0]).not.toContain('commit your work to the branch');
+      expect(rebriefTexts[0]).not.toContain('/synthetic-book/chapters/synthetic-canary.md');
+    } finally { await h.close(); }
+  });
+
+  it('/api/silas/rebrief refuses a blind review whose package was never kept by name, before any disposal or spawn', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-rebrief-unkept'); cleanupRepos.push(repo);
+    const jobId = 'reb-unkept';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, jobId);
+      admitJobAsBlind(h.ledger, jobId, false);
+      const priorId = h.ledger.listAgents().find((row) => row.jobId === jobId)!.id;
+      h.liveHandles.set(priorId, { role: 'minion', id: priorId, sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        async prompt() { throw new Error('the prior reviewer must not be prompted'); }, async steer() {}, async followUp() {},
+        subscribe: () => () => {}, health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), async dispose() {} });
+      const beforeSpawns = h.spawns.length;
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'try again' }, TOKEN);
+      expect(res.status).toBe(202);
+      const row = await awaitDirectiveTerminal(h, field<string>(res.json, 'request_id'));
+      expect(row.state).toBe('failed');
+      expect(row.failReason).toMatch(/^refused before any prompt: fresh reviewer refused before any effect: .*its attested blind input package was not kept/u);
+      expect(h.disposedHandles).not.toContain(priorId);
+      expect(h.spawns.length).toBe(beforeSpawns);
     } finally { await h.close(); }
   });
 

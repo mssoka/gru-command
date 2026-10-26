@@ -101,6 +101,8 @@ import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { startVectorHalves, VectorService } from './vector/service.js';
 import type { VectorBoardView } from './vector/board.js';
+import { BriefingReviewService } from './briefing-review/service.js';
+import type { BriefingReviewBoardCounts } from './briefing-review/board.js';
 import { createVectorServer } from './vector/server.js';
 import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
 import { onboardingProbesDir } from './onboarding/proof.js';
@@ -542,6 +544,9 @@ async function main(): Promise<number> {
   // The raids card (#351): late-bound too — the Vector service is built
   // after the engine.
   let vectorBoardView: () => VectorBoardView | null = () => null;
+  // Nefario's block (GH-505): late-bound too — the briefing-review service
+  // needs the dispatcher, which lands after the engine.
+  let briefingReviewBoardCounts: () => BriefingReviewBoardCounts | null = () => null;
   // Durable pipeline queue (owner approvals j-239/j-1064): late-bound too —
   // the mechanical consumer is constructed after the dispatcher it feeds.
   let pipelineView: () => import('./ledger/pipeline.js').PipelineBoardView | null = () => null;
@@ -607,6 +612,8 @@ async function main(): Promise<number> {
     verifyQueue: () => verificationView(),
     disk: () => diskBoardView(),
     vector: () => vectorBoardView(),
+    briefingReview: () => briefingReviewBoardCounts(),
+    briefingReviewStage: config.briefingReview.stage,
     pipeline: () => pipelineView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1722,9 +1729,22 @@ async function main(): Promise<number> {
       ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
     }, input.requestId);
   };
+  // Nefario, the pre-dispatch briefing review (GH-505): a Gru-side, zero-
+  // context review of the exact briefing before POST /api/dispatch. Lens jobs
+  // ride the normal dispatch path; the cockpit block is late-bound above.
+  const briefingReview = new BriefingReviewService({
+    config: config.briefingReview,
+    ledger,
+    notifications,
+    dispatch: (input) => dispatcher.dispatch(input),
+    apiBase: () => config.server.port === 0 ? null : `http://${dialHost(config.server.host)}:${String(config.server.port)}`,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  briefingReviewBoardCounts = () => briefingReview.boardCounts();
   const dispatchServer = createDispatchServer({
     config,
     intake,
+    briefingReview,
     intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
     // Intake slicing (#429): a planning-only minion through the normal dispatch path.
     intakeSlicing: new IntakeSlicingService({

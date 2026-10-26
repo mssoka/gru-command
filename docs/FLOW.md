@@ -1069,8 +1069,22 @@ by itself, and the turn is expected to ACT.
 awareness layer batches, persists, and calls the chat wake sink.
 
 - **Routing gate** — `notify_wake = "action-required"` (default) wakes for
-  machine-attention rows; `"all"` also wakes for FYI/needs-owner; `"never"`
+  machine-attention rows and for a RECORDED owner decision (#506) whose
+  follow-through is owed; `"all"` also wakes for FYI/needs-owner; `"never"`
   stays passive-only (context rides the next human turn).
+- **Owner decisions wake (issue #506)** — recording a choice on a
+  Gru-owned typed `needs-owner` card opens a Gru turn even in the default
+  mode: the card stays in FOR YOU, but Gru owes the chosen option's
+  follow-through and the card's resolution. The turn names the card, the
+  recorded option and the owed follow-through. Proposal cards whose
+  producer service executes the choice itself (Vector raids/fixes,
+  onboarding, GC reclaim/preserve/lane discard/sweep-pause) stay passive —
+  waking Gru would duplicate the operation or let a premature resolution
+  hide it from its producer. The wake claim is per `(notification id,
+  decided_at)`, so a replay or restart cannot wake twice, a decision never
+  spends the card's incident key, and a decision recorded while the service
+  was down is seeded on boot. `notify_wake = "never"`, the severity floor,
+  the rate limit and quiet hours still apply.
 - **Severity gate** — `wake_min_severity = "info" | "error"` floors a wake
   without changing routing.
 - **Rate limit + coalescing** — `wake_min_interval_ms` (default 5 min)
@@ -1172,7 +1186,12 @@ owner's choice durably and idempotently — it never acks or resolves the
 row, and a decision receipt is not proof its follow-on operation ran; the
 row stays visible as "decision recorded — awaiting follow-through" until
 its owner records the follow-through (`POST /api/notifications/{id}/disposition`
-with the action detail; an undecided row is refused). A discussion-only
+with the action detail; an undecided row is refused). Recording the
+choice on a Gru-owned card opens a follow-through wake unless
+`notify_wake = "never"` (and subject to the severity floor, rate limit and
+quiet hours) (#506), so the operation does not wait for an unrelated turn;
+producer-owned proposal cards keep their producer's own follow-through.
+A discussion-only
 decision (no options yet) is settled through the supported bridge: Gru
 attaches the agreed options with
 `POST /api/notifications/{id}/decision-options` after the chat discussion —

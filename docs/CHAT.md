@@ -323,15 +323,23 @@ relaying it. Two mechanisms share one boundary:
 - **Wake policy** (`[chat] notify_wake`, CONFIG.md; owner ruling
   2026-09-23): `action-required` (default) starts a Gru turn when a
   machine-attention notification lands, so a critical alert is acted on
-  without the user pinging; `all` also wakes for FYI/needs-owner rows;
-  `never` is passive-only. `wake_min_severity` floors the wake,
+  without the user pinging, and when a typed Gru-owned owner decision is
+  RECORDED (#506) — the card keeps its human routing, but the chosen
+  option's follow-through is Gru's work. Proposal decisions whose producer
+  service executes them (Vector, onboarding, GC proposals) stay passive;
+  `all` also wakes for FYI/needs-owner rows; `never` is passive-only.
+  `wake_min_severity` floors the wake,
   `wake_min_interval_ms` (default 5 min) bounds autonomous turns while
   candidates inside the window coalesce into ONE trailing wake,
   `wake_quiet_hours` defers wakes to the next real local-time window end
   (including DST changes); admission is rechecked after any queued user
   turn. Per-id dedupe is reconciled from durable ledger receipts on boot
   so a torn awareness sidecar write cannot redeliver a received wake. Unacked
-  machine rows at boot are seeded as Gru's backlog. A wake with nothing to
+  machine rows at boot are seeded as Gru's backlog. Gru-owned owner-decision
+  wakes (issue #506) claim a per-decision identity — card id + `decided_at` —
+  so they wake in the default mode, never spend the card's incident key,
+  and a replay or boot re-seed cannot wake twice; producer-executed
+  proposal choices stay passive. A wake with nothing to
   inject does not spawn a session or burn a turn, and a wake requested
   mid-turn becomes one trailing turn after the conversation goes idle — it
   is never steered into a live user turn. Each wake is a full model turn.

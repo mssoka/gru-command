@@ -1113,6 +1113,7 @@ describe('review round 1 — one continuation, never contradictory', () => {
         listImplementerMinions: () => [{ id: 'minion-old', role: 'minion', jobId: 'job-f', sessionFile: '/sessions/old.jsonl' }],
         registerAgent: () => {},
         getJob: () => ({ briefing: BRIEFING, status: 'working' }),
+        latestJobEvent: () => null,
       } as never,
       worktrees: { listWorktrees: () => [{ id: 'job-f', kind: 'job', path: lanePath, branch: null, jobId: 'job-f', status: 'active' }] } as never,
       jobId: 'job-f',
@@ -1285,7 +1286,7 @@ describe('review round 2 — durable debts, handoffs and verification (option A)
       },
       ledger: {
         getAgent: () => null, listAgents: () => [], listImplementerMinions: () => [], registerAgent: () => {},
-        getJob: () => ({ briefing: BRIEFING, status: 'working' }),
+        getJob: () => ({ briefing: BRIEFING, status: 'working' }), latestJobEvent: () => null,
       } as never,
       worktrees: { listWorktrees: () => [{ id: 'job-n', kind: 'job', path: lanePath, branch: null, jobId: 'job-n', status: 'active' }] } as never,
       jobId: 'job-n',

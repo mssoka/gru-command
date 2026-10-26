@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, EventRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, CreationContinuationConflictError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound, requireSafeRecordId } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -14,11 +14,12 @@ import { IntakeError } from '../intake/types.js';
 import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
 import type { IntakeSlicingService } from '../intake/slicing.js';
 import type { NotificationCenter } from '../notifications/center.js';
-import type { DispatchService } from './service.js';
+import type { CreationContinuationRequestResult, DispatchService } from './service.js';
 import { parsePreBootstrapPatchReference, PreBootstrapPatchError, type PreBootstrapPatchReference } from '../worktrees/prebootstrap-patch.js';
 import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
+import { redactCreationTokens } from '../worktrees/creation-intent.js';
 import type { DirectiveRegistry } from './fix-directive.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
@@ -42,6 +43,9 @@ import { childRefusalStatus, type ChildWorkerService } from './child-workers.js'
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
 import type { PropertyCampaignService } from './property-campaigns.js';
+import { parseBriefingReviewBlock, type BriefingReviewProvenance } from '../briefing-review/gate.js';
+import { BriefingReviewError } from '../briefing-review/types.js';
+import type { BriefingReviewService } from '../briefing-review/service.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -104,6 +108,10 @@ export interface DispatchServerOptions {
   readonly intakeSlicing?: IntakeSlicingService;
   /** Owner pairing-token actions only; never exposed as reviewer tools. */
   readonly propertyCampaigns?: PropertyCampaignService;
+  /** Nefario, the pre-dispatch briefing review (GH-505). Absent =
+   * /api/briefing-review* answers 503 (not hosted) and /api/dispatch gates
+   * nothing. */
+  readonly briefingReview?: BriefingReviewService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   /** Observe the actual continued physical session through the shared
@@ -519,6 +527,122 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       return true;
     }
+    if (path === '/api/dispatch/creation-continuation' && req.method === 'POST') {
+      if (!authed(req, res)) return true;
+      const body = await readBody(req);
+      if (Object.keys(body).some((key) => key !== 'job_id' && key !== 'request_id')) {
+        json(res, 400, { error: 'bad_request', detail: 'creation continuation accepts only job_id and request_id' });
+        return true;
+      }
+      let result: CreationContinuationRequestResult;
+      try {
+        result = await options.dispatch.requestCreationContinuation({
+          jobId: strField(body, 'job_id'), requestId: strField(body, 'request_id'),
+        });
+      } catch (error) {
+        if (error instanceof RecordNotFound) {
+          json(res, 404, { error: 'not_found', detail: error.message });
+          return true;
+        }
+        if (error instanceof CreationContinuationConflictError) {
+          json(res, 409, { error: 'creation_continuation_conflict', detail: error.message });
+          return true;
+        }
+        throw error;
+      }
+      if (result.readback.state === 'refused' || result.readback.state === 'custody-unknown') {
+        json(res, 409, { error: result.readback.state === 'refused' ? 'creation_continuation_refused' : 'creation_continuation_unknown', readback: result.readback });
+      } else {
+        json(res, result.created ? 202 : 200, { readback: result.readback });
+      }
+      return true;
+    }
+    if (path === '/api/dispatch/creation-continuation' && req.method === 'GET') {
+      if (!authed(req, res)) return true;
+      const query = new URL(req.url ?? path, 'http://localhost').searchParams;
+      const allowed = new Set(['job_id', 'request_id']);
+      for (const key of query.keys()) {
+        if (!allowed.has(key) || query.getAll(key).length !== 1) {
+          json(res, 400, { error: 'bad_request', detail: 'GET creation continuation requires one job_id and request_id only' });
+          return true;
+        }
+      }
+      const jobIds = query.getAll('job_id');
+      const requestIds = query.getAll('request_id');
+      if (jobIds.length !== 1 || requestIds.length !== 1 || !jobIds[0] || !requestIds[0]) {
+        json(res, 400, { error: 'bad_request', detail: 'GET creation continuation requires job_id and request_id' });
+        return true;
+      }
+      try {
+        requireSafeRecordId(jobIds[0], 'job id');
+        requireSafeRecordId(requestIds[0], 'request id');
+      } catch (error) {
+        json(res, 400, { error: 'bad_request', detail: error instanceof Error ? error.message : String(error) });
+        return true;
+      }
+      const readback = options.dispatch.getCreationContinuationReadback(jobIds[0], requestIds[0]);
+      if (readback === null) {
+        json(res, 404, { error: 'not_found', detail: `creation continuation ${requestIds[0]} for job ${jobIds[0]} not found` });
+      } else {
+        json(res, 200, { readback });
+      }
+      return true;
+    }
+    // Nefario, the pre-dispatch briefing review (GH-505). Commission, lens
+    // result and Gru's recorded push-back live here; every refusal is a named
+    // `{ error, detail }` with the status that says what to fix.
+    if (path === '/api/briefing-review' || path.startsWith('/api/briefing-review/')) {
+      if (!authed(req, res)) return true;
+      const briefingReview = options.briefingReview;
+      if (briefingReview === undefined) {
+        json(res, 503, {
+          error: 'briefing_review_not_hosted',
+          detail: 'the briefing review is not hosted on this service',
+        });
+        return true;
+      }
+      try {
+        const readReviewBody = async (): Promise<Record<string, unknown>> => {
+          try {
+            return await readBody(req, false);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new BriefingReviewError(
+              'briefing_review_invalid_request',
+              message,
+              message.includes('exceeds 512 KiB') ? 413 : 400,
+            );
+          }
+        };
+        if (req.method === 'POST' && path === '/api/briefing-review') {
+          const outcome = await briefingReview.commission(await readReviewBody());
+          json(res, outcome.status, outcome.body);
+          return true;
+        }
+        if (req.method === 'POST' && path === '/api/briefing-review/result') {
+          json(res, 200, briefingReview.submitResult(await readReviewBody()));
+          return true;
+        }
+        if (req.method === 'POST' && path === '/api/briefing-review/pushback') {
+          json(res, 200, briefingReview.pushback(await readReviewBody()));
+          return true;
+        }
+        json(res, 404, { error: 'briefing_review_not_found', detail: 'unsupported briefing-review route' });
+      } catch (error) {
+        if (error instanceof BriefingReviewError) {
+          if (error.status === 413) {
+            res.setHeader('connection', 'close');
+            res.once('finish', () => req.socket.destroySoon());
+          }
+          json(res, error.status, { error: error.code, detail: error.message });
+          return true;
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        log('error', 'briefing review handler failed', { path, error: detail });
+        json(res, 500, { error: 'briefing_review_failed', detail });
+      }
+      return true;
+    }
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
@@ -551,6 +675,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const reviewRole = optStrFieldStrict(body, 'review_role');
       const parentContractSha256 = optStrFieldStrict(body, 'parent_contract_sha256');
       let preBootstrapPatch: PreBootstrapPatchReference | undefined;
+      // GH-505: optional briefing-review provenance. A present-but-malformed
+      // block is a named 400; the gate then runs BEFORE any job row, worktree
+      // or spawn, so a refusal creates nothing.
+      let provenance: BriefingReviewProvenance | null;
+      try {
+        provenance = options.briefingReview?.admitDispatch({
+          jobId: strField(body, 'job_id'),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          briefing: strField(body, 'briefing'),
+          requested: parseBriefingReviewBlock(body['briefing_review']),
+        }) ?? null;
+      } catch (error) {
+        if (error instanceof BriefingReviewError) {
+          log('warn', 'briefing review refused dispatch', { code: error.code, detail: error.message });
+          json(res, error.status, { error: error.code, detail: error.message });
+          return true;
+        }
+        throw error;
+      }
       let outcome: Awaited<ReturnType<DispatchService['dispatch']>>;
       try {
         preBootstrapPatch = Object.hasOwn(body, 'prebootstrap_patch') ? parsePreBootstrapPatchReference(body['prebootstrap_patch']) : undefined;
@@ -576,6 +720,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(inputPackage !== undefined ? { inputPackage } : {}),
           ...(parentContractSha256 !== undefined ? { parentContractSha256 } : {}),
           ...(preBootstrapPatch !== undefined ? { preBootstrapPatch } : {}),
+          ...(provenance !== null ? { briefingReview: provenance } : {}),
         });
       } catch (error) {
         // Issue #317: the selected source cannot provide the named review
@@ -2266,7 +2411,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
       const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
-      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
+      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && path !== '/api/briefing-review' && !path.startsWith('/api/briefing-review/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
@@ -2277,7 +2422,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           }
         })
         .catch((error: unknown) => {
-          const message = String(error instanceof Error ? error.message : error);
+          const message = redactCreationTokens(String(error instanceof Error ? error.message : error));
           log('error', 'dispatch api handler failed', { path, error: message });
           if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message });
         });

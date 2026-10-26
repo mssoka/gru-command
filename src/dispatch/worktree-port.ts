@@ -69,6 +69,17 @@ export type WorktreeSweepResult = WorktreeSweepPaused | WorktreeSweepSwept;
 import type { WorktreeBaseSource } from '../ledger/api.js';
 import type { LoadedPreBootstrapPatch } from '../worktrees/prebootstrap-patch.js';
 
+/** Read-only identity of the original retained creation, never its raw token. */
+export interface RetainedJobCreationInspection {
+  readonly jobId: string;
+  readonly repoPath: string;
+  readonly branch: string;
+  readonly sha: string;
+  readonly baseSource: WorktreeBaseSource;
+  readonly receiptTokenSha256: string;
+  readonly producerSettlementSeq: number;
+}
+
 /** The worktree subsystem the dispatch flow rides on. */
 export interface WorktreePort {
   /** Resolve a review target exactly as `createReviewWorktree` would:
@@ -93,6 +104,17 @@ export interface WorktreePort {
   /** Spends a patched lane's creation receipt once dispatch recorded its
    * worker (`job.minion-spawned`); every earlier failure keeps it. */
   completePreBootstrapWorkerAdmission?(input: { repoPath: string; jobId: string }): void;
+  /** Strict same-job continuation only: inspection is read-only and the
+   * create method refuses absent receipts/refs instead of resolving a base,
+   * and any receipt other than the one the continuation accepted. */
+  inspectRetainedJobCreation?(input: { readonly repoPath: string; readonly jobId: string }): Promise<RetainedJobCreationInspection>;
+  createRetainedJobWorktree?(input: {
+    readonly repoPath: string;
+    readonly jobId: string;
+    readonly expected: { readonly receiptTokenSha256: string; readonly producerSettlementSeq: number };
+    /** Called once every check passed, before the first checkout work. */
+    readonly adopting?: () => void;
+  }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
     repoPath: string;
     roundId: string;

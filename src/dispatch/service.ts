@@ -2,8 +2,8 @@ import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
-import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
-import { requireSafeRecordId } from '../ledger/api.js';
+import type { CreationContinuationState, CreationContinuationTimeline, JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
+import { LaneWriterConflictError, RecordNotFound, creationContinuationJobRefusal, creationContinuationRepoMismatch, requireSafeRecordId } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobStatus, isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
@@ -12,14 +12,17 @@ import { requireSpawnCwd } from '../roles.js';
 import { renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
-import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
+import type { RetainedJobCreationInspection, WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
+import { RetainedCreationFailedError, RetainedCreationRefusalError, redactCreationTokens, type RetainedReceiptExpectation } from '../worktrees/creation-intent.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
 import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import type { DiskFloorGate, FloorAdmission } from '../maintenance/disk.js';
 import type { EventBus } from '../events/bus.js';
-import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { READ_ONLY_REVIEW_ORDERS, WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { BRIEFING_REVIEW_DISPATCHED } from '../briefing-review/events.js';
+import type { BriefingReviewProvenance } from '../briefing-review/gate.js';
 import {
   assertLaneUsesBoundStore,
   blobText,
@@ -33,6 +36,57 @@ import {
   type ReviewSourcePackage,
   type ReviewSourcePreflight,
 } from './review-source.js';
+
+type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+export interface CreationContinuationReadback {
+  readonly job_id: string;
+  readonly request_id: string;
+  readonly generation: number;
+  readonly payload_sha256: string;
+  readonly state: CreationContinuationState;
+  readonly active: boolean;
+  readonly job_status: string | null;
+  readonly original: {
+    readonly handoff_seq: number | null;
+    readonly briefing_sha256: string | null;
+    readonly handoff_repo_path: string | null;
+    readonly repo_path: string | null;
+    readonly branch: string | null;
+    readonly base_sha: string | null;
+    readonly base_source: string | null;
+    readonly producer_settlement_seq: number | null;
+  };
+  /** The registered lane, or (`retained-receipt`) the ref and receipt a
+   * failed continuation kept after rolling its checkout back. */
+  readonly custody: {
+    readonly worktree_id: string | null;
+    readonly path: string | null;
+    readonly branch: string | null;
+    readonly sha: string | null;
+    readonly base_source: string | null;
+    readonly status: string;
+    readonly evidence: 'manager-reconciliation' | 'ledger-registry-only' | 'retained-receipt';
+  } | null;
+  readonly queue: { readonly gate: string; readonly reason: string | null } | null;
+  readonly admission: { readonly agent_id: string; readonly event_seq: number } | null;
+  readonly delivery: { readonly event_seq: number; readonly agent_id: string | null; readonly sha: string | null } | null;
+  readonly reason: string | null;
+  readonly timeline: readonly { readonly seq: number; readonly ts: string; readonly state: string; readonly stage: string }[];
+}
+
+export interface CreationContinuationRequestResult {
+  readonly created: boolean;
+  readonly readback: CreationContinuationReadback;
+}
+
+interface CreationContinuationExecution {
+  readonly job: JobRecord;
+  readonly timeline: CreationContinuationTimeline;
+  readonly expected: RetainedReceiptExpectation;
+}
+
+
 import {
   admitBlindReview,
   blindCoverageOf,
@@ -43,10 +97,8 @@ import {
   renderBlindPackageBlock,
   type BlindCoverage,
 } from './blind-review.js';
-import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
+import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult, type ReviewRole } from './blind-input.js';
 import { assertPreBootstrapPatchDispatchBinding, preBootstrapIntakeIdentitySha256, readPreBootstrapDependencyPatchPackage, PreBootstrapPatchError, type LoadedPreBootstrapPatch, type PreBootstrapPatchReference } from '../worktrees/prebootstrap-patch.js';
-
-type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 function assertPreBootstrapAuthority(patch: LoadedPreBootstrapPatch, jobId: string, ledger: LedgerApi): void {
   const expected = patch.package.authority;
@@ -159,8 +211,10 @@ export interface DispatchOutcome {
   readonly job: JobRecord;
   readonly worktree: WorktreeLane;
   readonly agentId: string;
-  /** Resolves when the minion's briefing turn settles (ok | error). */
-  readonly settled: Promise<{ readonly ok: boolean; readonly error?: string }>;
+  /** Resolves when the minion's briefing turn settles (ok | error).
+   * `outcomeUnknown`: the turn failed while the service was stopping, so
+   * whether the sent prompt delivered is not known. */
+  readonly settled: Promise<{ readonly ok: boolean; readonly error?: string; readonly outcomeUnknown?: boolean }>;
 }
 
 export interface DispatchServiceOptions {
@@ -226,6 +280,8 @@ export function renderMinionBriefing(input: {
   agentId?: string;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
+  /** Host-admitted review role; blind contexts cannot receive lesson pointers. */
+  reviewRole?: ReviewRole | null;
   /** Issue #161: this parent has GC-mediated child-worker tools wired. */
   childWorkerTools?: boolean;
   /** The job's deliverable kind (E19). Non-PR kinds get their own closing
@@ -237,8 +293,12 @@ export function renderMinionBriefing(input: {
   reviewSource?: ReviewSourceBinding;
   /** #360 R5-B3: an admitted blind reviewer's package — its input. */
   blindPackage?: BlindInputPackage;
+  /** Nefario lens jobs (GH-505): a read-only planning review. The standing
+   * orders say change nothing, commit nothing, push nothing, open no PR —
+   * the generic investigation order to commit must never be the last word. */
+  readOnly?: boolean;
 }): string {
-  const lessonsSection = renderLessonsSection(input.lessons ?? []);
+  const lessonsSection = input.reviewRole === 'blind' ? '' : renderLessonsSection(input.lessons ?? []);
   return [
     `Dispatch briefing — job ${input.jobId}`,
     `Repo: ${input.repoName}`,
@@ -253,7 +313,9 @@ export function renderMinionBriefing(input: {
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
-    ...(input.childWorkerTools === true
+    // A blind reviewer commissions no child: a child holds neither its
+    // package nor its isolation rule, and its reads are never observed.
+    ...(input.childWorkerTools === true && input.reviewRole !== 'blind'
       ? [
           'Independent capacity (ad-hoc helper work only): if the briefing calls',
           'for one independent helper (e.g. read-only verification), use the',
@@ -268,37 +330,252 @@ export function renderMinionBriefing(input: {
           '',
         ]
       : []),
-    ...(input.deliverable === 'review'
+    ...(input.readOnly === true
       ? [
           'Execute the briefing inside this worktree. Standing orders: work only',
           'inside this tree; this brief is READ-ONLY — change nothing, commit',
-          'nothing (an unmodified tree is the expected result); read the named',
-          'immutable head and diff via git show/git diff inside your tree; never',
-          'merge; end with your findings and a completion report.',
+          'nothing, push nothing, open no pull request and implement nothing (an',
+          'unmodified tree is the expected result); read the repository and the',
+          'reviewed briefing; end with your findings and a completion report.',
         ]
-      : input.deliverable === 'artifact' || input.deliverable === 'investigation'
-        ? [
-            'Execute the briefing inside this worktree. Standing orders: work only',
-            'inside this tree; commit your work to the branch; verify it; hand back',
-            'the named artifact and end with a completion report; do not open a',
-            'pull request — this job owes an artifact handback, not a PR.',
-          ]
-        : [
-            'Execute the briefing inside this worktree. Standing orders: work only',
-            'inside this tree; commit your work to the branch; verify it (build,',
-            'tests, lint — whatever this project calls green) before finishing;',
-            'never merge your own pull request. End with a completion report.',
-          ]),
+      : input.deliverable === 'review'
+        ? READ_ONLY_REVIEW_ORDERS
+        : input.deliverable === 'artifact' || input.deliverable === 'investigation'
+          ? [
+              'Execute the briefing inside this worktree. Standing orders: work only',
+              'inside this tree; commit your work to the branch; verify it; hand back',
+              'the named artifact and end with a completion report; do not open a',
+              'pull request — this job owes an artifact handback, not a PR.',
+            ]
+          : [
+              'Execute the briefing inside this worktree. Standing orders: work only',
+              'inside this tree; commit your work to the branch; verify it (build,',
+              'tests, lint — whatever this project calls green) before finishing;',
+              'never merge your own pull request. End with a completion report.',
+            ]),
   ].join('\n');
 }
 
 export class DispatchService {
   private readonly opts: DispatchServiceOptions;
   private readonly log: Log;
+  private readonly activeCreationContinuations = new Set<string>();
 
   constructor(opts: DispatchServiceOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+  }
+
+  private continuationKey(jobId: string, requestId: string): string {
+    return `${jobId}\0${requestId}`;
+  }
+
+  private safeContinuationReason(error: unknown): string {
+    return redactCreationTokens(error instanceof Error ? error.message : String(error)).slice(0, 1000);
+  }
+
+  /** Authenticated route entry: inspect only, durably fence one identity,
+   * then run the same dispatch body in the background. Retries only return
+   * the recorded request; they never start it again. */
+  async requestCreationContinuation(input: { readonly jobId: string; readonly requestId: string }): Promise<CreationContinuationRequestResult> {
+    requireSafeRecordId(input.jobId, 'job id');
+    requireSafeRecordId(input.requestId, 'creation continuation request id');
+    const existing = this.opts.ledger.getCreationContinuation(input.jobId, input.requestId);
+    if (existing !== null) return { created: false, readback: this.creationContinuationReadback(existing) };
+
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+    const handoffs = this.opts.ledger.listJobEventsByKinds(input.jobId, ['job.handoff'], { limit: 2 });
+    const handoff = handoffs.length === 1 ? handoffs[0]! : null;
+    const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
+    const handoffRepoPath = typeof handoffPayload?.['repoPath'] === 'string' ? handoffPayload['repoPath'] : null;
+    let repoPath: string | null = null;
+    const briefingSha256 = typeof job.briefing === 'string'
+      ? createHash('sha256').update(job.briefing, 'utf8').digest('hex') : null;
+    let inspection: RetainedJobCreationInspection | null = null;
+    let refusalReason = creationContinuationJobRefusal(job) ?? undefined;
+    if (refusalReason !== undefined) {
+      // Refused at job scope; nothing else is read.
+    } else if (handoff === null || handoffRepoPath === null) refusalReason = `job "${job.id}" has no unique original job.handoff with its repository path`;
+    else if (this.opts.ledger.listJobAmendments(input.jobId).length > 0) refusalReason = `job "${job.id}" has an amended contract outside initial-dispatch continuation`;
+    else if (this.opts.worktrees.inspectRetainedJobCreation === undefined || this.opts.worktrees.createRetainedJobWorktree === undefined) {
+      refusalReason = 'retained-creation inspection and strict manager continuation are not wired';
+    } else {
+      try {
+        refusalReason = creationContinuationRepoMismatch(job, handoffRepoPath, null) ?? undefined;
+        if (refusalReason === undefined) {
+          inspection = await this.opts.worktrees.inspectRetainedJobCreation({ repoPath: handoffRepoPath, jobId: input.jobId });
+          refusalReason = creationContinuationRepoMismatch(job, handoffRepoPath, inspection.repoPath) ?? (
+            inspection.jobId !== input.jobId || inspection.branch !== `gru/${input.jobId}` || inspection.sha.length < 40 || inspection.baseSource === null
+              ? 'WorktreeManager returned a retained-creation identity that does not match the original job handoff' : undefined);
+          if (refusalReason === undefined) repoPath = inspection.repoPath;
+          else inspection = null;
+        }
+      } catch (error) {
+        refusalReason = this.safeContinuationReason(error);
+      }
+    }
+    const identityPayload = {
+      schema: 'same-job-retained-creation-continuation-v1', job_id: input.jobId, request_id: input.requestId,
+      handoff_seq: handoff?.seq ?? null, briefing_sha256: briefingSha256, handoff_repo_path: handoffRepoPath, repo_path: repoPath,
+      branch: inspection?.branch ?? null, base_sha: inspection?.sha ?? null, base_source: inspection?.baseSource ?? null,
+      producer_settlement_seq: inspection?.producerSettlementSeq ?? null,
+      receipt_token_sha256: inspection?.receiptTokenSha256 ?? null,
+    };
+    const payloadSha256 = createHash('sha256').update(JSON.stringify(identityPayload), 'utf8').digest('hex');
+    const accepted = this.opts.ledger.acceptCreationContinuation({
+      jobId: input.jobId, requestId: input.requestId, payloadSha256,
+      handoffSeq: handoff?.seq ?? null, briefingSha256, handoffRepoPath, repoPath,
+      branch: inspection?.branch ?? null, baseSha: inspection?.sha ?? null,
+      baseSource: inspection?.baseSource ?? null, producerSettlementSeq: inspection?.producerSettlementSeq ?? null,
+      receiptTokenSha256: inspection?.receiptTokenSha256 ?? null,
+      ...(refusalReason !== undefined ? { refusalReason } : {}),
+    });
+    if (!accepted.created || accepted.timeline.state !== 'accepted') {
+      return { created: accepted.created, readback: this.creationContinuationReadback(accepted.timeline) };
+    }
+
+    const { identity } = accepted.timeline;
+    const record = (state: CreationContinuationState | undefined, stage: string, details: Readonly<Record<string, unknown>>): void => {
+      this.opts.ledger.recordCreationContinuationState({
+        jobId: input.jobId, requestId: input.requestId, generation: identity.generation,
+        ...(state === undefined ? {} : { state }), stage, details,
+      });
+    };
+    const key = this.continuationKey(input.jobId, input.requestId);
+    this.activeCreationContinuations.add(key);
+    let custodyAttempted = false;
+    let custodyAdopted = false;
+    let disposedBeforePrompt = false;
+    const execution: CreationContinuationExecution = {
+      job, timeline: accepted.timeline,
+      expected: { receiptTokenSha256: identity.receiptTokenSha256!, producerSettlementSeq: identity.producerSettlementSeq! },
+    };
+    void Promise.resolve().then(async () => {
+      try {
+        const continuation = {
+          ...execution,
+          custodyAttempted: () => { custodyAttempted = true; },
+          custodyAdopted: (lane: WorktreeLane) => {
+            custodyAdopted = true;
+            record(undefined, 'custody-adopted', {
+              worktree_id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha,
+              base_source: identity.baseSource, worktree_status: lane.status,
+            });
+          },
+          queued: (gate: string, reason: string) => record('queued', 'queued', { gate, reason }),
+          disposedBeforePrompt: () => { disposedBeforePrompt = true; },
+        };
+        // The handoff path, as the original dispatch had it: its leaf is
+        // the job's repository name, a symlinked path included.
+        const outcome = await this.dispatch({
+          jobId: job.id, repoPath: handoffRepoPath!, title: job.title,
+          ...(job.displayName !== null ? { displayName: job.displayName } : {}),
+          ...(job.deliverable !== null ? { deliverable: job.deliverable } : {}),
+          ...(job.parentJobId !== null ? { parentJobId: job.parentJobId } : {}),
+          briefing: job.briefing!, creationContinuation: continuation,
+        });
+        const settled = await outcome.settled;
+        // The prompt was sent: a turn whose retries shutdown cancelled has
+        // an unknown outcome, never a known failure.
+        if (!settled.ok) {
+          const reason = this.safeContinuationReason(settled.error ?? 'minion turn failed');
+          if (settled.outcomeUnknown === true) record('custody-unknown', 'turn-outcome-unknown', { reason });
+          else record('failed', 'turn-settled-failure', { reason });
+        }
+      } catch (error) {
+        const reason = this.safeContinuationReason(error);
+        if (error instanceof RetainedCreationRefusalError) {
+          record('refused', 'manager-guard-refused', { reason });
+        } else if (error instanceof RetainedCreationFailedError) {
+          record('failed', 'retained-custody-kept', { reason, custody: 'retained' });
+        } else if (!custodyAttempted && error instanceof LaneWriterConflictError) {
+          record('refused', 'admission-refused', { reason });
+        } else if (!custodyAttempted) {
+          record('failed', 'failed-before-manager', { reason });
+        } else {
+          const lane = this.opts.ledger.getWorktree(input.jobId);
+          const admitted = this.opts.ledger.getCreationContinuationDispatchEvidence(input.jobId, input.requestId, identity.generation).spawned;
+          if (custodyAdopted && lane?.status === 'swept' && (admitted === null || disposedBeforePrompt)) {
+            record('failed', admitted === null ? 'known-swept-failure' : 'failed-before-prompt', { reason, worktree_status: lane.status });
+          } else if (!custodyAdopted && lane !== null) {
+            // Registered, then failed: the registry row holds the lane and
+            // the receipt may already be spent.
+            record('custody-unknown', 'registered-unsettled', { reason, worktree_status: lane.status });
+          } else {
+            record('custody-unknown', 'unsettled-failure', {
+              reason, manager_attempted: true, custody_adopted: custodyAdopted,
+              worktree_status: lane?.status ?? null, agent_spawn_event_observed: admitted !== null,
+            });
+          }
+        }
+      } finally {
+        this.activeCreationContinuations.delete(key);
+      }
+    }).catch((error: unknown) => {
+      this.log('error', 'creation continuation settlement could not be durably recorded', {
+        job: input.jobId, request: input.requestId, error: this.safeContinuationReason(error),
+      });
+    });
+    return { created: true, readback: this.creationContinuationReadback(accepted.timeline) };
+  }
+
+  getCreationContinuationReadback(jobId: string, requestId: string): CreationContinuationReadback | null {
+    const timeline = this.opts.ledger.getCreationContinuation(jobId, requestId);
+    return timeline === null ? null : this.creationContinuationReadback(timeline);
+  }
+
+  private creationContinuationReadback(timeline: CreationContinuationTimeline): CreationContinuationReadback {
+    const { identity } = timeline;
+    const active = this.activeCreationContinuations.has(this.continuationKey(identity.jobId, identity.requestId));
+    const job = this.opts.ledger.getJob(identity.jobId);
+    const evidence = this.opts.ledger.getCreationContinuationDispatchEvidence(identity.jobId, identity.requestId, identity.generation);
+    const lane = this.opts.ledger.getWorktree(identity.jobId);
+    const managerCustodyRecorded = timeline.events.some((event) => (event.payload as Record<string, unknown>)['stage'] === 'custody-adopted');
+    let state = timeline.state;
+    if (evidence.delivery !== null) state = 'delivered';
+    else if (state !== 'failed' && state !== 'refused' && state !== 'delivered' && !active) state = 'custody-unknown';
+    else if (evidence.spawned !== null && state !== 'failed' && state !== 'refused') state = 'admitted';
+    const latestPayload = timeline.events.at(-1)!.payload as Record<string, unknown>;
+    const queueEvent = [...timeline.events].reverse().find((event) => (event.payload as Record<string, unknown>)['state'] === 'queued');
+    const queuePayload = queueEvent?.payload as Record<string, unknown> | undefined;
+    const spawnPayload = evidence.spawned?.payload as Record<string, unknown> | undefined;
+    const deliveryPayload = evidence.delivery?.payload as Record<string, unknown> | undefined;
+    return {
+      job_id: identity.jobId, request_id: identity.requestId, generation: identity.generation,
+      payload_sha256: identity.payloadSha256, state, active, job_status: job?.status ?? null,
+      original: {
+        handoff_seq: identity.handoffSeq, briefing_sha256: identity.briefingSha256,
+        handoff_repo_path: identity.handoffRepoPath, repo_path: identity.repoPath,
+        branch: identity.branch, base_sha: identity.baseSha, base_source: identity.baseSource,
+        producer_settlement_seq: identity.producerSettlementSeq,
+      },
+      custody: lane !== null ? {
+        worktree_id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha,
+        base_source: lane.baseSource, status: lane.status,
+        evidence: managerCustodyRecorded ? 'manager-reconciliation' : 'ledger-registry-only',
+      } : latestPayload['custody'] === 'retained' ? {
+        worktree_id: null, path: null, branch: identity.branch, sha: identity.baseSha,
+        base_source: identity.baseSource, status: 'retained', evidence: 'retained-receipt',
+      } : null,
+      queue: queuePayload === undefined ? null : {
+        gate: typeof queuePayload['gate'] === 'string' ? queuePayload['gate'] : 'unknown',
+        reason: typeof queuePayload['reason'] === 'string' ? queuePayload['reason'] : null,
+      },
+      admission: evidence.spawned === null || typeof spawnPayload?.['agentId'] !== 'string' ? null : {
+        agent_id: spawnPayload['agentId'], event_seq: evidence.spawned.seq,
+      },
+      delivery: evidence.delivery === null ? null : {
+        event_seq: evidence.delivery.seq,
+        agent_id: typeof deliveryPayload?.['agentId'] === 'string' ? deliveryPayload['agentId'] : null,
+        sha: typeof deliveryPayload?.['sha'] === 'string' ? deliveryPayload['sha'] : null,
+      },
+      reason: typeof latestPayload['reason'] === 'string' ? latestPayload['reason'] : null,
+      timeline: timeline.events.map((event) => {
+        const payload = event.payload as Record<string, unknown>;
+        return { seq: event.seq, ts: event.ts, state: String(payload['state']), stage: String(payload['stage']) };
+      }),
+    };
   }
 
   /**
@@ -354,6 +631,22 @@ export class DispatchService {
     completionHandoff?: CompletionHandoffIntent;
     /** Optional initial-dispatch-only dependency patch package. */
     preBootstrapPatch?: PreBootstrapPatchReference;
+    /** Internal only: an authenticated same-job continuation has already
+     * persisted its request; it reuses the job row and handoff and enters
+     * only the strict retained-receipt manager path. */
+    creationContinuation?: CreationContinuationExecution & {
+      readonly custodyAttempted: () => void;
+      readonly custodyAdopted: (lane: WorktreeLane) => void;
+      readonly queued: (gate: string, reason: string) => void;
+      readonly disposedBeforePrompt: () => void;
+    };
+    /** Nefario lens jobs (GH-505): a read-only planning review. The rendered
+     * standing orders agree with the lens briefing's own read-only orders. */
+    readOnly?: boolean;
+    /** The verified briefing-review provenance this dispatch carries
+     * (GH-505): recorded on the job as `briefing.review-dispatched` after
+     * `addJob`, so the ledger proves the minion received the reviewed text. */
+    briefingReview?: BriefingReviewProvenance;
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
@@ -401,7 +694,7 @@ export class DispatchService {
       }
       if (input.commissioner !== undefined || input.targetRef !== undefined || input.targetSha !== undefined || input.targetBase !== undefined ||
           input.requiredInputs !== undefined || input.sourcePackage !== undefined || input.reviewRole !== undefined || input.inputPackage !== undefined ||
-          input.parentContractSha256 !== undefined) {
+          input.parentContractSha256 !== undefined || input.readOnly === true || input.briefingReview !== undefined) {
         throw new PreBootstrapPatchError('lane_unsupported', `job "${input.jobId}": prebootstrap_patch does not compose with report/review metadata`);
       }
       if (this.opts.preBootstrapPatchRoot === undefined) {
@@ -483,7 +776,8 @@ export class DispatchService {
     });
 
     // (1) The job row: the briefing IS the contract (recorded verbatim).
-    const job = this.opts.ledger.addJob({
+    // A continuation uses that exact existing row and never calls addJob.
+    const job = input.creationContinuation?.job ?? this.opts.ledger.addJob({
       id: input.jobId,
       repo: repoName,
       title: input.title,
@@ -495,6 +789,26 @@ export class DispatchService {
       ...(recordedTargetSha !== undefined ? { targetSha: recordedTargetSha } : {}),
       ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
+
+    if (input.briefingReview !== undefined) {
+      // GH-505: the job records which review admitted it and which exact
+      // briefing sha it received. A push-back dispatch carries no verdict
+      // block; its reason is the provenance.
+      this.opts.ledger.appendCustomEvent({
+        kind: BRIEFING_REVIEW_DISPATCHED,
+        jobId: job.id,
+        payload: {
+          job_id: job.id,
+          review_id: input.briefingReview.reviewId,
+          briefing_sha_256: input.briefingReview.briefingSha256,
+          round: input.briefingReview.round,
+          generation: input.briefingReview.generation,
+          verdict: input.briefingReview.verdict,
+          tier: input.briefingReview.tier,
+          ...(input.briefingReview.pushbackReason === null ? {} : { pushback_reason: input.briefingReview.pushbackReason }),
+        },
+      });
+    }
 
     if (reviewSource !== null) {
       this.opts.ledger.appendCustomEvent({
@@ -514,12 +828,15 @@ export class DispatchService {
 
     if (blindAdmission !== null) recordBlindAdmission(this.opts.ledger, job.id, blindAdmission, input.inputPackage);
 
-    // (2) Ops handoff: dispatched → working, on the record.
-    this.opts.ledger.appendCustomEvent({
-      kind: 'job.handoff',
-      jobId: job.id,
-      payload: { repo: repoName, repoPath: input.repoPath },
-    });
+    // (2) Ops handoff: dispatched → working, on the record. An existing
+    // continuation reuses its original handoff and never writes another.
+    if (input.creationContinuation === undefined) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'job.handoff',
+        jobId: job.id,
+        payload: { repo: repoName, repoPath: input.repoPath },
+      });
+    }
 
     let handoffPhaseId: string | null = null;
     // Tracks whether THIS run committed the terminal delivery event: a
@@ -595,21 +912,42 @@ export class DispatchService {
       // the worker gate as promptly as before (#429: a commission answers
       // with the recorded job while that gate holds it).
       const floor = this.opts.diskFloor;
-      if (floor !== undefined) floorAdmission = await this.waitAtDiskFloor(floor, job.id, input.title);
+      if (floor !== undefined) floorAdmission = await this.waitAtDiskFloor(
+        floor, job.id, input.title,
+        input.creationContinuation === undefined ? undefined : (reason) => input.creationContinuation!.queued('disk-floor', reason),
+      );
       assertAdmissible();
 
       // No registered agent exists yet while worktree/pacing/spawn awaits.
       // Reserve that runtime side effect so a concurrent bin cannot close
       // the lane then receive a late briefing.
-      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
+      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, input.creationContinuation === undefined
+        ? 'initial dispatch' : `initial creation continuation ${input.creationContinuation.timeline.identity.requestId}`);
+      // A lane owner may have started while the continuation waited at the
+      // floor; the admission now fences any later one.
+      if (input.creationContinuation !== undefined) {
+        const owner = this.opts.ledger.creationContinuationLaneOwner(job.id);
+        if (owner !== null) throw new LaneWriterConflictError(owner);
+      }
 
-      // (3) One worktree per job, fresh head, own branch (ruling 18). A lane
-      // the floor admitted holds the next waiter back until it is made.
+      // (3) One worktree per job. Only a continuation enters the strict
+      // retained-receipt manager method; it can never resolve a fresh base.
       let worktree: WorktreeLane;
       try {
-        worktree = preBootstrapPatch === null
-          ? await this.opts.worktrees.createJobWorktree({ repoPath: input.repoPath, jobId: job.id })
-          : await this.opts.worktrees.createJobWorktreeWithPreBootstrapPatch!({ repoPath: input.repoPath, jobId: job.id, preBootstrapPatch });
+        if (input.creationContinuation !== undefined) {
+          const createRetained = this.opts.worktrees.createRetainedJobWorktree;
+          if (createRetained === undefined) throw new Error('strict retained-creation manager path is not wired');
+          // A failure before the manager starts adopting has touched nothing.
+          worktree = await createRetained.call(this.opts.worktrees, {
+            repoPath: input.repoPath, jobId: job.id, expected: input.creationContinuation.expected,
+            adopting: input.creationContinuation.custodyAttempted,
+          });
+          input.creationContinuation.custodyAdopted(worktree);
+        } else {
+          worktree = preBootstrapPatch === null
+            ? await this.opts.worktrees.createJobWorktree({ repoPath: input.repoPath, jobId: job.id })
+            : await this.opts.worktrees.createJobWorktreeWithPreBootstrapPatch!({ repoPath: input.repoPath, jobId: job.id, preBootstrapPatch });
+        }
       } finally {
         floorAdmission?.done();
       }
@@ -643,6 +981,7 @@ export class DispatchService {
           queued: (info) => {
             queuedReason = info.reason;
             this.opts.ledger.noteJob(job.id, info.reason);
+            input.creationContinuation?.queued('worker-pacing', info.reason);
           },
         });
         workerLease = lease;
@@ -665,24 +1004,18 @@ export class DispatchService {
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
         // reaches the session (the tools execute in the service process;
-        // a runtime that cannot host them returns none).
+        // a runtime that cannot host them returns none). An admitted blind
+        // reviewer gets none: a child holds neither its package nor its
+        // isolation rule.
         const parentAgentId =
           this.opts.parentTools === undefined ? undefined : `minion_${randomUUID()}`;
         const parentNativeTools =
-          parentAgentId === undefined ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
+          parentAgentId === undefined || blindAdmission?.payload.role === 'blind' ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
         handle = await this.opts.spawner('minion', {
           cwd,
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
           ...(parentNativeTools.length > 0 ? { nativeTools: parentNativeTools } : {}),
         });
-        try {
-          assertHandoff();
-          assertAdmissible();
-          if (preBootstrapPatch !== null) assertPreBootstrapAuthority(preBootstrapPatch, job.id, this.opts.ledger);
-        } catch (error) {
-          await handle.dispose();
-          throw error;
-        }
       } catch (error) {
         // The lane cannot start — release the pacing slot and block the job.
         // A consumed pre-bootstrap package is never cleaned or replayed on an
@@ -692,29 +1025,89 @@ export class DispatchService {
         else this.log('warn', 'prebootstrap lane retained after worker admission failure', { job: job.id, path: worktree.path });
         throw error;
       }
+      // A minion abandoned before its prompt is disposed. Its row says so and
+      // its lane is released as a refused spawn's is only once the disposal
+      // resolved; a failed one may leave it running, so nothing is released.
+      const abandonBeforePrompt = async (error: unknown, agentRow: boolean): Promise<never> => {
+        try {
+          await handle.dispose();
+        } catch (disposeFailure) {
+          this.log('error', 'minion disposal before its prompt failed', { job: job.id, agent: handle.id, error: String(disposeFailure) });
+          throw new AggregateError([error, disposeFailure], `${String(error)}; disposing the spawned minion also failed: ${String(disposeFailure)}`);
+        }
+        if (agentRow) this.opts.ledger.setAgentState(handle.id, 'disposed');
+        input.creationContinuation?.disposedBeforePrompt();
+        releaseWorker();
+        await this.sweepQuietly(worktree.id);
+        throw error;
+      };
+      try {
+        assertHandoff();
+        assertAdmissible();
+        if (preBootstrapPatch !== null) assertPreBootstrapAuthority(preBootstrapPatch, job.id, this.opts.ledger);
+      } catch (error) {
+        if (preBootstrapPatch !== null) {
+          // A patched lane is never swept on an admission failure: its
+          // consumed package and custody stay for the authenticated readback.
+          try {
+            await handle.dispose();
+          } catch (disposeFailure) {
+            throw new AggregateError([error, disposeFailure], `${String(error)}; disposing the spawned minion also failed: ${String(disposeFailure)}`);
+          }
+          releaseWorker();
+          this.log('warn', 'prebootstrap lane retained after worker admission failure', { job: job.id, path: worktree.path });
+          throw error;
+        }
+        await abandonBeforePrompt(error, false);
+      }
       // Register the minion lane binding OURSELVES (idempotent): the
       // board engine's spawn-envelope registration is an observer, never
       // a precondition — dispatch must not depend on listener ordering.
       // Issue #161: a dispatched minion is explicitly TOP-LEVEL (legacy
       // rows stay unknown; the marker is never retro-fitted).
-      this.opts.ledger.registerAgent({
-        id: handle.id,
-        role: 'minion',
-        sessionFile: handle.sessionFile,
-        jobId: job.id,
-        parentage: 'top-level',
-      });
-      try { assertHandoff(); } catch (error) { await handle.dispose(); throw error; }
-      // Bind the admitted worker to the marked phase BEFORE its prompt runs:
-      // a delivery from any other worker can never complete this phase.
-      if (handoffPhaseId !== null) {
-        this.opts.ledger.bindPhaseHandoffMinion({ phaseId: handoffPhaseId, minionId: handle.id });
+      // A throw from any write after the spawn abandons the minion: no
+      // unprompted minion outlives a failed dispatch.
+      let registered = false;
+      try {
+        this.opts.ledger.registerAgent({
+          id: handle.id,
+          role: 'minion',
+          sessionFile: handle.sessionFile,
+          jobId: job.id,
+          parentage: 'top-level',
+        });
+        registered = true;
+        assertHandoff();
+        // Bind the admitted worker to the marked phase BEFORE its prompt runs:
+        // a delivery from any other worker can never complete this phase.
+        if (handoffPhaseId !== null) {
+          this.opts.ledger.bindPhaseHandoffMinion({ phaseId: handoffPhaseId, minionId: handle.id });
+        }
+        const spawned = this.opts.ledger.appendCustomEvent({
+          kind: 'job.minion-spawned',
+          jobId: job.id,
+          payload: {
+            agentId: handle.id, worktree: worktree.path, branch: worktree.branch,
+            ...(input.creationContinuation === undefined ? {} : {
+              creation_continuation_request_id: input.creationContinuation.timeline.identity.requestId,
+              creation_continuation_generation: input.creationContinuation.timeline.identity.generation,
+            }),
+          },
+        });
+        if (input.creationContinuation !== undefined) {
+          this.opts.ledger.recordCreationContinuationState({
+            jobId: job.id, requestId: input.creationContinuation.timeline.identity.requestId,
+            generation: input.creationContinuation.timeline.identity.generation,
+            state: 'admitted', stage: 'minion-spawned', details: {
+              agent_id: handle.id, spawn_event_seq: spawned.seq, worktree_id: worktree.id,
+              path: worktree.path, branch: worktree.branch, sha: worktree.sha,
+              base_source: input.creationContinuation.timeline.identity.baseSource,
+            },
+          });
+        }
+      } catch (error) {
+        await abandonBeforePrompt(error, registered);
       }
-      this.opts.ledger.appendCustomEvent({
-        kind: 'job.minion-spawned',
-        jobId: job.id,
-        payload: { agentId: handle.id, worktree: worktree.path, branch: worktree.branch },
-      });
       this.log('info', 'minion dispatched', {
         job: job.id,
         agent: handle.id,
@@ -726,11 +1119,18 @@ export class DispatchService {
       // rate-limited turn stays pending until its bounded automatic retry
       // path concludes — never recorded as delivered while a retry could
       // still carry it, never disposed out from under that retry.
-      const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      const reviewRole = blindAdmission?.payload.role ?? null;
+      const lessons = reviewRole === 'blind'
+        ? []
+        : this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      // A failure that settles while the service is stopping leaves the sent
+      // prompt's outcome unknown, whichever branch settles it.
+      const unlessStopping = (result: { readonly ok: false; readonly error: string }) =>
+        this.opts.stopSignal?.aborted === true ? { ...result, outcomeUnknown: true } : result;
       const settleTurn = async (
         failure: unknown | null,
         verdict: PromptTurnVerdict | null,
-      ): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+      ): Promise<{ readonly ok: boolean; readonly error?: string; readonly outcomeUnknown?: boolean }> => {
         // Issue #316/#356: whatever the reviewer's tools actually returned is
         // judged against the rule it was admitted under the moment the
         // initial prompt physically settled — before anything else, before
@@ -772,7 +1172,7 @@ export class DispatchService {
             handoffPhaseId,
             `dispatch turn failed: pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`,
           );
-          return { ok: false as const, error: detail };
+          return unlessStopping({ ok: false as const, error: detail });
         }
         const disposition = settlement.value;
         if (disposition === 'cancelled') {
@@ -794,7 +1194,7 @@ export class DispatchService {
           // The turn recorded no delivery, so the marked phase cannot have
           // completed: close the guard row instead of leaving a stale intent.
           this.closeHandoffQuietly(handoffPhaseId, 'dispatch turn failed: service stopped before the automatic retries settled');
-          return { ok: false as const, error: detail };
+          return { ok: false as const, error: detail, outcomeUnknown: true };
         }
         const retryFailed = disposition === 'exhausted' || disposition === 'superseded';
         if (failure !== null && disposition !== 'recovered') {
@@ -813,7 +1213,7 @@ export class DispatchService {
           if (!deliveredRecorded) {
             this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
           }
-          return { ok: false as const, error };
+          return unlessStopping({ ok: false as const, error });
         }
         if (retryFailed) {
           const error = `automatic rate-limit retry ${disposition} — the briefing turn did not deliver`;
@@ -829,7 +1229,7 @@ export class DispatchService {
             disposition,
           });
           this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
-          return { ok: false as const, error };
+          return unlessStopping({ ok: false as const, error });
         }
         // Terminal/error correlation (r4 blocker 1): a resolved prompt is
         // not success — both adapters settle fulfilled prompts that ended in
@@ -846,20 +1246,40 @@ export class DispatchService {
             ? ({ ok: true, error: null } as const)
             : (verdict ?? promptVerdictFromHealth(handle));
         if (!evidence.ok) {
-          return this.recordTurnFailure(
+          return unlessStopping(this.recordTurnFailure(
             job.id,
             handle.id,
             handoffPhaseId,
             deliveredRecorded,
             evidence.error ?? 'runtime settled the briefing turn with an in-band error',
-          );
+          ));
         }
         // The initial briefing carries the original contract only — revision
         // 0. A material amendment accepted while this turn ran stays pending
         // until a continuation carrying it delivers (owner rule 2).
+        const continuationIdentity = input.creationContinuation?.timeline.identity;
         const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
           worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
+          ...(continuationIdentity === undefined ? {} : {
+            creationContinuation: { requestId: continuationIdentity.requestId, generation: continuationIdentity.generation },
+          }),
           ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}), workRevision: 0 });
+        // The job.delivered receipt is the delivery; its continuation state
+        // is a best-effort mirror that never keeps the job from settling.
+        if (continuationIdentity !== undefined) {
+          try {
+            this.opts.ledger.recordCreationContinuationState({
+              jobId: job.id, requestId: continuationIdentity.requestId, generation: continuationIdentity.generation,
+              state: 'delivered', stage: 'job-delivered', details: {
+                delivery_event_seq: delivery.eventSeq, agent_id: handle.id, sha: delivery.sha,
+              },
+            });
+          } catch (error) {
+            this.log('error', 'creation continuation delivered state could not be recorded; its job.delivered receipt stands', {
+              job: job.id, request: continuationIdentity.requestId, error: this.safeContinuationReason(error),
+            });
+          }
+        }
         deliveredRecorded = true;
         if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
           job: job.id, note: delivery.note, lane: delivery.lanePath,
@@ -882,6 +1302,8 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        reviewRole,
+        ...(input.readOnly === true ? { readOnly: true } : {}),
         ...(reviewSource !== null ? { reviewSource } : {}),
         ...(blindAdmission?.payload.role === 'blind' && input.inputPackage !== undefined ? { blindPackage: input.inputPackage } : {}),
         agentId: handle.id,
@@ -902,9 +1324,21 @@ export class DispatchService {
           this.opts.worktrees.completePreBootstrapWorkerAdmission!({ repoPath: input.repoPath, jobId: job.id });
         }
       } catch (error) {
-        await handle.dispose();
-        this.opts.ledger.setAgentState(handle.id, 'disposed');
-        throw error;
+        if (preBootstrapPatch !== null) {
+          // The receipt was never spent: the patched lane and its custody
+          // stay for the authenticated readback — never swept.
+          try {
+            await handle.dispose();
+          } catch (disposeFailure) {
+            this.opts.ledger.setAgentState(handle.id, 'disposed');
+            throw new AggregateError([error, disposeFailure], `${String(error)}; disposing the spawned minion also failed: ${String(disposeFailure)}`);
+          }
+          this.opts.ledger.setAgentState(handle.id, 'disposed');
+          releaseWorker();
+          this.log('warn', 'prebootstrap lane retained after worker admission failure', { job: job.id, path: worktree.path });
+          throw error;
+        }
+        await abandonBeforePrompt(error, true);
       }
       const promptRun: Promise<unknown> =
         handle.promptWithVerdict !== undefined
@@ -949,10 +1383,10 @@ export class DispatchService {
       const current = this.opts.ledger.getJob(job.id);
       if (current !== null && !isJobTerminal(current.status) && current.status !== 'parked') {
         this.opts.ledger.setJobStatus(job.id, 'blocked');
-        this.opts.ledger.noteJob(job.id, `dispatch failed: ${failureDetail}`);
+        this.opts.ledger.noteJob(job.id, `dispatch failed: ${redactCreationTokens(failureDetail)}`);
       }
-      this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${failureDetail}`);
-      if (preBootstrapPatch !== null) throw new PreBootstrapPatchError('dispatch_failed', failureDetail, { cause: error });
+      this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${redactCreationTokens(failureDetail)}`);
+      if (preBootstrapPatch !== null) throw new PreBootstrapPatchError('dispatch_failed', redactCreationTokens(failureDetail), { cause: error });
       throw error;
     }
   }
@@ -962,7 +1396,12 @@ export class DispatchService {
    * noted. The service's stop ends the wait, and so does the job leaving
    * the states a lane may still be made in (binned, parked, blocked,
    * finished). */
-  private async waitAtDiskFloor(floor: Pick<DiskFloorGate, 'admitLane'>, jobId: string, label: string): Promise<FloorAdmission> {
+  private async waitAtDiskFloor(
+    floor: Pick<DiskFloorGate, 'admitLane'>,
+    jobId: string,
+    label: string,
+    onQueued?: (reason: string) => void,
+  ): Promise<FloorAdmission> {
     const jobEnded = new AbortController();
     const unsubscribe = this.opts.bus?.subscribe((event) => {
       if (event.kind !== 'job.status' || event.jobId !== jobId) return;
@@ -979,6 +1418,7 @@ export class DispatchService {
         queued: (info) => {
           floorQueued = true;
           this.opts.ledger.noteJob(jobId, info.reason);
+          onQueued?.(info.reason);
         },
       });
       if (floorQueued) this.opts.ledger.noteJob(jobId, `disk floor: admitted after ${admitted.waitedMs} ms queue wait`);

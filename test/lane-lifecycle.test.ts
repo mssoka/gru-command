@@ -267,6 +267,7 @@ async function directive(h: Harness, jobId: string, gate: PacingGate, onPrompt: 
       registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
       getJob: (id: string) => h.ledger.getJob(id),
       getAgent: () => null,
+      latestJobEvent: () => null,
     },
     worktrees: h.manager,
     jobId,

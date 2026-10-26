@@ -45,6 +45,35 @@ export class CreationIntentError extends Error {
   }
 }
 
+/** A strict continuation guard refused before it began any checkout work. */
+export class RetainedCreationRefusalError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RetainedCreationRefusalError';
+  }
+}
+
+/** A strict continuation failed after adopting its receipt; the retained
+ * ref, receipt and any partial checkout are kept for inspection. */
+export class RetainedCreationFailedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RetainedCreationFailedError';
+  }
+}
+
+/** The retained receipt a continuation accepted: its token digest and the
+ * producer settlement that proved the original creation stopped. */
+export interface RetainedReceiptExpectation {
+  readonly receiptTokenSha256: string;
+  readonly producerSettlementSeq: number;
+}
+
+/** A creation token is custody authority: it never enters a note or event. */
+export function redactCreationTokens(text: string): string {
+  return text.replace(/gru-creation:[A-Za-z0-9-]+/gu, '<redacted-creation-token>');
+}
+
 /** The lane a creation receipt belongs to. Identity fields only — every one
  * is revalidated on read against the caller's request, never trusted. */
 export interface CreationIntentLane {
@@ -157,7 +186,7 @@ export function writeCreationIntent(commonDir: string, intent: Omit<CreationInte
   try { unlinkSync(temp); } catch (error) {
     // Our own temporary name is absent when the exclusive open never ran.
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new CreationIntentError(`temporary creation receipt ${temp} could not be removed`,
+      throw new CreationIntentError(`the temporary creation receipt for branch ${intent.branch} could not be removed`,
         { cause: failed === undefined ? error : new AggregateError([failed, error], 'receipt publication and its temporary name both failed') });
     }
   }

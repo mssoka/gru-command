@@ -9,6 +9,7 @@ import { DECISION_SURFACES } from './decisions/questions.js';
 import { displayManagedRepoName, managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 import { SILAS_AUTOPILOT_RULE_IDS } from './dispatch/silas-rules.js';
+import { BRIEFING_REVIEW_STAGES, type BriefingReviewStage } from './briefing-review/types.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -197,8 +198,9 @@ export interface ChatConfig {
    * 'never' injects escalations + a ledger digest passively before the
    * next turn at no turn cost by itself; 'action-required' (default,
    * owner ruling 2026-09-23) wakes a turn for machine-attention rows so
-   * a critical alert is acted on without the user pinging; 'all' wakes
-   * for every notification. Each wake is a full model turn — see
+   * a critical alert is acted on without the user pinging, and for a
+   * RECORDED owner decision Gru owns whose follow-through is owed (#506); 'all'
+   * wakes for every notification. Each wake is a full model turn — see
    * CONFIG.md. */
   readonly notifyWake: NotifyWakeMode;
   /** Minimum interval between autonomous wake turns (ms); candidates
@@ -343,6 +345,22 @@ export const DEFAULT_VECTOR_CONFIG: VectorConfig = {
   maxRaidMs: 1_800_000,
   maxRaidTokens: 400_000,
   maxRaidsPerDay: 2,
+};
+
+/** Nefario, the pre-dispatch briefing review (GH-505, docs/BRIEFING-REVIEW.md).
+ * `enabled = false` is the stop state: no commission, no readiness refusal and
+ * an empty card. `stage = auto` (the default) follows the tier: high and medium
+ * are enforced, low is advisory. `stage` 1/2/3 are explicit overrides. */
+export interface BriefingReviewConfig {
+  readonly enabled: boolean;
+  readonly stage: BriefingReviewStage;
+}
+
+export const DEFAULT_BRIEFING_REVIEW_CONFIG: BriefingReviewConfig = {
+  enabled: true,
+  // Auto by tier: high and medium are enforced, low is advisory. Stages 1/2/3
+  // remain explicit floor overrides for an install that needs them.
+  stage: 'auto',
 };
 
 /** What GC does about a managed repository whose origin default branch has
@@ -788,6 +806,8 @@ export interface GruCommandConfig {
   readonly verify: VerifyConfig;
   readonly pacing: PacingConfig;
   readonly decisions: DecisionsConfig;
+  /** `[briefing_review]`: Nefario, the pre-dispatch briefing review. */
+  readonly briefingReview: BriefingReviewConfig;
   /** `[env]`: applied once at service boot (src/service-environment.ts). */
   readonly env: ConfiguredEnvironment;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
@@ -994,6 +1014,7 @@ const TOP_LEVEL_KEYS = [
   'verify',
   'pacing',
   'decisions',
+  'briefing_review',
   'env',
 ] as const;
 
@@ -1295,6 +1316,7 @@ export function loadConfig(
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let pacing: PacingConfig = DEFAULT_PACING_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
+  let briefingReview: BriefingReviewConfig = DEFAULT_BRIEFING_REVIEW_CONFIG;
   let configuredEnv = new ConfiguredEnvironment([]);
   let sourceFile: string | null = null;
 
@@ -1904,6 +1926,27 @@ export function loadConfig(
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
+    if (raw['briefing_review'] !== undefined) {
+      const table = requireTable(raw['briefing_review'], file, 'briefing_review');
+      for (const key of Object.keys(table)) {
+        if (key !== 'enabled' && key !== 'stage') {
+          throw new ConfigError(`unknown key \`${key}\` in [briefing_review] (valid keys: enabled, stage)`, file, `briefing_review.${key}`);
+        }
+      }
+      const stage = table['stage'];
+      const validStage = (BRIEFING_REVIEW_STAGES as readonly unknown[]).includes(stage);
+      if (stage !== undefined && !validStage) {
+        throw new ConfigError(
+          `briefing_review.stage must be "auto", 1, 2 or 3 (auto follows the tier: high + medium enforced, low advisory; 1 = record only, 2 = high only, 3 = high + medium), got: ${JSON.stringify(stage)}`,
+          file,
+          'briefing_review.stage',
+        );
+      }
+      briefingReview = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'briefing_review.enabled') : briefingReview.enabled,
+        stage: (stage as BriefingReviewStage | undefined) ?? briefingReview.stage,
+      };
+    }
     if (raw['env'] !== undefined) {
       configuredEnv = readEnvTable(raw['env'], file);
     }
@@ -1988,6 +2031,7 @@ export function loadConfig(
     verify,
     pacing,
     decisions,
+    briefingReview,
     env: configuredEnv,
     sourceFile,
     instanceDir,
