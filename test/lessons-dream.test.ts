@@ -215,6 +215,31 @@ describe('dream distiller protocol (one Bob pass)', () => {
     expect(prompt).toContain('Chapters are capped at 4096 bytes');
     expect(prompt).toContain('1024 bytes');
     expect(prompt).toContain('mergeInto');
+    // Scope: only what this pass adds or merges. A 2026-10-26 pass returned
+    // the whole book, so 27 unchanged lessons carried empty provenance and
+    // the parser refused the file.
+    expect(prompt).toContain('return ONLY the lessons this pass adds or merges');
+    expect(prompt).toContain('a lesson that needs no change is left out');
+    // Retention is scoped: the cap can trim or drop a lesson, and retiring a
+    // chapter deletes it unless its live lessons are carried.
+    expect(prompt).toContain('Do not return the whole book; in a chapter you keep, the host');
+    expect(prompt).toContain('retains every lesson you do not mention (the cap may still trim or drop');
+    expect(prompt).toContain('Retiring a chapter deletes it: carry its live');
+    // An unconditional "keeps every existing lesson" promise would be false.
+    expect(prompt).not.toContain('the host keeps every existing');
+    // Provenance is this batch's, never the existing lesson's.
+    expect(prompt).toContain('every lesson in the output cites at least one journal id');
+    expect(prompt).toContain("from this batch — never an existing lesson's provenance");
+    // The retired permissive sentence let an unchanged lesson ride along.
+    expect(prompt).not.toContain('Every new lesson cites at least one journal id');
+    // A carry out of a retired chapter is rebuilt under this batch's
+    // provenance. Without this, Bob echoes the lesson's old journal ids
+    // and the batch guard refuses the whole file — or invents a citation.
+    expect(prompt).toContain('carry its live lessons into other chapters and set "retire": true — a');
+    expect(prompt).toContain("carried lesson is rebuilt under this batch's provenance: cite the id");
+    expect(prompt).toContain('its old ids cannot travel');
+    expect(prompt).toContain('do not invent a citation — let it go');
+    expect(prompt).toContain('the owner reviews what retirement removes');
   });
 
   it('parses a valid update and rejects invented provenance / malformed shapes', () => {

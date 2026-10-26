@@ -112,7 +112,8 @@ keep = 5
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
 # Wake policy for Gru awareness: "action-required" (default; machine
-# attention OPENS a Gru turn), "all", or "never" (passive context only).
+# attention and recorded Gru-owned owner decisions OPEN a Gru turn), "all", or
+# "never" (passive context only).
 notify_wake = "action-required"
 # Minimum interval between autonomous wakes (ms); 0 disables the cap.
 wake_min_interval_ms = 300000
@@ -240,6 +241,14 @@ max_concurrent = 1                # concurrent runs; further requests queue FIFO
 worker_budget = 0                 # total test workers across runs; 0 = auto (cores - 2)
 lock_wait_timeout_ms = 900000     # queued request past this fails loud (never a silent hang)
 run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process group
+
+# [briefing_review]               # Nefario, the pre-dispatch briefing review (docs/BRIEFING-REVIEW.md)
+# Gru reviews one briefing before POST /api/dispatch; the tier picks the lenses
+# (low = stranger, medium = +acceptance/verification, high = all five). Binding
+# on readiness, advisory on content. Leave the block out of a config an older
+# build must still parse after `gru roll`.
+# enabled = true                  # false = stop state: no commission (503), no readiness refusal, zeroed card
+# stage = "auto"                  # auto follows the tier (high + medium enforced, low advisory); 1/2/3 are explicit overrides
 
 [decisions.jev]                   # Jev decisions (docs/jev-production-integration.md) — off by default
 # Keep a mode on every surface: without one, event_triage and supervision_guidance

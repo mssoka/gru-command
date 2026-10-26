@@ -958,7 +958,8 @@ export class Supervisor {
       // Adapters emit `error` followed immediately by their sticky
       // `state:error`. The latter is the same failure, not recovery/new
       // activity; letting it advance the token would invalidate the bounded
-      // provider-wall decision started by the error event itself.
+      // decision started by the error event itself (a known wall stops
+      // without one, #492).
       const expectedFailureTerminal =
         agent.decisionPending &&
         agent.failureTerminalPending &&
@@ -1813,7 +1814,7 @@ export class Supervisor {
    * authoritative: Jev classifies the signature only and can never grant a
    * restart past these guards — an `act`-band restart_advised with requireConfirm
    * still stops for a human, and known auth/quota walls always stop without
-   * burning rungs, whatever the model answers. */
+   * burning rungs: a known wall stops before any decision is asked (#492). */
   private async evaluateRecovery(
     agent: SupervisedAgent,
     reason: string,
@@ -1845,6 +1846,35 @@ export class Supervisor {
       } else if (allowRestart) {
         await this.restartRung(agent, reason);
       }
+      return;
+    }
+    if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
+      // A known wall stops now, before any decision is awaited or queued
+      // behind a pending one (#492): no answer can change its action
+      // (supervisionGuidance stops on a wall unconditionally), and a
+      // directive's recovery can dispose the handle while one is pending,
+      // which left the stale answer to void the stop.
+      try {
+        this.ledger.appendCustomEvent({
+          kind: 'supervision.guidance',
+          agentId: agent.agentId,
+          payload: {
+            class: deterministicClass,
+            restart_advised: false,
+            restart_authorized: false,
+            source: 'deterministic_guard',
+            route: 'fallback',
+            requires_confirm: false,
+          },
+        });
+      } catch (error) {
+        // A failed guidance record alone doesn't hold up the stop.
+        this.log('error', 'supervision guidance record failed; stopping the known wall anyway', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      }
+      this.stopForGuidance(agent, deterministicClass, source, recovery);
       return;
     }
     if (agent.decisionPending) {
@@ -1910,9 +1940,9 @@ export class Supervisor {
           class: failureClass,
           restart_advised: restartAdvised,
           restart_authorized: restartAuthorized,
-          source: deterministicWall ? 'deterministic_guard' : outcome.provenance.source,
-          route: deterministicWall ? 'fallback' : restartRoute.path,
-          requires_confirm: deterministicWall ? false : restartRoute.requiresConfirm,
+          source: outcome.provenance.source,
+          route: restartRoute.path,
+          requires_confirm: restartRoute.requiresConfirm,
         },
       });
       if (action.kind === 'stop') {
@@ -1934,8 +1964,8 @@ export class Supervisor {
         (runtimeError || agent.openControl === expectedOpenControl) &&
         !agent.breakerOpen
       ) {
-        if (deterministicWall) this.stopForGuidance(agent, deterministicClass, source, recovery);
-        else if (allowRestart) await this.restartRung(agent, reason);
+        // A known wall never reaches a decision (it stopped above).
+        if (allowRestart) await this.restartRung(agent, reason);
       }
     } finally {
       agent.decisionPending = false;

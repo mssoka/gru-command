@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { boardKpis, collectJobs } from './board-kpi.js';
-import type { AgentView, BoardSnapshot, BuildView, ChildWorkerCounts, DiskView, JobView, SilasView, VectorOnView, VectorView } from './board-protocol.js';
+import type { AgentView, BoardSnapshot, BriefingReviewView, BuildView, ChildWorkerCounts, DiskView, JobView, SilasView, VectorOnView, VectorView } from './board-protocol.js';
 import { cockpitCards, gruQueueLine, healthPill, type CockpitCard } from './cockpit.js';
 
 /**
@@ -317,6 +317,61 @@ describe('cockpit cards', () => {
     // A raid on the repository root names the repository alone.
     const root = card(cockpitCards(snapshot([], [], null, { vector: { ...base, running: [{ ...base.running[0]!, packageDir: '.', roundsDone: 0 }] } }), NOW), 'raids');
     expect(root.notes).toEqual(['demo · attack 1/4']);
+  });
+});
+
+describe('Nefario briefing-review card (GH-505)', () => {
+  const review = (overrides: Partial<BriefingReviewView> = {}): BriefingReviewView => ({
+    armed: 2, round: 3, tier: 'high', verdictsToday: 1, caught: 4, refusalsToday: 0, stage: 'advisory', ...overrides,
+  });
+
+  it('comes after the raids card, and only when the server sent its block (absent = no card, null = dashed)', () => {
+    const vector: VectorView = { enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 };
+    expect(cockpitCards(snapshot([], [], null), NOW).map((entry) => entry.id)).not.toContain('nefario');
+    expect(cockpitCards(snapshot([], [], null, { vector, briefingReview: review() }), NOW).map((entry) => entry.id))
+      .toEqual(['heists', 'megaminions', 'crew', 'prs', 'reviews', 'raids', 'nefario']);
+    expect(card(cockpitCards(snapshot([], [], null, { briefingReview: null }), NOW), 'nefario')).toMatchObject({
+      off: true, headline: { kpi: null, value: '—', unit: 'unavailable' }, facts: [], notes: ['the server could not read the briefing reviews'],
+    });
+  });
+
+  it('shows the aggregate pass only: live round and tier, stage suffix, and refusals at every enforced stage', () => {
+    const live = card(cockpitCards(snapshot([], [], null, { briefingReview: review() }), NOW), 'nefario');
+    expect(live.off).toBe(false);
+    expect(live.headline).toMatchObject({ kpi: 'briefingReview.armed', value: '2', unit: 'under test' });
+    expect(live.aside).toBe('round 3 · high · advisory');
+    // Stage 1 (advisory) never claims refusals it does not enforce.
+    expect(live.facts.map((fact) => [fact.kpi, fact.value, fact.alert])).toEqual([
+      ['briefingReview.verdictsToday', 1, false],
+      ['briefingReview.caught', 4, false],
+    ]);
+    const enforced = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ stage: 'high', refusalsToday: 1 }) }), NOW), 'nefario');
+    expect(enforced.aside).toBe('round 3 · high');
+    expect(enforced.facts.map((fact) => [fact.kpi, fact.value, fact.alert])).toEqual([
+      ['briefingReview.verdictsToday', 1, false],
+      ['briefingReview.caught', 4, false],
+      ['briefingReview.refusalsToday', 1, true],
+    ]);
+    // Stage 3 enforces medium as well as high; refusals stay the alert fact.
+    const medium = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ stage: 'high+medium', tier: 'medium', refusalsToday: 2 }) }), NOW), 'nefario');
+    expect(medium.aside).toBe('round 3 · medium');
+    expect(medium.facts.map((fact) => [fact.kpi, fact.value, fact.alert])).toEqual([
+      ['briefingReview.verdictsToday', 1, false],
+      ['briefingReview.caught', 4, false],
+      ['briefingReview.refusalsToday', 2, true],
+    ]);
+    expect(medium.asideTitle).toContain('the install holds high- and medium-tier dispatches');
+    // Nothing live: the aside says so, and the zeros still render (faded).
+    const quiet = card(cockpitCards(snapshot([], [], null, { briefingReview: review({ armed: 0, round: null, tier: null, verdictsToday: 0, caught: 0, stage: 'high' }) }), NOW), 'nefario');
+    expect(quiet.aside).toBe('no pass live');
+    expect(quiet.headline).toMatchObject({ kpi: 'briefingReview.armed', value: '0' });
+    expect(quiet.facts.every((fact) => fact.value === 0 && !fact.alert)).toBe(true);
+  });
+  it('counts a Nefario lens job row as an ordinary top-level investigation heist', () => {
+    const cards = cockpitCards(snapshot([job('briefing-review-abc-stranger', 'working')]), NOW);
+    const heists = card(cards, 'heists');
+    expect(heists.headline.value).toBe('1');
+    expect(heists.facts.find((entry) => entry.kpi === 'jobs.working')?.value).toBe(1);
   });
 });
 

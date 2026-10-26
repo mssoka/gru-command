@@ -239,3 +239,44 @@ describe('wake policy — quiet hours', () => {
     expect(snapshot.wokenIncidents).toContain('incident:512'); // newest kept
   });
 });
+
+describe('wake policy — recorded owner decisions (issue #506)', () => {
+  const decided = (overrides: Partial<WakeCandidate> = {}): WakeCandidate =>
+    candidate({ id: '\u0000owner-decision:["card-1","2026-10-25T09:13:00.000Z"]', incidentKey: 'gru.owner-escalation:merge-ready', reason: 'owner-decision', routing: 'needs-owner', ...overrides });
+
+  it('wakes a decided needs-owner card in action-required mode — the card stays owner-routed', () => {
+    const policy = new WakePolicy(BASE);
+    expect(policy.decide(decided(), 0)).toEqual({ action: 'wake' });
+    expect(policy.gate(decided())).toBeNull();
+  });
+
+  it("'never' stays passive-only for decisions too", () => {
+    const policy = new WakePolicy({ ...BASE, mode: 'never' });
+    expect(policy.decide(decided(), 0)).toEqual({ action: 'skip', reason: 'mode' });
+    expect(policy.gate(decided())).toBe('mode');
+  });
+
+  it('keeps the severity floor and the rate limit', () => {
+    const strict = new WakePolicy({ ...BASE, minSeverity: 'error' });
+    expect(strict.decide(decided({ severity: 'info' }), 0)).toEqual({ action: 'skip', reason: 'severity' });
+    const rate = new WakePolicy({ ...BASE, minIntervalMs: 300_000 });
+    rate.fired(['old'], 10_000);
+    expect(rate.decide(decided(), 20_000)).toEqual({ action: 'defer', reason: 'rate', retryAtMs: 310_000 });
+  });
+
+  it('dedupes per (card, decided_at), never by the card id or the incident key', () => {
+    const policy = new WakePolicy({ ...BASE, minIntervalMs: 0 });
+    const first = decided();
+    expect(policy.decide(first, 1_000).action).toBe('wake');
+    policy.fired([first.id], 1_000, []); // a decision claim spends no incident key
+    expect(policy.decide(first, 2_000)).toEqual({ action: 'skip', reason: 'dedupe' });
+    // A different recorded decision on the SAME incident (another merge card)
+    // is its own follow-through obligation.
+    expect(policy.decide(decided({ id: '\u0000owner-decision:["card-2","2026-10-25T14:43:00.000Z"]' }), 2_000))
+      .toEqual({ action: 'wake' });
+    // ... and does not inherit an unrelated incident claim.
+    const claimed = new WakePolicy({ ...BASE, minIntervalMs: 0 });
+    claimed.fired(['n1'], 1_000, ['gru.owner-escalation:merge-ready']);
+    expect(claimed.decide(decided(), 2_000)).toEqual({ action: 'wake' });
+  });
+});
