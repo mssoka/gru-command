@@ -192,6 +192,13 @@ function packageIdentity(): { root: string; identity: string } {
   return { root: installed, identity: reviewRuntimeVersion(installed) };
 }
 
+// The installed-tree cases build and walk the whole tarball. In the
+// four-worker fast phase their wall time tracks host load: a green Linux CI
+// run took 37s/54s/59s for the hoisted, freeze and boot cases, the same
+// cases took 76s/118s/124s on a loaded co-tenant host, and the failing
+// 2026-10-26 run reached 71s/62s/73s. The cases keep their work and their
+// assertions; the per-case ceilings below only stop co-tenant load from
+// reporting a still-progressing walk as a timeout (#511).
 describe('installed Perkins runtime identity', () => {
   it.skipIf(process.platform !== 'darwin')('fails closed on a missing pinned Python helper without leaking its output', () => {
     const root = fixture('gru-darwin-identity-');
@@ -302,7 +309,7 @@ describe('installed Perkins runtime identity', () => {
       writeFileSync(code, `${readFileSync(code, 'utf8')}\n// hoisted behavior change\n`);
       expect(reviewRuntimeVersion(root)).not.toBe(identity);
     }
-  }, 90_000);
+  }, 180_000);
 
   it('fails closed on the npm-ci esbuild hard link until the packaged postinstall unshares it', () => {
     // Owner incident 2026-10-07: esbuild's postinstall hard-links its
@@ -414,7 +421,7 @@ describe('installed Perkins runtime identity', () => {
       try { if (manager !== undefined && manager.getWorktree('installed-service-job') !== null) await manager.release({ worktreeId: 'installed-service-job' }); }
       finally { db.close(); repo.cleanup(); }
     }
-  }, 90_000);
+  }, 180_000);
 
   it('boots the installed main entrypoint and recovers checked lenses through its real service runner', async () => {
     // Linux's installed identity and both actual HTTP rounds must succeed
@@ -604,7 +611,7 @@ RuntimeRegistry.prototype.reserveReviewRound = async () => ({
       db.close();
       repo.cleanup();
     }
-  }, 120_000);
+  }, 240_000);
 
   it('builds a sanitized lock closure digest without hashing or publishing credential URLs', () => {
     const root = fixture('gru-review-lock-');
