@@ -132,8 +132,9 @@ retirement reports the same `phase_handoff_closed` id. A row retired before
 the context existed reads all six as `null` ("not recorded") and replays
 its original intent with them `null` or absent; any other body against a
 retired row is a `retire_conflict`. Retirement resolves the request's
-`silas.directive-unreconciled` card (an open recovery debt still reaches
-Gru through the obligation mailbox; a suspended one keeps its card).
+`silas.directive-unreconciled` card only when no obligation incarnation of
+the request is still active: an open, waiting **or** suspended recovery debt
+keeps the card as the pointer back to that debt.
 
 ### Refusals (all leave the record byte-identical)
 

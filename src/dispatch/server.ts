@@ -2386,10 +2386,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
+      const requestId = strictOptStrField(body, 'request_id');
+      // A replay of an already-recorded request answers from its own durable
+      // record — id, state and payload hash — even when the lane has gone
+      // terminal since: the id is consumed and the caller is told what it did.
+      // Only a NEW request is refused on a terminal lane (as the directive
+      // route does; #493 round 3).
+      const replayed = requestId === undefined ? null : options.ledger.getDirective(requestId);
+      if (replayed !== null && replayed.jobId === jobId) {
+        json(res, replayed.state === 'dispatching' || replayed.state === 'admitted' ? 202 : 200,
+          { request_id: replayed.requestId, job_id: jobId, state: directiveStateName(replayed), payload_hash: replayed.payloadHash, replay: true });
+        return true;
+      }
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
-      const requestId = strictOptStrField(body, 'request_id');
       if (requestId === undefined || options.ledger.getDirective(requestId) === null) {
         try { options.wave.assertWriterAdmissible(jobId); }
         catch (error) {
@@ -2409,7 +2420,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const intent = begun.record;
       if (!begun.created) {
         json(res, intent.state === 'dispatching' || intent.state === 'admitted' ? 202 : 200,
-          { request_id: intent.requestId, job_id: jobId, state: directiveStateName(intent), replay: true });
+          { request_id: intent.requestId, job_id: jobId, state: directiveStateName(intent), payload_hash: intent.payloadHash, replay: true });
         return true;
       }
       const release = options.ledger.beginJobAdmission(jobId, `rebrief ${intent.requestId}`);

@@ -1537,7 +1537,7 @@ describe('directive retirement — owner abandonment never discards known live w
     const repo = makeFixtureRepo('abandon-debt');
     cleanupRepos.push(repo);
     const h = await boot();
-    const { row } = await historicalLiveRequest(h, repo, 'job-debt', 'req-debt');
+    await historicalLiveRequest(h, repo, 'job-debt', 'req-debt');
     surfaceDirectiveRecovery({ ledger: h.ledger, notifications: h.notifications }, 'req-debt', 'restart interrupted the writer');
     const debt = h.ledger.recoveryObligation('job-debt', 'directive', 'req-debt')!;
     const card = (requestId: string) => h.ledger.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
