@@ -215,6 +215,17 @@ describe('dream distiller protocol (one Bob pass)', () => {
     expect(prompt).toContain('Chapters are capped at 4096 bytes');
     expect(prompt).toContain('1024 bytes');
     expect(prompt).toContain('mergeInto');
+    // Scope: only what this pass adds or merges. A 2026-10-26 pass returned
+    // the whole book, so 27 unchanged lessons carried empty provenance and
+    // the parser refused the file.
+    expect(prompt).toContain('return ONLY the lessons this pass adds or merges');
+    expect(prompt).toContain('a lesson that needs no change is left out');
+    expect(prompt).toContain('Do not return the whole book; the host keeps every existing');
+    // Provenance is this batch's, never the existing lesson's.
+    expect(prompt).toContain('every lesson in the output cites at least one journal id');
+    expect(prompt).toContain("from this batch — never an existing lesson's provenance");
+    // The retired permissive sentence let an unchanged lesson ride along.
+    expect(prompt).not.toContain('Every new lesson cites at least one journal id');
   });
 
   it('parses a valid update and rejects invented provenance / malformed shapes', () => {
