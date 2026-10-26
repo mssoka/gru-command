@@ -32,6 +32,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
     const stage = stagePackage();
     expect(existsSync(join(stage, 'docs/INTAKE.md'))).toBe(true);
     expect(existsSync(join(stage, 'resources/gc-workflows/skills/gc-build/intake.md'))).toBe(true);
+    expect(existsSync(join(stage, 'resources/gc-workflows/skills/briefing-review/lenses.md'))).toBe(true);
     rmSync(join(stage, 'resources/bmad-runtime'), { recursive: true, force: true });
     const root = temp();
     const repo = join(root, 'workspace', 'app');
@@ -105,7 +106,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
     writeFileSync(contextFile, JSON.stringify(context));
     const env = { HOME: home, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` };
     const verify = execFileSync(process.execPath, [join(stage, 'dist/cli/workflow-runtime.js'), 'verify', stage], { cwd: stage, env, encoding: 'utf-8' });
-    expect(verify).toContain('GC workflow gru-command-workflows@3 verified');
+    expect(verify).toContain('GC workflow gru-command-workflows@4 verified');
     const snapshots = new Set<string>();
     for (const route of ['normal', 'small-change']) {
       const result = JSON.parse(execFileSync(process.execPath, [join(stage, 'dist/cli/workflow-runtime.js'), 'render',
@@ -113,7 +114,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
         runtimeId: string; entrypoint: string; snapshotDir: string; contextFile: string;
       };
       snapshots.add(result.snapshotDir);
-      expect(result.runtimeId).toBe('gru-command-workflows@3');
+      expect(result.runtimeId).toBe('gru-command-workflows@4');
       expect(result.snapshotDir.startsWith(context.artifactRoot)).toBe(true);
       const source = readFileSync(result.entrypoint, 'utf-8');
       expect(source).toContain(context.jobId);
@@ -126,11 +127,17 @@ describe('GC-owned workflows in the actual distributable layout', () => {
         expect(text, name).not.toContain(repoRoot);
       }
       expect(readFileSync(join(result.snapshotDir, 'skills/gc-build/review.md'), 'utf-8')).toContain('actual run/session/pane identity');
+      // Nefario's lens helper rides the same snapshot: GC-owned method text,
+      // integrity-pinned, with no scrubbed tokens of its own.
+      const lenses = readFileSync(join(result.snapshotDir, 'skills/briefing-review/lenses.md'), 'utf-8');
+      expect(lenses).toContain('## Lens: stranger');
+      expect(lenses).not.toMatch(/\[\[gc-resource:|\{\{context\.|_bmad|bmad-build|bmad-review/u);
+      expect(lenses).not.toContain(repoRoot);
     }
     expect(snapshots.size).toBe(1);
     expect(git(lane, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
     const record = JSON.parse(readFileSync(join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json'), 'utf-8')) as { runtime_id: string; runtime_dir: string };
-    expect(record.runtime_id).toBe('gru-command-workflows@3');
+    expect(record.runtime_id).toBe('gru-command-workflows@4');
     expect(record.runtime_dir.startsWith(store)).toBe(true);
     for (const root of [home, workspace, repo, lane]) {
       for (const path of ['_bmad', '.agents/skills/bmad-build', '.claude/skills/bmad-build']) expect(existsSync(join(root, path))).toBe(false);

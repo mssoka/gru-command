@@ -120,6 +120,28 @@ describe('progressive-disclosure injection', () => {
     expect(omitted).toContain('commit your work to the branch');
   });
 
+  it('renders a read-only planning review for a Nefario lens job, with the read-only order as the last word', () => {
+    const base = {
+      jobId: 'briefing-review-j1-stranger',
+      repoName: 'repo',
+      branch: 'gru/briefing-review-j1-stranger',
+      worktreePath: '/tmp/wt',
+      sha: 'abc123',
+      briefing: 'review this briefing',
+    } as const;
+    const lens = renderMinionBriefing({ ...base, deliverable: 'investigation', readOnly: true });
+    // The read-only orders replace the generic investigation order to commit
+    // work to the branch — that order is never the last word on a lens job.
+    expect(lens).toContain('READ-ONLY');
+    expect(lens).toContain('push nothing, open no pull request and implement nothing');
+    expect(lens).not.toContain('commit your work to the branch');
+    expect(lens).not.toContain('do not open a');
+    // The generic investigation orders are unchanged when the flag is absent.
+    const investigation = renderMinionBriefing({ ...base, deliverable: 'investigation' });
+    expect(investigation).not.toContain('READ-ONLY');
+    expect(investigation).toContain('commit your work to the branch');
+  });
+
   it('tells a child-capable minion to name its own job as each reviewer\'s parent', () => {
     const briefing = renderMinionBriefing({
       jobId: 'impl-42',
