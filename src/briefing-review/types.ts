@@ -175,7 +175,10 @@ export function tierRank(tier: BriefingReviewTier): number {
 export function tierEnforcedAt(tier: BriefingReviewTier, stage: BriefingReviewStage): boolean {
   if (stage === 1) return false;
   if (stage === 2) return tier === 'high';
-  if (stage === 3 || stage === 'auto') return tier === 'high' || tier === 'medium';
+  if (stage === 3) return tier === 'high' || tier === 'medium';
+  // Auto follows the tier ladder: every non-low tier is enforced, so a tier
+  // added later is covered without a config edit. Stage 3 pins today's set.
+  if (stage === 'auto') return tier !== 'low';
   throw new Error(`unhandled briefing review stage ${String(stage)}`);
 }
 

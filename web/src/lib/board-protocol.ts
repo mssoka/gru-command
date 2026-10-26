@@ -637,8 +637,8 @@ export interface RepoOverviewView {
   readonly rows: readonly RepoOverviewRowView[];
 }
 
-/** The rollout stages the server can send (mirrors `BRIEFING_REVIEW_STAGES`
- * through the engine's 1→advisory / 2→high mapping). */
+/** The effective enforcement the server can send: 1→advisory, 2→high,
+ * 3/auto→high+medium. */
 export const BRIEFING_REVIEW_STAGE_NAMES = ['advisory', 'high', 'high+medium'] as const;
 
 export type BriefingReviewStageName = (typeof BRIEFING_REVIEW_STAGE_NAMES)[number];

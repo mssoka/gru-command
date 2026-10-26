@@ -1178,6 +1178,8 @@ describe('board engine — Nefario briefing-review wiring (GH-505)', () => {
       expect(stageThree.snapshot().briefingReview).toMatchObject({ stage: 'high+medium' });
       const stageAuto = new BoardEngine({ ledger, bus, briefingReview: counts, briefingReviewStage: 'auto' });
       expect(stageAuto.snapshot().briefingReview).toMatchObject({ stage: 'high+medium' });
+      const stageDefault = new BoardEngine({ ledger, bus, briefingReview: counts });
+      expect(stageDefault.snapshot().briefingReview).toMatchObject({ stage: 'high+medium' });
       // No wiring (a build without the review): the field is still present,
       // as null, so an old client never reads a missing block as "all clear".
       expect(new BoardEngine({ ledger, bus }).snapshot().briefingReview).toBeNull();

@@ -18,6 +18,7 @@ import {
   lensJobId,
   reviewedBriefing,
   type BriefingReviewFinding,
+  type BriefingReviewStage,
   type BriefingReviewTier,
 } from '../src/briefing-review/types.js';
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
@@ -62,7 +63,7 @@ interface Harness {
 
 function harness(options: {
   readonly enabled?: boolean;
-  readonly stage?: 1 | 2 | 3;
+  readonly stage?: BriefingReviewStage;
   readonly failOnce?: string;
   readonly workflow?: BriefingReviewServiceOptions['workflow'];
 } = {}): Harness {
@@ -747,6 +748,43 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
       repoPath: s2.repo.path,
       title: 'Refunds endpoint',
       briefing: revised,
+      requested: undefined,
+    })).toBeNull();
+  });
+
+  it('the shipped auto stage enforces every non-low tier and leaves low advisory', async () => {
+    const medium = harness({ stage: 'auto' });
+    await medium.service.commission(commission(medium, { tier: 'medium' }));
+    expect(() => medium.service.admitDispatch({
+      jobId: 'job-auto-medium',
+      repoPath: medium.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: undefined,
+    })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
+    medium.service.submitResult(result(medium, { lens: 'stranger', findings: [blocking()] }));
+    let refusal: unknown;
+    try {
+      medium.service.admitDispatch({
+        jobId: 'job-auto-medium',
+        repoPath: medium.repo.path,
+        title: 'Refunds endpoint',
+        briefing: BRIEFING,
+        requested: undefined,
+      });
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expect((refusal as Error).message).toContain('auto-by-tier');
+
+    const low = harness({ stage: 'auto' });
+    await low.service.commission(commission(low, { tier: 'low' }));
+    expect(low.service.admitDispatch({
+      jobId: 'job-auto-low',
+      repoPath: low.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
       requested: undefined,
     })).toBeNull();
   });

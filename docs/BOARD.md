@@ -113,7 +113,9 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `briefingReview` block: how many briefing reviews are under test, the
   newest live round and tier (`round N · <tier>`, suffixed `· advisory` at
   stage 1), today's verdicts, the blocking findings caught before dispatch,
-  and — at any enforced stage — today's refusals as an alert fact. The card shows
+  and — at any enforced stage — today's refusals as an alert fact. The
+  snapshot's `briefingReview.stage` is `'advisory' | 'high' | 'high+medium'`;
+  there is no compatibility shim for the unshipped `'medium'` spelling. The card shows
   the round's aggregate verdict only, never per-lens chips; a server that
   could not read the events sends `null` and the card renders dashed
   `unavailable`, while an older server sends no block and no card renders.

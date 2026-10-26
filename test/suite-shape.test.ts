@@ -193,7 +193,7 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
-  'briefing-review.test.ts': 25,
+  'briefing-review.test.ts': 26,
   'briefing-review-board.test.ts': 4,
   'briefing-review-server.test.ts': 6,
   'blind-input-dispatch.test.ts': 24,
@@ -227,7 +227,7 @@ const PINS: Record<string, number> = {
   'claude-review-isolation.test.ts': 4,
   'config-env-service.test.ts': 2,
   'config-env.test.ts': 25,
-  'config-generate.test.ts': 26,
+  'config-generate.test.ts': 27,
   'config.test.ts': 88,
   'decisions-backtest.test.ts': 20,
   'decisions-cli.test.ts': 8,

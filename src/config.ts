@@ -9,7 +9,7 @@ import { DECISION_SURFACES } from './decisions/questions.js';
 import { displayManagedRepoName, managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 import { SILAS_AUTOPILOT_RULE_IDS } from './dispatch/silas-rules.js';
-import { type BriefingReviewStage } from './briefing-review/types.js';
+import { BRIEFING_REVIEW_STAGES, type BriefingReviewStage } from './briefing-review/types.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -1934,7 +1934,7 @@ export function loadConfig(
         }
       }
       const stage = table['stage'];
-      const validStage = stage === 'auto' || (typeof stage === 'number' && [1, 2, 3].includes(stage));
+      const validStage = (BRIEFING_REVIEW_STAGES as readonly unknown[]).includes(stage);
       if (stage !== undefined && !validStage) {
         throw new ConfigError(
           `briefing_review.stage must be "auto", 1, 2 or 3 (auto follows the tier: high + medium enforced, low advisory; 1 = record only, 2 = high only, 3 = high + medium), got: ${JSON.stringify(stage)}`,

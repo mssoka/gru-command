@@ -8,6 +8,7 @@ import {
 } from '../src/briefing-review/board.js';
 import type { ArmedReview, BriefingReviewLedgerPort, LensVerdictEvent, RefusalEvent } from '../src/briefing-review/events.js';
 import type { EventRecord } from '../src/ledger/api.js';
+import { tierEnforcedAt } from '../src/briefing-review/types.js';
 
 /**
  * Nefario on the cockpit (GH-505): the pure count derivation, its day window
@@ -125,7 +126,9 @@ describe('Nefario board view — the pure derivation', () => {
     expect(briefingReviewBoardView({ counts: decided, stage: 2 })).toMatchObject({ stage: 'high' });
     expect(briefingReviewBoardView({ counts: decided, stage: 3 })).toMatchObject({ stage: 'high+medium' });
     expect(briefingReviewBoardView({ counts: decided, stage: 'auto' })).toMatchObject({ stage: 'high+medium' });
-    
+    // The explicit stage arms are exhaustive; an out-of-union value fails loud.
+    expect(() => briefingReviewBoardView({ counts: empty, stage: 'bogus' as never })).toThrow(/unhandled/);
+    expect(() => tierEnforcedAt('high', 'bogus' as never)).toThrow(/unhandled/);
     expect(briefingReviewBoardView({ counts: null, stage: 2 })).toBeNull();
     expect(EMPTY_BRIEFING_REVIEW_COUNTS).toEqual({ armed: 0, round: null, tier: null, verdictsToday: 0, caught: 0, refusalsToday: 0 });
   });

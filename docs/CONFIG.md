@@ -969,7 +969,7 @@ largest lanes and how much of the disk is not GC's. The row closes itself once
 the condition clears. `0` turns the budget or the floor off; the board's disk
 row and `GET /api/disk` still show the numbers.
 
-### Nefario's briefing review: stage 1, 2 or 3
+### Nefario's briefing review: stage auto, 1, 2 or 3
 
 `[briefing_review]` configures Nefario, the pre-dispatch review of a heist
 briefing ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)). Two keys:
@@ -987,8 +987,10 @@ briefing ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)). Two keys:
   has no `READY` review and no recorded push-back, before any job row exists.
   Stage 3 forces high and medium enforcement. Low stays advisory at every stage.
 
-The default is **`stage = "auto"`**: enforcement follows the tier; high and
-medium are held, low is advisory. Set `stage = 1` (advisory), `2` (high only)
+The default is **`stage = "auto"`**: enforcement follows the tier; every
+non-low tier is held (today high and medium), and low is advisory. Auto is
+forward-looking: a tier added later is enforced without a config edit; stage 3
+pins today's high + medium set. Set `stage = 1` (advisory), `2` (high only)
 or `3` (force high + medium) to override it. Promotion is a config change, not
 a code change. Before a flip, in-flight reviews at the newly enforced tier are
 revised or pushed back.

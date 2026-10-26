@@ -168,8 +168,9 @@ worktree or spawn**, with 409 `briefing_review_pending` (no verdict yet),
 `briefing_review_not_ready` (CHANGES-NEEDED) or `briefing_review_required` (an
 older round covers the chain but not this sha), plus one
 `briefing.review-refused` event. **Stage 3 and the default `stage = "auto"`**
-enforce medium as well as high; `auto` follows the tier, while 3 is an explicit
-override. Low stays advisory at every stage, and a heist with no armed review is
+enforce medium as well as high; `auto` enforces every non-low tier (so a tier
+added later is covered without a config edit), while 3 pins today's high +
+medium set. Low stays advisory at every stage, and a heist with no armed review is
 admitted — the server cannot infer an undeclared tier, so the role canon carries
 that obligation.
 
@@ -219,10 +220,16 @@ ruling.
 
 The cockpit's **NEFARIO** card (`docs/BOARD.md`) shows how many reviews are
 under test, the newest live round and tier (suffixed `· advisory` at stage 1),
-today's verdicts, the findings caught before dispatch, and — at any enforced
-stage — the refusals. A server that cannot read the events sends `briefingReview: null`
+today's verdicts, the findings caught before dispatch, and — at any
+enforced stage — the refusals. A server that cannot read the events sends
+`briefingReview: null`
 (dashed `unavailable` card); an older server sends no block at all (no card).
 There are no per-lens chips.
+
+The snapshot's `briefingReview.stage` is `'advisory' | 'high' | 'high+medium'`:
+stage 1, stage 2, and auto/stage 3 respectively. This is the first Nefario
+service, so there is no compatibility shim for the unshipped `'medium'`
+spelling.
 
 ## Refusal vocabulary
 

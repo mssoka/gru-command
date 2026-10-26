@@ -13,7 +13,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { BriefingReviewService } from '../src/briefing-review/service.js';
 import { BRIEFING_REVIEW_ARMED, BRIEFING_REVIEW_DISPATCHED, BRIEFING_REVIEW_REFUSED, readArmed } from '../src/briefing-review/events.js';
-import { lensJobId } from '../src/briefing-review/types.js';
+import { lensJobId, type BriefingReviewStage } from '../src/briefing-review/types.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -47,14 +47,16 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(options: { stage?: 1 | 2 | 3; disabled?: boolean; hosted?: boolean; defaults?: boolean } = {}): Promise<Harness> {
+async function boot(options: { stage?: BriefingReviewStage; disabled?: boolean; hosted?: boolean; defaults?: boolean } = {}): Promise<Harness> {
   const repo = makeFixtureRepo('refunds-api');
   cleanups.push(() => repo.cleanup());
   const dir = mkdtempSync(join(tmpdir(), 'gru-briefing-review-http-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const selectedStage = options.stage ?? 1;
+  const stageLiteral = typeof selectedStage === 'string' ? `"${selectedStage}"` : String(selectedStage);
   const reviewTable = options.defaults === true
     ? ''
-    : `[briefing_review]\nenabled = ${String(!(options.disabled ?? false))}\nstage = ${String(options.stage ?? 1)}\n`;
+    : `[briefing_review]\nenabled = ${String(!(options.disabled ?? false))}\nstage = ${stageLiteral}\n`;
   writeFileSync(
     join(dir, 'config.toml'),
     `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n${reviewTable}`,
