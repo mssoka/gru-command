@@ -605,6 +605,15 @@ path's own leaf must be the job's recorded repository (dispatch derived it so,
 a symlinked path included) and the path must resolve to the repository the
 manager inspects; the continuation dispatches through that same path.
 
+A continuation never consults the briefing-review gate (GH-505): the gate
+admits or refuses a dispatch *before* any job row exists, and the job a
+continuation reuses was created by a dispatch that already passed it under
+the policy of that moment — the job's existence is the admission proof.
+Re-asking could only strand retained creations whose review policy changed
+or predated the gate. A fresh dispatch of the same briefing is still gated,
+and the continuation itself is gated by the retained receipt, not by review
+policy.
+
 Every job branch creation, ordinary dispatch included, journals one
 `job.creation-producer-settled` event per receipt token when its Git child's
 own `close` shows that the child exited and every holder released its pipes

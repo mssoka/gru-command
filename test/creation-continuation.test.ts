@@ -4,6 +4,8 @@ import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { CreationContinuationConflictError, RecordNotFound } from '../src/ledger/api.js';
 import type { DispatchService } from '../src/dispatch/service.js';
+import type { BriefingReviewService } from '../src/briefing-review/service.js';
+import { BriefingReviewError } from '../src/briefing-review/types.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { writeCreationIntent } from '../src/worktrees/creation-intent.js';
@@ -55,6 +57,49 @@ describe('same-job retained initial-creation continuation', () => {
       expect(await get(query), query).toMatchObject({ status: 400, body: { error: 'bad_request' } });
     }
     expect(readContinuation).toHaveBeenCalledTimes(2);
+  });
+
+  it('never consults the briefing-review gate: the continued job\'s own dispatch already passed it (#501)', async () => {
+    const admitDispatch = vi.fn((): never => {
+      throw new BriefingReviewError('briefing_review_required', 'an enforced-tier briefing must be reviewed before dispatch', 400);
+    });
+    const requestContinuation = vi.fn(async () => ({ created: true, readback: { job_id: 'gate-job', request_id: 'gate-request', state: 'accepted' } }));
+    const dispatch = {
+      requestCreationContinuation: requestContinuation,
+      getCreationContinuationReadback: vi.fn(() => null),
+    } as unknown as DispatchService;
+    const base = await routeHarness(dispatch, { briefingReview: { admitDispatch } as unknown as BriefingReviewService });
+    // A fresh dispatch of this briefing is refused by the enforced gate …
+    const fresh = await fetch(`${base}/api/dispatch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ job_id: 'gate-job', repo_path: '/tmp/gate-repo', title: 'Gate', briefing: 'Original briefing gate-job' }),
+    });
+    expect(fresh.status).toBe(400);
+    expect(await fresh.json() as Record<string, unknown>).toMatchObject({ error: 'briefing_review_required' });
+    expect(admitDispatch).toHaveBeenCalledTimes(1);
+    // … while the continuation of the job that dispatch created passes
+    // without asking the gate: the job's existence is its admission proof.
+    const response = await request(base, 'POST', { job_id: 'gate-job', request_id: 'gate-request' });
+    expect(response.status).toBe(202);
+    expect(requestContinuation).toHaveBeenCalledWith({ jobId: 'gate-job', requestId: 'gate-request' });
+    expect(admitDispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an unsafe GET identifier by name instead of reaching the ledger (#501)', async () => {
+    const readContinuation = vi.fn(() => null);
+    const dispatch = {
+      requestCreationContinuation: vi.fn(),
+      getCreationContinuationReadback: readContinuation,
+    } as unknown as DispatchService;
+    const base = await routeHarness(dispatch);
+    const get = async (query: string) => {
+      const response = await fetch(`${base}/api/dispatch/creation-continuation${query}`, { headers: { authorization: `Bearer ${TOKEN}` } });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    expect(await get('?job_id=bad job&request_id=gate-request')).toMatchObject({ status: 400, body: { error: 'bad_request', detail: 'job id must be a safe 128-character record identifier' } });
+    expect(await get('?job_id=gate-job&request_id=bad/request')).toMatchObject({ status: 400, body: { error: 'bad_request', detail: 'request id must be a safe 128-character record identifier' } });
+    expect(readContinuation).not.toHaveBeenCalled();
   });
 
   it('adopts the exact receipt-owned branch/base/provenance and delivers the original job once through authenticated API', async () => {

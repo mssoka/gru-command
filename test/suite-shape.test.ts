@@ -230,7 +230,7 @@ const PINS: Record<string, number> = {
   'config-generate.test.ts': 27,
   'config.test.ts': 88,
   'creation-continuation-custody.test.ts': 34,
-  'creation-continuation.test.ts': 14,
+  'creation-continuation.test.ts': 16,
   'decisions-backtest.test.ts': 20,
   'decisions-cli.test.ts': 8,
   'decisions-deadline.test.ts': 28,

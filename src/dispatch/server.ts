@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, CreationContinuationConflictError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, CreationContinuationConflictError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound, requireSafeRecordId } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -566,6 +566,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const requestIds = query.getAll('request_id');
       if (jobIds.length !== 1 || requestIds.length !== 1 || !jobIds[0] || !requestIds[0]) {
         json(res, 400, { error: 'bad_request', detail: 'GET creation continuation requires job_id and request_id' });
+        return true;
+      }
+      try {
+        requireSafeRecordId(jobIds[0], 'job id');
+        requireSafeRecordId(requestIds[0], 'request id');
+      } catch (error) {
+        json(res, 400, { error: 'bad_request', detail: error instanceof Error ? error.message : String(error) });
         return true;
       }
       const readback = options.dispatch.getCreationContinuationReadback(jobIds[0], requestIds[0]);

@@ -12,6 +12,7 @@ import { LedgerDb } from '../../src/ledger/db.js';
 import { loadConfig } from '../../src/config.js';
 import { DispatchService, type DispatchServiceOptions } from '../../src/dispatch/service.js';
 import { createDispatchServer } from '../../src/dispatch/server.js';
+import type { BriefingReviewService } from '../../src/briefing-review/service.js';
 import type { WaveRunner } from '../../src/dispatch/perkins.js';
 import type { AgentHandle } from '../../src/runtime/types.js';
 import type { LogLevel } from '../../src/logger.js';
@@ -235,12 +236,13 @@ export async function httpHarness(h: HarnessSource, options: HarnessOptions = {}
 }
 
 /** A route-only server over a stand-in dispatch service. */
-export async function routeHarness(dispatch: DispatchService) {
+export async function routeHarness(dispatch: DispatchService, options: { readonly briefingReview?: BriefingReviewService } = {}) {
   const configDir = directory();
   writeFileSync(join(configDir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf8');
   const config = loadConfig({ GRU_COMMAND_HOME: configDir }, '/home/tester');
   const ledger = new LedgerApi(trackedDb().handle, { bus: new EventBus() });
-  const api = createDispatchServer({ config, dispatch, wave: {} as WaveRunner, ledger, pendingProducerBlockers: () => [] });
+  const api = createDispatchServer({ config, dispatch, wave: {} as WaveRunner, ledger, pendingProducerBlockers: () => [],
+    ...(options.briefingReview === undefined ? {} : { briefingReview: options.briefingReview }) });
   const server = createServer((req, res) => {
     const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
     if (!api.requestHook(req, res, path)) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); }
