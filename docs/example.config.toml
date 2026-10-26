@@ -82,15 +82,16 @@ restart_backoff_ms = 2000
 # FIFO admission caps for minion and Perkins review turns (queued waits are
 # carried in the board snapshot data; live turns are never preempted) plus
 # bounded automatic retry for the provider rate-limit error class (HTTP 429,
-# "rate limit"/"too many requests"/throttling). Every automatic retry is
-# recorded as a pacing.auto-retry ledger event; non-rate-limit failures and an
-# exhausted budget still stop to the supervisor ladder + Gru's machine queue. Ledger
-# vocabulary: pacing.queued, pacing.admitted, pacing.wait-cancelled,
-# pacing.queued-rollback, pacing.auto-retry, pacing.auto-retry-recovered,
-# pacing.auto-retry-exhausted. max_auto_retries = 0 disables automatic retry
-# (admission caps stay active). Enabled by default with unlimited admission
-# caps. Provider-agnostic: signatures match error text, never a provider brand
-# baked into code.
+# "rate limit"/"too many requests"/throttling, and the rate_limit token, so
+# Claude Code's statusless "high load" off-switch is retried too). Every
+# automatic retry is recorded as a pacing.auto-retry ledger event;
+# non-rate-limit failures and an exhausted budget still stop to the supervisor
+# ladder + Gru's machine queue. Ledger vocabulary: pacing.queued,
+# pacing.admitted, pacing.wait-cancelled, pacing.queued-rollback,
+# pacing.auto-retry, pacing.auto-retry-recovered, pacing.auto-retry-exhausted.
+# max_auto_retries = 0 disables automatic retry (admission caps stay active).
+# Enabled by default with unlimited admission caps. Provider-agnostic:
+# signatures match error text, never a provider brand baked into code.
 # Caps count MINION and Perkins review turns only: silas/bob/distiller/chat
 # core turns are outside this pool (the board view is not a provider-wide count).
 # max_concurrent_minions = 3

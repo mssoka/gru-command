@@ -354,8 +354,10 @@ restart_backoff_ms = 2000
 # Provider pacing: FIFO admission caps for minion and Perkins review
 # turns (queued waits are carried in the board snapshot data; live turns are never preempted),
 # plus bounded automatic retry for the rate-limit error class
-# (HTTP 429, "rate limit", "too many requests", throttling). Every
-# automatic retry is recorded as a pacing.auto-retry ledger event.
+# (HTTP 429, "rate limit", "too many requests", throttling and the
+# rate_limit token, so Claude Code's statusless "high load" off-switch
+# is retried too). Every automatic retry is recorded as a
+# pacing.auto-retry ledger event.
 # Full ledger vocabulary: pacing.queued, pacing.admitted,
 # pacing.wait-cancelled, pacing.queued-rollback, pacing.auto-retry,
 # pacing.auto-retry-recovered, pacing.auto-retry-exhausted.

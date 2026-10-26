@@ -30,7 +30,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
-import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { MAX_PACING_ERROR_CHARS, PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
@@ -388,6 +388,17 @@ function rateLimitPolicy(overrides: Partial<RateLimitBackoffPolicy> = {}): RateL
 /** Emit an adapter-style in-band failure event for the handle. */
 function emitFailure(handle: FakeHandle, text: string): void {
   handle.emit({ type: 'error', error: text, fatal: false });
+}
+
+/** A live native directive turn for `agentId`, on its own working job. */
+function directiveTurn(h: Harness, agentId: string): PendingTurn {
+  const jobId = `job-${agentId}`;
+  h.api.addJob({ id: jobId, repo: 'fixture', title: jobId }); h.api.setJobStatus(jobId, 'working');
+  h.api.registerAgent({ id: agentId, role: 'minion', jobId });
+  const request = h.api.beginDirectiveIntent({ jobId, requestId: `request-${agentId}`, directive: 'repair the lane', holder: 'gru' }).record;
+  return { text: 'repair the lane', owner: `silas-directive:${request.requestId}`, directive: {
+    identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+  } };
 }
 
 /** Hang a handle: open a turn, go streaming, then let silence accrue. */
@@ -3382,6 +3393,153 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.supervisor.onNotificationDisposed(incident!.id);
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
+  });
+
+  it('a wall stays a wall on a directive turn, tagged or not, when typed or fatal; untagged, GC\'s refusal walls only in its old wording (#485)', async () => {
+    const providerAuth = 'HTTP 401 provider rejection: invalid x-api-key';
+    const oldRefusal = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work is authorized';
+    const refusal = 'DirectiveCheckpointError: directive authority is terminal, held or superseded — no work may proceed';
+    for (const { id, error, typed, tagged, fatal, walls } of [
+      { id: 'provider-auth', error: providerAuth, typed: true, tagged: false, fatal: false, walls: true },
+      // A typed provider response is never GC's refusal, whatever its tag says.
+      { id: 'provider-auth-tagged', error: providerAuth, typed: true, tagged: true, fatal: false, walls: true },
+      // A fatal error is never skipped as a refusal, tag or not.
+      { id: 'fatal-tagged', error: oldRefusal, typed: false, tagged: true, fatal: true, walls: true },
+      // Untagged, the old wording walled by itself: why GC's own text changed.
+      { id: 'old-refusal-untagged', error: oldRefusal, typed: false, tagged: false, fatal: false, walls: true },
+      { id: 'refusal-untagged', error: refusal, typed: false, tagged: false, fatal: false, walls: false },
+    ] as const) {
+      const h = boot();
+      try {
+        const handle = new FakeHandle('minion', id, null);
+        handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+        h.registry.adopt(handle);
+        const spawns = h.registry.spawnCalls.length;
+        handle.emit({ type: 'error', error, fatal, ...(tagged ? { nativeControl: 'directive-refusal' as const } : {}), ...(typed ? {
+          provider: 'synthetic-provider', model: 'synthetic-model', typed: { origin: 'provider-message' as const, status: 401 },
+        } : {}) });
+        if (walls) {
+          await vi.waitFor(() => expect(handle.disposed, id).toBe(true));
+          expect(h.supervisor.viewFor(id), id).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall', restarts: 0 });
+          expect(h.notificationsOfKind(`supervision.provider-wall.${id}.authentication_wall`), id).toHaveLength(1);
+        } else {
+          for (let i = 0; i < 16; i += 1) await Promise.resolve();
+          expect(handle.disposed, id).toBe(false);
+          expect(h.supervisor.viewFor(id), id).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+          expect(h.api.listNotifications({ limit: 100 }).some((row) => row.kind.includes('provider-wall')), id).toBe(false);
+        }
+        expect(h.registry.spawnCalls, id).toHaveLength(spawns);
+        expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained'), id).toBe(false);
+      } finally { h.dispose(); }
+    }
+  });
+
+  it('a tagged refusal on a directive turn skips pacing and the decision service, and leaves a bounded, marked durable trace (#485)', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) =>
+      deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    const sleeper = new ManualSleeper();
+    const h = boot({ decide } as unknown as DecisionService, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-native-refusal', null);
+      handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+      h.registry.adopt(handle);
+      // Rate-limit-looking text: routed, it would start the automatic retry. The
+      // bound falls inside an emoji's surrogate pair: the cut keeps whole code points.
+      const head = 'DirectiveCheckpointError: 429 rate limit — directive authority is terminal, held or superseded — no work may proceed; ';
+      const error = `${head.padEnd(MAX_PACING_ERROR_CHARS - 1, 'x')}😀${'detail '.repeat(10)}`;
+      handle.emit({ type: 'error', error, fatal: false, nativeControl: 'directive-refusal' });
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+      expect(sleeper.delays).toEqual([]);
+      expect(decide).not.toHaveBeenCalled();
+      const events = h.api.listEvents({ limit: 100 });
+      expect(events.some((event) => event.kind.startsWith('pacing.') || event.kind === 'supervision.guidance')).toBe(false);
+      expect(error.length).toBeGreaterThan(MAX_PACING_ERROR_CHARS);
+      expect(events.filter((event) => event.kind === 'supervision.native-refusal-retained')).toEqual([
+        expect.objectContaining({ agentId: handle.id, jobId: `job-${handle.id}`,
+          payload: { error: error.slice(0, MAX_PACING_ERROR_CHARS - 1), error_truncated: true, error_length: error.length } }),
+      ]);
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, restarts: 0 });
+      expect(handle.disposed).toBe(false);
+      expect(handle.promptCalls).toHaveLength(0);
+      // The same text untagged is routed: the automatic retry is scheduled.
+      handle.emit({ type: 'error', error, fatal: false });
+      expect(sleeper.delays).toEqual([100]);
+    } finally { h.dispose(); }
+  });
+
+  it('a tagged refusal whose pending turn cannot be read is logged loud and routed as an ordinary failure (#485)', async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const h = boot(undefined, { log: (level, msg) => logs.push({ level, msg }) });
+    try {
+      const handle = new FakeHandle('minion', 'minion-unreadable-turn', null);
+      handle.pendingTurnSnapshot = directiveTurn(h, handle.id);
+      Object.defineProperty(handle, 'pendingTurn', { value: () => { throw new Error('pending turn unreadable'); } });
+      h.registry.adopt(handle);
+      // Routed, GC's refusal text with the disk's words walls: the fallback is visible.
+      handle.emit({ type: 'error', error: 'directive refused: directive bookkeeping failed: transcript write: EDQUOT: disk quota exceeded', fatal: false, nativeControl: 'directive-refusal' });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' });
+      expect(logs).toContainEqual({ level: 'warn', msg: 'pending-turn read failed — a native directive refusal is routed as an ordinary failure' });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
+    } finally { h.dispose(); }
+  });
+
+  it('Claude Code\'s statusless typed rate_limit reaches the bounded retry before any wall; as a quota-class text it walls with no pacing policy or once its budget is spent (#485)', async () => {
+    // 2.1.309's client-side capacity off-switch, as GC's adapter words it.
+    const error = 'Opus is experiencing high load. Switch to Sonnet. (rate_limit)';
+    const event = { type: 'error' as const, error, fatal: false, provider: 'anthropic-claude-native', model: 'claude-opus-5-5',
+      typed: { origin: 'provider-message' as const, bodyCode: 'rate_limit' } };
+    const sleeper = new ManualSleeper();
+    const paced = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-paced', null);
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-capacity' };
+      paced.registry.adopt(handle);
+      handle.emit(event);
+      expect(sleeper.delays).toEqual([100]);
+      expect(paced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(handle.disposed).toBe(false);
+    } finally { paced.dispose(); }
+    const spentSleeper = new ManualSleeper();
+    const spent = boot(undefined, { rateLimitBackoff: rateLimitPolicy({ maxRetries: 1 }), sleep: spentSleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-spent', null);
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-capacity' };
+      handle.promptHook = () => { handle.emit(event); };
+      spent.registry.adopt(handle);
+      handle.emit(event);
+      expect(spentSleeper.delays).toEqual([100]);
+      await spentSleeper.release(); // the one retry meets the off-switch again: the budget is spent
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(handle.promptCalls).toHaveLength(1);
+      expect(spent.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+    } finally { spent.dispose(); }
+    const unpaced = boot();
+    try {
+      const handle = new FakeHandle('minion', 'minion-capacity-unpaced', null);
+      unpaced.registry.adopt(handle);
+      handle.emit(event);
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(unpaced.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+    } finally { unpaced.dispose(); }
+  });
+
+  it('a refusal tag on a turn that carries no directive is logged loud and routed as an ordinary failure (#485)', async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0,
+      log: (level, msg) => logs.push({ level, msg }) });
+    try {
+      h.api.addJob({ id: 'job-dispatch-turn', repo: 'fixture', title: 'job-dispatch-turn' });
+      const handle = new FakeHandle('minion', 'minion-dispatch-turn', null);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-dispatch-turn' });
+      handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-dispatch-turn' };
+      h.registry.adopt(handle);
+      handle.emit({ type: 'error', error: 'DirectiveCheckpointError: 429 rate limit — no work may proceed', fatal: false, nativeControl: 'directive-refusal' });
+      expect(sleeper.delays).toEqual([100]);
+      expect(logs).toContainEqual({ level: 'warn', msg: 'native directive refusal tag on a turn that carries no directive; routed as an ordinary failure' });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.native-refusal-retained')).toBe(false);
+    } finally { h.dispose(); }
   });
 
   it('a legacy machine-routed provider-wall row dedupes the new machine stop: one row, Gru disposition re-arms', async () => {
