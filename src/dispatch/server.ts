@@ -2387,18 +2387,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
       const requestId = strictOptStrField(body, 'request_id');
-      // A replay of an already-recorded request answers from its own durable
-      // record — id, state and payload hash — even when the lane has gone
-      // terminal since: the id is consumed and the caller is told what it did.
-      // Only a NEW request is refused on a terminal lane (as the directive
-      // route does; #493 round 3).
-      const replayed = requestId === undefined ? null : options.ledger.getDirective(requestId);
-      if (replayed !== null && replayed.jobId === jobId) {
-        json(res, replayed.state === 'dispatching' || replayed.state === 'admitted' ? 202 : 200,
-          { request_id: replayed.requestId, job_id: jobId, state: directiveStateName(replayed), payload_hash: replayed.payloadHash, replay: true });
-        return true;
-      }
-      if (isJobTerminal(job.status)) {
+      // A replay of an already-recorded request must still answer from its own
+      // durable record after the lane goes terminal — the id is consumed, and
+      // the caller is told what it did. Only a NEW request is refused on a
+      // terminal lane (as the directive route does; #493 round 3). The intent
+      // call below still arbitrates replay vs changed payload, so this can
+      // never launder a conflicting body into a 202.
+      const existing = requestId === undefined ? null : options.ledger.getDirective(requestId);
+      const replayedRequest = existing !== null && existing.jobId === jobId;
+      if (isJobTerminal(job.status) && !replayedRequest) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
       if (requestId === undefined || options.ledger.getDirective(requestId) === null) {
