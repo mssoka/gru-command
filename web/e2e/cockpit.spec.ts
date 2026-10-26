@@ -69,6 +69,9 @@ interface Slots {
   children: { active: number; queued: number; finished: number; lifetimeCreations: number } | null;
   /** #351 raids block; null = absent (an older server: no raids card). */
   vector: Record<string, unknown> | null;
+  /** GH-505 Nefario block; 'absent' = an older server sends none (no card),
+   * null = the server could not read it (dashed unavailable card). */
+  briefingReview: Record<string, unknown> | null | 'absent';
   long: boolean;
 }
 
@@ -77,7 +80,7 @@ const DEFAULT_SLOTS: Slots = {
   conflicting: 0, total: 1, liveMinions: 1, midTurn: 0, disposed: 1, failedToday: 0,
   active: 0, queued: 0, orphaned: 0, behind: 0, unacked: 0, wakes: 0, pending: 1,
   gruWakeAgeMs: null, silasWakeAgeMs: 7_200_000, deferredCount: 0, deferredTruncated: false,
-  children: null, vector: null, long: false,
+  children: null, vector: null, briefingReview: 'absent', long: false,
 };
 
 function slotSpec(overrides: Partial<Slots>): Slots {
@@ -316,6 +319,7 @@ function makeSnapshot(slots: Slots): BoardSnapshot {
     // omits the group (never a claimed zero).
     ...(spec.children !== null ? { children: spec.children } : {}),
     ...(spec.vector !== null ? { vector: spec.vector } : {}),
+    ...(spec.briefingReview === 'absent' ? {} : { briefingReview: spec.briefingReview }),
     ownerPrs: [
       {
         id: 'owner-pr:synthetic',
@@ -529,6 +533,18 @@ const VIEWPORTS: ReadonlyArray<[number, number]> = [
 
 const RAIDS_OFF: Record<string, unknown> = { enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 };
 
+const BRIEFING_REVIEW_ON: Record<string, unknown> = {
+  armed: 2,
+  round: 3,
+  tier: 'high',
+  verdictsToday: 1,
+  caught: 4,
+  refusalsToday: 0,
+  stage: 'advisory',
+};
+
+const BRIEFING_REVIEW_STAGE2: Record<string, unknown> = { ...BRIEFING_REVIEW_ON, refusalsToday: 2, stage: 'high' };
+
 const RAIDS_ON: Record<string, unknown> = {
   enabled: true,
   raidMode: 'proposed',
@@ -681,6 +697,53 @@ test('KPI cards: two columns on a phone, three in the cockpit board column, a ro
   await send(makeSnapshot(familyA(9)));
   await expect(page.locator('#board-kpis .cockpit-card')).toHaveCount(5);
   expect(await columns()).toEqual({ perRow: 5, count: 5, overflow: false, rowFills: true });
+});
+
+test('Nefario: the live pass renders after raids, an absent block renders no card, null renders the dashed unavailable card, and seven cards fill one row at 2400px', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const send = await harness(page, makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_ON }));
+  const nefario = page.locator('.cockpit-card--nefario');
+  await expect(nefario).toBeVisible();
+  // The card shows the aggregate pass only — never per-lens chips.
+  await expect(nefario.locator('.cockpit-card__aside')).toHaveText('round 3 · high · advisory');
+  await expect(nefario.locator('[data-kpi="briefingReview.armed"]')).toHaveText('2');
+  await expect(nefario.locator('[data-kpi="briefingReview.verdictsToday"]')).toHaveText('1');
+  await expect(nefario.locator('[data-kpi="briefingReview.caught"]')).toHaveText('4');
+  // Stage 1 is advisory: it never claims a refusal it does not enforce.
+  await expect(nefario.locator('[data-kpi="briefingReview.refusalsToday"]')).toHaveCount(0);
+  expect(await page.evaluate(() => [...document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')].map((card) => card.dataset.card)))
+    .toEqual(['heists', 'megaminions', 'crew', 'prs', 'reviews', 'raids', 'nefario']);
+  // Stage 2 adds the refusals fact as an alert.
+  await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_STAGE2 }));
+  await expect(nefario.locator('.cockpit-card__aside')).toHaveText('round 3 · high');
+  await expect(nefario.locator('[data-kpi="briefingReview.refusalsToday"]')).toHaveText('2');
+  await expect(nefario.locator('.cockpit-fact--alert [data-kpi="briefingReview.refusalsToday"]')).toHaveCount(1);
+  // An older server sends no block: no card at all (never a card of zeros).
+  await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON }));
+  expect(await page.evaluate(() => ({ count: document.querySelectorAll('#board-kpis .cockpit-card').length, review: Boolean(document.querySelector('.cockpit-card--nefario')) })))
+    .toEqual({ count: 6, review: false });
+  // A block the server could not read is unknown: dashed, never zeros.
+  await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: null }));
+  await expect(nefario).toHaveClass(/cockpit-card--off/u);
+  await expect(nefario.locator('.cockpit-card__big')).toHaveText('—');
+  await expect(nefario.locator('.cockpit-card__unit')).toHaveText('unavailable');
+  await expect(nefario.locator('.cockpit-fact--note')).toHaveText('the server could not read the briefing reviews');
+  // Seven cards still fill ONE row on the wide cockpit board (2400px).
+  await page.setViewportSize({ width: 2400, height: 900 });
+  await send(makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_ON }));
+  await settleTransitions(page);
+  const row = (): Promise<{ perRow: number; count: number; overflow: boolean; rowFills: boolean }> => page.evaluate(() => {
+    const grid = document.querySelector('.cockpit-kpis__grid')!.getBoundingClientRect();
+    const cards = [...document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')].map((card) => card.getBoundingClientRect());
+    const first = cards.filter((box) => Math.abs(box.y - cards[0]!.y) <= 0.5);
+    return {
+      perRow: first.length,
+      count: cards.length,
+      overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      rowFills: Math.abs(first[first.length - 1]!.right - grid.right) <= 1,
+    };
+  });
+  expect(await row()).toEqual({ perRow: 7, count: 7, overflow: false, rowFills: true });
 });
 
 test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({ page }) => {

@@ -69,7 +69,15 @@ this is routing compatibility, not an external BMAD dependency.
 - Planning and review helper entrypoints are also independently resolvable.
 - Intake helpers, read by intake rather than rendered into a lane:
   `skills/gc-build/intake.md` (the planning contract) and, since
-  `gru-command-workflows@3`, `skills/gc-build/slice.md` (#429). The slicing
+  `gru-command-workflows@3`, `skills/gc-build/slice.md` (#429).
+  Since `gru-command-workflows@4`, `skills/briefing-review/lenses.md` is
+  Nefario's lens method (#505): a shared preamble plus one `## Lens:` section
+  per lens (`stranger`, `acceptance`, `verification`, `repo`, `scope`). The
+  briefing review embeds the preamble and the selected section in each
+  read-only lens job and names the package id and file sha256 in the briefing;
+  see [BRIEFING-REVIEW.md](BRIEFING-REVIEW.md). The directory carries no
+  `SKILL.md`, so the manifest's `skills` stays `['gc-build']` and lane skill
+  enumeration is unchanged. The slicing
   helper ports the "Epic into stories" method of BMad's `bmad-ticket`: one
   minion-session slice per step toward the epic's Done when, a tracer bullet
   first, lanes that never touch the same code, one runnable check per slice,

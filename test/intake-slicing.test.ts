@@ -82,8 +82,8 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const input = h.dispatch.mock.calls[0]![0];
     expect(input).toMatchObject({ jobId: identity.jobId, repoPath: h.repo, deliverable: 'investigation', title: 'Slice intake cart into heists' });
     const runtime = loadBundledWorkflowRuntime();
-    expect(runtime.id).toBe('gru-command-workflows@3');
-    expect(input.briefing).toContain(`GC slicing helper (gru-command-workflows@3 ${SLICING_HELPER}, sha256 ${runtime.manifest.files[SLICING_HELPER]!}):`);
+    expect(runtime.id).toBe('gru-command-workflows@4');
+    expect(input.briefing).toContain(`GC slicing helper (gru-command-workflows@4 ${SLICING_HELPER}, sha256 ${runtime.manifest.files[SLICING_HELPER]!}):`);
     expect(input.briefing).toContain(runtime.files.get(SLICING_HELPER)!.toString('utf-8'));
     expect(input.briefing).toContain(`- revisionId: ${preview.revisionId}`);
     expect(input.briefing).toContain(`- result requestId: ${identity.resultRequestId} (GC assigns it)`);

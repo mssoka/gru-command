@@ -193,6 +193,9 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
+  'briefing-review.test.ts': 23,
+  'briefing-review-board.test.ts': 4,
+  'briefing-review-server.test.ts': 4,
   'blind-input-dispatch.test.ts': 24,
   'blind-input.test.ts': 34,
   'blind-observer-service.test.ts': 2,
@@ -207,7 +210,7 @@ const PINS: Record<string, number> = {
   'workflow-session.test.ts': 21,
   'worker-verification-policy.test.ts': 57,
   'board-engine-v4.test.ts': 9,
-  'board-engine.test.ts': 47,
+  'board-engine.test.ts': 49,
   'board-frames.test.ts': 5,
   'board-pipeline-view.test.ts': 2,
   'board-server.test.ts': 61,
@@ -277,7 +280,7 @@ const PINS: Record<string, number> = {
   'lessons-dream.test.ts': 65,
   'lessons-dream-service.test.ts': 8,
   'lessons-e2e.test.ts': 2,
-  'lessons-injection.test.ts': 8,
+  'lessons-injection.test.ts': 9,
   'lessons-journal.test.ts': 6,
   'lessons-references.test.ts': 5,
   'lessons-server.test.ts': 12,

@@ -321,6 +321,44 @@ conflict between the architecture and its heist, the epic or the code, do not
 choose a side or edit the architecture. Post it to `needs-owner` as a
 `scope-design` decision quoting both sides, and hold only the step it gates.
 
+## Nefario's briefing stress-test (docs/BRIEFING-REVIEW.md)
+
+Before a heist's first dispatch, stress-test the briefing with a zero-context
+review: the phrasing, the acceptance criteria, the seams — anything a worker
+would have to guess. Nefario reads only the briefing, the repository and a
+lens method; it never sees the consult conversation or your reasoning.
+
+- **Commission.** Authenticated `POST /api/briefing-review`
+  `{ "repoPath", "title", "briefing", "tier", "justification" }` with the exact
+  briefing text you will dispatch. Declare the tier by risk: `low` runs the
+  stranger lens, `medium` adds acceptance and verification, `high` runs all
+  five. Your one-line `justification` says why that tier. A commission answers
+  202 with the review identity and its lens jobs, or 200 when the identical
+  commission already converged.
+- **Wait for the pass.** Every lens states READY or CHANGES-NEEDED; one
+  CHANGES-NEEDED decides the round. Every finding quotes the briefing, so a
+  finding is either a real ambiguity or a real contradiction in your text.
+- **Three routing paths.** Fix the briefing and re-commission the revision;
+  escalate to the owner through `POST /api/notifications/needs-owner` with
+  reserved class `scope-design` when the lenses disagree with the intent; or
+  record a push-back, authenticated `POST /api/briefing-review/pushback`
+  `{ "repoPath", "briefingSha256", "reason", "by": "gru" }`, when you judged
+  the finding and are shipping as written. A push-back is your judgment on the
+  record, never a way to hide a finding from the owner.
+- **Round cap.** Three consecutive CHANGES-NEEDED rounds for one heist mean a
+  disagreement, not a drafting problem: escalate to the owner instead of
+  revising a fourth time; the commission itself refuses with
+  `briefing_review_round_cap`.
+- **Provenance.** Dispatch with the exact reviewed text and carry
+  `"briefing_review": { "rounds", "verdict", "briefing_sha256" }` from the
+  commission. A READY review attaches by itself; a push-back dispatch omits
+  the block. At `stage = 2` a high-tier dispatch whose exact briefing is not
+  READY and not pushed back is refused before any lane exists — at `stage = 1`
+  the review is recorded and only a false claim is refused.
+- **Never** treat the review as scope authority. It is binding on readiness
+  and advisory on content: it never changes what the owner asked for, and an
+  owner ruling always wins.
+
 ## Onboarding heists (#427)
 
 Code finds managed repositories whose origin has no `.gru-command/worktree.toml`

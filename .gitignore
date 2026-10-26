@@ -19,10 +19,10 @@ web/test-results-repo-overview/
 # Local env — never commit secrets
 .env
 .env.*
-# Agent scratch (review sessions, render caches)
+# Agent scratch (review sessions, render caches, local BMad tooling)
 .lavish/
 _bmad-output/
-_bmad/render/
+_bmad/
 # GH350 real-tool fixture provisioning (Root-approved 2026-10-14): the
 # committed lock identity is the source of truth; node_modules and the
 # per-stage evidence area are materialized locally and never committed.

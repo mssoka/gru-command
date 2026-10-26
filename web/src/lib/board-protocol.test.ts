@@ -830,6 +830,43 @@ describe('vector raids block (#351)', () => {
   });
 });
 
+describe('Nefario briefing-review block (GH-505)', () => {
+  const review = (): Record<string, unknown> => ({
+    armed: 2,
+    round: 3,
+    tier: 'high',
+    verdictsToday: 1,
+    caught: 4,
+    refusalsToday: 0,
+    stage: 'advisory',
+  });
+
+  it('is optional (an older server sends none) and tolerates a null block; a present one passes only with its full shape', () => {
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: undefined })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: null })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: review() })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), briefingReview: { ...review(), armed: 0, round: null, tier: null, stage: 'high' } })).toBe(true);
+  });
+
+  it('rejects a malformed block, one field at a time: a guessed count or stage never renders', () => {
+    const broken: readonly Record<string, unknown>[] = [
+      { ...review(), armed: -1 },
+      { ...review(), armed: 1.5 },
+      { ...review(), armed: undefined },
+      { ...review(), round: -1 },
+      { ...review(), round: '3' },
+      { ...review(), tier: 'critical' },
+      { ...review(), tier: 3 },
+      { ...review(), verdictsToday: null },
+      { ...review(), caught: Number.NaN },
+      { ...review(), refusalsToday: '0' },
+      { ...review(), stage: 'enforce' },
+      { ...review(), stage: null },
+    ];
+    for (const block of broken) expect(isValidSnapshot({ ...snapshot(), briefingReview: block }), JSON.stringify(block)).toBe(false);
+  });
+});
+
 describe('provider pacing mirror (server parity)', () => {
   /** A valid snapshot carrying the mirrored pacing gate block. */
   function pacingSnapshot(): Record<string, unknown> {

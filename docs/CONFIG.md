@@ -671,6 +671,21 @@ lock_wait_timeout_ms = 900000
 # needed, and records the run as timed out / non-success.
 run_timeout_ms = 1800000
 
+# [briefing_review]
+# Nefario (docs/BRIEFING-REVIEW.md): Gru commissions a zero-context review
+# of one briefing BEFORE POST /api/dispatch; tier picks the lenses (low =
+# stranger, medium = +acceptance/verification, high = all five). The review
+# is binding on readiness (it can hold a dispatch back) and advisory on
+# content (it never changes scope or overrides an owner ruling).
+# enabled = false is the stop state: no commission (503), no readiness
+# refusal, and a zeroed board card. Leave it out of a config an older
+# build must still parse.
+# enabled = true
+# stage = 1 records provenance and refuses only a FALSE provenance claim;
+# stage = 2 also refuses a high-tier dispatch whose exact briefing sha has
+# no READY review or recorded push-back. Medium/low stay advisory.
+# stage = 1
+
 # ── Jev decisions (optional) ─────────────────────────────────────────
 # Jev is a small, cheap "System One" decision model (TypeSafe, via OpenRouter).
 # Gru Command runs fully without it: with Jev off, deterministic code makes
@@ -953,6 +968,29 @@ When GC is over the budget or under the floor and nothing it can free remains
 largest lanes and how much of the disk is not GC's. The row closes itself once
 the condition clears. `0` turns the budget or the floor off; the board's disk
 row and `GET /api/disk` still show the numbers.
+
+### Nefario's briefing review: stage 1 or 2
+
+`[briefing_review]` configures Nefario, the pre-dispatch review of a heist
+briefing ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)). Two keys:
+
+- **`enabled`** (boolean, default `true`). `false` is the stop state: a
+  commission answers 503 `briefing_review_disabled`, the dispatch gate admits
+  everything, and the cockpit card shows zeros. Nothing else changes: Perkins,
+  intake approval, merge authority and the verbatim-briefing contract are
+  untouched either way.
+- **`stage`** (exactly `1` or `2`, default `1`). Stage 1 records provenance and
+  refuses only a **false** provenance claim — a dispatch that says "READY" for a
+  review that holds no verdict, or names a sha it is not dispatching. Stage 2
+  also refuses a **high-tier** dispatch whose exact briefing sha has no `READY`
+  review and no recorded push-back, before any job row exists. Medium and low
+  tiers stay advisory in both stages.
+
+The section is emitted **as a commented example** in a freshly generated config
+so a default config stays parseable by a pre-Nefario build after `gru roll`; a
+re-run re-emits it active, like `[env]` and `[pacing]`. An install that has
+enabled it and wants to roll back must remove the block first. Invalid values
+fail loud: `briefing_review.stage must be 1 or 2 …`.
 
 ### Mailbox recovery cadence
 

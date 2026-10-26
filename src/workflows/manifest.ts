@@ -27,6 +27,10 @@ export const REQUIRED_INTAKE_WORKFLOW_FILE = 'skills/gc-build/intake.md';
  * package without it, and commissioning refuses a loaded package lacking it.
  * Older packages still load and bind, so their lanes remain valid. */
 export const REQUIRED_SLICING_WORKFLOW_FILE = 'skills/gc-build/slice.md';
+/** Nefario's lens helper (briefing review): like the slicing helper it is
+ * guarded on refresh and at commission, never at parse time — a retained
+ * historical package must keep loading and binding its lanes. */
+export const REQUIRED_BRIEFING_REVIEW_WORKFLOW_FILE = 'skills/briefing-review/lenses.md';
 
 export class WorkflowResourceError extends Error {
   constructor(message: string) {

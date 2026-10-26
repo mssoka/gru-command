@@ -541,6 +541,28 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(mount.querySelectorAll('h1, h2, h3, h4, h5, h6, section, [role="region"], [role="heading"]')).toHaveLength(0);
   });
 
+  it('renders Nefario after raids and tells the grid it holds seven cards', () => {
+    const view = new BoardView(() => {});
+    const vector = { enabled: false as const, raidMode: 'proposed' as const, maxRaidsPerDay: 2 };
+    const briefingReview = { armed: 1, round: 2, tier: 'high' as const, verdictsToday: 1, caught: 3, refusalsToday: 0, stage: 'advisory' as const };
+    view.render({ ...snapshot(), vector, briefingReview });
+    const cards = [...document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')];
+    expect(cards.map((card) => card.dataset.card)).toEqual(['heists', 'megaminions', 'crew', 'prs', 'reviews', 'raids', 'nefario']);
+    // data-count='7' is the CSS hook that keeps one row on a wide board.
+    expect(document.querySelector<HTMLElement>('.cockpit-kpis__grid')?.dataset.count).toBe('7');
+    const nefario = document.querySelector<HTMLElement>('.cockpit-card--nefario')!;
+    expect(nefario.classList.contains('cockpit-card--off')).toBe(false);
+    expect(nefario.getAttribute('aria-label')).toBe('NEFARIO');
+    expect(nefario.querySelector('.cockpit-card__aside')?.textContent).toBe('round 2 · high · advisory');
+    expect(nefario.querySelector('.cockpit-card__big')?.textContent).toBe('1');
+    expect(nefario.querySelector('.cockpit-card__big')?.getAttribute('data-kpi')).toBe('briefingReview.armed');
+    expect(nefario.querySelector('[data-kpi="briefingReview.caught"]')?.textContent).toBe('3');
+    // An older server sends no block: six cards, still one row's worth.
+    view.render({ ...snapshot(), vector });
+    expect(document.querySelector<HTMLElement>('.cockpit-kpis__grid')?.dataset.count).toBe('6');
+    expect(document.querySelector('.cockpit-card--nefario')).toBeNull();
+  });
+
   it('puts a check that needs a look first, in alert ink with its flag, and says how many', () => {
     const view = new BoardView(() => {});
     view.render(

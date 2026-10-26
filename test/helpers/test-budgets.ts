@@ -64,6 +64,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'spawns and reaps a real child process and streams large real files',
   },
   {
+    file: 'briefing-review-server.test.ts',
+    workload: 'real HTTP dispatch server over a real git fixture lane: Nefario commission, lens results, a gated dispatch and its recorded provenance',
+  },
+  {
     file: 'blind-observer-service.test.ts',
     workload: 'boots the compiled dist/main.js service with a runtime/preload double and a real ledger',
   },

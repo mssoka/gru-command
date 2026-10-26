@@ -104,12 +104,20 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   the ones that need a look first, then the Jev decisions and Gru wake
   chips), the owner-chime speaker, the notification bell, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
-  owns mobile chat. The board column opens with six **KPI cards**:
+  owns mobile chat. The board column opens with the **KPI cards**:
   HEISTS (with a stage bar toward done), MEGAMINIONS (every job a minion
   commissioned), CREW (sub-minions, active and queued, folded in when
   reported), PRS, REVIEWS and VECTOR RAIDS (from the snapshot's `vector`
   block; dashed `off` until raids are enabled, absent from an older
-  server). Every count is a `data-kpi` span tied to the same derivations
+  server), plus **NEFARIO** (GH-505) when the snapshot carries a
+  `briefingReview` block: how many briefing reviews are under test, the
+  newest live round and tier (`round N · <tier>`, suffixed `· advisory` at
+  stage 1), today's verdicts, the blocking findings caught before dispatch,
+  and — at stage 2 only — today's refusals as an alert fact. The card shows
+  the round's aggregate verdict only, never per-lens chips; a server that
+  could not read the events sends `null` and the card renders dashed
+  `unavailable`, while an older server sends no block and no card renders.
+  Seven cards still fill one row on the wide board (`data-count='7'`). Every count is a `data-kpi` span tied to the same derivations
   the v4 strip used; a headline number stands alone and grows freely, fact
   counts reserve a two-digit slot (`tabular-nums` + a floor), so crossing
   9→10 never reflows a label. At ≥1100px it is three panes — chat (~30%, collapsible,

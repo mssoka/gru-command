@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "name": "gru-command-workflows",
-  "version": 3,
-  "id": "gru-command-workflows@3",
+  "version": 4,
+  "id": "gru-command-workflows@4",
   "skills": [
     "gc-build"
   ],
@@ -15,9 +15,10 @@
   "files": {
     ".claude-plugin/plugin.json": "881e63d6a2a29e6157d56e53cb2660dead3db2860d9726bf93e9884758f8c16a",
     "LICENSE": "0aa79baf6328b4a1e694ce10a12ffc36d7666554da128dff0e8fcda0fc536a66",
-    "NOTICE.md": "e2ca7aec26b3d834cc23b6368884132729053b620d71fc6cadbd6ab11840cbfc",
+    "NOTICE.md": "229570b66e3cb6e44cafbe46613842233b01a2e3d9b9a3a343b44695305c5e3c",
     "scripts/context.mjs": "f35b092013dd05a802f7404e0aa06590cec50c61258e3854a20ae5bd7dd80bc7",
     "scripts/render.mjs": "48a14257320d7ce6034dbf543fe37b2243efd70c940828223612fdd49d446121",
+    "skills/briefing-review/lenses.md": "adaece3f7b9295ea2b949101b9b1ea9b9d472b554934c7d9f27ed854cf1996c1",
     "skills/gc-build/SKILL.md": "8464d4b68100cb5b7f362a3c9766e1b29f3643ada1a0444a1d1decbdc62ab302",
     "skills/gc-build/implement.md": "6a3f7262261abc28d68b75b72653d8c0ab2a9bbc99c108acc5bc5922291e66f7",
     "skills/gc-build/intake.md": "f0168e6d14e6a0342f476d471c73d51af6322e4ee8f31f63c272c0f380841e2a",
