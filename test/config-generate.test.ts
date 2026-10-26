@@ -525,6 +525,20 @@ describe('config-generate CLI', () => {
     });
   });
 
+  it('round trip preserves [briefing_review] stage in both the auto string and numeric forms', () => {
+    for (const [literal, expected] of [['"auto"', 'auto'], ['2', 2]] as const) {
+      const root = tempDir('gru-command-config-briefing-review-');
+      const instance = join(root, 'instance');
+      mkdirSync(instance, { recursive: true });
+      writeFileSync(join(instance, 'config.toml'), `[briefing_review]\nenabled = true\nstage = ${literal}\n`);
+      const forced = run(instance, ['--force']);
+      expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
+      const raw = parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as Record<string, unknown>;
+      expect(raw.briefing_review).toMatchObject({ enabled: true, stage: expected });
+      expect(loadConfig({ GRU_COMMAND_HOME: instance }, root).briefingReview).toEqual({ enabled: true, stage: expected });
+    }
+  });
+
   it('round trip preserves disabled pacing independently of resident concurrency', () => {
     const root = tempDir('gru-command-config-pacing-independent-');
     const instance = join(root, 'instance');
@@ -613,6 +627,7 @@ describe('config-generate CLI', () => {
     expect(doc).toContain('<!-- BEGIN GENERATED CONFIG REFERENCE');
     expect(doc).toContain('<!-- END GENERATED CONFIG REFERENCE -->');
     expect(doc).toContain(renderConfigDocBlock());
+    expect(renderConfigDocBlock()).toContain('# stage = "auto"');
   });
 
   it('the rendered config reference describes the conflict cascade as the fyi mechanical tier', () => {

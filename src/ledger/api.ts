@@ -8410,7 +8410,7 @@ export class LedgerApi {
         const closure = this.eventFromRow(reserved);
         const facts = closure.payload as { inspection_directive: unknown };
         if (closure.jobId !== input.jobId || facts.inspection_directive !== input.directive || input.kind === 'rebrief') {
-          throw new DirectiveCheckpointError('reserved current inspection identity requires this job’s exact separately authorized current-inspection directive');
+          throw new DirectiveCheckpointError('reserved current inspection identity requires this job’s exact separately approved current-inspection directive');
         }
       }
     }
@@ -8634,7 +8634,7 @@ export class LedgerApi {
     if (row === null || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || isDirectiveTerminal(row.state) ||
         job === null || isJobTerminal(job.status) || job.status === 'parked' ||
         this.hasOpenDirectiveRecoveryHold(identity.jobId) || this.directiveRecoveryEpoch(identity.jobId) !== identity.authorityEpoch) {
-      throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work is authorized');
+      throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work may proceed');
     }
     if (requiredWorkRevision(this.listJobAmendments(identity.jobId)) !== identity.workRevision ||
         (this.effectiveContract(identity.jobId)?.contractSha256 ?? createHash('sha256').update('').digest('hex')) !== identity.contractSha256) {

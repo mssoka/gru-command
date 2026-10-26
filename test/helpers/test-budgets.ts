@@ -84,6 +84,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'real uv renders of the bundled BMAD runtime over git repositories and worktrees',
   },
   { file: 'branch-idle-guard.test.ts', workload: 'real service and git lane lifecycle' },
+  {
+    file: 'briefing-review-server.test.ts',
+    workload: 'real HTTP dispatch server over a real git fixture lane: Nefario commission, lens results, a gated dispatch and its recorded provenance',
+  },
   { file: 'claude-adapter.test.ts', workload: 'real CLI child processes over stdio per test' },
   { file: 'cleanup-repair.test.ts', workload: 'real git lanes released, moved with their repository and repaired, review and preserve expiry over real folders and refs, and gru-service reset over real worktrees' },
   { file: 'config-env-service.test.ts', workload: 'boots the compiled dist/main.js with an [env] table and a recording git, plus seven refused direct boots' },

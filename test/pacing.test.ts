@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULT_PACING_CONFIG, type PacingConfig } from '../src/config.js';
 import {
   backoffDelayMs,
+  boundedErrorText,
   compileRateLimitPatterns,
   isRateLimitErrorText,
+  MAX_PACING_ERROR_CHARS,
   PacingGate,
   pacingExhaustedPayload,
   pacingRecoveredPayload,
@@ -45,6 +47,13 @@ describe('rate-limit error class (provider-agnostic)', () => {
     for (const text of rateLimited) {
       expect(isRateLimitErrorText(text), text).toBe(true);
     }
+  });
+
+  it('matches Claude Code\'s typed rate_limit, as its capacity off-switch reports it with no status (#485)', () => {
+    // GC's own text for 2.1.309's client-side capacity off-switch: a typed code, no HTTP status.
+    expect(isRateLimitErrorText('Opus is experiencing high load. Switch to Sonnet. (rate_limit)')).toBe(true);
+    // A word boundary never falls at "_": a field named after it is no rate limit.
+    expect(isRateLimitErrorText('rate_limit_remaining: 0')).toBe(false);
   });
 
   it('does not match auth, billing, transport, server, or hang failures', () => {
@@ -650,6 +659,16 @@ describe('pacing ledger honesty (r4 triage rows A3/A4/A9)', () => {
     expect(pacingRetryPayload(1, 3, 100, 'HTTP 429').error).toBe('HTTP 429');
   });
 
+  it('one bounded error text for every ledger payload: whole up to the bound, marked with its length when cut, never mid code point (#485)', () => {
+    expect(boundedErrorText('x'.repeat(MAX_PACING_ERROR_CHARS))).toEqual({ error: 'x'.repeat(MAX_PACING_ERROR_CHARS) });
+    expect(boundedErrorText('y'.repeat(MAX_PACING_ERROR_CHARS + 7))).toEqual({ error: 'y'.repeat(MAX_PACING_ERROR_CHARS), error_truncated: true, error_length: MAX_PACING_ERROR_CHARS + 7 });
+    // The bound falls inside an emoji's surrogate pair: the cut keeps whole code points.
+    const split = `${'z'.repeat(MAX_PACING_ERROR_CHARS - 1)}😀 and more`;
+    expect(boundedErrorText(split)).toEqual({ error: 'z'.repeat(MAX_PACING_ERROR_CHARS - 1), error_truncated: true, error_length: split.length });
+    // Both retry producers' payloads carry the same marker.
+    expect(pacingExhaustedPayload(3, 3, split)).toEqual({ attempts: 3, max_auto_retries: 3, ...boundedErrorText(split) });
+  });
+
   it('fails loud at the gate boundary on a non-finite cap instead of wedging the pool (r12 blind#6)', () => {
     expect(
       () => new PacingGate({ enabled: true, maxConcurrentMinions: Number.NaN, maxConcurrentReviewTurns: 0 }),
@@ -729,6 +748,22 @@ describe('worker-turn preparation and per-job turn knowledge (#427 lane slimming
     const lease = await gate.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' });
     expect(gate.workerTurnsFor('job-a')).toEqual({ held: 1, queued: 0 });
     expect(events).toEqual([{ kind: 'pacing.prepare-failed', jobId: 'job-a', payload: { id: 'job-a', label: 'Job A', pool: 'worker', error: 'Error: setup exploded' } }]);
+    lease.release();
+  });
+
+  it('records a failed preparation\'s error bounded like every ledger payload (#485)', async () => {
+    const events: Array<{ kind: string; payload?: unknown }> = [];
+    const verbose = `setup exploded: ${'detail '.repeat(100)}`;
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, payload: event.payload }),
+      prepareWorkerTurn: async () => { throw new Error(verbose); },
+    });
+    const lease = await gate.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' });
+    expect(events).toEqual([{ kind: 'pacing.prepare-failed', payload: { id: 'job-a', label: 'Job A', pool: 'worker', ...boundedErrorText(`Error: ${verbose}`) } }]);
+    expect(events[0]!.payload).toMatchObject({ error_truncated: true });
     lease.release();
   });
 

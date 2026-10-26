@@ -16,7 +16,8 @@ import { ConfigError, type PacingConfig } from '../config.js';
  */
 
 /** Generic, provider-agnostic rate-limit signatures: the 429 family plus
- * plain-language rate-limit phrasing any provider may emit. A bare numeric
+ * plain-language rate-limit phrasing any provider may emit, and Claude Code's
+ * typed `rate_limit` (its capacity off-switch carries no status, #485). A bare numeric
  * token is NOT enough — otherwise "TypeError at line 429" or "only 429
  * bytes read" would schedule automatic retries. The code must look like a
  * status (HTTP/status/error/code context, or the leading status-code shape
@@ -25,7 +26,7 @@ import { ConfigError, type PacingConfig } from '../config.js';
  * exhaustion ("quota exceeded", "insufficient balance") must never be
  * retried into a silent loop. */
 const GENERIC_RATE_LIMIT_PATTERN =
-  /^429\b|\b(?:http(?:\/ ?\d+(?:\.\d+)*)?|status(?:[_\s]?code)?|error(?:[_\s]?code)?|code)\b\s*[:=,_-]?\s*429\b|\b429\b[^\p{L}\p{N}]{0,8}(?:too many requests|rate[- ]?limit)|\btoo many requests\b|\bthrottl(?:e|ed|ing)\b|\brate[- ]?limit(?:ed|ing)?\b/iu;
+  /^429\b|\b(?:http(?:\/ ?\d+(?:\.\d+)*)?|status(?:[_\s]?code)?|error(?:[_\s]?code)?|code)\b\s*[:=,_-]?\s*429\b|\b429\b[^\p{L}\p{N}]{0,8}(?:too many requests|rate[- ]?limit)|\btoo many requests\b|\bthrottl(?:e|ed|ing)\b|\brate[-_ ]?limit(?:ed|ing)?\b/iu;
 
 /** True when the error text matches the generic 429 family or one of the
  * configured signatures. Never matches on provider identity. */
@@ -115,21 +116,31 @@ export function backoffDelayMs(
  * text is bounded here so both producers record the same bound. */
 export const MAX_PACING_ERROR_CHARS = 500;
 
-function boundedPacingError(error: string): string {
-  return error.length > MAX_PACING_ERROR_CHARS ? error.slice(0, MAX_PACING_ERROR_CHARS) : error;
+/** An error text bounded for a ledger payload: at most MAX_PACING_ERROR_CHARS,
+ * cut on a code-point boundary, and when cut, marked with the original length.
+ * The supervisor's retained refusals use it too (#485). */
+export interface BoundedErrorText {
+  readonly error: string;
+  readonly error_truncated?: true;
+  readonly error_length?: number;
 }
 
-export interface PacingRetryPayload {
+export function boundedErrorText(error: string): BoundedErrorText {
+  if (error.length <= MAX_PACING_ERROR_CHARS) return { error };
+  const cut = error.slice(0, MAX_PACING_ERROR_CHARS);
+  const last = cut.charCodeAt(cut.length - 1);
+  return { error: last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut, error_truncated: true, error_length: error.length };
+}
+
+export interface PacingRetryPayload extends BoundedErrorText {
   readonly attempt: number;
   readonly max_auto_retries: number;
   readonly delay_ms: number;
-  readonly error: string;
 }
 
-export interface PacingExhaustedPayload {
+export interface PacingExhaustedPayload extends BoundedErrorText {
   readonly attempts: number;
   readonly max_auto_retries: number;
-  readonly error: string;
 }
 
 export interface PacingRecoveredPayload {
@@ -143,7 +154,7 @@ export function pacingRetryPayload(
   delayMs: number,
   error: string,
 ): PacingRetryPayload {
-  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, error: boundedPacingError(error) };
+  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, ...boundedErrorText(error) };
 }
 
 export function pacingExhaustedPayload(
@@ -151,7 +162,7 @@ export function pacingExhaustedPayload(
   maxAutoRetries: number,
   error: string,
 ): PacingExhaustedPayload {
-  return { attempts, max_auto_retries: maxAutoRetries, error: boundedPacingError(error) };
+  return { attempts, max_auto_retries: maxAutoRetries, ...boundedErrorText(error) };
 }
 
 export function pacingRecoveredPayload(attempts: number, maxAutoRetries: number): PacingRecoveredPayload {
@@ -584,7 +595,7 @@ export class PacingGate {
       (error: unknown) => {
         // Never blocks the turn: the failure is on the record and it proceeds.
         try {
-          this.recordEvent('pacing.prepare-failed', waiter, { pool: kind, error: String(error) });
+          this.recordEvent('pacing.prepare-failed', waiter, { pool: kind, ...boundedErrorText(String(error)) });
         } catch {
           // best-effort: the turn still proceeds
         }

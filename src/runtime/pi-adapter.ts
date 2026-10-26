@@ -53,7 +53,7 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { isPublicModelToken } from './review-model-identity.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveRetryStart, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveBookkeepingError, DirectiveCheckpointError, isNativeDirectiveRefusal, thrownDetail, thrownText, withOwnIo, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveRetryStart, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -1134,7 +1134,18 @@ export class PiAgentHandle implements AgentHandle {
   private livePromptText: string | null = null;
   private livePromptImages: PromptOptions['images'] | undefined;
   private liveDirective: PromptOptions['directive'] | undefined;
-  private directiveAdmissionError: unknown = null;
+  /** The live directive's first admission/guard failure, boxed: a thrown
+   * null or undefined still fails it, so every later fence refuses. */
+  private directiveAdmissionFailure: { readonly error: unknown } | null = null;
+  /** Every native directive refusal this turn threw (#485), as the exact
+   * object thrown: a `DirectiveCheckpointError` GC raised for the live
+   * directive, GC's wrapper whose cause is one, or the `AggregateError` that
+   * replaced one whose receipt could not be journaled. Reset per turn. See
+   * RuntimeEvent `nativeControl`. */
+  private readonly nativeDirectiveRefusals = new Set<Error>();
+  /** Bookkeeping faults already logged (the fault itself, or its refusal when the
+   * fault is no object): each is logged once, first failure or not. */
+  private readonly loggedBookkeepingFaults = new WeakSet<object>();
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'` holding no tool calls).
@@ -1292,7 +1303,7 @@ export class PiAgentHandle implements AgentHandle {
           }
           if (!isDeepStrictEqual(input.context.tools, session.agent.state.tools)) throw new DirectiveCheckpointError('effective native executor authority differs from its accepted tool setup');
           if (batchMode() !== executionMode) throw new DirectiveCheckpointError('native directive batch execution mode changed before tool effect');
-          flushDirectiveToolIntent(this.sessionFile, assistantMessage, invocation, directive.identity, executionMode);
+          withOwnIo('tool intent journal', () => flushDirectiveToolIntent(this.sessionFile, assistantMessage, invocation, directive.identity, executionMode));
         };
         try {
           check();
@@ -1320,28 +1331,73 @@ export class PiAgentHandle implements AgentHandle {
 
   private assertDirectiveExecutionAuthority(directive: NonNullable<PromptOptions['directive']>, signal?: AbortSignal, recheckCurrentAdmission = true): void {
     if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
-    if (this.directiveAdmissionError !== null) throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`);
+    // GC's wrapper names its cause: it is a refusal only when that cause is one.
+    const failure = this.directiveAdmissionFailure;
+    if (failure !== null) {
+      throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${thrownText(failure.error, 'string')}`, { cause: failure.error });
+    }
     if (this.publishedDirectiveAdmission !== directive) throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
-    if (recheckCurrentAdmission) directive.beforeAdmission();
-    if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect or completion');
+    // Each GC bookkeeping call runs by itself: a fault there is GC's refusal.
+    if (recheckCurrentAdmission) withOwnIo('authority check', () => directive.beforeAdmission());
+    if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest?.()) {
+      throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect or completion');
+    }
   }
 
   private refuseDirectiveGuard(directive: PromptOptions['directive'], toolCallId: string | undefined, error: unknown): never {
     if (directive !== undefined) {
-      this.directiveAdmissionError ??= error;
+      this.failDirectiveAdmission(error);
+      this.recordDirectiveRefusal(error);
       const producer = this.directiveProducers.get(directive.identity.requestId);
       if (producer !== undefined) {
         const key = `${producer.incarnation}:${toolCallId === undefined ? 'authority' : `tool:${toolCallId}`}`;
-        const refusal = { producer, ...(toolCallId === undefined ? {} : { toolCallId }), reason: String(error) };
+        const refusal = { producer, ...(toolCallId === undefined ? {} : { toolCallId }), reason: thrownText(error, 'string') };
         this.pendingGuardRefusals.set(key, refusal);
         try {
           if (toolCallId === undefined) recordDirectiveAuthorityRefusal(producer, refusal.reason);
           else recordDirectiveToolRefusal(producer, toolCallId, refusal.reason);
           this.pendingGuardRefusals.delete(key);
-        } catch (journalError) { throw new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained'); }
+        } catch (journalError) {
+          // Still the refusal: the turn now fails with this object instead. A
+          // foreign error keeps its own words, so it is still classified by them.
+          const refusalError = isNativeDirectiveRefusal(error);
+          const unrecorded = new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained' +
+            (refusalError ? '' : `: ${thrownText(error, 'string')}`));
+          if (refusalError) this.nativeDirectiveRefusals.add(unrecorded);
+          throw unrecorded;
+        }
       }
     }
     throw error;
+  }
+
+  /** Fails the live directive's admission/guard once: the first failure stays
+   * the turn's, and a bookkeeping fault is logged with the fault it replaced. */
+  private failDirectiveAdmission(error: unknown): void {
+    this.directiveAdmissionFailure ??= { error };
+    this.logBookkeepingFault(error);
+  }
+
+  /** Every bookkeeping fault is logged, first failure or not, and once. */
+  private logBookkeepingFault(error: unknown): void {
+    if (!(error instanceof DirectiveBookkeepingError)) return;
+    const fault = typeof error.fault === 'object' && error.fault !== null ? error.fault : error;
+    if (this.loggedBookkeepingFaults.has(fault)) return;
+    this.loggedBookkeepingFaults.add(fault);
+    this.log('error', 'native directive bookkeeping failed; the directive is refused', { error: error.message, fault: thrownDetail(error.fault) });
+  }
+
+  /** Keeps a refusal GC raised for the live directive; a plain error, or GC's
+   * wrapper around one, is routed as the failure it is. */
+  private recordDirectiveRefusal(error: unknown): void {
+    if (isNativeDirectiveRefusal(error)) this.nativeDirectiveRefusals.add(error);
+  }
+
+  /** Pi's SDK reduces a thrown refusal to its message in the failed turn's
+   * assistant message: only exact equality with a recorded one counts (a
+   * refusal always states a reason, so an empty text never matches). */
+  private isNativeDirectiveRefusalText(detail: string): boolean {
+    return [...this.nativeDirectiveRefusals].some((refusal) => refusal.message === detail);
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -1854,7 +1910,8 @@ export class PiAgentHandle implements AgentHandle {
     this.liveTurnStop = { stopReason: null, error: null, holdsCalls: false };
     this.liveDirective = directive;
     this.preparedDirectiveEffects.clear();
-    this.directiveAdmissionError = null;
+    this.directiveAdmissionFailure = null;
+    this.nativeDirectiveRefusals.clear();
     this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
@@ -1866,13 +1923,25 @@ export class PiAgentHandle implements AgentHandle {
       // compaction terminal is published if Pi's gate has cleared. If one is
       // still withheld, or the handle was disposed (the reconcile bound
       // disposes), the directive is not admitted.
-      if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
-      if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
-      if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
-      if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
-      directive.beforeAdmission();
-      if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
-        throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
+      try {
+        if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
+        if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
+        if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
+        if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
+        withOwnIo('authority check', () => directive.beforeAdmission());
+        if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest?.()) {
+          throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
+        }
+      } catch (error) {
+        // Pi calls this outside its own try: the prompt rejects with this very
+        // object. GC's authority or compaction refusal here keeps a durable
+        // authority receipt, as a fence refusal does (an unrecorded one rejects
+        // as its AggregateError). A bookkeeping fault before acceptance keeps
+        // none, so it never blocks the resume of a checkpoint the SDK writes.
+        if (error instanceof DirectiveCheckpointError && !(error instanceof DirectiveBookkeepingError)) this.refuseDirectiveGuard(directive, undefined, error);
+        this.recordDirectiveRefusal(error);
+        this.logBookkeepingFault(error);
+        throw error;
       }
     };
     let captured: PromptTurnVerdict = { ok: true, error: null };
@@ -1881,7 +1950,7 @@ export class PiAgentHandle implements AgentHandle {
         // A turn rejected by dispose() must not overwrite the terminal
         // 'disposed' state with 'error'.
         if (!this.disposed) {
-          this.setState('error', String(error));
+          this.setState('error', thrownText(error, 'string'));
           // Typed provenance (r1 #13): ONLY a real SDK provider error
           // (numeric status) carries provider identity + typed fields.
           // Arbitrary exceptions stay anonymous — the sensor can never
@@ -1889,8 +1958,10 @@ export class PiAgentHandle implements AgentHandle {
           const typed = typedFromSdkError(error);
           this.emit({
             type: 'error',
-            error: String(error),
+            error: thrownText(error, 'string'),
             fatal: false,
+            // A refusal rejects the prompt as the very object recorded.
+            ...(typed === null && error instanceof Error && this.nativeDirectiveRefusals.has(error) ? { nativeControl: 'directive-refusal' as const } : {}),
             ...(typed !== null && this.session.model !== undefined
               ? { provider: this.session.model.provider, model: this.session.model.id }
               : {}),
@@ -1931,9 +2002,9 @@ export class PiAgentHandle implements AgentHandle {
               const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
               captured = proof.state === 'terminal' ? { ok: proof.ok, error: proof.error } : { ok: false, error: 'native correlated terminal proof unavailable' };
             } catch (error) {
-              captured = { ok: false, error: `native correlated terminal proof unavailable: ${String(error)}` };
+              captured = { ok: false, error: `native correlated terminal proof unavailable: ${thrownText(error, 'string')}` };
             }
-            if (this.directiveAdmissionError !== null) captured = { ok: false, error: String(this.directiveAdmissionError) };
+            if (this.directiveAdmissionFailure !== null) captured = { ok: false, error: thrownText(this.directiveAdmissionFailure.error, 'string') };
           }
           this.preparedDirectiveEffects.clear();
           this.liveDirective = undefined;
@@ -1976,7 +2047,7 @@ export class PiAgentHandle implements AgentHandle {
       try {
         listener(event);
       } catch (error) {
-        this.log('warn', 'runtime event listener threw', { error: String(error) });
+        this.log('warn', 'runtime event listener threw', { error: thrownText(error, 'string') });
       }
     }
   }
@@ -2087,7 +2158,7 @@ export class PiAgentHandle implements AgentHandle {
             : recordDirectiveRetryStart(producer, e, this.session.sessionManager.getBranch().at(-1));
           if (reason !== null) this.log('warn', unrecorded, { requestId, reason });
         } catch (error) {
-          this.log('warn', unrecorded, { requestId, error: String(error) });
+          this.log('warn', unrecorded, { requestId, error: thrownText(error, 'string') });
         }
         return;
       }
@@ -2111,11 +2182,12 @@ export class PiAgentHandle implements AgentHandle {
           // real persisted native user entry, fsyncs it, then calls the host.
           queueMicrotask(() => {
             try {
-              const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
-              directive.onAdmitted(binding);
+              // The readback with its binding write, and the ledger's publication, are GC's own bookkeeping.
+              const binding = withOwnIo('admission receipt', () => inspectDirectiveAdmission(this.sessionFile, directive.identity));
+              withOwnIo('admission publication', () => directive.onAdmitted(binding));
               if (this.liveDirective === directive) this.publishedDirectiveAdmission = directive;
             } catch (error) {
-              if (this.liveDirective === directive) this.directiveAdmissionError ??= error;
+              if (this.liveDirective === directive) this.failDirectiveAdmission(error);
             }
           });
         }
@@ -2138,11 +2210,11 @@ export class PiAgentHandle implements AgentHandle {
             // only its persisted terminal checkpoint is associated afterward.
             queueMicrotask(() => {
               try {
-                const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
+                const proof = withOwnIo('checkpoint read', () => inspectDirectiveCheckpoint(this.sessionFile, directive.identity));
                 if (producer === undefined || proof.state !== 'terminal' || !proof.ok) throw new DirectiveCheckpointError('native completion checkpoint/producer unavailable');
-                recordDirectiveCompletion(producer, proof.checkpointId, head);
+                withOwnIo('completion receipt', () => recordDirectiveCompletion(producer, proof.checkpointId, head));
               } catch (error) {
-                if (this.liveDirective === directive) this.directiveAdmissionError ??= error;
+                if (this.liveDirective === directive) this.failDirectiveAdmission(error);
               }
             });
           }
@@ -2167,21 +2239,26 @@ export class PiAgentHandle implements AgentHandle {
               typeof msg['provider'] === 'string' ? msg['provider'] : this.session.model?.provider ?? '',
               typeof msg['model'] === 'string' ? msg['model'] : this.session.model?.id ?? '',
             );
+            // Pi stamps its own failure message with the model: a refusal
+            // names no provider all the same.
+            const refusal = typed === null && this.liveDirective !== undefined && this.isNativeDirectiveRefusalText(detail);
             this.emit({
               type: 'error',
               error: detail,
               fatal: false,
-              ...(typeof msg['provider'] === 'string'
-                ? { provider: msg['provider'] }
-                : this.session.model !== undefined
-                  ? { provider: this.session.model.provider }
-                  : {}),
-              ...(typeof msg['model'] === 'string'
-                ? { model: msg['model'] }
-                : this.session.model !== undefined
-                  ? { model: this.session.model.id }
-                  : {}),
-              ...(typed !== null ? { typed } : {}),
+              ...(refusal ? { nativeControl: 'directive-refusal' as const } : {
+                ...(typeof msg['provider'] === 'string'
+                  ? { provider: msg['provider'] }
+                  : this.session.model !== undefined
+                    ? { provider: this.session.model.provider }
+                    : {}),
+                ...(typeof msg['model'] === 'string'
+                  ? { model: msg['model'] }
+                  : this.session.model !== undefined
+                    ? { model: this.session.model.id }
+                    : {}),
+                ...(typed !== null ? { typed } : {}),
+              }),
             });
             this.setState('error', detail);
           }

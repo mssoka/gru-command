@@ -489,6 +489,9 @@ body {
   .cockpit-kpis__grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   /* No raids block (an older server): five cards fill five columns. */
   .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  /* Nefario's card (GH-505): seven cards still fill ONE row on a wide board
+     (the 2400px cockpit), never six with a hole at the end. */
+  .cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 }
 
 .cockpit-card {
@@ -533,6 +536,7 @@ body {
 .cockpit-card--prs .cockpit-card__mark { background: var(--rev); }
 .cockpit-card--reviews .cockpit-card__mark { background: var(--perkins); }
 .cockpit-card--raids .cockpit-card__mark { background: repeating-linear-gradient(135deg, var(--work) 0 3px, var(--line) 3px 5.5px); }
+.cockpit-card--nefario .cockpit-card__mark { background: linear-gradient(90deg, var(--card) 0 50%, var(--rev) 50%); }
 
 .cockpit-card__label {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

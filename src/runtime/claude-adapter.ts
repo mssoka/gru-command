@@ -41,6 +41,7 @@ import {
   SessionAlreadyActiveError,
 } from './session-paths.js';
 import {
+  CLAUDE_NO_CONTENT,
   ClaudeControlTranslator,
   ClaudeTurnTranslator,
   extractSessionId,
@@ -71,6 +72,12 @@ import {
   inspectDirectiveAdmission,
   inspectDirectiveCheckpoint,
   isClaudeTaskNotification,
+  isNativeDirectiveRefusal,
+  DirectiveBookkeepingError,
+  ownIoRefusal,
+  thrownDetail,
+  thrownText,
+  withOwnIo,
   prepareClaudeDirectiveBinding,
   prepareDirectiveProducer as prepareNativeDirectiveProducer,
   readDirectiveBinding,
@@ -282,7 +289,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
 
   /** Turn-spawn ENOENT after a previously-ok probe: the binary vanished. */
   private onInfraError(error: unknown): void {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if ((error as NodeJS.ErrnoException | null | undefined)?.code === 'ENOENT') {
       this.binaryOk = false;
       this.down = `binary "${this.binary}" vanished mid-run (ENOENT)`;
     }
@@ -721,6 +728,21 @@ export function backgroundStopNotice(tasks: readonly string[], reason: Backgroun
     'your turn. If you need a result, run the command again and wait for it before you reply.';
 }
 
+/** A tool fence's refusal after the turn already failed: the earlier failure
+ * reports itself; this names no wall word (#485). */
+const EARLIER_DIRECTIVE_FAILURE = 'an earlier directive failure refused this turn\'s tool effects';
+
+/** A write to a transcript stream an earlier fault destroyed (#485). A fault
+ * whose `code` cannot be read (a throwing getter, a Proxy trap) is no such
+ * write: it is logged like any other. */
+function isDestroyedStreamWrite(fault: unknown): boolean {
+  try {
+    return typeof fault === 'object' && fault !== null && (fault as NodeJS.ErrnoException).code === 'ERR_STREAM_DESTROYED';
+  } catch {
+    return false;
+  }
+}
+
 /** One directive turn in flight (#424). */
 interface DirectiveTurn {
   readonly directive: NonNullable<PromptOptions['directive']>;
@@ -730,7 +752,12 @@ interface DirectiveTurn {
   /** Settles once the CLI's echo was read back and published (or refused). */
   admission: Promise<void> | null;
   admitted: DirectiveNativeBinding | null;
-  failure: unknown;
+  /** The turn's first failure, boxed: a thrown null or undefined still fails
+   * it, so every later fence refuses (#485). GC's own later failures (a lost
+   * write, a second prompt, the channel's deny) report it, not themselves; a
+   * failure of the CLI process, or of the permission channel's transport or
+   * protocol, reports itself, untagged. Its guard receipt stays durable. */
+  failure: { readonly error: unknown } | null;
   completion: Promise<void> | null;
 }
 
@@ -863,7 +890,10 @@ export function claudeInBandError(
   apiError: ApiErrorInfo | null,
   model: string | null,
 ): Extract<RuntimeEvent, { type: 'error' }> {
-  const text = result.text ?? apiError?.text ?? `turn ended with result subtype "${result.subtype}"`;
+  // Shared by the ordinary and the refused path, so both say the same (#485).
+  const said = (text: string | null | undefined): string | null => text == null || text.trim() === '' || text.trim() === CLAUDE_NO_CONTENT ? null : text;
+  const text = said(result.text) ?? said(apiError?.text) ??
+    (apiError !== null || result.apiErrorStatus !== null ? 'the CLI reported an API error' : `turn ended with result subtype "${result.subtype}"`);
   const status = apiError?.status ?? result.apiErrorStatus;
   const code = apiError?.code ?? null;
   // A provider failure is typed whenever the CLI attached either fact — a
@@ -1186,6 +1216,9 @@ export class ClaudeCodeHandle implements AgentHandle {
   private preparingTurn = false;
   /** Directive producers this handle prepared, by request (#424). */
   private readonly directiveProducers = new Map<string, DirectiveProducer>();
+  /** Bookkeeping faults already logged (the fault itself, or its refusal when the
+   * fault is no object): each is logged once, first failure or not. */
+  private readonly loggedBookkeepingFaults = new WeakSet<object>();
   /** Guard refusals whose receipt could not be written yet (retried at cessation). */
   private readonly pendingGuardRefusals = new Map<string, { readonly producer: DirectiveProducer; readonly toolUseId?: string; readonly reason: string }>();
   /** Every producer's cessation receipt is written (#424). */
@@ -1259,7 +1292,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       else recordDirectiveToolRefusal(producer, toolUseId, reason);
     } catch (error) {
       this.pendingGuardRefusals.set(`${producer.incarnation}:${toolUseId ?? 'authority'}`, { producer, ...(toolUseId === undefined ? {} : { toolUseId }), reason });
-      this.log('error', 'directive guard refusal receipt failed; retried at cessation', { error: String(error) });
+      this.log('error', 'directive guard refusal receipt failed; retried at cessation', { error: thrownText(error, 'string') });
     }
   }
 
@@ -1666,7 +1699,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       }
       for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
     } catch (error) {
-      this.log('error', 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written', { error: String(error) });
+      this.log('error', 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written', { error: thrownText(error, 'string') });
       return false;
     }
     this.producersCeased = true;
@@ -1690,7 +1723,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       try {
         listener(event);
       } catch (error) {
-        this.log('warn', 'runtime event listener threw', { error: String(error) });
+        this.log('warn', 'runtime event listener threw', { error: thrownText(error, 'string') });
       }
     }
   }
@@ -2029,14 +2062,36 @@ export class ClaudeCodeHandle implements AgentHandle {
     return { directive, producer, content, settings, admission: null, admitted: null, failure: null, completion: null };
   }
 
-  private failDirective(turn: DirectiveTurn, error: unknown, abortTurn: (detail: string) => void): void {
-    turn.failure ??= error;
-    abortTurn(`directive refused: ${error instanceof Error ? error.message : String(error)}`);
+  /** Records a directive turn's failure once and returns the one the turn
+   * reports: the first, which a later failure never supersedes (#485). */
+  private recordDirectiveFailure(turn: DirectiveTurn, error: unknown): unknown {
+    turn.failure ??= { error };
+    // Every bookkeeping fault is logged, first or not, and once per fault: the
+    // writes Node had buffered behind a failed transcript write (and the rest
+    // of its batch) get that root error itself, so one fault is wrapped once
+    // per frame. Only a write made after the stream was destroyed gets
+    // ERR_STREAM_DESTROYED, which restates the root and is not logged.
+    if (error instanceof DirectiveBookkeepingError && !isDestroyedStreamWrite(error.fault)) {
+      const fault = typeof error.fault === 'object' && error.fault !== null ? error.fault : error;
+      if (!this.loggedBookkeepingFaults.has(fault)) {
+        this.loggedBookkeepingFaults.add(fault);
+        this.log('error', 'claude directive bookkeeping failed; the directive is refused', { request: turn.directive.identity.requestId,
+          error: error.message, fault: thrownDetail(error.fault) });
+      }
+    }
+    return turn.failure.error;
+  }
+
+  /** Ends the turn with its failure: an earlier one still owed its report is
+   * reported, with its own text and as its own cause. */
+  private failDirective(turn: DirectiveTurn, error: unknown, abortTurn: (detail: string, cause?: unknown) => void): void {
+    const failure = this.recordDirectiveFailure(turn, error);
+    abortTurn(`directive refused: ${thrownText(failure)}`, failure);
   }
 
   /** Admission at the CLI's own echo; completion at the turn's own result. Each
    * reads back the frame only once it is durable in the transcript. */
-  private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string) => void): void {
+  private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string, cause?: unknown) => void): void {
     const { directive, producer } = turn;
     if (frame['type'] === 'user' && frame['isReplay'] === true) {
       // The CLI's own task notification is neither the echo nor a second prompt (#471).
@@ -2048,8 +2103,9 @@ export class ClaudeCodeHandle implements AgentHandle {
       turn.admission = durable.then(() => {
         // A directive that already failed admits nothing more.
         if (turn.failure !== null) return;
-        const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
-        directive.onAdmitted(binding);
+        // The readback with its binding write, and the ledger's publication, are GC's own bookkeeping.
+        const binding = withOwnIo('admission receipt', () => inspectDirectiveAdmission(this.sessionFile, directive.identity));
+        withOwnIo('admission publication', () => directive.onAdmitted(binding));
         turn.admitted = binding;
       }).catch((error: unknown) => this.failDirective(turn, error, abortTurn));
       return;
@@ -2070,48 +2126,73 @@ export class ClaudeCodeHandle implements AgentHandle {
         await turn.admission;
         if (turn.failure !== null || turn.admitted === null) return;
         // Completed original work may be historical: verify native authority, not today's candidacy.
-        if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest()) {
+        if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest()) {
           this.recordGuardRefusal(producer, undefined, 'live native directive role/tools/model authority changed before completion');
           throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before completion');
         }
-        const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
+        const proof = withOwnIo('checkpoint read', () => inspectDirectiveCheckpoint(this.sessionFile, directive.identity));
         if (proof.state !== 'terminal' || !proof.ok) {
           throw new DirectiveCheckpointError(`native completion checkpoint unavailable: ${proof.state === 'unknown' ? proof.reason : proof.state === 'terminal' ? proof.error ?? 'failed' : 'not terminal'}`);
         }
-        recordDirectiveCompletion(producer, proof.checkpointId, head);
+        withOwnIo('completion receipt', () => recordDirectiveCompletion(producer, proof.checkpointId, head));
       }).catch((error: unknown) => {
-        turn.failure ??= error;
-        this.log('error', 'claude directive completion was not recorded', { request: directive.identity.requestId, error: String(error) });
+        this.recordDirectiveFailure(turn, error);
+        this.log('error', 'claude directive completion was not recorded', { request: directive.identity.requestId, error: thrownText(error, 'string') });
       });
     }
+  }
+
+  /** The tool fence's checks, synchronous from the admission on. */
+  private fenceDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest): ClaudeToolDecision {
+    if (turn.failure !== null) throw new DirectiveCheckpointError(EARLIER_DIRECTIVE_FAILURE);
+    if (turn.admitted === null) {
+      throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
+    }
+    // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by
+    // name. The CLI reads the strings "true"/"false" as booleans; anything else that is not plainly
+    // a foreground call is refused too.
+    const background = request.input['run_in_background'];
+    if (background !== undefined && background !== false && background !== 'false') {
+      throw new DirectiveCheckpointError('a directive turn cannot start a background task: its completion would outlive the turn');
+    }
+    // Each GC bookkeeping call runs by itself: a fault there is GC's refusal.
+    withOwnIo('authority check', () => turn.directive.beforeAdmission());
+    if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, turn.directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest()) {
+      throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect');
+    }
+    withOwnIo('tool intent read', () => assertClaudeDirectiveToolIntent(this.sessionFile, turn.directive.identity, request.toolUseId, request.toolName, request.input));
+    return { allow: true };
+  }
+
+  /** The fence passed, but the turn may have failed since: the allow is
+   * re-checked as it is written, and a recorded failure denies it, with the
+   * same durable guard receipt as a fence deny (#485). A failure of the CLI
+   * process, or of the channel's transport or protocol, records none: GC has
+   * ended the CLI's stdin, so the allow is dropped there and no tool runs. */
+  private confirmDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest): ClaudeToolDecision {
+    if (turn.failure === null) return { allow: true };
+    this.recordGuardRefusal(turn.producer, request.toolUseId, EARLIER_DIRECTIVE_FAILURE);
+    return { allow: false, message: `Refused by the directive's authority fence: ${EARLIER_DIRECTIVE_FAILURE}` };
   }
 
   /** The tool fence (#424): admission published, authority current, the exact
    * intent durable in the admitted turn. Anything else refuses the tool and
    * ends the turn, with a durable guard receipt. */
-  private decideDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest, durable: Promise<void>, abortTurn: (detail: string) => void): Promise<ClaudeToolDecision> {
+  private decideDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest, durable: Promise<void>, abortTurn: (detail: string, cause?: unknown) => void): Promise<ClaudeToolDecision> {
     return durable.then(async (): Promise<ClaudeToolDecision> => {
       await turn.admission;
-      if (turn.failure !== null || turn.admitted === null) {
-        throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
+      try {
+        return this.fenceDirectiveTool(turn, request);
+      } catch (error) {
+        // Recorded before this decision yields: a concurrent request's fence,
+        // resuming right after it, must see the failure (#485).
+        this.recordDirectiveFailure(turn, error);
+        throw error;
       }
-      // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by
-      // name. The CLI reads the strings "true"/"false" as booleans; anything else that is not plainly
-      // a foreground call is refused too.
-      const background = request.input['run_in_background'];
-      if (background !== undefined && background !== false && background !== 'false') {
-        throw new DirectiveCheckpointError('a directive turn cannot start a background task: its completion would outlive the turn');
-      }
-      turn.directive.beforeAdmission();
-      if (readDirectiveBinding(this.sessionFile, turn.directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest()) {
-        throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect');
-      }
-      assertClaudeDirectiveToolIntent(this.sessionFile, turn.directive.identity, request.toolUseId, request.toolName, request.input);
-      return { allow: true };
     }).catch((error: unknown): ClaudeToolDecision => {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = thrownText(error);
       this.recordGuardRefusal(turn.producer, request.toolUseId, reason);
-      turn.failure ??= error;
+      this.recordDirectiveFailure(turn, error);
       // The deny is written first (this decision's own continuation); the
       // turn ends right after it.
       setImmediate(() => this.failDirective(turn, error, abortTurn));
@@ -2138,6 +2219,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       let settled = false;
       let failed = false;
       let failure = '';
+      /** The turn failed as GC's own directive refusal (#485). */
+      let refused = false;
       let child: ChildProcess;
       let stderrTail = '';
 
@@ -2267,12 +2350,18 @@ export class ClaudeCodeHandle implements AgentHandle {
 
       // Mark the turn failed (loud, once). Settling happens in the close
       // handler so the transcript stream is always flushed first.
-      const failTurn = (detail: string): void => {
+      // A directive turn's failure is a native directive refusal (#485) when
+      // the caller names its cause and that cause is GC's own refusal: a
+      // fence's error, the permission channel's deny, or, at the turn's end,
+      // the failure the turn recorded when nothing reported one sooner. An
+      // unrelated failure (the process, a foreign session) names no cause.
+      const failTurn = (detail: string, cause?: unknown): void => {
         if (failed) return;
         failed = true;
         failure = detail;
+        refused = turn !== null && isNativeDirectiveRefusal(cause);
         if (!this.disposed) {
-          this.emit({ type: 'error', error: detail, fatal: false });
+          this.emit({ type: 'error', error: detail, fatal: false, ...(refused ? { nativeControl: 'directive-refusal' as const } : {}) });
           this.setState('error', detail);
         }
       };
@@ -2304,8 +2393,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       let escalation: ReturnType<typeof setTimeout> | null = null;
       /** A live directive child already reported an error (handled once). */
       let liveError = false;
-      const abortTurn = (detail: string): void => {
-        failTurn(detail);
+      const abortTurn = (detail: string, cause?: unknown): void => {
+        failTurn(detail, cause);
         if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
         try { child.stdin?.end(); } catch { /* already closed */ }
         try { child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -2328,23 +2417,26 @@ export class ClaudeCodeHandle implements AgentHandle {
               transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
                 // A lost frame leaves the directive's record incomplete: no delivery.
                 try {
-                  if (error != null) this.failDirective(turn, new DirectiveCheckpointError(`directive transcript write failed: ${error.message}`), abortTurn);
+                  if (error != null) this.failDirective(turn, ownIoRefusal('transcript write', error), abortTurn);
                 } catch (failure) {
-                  // The directive still fails, and its CLI is still ended.
-                  turn.failure ??= failure;
-                  this.log('error', 'directive failure handling threw after a lost transcript write', { error: failure instanceof Error ? failure.stack ?? failure.message : String(failure) });
-                  // abortTurn cannot throw: its signals are guarded and event
-                  // listeners are isolated by emit().
-                  abortTurn(`directive failure handling threw: ${failure instanceof Error ? failure.message : String(failure)}`);
+                  // The directive still fails, and its CLI is still ended. An
+                  // earlier failure still owed its report stays the turn's.
+                  // recordDirectiveFailure keeps the failure in memory, and
+                  // emit() isolates abortTurn's listeners; no guard is added.
+                  const owed = this.recordDirectiveFailure(turn, failure);
+                  this.log('error', 'directive failure handling threw after a lost transcript write', { error: thrownDetail(failure) });
+                  abortTurn(owed === failure ? `directive failure handling threw: ${thrownText(failure)}` : `directive refused: ${thrownText(owed)}`, owed);
                 } finally {
                   resolveWritten();
                 }
               });
             })
             : new Promise<void>((resolveDurable, rejectDurable) => {
+              // A lost gating frame is GC's own transcript I/O: its refusal.
+              const lost = (error: unknown): void => rejectDurable(ownIoRefusal('transcript write', error));
               transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
-                if (error != null) { rejectDurable(error); return; }
-                try { syncTranscript(params.sessionFile); resolveDurable(); } catch (syncError) { rejectDurable(syncError); }
+                if (error != null) { lost(error); return; }
+                try { syncTranscript(params.sessionFile); resolveDurable(); } catch (syncError) { lost(syncError); }
               });
             });
           durable.catch(() => { /* each consumer observes it */ });
@@ -2400,7 +2492,7 @@ export class ClaudeCodeHandle implements AgentHandle {
             // A directive refuses everything after this (admission, tools,
             // completion). Ends stdin too (a directive turn keeps it open)
             // and escalates to SIGKILL for a CLI that ignores SIGTERM.
-            if (turn !== null) turn.failure ??= new DirectiveCheckpointError(`the CLI reported a foreign session (${init.sessionId || '(empty)'}, not ${params.sessionId})`);
+            if (turn !== null) this.recordDirectiveFailure(turn, new DirectiveCheckpointError(`the CLI reported a foreign session (${init.sessionId || '(empty)'}, not ${params.sessionId})`));
             abortTurn(
               `session id mismatch: requested ${params.sessionId}, claude reported ` +
                 `${init.sessionId || '(empty)'} — refusing to continue a foreign session`,
@@ -2447,16 +2539,22 @@ export class ClaudeCodeHandle implements AgentHandle {
           : [...claudeTurnArgs({ ...params, verificationSettingsFile: turn.settings.file }, this.sessionEstablished), '--replay-user-messages'];
         // The CLI child is an independent physical controller of the turn:
         // only its observed close (at this handle's cessation) proves it gone.
-        if (turn !== null) recordDirectiveIndependentController(turn.producer);
+        if (turn !== null) withOwnIo('controller receipt', () => recordDirectiveIndependentController(turn.producer));
         child = (params.spawnProcess ?? spawn)(params.binary, args, {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           ...claudeChildEnv(params),
         });
       } catch (error) {
-        // Synchronous spawn faults (async ENOENT arrives via 'error').
-        this.onInfraError(error);
-        failTurn(`claude process failed to spawn: ${String(error)}`);
+        if (turn !== null && isNativeDirectiveRefusal(error)) {
+          // GC's own controller receipt failed: no CLI was started (#485).
+          const failure = this.recordDirectiveFailure(turn, error);
+          failTurn(`directive refused: ${thrownText(failure)}`, failure);
+        } else {
+          // Synchronous spawn faults (async ENOENT arrives via 'error').
+          this.onInfraError(error);
+          failTurn(`claude process failed to spawn: ${thrownText(error, 'string')}`);
+        }
         turn?.settings.dispose();
         keepNotice();
         transcript.end(() => settle(new Error(failure)));
@@ -2524,7 +2622,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         // admission was never published at all — is no success, whatever the
         // CLI reported.
         if (turn !== null && turn.failure !== null && !failed) {
-          failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`);
+          failTurn(`directive turn refused: ${thrownText(turn.failure.error)}`, turn.failure.error);
         }
         if (turn !== null && turn.admitted === null && !failed && translator.result !== null) {
           failTurn('directive turn ended without the CLI\'s admission echo; nothing it did counts as delivered');
@@ -2551,6 +2649,23 @@ export class ClaudeCodeHandle implements AgentHandle {
           settle(null);
           return;
         }
+        // The refusal is GC's, but an API error the CLI reported on the main
+        // thread of the same turn is the provider's (#485): emitted untagged
+        // so supervision classifies it, even when the abort cut off its
+        // result. After a refusal GC reports the last main-thread API error it
+        // saw, even one the CLI's own result would drop (a wall seen is a
+        // wall), unless a later real main-thread call cleared it (the CLI's
+        // own `<synthetic>` replies do not), with an error result's text when
+        // there is one, through the ordinary path's own text helper. That is a
+        // main-thread API-error frame with text, a status or a code, or a
+        // result that carries an API status. A subagent's API error, and a
+        // result error the abort itself caused, are not the turn's. Any other
+        // failed turn reports only its own failure.
+        const apiError = translator.apiError;
+        if (refused && ((apiError !== null && (apiError.text.trim() !== '' || apiError.status !== null || apiError.code !== null)) || (result?.apiErrorStatus ?? null) !== null)) {
+          this.emit(claudeInBandError(result?.isError === true ? result : { subtype: 'error', isError: true, text: null, apiErrorStatus: result?.apiErrorStatus ?? null },
+            apiError, translator.init?.model ?? params.model ?? null));
+        }
         if (!failed) {
           const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
           failTurn(
@@ -2575,13 +2690,43 @@ export class ClaudeCodeHandle implements AgentHandle {
       if (turn !== null) {
         // Every tool asks the host (#424); the lane's verification policy rides along.
         directivePermissions = new ClaudeDirectivePermissionChannel(child, {
-          fail: (message) => abortTurn(message),
+          // The failure after the channel's own deny reports the turn's
+          // failure: that deny, or an earlier one still owed its report, with
+          // its own text and as its own cause (#485).
+          fail: (message, refused) => {
+            const report = refused as { readonly failure: unknown; readonly owed: boolean } | undefined;
+            if (report === undefined) abortTurn(message);
+            else abortTurn(report.owed ? `directive refused: ${thrownText(report.failure)}` : message, report.failure);
+          },
           // A deny the channel wrote itself is a refusal like the fence's (#424).
           refused: (toolUseId, reason) => {
-            this.recordGuardRefusal(turn.producer, toolUseId, reason);
-            turn.failure ??= new DirectiveCheckpointError(reason);
+            const refusal = new DirectiveCheckpointError(reason);
+            this.recordGuardRefusal(turn.producer, toolUseId, refusal.message);
+            const failure = this.recordDirectiveFailure(turn, refusal);
+            return { failure, owed: failure !== refusal };
+          },
+          // The channel's backstop for a GC bug in refused() or fail() above,
+          // which don't throw in production (#485): the turn fails as a tagged
+          // handling refusal, unless it has already reported a failure.
+          failRefused: (reason) => {
+            const refusal = new DirectiveCheckpointError(reason);
+            let unrecorded: { readonly error: unknown } | null = null;
+            try {
+              this.recordDirectiveFailure(turn, refusal);
+            } catch (error) {
+              unrecorded = { error };
+            }
+            turn.failure ??= { error: refusal };
+            const failure = turn.failure.error;
+            abortTurn(failure === refusal ? reason : `directive refused: ${thrownText(failure)}`, failure);
+            if (unrecorded !== null) {
+              this.log('error', 'claude directive refusal could not be recorded; the turn is refused regardless', { request: turn.directive.identity.requestId, error: thrownDetail(unrecorded.error) });
+            }
           },
           decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
+          confirm: (request) => this.confirmDirectiveTool(turn, request),
+          log: (message, fields) => this.log('error', message, fields),
+          killGraceMs: params.killGraceMs,
           ...(params.workerVerification !== undefined ? { verification: params.workerVerification } : {}),
         });
         directivePermissions.start();

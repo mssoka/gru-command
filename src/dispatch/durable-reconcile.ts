@@ -10,6 +10,8 @@ import {
   type UnmarkedReconcileReport,
 } from './obligations.js';
 import { REPORT_BACKFILL_EVENT } from '../ledger/obligations.js';
+import { BRIEFING_REVIEW_OBLIGATION_ACTION, BRIEFING_REVIEW_VERDICT } from '../briefing-review/events.js';
+import { BRIEFING_REVIEW_JOB_PREFIX } from '../briefing-review/types.js';
 import { settleDirectivesFromEvidence, type DirectiveEvidenceReport } from './rebrief-recovery.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -107,6 +109,8 @@ export interface ReportClosureReport extends Record<string, unknown> {
   readonly examined: number;
   readonly superseded: number;
   readonly opened: number;
+  /** Nefario lens debts answered by the lens's accepted result (GH-505). */
+  readonly answered: number;
   readonly published: number;
   readonly failed: number;
 }
@@ -210,6 +214,7 @@ export function reconcileReportClosures(
   let failed = 0;
   let examined = 0;
   let opened = 0;
+  let answered = 0;
   let published = 0;
 
   // (1+2) Backstop + card, paged under a durable cursor.
@@ -236,6 +241,26 @@ export function reconcileReportClosures(
             deps.log?.('error', 'delivered report job has no delivery event — cannot open its obligation', { job: job.id });
           }
           continue; // report acceptance or an ineligible delivery is not completion
+        }
+        // Nefario lens jobs (GH-505): an accepted lens result IS the
+        // disposition of that lens's own report. The debt only opens here
+        // because the lane's turn ended after it submitted, so it is settled
+        // as acted instead of paging Gru once per lens.
+        if (job.id.startsWith(BRIEFING_REVIEW_JOB_PREFIX)) {
+          const accepted = deps.ledger.latestJobEvent(job.id, BRIEFING_REVIEW_VERDICT);
+          if (accepted !== null) {
+            deps.ledger.settleObligation({
+              obligationId: active.id,
+              settlement: {
+                kind: 'executed-action',
+                action: BRIEFING_REVIEW_OBLIGATION_ACTION,
+                evidenceEventSeq: accepted.seq,
+                evidenceEventKind: BRIEFING_REVIEW_VERDICT,
+              },
+            });
+            answered += 1;
+            continue;
+          }
         }
         // The card: live debts only. A backfilled debt was surfaced to the
         // owner as a dry-run row before --apply, so carding it here would
@@ -315,7 +340,7 @@ export function reconcileReportClosures(
   }
   deps.ledger.writeReconcileCursor({ scope: REPORT_SUPERSEDE_SCOPE, cursor: supersedeCursor });
 
-  return { examined, superseded, opened, published, failed };
+  return { examined, superseded, opened, answered, published, failed };
 }
 
 /** The durable supersede reason for a report's target, or null when the
