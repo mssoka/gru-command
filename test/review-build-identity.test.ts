@@ -209,6 +209,12 @@ describe('installed Perkins runtime identity', () => {
     expect(() => reviewRuntimeVersion(root)).toThrow('requires a usable pinned Python 3 executable');
     expect(() => reviewRuntimeVersion(root)).not.toThrow('credential-looking-secret');
   });
+  // The installed-tree fingerprint walks every executable file for each of
+  // the mutations below; on GitHub's Linux runners that is ~195-203s in a
+  // green full suite and 395s when the four-worker fast phase runs on a
+  // loaded co-tenant host (#511). 300s cut a run that was still making
+  // progress, so this case carries the budget its CPU-bound work needs
+  // rather than a suite-wide increase. The assertions are unchanged.
   it('fingerprints the actual npm tarball without a package-lock and fails closed on missing provenance', () => {
     const { root, identity } = packageIdentity();
     expect(identity).toMatch(/^[a-f0-9]{64}$/u);
@@ -280,7 +286,7 @@ describe('installed Perkins runtime identity', () => {
     rmSync(dependency);
     rmSync(join(root, 'dist', 'review-dependency-identity.json'));
     expect(() => reviewRuntimeVersion(root)).toThrow();
-  }, 300_000);
+  }, 600_000);
 
   it('resolves a hoisted installed dependency by the Node ancestor lookup', () => {
     const { root, identity } = packageIdentity();

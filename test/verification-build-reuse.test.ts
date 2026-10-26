@@ -545,7 +545,13 @@ describe('verification build reuse (#318)', () => {
 
   it('a timeout mid-build kills the run, leaves later steps unrun and is not inherited', async () => {
     const lane = makeLane();
-    const scheduler = makeScheduler({ runTimeoutMs: 1_500 });
+    // This one scheduler's ceiling must sit on both sides of the fixture's
+    // 30s slow build: short enough that the slow build cannot finish, and
+    // long enough that the follow-up healthy four-step run is never itself
+    // timed out. 1.5s coupled those two unrelated budgets — under CI
+    // co-tenant load the follow-up run was killed inside its npm startup
+    // (#511), so it now gets the same 10s headroom as any other run here.
+    const scheduler = makeScheduler({ runTimeoutMs: 10_000 });
     lane.flag('slow-build');
     const timed = await run(scheduler, lane, 'docs', DOCS);
     expect(timed.ok).toBe(false);
@@ -557,6 +563,7 @@ describe('verification build reuse (#318)', () => {
     expect(count(lane.steps(), 'config-docs')).toBe(0);
     lane.unflag('slow-build');
     const next = await run(scheduler, lane, 'static', STATIC);
+    expect(next.timedOut).toBe(false);
     expect(next.ok).toBe(true);
     expect(next.checks?.[3]).toMatchObject({ status: 'passed', ran: true, reuseRefusal: 'no-prior-build' });
     expect(count(lane.steps(), 'build')).toBe(2);
