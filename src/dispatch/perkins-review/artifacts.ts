@@ -337,17 +337,27 @@ async function inTime<T>(read: Promise<T>, remaining: (() => number) | undefined
 }
 
 /** Members of group `pgid` from `ps -A -o pid=,pgid=,stat=` output, or null
- * when any line cannot be read (R8-3). */
+ * when OUR membership cannot be established (R8-3). A line whose pid or
+ * group does not parse leaves the table unreliable, and so does a member of
+ * ours whose state does not: unknown is live. A row whose pid and group both
+ * parse and whose group is NOT ours says nothing about our group in ANY
+ * state — `ps` prints `?` for a process it cannot fully stat, and one such
+ * foreign row must never void the table (and with it a stopped group) as it
+ * did in #511. */
 export function psGroupMembers(stdout: string, pgid: number): GroupMember[] | null {
   const members: GroupMember[] = [];
   for (const line of stdout.split('\n')) {
     if (line.trim() === '') continue;
     const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/u.exec(line);
-    if (match === null || !PS_STATE.test(match[3]!)) return null;
+    if (match === null) return null;
     const pid = Number(match[1]);
     const group = Number(match[2]);
     if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(group)) return null;
-    if (group === pgid) members.push({ pid, state: match[3]! });
+    // Proven not ours: its own pid and group parsed, so its state cannot
+    // speak for our group — a `?E` foreign row is simply not membership.
+    if (group !== pgid) continue;
+    if (!PS_STATE.test(match[3]!)) return null; // ours, unreadable state: unknown, so live.
+    members.push({ pid, state: match[3]! });
   }
   return members;
 }
