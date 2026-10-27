@@ -167,6 +167,8 @@ export class SessionStore {
   private readonly backupDir: string;
   private readonly stateFile: string;
   private readonly baselineFile: string;
+  /** The intended baseline, written before the pass's copies (see runBackup). */
+  private readonly baselinePendingFile: string;
   private readonly retention: number;
   private readonly backupMaxAgeMs: number;
   private readonly log: StoreLog;
@@ -191,6 +193,7 @@ export class SessionStore {
     this.backupDir = join(this.sessionsDir, 'backups');
     this.stateFile = join(this.sessionsDir, 'store-state.json');
     this.baselineFile = join(this.sessionsDir, 'backup-baseline.json');
+    this.baselinePendingFile = join(this.sessionsDir, 'backup-baseline.json.pending');
     this.retention = opts.retention ?? DEFAULT_BACKUP_RETENTION;
     this.backupMaxAgeMs = opts.backupMaxAgeMs ?? BACKUP_MAX_AGE_MS;
     this.log = opts.log ?? (() => {});
@@ -707,7 +710,13 @@ export class SessionStore {
     for (const [key, entry] of Object.entries(baseline)) {
       if (!scanned.has(key)) next[key] = entry;
     }
-    const created: string[] = [];
+    // Decide first, copy second: the baseline that records this pass's
+    // intended copies is written BEFORE the copies, so a copy's identity is
+    // durable before any prune can act on it. A crash, or an unpublishable
+    // final baseline, then leaves a recorded generation that exists or that
+    // the next pass repairs — never an unrecorded copy that a later prune can
+    // delete.
+    const copies: { readonly source: SessionSourceScan; readonly dest: string }[] = [];
     let skipped = 0;
     for (const source of sources) {
       const previous = baseline[source.key];
@@ -734,51 +743,71 @@ export class SessionStore {
         });
       }
       const name = `${source.backupKey}.${stamp}${BACKUP_SUFFIX}`;
-      const dest = join(this.backupDir, name);
+      next[source.key] = {
+        size: source.size,
+        mtimeMs: source.mtimeMs,
+        ctimeMs: source.ctimeMs,
+        backup: name,
+      };
+      copies.push({ source, dest: join(this.backupDir, name) });
+    }
+    try {
+      this.writeBaseline(next, this.baselinePendingFile);
+    } catch (error) {
+      // A pass that cannot record what it is about to write must not write
+      // it: no copies and no prune. The previous baseline (and its
+      // generations) stay exactly as they were, and the next pass retries.
+      this.log('warn', "session backup baseline could not be written — this pass's copies are deferred", {
+        baselineFile: this.baselineFile,
+        error: String(error),
+      });
+      return { created: [], pruned: [], skipped };
+    }
+    const created: string[] = [];
+    for (const copy of copies) {
       // Copy to a staging name and rename into the slot: a failed copy (disk
       // full, source gone mid-copy) must never truncate the generation this
       // same slot may already hold and the baseline may already record.
-      const staging = `${dest}.tmp-${process.pid}`;
+      const staging = `${copy.dest}.tmp-${process.pid}`;
       try {
-        copyFileSync(source.file, staging);
-        renameSync(staging, dest);
-        created.push(dest);
-        next[source.key] = {
-          size: source.size,
-          mtimeMs: source.mtimeMs,
-          ctimeMs: source.ctimeMs,
-          backup: name,
-        };
+        copyFileSync(copy.source.file, staging);
+        renameSync(staging, copy.dest);
+        created.push(copy.dest);
       } catch (error) {
         try {
           unlinkSync(staging);
         } catch {
           /* nothing was written, or the cleanup raced the failure */
         }
-        // The previous recorded generation stays protected (its older
-        // fingerprint can never skip a changed source), and the next pass
-        // retries this one.
-        if (previous !== undefined) next[source.key] = previous;
-        this.log('warn', 'session backup copy failed', { file: source.file, error: String(error) });
+        // The recorded generation is now missing; the next pass repairs it
+        // from the recorded fingerprint. The previous generation stays
+        // protected this pass by the union below.
+        this.log('warn', 'session backup copy failed', { file: copy.source.file, error: String(error) });
       }
     }
-    // Every generation the baseline records — a copy made this pass and the
-    // recorded generation of an unchanged source alike — is protected from
-    // this pass's prune, so the baseline never names a file the pass deleted.
-    const recordedGenerations = new Set(Object.values(next).map((entry) => entry.backup));
+    this.persistSnapshotFromSources(sources);
+    // Every generation the baseline records — this pass's intended copies,
+    // an unchanged source's recorded copy, and every entry the previous
+    // baseline named — is protected from this pass's prune, so a failed copy
+    // never costs the source its last good snapshot and the baseline never
+    // names a file the pass deleted.
+    const recordedGenerations = new Set([
+      ...Object.values(next).map((entry) => entry.backup),
+      ...Object.values(baseline).map((entry) => entry.backup),
+    ]);
     // A fresh flat listing for the prune, taken AFTER the copies so the count
     // rule sees the generations this pass added.
     const presentAfter = this.listBackupGenerations();
     const pruned = this.pruneBackups(live, recordedGenerations, presentAfter, now);
-    this.persistSnapshotFromSources(sources);
     try {
-      this.writeBackupBaseline(next);
+      this.publishBaseline();
     } catch (error) {
-      // The boot pass is NOT guarded (registry.boot calls runBackup directly);
-      // an un-replaceable baseline target must not refuse service startup.
-      // The copies and the size snapshot stay, and the next pass retries.
-      this.log('warn', 'session backup baseline could not be written — the next pass retries', {
+      // The unguarded boot pass must not refuse startup over an
+      // un-replaceable final path: the pending record stays and is preferred
+      // by the next pass, so no recorded identity is lost.
+      this.log('warn', 'session backup baseline could not be published — the pending record is kept', {
         baselineFile: this.baselineFile,
+        pendingFile: this.baselinePendingFile,
         error: String(error),
       });
     }
@@ -897,9 +926,21 @@ export class SessionStore {
     readonly baseline: { readonly [key: string]: BackupBaselineEntry };
     readonly state: 'ok' | 'missing' | 'corrupt';
   } {
+    // A pending record is the previous pass's intended baseline, written
+    // before its copies; it is preferred when it is valid (the final file may
+    // be older, or unpublishable).
+    const pending = this.readBaselineFile(this.baselinePendingFile);
+    if (pending.state === 'ok') return pending;
+    return this.readBaselineFile(this.baselineFile);
+  }
+
+  private readBaselineFile(file: string): {
+    readonly baseline: { readonly [key: string]: BackupBaselineEntry };
+    readonly state: 'ok' | 'missing' | 'corrupt';
+  } {
     let text: string;
     try {
-      text = readFileSync(this.baselineFile, 'utf-8');
+      text = readFileSync(file, 'utf-8');
     } catch (error) {
       return {
         baseline: {},
@@ -936,13 +977,13 @@ export class SessionStore {
     }
   }
 
-  /** Atomic rewrite of the change baseline (staging + rename, like the snapshot). */
-  private writeBackupBaseline(sources: { readonly [key: string]: BackupBaselineEntry }): void {
+  /** Atomic write of a baseline record to `path` (staging + rename). */
+  private writeBaseline(sources: { readonly [key: string]: BackupBaselineEntry }, path: string): void {
     const baseline: BackupBaseline = { version: BACKUP_BASELINE_VERSION, sources };
-    const staging = `${this.baselineFile}.tmp-${process.pid}`;
+    const staging = `${path}.tmp-${process.pid}`;
     writeFileSync(staging, `${JSON.stringify(baseline, null, 2)}\n`, 'utf-8');
     try {
-      renameSync(staging, this.baselineFile);
+      renameSync(staging, path);
     } catch (error) {
       try {
         unlinkSync(staging);
@@ -951,6 +992,11 @@ export class SessionStore {
       }
       throw error;
     }
+  }
+
+  /** Publish the pass's pending record as the baseline the next pass reads. */
+  private publishBaseline(): void {
+    renameSync(this.baselinePendingFile, this.baselineFile);
   }
 
   /** All session jsonl files under the sessions dir (backups/state excluded). */

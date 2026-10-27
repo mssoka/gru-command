@@ -463,9 +463,13 @@ prompt/tool content, so nothing but the owner should traverse it.
   change baseline is the separate file
   `<data_dir>/sessions/backup-baseline.json`
   (`{"version":1,"sources":{"<sessions-relative path>":{"size":N,"mtimeMs":M,"ctimeMs":C,"backup":"<generation file name>"}}}`),
-  so a restart copies nothing for unchanged sources; a missing or corrupt
-  baseline copies each source once and rewrites it, and a live source whose
-  recorded generation is gone is copied again. Pruning keeps the newest
+  so a restart copies nothing for unchanged sources; each pass records its
+  intended copies in `backup-baseline.json.pending` BEFORE copying and
+  publishes that record when the pass completes (a pass that cannot record
+  writes nothing; a record that cannot be published is preferred by the next
+  pass, so a copy's identity is never lost). A missing or corrupt baseline
+  copies each source once and rewrites it, and a live source whose recorded
+  generation is gone is copied again. Pruning keeps the newest
   24 generations of a live source and deletes generations whose ISO hour
   ended more than 7 days ago, but never the newest generation and never a
   generation the baseline records — they can differ after a clock step or a

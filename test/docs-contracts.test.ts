@@ -75,6 +75,7 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain('"ctimeMs":C');
     expect(runtimes).toContain('"backup":"<generation file name>"');
     expect(runtimes).toContain('unchanged sources are not copied at all');
+    expect(runtimes).toContain('backup-baseline.json.pending');
     expect(runtimes).toContain('a live source whose recorded generation is gone is copied again');
     expect(runtimes).toContain(`newest ${DEFAULT_BACKUP_RETENTION} generations of a live source`);
     expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);

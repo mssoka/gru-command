@@ -844,12 +844,40 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     // The boot pass is unguarded: an un-replaceable baseline must be a warn,
     // never a refused startup.
     expect(thrown).toBeNull();
-    expect(warnings.some((msg) => msg.includes('baseline could not be written'))).toBe(true);
-    expect(pass?.created.length ?? 0).toBe(1);
-    // Once the target is replaceable again, the next pass records normally.
+    expect(warnings.some((msg) => msg.includes('baseline could not be published'))).toBe(true);
+    expect(pass?.created.length ?? 0).toBe(1); // the copy itself happened
+    // The pending record survives the failed publish and is preferred next.
+    expect(existsSync(join(store.sessionsDir, 'backup-baseline.json.pending'))).toBe(true);
     rmSync(baselinePath(store), { recursive: true, force: true });
-    expect(restarted.runBackup(new Date('2026-10-01T12:05:00Z')).created.length).toBe(1);
+    const published = restarted.runBackup(new Date('2026-10-01T12:05:00Z'));
+    expect(published.created).toEqual([]); // unchanged since the pending record's copy
+    expect(existsSync(join(store.sessionsDir, 'backup-baseline.json.pending'))).toBe(false);
     expect(Object.keys(readBaseline(restarted).sources)).toHaveLength(1);
+  });
+
+  it('keeps the last copy when a pass cannot publish its baseline and the source then vanishes', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'gone.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z')); // G1 recorded
+    appendFileSync(file, 'two\n', 'utf-8');
+    store.runBackup(new Date('2026-10-03T10:05:00Z')); // G3 recorded (newest name)
+    appendFileSync(file, 'three\n', 'utf-8');
+    // The final baseline cannot be replaced, so this pass's copy (stamped
+    // BEFORE the recorded name after a backwards clock) is only in the
+    // pending record until it can be published.
+    rmSync(baselinePath(store));
+    mkdirSync(baselinePath(store));
+    const last = store.runBackup(new Date('2026-10-02T10:05:00Z'));
+    expect(last.created.length).toBe(1);
+    expect(existsSync(join(store.sessionsDir, 'backup-baseline.json.pending'))).toBe(true);
+    rmSync(file);
+
+    // Every generation is over-age; the pending record names the actual last
+    // copy, so it survives even though it sorts before a stale generation.
+    const overAge = store.runBackup(new Date('2026-10-20T10:05:00Z'));
+    expect(overAge.created).toEqual([]);
+    expect(existsSync(last.created[0]!)).toBe(true);
+    expect(readFileSync(last.created[0]!, 'utf-8')).toBe('one\ntwo\nthree\n');
   });
 });
 
@@ -1176,8 +1204,12 @@ describe('SessionStore backup pass failure handling', () => {
     const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
     expect(failed.created).toEqual([]);
     expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
-    // Not recorded: the next pass must retry instead of trusting it forever.
-    expect(Object.keys(readBaseline(store).sources)).toEqual([]);
+    // The identity is recorded BEFORE the copy (so a later prune cannot lose
+    // an unrecorded generation); the recorded generation is missing, so the
+    // next pass repairs it instead of trusting it forever.
+    const entries = Object.entries(readBaseline(store).sources);
+    expect(entries).toHaveLength(1);
+    expect(existsSync(join(store.sessionsDir, 'backups', entries[0]![1].backup))).toBe(false);
 
     rmSync(join(store.sessionsDir, 'backups', destName), { recursive: true, force: true });
     const retried = store.runBackup(new Date('2026-10-01T12:05:00Z'));
@@ -1204,9 +1236,10 @@ describe('SessionStore backup pass failure handling', () => {
     const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
     expect(failed.created).toEqual([]);
     expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
-    // The last good snapshot is still the recorded one and survives the prune.
-    expect(readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup).toBe(recorded);
+    // The previous baseline's generation is still protected from the prune
+    // and survives, even though the record now names the intended copy.
     expect(existsSync(first.created[0]!)).toBe(true);
+    expect(backupNames(store)).toContain(recorded);
 
     rmSync(join(store.sessionsDir, 'backups', destName), { recursive: true, force: true });
     expect(store.runBackup(new Date('2026-10-01T12:05:00Z')).created.length).toBe(1);
