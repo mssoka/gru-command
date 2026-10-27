@@ -73,6 +73,122 @@ or uncertain blocks require deliberate repair, never automatic cleanup. Existing
 jobs still resolve verification commands from their original manifests and keep
 their original runtime bindings and paths.
 
+## 1a. Guarded pre-bootstrap dependency patch
+
+A normal `POST /api/dispatch` has no pre-bootstrap edit and follows the existing
+path unchanged. A narrowly-scoped exception is available only when a fresh,
+top-level PR-owing job explicitly includes `prebootstrap_patch` and its
+immutable briefing contains exactly one line:
+
+```text
+GC PRE-BOOTSTRAP DEPENDENCY PATCH AUTHORIZATION: files=requirements.txt
+```
+
+The package must be staged by the trusted operator under the instance's private
+`<data_dir>/prebootstrap-patches/` directory (0700); its regular file must be
+owner-only. The bounded JSON package is at most 1 MiB and the UTF-8 dependency
+file at most 256 KiB. The request names only a plain `.json` basename and the
+SHA-256 of the exact package bytes:
+
+```json
+"prebootstrap_patch": {
+  "package_file": "repair-<request>.json",
+  "package_sha256": "<64 lowercase hex characters>"
+}
+```
+
+Package version 1 is a strict JSON object with no unknown keys:
+
+```json
+{
+  "version": 1,
+  "repository": { "path": "<canonical absolute repo path>", "origin_sha256": "<64 lowercase hex>" },
+  "base": { "commit": "<full fetched commit id>", "tree": "<full Git tree id>" },
+  "authority": {
+    "contract_sha256": "<exact briefing SHA-256>",
+    "work_revision": 0,
+    "authority_epoch": 0,
+    "request_sha256": "<normalized dispatch payload SHA-256>"
+  },
+  "allowlist": ["requirements.txt"],
+  "files": [{
+    "path": "requirements.txt",
+    "before_sha256": "<old content SHA-256>",
+    "after_sha256": "<new content SHA-256>",
+    "content": "<new UTF-8 text>"
+  }]
+}
+```
+
+`origin_sha256` is the SHA-256 of `git remote get-url origin` (so after any
+`insteadOf` rewrite) with surrounding whitespace trimmed. `request_sha256` is
+the SHA-256 of this exact JSON, keys in this order and no whitespace:
+
+```text
+{"version":1,"job_id":…,"repo_path":…,"title":…,"display_name":…,"deliverable":…,"briefing_sha256":…,"completion_handoff":…,"prebootstrap_package_file":…}
+```
+
+`repo_path` and `title` are as posted, `display_name` is the trimmed name or
+`null`, `deliverable` defaults to `"pr"`, `briefing_sha256` is the SHA-256 of
+the briefing, and `completion_handoff` is `{"kind":…,"decision":…}` or `null`.
+Escape every string exactly as ECMAScript `JSON.stringify` would (well-formed
+JSON: `"` and `\\` escaped, control characters as `\u00XX` short escapes,
+lone surrogates well-formed-escaped, all other characters raw) and take the
+SHA-256 over the UTF-8 bytes of that exact serialization — a hand-built
+mismatching digest is refused as `request_mismatch`, never re-derived.
+Report/review metadata is refused for this route. The digest leaves out only the
+package's own SHA-256, which would make it self-referential; the admission
+receipt joins the two digests as `intake_identity_sha256`, the SHA-256 of
+`{"version":1,"request_payload_sha256":…,"package_sha256":…}`. The source and
+package bytes are reread and rehashed at worktree application. Revision/epoch
+must be the initial 0/0 authority; the contract, revision, epoch and the job's
+`working` status are rechecked through setup and up to the briefing.
+
+The supported file grammar is intentionally small: root `requirements.txt`,
+blank/comment lines and pinned `distribution==version` declarations only.
+Existing comment/blank lines must remain identical, and every pin keeps its
+line, name and extras: only its `==version` may change, so no distribution is
+added, removed or moved. No include/constraint files,
+URLs, VCS/path references, options, environment expansion, secrets, manifests,
+setup commands, configuration or other file paths are accepted. Package
+content is never interpreted as a shell command or diff. The patch binds the
+canonical repository path, origin fingerprint, fetched origin commit and tree,
+initial contract, request and old/new content. Local-head fallback is refused.
+
+With the existing per-repository creation lock, GC proves the exact source,
+base/tree, dependency blob, fresh branch/path and no retained creation receipt
+before writing. It applies the one file atomically in the new owned worktree,
+checks the actual changed-path set and records before/after Git tree identities.
+The committed `.gru-command/worktree.toml` cannot be changed by this control;
+the exact existing links/copies/setup flow then runs normally. The worker is not
+spawned until every configured setup step succeeds and current authority still
+matches. Disk floor, repository identity, lane custody and worker pacing remain
+in force. No package means no change to the normal path.
+
+The ledger records `job.prebootstrap-patch-admitted`, the one-time
+`worktree.prebootstrap-patch-creation-claimed` consumption receipt, patch
+start/applied/failure, per-command setup start/spawn/result, setup
+success/failure, `worktree.prebootstrap-publication-failed` and dispatch
+failure. A POST failure after job admission is returned as
+`409 prebootstrap_patch_dispatch_failed` with the job id and readback path, not
+as a pre-admission refusal. Admission/claim receipts bind the request, package,
+authority and intended source; producer receipts add the owned lane path,
+branch and creation-token hash. A lane's failure receipt carries its `stage`,
+`error_class` and `error_sha256`; the dispatch failure receipt carries
+`error_class`, `error_code` and `error_sha256`. The ledger never stores the raw
+message or setup output. Read the authenticated
+`GET /api/dispatch/jobs/<job-id>/prebootstrap-patch` for durable event readback.
+Missing spawn/result receipts mean **unknown**, never process cessation or
+no-effects. A recorded child exit/result is not proof that the entire process
+group ceased; the readback keeps group state explicitly unknown. A consumed
+request is never replayed. A patched lane keeps its creation receipt until its
+worker is admitted (`job.minion-spawned`, then the last pre-briefing check), so
+any earlier failure, including one after setup succeeded, retains the lane, the
+receipt and the evidence; do not retry it, rerun setup, clean the lane or infer
+that an unknown producer stopped. Inspect custody and process records; any
+future attempt requires a separately authorized fresh job and request. The
+endpoint offers no retry or cleanup action.
+
 ## 2. Registry (18b)
 
 The ledger is the authoritative map job → worktree → branch → **processes**:

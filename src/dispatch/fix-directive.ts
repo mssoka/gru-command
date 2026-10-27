@@ -499,6 +499,14 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane', admission: 'none' };
   }
+  // A patched lane's dependency state is proven only by dispatch's own
+  // worker admission (job.minion-spawned, then the receipt spend). A
+  // directive must never spawn a worker into a retained patched lane
+  // before that proof: refuse by name and point at the readback (#495).
+  if (input.ledger.latestJobEvent(input.jobId, 'worktree.prebootstrap-patch-creation-claimed') !== null &&
+      input.ledger.latestJobEvent(input.jobId, 'job.minion-spawned') === null) {
+    throw new Error(`job "${input.jobId}" retains a patched lane whose worker admission is unproven — a directive cannot spawn a worker into it; read GET /api/dispatch/jobs/${encodeURIComponent(input.jobId)}/prebootstrap-patch and use a separately authorized fresh job/request`);
+  }
   guard(); // lane exists: pin original branch before pacing/spawn awaits
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {

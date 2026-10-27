@@ -86,10 +86,12 @@ describe('prune-stale-dist', () => {
     // sweep's card and its follow-through (dist/worktrees/lane-provenance.js,
     // dist/worktrees/sweep-card.js, dist/worktrees/sweep-decisions.js); #494
     // the service boot's [env] step (dist/service-environment.js); #505
-    // Nefario's briefing review (dist/briefing-review/*.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5234);
+    // Nefario's briefing review (dist/briefing-review/*.js); and the
+    // guarded pre-bootstrap dependency patch reader
+    // (dist/worktrees/prebootstrap-patch.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5235);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('797959beeb6a9122805561420b1abb8227ab3d7d24777199f35032102ccc9a1a');
+      .toBe('038e4573980d8b081eec48cca8a744a873dca3e63aaca94502d09c5721397845');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

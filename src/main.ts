@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { bootServiceEnvironment, type ServiceEnvironment } from './service-environment.js';
 import { loadOrCreateIdentity } from './identity.js';
@@ -342,6 +342,7 @@ async function main(): Promise<number> {
   // root (ruling 7). Failure is loud and named (EACCES/ENOSPC never
   // surface as a raw stack).
   const uploadsDir = join(config.dataDir, 'uploads');
+  const preBootstrapPatchRoot = join(config.dataDir, 'prebootstrap-patches');
   try {
     // 0700 like every other instance dir (chat/, sessions/, ledger/) —
     // uploads will carry user material; not group/world traversable.
@@ -361,6 +362,21 @@ async function main(): Promise<number> {
   } catch (error) {
     logger.error('uploads dir creation failed — refusing to start (SPEC ruling 19)', {
       path: uploadsDir,
+      error: String(error),
+    });
+    return 1;
+  }
+  // Hash-pinned pre-bootstrap package material is private instance data,
+  // separate from project checkouts and protected at every service start.
+  try {
+    mkdirSync(preBootstrapPatchRoot, { recursive: true, mode: 0o700 });
+    const patchRootStat = lstatSync(preBootstrapPatchRoot);
+    if (!patchRootStat.isDirectory() || patchRootStat.isSymbolicLink()) throw new Error('prebootstrap package root must be a real directory, not a symlink');
+    if ((patchRootStat.mode & 0o777) !== 0o700) chmodSync(preBootstrapPatchRoot, 0o700);
+    logger.info('prebootstrap_patch_root', { path: preBootstrapPatchRoot });
+  } catch (error) {
+    logger.error('private prebootstrap package directory creation failed — refusing to start', {
+      path: preBootstrapPatchRoot,
       error: String(error),
     });
     return 1;
@@ -1169,6 +1185,7 @@ async function main(): Promise<number> {
     root: config.worktrees.root,
     preserveRoot: config.worktrees.preserveRoot,
     setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    preBootstrapPatchRoot,
     onBaseFallback: ({ repoName, worktreeId, defaultBranch, sha, detail }) => {
       // Degraded lane creation (owner incident 2026-09-23): origin could
       // not be fetched, so the lane branched from the host clone's local
@@ -1313,6 +1330,7 @@ async function main(): Promise<number> {
     bus,
     parentTools: parentToolsFor,
     reviewSource: gitReviewSourcePreflight,
+    preBootstrapPatchRoot,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
