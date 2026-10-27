@@ -86,7 +86,10 @@ describe('owned-group liveness over ps (#511)', () => {
       vi.mocked(spawnSync).mockReturnValue(listing(null, '') as never);
       failsWith('ETIMEDOUT');
       expect(groupHasLiveMember(ABSENT_GROUP, 0)).toBe(true);
+      // The async reader runs its OWN listing (`execFile`), never the sync one.
+      expect(execFile).not.toHaveBeenCalled();
       await expect(groupHasLiveMemberAsync(ABSENT_GROUP, 0)).resolves.toBe(true);
+      expect(execFile).toHaveBeenCalled();
       // The other half of the same guard: a run that reported success with
       // nothing to read is unknown too.
       vi.mocked(spawnSync).mockReturnValue(listing(0, null) as never);
@@ -99,7 +102,9 @@ describe('owned-group liveness over ps (#511)', () => {
       vi.mocked(spawnSync).mockReturnValue(listing(0, CLEAN_TABLE) as never);
       completesWith(CLEAN_TABLE);
       expect(groupHasLiveMember(ABSENT_GROUP, 5_000)).toBe(false);
+      expect(execFile).not.toHaveBeenCalled();
       await expect(groupHasLiveMemberAsync(ABSENT_GROUP, 5_000)).resolves.toBe(false);
+      expect(execFile).toHaveBeenCalled();
     });
   });
 
@@ -108,7 +113,9 @@ describe('owned-group liveness over ps (#511)', () => {
       vi.mocked(spawnSync).mockReturnValue(listing(0, OUR_MEMBER) as never);
       completesWith(OUR_MEMBER);
       expect(groupHasLiveMember(ABSENT_GROUP, 5_000)).toBe(true);
+      expect(execFile).not.toHaveBeenCalled();
       await expect(groupHasLiveMemberAsync(ABSENT_GROUP, 5_000)).resolves.toBe(true);
+      expect(execFile).toHaveBeenCalled();
     });
   });
 });

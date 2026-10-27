@@ -1435,7 +1435,7 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(executingMember(psGroupMembers(table, absent))).toBe(false);
   });
 
-  it('ps membership stays fail-closed where it must — a sleeping member of ours, our own unreadable state, a failed ps run — while a clean listing without our group is stopped (#511 preservation)', async () => {
+  it('ps membership stays fail-closed where it must — a sleeping member of ours, our own unreadable state, a failed ps run — while a clean listing without our group is stopped (#511 preservation)', () => {
     // Above every platform's pid_max: provably no live process shares this
     // group, so a clean listing really has no rows for it.
     const absent = 2_000_000_001;
@@ -1445,28 +1445,12 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(executingMember(psGroupMembers(`  41001 ${absent} Zbroken\n`, absent))).toBe(true);
     expect(executingMember(psGroupMembers(`  41001 ${absent} z\n`, absent))).toBe(true);
     // 3. A `ps` run that fails (non-zero status, or no string to read) is
-    // unknown, so live. `platform` pins the ps reader on every host (CI is
-    // Linux, where the untouched /proc reader would answer instead) and group
-    // existence is forced for a group no process can have, so both answers of
-    // the same call are pinned side by side: a listing that COMPLETES has no
-    // rows for our group and answers stopped, while the same call on a budget
-    // no listing can meet (production floors a zero budget to 1 ms) answers
-    // live. The branch itself is pinned BY CONSTRUCTION in
-    // perkins-group-liveness-ps.test.ts, which stubs the listing; this case
-    // keeps the real reader in the loop (a full listing takes ~14 ms here, so
-    // the 1 ms floor cannot complete).
-    const realPlatform = OWNED_GIT_SEAMS.platform;
-    const existence = vi.spyOn(process, 'kill').mockReturnValue(true);
-    try {
-      OWNED_GIT_SEAMS.platform = 'darwin';
-      expect(groupHasLiveMember(absent, 5_000)).toBe(false);
-      await expect(groupHasLiveMemberAsync(absent, 5_000)).resolves.toBe(false);
-      expect(groupHasLiveMember(absent, 0)).toBe(true);
-      await expect(groupHasLiveMemberAsync(absent, 0)).resolves.toBe(true);
-    } finally {
-      existence.mockRestore();
-      OWNED_GIT_SEAMS.platform = realPlatform;
-    }
+    // unknown, so live — pinned BY CONSTRUCTION in
+    // perkins-group-liveness-ps.test.ts, whose file-scoped `node:child_process`
+    // stub decides the branch with no deadline, spawn latency or host table.
+    // The real reader cannot prove it here: on Linux a listing completes
+    // inside the 1 ms floor production floors a zero budget to, so the same
+    // assertion would red on a host where the code is right.
     // 4. A successful listing with no rows for our group is stopped, unchanged.
     expect(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent)).toEqual([]);
     expect(executingMember(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent))).toBe(false);
