@@ -669,6 +669,39 @@ describe('retained-creation continuation custody', () => {
     }
   });
 
+  it('redacts the token a locked-tree removal echoes through a proven release', async () => {
+    // The non-budget release removes on the event loop (runGit); the same
+    // after-proof lock window makes git echo the lock reason there.
+    const sink = logSink();
+    const h = managerFixture('locked-release-sync-redaction', { log: sink.log });
+    const jobId = 'locked-release-sync-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    const record = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId });
+    const gitFile = readFileSync(join(record.path, '.git'), 'utf8').trim();
+    const admin = resolve(record.path, gitFile.slice('gitdir: '.length));
+    const token = (JSON.parse(readFileSync(join(admin, 'gru-creation-handoff.json'), 'utf8')) as { readonly token: string }).token;
+    expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+    const restore = lockBeforeRemovalGit();
+    try {
+      const thrown = await h.worktrees.release({ worktreeId: jobId, requireReleaseProofs: true, onLiveProcess: 'refuse' })
+        .then(() => null, (failure: unknown) => failure);
+      const aborted = h.ledger.listJobEventsByKinds(jobId, ['worktree.release-aborted']);
+      expect(aborted, `release rejected with: ${thrown instanceof Error ? thrown.message : String(thrown)}`).toHaveLength(1);
+      const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
+      expect(detail).toContain('cannot remove a locked working tree');
+      expect(detail).not.toContain(token);
+      expect(hasRawCreationToken(detail)).toBe(false);
+      const error = thrown as Error;
+      expect(error.message).toContain('<redacted-creation-token>');
+      expect(error.message).not.toContain(token);
+      expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
+    } finally {
+      vi.stubEnv('PATH', restore);
+    }
+  });
+
   it('redacts the token a failing setup command prints from the lane registry', async () => {
     // While a lane is still locked for its creation, `git worktree list
     // --porcelain` prints its lock reason. A setup command that prints it and
