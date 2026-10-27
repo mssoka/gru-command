@@ -391,9 +391,9 @@ The service self-manages:
   name). Change means that fingerprint moved, so an in-place rewrite is
   copied and a metadata-only touch costs one harmless extra copy. Unchanged
   transcripts are never re-copied, however recently they were written; a
-  transcript whose recorded generation has gone missing is copied once
-  more, with a `warn`, so an out-of-band reclaim of the backup directory
-  cannot leave a live transcript without a snapshot. Per live transcript
+  transcript whose recorded generation is missing, damaged or truncated is
+  copied once more, with a `warn`, so an out-of-band reclaim (or damage) of
+  the backup directory cannot leave a live transcript without a snapshot. Per live transcript
   the newest 24 backups are kept, and any generation whose ISO hour ended
   more than 7 days ago is pruned — never the newest generation and never the
   generation the baseline records. After a clock step or a failed baseline
