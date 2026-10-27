@@ -1069,8 +1069,6 @@ describe('SessionStore prune liveness', () => {
   });
 });
 
-});
-
 describe('SessionStore backup pass preservation', () => {
   it('never modifies or removes a live session file', () => {
     const store = new SessionStore(tmpDataDir());
