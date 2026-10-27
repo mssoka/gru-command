@@ -466,10 +466,11 @@ prompt/tool content, so nothing but the owner should traverse it.
   recorded generation is gone is copied again. Pruning keeps the newest
   24 generations of a live source and deletes generations whose ISO hour
   ended more than 7 days ago, but never a source's newest generation and
-  never a copy the current pass just wrote: a live source's last snapshot
-  is never deleted, and a source that is gone keeps exactly its newest
-  backup while its older generations age out (the count rule does not
-  apply to a source that can no longer produce generations). The slot IS
+  never a generation the baseline records: a live source's last snapshot is
+  never deleted, and a source that is gone keeps its newest backup while its
+  older generations age out (the count rule does not apply to a source that
+  can no longer produce generations, so it can hold up to a week of hourly
+  generations). The slot IS
   the ISO hour: a second pass in the same hour refreshes that slot
   (freshest in-slot state wins). Backups copy live files, so a trailing
   line may be partial — recovery tooling must tolerate a torn tail.

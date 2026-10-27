@@ -53,7 +53,7 @@ describe('docs contracts: session backup policy', () => {
     expect(ops).toContain('recorded generation has gone missing');
     // The count rule is scoped to a live transcript; the dead-source rule stays:
     expect(ops).toContain('Per live transcript the newest 24 backups are kept');
-    expect(ops).toContain('A transcript that is gone keeps exactly its newest backup');
+    expect(ops).toContain('A transcript that is gone keeps its newest backup while its older generations age out');
     // The chosen maximum age, derived from the code's default:
     expect(ops).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(ops).toContain('never the newest one');
@@ -77,18 +77,22 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain('newest 24 generations of a live source');
     expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(runtimes).toContain("never a source's newest generation");
-    expect(runtimes).toContain('a source that is gone keeps exactly its newest backup');
+    expect(runtimes).toContain('a source that is gone keeps its newest backup while its older generations age out');
+    expect(runtimes).toContain('never a generation the baseline records');
     // The retired every-pass copy and count-only statements are gone.
     expect(runtimes).not.toContain('tracked session files are copied hourly');
     expect(runtimes).not.toContain('the newest 24 backups are retained');
   });
 
-  it('SPEC.md ruling 12 states changed-only copying, the repair and the newest-generation floor', () => {
+  it('SPEC.md ruling 12 states changed-only copying, the repair and both prune rules', () => {
     const spec = section(doc('SPEC.md'), '12. **Session forensics preserved:**', '13. **Escalations');
     expect(spec).toContain('copies only');
     expect(spec).toContain('backup-baseline.json');
     expect(spec).toContain('re-creates a missing recorded backup');
-    expect(spec).toContain("never prunes a source's newest generation");
+    // Both prune rules, their scopes and the floors:
+    expect(spec).toContain('newest 24 generations of a live source');
+    expect(spec).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
+    expect(spec).toContain('never the newest generation nor one the baseline records');
     expect(spec).not.toContain('hourly rolling backup;');
   });
 });

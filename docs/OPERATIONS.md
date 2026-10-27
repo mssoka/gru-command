@@ -394,9 +394,9 @@ The service self-manages:
   cannot leave a live transcript without a snapshot. Per live transcript
   the newest 24 backups are kept, and any generation whose ISO hour ended
   more than 7 days ago is pruned — never the newest one, which is that
-  transcript's last snapshot. A transcript that is gone keeps exactly its
-  newest backup while its older generations age out (up to a week of
-  hourly generations). Recovery tooling must tolerate a torn tail line.
+  transcript's last snapshot. A transcript that is gone keeps its newest
+  backup while its older generations age out, so it can hold up to a week
+  of hourly generations. Recovery tooling must tolerate a torn tail line.
 - **Chat frames + service log** — size-based rotation with retained
   shards (see above).
 

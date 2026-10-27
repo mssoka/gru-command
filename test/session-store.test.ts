@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync, statSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync, statSync, utimesSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, relative, resolve } from 'node:path';
@@ -598,7 +598,35 @@ describe('SessionStore changed-only backup pass', () => {
     expect(readBaseline(store).version).toBe(1);
   });
 
-  it('one pass performs one tree walk and one stat per source for N sources with M changed copies', () => {
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'a baseline the process cannot read takes the cold-start path',
+    () => {
+      const dataDir = tmpDataDir();
+      const store = new SessionStore(dataDir);
+      seedSource(store, 'gru', 'a.jsonl', 'one\n');
+      store.runBackup(new Date('2026-10-01T10:05:00Z'));
+      chmodSync(baselinePath(store), 0o000);
+
+      const warnings: string[] = [];
+      const restarted = new SessionStore(dataDir, {
+        log: (level, msg) => {
+          if (level === 'warn') warnings.push(msg);
+        },
+      });
+      let pass: ReturnType<SessionStore['runBackup']>;
+      try {
+        pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+      } finally {
+        chmodSync(baselinePath(store), 0o600);
+      }
+      expect(pass.created.length).toBe(1);
+      expect(pass.skipped).toBe(0);
+      expect(warnings.some((msg) => msg.includes('baseline is corrupt'))).toBe(true);
+      expect(Object.keys(readBaseline(restarted).sources)).toHaveLength(1);
+    },
+  );
+
+  it('one pass performs one tree walk, one backup listing and one stat per source for N sources with M changed copies', () => {
     const store = new SessionStore(tmpDataDir());
     const files = Array.from({ length: 6 }, (_, index) => seedSource(store, 'gru', `s${index}.jsonl`, `${index}\n`));
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
@@ -606,47 +634,65 @@ describe('SessionStore changed-only backup pass', () => {
 
     const walk = vi.spyOn(store, 'listSessionFiles');
     const scan = vi.spyOn(store, 'scanSessionSources');
+    const listing = vi.spyOn(store as unknown as { listBackupGenerations(): unknown }, 'listBackupGenerations');
     const stat = vi.spyOn(store as unknown as { statSource(file: string): unknown }, 'statSource');
     const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
     // Exactly M copies for M changed sources; the rest are skipped.
     expect(pass.created.length).toBe(2);
     expect(pass.skipped).toBe(4);
-    // Cost: one directory walk (it used to walk twice per pass), one scan,
-    // and one stat per source — the same data feeds the copy decision, the
-    // prune and the size snapshot.
+    // Cost: one directory walk (it used to walk twice per pass), one scan, one
+    // flat backup-dir listing (not a tree walk; it answers "is the recorded
+    // generation still there?"), and one stat per source — the same data feeds
+    // the copy decision, the prune and the size snapshot.
     expect(walk).toHaveBeenCalledTimes(1);
     expect(scan).toHaveBeenCalledTimes(1);
+    expect(listing).toHaveBeenCalledTimes(1);
     expect(stat).toHaveBeenCalledTimes(files.length);
     walk.mockRestore();
     scan.mockRestore();
+    listing.mockRestore();
     stat.mockRestore();
   });
 
-  it('re-creates a missing recorded backup for an unchanged source', () => {
-    const store = new SessionStore(tmpDataDir());
+  it('re-creates only the missing recorded generation, not the whole backup set', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
     const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
-    expect(store.runBackup(new Date('2026-10-01T10:05:00Z')).created.length).toBe(1);
-    // An out-of-band reclaim of the backup directory (the disk win this
-    // change exists to enable) leaves the baseline in place.
-    rmSync(join(store.sessionsDir, 'backups'), { recursive: true, force: true });
+    const sibling = seedSource(store, 'minion', 'b.jsonl', 'two\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    expect(first.created.length).toBe(2);
+    appendFileSync(file, 'more\n', 'utf-8');
+    expect(store.runBackup(new Date('2026-10-01T11:05:00Z')).created.length).toBe(1);
+
+    // Only the generation the baseline records for `file` disappears; the
+    // older generation of the same source stays and must not be mistaken for
+    // the recorded snapshot.
+    const recorded = readBaseline(store).sources;
+    const fileKey = Object.keys(recorded).find((key) => key.startsWith('gru/'))!;
+    const removed = recorded[fileKey]!.backup;
+    const older = backupNames(store).find((name) => name.includes('gru__') && name.includes('2026-10-01T10'))!;
+    expect(backupNames(store)).toContain(removed);
+    rmSync(join(store.sessionsDir, 'backups', removed));
 
     const warnings: string[] = [];
-    const restarted = new SessionStore(store.dataDir, {
+    const restarted = new SessionStore(dataDir, {
       log: (level, msg) => {
         if (level === 'warn') warnings.push(msg);
       },
     });
-    const pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+    const pass = restarted.runBackup(new Date('2026-10-01T12:05:00Z'));
+    // Exactly the one source whose recorded generation vanished is copied; the
+    // untouched sibling is skipped, so this is not a cold-start pass.
     expect(pass.created.length).toBe(1);
-    expect(pass.skipped).toBe(0);
+    expect(pass.skipped).toBe(1);
     expect(warnings.some((msg) => msg.includes('recorded session backup is missing'))).toBe(true);
-    const names = backupNames(restarted);
-    expect(names).toHaveLength(1);
-    // The re-created snapshot is the live content, and the next unchanged
-    // pass trusts it again.
-    expect(readFileSync(join(restarted.sessionsDir, 'backups', names[0]!), 'utf-8')).toBe('one\n');
-    expect(restarted.runBackup(new Date('2026-10-01T12:05:00Z')).created).toEqual([]);
-    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(restarted.sessionsDir, 'backups', older))).toBe(true);
+    const refreshed = backupNames(restarted).filter((name) => name.includes('gru__') && name.includes('2026-10-01T12'));
+    expect(refreshed).toHaveLength(1);
+    expect(readFileSync(join(restarted.sessionsDir, 'backups', refreshed[0]!), 'utf-8')).toBe('one\nmore\n');
+    // Both sources are unchanged again: the next pass skips both.
+    expect(restarted.runBackup(new Date('2026-10-01T13:05:00Z')).created).toEqual([]);
+    expect(existsSync(sibling)).toBe(true);
   });
 
   it('copies a same-size rewrite even when the original mtime is restored', () => {
@@ -799,6 +845,14 @@ describe('SessionStore backup prune safety', () => {
     expect(existsSync(pass.created[0]!)).toBe(true);
     expect(backupNames(store)).toContain(pass.created[0]!.split('/').pop()!);
     expect(readFileSync(pass.created[0]!, 'utf-8')).toBe('one\ntwo\nthree\n');
+
+    // The next unchanged pass may not prune the generation the baseline now
+    // records, even though it is the lexicographically oldest name.
+    const next = store.runBackup(new Date('2026-10-01T09:35:00Z'));
+    expect(next.created).toEqual([]);
+    expect(next.pruned).toEqual([]);
+    expect(existsSync(pass.created[0]!)).toBe(true);
+    expect(Object.values(readBaseline(store).sources)[0]!.backup).toBe(pass.created[0]!.split('/').pop()!);
   });
 
   it('ages a generation out only when its ISO hour has ended more than the maximum age ago', () => {
@@ -813,8 +867,13 @@ describe('SessionStore backup prune safety', () => {
     expect(inside.pruned).toEqual([]);
     expect(existsSync(aged.created[0]!)).toBe(true);
 
-    // The slot's hour has now ended exactly 7 days ago: it ages out.
-    const outside = store.runBackup(new Date('2026-10-08T11:00:00Z'));
+    // The slot's hour ended exactly 7 days ago: NOT more than the maximum age.
+    const atBoundary = store.runBackup(new Date('2026-10-08T11:00:00Z'));
+    expect(atBoundary.pruned).toEqual([]);
+    expect(existsSync(aged.created[0]!)).toBe(true);
+
+    // One minute past the boundary it ages out.
+    const outside = store.runBackup(new Date('2026-10-08T11:01:00Z'));
     expect(outside.pruned).toEqual([aged.created[0]]);
   });
 

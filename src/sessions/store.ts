@@ -589,6 +589,11 @@ export class SessionStore {
     return relative(this.sessionsDir, file).replace(/[/\\]/g, '__');
   }
 
+  /** One flat listing of the backup dir — never a tree walk. */
+  private listBackupGenerations(): ReadonlySet<string> {
+    return new Set(readdirSync(this.backupDir));
+  }
+
   /**
    * One backup pass: copy the tracked session files whose content changed
    * since that source's last recorded backup into the backup dir with an
@@ -610,9 +615,13 @@ export class SessionStore {
     }
     const sources = this.scanSessionSources();
     const live = new Set(sources.map((source) => source.backupKey));
+    // One listing taken BEFORE the copies: the skip decision needs to know
+    // whether the recorded generation is still there. (The prune takes its
+    // own fresh listing afterwards, so the count rule still sees the copies
+    // this pass adds.)
+    const presentBefore = this.listBackupGenerations();
     const next: Record<string, BackupBaselineEntry> = {};
     const created: string[] = [];
-    const written = new Set<string>();
     let skipped = 0;
     for (const source of sources) {
       const previous = baseline[source.key];
@@ -622,7 +631,7 @@ export class SessionStore {
         previous.mtimeMs === source.mtimeMs &&
         previous.ctimeMs === source.ctimeMs
       ) {
-        if (existsSync(join(this.backupDir, previous.backup))) {
+        if (presentBefore.has(previous.backup)) {
           next[source.key] = previous; // unchanged since its last recorded backup
           skipped += 1;
           continue;
@@ -640,7 +649,6 @@ export class SessionStore {
       try {
         copyFileSync(source.file, dest);
         created.push(dest);
-        written.add(name);
         next[source.key] = {
           size: source.size,
           mtimeMs: source.mtimeMs,
@@ -652,7 +660,11 @@ export class SessionStore {
         this.log('warn', 'session backup copy failed', { file: source.file, error: String(error) });
       }
     }
-    const pruned = this.pruneBackups(live, written, now);
+    // Every generation the baseline records — a copy made this pass and the
+    // recorded generation of an unchanged source alike — is protected from
+    // this pass's prune, so the baseline never names a file the pass deleted.
+    const recordedGenerations = new Set(Object.values(next).map((entry) => entry.backup));
+    const pruned = this.pruneBackups(live, recordedGenerations, now);
     this.persistSnapshotFromSources(sources);
     this.writeBackupBaseline(next);
     if (created.length > 0 || pruned.length > 0) {
@@ -687,18 +699,20 @@ export class SessionStore {
    * - **Count** (live sources only, unchanged): keep the newest `retention`
    *   generations. A source whose live file is gone can never produce
    *   another generation, so its generations are bounded by age instead.
-   * - **Age**: delete a generation whose ISO-hour slot ended more than
+   * - **Age**: delete a generation whose ISO-hour slot ended MORE than
    *   `backupMaxAgeMs` before this pass — an idle source would otherwise
    *   hold every generation it ever produced forever.
    * - **Floor**: the NEWEST generation of every source survives both rules.
    *   It is that source's last snapshot: a live source's is never deleted,
-   *   and a dead source keeps exactly that one once its older generations
-   *   age out.
-   * - **This pass's own copies** are never pruned either: after a backwards
-   *   clock step a fresh slot sorts before the older names, and the count
-   *   rule must not delete the copy it was just asked to protect.
+   *   and a source that is gone keeps its newest backup while its older
+   *   generations age out (up to a week of hourly generations).
+   * - **Recorded generations** (the entry the baseline names, whether it was
+   *   copied this pass or an unchanged source's recorded copy) are never
+   *   pruned either: after a backwards clock step a fresh slot sorts before
+   *   the older names, and the count rule must not delete the very copy the
+   *   baseline points at.
    */
-  private pruneBackups(liveSources: ReadonlySet<string>, writtenThisPass: ReadonlySet<string>, now: Date): string[] {
+  private pruneBackups(liveSources: ReadonlySet<string>, recordedGenerations: ReadonlySet<string>, now: Date): string[] {
     if (!existsSync(this.backupDir)) return [];
     const BACKUP_NAME = /^(.*)\.(\d{4}-\d{2}-\d{2}T\d{2})\.bak$/;
     const bySource = new Map<string, string[]>();
@@ -720,11 +734,12 @@ export class SessionStore {
         for (const name of names.slice(0, Math.max(0, names.length - this.retention))) doomed.add(name);
       }
       for (const name of names) {
-        // A slot is current for its whole hour; it ages out when that hour ends.
-        if (this.backupStampMs(name) + BACKUP_SLOT_MS <= cutoff) doomed.add(name);
+        // A slot is current for its whole hour, so it ages out only once that
+        // hour ended MORE than the maximum age ago.
+        if (this.backupStampMs(name) + BACKUP_SLOT_MS < cutoff) doomed.add(name);
       }
       doomed.delete(newest); // the floor: a source's last snapshot always survives
-      for (const name of writtenThisPass) doomed.delete(name); // never prune this pass's own copy
+      for (const name of recordedGenerations) doomed.delete(name); // never prune a recorded copy
       for (const name of names) {
         if (!doomed.has(name)) continue;
         const target = join(this.backupDir, name);
