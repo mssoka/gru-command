@@ -610,17 +610,22 @@ export class SessionStore {
    * warns and the pass continues.
    */
   private sweepStagingArtifacts(backupNames: ReadonlySet<string>): void {
-    const backupStaging = [...backupNames].filter((name) => /\.tmp-\d+$/u.test(name));
+    const targets = [...backupNames]
+      .filter((name) => /\.tmp-\d+$/u.test(name))
+      .map((name) => join(this.backupDir, name));
     let sessionEntries: string[] = [];
     try {
       sessionEntries = readdirSync(this.sessionsDir);
     } catch (error) {
       this.log('warn', 'session staging sweep could not list the sessions dir', { error: String(error) });
     }
-    const baselinePrefix = `${basename(this.baselineFile)}.tmp-`;
-    const baselineStaging = sessionEntries.filter((name) => name.startsWith(baselinePrefix));
-    for (const name of [...backupStaging, ...baselineStaging]) {
-      const path = name.startsWith(baselinePrefix) ? join(this.sessionsDir, name) : join(this.backupDir, name);
+    const stagingPrefixes = [basename(this.baselineFile), basename(this.stateFile), 'store-shutdown-checkpoint.json'].map(
+      (name) => `${name}.tmp-`,
+    );
+    for (const name of sessionEntries) {
+      if (stagingPrefixes.some((prefix) => name.startsWith(prefix))) targets.push(join(this.sessionsDir, name));
+    }
+    for (const path of targets) {
       try {
         unlinkSync(path);
       } catch (error) {
@@ -846,12 +851,13 @@ export class SessionStore {
         // hour ended MORE than the maximum age ago.
         if (this.backupStampMs(name) + BACKUP_SLOT_MS < cutoff) doomed.add(name);
       }
-      // Floor: a source's last snapshot always survives. The baseline's
-      // recorded generation IS that snapshot (a backwards clock can make it
-      // sort before a stale, later-named generation); a source the baseline
-      // does not know falls back to its newest name.
-      const recordedLast = [...names].reverse().find((name) => recordedGenerations.has(name));
-      doomed.delete(recordedLast ?? newest);
+      // Floor: both candidates for a source's last snapshot survive. The
+      // baseline's recorded generation is the last copy the pass knows it
+      // made; the newest generation name is the fallback for a source the
+      // baseline does not know, and the survivor of a pass whose baseline
+      // write never landed. A backwards clock makes the two differ, and the
+      // pass cannot tell which holds the last bytes, so neither is deleted.
+      doomed.delete(newest);
       for (const name of recordedGenerations) doomed.delete(name); // never prune a recorded copy
       for (const name of names) {
         if (!doomed.has(name)) continue;

@@ -643,10 +643,9 @@ describe('SessionStore changed-only backup pass', () => {
     expect(pass.created.length).toBe(2);
     expect(pass.skipped).toBe(4);
     // Cost: one directory walk (it used to walk twice per pass), one scan, two
-    // flat backup-dir listings (not tree walks: one answers "is the recorded
-    // generation still there?", the prune's own runs after the copies), and
-    // one stat per source — the same data feeds the copy decision, the prune
-    // and the size snapshot.
+    // flat backup-dir listings (not tree walks: the pre-copy one feeds the
+    // staging sweep, the prune's own runs after the copies), one stat per
+    // source and one stat per SKIPPED source's recorded generation.
     expect(walk).toHaveBeenCalledTimes(1);
     expect(scan).toHaveBeenCalledTimes(1);
     expect(listing).toHaveBeenCalledTimes(2);
@@ -877,14 +876,18 @@ describe('SessionStore backup artifact integrity', () => {
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
     const staleBackupStaging = join(store.sessionsDir, 'backups', 'gru__a.jsonl.2026-10-01T10.bak.tmp-999999');
     const staleBaselineStaging = join(store.sessionsDir, 'backup-baseline.json.tmp-999999');
-    writeFileSync(staleBackupStaging, 'partial', 'utf-8');
-    writeFileSync(staleBaselineStaging, '{"version":1,"sources":{}}', 'utf-8');
+    const staleStateStaging = join(store.sessionsDir, 'store-state.json.tmp-999999');
+    const staleCheckpointStaging = join(store.sessionsDir, 'store-shutdown-checkpoint.json.tmp-999999');
+    for (const path of [staleBackupStaging, staleBaselineStaging, staleStateStaging, staleCheckpointStaging]) {
+      writeFileSync(path, 'partial', 'utf-8');
+    }
 
     store.runBackup(new Date('2026-10-01T11:05:00Z'));
-    // A crashed copy/baseline write must not accumulate in the backup dir or
-    // the sessions dir.
-    expect(existsSync(staleBackupStaging)).toBe(false);
-    expect(existsSync(staleBaselineStaging)).toBe(false);
+    // A crashed copy or write must not accumulate in the backup dir or the
+    // sessions dir.
+    for (const path of [staleBackupStaging, staleBaselineStaging, staleStateStaging, staleCheckpointStaging]) {
+      expect(existsSync(path)).toBe(false);
+    }
     expect(backupNames(store)).toHaveLength(1);
   });
 
@@ -997,14 +1000,65 @@ describe('SessionStore backup prune safety', () => {
     expect(existsSync(file)).toBe(true);
     rmSync(file); // now the source is gone
 
-    // Every generation is over-age; the name-newest (10-03) holds stale
-    // content, so the recorded generation is the one that must survive — and
-    // the stale over-age name-newest is pruned with the rest.
+    // Every generation is over-age. The pass cannot tell which of the two
+    // candidates (the recorded generation, the newest name) holds the last
+    // bytes after a clock step, so both survive; only the older one ages out.
     const pruned = store.runBackup(new Date('2026-10-20T10:05:00Z'));
     expect(pruned.created).toEqual([]);
     expect(existsSync(last.created[0]!)).toBe(true);
     expect(readFileSync(last.created[0]!, 'utf-8')).toBe('one\ntwo\nthree\n');
-    expect(backupNames(store)).toEqual([last.created[0]!.split('/').pop()!]);
+    expect(backupNames(store)).toHaveLength(2);
+    expect(backupNames(store)).toContain(last.created[0]!.split('/').pop()!);
+  });
+
+  it('keeps the newest generation of a source the baseline does not know', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(file, 'two\n', 'utf-8');
+    store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    rmSync(file);
+    // The upgrade / corrupt-baseline shape: generations exist, but no
+    // recorded entry tells the prune which one to keep.
+    rmSync(baselinePath(store));
+
+    const pass = store.runBackup(new Date('2026-11-01T10:05:00Z'));
+    expect(pass.created).toEqual([]);
+    expect(pass.pruned).toHaveLength(1); // the older slot ages out
+    const survivors = backupNames(store);
+    expect(survivors).toHaveLength(1);
+    expect(survivors[0]).toContain('2026-10-01T11');
+  });
+
+  it('keeps a completed copy the baseline never recorded, after the source is gone', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const savedBaseline = readFileSync(baselinePath(store), 'utf-8');
+    appendFileSync(file, 'two\n', 'utf-8');
+    // A pass copies to a new slot but cannot persist the baseline (the state a
+    // hard stop between the copy and the baseline write leaves behind).
+    rmSync(baselinePath(store));
+    mkdirSync(baselinePath(store));
+    const warnings: string[] = [];
+    const failing = new SessionStore(store.dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    const copied = failing.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(copied.created.length).toBe(1);
+    expect(warnings.some((msg) => msg.includes('baseline could not be written'))).toBe(true);
+
+    // Restore the last persisted baseline (it names the older copy only) and
+    // remove the source: the unrecorded newest copy must not be age-pruned.
+    rmSync(baselinePath(store), { recursive: true, force: true });
+    writeFileSync(baselinePath(store), savedBaseline, 'utf-8');
+    rmSync(file);
+    const overAge = store.runBackup(new Date('2026-11-01T10:05:00Z'));
+    expect(overAge.created).toEqual([]);
+    expect(existsSync(copied.created[0]!)).toBe(true);
+    expect(readFileSync(copied.created[0]!, 'utf-8')).toBe('one\ntwo\n');
   });
 
   it('a dead source keeps its recent generations: age bounds it, not the count rule', () => {
