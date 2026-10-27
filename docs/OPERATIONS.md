@@ -278,9 +278,10 @@ Preconditions (all enforced; every refusal is a loud no-effect failure):
   CLOSED (`pr_open: false`) and NOT merged (`merged: false`) at the
   requested head — no observation, an open PR, a merge or a moved head is
   refused;
-- no target-owned live work: spawning/streaming worker turns, non-terminal
-  tracked child workers, pending/live review rounds or unsettled
-  verification runs.
+- no target-owned live work: live directive requests and pending re-brief
+  markers (each named; settle, retire or have the owner abandon it first),
+  spawning/streaming worker turns, non-terminal tracked child workers,
+  pending/live review rounds or unsettled verification runs.
 
 Request (pairing token in `Authorization: Bearer`):
 
@@ -343,13 +344,18 @@ or automatic binning — the write itself is the ordinary status surface):
   does NOT stop a running worker, cancel a queue entry, release a
   worktree, delete artifacts or ack notifications. The status transaction
   refuses target-owned open worker turns, unfinished child workers,
-  pending/live review rounds, unsettled verification runs, and in-flight
-  initial dispatch, directive or provider-recovery admission, with no
-  status or event mutation. A historical claimed wait/directive intent
-  does not hold the lane after its runtime attempt settles. Stop live work through its own authorized
-  surfaces first — the board keeps showing the live producer and the
-  worktree stays on the record. A `working` label alone is not proof of
-  a live producer; idle `working` jobs remain bin-eligible.
+  pending/live review rounds, unsettled verification runs, in-flight
+  initial dispatch, directive or provider-recovery admission, live
+  directive requests and pending re-brief markers (each named), with no
+  status or event mutation. A historical claimed wait does not hold the
+  lane after its runtime attempt settles. Stop live work through its own
+  authorized surfaces first — the board keeps showing the live producer and
+  the worktree stays on the record. A live directive or re-brief marker
+  whose producer custody the service cannot establish is closed by the
+  owner's abandonment (`by: "owner"`, `confirm_intent: true`; Gru asks, never
+  calls it), never by binning; it refuses while any producer is known to
+  run ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-abandonment-unknown-custody)). A `working` label alone is not proof of a live
+  producer; idle `working` jobs remain bin-eligible.
 
 Request (pairing token in `Authorization: Bearer`):
 

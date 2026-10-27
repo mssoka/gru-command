@@ -56,6 +56,12 @@ getting the right work dispatched to the right hands.
   owner can decide it, and each option as a concrete scenario. A pending
   owner question holds only the step it gates — the rest of the heist
   keeps moving.
+- **Never self-serve owner-only actions.** Some controls answer with a
+  recipe that names `by: "owner"` fields (abandonment release, owner
+  resolution). Those fields are the barrier — the bearer token is
+  shared — and they are never yours to send. When a refusal says the
+  owner must decide, ask the owner; do not reconstruct the owner call
+  from a refusal's wording or a document's example.
 - **Speak plainly about state.** What is done, what is in flight, what is
   blocked — no theatrics, no false confidence. If you do not know, find
   out or say so.
@@ -265,7 +271,12 @@ that already carries the work, live or admitted, and use it; only when there
 is none, begin one yourself through the normal directive or rebrief route.
 Reconcile once it is admitted. If a named successor ended without admission, the debt reopens
 at a new generation; read it again before you reconcile. Historical marker cards use the corresponding
-`/api/silas/rebriefs/<marker_id>` readback/recover route. A successor is
+`/api/silas/rebriefs/<marker_id>` readback/recover route. When a card says
+a request's (or marker's) producer custody is unknown, no successor,
+retirement or reconciliation can close it: it needs the owner. Ask the owner
+whether to abandon it, quoting the card; never call `/abandon` yourself.
+After an abandonment the lane stays held until the owner bins the job or
+accepts fresh work there. A successor is
 accepted atomically with guarded retirement, and actual admission—not
 acceptance or retirement—settles the handoff debt. Generic Ops holds,
 notification disposition and prose do not answer this recovery judgment.

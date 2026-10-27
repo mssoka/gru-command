@@ -24,6 +24,7 @@ import type { RepoOverviewView } from '../src/repos/overview.js';
 import type { DecisionRecord } from '../src/ledger/decision-memory.js';
 import type { MailboxItem } from '../src/ledger/mailbox.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
+import { markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -662,6 +663,25 @@ describe('board server — HTTP API', () => {
 
   it('a binned discard is audited end-to-end; auth/malformed/illegal attempts never mutate', async () => {
     const { api, port } = harness;
+    for (const state of ['dispatching', 'admitted'] as const) {
+      const id = `audit-live-${state}`;
+      api.addJob({ id, repo: 'demo-repo', title: `Live directive ${state}` });
+      api.setJobStatus(id, 'working');
+      const intent = api.beginDirectiveIntent({ jobId: id, directive: 'keep live control', holder: 'fixture', requestId: `live-${state}` }).record;
+      if (state === 'admitted') {
+        markHistoricalDirectiveFixture(api, intent.requestId);
+        const sent = api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: id,
+          payload: { request_id: intent.requestId, minion_id: `minion-${state}` } });
+        api.recordDirectiveAdmission({ requestId: intent.requestId, minionId: `minion-${state}`, eventSeq: sent.seq });
+      }
+      const before = api.listJobEvents(id);
+      const refused = await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'binned' });
+      expect(refused.status, state).toBe(400);
+      expect((refused.body as { detail: string }).detail, state).toMatch(new RegExp(`live directive request.*${intent.requestId} \\(${state}\\)`, 'u'));
+      expect(api.getJob(id)?.status, state).toBe('working');
+      expect(api.getDirective(intent.requestId)?.state, state).toBe(state);
+      expect(api.listJobEvents(id), state).toEqual(before);
+    }
     api.addJob({ id: 'audit-binned', repo: 'demo-repo', title: 'Audit the discard' });
     const eventsBefore = api.listJobEvents('audit-binned').length;
     // A caller-provided `by` is NOT authentication.
@@ -707,6 +727,35 @@ describe('board server — HTTP API', () => {
     const row = snapshot.repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'audit-binned');
     expect(row?.status).toBe('binned');
     expect(row?.prState).toBeNull();
+  });
+
+  it('a terminal status write never closes over a live directive: done is refused by name, merged is an observed fact', async () => {
+    const { api, port } = harness;
+    for (const state of ['dispatching', 'admitted'] as const) {
+      const id = `done-live-${state}`;
+      api.addJob({ id, repo: 'demo-repo', title: `Live directive ${state}` });
+      api.setJobStatus(id, 'working');
+      const intent = api.beginDirectiveIntent({ jobId: id, directive: 'keep live control', holder: 'fixture', requestId: `done-${state}` }).record;
+      if (state === 'admitted') {
+        markHistoricalDirectiveFixture(api, intent.requestId);
+        const sent = api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: id,
+          payload: { request_id: intent.requestId, minion_id: `minion-${state}` } });
+        api.recordDirectiveAdmission({ requestId: intent.requestId, minionId: `minion-${state}`, eventSeq: sent.seq });
+      }
+      const before = api.listJobEvents(id);
+      const refused = await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'done' });
+      expect(refused.status, state).toBe(400);
+      expect((refused.body as { detail: string }).detail, state).toContain(`live directive request(s): ${intent.requestId} (${state})`);
+      expect(api.getJob(id)?.status, state).toBe('working');
+      expect(api.listJobEvents(id), state).toEqual(before);
+      // A merge happened whatever the ledger says: it is recorded, and the
+      // request stays live for its reconcilers.
+      expect((await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'in-review' })).status, state).toBe(200);
+      const merged = await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'merged' });
+      expect(merged.status, state).toBe(200);
+      expect((merged.body as { status: string }).status, state).toBe('merged');
+      expect(api.getDirective(intent.requestId)?.state, state).toBe(state);
+    }
   });
 
   it('Gru loaded action bins a named abandoned heist through auth with truthful history and no revival', async () => {

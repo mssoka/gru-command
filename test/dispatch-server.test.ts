@@ -2696,6 +2696,27 @@ if (argv.includes('--method') && argv.includes('POST')) {
       const discardedRebrief = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'binned-rebrief', note: 'x' }, TOKEN);
       expect(discardedRebrief.status).toBe(400);
       expect(field<string>(discardedRebrief.json, 'detail')).toContain('terminal lanes are never re-briefed');
+      // A consumed request id still answers from its own record after the
+      // lane goes terminal: the caller is told what its id did, with the
+      // payload hash, and no second writer is created (#493 round 3).
+      h.ledger.addJob({ id: 'consumed-rebrief', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('consumed-rebrief', 'working');
+      const consumed = h.ledger.beginRebriefIntent({ jobId: 'consumed-rebrief', note: 'earlier work', holder: 'silas-ops' });
+      // `merged` is reachable with live control (only done/binned are fenced
+      // by it), which is exactly the incident shape: the id is consumed and
+      // the lane goes terminal afterwards.
+      h.ledger.setJobStatus('consumed-rebrief', 'in-review');
+      h.ledger.setJobStatus('consumed-rebrief', 'merged');
+      const replay = await call(h.port, 'POST', '/api/silas/rebrief',
+        { job_id: 'consumed-rebrief', note: 'earlier work', request_id: consumed.record.requestId }, TOKEN);
+      expect(replay.status).toBe(202); // the recorded request is still live
+      expect(field<boolean>(replay.json, 'replay')).toBe(true);
+      expect(field<string>(replay.json, 'payload_hash')).toBe(consumed.record.payloadHash);
+      // A body that does not match the recorded request is still a conflict,
+      // never laundered into a replay by the terminal lane.
+      const conflicting = await call(h.port, 'POST', '/api/silas/rebrief',
+        { job_id: 'consumed-rebrief', note: 'different work', request_id: consumed.record.requestId }, TOKEN);
+      expect(conflicting.status).toBe(409);
 
       // No job lane in the registry: the re-brief must fail loud instead of
       // spawning a fresh worker with nowhere to work.

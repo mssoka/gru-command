@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { DirectiveNativeBinding } from '../runtime/directive-checkpoint.js';
+import type { ObligationState } from './states.js';
 
 /**
  * Durable directive requests — typed vocabulary (phase 3 slice).
@@ -22,7 +23,8 @@ import type { DirectiveNativeBinding } from '../runtime/directive-checkpoint.js'
  * - `settled`/`failed` are terminal for the request id: a retry is a NEW
  *   decision with a NEW request id, never a silent replay of consumed
  *   authorization (recovered capacity is not permission — incident
- *   PR131/287e16f2).
+ *   PR131/287e16f2). An owner abandonment is also `failed`, but it is no
+ *   no-effect proof: its outcome and producer custody stay unknown.
  * - `retired` is the guarded, audited CONTROL closure for an interrupted
  *   request: the writer ceased (server-verified) and no correlated
  *   terminal receipt exists or can be fabricated. It claims neither
@@ -62,10 +64,11 @@ export function directiveAdmissionClass(record: Pick<DirectiveRequestRecord, 'ad
   return record.admissionSeq === null ? 'admission-unknown' : 'admitted-without-terminal';
 }
 
-/** Typed refusals of the guarded retirement transition. Every code maps to
- * HTTP 409 at the route: the request is real and the caller must change
- * state or evidence, never retry blindly. `blockers` names the live
- * ownership the service found (never caller-supplied). */
+/** Typed refusals of the guarded retirement and abandonment transitions.
+ * Every code maps to HTTP 409 at the route except `incomplete_context`, a
+ * 400: the request is real and the caller must change state or evidence,
+ * never retry blindly. `blockers` names the live ownership the service found
+ * (never caller-supplied). */
 export const DIRECTIVE_RETIREMENT_REFUSAL_CODES = [
   'directive_not_live',
   'retire_conflict',
@@ -73,8 +76,13 @@ export const DIRECTIVE_RETIREMENT_REFUSAL_CODES = [
   'terminal_receipt_present',
   'admission_evidence_incomplete',
   'stale_head',
+  'stale_generation',
+  'stale_authority',
   'lane_unavailable',
   'live_work',
+  'incomplete_context',
+  // Abandonment only: the service can verify cessation, so retire instead.
+  'retirement_available',
 ] as const;
 export type DirectiveRetirementRefusalCode = (typeof DIRECTIVE_RETIREMENT_REFUSAL_CODES)[number];
 
@@ -90,21 +98,57 @@ export class DirectiveRetirementError extends Error {
   }
 }
 
-/** The canonical retirement intent: the caller's binding expectations plus
- * audit provenance. The fingerprint over exactly these fields is the
- * replay-identity — a replay with changed content is a conflict, never a
- * second transition. */
+/** The canonical retirement intent: the caller's request/lane binding and
+ * current generation/approved-authority expectations plus audit provenance.
+ * The fingerprint over exactly these fields is the replay identity — a replay
+ * with changed content is a conflict, never a second transition. The context
+ * is all present (every live transition) or all absent (only the replay of a
+ * row retired before the context existed). */
 export interface DirectiveRetirementIntent {
   readonly requestId: string;
   readonly expectedJobId: string;
   readonly expectedState: LiveDirectiveState;
   readonly expectedPayloadHash: string;
   readonly expectedHead: string;
+  /** The recovery obligation's generation, plan revision and state, each
+   * null when no recovery obligation exists. */
+  readonly expectedGeneration?: number | null;
+  readonly expectedPlanRevision?: number | null;
+  readonly expectedObligationState?: ObligationState | null;
+  /** The current control epoch and approved work inputs. */
+  readonly expectedAuthorityEpoch?: number;
+  readonly expectedWorkRevision?: number;
+  readonly expectedContractSha256?: string;
   readonly reason: string;
   readonly by: string;
 }
 
+/** The write-boundary context of a live retirement, in fingerprint order,
+ * with the HTTP field each one arrives in. */
+export const DIRECTIVE_RETIREMENT_CONTEXT = {
+  expectedGeneration: 'expected_generation',
+  expectedPlanRevision: 'expected_plan_revision',
+  expectedObligationState: 'expected_obligation_state',
+  expectedAuthorityEpoch: 'expected_authority_epoch',
+  expectedWorkRevision: 'expected_work_revision',
+  expectedContractSha256: 'expected_contract_sha256',
+} as const;
+const CONTEXT_KEYS = Object.keys(DIRECTIVE_RETIREMENT_CONTEXT) as (keyof typeof DIRECTIVE_RETIREMENT_CONTEXT)[];
+
+/** Whether an intent carries the context: all of it, or none of it. A
+ * partial context is a typed `incomplete_context` refusal naming the gaps. */
+export function directiveRetirementHasContext(intent: DirectiveRetirementIntent): boolean {
+  const missing = CONTEXT_KEYS.filter((key) => intent[key] === undefined);
+  if (missing.length === CONTEXT_KEYS.length) return false;
+  if (missing.length > 0) {
+    throw new DirectiveRetirementError('incomplete_context',
+      `directive retirement context is partial — missing ${missing.map((key) => DIRECTIVE_RETIREMENT_CONTEXT[key]).join(', ')}`);
+  }
+  return true;
+}
+
 export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent): string {
+  const context = directiveRetirementHasContext(intent) ? CONTEXT_KEYS.map((key) => intent[key]) : [];
   return createHash('sha256')
     .update(
       JSON.stringify([
@@ -113,6 +157,7 @@ export function directiveRetirementFingerprint(intent: DirectiveRetirementIntent
         intent.expectedState,
         intent.expectedPayloadHash,
         intent.expectedHead,
+        ...context,
         intent.reason,
         intent.by,
       ]),
@@ -159,6 +204,24 @@ export interface DirectiveRequestRecord {
    * lost-response retry can reconstruct the identical canonical intent. */
   readonly retireExpectedState: LiveDirectiveState | null;
   readonly retireExpectedHead: string | null;
+  /** The write-boundary context the retirement bound, so a lost-response
+   * retry can rebuild the exact intent. A null `retireExpectedAuthorityEpoch`
+   * marks a row retired before the context existed: every field is then
+   * "not recorded" and only the original context-free intent replays.
+   * Otherwise null generation, plan revision and obligation state mean no
+   * recovery obligation existed. */
+  readonly retireExpectedGeneration: number | null;
+  readonly retireExpectedPlanRevision: number | null;
+  readonly retireExpectedObligationState: ObligationState | null;
+  readonly retireExpectedAuthorityEpoch: number | null;
+  readonly retireExpectedWorkRevision: number | null;
+  readonly retireExpectedContractSha256: string | null;
+  /** Owner abandonment (the row is `failed`; set only by
+   * `abandonLiveDirective`): who closed the request and why. It claims no
+   * completion, no effect and no cessation. */
+  readonly abandonedAt: string | null;
+  readonly abandonedBy: string | null;
+  readonly abandonReason: string | null;
   /** Continuation hold: set to the identity of the fresh accepted request
    * that superseded this retirement; null while the hold is open. */
   readonly holdReleasedBy: string | null;
@@ -181,10 +244,15 @@ export interface DirectiveRequestRecord {
   readonly recoveryDecision: { readonly fingerprint: string; readonly successorId: string | null; readonly eventSeq: number } | null;
 }
 
-/** One open (or released) continuation hold created by a retirement. The
- * presence of an unreleased hold fences lane automation (review arming,
- * digest offers) until a fresh directive/re-brief request is accepted. */
+/** One open (or released) continuation hold created by a retirement or an
+ * owner abandonment. The presence of an unreleased hold fences lane
+ * automation (review arming, digest offers) until a fresh directive/re-brief
+ * request is accepted; an abandonment hold only by one the owner accepts
+ * (or binning). `retiredAt`/`retiredBy`/`reason` are when, by whom and why
+ * control closed, whichever `kind` closed it. `requestId` is the marker id
+ * of an abandoned re-brief generation. */
 export interface DirectiveRecoveryHold {
+  readonly kind: 'retired' | 'abandoned' | 'rebrief-abandoned';
   readonly jobId: string;
   readonly requestId: string;
   readonly admissionClass: DirectiveAdmissionClass;
@@ -193,4 +261,20 @@ export interface DirectiveRecoveryHold {
   readonly reason: string;
   readonly releasedBy: string | null;
   readonly releasedAt: string | null;
+}
+
+/** The state a reader names: an owner abandonment is stored `failed` but is
+ * never no-effect proof, so it reads `abandoned`. */
+export function directiveStateName(record: Pick<DirectiveRequestRecord, 'state' | 'abandonedAt'>): string {
+  return record.abandonedAt === null ? record.state : 'abandoned';
+}
+
+/** Producer-custody uncertainty a supervisor or ledger reports: a producer
+ * whose cessation is unproven, never one known to run. Owner abandonment may
+ * close a request over these (it clears none of them). Every other blocker
+ * names a producer that is live or about to run. */
+export const RESTART_CLEANUP_UNCONFIRMED = 'restart cleanup unconfirmed:';
+export const UNPROVEN_DIRECTIVE_CESSATION = 'unproven directive producer cessation:';
+export function isProducerCustodyUncertainty(blocker: string): boolean {
+  return blocker.startsWith(RESTART_CLEANUP_UNCONFIRMED) || blocker.startsWith(UNPROVEN_DIRECTIVE_CESSATION);
 }

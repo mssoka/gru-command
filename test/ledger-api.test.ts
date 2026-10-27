@@ -11,6 +11,7 @@ import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { markHistoricalDirectiveFixture, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -400,6 +401,20 @@ describe('ledger api — the record of state', () => {
       expect(api.getJob(id)?.status, source).toBe('binned');
       expect(api.listEvents().length, source).toBe(eventsBefore);
     }
+    // A live native directive cannot be hidden behind terminal discard.
+    api.addJob({ id: 'binned-live-directive', repo: 'discard-fixture', title: 'Live control prevents discard' });
+    api.setJobStatus('binned-live-directive', 'working');
+    const live = api.beginDirectiveIntent({ jobId: 'binned-live-directive', directive: 'still live', holder: 'test', requestId: 'live-directive-before-bin' }).record;
+    const liveEvents = api.listJobEvents('binned-live-directive');
+    expect(() => api.setJobStatus('binned-live-directive', 'binned')).toThrow(/live directive request.*live-directive-before-bin \(dispatching\)/u);
+    expect(api.getJob('binned-live-directive')?.status).toBe('working');
+    expect(api.getDirective(live.requestId)).toEqual(live);
+    expect(api.listJobEvents('binned-live-directive')).toEqual(liveEvents);
+    // Once the original control has an explicit terminal outcome, the
+    // ordinary binned path remains available.
+    api.failDirective({ requestId: live.requestId, reason: 'fixture proves no native effect occurred' });
+    expect(api.setJobStatus('binned-live-directive', 'binned').status).toBe('binned');
+
     // Re-binning an already-binned lane is the generic same-status no-op:
     // no transition, no duplicate event — a timed-out retry is safe.
     const rebinEvents = api.listEvents().length;
@@ -902,14 +917,21 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect(replay.retired).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
 
-    // A binned (discarded) lane retires its markers through the same
-    // identity-checked path, auditing the terminal status truthfully.
+    // Pending markers refuse binning by name: a discard never hides them.
     const binnedId = 'retire-binned';
     api.addJob({ id: binnedId, repo: 'terminal-retirement', title: 'binned retirement' });
     api.setJobStatus(binnedId, 'working');
     const binnedMarkers = api.beginPendingRebrief({ jobId: binnedId, note: 'n', briefing: 'b' });
     const binnedCandidates = candidatesOf(binnedMarkers);
-    api.setJobStatus(binnedId, 'binned');
+    const eventsBeforeBin = api.listJobEvents(binnedId);
+    expect(() => api.setJobStatus(binnedId, 'binned')).toThrow(
+      `pending re-brief marker(s): ${binnedMarkers.map((marker) => `${marker.id} (${marker.kind})`).join(', ')}`);
+    expect(api.getJob(binnedId)?.status).toBe('working');
+    expect(api.listPendingRebriefs({ jobId: binnedId })).toEqual(binnedMarkers);
+    expect(api.listJobEvents(binnedId)).toEqual(eventsBeforeBin);
+    // A lane binned before that refusal existed retires its markers through
+    // the same identity-checked path, auditing the terminal status truthfully.
+    markLegacyTerminalJobFixture(api, binnedId, 'binned');
     const binnedRetire = api.retirePendingRebriefs({ jobId: binnedId, reason: 'job terminal', candidates: binnedCandidates });
     expect(binnedRetire.refused).toBeNull();
     expect(binnedRetire.retired).toHaveLength(binnedMarkers.length);
@@ -1690,6 +1712,56 @@ describe('report-job closure (issue #220)', () => {
     }
   });
 
+  it('a commissioner disposition refuses by name while a directive is live on the report lane, and changes nothing', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-live', { targetRef: 'https://x/pull/8', targetSha: 's1' });
+      const live = api.beginDirectiveIntent({ jobId: 'rep-live', directive: 'follow-up on the report lane', holder: 'fixture', requestId: 'rep-live-directive' }).record;
+      const obligation = api.findReportObligation('rep-live')!;
+      const events = api.listJobEvents('rep-live');
+      expect(() => api.settleReportDisposition({ jobId: 'rep-live', outcome: 'dismissed', note: 'not actionable' }))
+        .toThrow(`live directive request(s): ${live.requestId} (dispatching)`);
+      expect(api.getJob('rep-live')?.status).toBe('delivered');
+      expect(api.getObligation(obligation.id)).toEqual(obligation);
+      expect(api.listJobEvents('rep-live')).toEqual(events);
+      // Once the directive settles through its own path, the same disposition closes the report.
+      api.failDirective({ requestId: live.requestId, reason: 'fixture no-effect proof' });
+      expect(api.settleReportDisposition({ jobId: 'rep-live', outcome: 'dismissed', note: 'not actionable' }).job.status).toBe('done');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('auto-supersede waits for a live directive with one durable note, never a refusal every pass', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-held', { targetRef: 'https://x/pull/7', targetSha: 's1' });
+      api.addJob({ id: 'src-held', repo: 'fixture-app', title: 'source', briefing: 'b' });
+      api.setJobPr('src-held', 'https://x/pull/7');
+      api.setJobStatus('src-held', 'working');
+      api.setJobStatus('src-held', 'in-review');
+      api.setJobStatus('src-held', 'merged');
+      const live = api.beginDirectiveIntent({ jobId: 'rep-held', directive: 'follow-up on the report lane', holder: 'fixture', requestId: 'rep-held-live' }).record;
+      const logs: string[] = [];
+      const notifications = new NotificationCenter({ ledger: api, bus: new EventBus() });
+      for (let pass = 0; pass < 2; pass += 1) {
+        const report = reconcileReportClosures({ ledger: api, notifications, log: (level, message) => { logs.push(`${level}:${message}`); } });
+        expect(report).toMatchObject({ superseded: 0, failed: 0 });
+      }
+      expect(logs).toEqual([]);
+      expect(api.getJob('rep-held')?.status).toBe('delivered');
+      expect(api.listJobEventsByKinds('rep-held', ['report.supersede-deferred']).map((event) => event.payload)).toEqual([
+        { reason: 'target PR merged (src-held) — the findings can no longer apply', blockers: [`live directive request(s): ${live.requestId} (dispatching)`] }]);
+      api.failDirective({ requestId: live.requestId, reason: 'fixture no-effect proof' });
+      expect(reconcileReportClosures({ ledger: api, notifications })).toMatchObject({ superseded: 1, failed: 0 });
+      expect(api.getJob('rep-held')?.status).toBe('done');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('only the recorded commissioner (or gru) may settle, and every closure path resolves the card', () => {
     const { api, db, dir } = freshDb();
     try {
@@ -2180,7 +2252,25 @@ describe('administrative closeout of a parked PR-backed job', () => {
       parkedPrJob(api, 'live-verify');
       api.appendCustomEvent({ kind: 'verification.started', jobId: 'live-verify', payload: { run_id: 'run-live' } });
 
-      for (const id of ['live-turn', 'live-child', 'live-round', 'live-verify']) {
+      // A live directive request (admission unknown, or admitted without a
+      // terminal receipt) is read and refuses by name.
+      for (const state of ['dispatching', 'admitted'] as const) {
+        const id = `live-directive-${state}`;
+        api.addJob({ id, repo: 'gru-command', title: `t-${id}`, briefing: 'b' });
+        api.setJobStatus(id, 'working');
+        api.setJobPr(id, PR_URL);
+        const live = api.beginDirectiveIntent({ jobId: id, directive: 'keep control', holder: 'fixture', requestId: `${id}-request` }).record;
+        if (state === 'admitted') {
+          markHistoricalDirectiveFixture(api, live.requestId);
+          const sent = api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: id, payload: { request_id: live.requestId, minion_id: 'minion-live' } });
+          api.recordDirectiveAdmission({ requestId: live.requestId, minionId: 'minion-live', eventSeq: sent.seq });
+        }
+        api.setJobStatus(id, 'in-review');
+        api.setJobStatus(id, 'parked');
+        appendObservation(api, id, { prUrl: PR_URL });
+      }
+
+      for (const id of ['live-turn', 'live-child', 'live-round', 'live-verify', 'live-directive-dispatching', 'live-directive-admitted']) {
         const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest(id)));
         expect(refused.name, id).toBe('AdminCloseoutRefusal');
         expect(refused.code, id).toBe('live-work');
@@ -2192,6 +2282,11 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-turn'))).message).toContain('worker-live');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-round'))).message).toContain('live-round-r1');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-verify'))).message).toContain('verification');
+      for (const state of ['dispatching', 'admitted'] as const) {
+        expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest(`live-directive-${state}`))).message)
+          .toContain(`live directive request(s): live-directive-${state}-request (${state})`);
+        expect(api.getDirective(`live-directive-${state}-request`)?.state).toBe(state);
+      }
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2227,7 +2322,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
     }
   });
 
-  it('administrative closeout leaves control rows and the lane worktree untouched (no release, no re-brief retirement)', () => {
+  it('administrative closeout refuses pending re-brief markers by name and leaves them and the lane worktree untouched', () => {
     const { api, db, dir } = freshDb();
     try {
       parkedPrJob(api, 'control-rows');
@@ -2246,11 +2341,13 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(markers.length).toBeGreaterThan(0);
       const laneBefore = api.listWorktrees({ jobId: 'control-rows' });
 
-      const result = api.adminCloseParkedJob(closeoutRequest('control-rows'));
-      expect(result.job.status).toBe('done');
-      // Re-brief/directive control rows are owned by their own reconcilers:
-      // the closeout neither retires nor rewrites them.
-      expect(api.listPendingRebriefs({ jobId: 'control-rows' })).toHaveLength(markers.length);
+      const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('control-rows')));
+      expect(refused.code).toBe('live-work');
+      expect(refused.message).toContain(`pending re-brief marker(s): ${markers.map((marker) => `${marker.id} (${marker.kind})`).join(', ')}`);
+      expect(api.getJob('control-rows')?.status).toBe('parked');
+      // Re-brief control rows close through their own paths: the closeout
+      // neither retires nor rewrites them.
+      expect(api.listPendingRebriefs({ jobId: 'control-rows' })).toEqual(markers);
       // The lane worktree is untouched — release belongs to the sweep, never
       // to the closeout.
       expect(api.listWorktrees({ jobId: 'control-rows' })).toEqual(laneBefore);

@@ -1174,4 +1174,44 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
     `,
   },
+  {
+    // A live retirement's write-boundary context (recovery obligation
+    // generation/plan revision/state, control epoch, approved work revision
+    // and contract) lives on the row beside `retire_expected_state`/`_head`,
+    // so reading a retired row never scans events. Rows retired earlier keep
+    // NULL: their context was never recorded. An owner abandonment of a live
+    // request (state `failed`, outcome and producer custody unknown) records
+    // who and why, and its open continuation hold rides the existing
+    // `hold_released_*` columns. An abandoned re-brief marker generation is
+    // deleted like a retired one; its audit identity and hold live in
+    // `rebrief_abandonments`. Additive. LANDING COLLISION (same convention
+    // as migrations 10-31): renumber ONLY this never-applied migration if
+    // main lands id 32 first.
+    id: 32,
+    name: 'directive-retirement-context',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_generation INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_plan_revision INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_obligation_state TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_authority_epoch INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_work_revision INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_contract_sha256 TEXT;
+      ALTER TABLE pending_directives ADD COLUMN abandoned_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN abandoned_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN abandon_reason TEXT;
+      CREATE TABLE rebrief_abandonments (
+        marker_id        TEXT PRIMARY KEY,
+        job_id           TEXT NOT NULL REFERENCES jobs(id),
+        payload_hash     TEXT NOT NULL,
+        baseline_seq     INTEGER NOT NULL,
+        abandoned_at     TEXT NOT NULL,
+        abandoned_by     TEXT NOT NULL,
+        abandon_reason   TEXT NOT NULL,
+        event_seq        INTEGER NOT NULL,
+        hold_released_by TEXT,
+        hold_released_at TEXT
+      );
+      CREATE INDEX idx_rebrief_abandonments_hold ON rebrief_abandonments(job_id, hold_released_by);
+    `,
+  },
 ];

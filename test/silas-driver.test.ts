@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { directiveRetirementInputs } from './helpers/directive-native-fixture.js';
 import {
   adviseFollowThrough,
   adviseRecurrence,
@@ -631,6 +632,7 @@ function retireInterruptedForTest(ledger: LedgerApi, jobId: string, directive = 
     expectedState: 'dispatching',
     expectedPayloadHash: intent.record.payloadHash,
     expectedHead: head,
+    ...directiveRetirementInputs(ledger, intent.record.requestId),
     lane: { id: `lane-${jobId}`, resolvedHead: head },
     reason: 'writer ceased; verification race',
     by: 'silas-ops',

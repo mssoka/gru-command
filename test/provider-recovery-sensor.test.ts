@@ -24,6 +24,7 @@ import { claudeSnapshot, composeMetadataReaders, type NativeCommandPort } from '
 import { CLAUDE_METADATA_ENDPOINT, type MetadataFetchPort } from '../src/provider-recovery/metadata.js';
 import type { ProbeOutcome, ProviderProbePort, ProbeRoute } from '../src/provider-recovery/probe.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { directiveRetirementInputs } from './helpers/directive-native-fixture.js';
 
 /**
  * The provider-recovery sensor contract (owner-approved 2026-09-28),
@@ -205,8 +206,8 @@ describe('wait establishment (acceptance 1) — explicit evidence only', () => {
     h.makeJob('job-1');
     const begun = h.ledger.beginDirectiveIntent({ jobId: 'job-1', directive: 'old request', holder: 'silas-ops', requestId: 'sensor-retired' });
     h.ledger.retireInterruptedDirective({ requestId: begun.record.requestId, expectedJobId: 'job-1', expectedState: 'dispatching',
-      expectedPayloadHash: begun.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'sensor-fixture-lane', resolvedHead: 'a'.repeat(40) },
-      reason: 'fixture producer ceased', by: 'silas-ops' });
+      expectedPayloadHash: begun.record.payloadHash, expectedHead: 'a'.repeat(40), ...directiveRetirementInputs(h.ledger, begun.record.requestId),
+      lane: { id: 'sensor-fixture-lane', resolvedHead: 'a'.repeat(40) }, reason: 'fixture producer ceased', by: 'silas-ops' });
     const observation = h.minionObservation();
     const wait = h.sensor.recordWait(observation, { provider: 'zai-coding-cn', model: 'glm-5.3', errorMessage: observation.errorMessage,
       status: 429, bodyCode: '1302' }, h.probe.endpoint, h.probe.fingerprint);

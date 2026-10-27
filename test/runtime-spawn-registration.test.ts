@@ -18,6 +18,7 @@ import type { WorktreePort } from '../src/dispatch/worktree-port.js';
 import { retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
+import { directiveRetirementFreshness } from './helpers/directive-native-fixture.js';
 
 const caps = { streaming: true, steer: 'native' as const, resume: 'file' as const, images: false,
   thinking: false, thinkingLevelControl: false, followUp: true };
@@ -208,7 +209,8 @@ describe('registry publication and production consumer custody (GH-280)', () => 
       next = reader(h); next.close(); next = reader(h); // real LedgerDb close/reopen, fresh registry/watchdog
       const guarded = () => retireInterruptedDirectiveFromRoute({ ledger: next!.ledger, worktrees,
         pendingProducerBlockers: (jobId) => next!.supervisor.pendingProducerBlockers(jobId), requestId: row.requestId,
-        expected: { jobId: h.jobId, state: 'dispatching', payloadHash: row.payloadHash, head: repo.head() },
+        expected: { jobId: h.jobId, state: 'dispatching', payloadHash: row.payloadHash, head: repo.head(),
+          ...directiveRetirementFreshness(next!.ledger, row.requestId) },
         reason: 'original native producer proved ceased without delivery', by: 'silas-ops' });
       const refused = () => {
         try { guarded(); throw new Error('guarded retirement unexpectedly succeeded'); }
@@ -312,7 +314,8 @@ describe('registry publication and production consumer custody (GH-280)', () => 
       try {
         retireInterruptedDirectiveFromRoute({ ledger: next.ledger, worktrees: { listWorktrees: () => [lane] },
           pendingProducerBlockers: (jobId) => next!.supervisor.pendingProducerBlockers(jobId), requestId: row.requestId,
-          expected: { jobId: h.jobId, state: 'dispatching', payloadHash: row.payloadHash, head: repo.head() },
+          expected: { jobId: h.jobId, state: 'dispatching', payloadHash: row.payloadHash, head: repo.head(),
+            ...directiveRetirementFreshness(next.ledger, row.requestId) },
           reason: 'unknown held native producer', by: 'silas-ops' });
         throw new Error('guarded retirement released held native custody');
       } catch (error) {

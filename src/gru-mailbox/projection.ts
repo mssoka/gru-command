@@ -211,10 +211,13 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       const page = ledger.listPendingDirectives({ jobId: job.id, limit: 1000, cursor });
       for (const directive of page) {
         cursor = directive.requestId;
-        if ((LIVE_DIRECTIVE_STATES as readonly string[]).includes(directive.state) || (directive.state === 'retired' && directive.holdReleasedBy === null)) {
+        if ((LIVE_DIRECTIVE_STATES as readonly string[]).includes(directive.state) ||
+            (directive.state === 'retired' && directive.abandonedAt === null && directive.holdReleasedBy === null) ||
+            (directive.abandonedAt !== null && directive.holdReleasedBy === null)) {
           references.push({ kind: 'directive', id: directive.requestId });
-          controls.push([directive.requestId, directive.state, directive.admissionMinion, directive.admissionSeq, directive.deliverySeq, directive.holdReleasedBy]);
+          controls.push([directive.requestId, directive.abandonedAt !== null ? 'abandoned' : directive.state, directive.admissionMinion, directive.admissionSeq, directive.deliverySeq, directive.holdReleasedBy]);
           if (directive.state === 'retired') restrictions.push(`retired control ${directive.requestId}: fresh owner-authorized request required`);
+          if (directive.abandonedAt !== null) restrictions.push(`abandoned control ${directive.requestId}: fresh owner-authorized request required`);
         }
       }
       if (page.length < 1000) break;

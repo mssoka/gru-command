@@ -69,6 +69,35 @@ export function markHistoricalDirectiveFixture(ledger: LedgerApi, requestId: str
   db.prepare('UPDATE pending_directives SET request_kind = NULL, authority_epoch = NULL, contract_snapshot = NULL, contract_sha256 = NULL WHERE request_id = ?').run(requestId);
 }
 
+/** A job that went terminal before live directives and re-brief markers
+ * refused that status write (pre-#493 history): the status row and its
+ * `job.status` event are written as that old transaction wrote them. */
+export function markLegacyTerminalJobFixture(ledger: LedgerApi, jobId: string, status: 'binned' | 'done'): void {
+  const { db } = ledger as unknown as { readonly db: DatabaseSync };
+  const from = ledger.getJob(jobId)?.status;
+  if (from === undefined) throw new Error(`no job ${jobId}`);
+  const ts = new Date().toISOString();
+  db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(status, ts, jobId);
+  db.prepare("INSERT INTO events (ts, kind, job_id, payload) VALUES (?, 'job.status', ?, ?)").run(ts, jobId, JSON.stringify({ from, to: status }));
+}
+
+/** Fresh retirement expectations for direct ledger callers. Production
+ * callers must supply these values from the authenticated direct readback. */
+export function directiveRetirementInputs(ledger: LedgerApi, requestId: string) {
+  const row = ledger.getDirective(requestId);
+  if (row === null) throw new Error(`no directive request ${requestId}`);
+  const authority = ledger.directiveCurrentAuthority(row.jobId);
+  const obligation = ledger.recoveryObligation(row.jobId, 'directive', requestId);
+  return { expectedGeneration: obligation?.generation ?? null, expectedPlanRevision: obligation?.planRevision ?? null,
+    expectedObligationState: obligation?.state ?? null, expectedAuthorityEpoch: authority.authorityEpoch,
+    expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256 } as const;
+}
+
+/** The same expectations shaped for the route orchestration's `expected`. */
+export function directiveRetirementFreshness(ledger: LedgerApi, requestId: string) {
+  return { context: directiveRetirementInputs(ledger, requestId) } as const;
+}
+
 /** Persist genuine current-protocol admission for non-runtime ledger consumers. */
 export function admitNativeDirectiveFixture(ledger: LedgerApi, requestId: string, minionId: string, file: string,
   completed?: { readonly head: string | null; readonly cwd: string }): number {

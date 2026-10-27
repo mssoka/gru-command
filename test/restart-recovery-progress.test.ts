@@ -1,4 +1,4 @@
-import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, directiveRetirementFreshness, directiveRetirementInputs, markHistoricalDirectiveFixture, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
@@ -18,7 +18,7 @@ import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/r
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { admitBlindReview, recordBlindAdmission } from '../src/dispatch/blind-review.js';
-import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
+import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -732,7 +732,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const head = resolveGitCommit(f.lane.path, 'HEAD'); const watermark = f.ledger.latestEventSeq(); const original = f.ledger.getDirective(f.intent.requestId);
     let refusal: unknown;
     try { f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId, expectedState: 'dispatching', expectedPayloadHash: f.intent.payloadHash,
-      expectedHead: head, lane: { id: f.lane.id, resolvedHead: head }, reason: 'no unsafe retirement', by: 'gru' }); } catch (error) { refusal = error; }
+      expectedHead: head, ...directiveRetirementInputs(f.ledger, f.intent.requestId), lane: { id: f.lane.id, resolvedHead: head },
+      reason: 'no unsafe retirement', by: 'gru' }); } catch (error) { refusal = error; }
     expect(refusal).toMatchObject({ code: 'live_work', blockers: ['original native physical owner cessation remains UNKNOWN'] });
     const input = { ledger: f.ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [], requestId: f.intent.requestId, generation: debt.generation,
       expectedPayloadHash: f.intent.payloadHash, expectedHead: head, expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: f.identity.workRevision,
@@ -816,7 +817,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const head = resolveGitCommit(f.lane.path, 'HEAD');
     const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
       expectedState: f.ledger.getDirective(f.intent.requestId)!.state as 'dispatching', expectedPayloadHash: f.intent.payloadHash,
-      expectedHead: head, lane: { id: f.lane.id, resolvedHead: head },
+      expectedHead: head, ...directiveRetirementInputs(f.ledger, f.intent.requestId), lane: { id: f.lane.id, resolvedHead: head },
       reason: 'preparation refused before any native target', by: 'gru' });
     expect(retired.record.state).toBe('retired');
   });
@@ -833,7 +834,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const head = resolveGitCommit(f.lane.path, 'HEAD');
     const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
       expectedState: 'dispatching', expectedPayloadHash: f.intent.payloadHash, expectedHead: head,
-      lane: { id: f.lane.id, resolvedHead: head },
+      ...directiveRetirementInputs(f.ledger, f.intent.requestId), lane: { id: f.lane.id, resolvedHead: head },
       reason: 'interrupted before any target was retained', by: 'gru' });
     expect(retired.record.state).toBe('retired');
   });
@@ -2461,11 +2462,23 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     await service.dispose();
   });
 
-  it('terminal jobs never revive or infer completion from bookkeeping', async () => {
-    const f = await fixture(); f.seed(); f.ledger.setJobStatus(f.intent.jobId, 'done');
-    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
-    expect(f.spawns).toEqual([]); expect(f.ledger.getJob(f.intent.jobId)?.status).toBe('done');
-    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching');
+  it('terminal jobs never revive or infer completion from bookkeeping, and their live requests stay visible', async () => {
+    // A merge is accepted over a live request; done and binned predate the
+    // refusal of those writes (legacy history).
+    for (const terminal of ['merged', 'done', 'binned'] as const) {
+      const f = await fixture(); f.seed();
+      if (terminal === 'merged') { f.ledger.setJobStatus(f.intent.jobId, 'in-review'); f.ledger.setJobStatus(f.intent.jobId, 'merged'); }
+      else markLegacyTerminalJobFixture(f.ledger, f.intent.jobId, terminal);
+      const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+      expect(f.spawns, terminal).toEqual([]); expect(f.ledger.getJob(f.intent.jobId)?.status, terminal).toBe(terminal);
+      // Exact native admission is bookkeeping and is restored; completion is never inferred.
+      expect(f.ledger.getDirective(f.intent.requestId)?.state, terminal).toBe('admitted');
+      const card = f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active');
+      expect(card, terminal).toMatchObject({ routing: 'action-required', agentId: null,
+        title: `Directive ${f.intent.requestId} is still admitted on ${terminal} job ${f.intent.jobId}` });
+      expect(card?.detail, terminal).toContain(`POST /api/silas/directives/${f.intent.requestId}/abandon`);
+      await service.dispose();
+    }
   });
 
   it('actual native admission callback replay binds once, with strict actor/request/hash identity', async () => {
@@ -2592,7 +2605,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // The named successor ends without native admission, so it can never settle the debt.
     if (end === 'failed') f.ledger.failDirective({ requestId: f.successor.requestId, reason: 'positive no-effect before any prompt' });
     else retireInterruptedDirectiveFromRoute({ ...f.deps, requestId: f.successor.requestId, reason: 'stuck before admission; ceased', by: 'silas-ops',
-      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash, head: resolveGitCommit(f.lane.path, 'HEAD') } });
+      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash,
+        head: resolveGitCommit(f.lane.path, 'HEAD'), ...directiveRetirementFreshness(f.ledger, f.successor.requestId) } });
     const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
     expect(f.ledger.getObligation(f.debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'superseded', byObligationId: reopened.id } });
     expect(reopened).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision',
@@ -2614,6 +2628,23 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   }
   it('a fresh-session successor that fails before native admission reopens the retired predecessor debt for reconcile-admitted (#470)', () => assertStrandedSuccessorReopensDebt('rebrief-successor', 'failed'));
   it('a successor retired before native admission reopens the retired predecessor debt for reconcile-admitted (#470)', () => assertStrandedSuccessorReopensDebt('successor', 'retired'));
+
+  it('an owner-abandoned successor reopens the predecessor debt as an owner decision, never as unadmitted (#493)', async () => {
+    const f = await strandableSuccessor('successor');
+    // The successor's native producer journal never proved cessation: custody unknown.
+    f.ledger.prepareDirectiveTarget(f.successor.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveProducer({ identity: f.ledger.directiveTurnIdentity(f.successor.requestId), agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    abandonLiveDirectiveFromRoute({ ...f.deps, requestId: f.successor.requestId, reason: 'successor custody unknown', by: 'owner',
+      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash } });
+    const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
+    expect(f.ledger.getObligation(f.debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'superseded', byObligationId: reopened.id,
+      reason: `named successor ${f.successor.requestId} was abandoned by the owner with its outcome unknown` } });
+    expect(reopened.nextAction).toEqual({ kind: 'owner-decision', decision: `named successor ${f.successor.requestId} was abandoned by the owner with its outcome unknown. ` +
+      'Whether this retired request\'s approved work still needs doing is the owner\'s decision: nothing records that the successor ran, or that it did not.' });
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-recovery-reopened')?.payload).toMatchObject({ successor_state: 'abandoned' });
+    expect(JSON.stringify(f.ledger.listJobEvents(f.intent.jobId))).not.toContain('without native admission');
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 0, failures: [] });
+  });
 
   it('a successor chain reopens the first predecessor when its successor is itself recovered; each debt settles on the final admission (#470)', async () => {
     const f = await strandableSuccessor('rebrief-successor');
@@ -3096,7 +3127,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, old)).toThrow(/exact current physical/);
     expect(f.ledger.latestEventSeq()).toBe(watermark); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(bytes);
     expect(() => f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId, expectedState: 'admitted', expectedPayloadHash: f.intent.payloadHash,
-      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), lane: { id: f.lane.id, resolvedHead: resolveGitCommit(f.lane.path, 'HEAD') }, reason: 'must not exempt an executing native owner', by: 'gru' })).toThrow(/live ownership/);
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), ...directiveRetirementInputs(f.ledger, f.intent.requestId),
+      lane: { id: f.lane.id, resolvedHead: resolveGitCommit(f.lane.path, 'HEAD') }, reason: 'must not exempt an executing native owner', by: 'gru' })).toThrow(/live ownership/);
     expect(f.ledger.latestEventSeq()).toBe(watermark);
   });
 
@@ -3684,7 +3716,7 @@ it('P28 genuine ordinary settlement rolls back debt and control together on stor
 it('P28 terminal legacy cancellation closes late routine recovery debt administratively without inventing successful completion', async () => {
   const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
   const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old interrupted request', briefing: 'original' });
-  f.ledger.setJobStatus(f.intent.jobId, 'binned'); const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late recovery observation');
+  markLegacyTerminalJobFixture(f.ledger, f.intent.jobId, 'binned'); const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late recovery observation');
   expect(debt.state).toBe('open');
   const result = f.ledger.retirePendingRebriefs({ jobId: f.intent.jobId, reason: 'actual terminal job control', candidates: markers });
   expect(result.retired).toHaveLength(2); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
@@ -3815,7 +3847,7 @@ it('a review job\'s durable re-brief gives the fresh reviewer the read-only orde
 async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {
   const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
   const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old interrupted request', briefing: 'original' });
-  f.ledger.setJobStatus(f.intent.jobId, 'binned');
+  markLegacyTerminalJobFixture(f.ledger, f.intent.jobId, 'binned');
   const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late terminal original context');
   const retire = (ledger: LedgerApi) => ledger.retirePendingRebriefs({ jobId: f.intent.jobId, reason: 'actual terminal administrative cancellation', candidates: markers });
   if (mode === 'suspended') f.ledger.suspendObligation(debt.id, 'original context remains held');

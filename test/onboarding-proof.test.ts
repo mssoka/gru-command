@@ -2564,7 +2564,9 @@ describe('the service: one row for Gru per stuck episode', () => {
     expect(h.attention().filter((row) => row.open)).toEqual([]);
     await tick(h, service);
     expect(h.attention().filter((row) => row.open)).toEqual([expect.objectContaining({ id: rowId(H3, third, 'deferred') })]);
-    h.ledger.setJobStatus(JOB, 'done');
+    // The job ends by a merge: its live proof directive refuses `done`.
+    h.ledger.setJobStatus(JOB, 'in-review');
+    h.ledger.setJobStatus(JOB, 'merged');
     await tick(h, service);
     expect(h.attention().filter((row) => row.open)).toEqual([]);
   });
@@ -2753,6 +2755,24 @@ describe('the service: one row for Gru per stuck episode', () => {
     expect(h.attention()[0]!.detail).toContain('The minion\'s turn was retired before it finished; a continuation hold may need Gru.');
     expect(h.attention()[0]!.detail).not.toContain('finished that turn');
     expect(h.directives).toHaveLength(1);
+  });
+
+  it('An owner-abandoned directive is an unknown outcome, never a refusal: no next attempt, and a row of its own words', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.outcome = (input) => failing(input);
+    const service = await started(h.service());
+    const first = deliver(h.ledger, H1);
+    await service.idle();
+    // Stored failed, as an abandonment is; a refusal would ask again under attempt 2.
+    h.db.handle.prepare(`UPDATE pending_directives SET state = 'failed', fail_reason = 'abandoned by the owner; outcome and producer custody unknown: x',
+      abandoned_at = '2026-10-24T00:00:00.000Z', abandoned_by = 'owner', abandon_reason = 'x' WHERE request_id = ?`).run(onboardingProofDirectiveId(JOB, H1, 1));
+    await tick(h, service);
+    await tick(h, service);
+    expect(h.directives.map((input) => input.requestId)).toEqual([onboardingProofDirectiveId(JOB, H1, 1)]);
+    expect(h.attention()).toEqual([{ id: rowId(H1, first, 'retired'), title: 'Onboarding proof failure: the owner abandoned the minion\'s turn: fixture-app', detail: expect.any(String), open: true }]);
+    expect(h.attention()[0]!.detail).toContain('its outcome is unknown and no further one is sent');
   });
 
   it('An unknown outcome is an unreadable record: it keeps the fence, is never proven again, and gets one row', async () => {
@@ -2976,7 +2996,9 @@ describe('the service: one row for Gru per stuck episode', () => {
     const service = await started(h.service());
     expect(h.attention()).toEqual([expect.objectContaining({ id: rowId(H3, third, 'failures'), open: true })]);
     expect(commentReceipts(h.ledger)).toEqual([]);
-    h.ledger.setJobStatus(JOB, 'done');
+    // The job ends by a merge: its live proof directive refuses `done`.
+    h.ledger.setJobStatus(JOB, 'in-review');
+    h.ledger.setJobStatus(JOB, 'merged');
     await service.idle();
     expect(h.attention().filter((row) => row.open)).toEqual([]);
     // Its comments are not settled yet: the next reconcile reads the job again and posts them.

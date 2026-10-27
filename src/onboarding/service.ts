@@ -985,6 +985,10 @@ export class OnboardingService {
       reasons.push({ reason: 'retired', title: `Onboarding proof failure: the minion's turn was retired: ${shown(repo)}`, failure: true,
         line: `The minion's turn was retired before it finished; a continuation hold may need Gru. Job ${jobId}'s newest delivery still names the failed head ${head.slice(0, 12)}.` });
     }
+    if (directive === 'abandoned') {
+      reasons.push({ reason: 'retired', title: `Onboarding proof failure: the owner abandoned the minion's turn: ${shown(repo)}`, failure: true,
+        line: `The owner abandoned the directive telling job ${jobId}'s minion about its failed proof; its outcome is unknown and no further one is sent. Job ${jobId}'s newest delivery still names the failed head ${head.slice(0, 12)}.` });
+    }
     if (directive === 'settled' && this.settledAgain(jobId, head)) {
       reasons.push({ reason: 'unanswered', title: `Onboarding proof failure unanswered: ${shown(repo)}`, failure: true,
         line: `Job ${jobId}'s minion was told its proof failed and finished that turn, but its newest delivery still names the failed head ${head.slice(0, 12)}.` });
@@ -1295,9 +1299,11 @@ export class OnboardingService {
         break;
       }
       // Retired: the writer stopped with no terminal receipt, and a
-      // continuation hold may keep automation off the lane. Settled or
-      // live: told, or being told; the lane admitted it, so the refusals
-      // before it count no more.
+      // continuation hold may keep automation off the lane. Abandoned: the
+      // owner closed it with its outcome unknown — never a refusal before
+      // any prompt, so no next attempt. Settled or live: told, or being
+      // told; the lane admitted it, so the refusals before it count no more.
+      if (row.abandonedAt !== null) return 'abandoned';
       if (row.state === 'retired') return 'retired';
       if (row.state !== 'failed') {
         this.directRefusals.delete(key);
@@ -1337,7 +1343,7 @@ export class OnboardingService {
 /** Where telling the minion about a failed head stands: a request is being
  * made (or will be), one is live, one settled, one was retired, or every
  * attempt was refused. */
-type DirectiveStanding = 'asking' | 'live' | 'settled' | 'retired' | 'exhausted';
+type DirectiveStanding = 'asking' | 'live' | 'settled' | 'retired' | 'abandoned' | 'exhausted';
 
 /** One reason a head is stuck, as Gru's row names it. */
 interface StuckReason {
