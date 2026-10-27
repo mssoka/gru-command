@@ -531,6 +531,9 @@ interface CardFit {
   readonly unit: Surface & { readonly text: string };
   readonly aside: Surface | null;
   readonly facts: Surface | null;
+  /** Each `.cockpit-fact` item — the element whose `nowrap` cut the
+   * owner's `0 fixes awaiting you` fact, measured on its own. */
+  readonly factItems: readonly Surface[];
   readonly head: number;
 }
 
@@ -576,6 +579,11 @@ async function cockpitFit(page: Page): Promise<CockpitFit> {
           unit: { ...surface(unit, 'unit'), text: unit.textContent ?? '' },
           aside: optional(card.querySelector<HTMLElement>('.cockpit-card__aside')),
           facts: optional(card.querySelector<HTMLElement>('.cockpit-card__facts')),
+          factItems: [...card.querySelectorAll<HTMLElement>('.cockpit-fact')].map((item) => ({
+            cw: item.clientWidth,
+            sw: item.scrollWidth,
+            whiteSpace: getComputedStyle(item).whiteSpace,
+          })),
           head: card.querySelector<HTMLElement>('.cockpit-card__head')!.getBoundingClientRect().height,
         };
       }),
@@ -600,7 +608,10 @@ function cardSurfaces(card: CardFit): ReadonlyArray<readonly [string, Surface]> 
     ['label', card.label],
     ['unit', card.unit],
     ['aside', card.aside],
-    ['facts', card.facts],
+    ['facts row', card.facts],
+    // The item is where the `nowrap` lived (a fact's count + label), so a
+    // container-only check would pass a row of unbreakable items.
+    ...card.factItems.map((item, index): readonly [string, Surface | null] => [`fact[${index}]`, item]),
   ];
   return surfaces.filter((surface): surface is readonly [string, Surface] => surface[1] !== null);
 }
@@ -894,7 +905,10 @@ test('the KPI strip holds its column rule and reads whole at every cockpit width
   // The widths the briefing names, plus the 360px phone the rest of this
   // suite already exercises (the strip must hold there too).
   const widths: ReadonlyArray<[number, number]> = [
-    [2400, 900], [2062, 686], [1600, 900], [1280, 900], [1000, 900], [768, 900], [390, 800], [360, 740],
+    // 375 is the two-column phone band where a long aside first wraps
+    // inside its own box (it is not coarser than the 390/360 pair: it is
+    // the boundary the review flagged).
+    [2400, 900], [2062, 686], [1600, 900], [1280, 900], [1000, 900], [768, 900], [390, 800], [375, 812], [360, 740],
   ];
   for (const [width, height] of widths) {
     await page.setViewportSize({ width, height });
