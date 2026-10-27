@@ -608,7 +608,11 @@ describe('pre-bootstrap dependency patch package fences', () => {
     f.repo.git(['rm', '--quiet', 'requirements.txt']);
     symlinkSync('requirements-target.txt', join(f.repo.path, 'requirements.txt'));
     f.repo.git(['add', 'requirements.txt', 'requirements-target.txt']);
-    f.repo.git(['commit', '--quiet', '-m', 'synthetic symlink requirements']);
+    // The fixture repo has no host git identity (CI runners auto-detect an
+    // empty one), so this commit names the same fixture author every other
+    // fixture commit uses.
+    f.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit', '--quiet', '-m', 'synthetic symlink requirements']);
     f.repo.git(['push', '--quiet', 'origin', 'main']);
     const made = f.makePackage({ jobId: 'job-symlink-requirements' });
     await expect(dispatch(f, 'job-symlink-requirements', made.reference)).rejects.toThrow(/file_mismatch/u);
