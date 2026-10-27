@@ -86,12 +86,27 @@ export interface SessionSourceScan {
   readonly backupKey: string;
   readonly size: number;
   readonly mtimeMs: number;
+  readonly ctimeMs: number;
 }
 
 /** Fingerprint of the content last copied into a source's backup. */
 export interface BackupBaselineEntry {
+  /** Size of the source when the pass scanned it for the copy. */
   readonly size: number;
+  /** Modification time when the pass scanned it for the copy. */
   readonly mtimeMs: number;
+  /**
+   * Status-change time when the pass scanned it. A write cannot restore it
+   * through the filesystem API (unlike mtime), so a same-size rewrite with a
+   * restored mtime still reads as changed.
+   */
+  readonly ctimeMs: number;
+  /**
+   * File name (inside the backup dir) of the generation this entry records.
+   * The pass verifies it still exists: an out-of-band reclaim of the backup
+   * dir must never silence a source's backups forever.
+   */
+  readonly backup: string;
 }
 
 /** What one backup pass did (`skipped` = unchanged sources left alone). */
@@ -120,6 +135,8 @@ const LOCK_HEARTBEAT_MS = 5_000;
 /** Heartbeat age permits bounded inspection, never proves owner absence. */
 const LOCK_STALE_MS = 60_000;
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // hourly (SPEC ruling 12)
+/** One ISO-hour slot: the span a generation's stamp stands for. */
+const BACKUP_SLOT_MS = 60 * 60 * 1000;
 const BACKUP_SUFFIX = '.bak';
 const BACKUP_BASELINE_VERSION = 1;
 /**
@@ -129,7 +146,7 @@ const BACKUP_BASELINE_VERSION = 1;
  * threshold of the live instance (sources idle longer than a week held the
  * bulk of the generations nobody would ever restore from).
  */
-const BACKUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export const BACKUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Durable session store (EPICS E2 story 3; SPEC ruling 12).
@@ -472,6 +489,13 @@ export class SessionStore {
     const snapshot: Record<string, number> = {};
     for (const source of sources) snapshot[source.file] = source.size;
     this.writeSnapshot(snapshot);
+    // Deliberate: the scan is the pass's one traversal, so these sizes are
+    // the pass's start-of-pass view, not a post-copy re-stat (Required 3 in
+    // the approved intent forbids a second stat walk here). A hard stop
+    // during the pass can therefore make the next boot's growth report
+    // include bytes written while the service was up — the same class of
+    // window the pre-existing post-snapshot writes already had. Do not
+    // "fix" this back into a second walk.
   }
 
   /** Bare size map at `sessions/store-state.json` (shape pinned by tests). */
@@ -531,8 +555,16 @@ export class SessionStore {
       let stat: { readonly size: number; readonly mtimeMs: number };
       try {
         stat = this.statSource(file);
-      } catch {
-        continue; // vanished mid-scan
+      } catch (error) {
+        // A vanished source is ordinary; any other failure is not — never
+        // drop a live source from the pass without a trace.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          this.log('warn', 'session source could not be inspected — left out of this pass', {
+            file,
+            error: String(error),
+          });
+        }
+        continue;
       }
       sources.push({
         file,
@@ -540,15 +572,16 @@ export class SessionStore {
         backupKey: this.backupKeyFor(file),
         size: stat.size,
         mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
       });
     }
     return sources;
   }
 
   /** Stat seam: exactly one call per source per pass (the cost test counts it). */
-  private statSource(file: string): { readonly size: number; readonly mtimeMs: number } {
+  private statSource(file: string): { readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number } {
     const stat = statSync(file);
-    return { size: stat.size, mtimeMs: stat.mtimeMs };
+    return { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
   }
 
   /** Flattened source key the backup file name is built from. */
@@ -562,7 +595,9 @@ export class SessionStore {
    * ISO-hour suffix (the slot IS the hour — a second pass in the same hour
    * refreshes the slot), prune, and persist both the size snapshot and the
    * change baseline. Unchanged sources are not copied at all, however
-   * recently they were written.
+   * recently they were written — the one exception is a source whose
+   * recorded generation has gone missing: that snapshot is re-created, not
+   * copied on a time window.
    */
   runBackup(now: Date = new Date()): BackupPassResult {
     mkdirSync(this.backupDir, { recursive: true });
@@ -577,25 +612,47 @@ export class SessionStore {
     const live = new Set(sources.map((source) => source.backupKey));
     const next: Record<string, BackupBaselineEntry> = {};
     const created: string[] = [];
+    const written = new Set<string>();
     let skipped = 0;
     for (const source of sources) {
       const previous = baseline[source.key];
-      if (previous !== undefined && previous.size === source.size && previous.mtimeMs === source.mtimeMs) {
-        next[source.key] = previous; // unchanged since its last recorded backup
-        skipped += 1;
-        continue;
+      if (
+        previous !== undefined &&
+        previous.size === source.size &&
+        previous.mtimeMs === source.mtimeMs &&
+        previous.ctimeMs === source.ctimeMs
+      ) {
+        if (existsSync(join(this.backupDir, previous.backup))) {
+          next[source.key] = previous; // unchanged since its last recorded backup
+          skipped += 1;
+          continue;
+        }
+        // Unchanged content, but the generation it was recorded against is
+        // gone (an out-of-band reclaim of the backup dir): re-create it
+        // rather than let a live source run with no snapshot at all.
+        this.log('warn', 'recorded session backup is missing — re-copying its unchanged source', {
+          file: source.file,
+          backup: join(this.backupDir, previous.backup),
+        });
       }
-      const dest = join(this.backupDir, `${source.backupKey}.${stamp}${BACKUP_SUFFIX}`);
+      const name = `${source.backupKey}.${stamp}${BACKUP_SUFFIX}`;
+      const dest = join(this.backupDir, name);
       try {
         copyFileSync(source.file, dest);
         created.push(dest);
-        next[source.key] = { size: source.size, mtimeMs: source.mtimeMs };
+        written.add(name);
+        next[source.key] = {
+          size: source.size,
+          mtimeMs: source.mtimeMs,
+          ctimeMs: source.ctimeMs,
+          backup: name,
+        };
       } catch (error) {
         // Never recorded: the next pass retries this source.
         this.log('warn', 'session backup copy failed', { file: source.file, error: String(error) });
       }
     }
-    const pruned = this.pruneBackups(live, now);
+    const pruned = this.pruneBackups(live, written, now);
     this.persistSnapshotFromSources(sources);
     this.writeBackupBaseline(next);
     if (created.length > 0 || pruned.length > 0) {
@@ -624,21 +681,24 @@ export class SessionStore {
   }
 
   /**
-   * Retention prune, two rules and one floor. Names parse as
+   * Retention prune, two rules and two floors. Names parse as
    * `<flattened source>.<YYYY-MM-DDTHH>.bak` and sort chronologically.
    *
    * - **Count** (live sources only, unchanged): keep the newest `retention`
    *   generations. A source whose live file is gone can never produce
    *   another generation, so its generations are bounded by age instead.
-   * - **Age**: delete a generation whose ISO-hour stamp is older than
-   *   `backupMaxAgeMs` — an idle source would otherwise hold every
-   *   generation it ever produced forever.
+   * - **Age**: delete a generation whose ISO-hour slot ended more than
+   *   `backupMaxAgeMs` before this pass — an idle source would otherwise
+   *   hold every generation it ever produced forever.
    * - **Floor**: the NEWEST generation of every source survives both rules.
    *   It is that source's last snapshot: a live source's is never deleted,
    *   and a dead source keeps exactly that one once its older generations
    *   age out.
+   * - **This pass's own copies** are never pruned either: after a backwards
+   *   clock step a fresh slot sorts before the older names, and the count
+   *   rule must not delete the copy it was just asked to protect.
    */
-  private pruneBackups(liveSources: ReadonlySet<string>, now: Date): string[] {
+  private pruneBackups(liveSources: ReadonlySet<string>, writtenThisPass: ReadonlySet<string>, now: Date): string[] {
     if (!existsSync(this.backupDir)) return [];
     const BACKUP_NAME = /^(.*)\.(\d{4}-\d{2}-\d{2}T\d{2})\.bak$/;
     const bySource = new Map<string, string[]>();
@@ -660,9 +720,11 @@ export class SessionStore {
         for (const name of names.slice(0, Math.max(0, names.length - this.retention))) doomed.add(name);
       }
       for (const name of names) {
-        if (this.backupStampMs(name) < cutoff) doomed.add(name);
+        // A slot is current for its whole hour; it ages out when that hour ends.
+        if (this.backupStampMs(name) + BACKUP_SLOT_MS <= cutoff) doomed.add(name);
       }
       doomed.delete(newest); // the floor: a source's last snapshot always survives
+      for (const name of writtenThisPass) doomed.delete(name); // never prune this pass's own copy
       for (const name of names) {
         if (!doomed.has(name)) continue;
         const target = join(this.backupDir, name);
@@ -711,11 +773,19 @@ export class SessionStore {
       if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { baseline: {}, state: 'corrupt' };
       const baseline: Record<string, BackupBaselineEntry> = {};
       for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-        const size = (value as { size?: unknown } | null)?.size;
-        const mtimeMs = (value as { mtimeMs?: unknown } | null)?.mtimeMs;
+        const entry = value as { size?: unknown; mtimeMs?: unknown; ctimeMs?: unknown; backup?: unknown } | null;
+        const size = entry?.size;
+        const mtimeMs = entry?.mtimeMs;
+        const ctimeMs = entry?.ctimeMs;
+        const backup = entry?.backup;
         if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return { baseline: {}, state: 'corrupt' };
         if (typeof mtimeMs !== 'number' || !Number.isFinite(mtimeMs)) return { baseline: {}, state: 'corrupt' };
-        baseline[key] = { size, mtimeMs };
+        if (typeof ctimeMs !== 'number' || !Number.isFinite(ctimeMs)) return { baseline: {}, state: 'corrupt' };
+        // The recorded generation must name a file INSIDE the backup dir.
+        if (typeof backup !== 'string' || backup === '' || backup === '.' || backup === '..' || /[/\\]/u.test(backup)) {
+          return { baseline: {}, state: 'corrupt' };
+        }
+        baseline[key] = { size, mtimeMs, ctimeMs, backup };
       }
       return { baseline, state: 'ok' };
     } catch {

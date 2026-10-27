@@ -386,13 +386,17 @@ The service self-manages:
 - **Session transcripts** — an hourly pass (and one at boot) copies only
   the transcripts whose content changed since their last recorded copy
   into `<data_dir>/sessions/backups/` (ISO-hour slots); the change
-  baseline is `<data_dir>/sessions/backup-baseline.json`. Unchanged
-  transcripts are never re-copied, however recently they were written.
-  Per source: the newest 24 backups are kept and any generation older
-  than 7 days is pruned — never the newest one, which is that
-  transcript's last snapshot. A transcript that is gone keeps exactly
-  its newest backup while its older generations age out. Recovery
-  tooling must tolerate a torn tail line.
+  baseline is `<data_dir>/sessions/backup-baseline.json` (size, mtime and
+  ctime of the copied content plus the generation's file name). Unchanged
+  transcripts are never re-copied, however recently they were written; a
+  transcript whose recorded generation has gone missing is copied once
+  more, with a `warn`, so an out-of-band reclaim of the backup directory
+  cannot leave a live transcript without a snapshot. Per live transcript
+  the newest 24 backups are kept, and any generation whose ISO hour ended
+  more than 7 days ago is pruned — never the newest one, which is that
+  transcript's last snapshot. A transcript that is gone keeps exactly its
+  newest backup while its older generations age out (up to a week of
+  hourly generations). Recovery tooling must tolerate a torn tail line.
 - **Chat frames + service log** — size-based rotation with retained
   shards (see above).
 

@@ -48,11 +48,11 @@ integrated. Other users can install it on their laptops from GitHub.
     jsonl in standard pi session-dir patterns (path declared via
     /health), flock'd, hourly rolling backup that copies only files whose
     content changed since their last recorded copy (baseline in
-    sessions/backup-baseline.json) and never prunes a source's newest
-    generation; the pi CLI (or claude CLI) is the documented emergency
-    console — stop service, open the newest session file, single-writer
-    preserved by the stop; service detects jsonl growth while down and
-    reloads.
+    sessions/backup-baseline.json), re-creates a missing recorded backup
+    and never prunes a source's newest generation; the pi CLI (or claude
+    CLI) is the documented emergency console — stop service, open the
+    newest session file, single-writer preserved by the stop; service
+    detects jsonl growth while down and reloads.
 13. **Escalations/notifications:** event-bus native. FYI → notification;
     action-required → a queued item Gru surfaces in chat; ack ids
     (nothing shown is unproven).

@@ -2,9 +2,12 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { BACKUP_MAX_AGE_MS } from '../src/sessions/store.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const doc = (name: string): string => readFileSync(join(root, 'docs', name), 'utf-8').replace(/\s+/g, ' ');
+/** Derived from the code's own default, never a hand-maintained literal. */
+const MAX_AGE_DAYS = BACKUP_MAX_AGE_MS / (24 * 60 * 60 * 1000);
 
 describe('docs contracts', () => {
   it('BOARD.md promises no age-based owner escalation (#108)', () => {
@@ -42,30 +45,49 @@ describe('docs contracts: session backup policy', () => {
     return text.slice(start, end);
   }
 
-  it('OPERATIONS.md states changed-only copies and the last-snapshot floor', () => {
+  it('OPERATIONS.md states changed-only copies, the missing-backup repair, the age and the floor', () => {
     const ops = section(doc('OPERATIONS.md'), '## Backups & restore', '## Install rehearsal');
     expect(ops).toContain('copies only');
     expect(ops).toContain('backup-baseline.json');
+    // The missing-recorded-generation repair (a reclaim must not silence backups):
+    expect(ops).toContain('recorded generation has gone missing');
+    // The count rule is scoped to a live transcript; the dead-source rule stays:
+    expect(ops).toContain('Per live transcript the newest 24 backups are kept');
+    expect(ops).toContain('A transcript that is gone keeps exactly its newest backup');
+    // The chosen maximum age, derived from the code's default:
+    expect(ops).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(ops).toContain('never the newest one');
-    // The retired count-only wording is gone from this section.
+    // The retired count-only and every-pass wording is gone from this section.
     expect(ops).not.toContain('newest 24 per file');
     expect(ops).not.toContain('hourly rolling copies');
+    expect(ops).not.toContain('Per source: the newest 24 backups');
   });
 
-  it('RUNTIMES.md states the baseline file, the maximum age and both prune rules', () => {
+  it('RUNTIMES.md states the baseline shape, changed-only copies and both prune rules', () => {
     const runtimes = section(doc('RUNTIMES.md'), '## Session store (SPEC ruling 12)', '### Emergency console');
     expect(runtimes).toContain('backup-baseline.json');
-    expect(runtimes).toContain('7 days');
+    // The recorded baseline shape, field by field:
+    expect(runtimes).toContain('"version":1');
+    expect(runtimes).toContain('"size":N');
+    expect(runtimes).toContain('"mtimeMs":M');
+    expect(runtimes).toContain('"ctimeMs":C');
+    expect(runtimes).toContain('"backup":"<generation file name>"');
+    expect(runtimes).toContain('unchanged sources are not copied at all');
+    expect(runtimes).toContain('a source whose recorded generation is gone is copied again');
+    expect(runtimes).toContain('newest 24 generations of a live source');
+    expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(runtimes).toContain("never a source's newest generation");
+    expect(runtimes).toContain('a source that is gone keeps exactly its newest backup');
     // The retired every-pass copy and count-only statements are gone.
     expect(runtimes).not.toContain('tracked session files are copied hourly');
     expect(runtimes).not.toContain('the newest 24 backups are retained');
   });
 
-  it('SPEC.md ruling 12 states changed-only copying and the newest-generation floor', () => {
+  it('SPEC.md ruling 12 states changed-only copying, the repair and the newest-generation floor', () => {
     const spec = section(doc('SPEC.md'), '12. **Session forensics preserved:**', '13. **Escalations');
     expect(spec).toContain('copies only');
     expect(spec).toContain('backup-baseline.json');
+    expect(spec).toContain('re-creates a missing recorded backup');
     expect(spec).toContain("never prunes a source's newest generation");
     expect(spec).not.toContain('hourly rolling backup;');
   });
