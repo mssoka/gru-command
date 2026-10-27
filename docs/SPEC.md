@@ -55,7 +55,7 @@ integrated. Other users can install it on their laptops from GitHub.
     the newest generation nor the one the baseline records; the pi CLI (or
     claude CLI) is the documented emergency console — stop service, open
     the newest session file, single-writer preserved by the stop; service
-    detects jsonl growth while down and reloads.
+    detects jsonl changes since the last snapshot and reloads.
 13. **Escalations/notifications:** event-bus native. FYI → notification;
     action-required → a queued item Gru surfaces in chat; ack ids
     (nothing shown is unproven).

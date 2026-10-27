@@ -380,7 +380,7 @@ export class RuntimeRegistry {
   boot(): GrowthReport {
     this.growth = this.opts.store.detectGrowth();
     for (const finding of this.growth.findings) {
-      this.log('warn', 'session jsonl changed while service was down', {
+      this.log('warn', 'session jsonl changed since the last snapshot', {
         file: finding.file,
         kind: finding.kind,
         byte_delta: finding.grewByBytes,

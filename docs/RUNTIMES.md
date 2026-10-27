@@ -513,8 +513,9 @@ runtime registry and session store (`stubbed: false`):
 - `agent_session` — aggregate session state (`no-session` / `idle` /
   `streaming`) plus the most recent activity timestamp.
 - `session_growth` — the boot report: `none`, or the list of files that
-  grew, shrank, or were deleted while the service was down (file, kind,
-  byte delta).
+  grew, shrank, or were deleted since the last snapshot — normally while the
+  service was down; a hard stop during a pass can also surface writes from
+  just before it (file, kind, byte delta).
 
 Note: `/health` discloses absolute paths (workspace, data dir, session
 files) — stage-consistent with the loopback-only bind of the pre-UI

@@ -881,6 +881,41 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
   });
 });
 
+describe('SessionStore backup pass diagnostics', () => {
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'warns when a session subdirectory cannot be listed, and still backs up the rest',
+    () => {
+      const store = new SessionStore(tmpDataDir());
+      seedSource(store, 'gru', 'a.jsonl', 'one\n');
+      const blocked = join(store.sessionsDir, 'minion');
+      mkdirSync(blocked, { recursive: true });
+      writeFileSync(join(blocked, 'b.jsonl'), 'two\n', 'utf-8');
+      chmodSync(blocked, 0o000);
+
+      const warnings: string[] = [];
+      const logging = new SessionStore(store.dataDir, {
+        log: (level, msg) => {
+          if (level === 'warn') warnings.push(msg);
+        },
+      });
+      let thrown: unknown = null;
+      let pass: ReturnType<SessionStore['runBackup']> | null = null;
+      try {
+        pass = logging.runBackup(new Date('2026-10-01T10:05:00Z'));
+      } catch (error) {
+        thrown = error;
+      } finally {
+        chmodSync(blocked, 0o700);
+      }
+      // A subtree that cannot be listed must be named, never silently
+      // dropped from the copy decision and the size snapshot.
+      expect(thrown).toBeNull();
+      expect(warnings.some((msg) => msg.includes('subtree is left out'))).toBe(true);
+      expect(pass?.created.length ?? 0).toBe(1); // the readable source is still backed up
+    },
+  );
+});
+
 describe('SessionStore backup artifact integrity', () => {
   it('re-copies when the recorded generation is truncated', () => {
     const store = new SessionStore(tmpDataDir());

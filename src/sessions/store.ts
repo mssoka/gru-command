@@ -464,8 +464,8 @@ export class SessionStore {
         });
       }
     }
-    // Snapshot entries whose file VANISHED while down are findings too —
-    // a console delete must never pass silently.
+    // Snapshot entries whose file VANISHED since the last snapshot are
+    // findings too — a console delete must never pass silently.
     const present = new Set(this.listSessionFiles());
     for (const [file, prev] of Object.entries(previous)) {
       if (!present.has(file) && prev > 0) {
@@ -1006,7 +1006,15 @@ export class SessionStore {
       let entries;
       try {
         entries = readdirSync(dir, { withFileTypes: true });
-      } catch {
+      } catch (error) {
+        // A vanished directory is ordinary; any other failure silently drops
+        // every source under it from the pass, so it is named.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          this.log('warn', 'session directory could not be listed — its subtree is left out of this pass', {
+            dir,
+            error: String(error),
+          });
+        }
         return;
       }
       for (const entry of entries) {
