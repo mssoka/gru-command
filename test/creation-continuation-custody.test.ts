@@ -778,6 +778,32 @@ describe('retained-creation continuation custody', () => {
     expect(noLineRedacted.text).not.toContain(uuid.slice(8));
     expect(noLineRedacted.text).toContain('cut mid-line');
     expect(noLineRedacted.startsAtLine).toBe(true);
+    // A truncated window that starts at a line boundary has nothing partial
+    // to drop: its first complete line must still be redacted, not dropped.
+    const aligned = new OutputTail();
+    aligned.push(Buffer.from(`${'z'.repeat(65_536)}\n`));
+    aligned.push(Buffer.from(`locked gru-creation:${uuid}\nrecorded after\n`));
+    const alignedStream = aligned.stream();
+    expect(alignedStream.truncated).toBe(true);
+    expect(alignedStream.startsAtLine).toBe(true);
+    expect(alignedStream.text).toContain(`gru-creation:${uuid}`);
+    const alignedRedacted = redactedStreamTail(alignedStream);
+    expect(alignedRedacted.text.startsWith('locked ')).toBe(true);
+    expect(alignedRedacted.text).toContain('<redacted-creation-token>');
+    expect(alignedRedacted.text).not.toContain(uuid);
+    expect(alignedRedacted.text).toContain('recorded after');
+    // A mid-line window whose later line carries a complete token: the
+    // partial first line is dropped AND the later token is still redacted.
+    const mixed = new OutputTail();
+    mixed.push(Buffer.from(`${'w'.repeat(65_536 - 8)}partial`));
+    mixed.push(Buffer.from(`\nlocked gru-creation:${uuid}\nrecorded after\n`));
+    const mixedStream = mixed.stream();
+    expect(mixedStream.truncated).toBe(true);
+    expect(mixedStream.startsAtLine).toBe(false);
+    const mixedRedacted = redactedStreamTail(mixedStream);
+    expect(mixedRedacted.text).toContain('<redacted-creation-token>');
+    expect(mixedRedacted.text).not.toContain(uuid);
+    expect(mixedRedacted.text).toContain('recorded after');
   });
 
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
