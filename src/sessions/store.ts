@@ -675,6 +675,25 @@ export class SessionStore {
     }
   }
 
+  /**
+   * Whether an interrupted rename left a COMPLETE staged copy for this
+   * generation (`<generation>.tmp-<pid>`, at least the recorded size): the
+   * sweep promotes it instead of deleting it, so the baseline must keep the
+   * entry that names it.
+   */
+  private hasCompleteStagedCopy(generation: string, expectedSize: number): boolean {
+    try {
+      for (const name of readdirSync(this.backupDir)) {
+        if (!name.startsWith(`${generation}.tmp-`) || !/\.tmp-\d+$/u.test(name)) continue;
+        const stat = statSync(join(this.backupDir, name));
+        if (stat.isFile() && stat.size >= expectedSize) return true;
+      }
+    } catch {
+      /* no readable staging */
+    }
+    return false;
+  }
+
   /** Size of a readable recorded generation, or null when it is unusable. */
   private statGeneration(name: string): number | null {
     const path = join(this.backupDir, name);
@@ -1019,6 +1038,9 @@ export class SessionStore {
     const merged: Record<string, BackupBaselineEntry> = { ...pending.baseline };
     for (const [key, entry] of Object.entries(pending.baseline)) {
       if (this.statGeneration(entry.backup) !== null) continue;
+      // An interrupted rename's complete staging copy is this entry's
+      // generation: the sweep will promote it, so the pending entry stands.
+      if (this.hasCompleteStagedCopy(entry.backup, entry.size)) continue;
       const fallback = final.baseline[key];
       if (fallback !== undefined && this.statGeneration(fallback.backup) !== null) merged[key] = fallback;
     }
