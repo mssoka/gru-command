@@ -653,9 +653,13 @@ describe('retained-creation continuation custody', () => {
       expect(aborted, `release rejected with: ${thrown instanceof Error ? thrown.message : String(thrown)}`).toHaveLength(1);
       const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
       expect(detail).toContain('cannot remove a locked working tree');
-      expect(detail).toContain('<redacted-creation-token>');
+      // The recorded detail is cut at 400 points (oneLineErrorText), and a
+      // long temp path can push the placeholder past the cut: assert the
+      // secret's absence durably, and the placeholder on the untruncated error.
       expect(detail).not.toContain(token);
+      expect(hasRawCreationToken(detail)).toBe(false);
       const error = thrown as Error;
+      expect(error.message).toContain('<redacted-creation-token>');
       expect(error.message).not.toContain(token);
       expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
       expect(sink.entries.some((entry) => entry.msg === 'release aborted after its records; the tree is retained and a retry reuses what was saved')).toBe(true);
@@ -701,6 +705,38 @@ describe('retained-creation continuation custody', () => {
       stack: error.stack,
       cause: [(cause as Error).message, (cause as Error).stack, setup.output],
     }))).toBe(false);
+  });
+
+  it('does not keep a prefixless token body cut at the setup retention boundary', async () => {
+    // The retained setup window keeps the last 64 KiB of a stream. A token
+    // line straddling that boundary loses its fixed prefix, and the
+    // prefix-anchored redaction can then no longer see the body — the prefix
+    // is a known literal, so the surviving body would reconstruct a live
+    // custody token. The first partial line must be dropped instead.
+    const h = managerFixture('setup-boundary-redaction');
+    const jobId = 'setup-boundary-redaction';
+    const uuid = randomUUID();
+    const token = `gru-creation:${uuid}`;
+    // 65491 filler bytes after the token line put the window's start 5 bytes
+    // into it, leaving the whole body without the prefix.
+    const command = `printf '${token}\\n'; yes y | head -c 65491; exit 3`;
+    h.repo.commitFile('.gru-command/worktree.toml', `[[setup]]\ncommand = "${command}"\n`, 'setup that straddles the retention boundary');
+    const retained = syntheticRetained(h, jobId);
+    const thrown = await h.worktrees.createRetainedJobWorktree({
+      repoPath: h.repo.path, jobId,
+      expected: { receiptTokenSha256: sha256(retained.token), producerSettlementSeq: settlements(h, jobId)[0]!.seq },
+    }).then(() => null, (failure: unknown) => failure);
+    const error = thrown as Error;
+    expect(error.message).toContain('worktree setup command exited 3');
+    const setup = error.cause as unknown as { readonly output: { readonly stdout: { readonly text: string; readonly startsAtLine: boolean; readonly truncated: boolean }; readonly stderr: { readonly text: string } } };
+    // The window was truncated mid-line and its surviving text is not vacuous.
+    expect(setup.output.stdout.truncated).toBe(true);
+    expect(setup.output.stdout.text.length).toBeGreaterThan(1_000);
+    // No fragment of the token body survives anywhere the error records.
+    for (const text of [error.message, setup.output.stdout.text, setup.output.stderr.text]) {
+      expect(text).not.toContain(uuid);
+    }
+    expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, setup.output]))).toBe(false);
   });
 
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
