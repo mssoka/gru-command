@@ -496,16 +496,31 @@ body {
   .cockpit-kpis__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+/* Each card takes TWO tracks of the strip's own grid: its head and its
+   body. The head track is shared by every card in the row (subgrid), so a
+   row where one card's label or aside wraps to a second line gives every
+   card in that row the same head height — and a row where nothing wraps
+   pays nothing for the guarantee. The card's own 4px gap is the internal
+   row gap; the strip's 10px stays between rows of cards. */
 .cockpit-card {
   min-width: 0;
   display: grid;
-  align-content: start;
+  grid-template-rows: subgrid;
+  grid-row: span 2;
   gap: 4px;
   padding: 10px 13px 11px;
   border: var(--outline);
   border-radius: var(--radius-md);
   background: var(--card);
   box-shadow: var(--shadow-btn);
+}
+
+/* The headline, the stage bar and the facts: everything below the head. */
+.cockpit-card__body {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
 }
 
 /* An off feature (raids before opt-in): dashed and flat, never alarming. */
@@ -515,10 +530,9 @@ body {
   box-shadow: none;
 }
 
-/* One head height for every card in a row: the label's line plus the
-   aside's line is the tallest head a row produces once both wrap instead
-   of being cut, so the height is reserved here rather than left to which
-   text each card happens to carry. */
+/* The label and its aside; the aside drops to a second line when both do
+   not fit, and the row's shared track (above) keeps every card's head the
+   same height either way. */
 .cockpit-card__head {
   display: flex;
   flex-wrap: wrap;
@@ -527,15 +541,6 @@ body {
   min-width: 0;
   font-size: 11.5px;
   line-height: 1.2;
-  min-height: 2.5em;
-}
-
-/* A phone-width card is narrow enough that an aside wraps inside itself
-   (Nefario's `round 3 · high · advisory`), so reserve that second aside
-   line too — the heads still match across a row. Declared after the base
-   rule: same specificity, so source order decides the tier. */
-@container kpis (max-width: 349px) {
-  .cockpit-card__head { min-height: 3.75em; }
 }
 
 .cockpit-card__mark {
