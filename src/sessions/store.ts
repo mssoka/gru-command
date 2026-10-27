@@ -1,7 +1,6 @@
 import {
   closeSync,
   copyFileSync,
-  existsSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -692,7 +691,10 @@ export class SessionStore {
     // recorded generation of an unchanged source alike — is protected from
     // this pass's prune, so the baseline never names a file the pass deleted.
     const recordedGenerations = new Set(Object.values(next).map((entry) => entry.backup));
-    const pruned = this.pruneBackups(live, recordedGenerations, now);
+    // A fresh flat listing for the prune, taken AFTER the copies so the count
+    // rule sees the generations this pass added.
+    const presentAfter = this.listBackupGenerations();
+    const pruned = this.pruneBackups(live, recordedGenerations, presentAfter, now);
     this.persistSnapshotFromSources(sources);
     this.writeBackupBaseline(next);
     if (created.length > 0 || pruned.length > 0 || skipped > 0) {
@@ -740,11 +742,15 @@ export class SessionStore {
    *   clock step a fresh slot sorts before the older names, and the count rule
    *   must not delete the very copy the baseline points at.
    */
-  private pruneBackups(liveSources: ReadonlySet<string>, recordedGenerations: ReadonlySet<string>, now: Date): string[] {
-    if (!existsSync(this.backupDir)) return [];
+  private pruneBackups(
+    liveSources: ReadonlySet<string>,
+    recordedGenerations: ReadonlySet<string>,
+    present: ReadonlySet<string>,
+    now: Date,
+  ): string[] {
     const BACKUP_NAME = /^(.*)\.(\d{4}-\d{2}-\d{2}T\d{2})\.bak$/;
     const bySource = new Map<string, string[]>();
-    for (const name of readdirSync(this.backupDir)) {
+    for (const name of present) {
       const match = BACKUP_NAME.exec(name);
       if (match === null) continue;
       const source = match[1]!;

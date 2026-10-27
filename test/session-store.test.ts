@@ -627,7 +627,7 @@ describe('SessionStore changed-only backup pass', () => {
     },
   );
 
-  it('one pass performs one tree walk, flat backup listings and one stat per source for N sources with M changed copies', () => {
+  it('one pass performs one tree walk, one stat per source and only flat backup listings', () => {
     const store = new SessionStore(tmpDataDir());
     const files = Array.from({ length: 6 }, (_, index) => seedSource(store, 'gru', `s${index}.jsonl`, `${index}\n`));
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
@@ -641,14 +641,14 @@ describe('SessionStore changed-only backup pass', () => {
     // Exactly M copies for M changed sources; the rest are skipped.
     expect(pass.created.length).toBe(2);
     expect(pass.skipped).toBe(4);
-    // Cost: one directory walk (it used to walk twice per pass), one scan, one
-    // pre-copy flat backup-dir listing (not a tree walk; it answers "is the
-    // recorded generation still there?" — the prune takes its own flat
-    // listing), and one stat per source — the same data feeds the copy
-    // decision, the prune and the size snapshot.
+    // Cost: one directory walk (it used to walk twice per pass), one scan, two
+    // flat backup-dir listings (not tree walks: one answers "is the recorded
+    // generation still there?", the prune's own runs after the copies), and
+    // one stat per source — the same data feeds the copy decision, the prune
+    // and the size snapshot.
     expect(walk).toHaveBeenCalledTimes(1);
     expect(scan).toHaveBeenCalledTimes(1);
-    expect(listing).toHaveBeenCalledTimes(1);
+    expect(listing).toHaveBeenCalledTimes(2);
     expect(stat).toHaveBeenCalledTimes(files.length);
     walk.mockRestore();
     scan.mockRestore();
