@@ -1407,6 +1407,51 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('a ps row the host cannot fully stat (?E) is proven not to be OUR group, so it never makes a stopped group read as running (#511)', () => {
+    // The incident table in its simplest shape: an unrelated `ps` row whose
+    // state the kernel would not fully report (`?E`) sits beside rows for OUR
+    // group, which are stopped. Membership used to be validated over EVERY
+    // line, so one foreign unreadable state voided the whole table — and an
+    // unknown table is a live group (R8-3), which is the settle loop's
+    // "cleanup unconfirmed" refusal. A row whose pid and group both parse and
+    // whose group is not ours cannot speak for ours in any state.
+    const incident = '  29833  86745 ?E\n  41001 987654 Z\n  41002 987654 Z+\n';
+    expect(psGroupMembers(incident, 987654)).toEqual([{ pid: 41_001, state: 'Z' }, { pid: 41_002, state: 'Z+' }]);
+    expect(executingMember(psGroupMembers(incident, 987654))).toBe(false);
+    // The same reading over a REAL listing from this host — its own rows,
+    // spacing and flags — with the unrelated `?E` row added.
+    const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8' });
+    expect(listed.status).toBe(0);
+    const rows = listed.stdout.split('\n').filter((line) => line.trim() !== '');
+    expect(rows.length).toBeGreaterThan(0);
+    const table = `${rows.join('\n')}\n  41001 987654 Z\n  41002 987654 Z+\n  29833  86745 ?E\n`;
+    expect(executingMember(psGroupMembers(table, 987654))).toBe(false);
+  });
+
+  it('ps membership stays fail-closed where it must — a sleeping member of ours, our own unreadable state, a failed ps run — while a clean listing without our group is stopped (#511 preservation)', () => {
+    // 1. An unrelated `?E` row never erases a LIVE member of our group.
+    expect(executingMember(psGroupMembers('  29833  86745 ?E\n  41001 987654 S\n', 987654))).toBe(true);
+    // 2. A row for OUR group whose state cannot be parsed is unknown, so live.
+    expect(executingMember(psGroupMembers('  41001 987654 Zbroken\n', 987654))).toBe(true);
+    expect(executingMember(psGroupMembers('  41001 987654 z\n', 987654))).toBe(true);
+    // 3. A `ps` run that fails (non-zero status) is unknown, so live: a real
+    // group, listed on the same 1 ms budget production floors a zero budget
+    // to. The listing is measured first so this case cannot silently stop
+    // exercising the failure branch.
+    const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
+    const pgid = child.pid!;
+    try {
+      const cut = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', timeout: 1, killSignal: 'SIGKILL' });
+      expect(cut.status, 'the 1 ms budget did not cut the ps run, so this case no longer exercises the failed-run branch').not.toBe(0);
+      expect(groupHasLiveMember(pgid, 0)).toBe(true);
+    } finally {
+      process.kill(-pgid, 'SIGKILL');
+    }
+    // 4. A successful listing with no rows for our group is stopped, unchanged.
+    expect(psGroupMembers('  10    10 Ss\n  11    99 Z\n', 987654)).toEqual([]);
+    expect(executingMember(psGroupMembers('  10    10 Ss\n  11    99 Z\n', 987654))).toBe(false);
+  });
+
   it('a /proc listing or read that never settles is bounded by the remaining budget — unknown, so live (#360 R5-E6)', async () => {
     const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
     const pgid = child.pid!;
