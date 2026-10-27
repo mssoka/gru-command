@@ -1441,26 +1441,20 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(executingMember(psGroupMembers(`  41001 ${absent} Zbroken\n`, absent))).toBe(true);
     expect(executingMember(psGroupMembers(`  41001 ${absent} z\n`, absent))).toBe(true);
     // 3. A `ps` run that fails (non-zero status, or no string to read) is
-    // unknown, so live. `platform` pins the ps reader on every host — CI is
-    // Linux, where the untouched /proc reader would answer instead — for a
-    // REAL, existing group listed on the same 1 ms budget production floors
-    // a zero budget to. The uncut listing is measured immediately before
-    // with the same invocation, so a host where 1 ms stops cutting a full
-    // listing fails this case loudly. (A seam that could force the status
-    // would instrument the branch itself; production carries none, and this
-    // change deliberately adds none.)
-    const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
-    const pgid = child.pid!;
+    // unknown, so live. `platform` pins the ps reader on every host (CI is
+    // Linux, where the untouched /proc reader would answer instead) and group
+    // existence is forced for a group no process can have: a listing that
+    // SUCCEEDS has no rows for our group and answers stopped, so only the
+    // failed run answers live and this case proves which branch ran.
     const realPlatform = OWNED_GIT_SEAMS.platform;
+    const existence = vi.spyOn(process, 'kill').mockReturnValue(true);
     try {
       OWNED_GIT_SEAMS.platform = 'darwin';
-      const cut = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', timeout: 1, killSignal: 'SIGKILL' });
-      expect(cut.status, 'the 1 ms budget no longer cuts a ps listing, so this case no longer shows the failed-run branch').not.toBe(0);
-      expect(groupHasLiveMember(pgid, 0)).toBe(true);
-      await expect(groupHasLiveMemberAsync(pgid, 0)).resolves.toBe(true);
+      expect(groupHasLiveMember(absent, 0)).toBe(true);
+      await expect(groupHasLiveMemberAsync(absent, 0)).resolves.toBe(true);
     } finally {
+      existence.mockRestore();
       OWNED_GIT_SEAMS.platform = realPlatform;
-      process.kill(-pgid, 'SIGKILL');
     }
     // 4. A successful listing with no rows for our group is stopped, unchanged.
     expect(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent)).toEqual([]);
