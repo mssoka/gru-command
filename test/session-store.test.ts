@@ -1158,6 +1158,34 @@ describe('SessionStore baseline recovery', () => {
     expect(existsSync(join(store.sessionsDir, 'backups', entry.backup))).toBe(true);
   });
 
+  it('prefers the final entry when the pending entry names an unusable generation', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const key = Object.keys(readBaseline(store).sources)[0]!;
+    const recorded = readBaseline(store).sources[key]!.backup;
+    const stat = statSync(file);
+    // The pending entry carries the source's CURRENT fingerprint but names a
+    // generation that exists only as a directory: unusable, not absent.
+    const pendingName = `${relativeKey(store, file)}.2026-10-01T11.bak`;
+    mkdirSync(join(store.sessionsDir, 'backups', pendingName));
+    writeFileSync(
+      join(store.sessionsDir, 'backup-baseline.json.pending'),
+      JSON.stringify({
+        version: 1,
+        sources: { [key]: { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, backup: pendingName } },
+      }),
+      'utf-8',
+    );
+
+    const pass = store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    // The final baseline's usable entry wins: the unchanged source is
+    // skipped instead of repaired against the unusable pending name.
+    expect(pass.created).toEqual([]);
+    expect(pass.skipped).toBe(1);
+    expect(readBaseline(store).sources[key]!.backup).toBe(recorded);
+  });
+
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
     're-copies when the recorded generation cannot be read',
     () => {
@@ -1415,6 +1443,19 @@ describe('SessionStore backup prune safety', () => {
     // One minute past the boundary it ages out.
     const outside = store.runBackup(new Date('2026-10-08T11:01:00Z'));
     expect(outside.pruned).toEqual([aged.created[0]]);
+  });
+
+  it('applies an explicit backupMaxAgeMs shorter than the default', () => {
+    const twoHours = 2 * 60 * 60 * 1000;
+    const store = new SessionStore(tmpDataDir(), { backupMaxAgeMs: twoHours });
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z')); // slot 10:00-11:00
+    appendFileSync(file, 'two\n', 'utf-8');
+    const second = store.runBackup(new Date('2026-10-01T14:05:00Z')); // its slot ended 3h ago
+    // With the 2-hour option the first generation is over-age although the
+    // 7-day default would keep it.
+    expect(second.pruned).toContain(first.created[0]);
+    expect(existsSync(second.created[0]!)).toBe(true);
   });
 
   it('applies the default 7-day maximum age to a store constructed without the option', () => {
