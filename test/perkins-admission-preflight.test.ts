@@ -1435,7 +1435,7 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(executingMember(psGroupMembers(table, absent))).toBe(false);
   });
 
-  it('ps membership stays fail-closed where it must — a sleeping member of ours, our own unreadable state, a failed ps run — while a clean listing without our group is stopped (#511 preservation)', () => {
+  it('ps membership stays fail-closed where it must — a sleeping member of ours, our own unreadable state, a failed ps run (pinned by construction in perkins-group-liveness-ps.test.ts) — while a clean listing without our group is stopped (#511 preservation)', () => {
     // Above every platform's pid_max: provably no live process shares this
     // group, so a clean listing really has no rows for it.
     const absent = 2_000_000_001;
