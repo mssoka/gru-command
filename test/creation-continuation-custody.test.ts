@@ -434,6 +434,102 @@ describe('retained-creation continuation custody', () => {
     expect(api.spawns).toHaveLength(0);
   });
 
+  it('redacts the creation token from the rollback rethrow and its inner errors', async () => {
+    // The failed `git worktree add --lock --reason gru-creation:<token>` and
+    // the rollback that cannot prove an invocation-owned reservation are two
+    // different errors; both leave through the rethrow, and neither may carry
+    // the custody token.
+    const h = managerFixture('rollback-rethrow-redaction');
+    const jobId = 'rollback-rethrow-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    // An unwritable lane root fails the checkout add before any path or
+    // orphan administration exists, so the rollback has no owned holder.
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    chmodSync(parent, 0o555);
+    try {
+      const thrown = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId }).then(() => null, (failure: unknown) => failure);
+      // The rethrow ran: the failed add and the failed rollback are paired.
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const rethrown = thrown as AggregateError;
+      expect(rethrown.errors).toHaveLength(2);
+      expect(String(rethrown.errors[0])).toMatch(/^Error: git worktree add --lock --reason /u);
+      expect(String(rethrown.errors[1])).toMatch(/has no invocation-owned checkout reservation$/u);
+      expect(rethrown.message).toMatch(/^worktree creation failed \(git worktree add --lock --reason /u);
+
+      // The exact token this creation minted: its durable receipt survives the
+      // failed rollback, so the assertion is bound to the real secret.
+      const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+      const token = readCreationIntent(common, `gru/${jobId}`)?.token;
+      expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+      expect(receiptFiles(h.repo)).toHaveLength(1);
+
+      const text = JSON.stringify({
+        message: rethrown.message,
+        stack: rethrown.stack,
+        inner: rethrown.errors.map((error: Error) => [error.name, error.message, error.stack]),
+      });
+      expect(hasRawCreationToken(text)).toBe(false);
+      expect(text).not.toContain(token!);
+
+      // The operator meaning survives: the path, the custody condition and
+      // what to inspect, with only the secret replaced.
+      const path = join(parent, `job-${jobId}`);
+      expect(rethrown.message).toContain('<redacted-creation-token>');
+      expect(rethrown.message).toContain(`rollback custody unconfirmed for ${path}`);
+      expect(rethrown.message).toContain('inspect retained resources before retry');
+      expect(String(rethrown.errors[0])).toContain('<redacted-creation-token>');
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
+  it('redacts the creation token from the rollback log line that refuses an orphan administration', async () => {
+    // The rollback's own orphanCreationAdmin refusal names the custody token
+    // it expected; the manager log line that records it must not.
+    const sink = logSink();
+    const h = managerFixture('rollback-log-redaction', { log: sink.log });
+    const jobId = 'rollback-log-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    const path = join(parent, `job-${jobId}`);
+    const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    // An administration that claims this lane's path under another creation's
+    // lock: the rollback meets it and refuses by name.
+    const admin = join(common, 'worktrees', 'foreign');
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(admin, 'gitdir'), `${join(realpathSync(parent), `job-${jobId}`, '.git')}\n`);
+    writeFileSync(join(admin, 'HEAD'), `ref: refs/heads/gru/${jobId}\n`);
+    writeFileSync(join(admin, 'commondir'), '../..\n');
+    writeFileSync(join(admin, 'locked'), `gru-creation:${randomUUID()}\n`);
+    chmodSync(parent, 0o555);
+    try {
+      const thrown = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId }).then(() => null, (failure: unknown) => failure);
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const token = readCreationIntent(common, `gru/${jobId}`)?.token;
+      expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+
+      const refusal = sink.entries.find((entry) => entry.msg === 'creation rollback custody unconfirmed; resources retained');
+      expect(refusal, 'the rollback custody log line was emitted').toBeDefined();
+      expect(refusal!.level).toBe('error');
+      expect(refusal!.fields['path']).toBe(path);
+      const detail = String(refusal!.fields['error']);
+      expect(detail).toContain('lane administration');
+      expect(detail).toContain('is locked for another creation');
+      expect(detail).toContain('inspect it before retrying');
+      expect(detail).toContain('<redacted-creation-token>');
+      expect(detail).not.toContain(token!);
+      expect(hasRawCreationToken(JSON.stringify(sink.entries))).toBe(false);
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
     const h = await retainedFixture('shutdown-cancel');
     const stop = new AbortController();
