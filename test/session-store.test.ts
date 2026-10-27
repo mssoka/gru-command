@@ -652,11 +652,17 @@ describe('SessionStore changed-only backup pass', () => {
   it('copies a same-size rewrite even when the original mtime is restored', () => {
     const store = new SessionStore(tmpDataDir());
     const file = seedSource(store, 'gru', 'a.jsonl', 'aaaa\n');
+    // A whole-second mtime restores exactly, so the size and mtime a later
+    // pass compares are identical to the recorded ones — only the ctime moves.
+    const fixedSeconds = 1_790_000_000;
+    utimesSync(file, fixedSeconds, fixedSeconds);
     const before = statSync(file);
+    expect(before.mtimeMs).toBe(fixedSeconds * 1000);
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
 
     writeFileSync(file, 'bbbb\n', 'utf-8'); // same length: the size does not move
-    utimesSync(file, before.atime, before.mtime); // an editor/tool restoring the mtime
+    utimesSync(file, fixedSeconds, fixedSeconds); // the editor restores the mtime
+    expect(statSync(file).size).toBe(before.size);
     expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
     expect(statSync(file).ctimeMs).not.toBe(before.ctimeMs);
 
