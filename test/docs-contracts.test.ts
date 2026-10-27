@@ -50,7 +50,7 @@ describe('docs contracts: session backup policy', () => {
     expect(ops).toContain('copies only');
     expect(ops).toContain('backup-baseline.json');
     // The missing-recorded-generation repair (a reclaim must not silence backups):
-    expect(ops).toContain('recorded generation has gone missing');
+    expect(ops).toContain('recorded generation is missing, damaged or truncated');
     // The count rule is scoped to a live transcript; the dead-source rule stays:
     expect(ops).toContain(`Per live transcript the newest ${DEFAULT_BACKUP_RETENTION} backups are kept`);
     expect(ops).toContain('A transcript that is gone keeps its last recorded backup while its older generations age out');
