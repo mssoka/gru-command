@@ -594,6 +594,64 @@ describe('retained-creation continuation custody', () => {
     })).not.toMatch(/gru-creation:[0-9a-f]{8}-/u);
   });
 
+  it('redacts the token a locked-tree removal echoes through the disk-budget release', async () => {
+    // The disk-budget release removes off the event loop (runGitAsync) with a
+    // single --force; git then refuses a locked tree and echoes its lock
+    // reason — the creation token — into the release failure and its record.
+    const sink = logSink();
+    const h = managerFixture('locked-release-redaction', { log: sink.log });
+    const jobId = 'locked-release-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    const record = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId });
+    const token = `gru-creation:${randomUUID()}`;
+    git(h.repo, ['worktree', 'lock', '--reason', token, record.path]);
+    const thrown = await h.worktrees.release({ worktreeId: jobId, requireReleaseProofs: true, onLiveProcess: 'refuse', diskBudget: true })
+      .then(() => null, (failure: unknown) => failure);
+    // The async removal ran and its refusal was recorded, not silently dropped.
+    expect(thrown).toBeInstanceOf(Error);
+    const aborted = h.ledger.listJobEventsByKinds(jobId, ['worktree.release-aborted']);
+    expect(aborted).toHaveLength(1);
+    const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
+    expect(detail).toContain('cannot remove a locked working tree');
+    expect(detail).toContain('<redacted-creation-token>');
+    expect(detail).not.toContain(token);
+    const error = thrown as Error;
+    expect(error.message).not.toContain(token);
+    expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
+    expect(sink.entries.some((entry) => entry.msg === 'release aborted after its records; the tree is retained and a retry reuses what was saved')).toBe(true);
+  });
+
+  it('redacts the token a failing setup command prints from the lane registry', async () => {
+    // While a lane is still locked for its creation, `git worktree list
+    // --porcelain` prints its lock reason. A setup command that prints it and
+    // fails carries the token into the setup error, which records durably.
+    const h = managerFixture('setup-registry-redaction');
+    const jobId = 'setup-registry-redaction';
+    h.repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "git worktree list --porcelain; exit 3"\n', 'setup that prints the lane registry');
+    const retained = syntheticRetained(h, jobId);
+    const thrown = await h.worktrees.createRetainedJobWorktree({
+      repoPath: h.repo.path, jobId,
+      expected: { receiptTokenSha256: sha256(retained.token), producerSettlementSeq: settlements(h, jobId)[0]!.seq },
+    }).then(() => null, (failure: unknown) => failure);
+    expect(thrown).toBeInstanceOf(Error);
+    const error = thrown as Error;
+    expect(error.message).toContain('worktree setup command exited 3');
+    // The continuation kept its receipt, so the exact token is still readable.
+    const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    const token = readCreationIntent(common, retained.branch)?.token;
+    expect(token).toBe(retained.token);
+    expect(error.message).toContain('<redacted-creation-token>');
+    expect(error.message).not.toContain(retained.token);
+    const cause = error.cause instanceof Error ? error.cause : null;
+    expect(hasRawCreationToken(JSON.stringify({
+      message: error.message,
+      stack: error.stack,
+      cause: cause === null ? null : [cause.message, cause.stack, (cause as unknown as { output?: unknown }).output],
+    }))).toBe(false);
+  });
+
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
     const h = await retainedFixture('shutdown-cancel');
     const stop = new AbortController();
