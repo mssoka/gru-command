@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { DispatchService } from '../src/dispatch/service.js';
+import { OutputTail, redactedStreamTail } from '../src/worktrees/manifest.js';
 import { JobExecutionStop } from '../src/dispatch/job-stop.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { clearCreationIntent, readCreationIntent, writeCreationIntent } from '../src/worktrees/creation-intent.js';
@@ -707,36 +708,29 @@ describe('retained-creation continuation custody', () => {
     }))).toBe(false);
   });
 
-  it('does not keep a prefixless token body cut at the setup retention boundary', async () => {
-    // The retained setup window keeps the last 64 KiB of a stream. A token
-    // line straddling that boundary loses its fixed prefix, and the
+  it('does not keep a prefixless token body cut at the setup retention boundary', () => {
+    // The retained setup window keeps whole pipe chunks; a token line that
+    // straddles a chunk boundary loses its fixed prefix, and the
     // prefix-anchored redaction can then no longer see the body — the prefix
-    // is a known literal, so the surviving body would reconstruct a live
-    // custody token. The first partial line must be dropped instead.
-    const h = managerFixture('setup-boundary-redaction');
-    const jobId = 'setup-boundary-redaction';
+    // is a known literal, so a surviving body reconstructs a live custody
+    // token. A pipe's chunk boundaries cannot be driven from a setup command
+    // (an end-to-end attempt at this head passed without touching the leak),
+    // so the window is built directly.
     const uuid = randomUUID();
-    const token = `gru-creation:${uuid}`;
-    // 65491 filler bytes after the token line put the window's start 5 bytes
-    // into it, leaving the whole body without the prefix.
-    const command = `printf '${token}\\n'; yes y | head -c 65491; exit 3`;
-    h.repo.commitFile('.gru-command/worktree.toml', `[[setup]]\ncommand = "${command}"\n`, 'setup that straddles the retention boundary');
-    const retained = syntheticRetained(h, jobId);
-    const thrown = await h.worktrees.createRetainedJobWorktree({
-      repoPath: h.repo.path, jobId,
-      expected: { receiptTokenSha256: sha256(retained.token), producerSettlementSeq: settlements(h, jobId)[0]!.seq },
-    }).then(() => null, (failure: unknown) => failure);
-    const error = thrown as Error;
-    expect(error.message).toContain('worktree setup command exited 3');
-    const setup = error.cause as unknown as { readonly output: { readonly stdout: { readonly text: string; readonly startsAtLine: boolean; readonly truncated: boolean }; readonly stderr: { readonly text: string } } };
-    // The window was truncated mid-line and its surviving text is not vacuous.
-    expect(setup.output.stdout.truncated).toBe(true);
-    expect(setup.output.stdout.text.length).toBeGreaterThan(1_000);
-    // No fragment of the token body survives anywhere the error records.
-    for (const text of [error.message, setup.output.stdout.text, setup.output.stderr.text]) {
-      expect(text).not.toContain(uuid);
-    }
-    expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, setup.output]))).toBe(false);
+    const kept = new OutputTail();
+    const split = `gru-creation:${uuid.slice(0, 8)}`;
+    kept.push(Buffer.from(`${'x'.repeat(65_536 - split.length)}${split}`));
+    kept.push(Buffer.from(`${uuid.slice(8)}\nrecorded after\n`));
+    const stream = kept.stream();
+    expect(stream.truncated).toBe(true);
+    expect(stream.startsAtLine).toBe(false);
+    expect(stream.text).toContain(uuid.slice(8)); // the raw window holds the body
+    const redacted = redactedStreamTail(stream);
+    // The partial first line is dropped, not kept as a prefixless body.
+    expect(redacted.text).not.toContain(uuid);
+    expect(redacted.text).not.toContain(uuid.slice(8));
+    expect(redacted.text).toContain('recorded after');
+    expect(redacted.startsAtLine).toBe(true);
   });
 
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {

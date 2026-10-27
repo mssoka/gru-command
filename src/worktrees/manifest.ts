@@ -579,8 +579,10 @@ function tail(text: string, max = 2_000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`;
 }
 
+/* Exported for its tests: the boundary rule is a function of the retained
+ * window, and a pipe's chunk boundaries cannot be driven from a setup command. */
 /** A setup stream's bounded tail with any creation token redacted. */
-function redactedStreamTail(stream: SetupStreamTail): SetupStreamTail {
+export function redactedStreamTail(stream: SetupStreamTail): SetupStreamTail {
   const text = redactCreationTokens(stream.text);
   return text === stream.text ? stream : { ...stream, text };
 }
