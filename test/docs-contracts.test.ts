@@ -79,9 +79,9 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain('a live source whose recorded generation is gone is copied again');
     expect(runtimes).toContain('newest 24 generations of a live source');
     expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
-    expect(runtimes).toContain("never a source's newest generation");
-    expect(runtimes).toContain('a source that is gone keeps its newest backup while its older generations age out');
     expect(runtimes).toContain('never a generation the baseline records');
+    expect(runtimes).toContain('a source the baseline does not know keeps its newest name');
+    expect(runtimes).toContain('a source that is gone keeps its newest backup while its older generations age out');
     expect(runtimes).toContain('sampled when the pass scans the source');
     expect(runtimes).toContain('the entry recorded for a source that is gone stays in the baseline');
     // The retired every-pass copy and count-only statements are gone.
