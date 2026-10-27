@@ -893,7 +893,7 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     const stagingObstruction = join(store.sessionsDir, 'backups', `${recorded}.tmp-${process.pid}`);
     mkdirSync(stagingObstruction);
 
-    const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    const pass = store.runBackup(new Date('2026-10-01T10:35:00Z')); // same ISO hour: same slot
     expect(pass.created).toEqual([]);
     expect(readFileSync(recordedPath, 'utf-8')).toBe('aaaaaaaa\n');
     rmSync(stagingObstruction, { recursive: true, force: true });
