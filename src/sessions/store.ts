@@ -552,7 +552,7 @@ export class SessionStore {
   scanSessionSources(): readonly SessionSourceScan[] {
     const sources: SessionSourceScan[] = [];
     for (const file of this.listSessionFiles()) {
-      let stat: { readonly size: number; readonly mtimeMs: number };
+      let stat: { readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number };
       try {
         stat = this.statSource(file);
       } catch (error) {
