@@ -1443,13 +1443,18 @@ describe('Perkins admission preflight (gh-169)', () => {
     // 3. A `ps` run that fails (non-zero status, or no string to read) is
     // unknown, so live. `platform` pins the ps reader on every host (CI is
     // Linux, where the untouched /proc reader would answer instead) and group
-    // existence is forced for a group no process can have: a listing that
-    // SUCCEEDS has no rows for our group and answers stopped, so only the
-    // failed run answers live and this case proves which branch ran.
+    // existence is forced for a group no process can have, so both answers of
+    // the same call are pinned side by side: a listing that COMPLETES has no
+    // rows for our group and answers stopped, while the same call on a budget
+    // no listing can meet (production floors a zero budget to 1 ms) answers
+    // live. Only the failed-run branch can produce that pair, so this case
+    // proves which branch ran rather than passing through a live member.
     const realPlatform = OWNED_GIT_SEAMS.platform;
     const existence = vi.spyOn(process, 'kill').mockReturnValue(true);
     try {
       OWNED_GIT_SEAMS.platform = 'darwin';
+      expect(groupHasLiveMember(absent, 5_000)).toBe(false);
+      await expect(groupHasLiveMemberAsync(absent, 5_000)).resolves.toBe(false);
       expect(groupHasLiveMember(absent, 0)).toBe(true);
       await expect(groupHasLiveMemberAsync(absent, 0)).resolves.toBe(true);
     } finally {
