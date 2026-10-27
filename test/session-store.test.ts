@@ -1072,6 +1072,69 @@ describe('SessionStore prune liveness', () => {
   });
 });
 
+describe('SessionStore baseline recovery', () => {
+  it('prefers the final baseline entry whose generation exists over intent-only pending entries', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const finalText = readFileSync(baselinePath(store), 'utf-8');
+    // A pending record written before a copy that never landed: it names a
+    // generation that does not exist.
+    const pending = {
+      version: 1,
+      sources: {
+        ...readBaseline(store).sources,
+        ...Object.fromEntries(
+          Object.keys(readBaseline(store).sources).map((key) => [
+            key,
+            { size: 4, mtimeMs: 1, ctimeMs: 1, backup: `${relativeKey(store, file)}.2026-10-01T11.bak` },
+          ]),
+        ),
+      },
+    };
+    writeFileSync(join(store.sessionsDir, 'backup-baseline.json.pending'), JSON.stringify(pending), 'utf-8');
+    writeFileSync(baselinePath(store), finalText, 'utf-8');
+
+    // The next pass must use the entry whose generation exists: the source is
+    // unchanged, so it skips rather than copying against the phantom name.
+    const pass = store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    expect(pass.created).toEqual([]);
+    expect(pass.skipped).toBe(1);
+    const entry = Object.values(readBaseline(store).sources)[0]!;
+    expect(existsSync(join(store.sessionsDir, 'backups', entry.backup))).toBe(true);
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    're-copies when the recorded generation cannot be read',
+    () => {
+      const store = new SessionStore(tmpDataDir());
+      const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+      store.runBackup(new Date('2026-10-01T10:05:00Z'));
+      const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+      const recordedPath = join(store.sessionsDir, 'backups', recorded);
+      chmodSync(recordedPath, 0o000);
+
+      const warnings: string[] = [];
+      const restarted = new SessionStore(store.dataDir, {
+        log: (level, msg) => {
+          if (level === 'warn') warnings.push(msg);
+        },
+      });
+      let pass: ReturnType<SessionStore['runBackup']> | null = null;
+      try {
+        pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+      } finally {
+        chmodSync(recordedPath, 0o600);
+      }
+      // An unreadable snapshot is not a snapshot: repair it (and say so).
+      expect(pass?.created.length ?? 0).toBe(1);
+      expect(pass?.skipped ?? -1).toBe(0);
+      expect(warnings.some((msg) => msg.includes('missing or unusable'))).toBe(true);
+      expect(existsSync(file)).toBe(true);
+    },
+  );
+});
+
 describe('SessionStore backup pass preservation', () => {
   it('never modifies or removes a live session file', () => {
     const store = new SessionStore(tmpDataDir());

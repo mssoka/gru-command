@@ -1,5 +1,7 @@
 import {
+  accessSync,
   closeSync,
+  constants as fsConstants,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -650,11 +652,16 @@ export class SessionStore {
     }
   }
 
-  /** Size of a recorded generation, or null when it is gone/not a file. */
+  /** Size of a readable recorded generation, or null when it is unusable. */
   private statGeneration(name: string): number | null {
+    const path = join(this.backupDir, name);
     try {
-      const stat = statSync(join(this.backupDir, name));
-      return stat.isFile() ? stat.size : null;
+      const stat = statSync(path);
+      if (!stat.isFile()) return null;
+      // A generation the service cannot read is not a snapshot it can
+      // restore: force the repair path (and its warn) instead of skipping.
+      accessSync(path, fsConstants.R_OK);
+      return stat.size;
     } catch {
       return null;
     }
@@ -702,10 +709,10 @@ export class SessionStore {
     }
     const sources = this.scanSessionSources();
     const liveFiles = new Map(sources.map((source) => [source.backupKey, source.file]));
-    // One listing taken BEFORE the copies: the skip decision needs to know
-    // whether the recorded generation is still there. (The prune takes its
+    // One flat listing taken BEFORE the copies, for the staging sweep (the
+    // skip decision stats the recorded generation itself). The prune takes its
     // own fresh listing afterwards, so the count rule still sees the copies
-    // this pass adds.)
+    // this pass adds.
     const presentBefore = this.listBackupGenerations();
     this.sweepStagingArtifacts(presentBefore);
     const scanned = new Set(sources.map((source) => source.key));
@@ -967,10 +974,21 @@ export class SessionStore {
   } {
     // A pending record is the previous pass's intended baseline, written
     // before its copies; it is preferred when it is valid (the final file may
-    // be older, or unpublishable).
+    // be older, or unpublishable). An entry whose generation never landed is
+    // intent-only: when the final baseline names a generation that does
+    // exist for the same source, that entry wins, so a crash cannot make the
+    // record point away from the real last copy.
     const pending = this.readBaselineFile(this.baselinePendingFile);
-    if (pending.state === 'ok') return pending;
-    return this.readBaselineFile(this.baselineFile);
+    if (pending.state !== 'ok') return this.readBaselineFile(this.baselineFile);
+    const final = this.readBaselineFile(this.baselineFile);
+    if (final.state !== 'ok') return pending;
+    const merged: Record<string, BackupBaselineEntry> = { ...pending.baseline };
+    for (const [key, entry] of Object.entries(pending.baseline)) {
+      if (existsSync(join(this.backupDir, entry.backup))) continue;
+      const fallback = final.baseline[key];
+      if (fallback !== undefined && existsSync(join(this.backupDir, fallback.backup))) merged[key] = fallback;
+    }
+    return { baseline: merged, state: 'ok' };
   }
 
   private readBaselineFile(file: string): {
