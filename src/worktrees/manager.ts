@@ -975,7 +975,8 @@ function spawnGit(
 
 /** {@link runGit} off the event loop (#427), for git whose cost grows with
  * the tree (a full checkout, a listing of what a removal left). Resolves with
- * stdout as git printed it (untrimmed); rejects as runGit throws. */
+ * stdout as git printed it (untrimmed); rejects like runGit, with the creation
+ * token redacted from its message (git echoes a locked tree's lock reason). */
 function runGitAsync(repoPath: string, args: readonly string[], opts: Pick<SpawnGitOptions, 'indexFile' | 'input' | 'maxBuffer'> = {}): Promise<string> {
   return new Promise((resolveOut, reject) => {
     const child = execFile('git', [...args], {
@@ -985,7 +986,11 @@ function runGitAsync(repoPath: string, args: readonly string[], opts: Pick<Spawn
       env: { ...repositoryGitEnv(false), ...(opts.indexFile !== undefined ? { GIT_INDEX_FILE: opts.indexFile } : {}) },
     }, (error, stdout, stderr) => {
       if (error === null) resolveOut(stdout);
-      else reject(new Error(`git ${args.join(' ')} failed (exit ${String(error.code ?? error.signal)}) in ${repoPath}: ${stderr.trim() || error.message}`));
+      else {
+        reject(new Error(redactCreationTokens(
+          `git ${args.join(' ')} failed (exit ${String(error.code ?? error.signal)}) in ${repoPath}: ${stderr.trim() || error.message}`,
+        )));
+      }
     });
     child.stdin?.on('error', reject);
     if (opts.input !== undefined) child.stdin?.end(opts.input);

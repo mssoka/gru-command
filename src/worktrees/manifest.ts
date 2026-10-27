@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, relative, resolve, win32 } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
+import { redactCreationTokens } from './creation-intent.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -556,9 +557,17 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   }
 
   opts.onOutcome?.({ code: outcome.code, signal: outcome.signal, timedOut, stopped });
-  const output = { stdout: stdout.stream(), stderr: stderr.stream() };
+  // A setup command can print a lane's own registry (`git worktree list
+  // --porcelain` shows the lock reason while the lane is still locked for its
+  // creation). Its output text is recorded durably through this error (a
+  // child's result summary, the retained failure reason, the service log), so
+  // the creation token is redacted here, before the error exists.
+  const output = {
+    stdout: redactedStreamTail(stdout.stream()),
+    stderr: redactedStreamTail(stderr.stream()),
+  };
   const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
-  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);
+  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(redactCreationTokens(`${what}: ${command}\noutput tail:\n${outputTail}`), output);
   if (stopped) throw failed('worktree setup command was stopped (its caller aborted)');
   if (timedOut) throw failed(`worktree setup command timed out after ${timeoutMs}ms`);
   if (outcome.code === null) throw failed(`worktree setup command was killed by ${String(outcome.signal)}`);
@@ -567,4 +576,10 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
 
 function tail(text: string, max = 2_000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`;
+}
+
+/** A setup stream's bounded tail with any creation token redacted. */
+function redactedStreamTail(stream: SetupStreamTail): SetupStreamTail {
+  const text = redactCreationTokens(stream.text);
+  return text === stream.text ? stream : { ...stream, text };
 }
