@@ -514,6 +514,130 @@ async function expectSlots(page: Page, kpis: readonly string[], value: number): 
   }
 }
 
+/** One card's text surfaces as measured widths: `cw`/`sw` are the box's
+ * client and scroll widths (equal when nothing is cut). */
+interface Surface {
+  readonly cw: number;
+  readonly sw: number;
+  readonly whiteSpace: string;
+}
+
+interface CardFit {
+  readonly card: string;
+  /** The card's row, as its top edge (cards in one row share it). */
+  readonly top: number;
+  readonly cardBox: Surface;
+  readonly label: Surface;
+  readonly unit: Surface & { readonly text: string };
+  readonly aside: Surface | null;
+  readonly facts: Surface | null;
+  readonly head: number;
+}
+
+interface CockpitFit {
+  /** The KPI wrapper's width — the size container the tracks follow. */
+  readonly containerWidth: number;
+  /** The grid's USED column count (the resolved track list). */
+  readonly columns: number;
+  readonly cards: readonly CardFit[];
+  readonly bodyOverflow: boolean;
+}
+
+/** The strip's measured reading: every card's text surfaces, its head's
+ * height, the grid's used column count and the wrapper width the count is
+ * derived from. Required surfaces throw when absent (a missing element
+ * never measures as an equal pair of zeros). */
+async function cockpitFit(page: Page): Promise<CockpitFit> {
+  return page.evaluate(() => {
+    const kpis = document.getElementById('board-kpis');
+    if (!kpis) throw new Error('missing #board-kpis');
+    const grid = kpis.querySelector<HTMLElement>('.cockpit-kpis__grid');
+    if (!grid) throw new Error('missing .cockpit-kpis__grid');
+    const surface = (el: HTMLElement | null, what: string): Surface => {
+      if (el === null) throw new Error(`missing ${what}`);
+      return { cw: el.clientWidth, sw: el.scrollWidth, whiteSpace: getComputedStyle(el).whiteSpace };
+    };
+    const optional = (el: HTMLElement | null): Surface | null =>
+      el === null ? null : { cw: el.clientWidth, sw: el.scrollWidth, whiteSpace: getComputedStyle(el).whiteSpace };
+    return {
+      containerWidth: kpis.clientWidth,
+      // The computed value resolves `repeat(auto-fit, …)` to one entry per
+      // track; a track the row has no card for is COLLAPSED to 0px, so the
+      // columns the owner sees are the positive ones (Rule 2's `n`).
+      columns: getComputedStyle(grid).gridTemplateColumns.split(' ').filter((track) => parseFloat(track) > 0).length,
+      cards: [...kpis.querySelectorAll<HTMLElement>('.cockpit-card')].map((card) => {
+        const unit = card.querySelector<HTMLElement>('.cockpit-card__unit');
+        if (unit === null) throw new Error('missing .cockpit-card__unit');
+        return {
+          card: card.dataset.card ?? '',
+          top: Math.round(card.getBoundingClientRect().top),
+          cardBox: surface(card, 'card'),
+          label: surface(card.querySelector<HTMLElement>('.cockpit-card__label'), 'label'),
+          unit: { ...surface(unit, 'unit'), text: unit.textContent ?? '' },
+          aside: optional(card.querySelector<HTMLElement>('.cockpit-card__aside')),
+          facts: optional(card.querySelector<HTMLElement>('.cockpit-card__facts')),
+          head: card.querySelector<HTMLElement>('.cockpit-card__head')!.getBoundingClientRect().height,
+        };
+      }),
+      bodyOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+    };
+  });
+}
+
+/** Rule 2: the column count a strip of `cards` cards takes in a
+ * `width`-wide wrapper — gap 10, minimum card 180, capped at seven, and
+ * floored at two (a phone keeps two columns). */
+function expectedColumns(width: number, cards: number): number {
+  return Math.min(7, cards, Math.max(2, Math.floor((width + 10) / 190)));
+}
+
+/** Every text surface of one card, named as the owner reads it; the
+ * optional ones (an aside, a facts row) are absent, never measured as
+ * a zero-width pair. */
+function cardSurfaces(card: CardFit): ReadonlyArray<readonly [string, Surface]> {
+  const surfaces: ReadonlyArray<readonly [string, Surface | null]> = [
+    ['card', card.cardBox],
+    ['label', card.label],
+    ['unit', card.unit],
+    ['aside', card.aside],
+    ['facts', card.facts],
+  ];
+  return surfaces.filter((surface): surface is readonly [string, Surface] => surface[1] !== null);
+}
+
+/** A1/A3/A4: nothing on a card is cut, no surface keeps the `nowrap` rule
+ * that produced the owner's clip, every card in a row shares ONE head
+ * height, the grid's columns equal Rule 2, and the page never scrolls
+ * sideways. `where` names the width and fixture so a failure is
+ * actionable without reading the diff. */
+function expectCockpitFits(fit: CockpitFit, where: string): void {
+  expect(fit.bodyOverflow, `no horizontal page scroll at ${where}`).toBe(false);
+  expect(fit.cards.length, `cards measured at ${where}`).toBeGreaterThan(0);
+  // A1 first: every surface reads whole. The owner's symptom — a headline
+  // unit cut to "111 on t…" — is named before the cause is inspected.
+  for (const card of fit.cards) {
+    for (const [name, box] of cardSurfaces(card)) {
+      expect(box.sw, `${card.card} ${name} is cut at ${where}`).toBeLessThanOrEqual(box.cw + 1);
+    }
+  }
+  // A2: the rule that produced the cut is gone, not merely benign.
+  for (const card of fit.cards) {
+    for (const [name, box] of cardSurfaces(card)) {
+      if (name === 'card') continue;
+      expect(box.whiteSpace, `${card.card} ${name} wraps at ${where}`).not.toBe('nowrap');
+    }
+  }
+  const rows = new Map<number, number[]>();
+  for (const card of fit.cards) rows.set(card.top, [...(rows.get(card.top) ?? []), card.head]);
+  for (const [top, heights] of rows) {
+    expect(
+      Math.max(...heights) - Math.min(...heights),
+      `head heights equal in the row at y=${top} (${heights.join(', ')}) at ${where}`,
+    ).toBeLessThanOrEqual(1);
+  }
+  expect(fit.columns, `grid columns vs Rule 2 at ${where}`).toBe(expectedColumns(fit.containerWidth, fit.cards.length));
+}
+
 /** familyA's fact counts (the headline numbers ride their own line). */
 const FAMILY_A_FACTS: readonly string[] = [
   'jobs.working', 'jobs.inReview', 'jobs.merged', 'prs.mergedToday', 'lanes.midTurn', 'lanes.disposed', 'reviews.failedToday',
@@ -750,6 +874,78 @@ test('Nefario: the live pass renders after raids, an absent block renders no car
     };
   });
   expect(await row()).toEqual({ perRow: 7, count: 7, overflow: false, rowFills: true });
+});
+
+/** The strip's three snapshot shapes: all seven cards, the six an older
+ * server sends (no Nefario block), and the five with no raids block. */
+const STRIP_FIXTURES: ReadonlyArray<{ readonly name: string; readonly count: number; readonly slots: Slots }> = [
+  { name: 'seven cards', count: 7, slots: { ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_ON } },
+  { name: 'six cards', count: 6, slots: { ...familyA(4), vector: RAIDS_ON } },
+  { name: 'five cards', count: 5, slots: { ...familyA(4) } },
+];
+
+/** Work 3: at EVERY cockpit width the strip holds Rule 2 for the seven-,
+ * six- and five-card snapshots, no card surface is cut, the unit no longer
+ * computes `nowrap`, every card in a row shares one head height, and no
+ * width scrolls the page sideways. */
+test('the KPI strip holds its column rule and reads whole at every cockpit width', async ({ page }) => {
+  await page.setViewportSize({ width: 2400, height: 900 });
+  const send = await harness(page, makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_ON }));
+  // The widths the briefing names, plus the 360px phone the rest of this
+  // suite already exercises (the strip must hold there too).
+  const widths: ReadonlyArray<[number, number]> = [
+    [2400, 900], [2062, 686], [1600, 900], [1280, 900], [1000, 900], [768, 900], [390, 800], [360, 740],
+  ];
+  for (const [width, height] of widths) {
+    await page.setViewportSize({ width, height });
+    // The cockpit's grid transition and the pane reflow follow a resize;
+    // a measurement taken mid-tween would read the previous layout.
+    await settleTransitions(page);
+    for (const fixture of STRIP_FIXTURES) {
+      await send(makeSnapshot(fixture.slots));
+      await expect(page.locator('#board-kpis .cockpit-card')).toHaveCount(fixture.count);
+      await settleTransitions(page);
+      expectCockpitFits(await cockpitFit(page), `${fixture.name} at ${width}×${height}`);
+    }
+  }
+});
+
+/** Work 2 / A1: the owner's geometry. A 2062×686 viewport running the
+ * cockpit's default panes leaves the board column 1127px, where seven
+ * cards were 152px wide and the owner read `111 on t…` — the headline's
+ * unit elided inside the card. The band is read by name, unit included. */
+test('owner geometry: 2062×686 with the default panes reads the whole unit of a three-digit heist count', async ({ page }) => {
+  await page.setViewportSize({ width: 2062, height: 686 });
+  await harness(page, makeSnapshot({ ...familyA(4), total: 111, vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_ON }));
+  // The owner's board has 111 heists — a three-digit headline beside its unit.
+  await waitForCount(page, 'jobs.total', 111);
+  await expect(page.locator('.cockpit-card--heists .cockpit-card__unit')).toHaveText('on the board');
+  await expect(page.locator('#board-kpis .cockpit-card')).toHaveCount(7);
+  await settleTransitions(page);
+  const fit = await cockpitFit(page);
+  expect(fit.containerWidth >= 1120 && fit.containerWidth <= 1135, `the default panes leave the board column ≈1127px (measured ${fit.containerWidth})`).toBe(true);
+  expectCockpitFits(fit, 'owner geometry 2062×686');
+  const heists = fit.cards.find((card) => card.card === 'heists');
+  expect(heists, 'the HEISTS card rendered').toBeTruthy();
+  expect(heists!.unit.text).toBe('on the board');
+  expect(heists!.unit.sw, 'HEISTS unit unclipped').toBeLessThanOrEqual(heists!.unit.cw + 1);
+});
+
+/** Work 2 / A1: the narrow container. The owner's persisted cockpit split
+ * (chat at its 640px ceiling, a 434px rail) leaves the board column 940px;
+ * the splitter controller restores that pair from `gru-pane-sizes` before
+ * the board renders. Seven cards must still read whole there. */
+test('narrow board column: the persisted pane split (≈940px) reads its seven cards whole', async ({ page }) => {
+  await page.setViewportSize({ width: 2062, height: 900 });
+  await page.addInitScript(() => {
+    localStorage.setItem('gru-pane-sizes', JSON.stringify({ cockpit: { chat: 640, rail: 434 } }));
+  });
+  await harness(page, makeSnapshot({ ...familyA(4), vector: RAIDS_ON, briefingReview: BRIEFING_REVIEW_ON }));
+  await expect(page.locator('#board-kpis .cockpit-card')).toHaveCount(7);
+  await settleTransitions(page);
+  const fit = await cockpitFit(page);
+  expect(fit.containerWidth >= 930 && fit.containerWidth <= 950, `the persisted split leaves the board column ≈940px (measured ${fit.containerWidth})`).toBe(true);
+  expectCockpitFits(fit, 'narrow container (persisted split)');
 });
 
 test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({ page }) => {
