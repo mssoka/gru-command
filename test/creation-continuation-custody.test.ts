@@ -731,6 +731,20 @@ describe('retained-creation continuation custody', () => {
     expect(redacted.text).not.toContain(uuid.slice(8));
     expect(redacted.text).toContain('recorded after');
     expect(redacted.startsAtLine).toBe(true);
+    // The no-line-break arm: when nothing follows the partial line, only the
+    // cut note is kept — the window is exactly the prefixless body.
+    const nothing = new OutputTail();
+    nothing.push(Buffer.from(`${'y'.repeat(65_536 - split.length)}${split}`));
+    nothing.push(Buffer.from(uuid.slice(8)));
+    const noLine = nothing.stream();
+    expect(noLine.truncated).toBe(true);
+    expect(noLine.startsAtLine).toBe(false);
+    expect(noLine.text).toContain(uuid.slice(8));
+    const noLineRedacted = redactedStreamTail(noLine);
+    expect(noLineRedacted.text).not.toContain(uuid);
+    expect(noLineRedacted.text).not.toContain(uuid.slice(8));
+    expect(noLineRedacted.text).toContain('cut mid-line');
+    expect(noLineRedacted.startsAtLine).toBe(true);
   });
 
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
