@@ -1529,7 +1529,7 @@ describe('SessionStore backup prune safety', () => {
 });
 
 describe('SessionStore backup pass failure handling', () => {
-  it('records the intended generation for a failed cold-start copy and repairs it next pass', () => {
+  it('adopts nothing for a failed cold-start copy over an occupied slot and copies it next pass', () => {
     const store = new SessionStore(tmpDataDir());
     const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
     const stamp = '2026-10-01T11';
@@ -1547,14 +1547,10 @@ describe('SessionStore backup pass failure handling', () => {
     const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
     expect(failed.created).toEqual([]);
     expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
-    // The identity is recorded BEFORE the copy (so a later prune cannot lose
-    // an unrecorded generation); the recorded generation is missing, so the
-    // next pass repairs it instead of trusting it forever.
-    const entries = Object.entries(readBaseline(store).sources);
-    expect(entries).toHaveLength(1);
-    // The recording names the intended generation, which is not a regular
-    // file (the obstruction was a directory), so the next pass repairs it.
-    expect(statSync(join(store.sessionsDir, 'backups', entries[0]![1].backup)).isFile()).toBe(false);
+    // The destination is occupied by something that is not a copy, so no
+    // entry is adopted: the next pass copies instead of trusting a slot this
+    // pass did not write.
+    expect(Object.keys(readBaseline(store).sources)).toEqual([]);
 
     rmSync(join(store.sessionsDir, 'backups', destName), { recursive: true, force: true });
     const retried = store.runBackup(new Date('2026-10-01T12:05:00Z'));
