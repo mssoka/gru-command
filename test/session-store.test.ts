@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -26,6 +26,33 @@ function seedSession(store: SessionStore, role = 'gru', text = '{"type":"session
   writeFileSync(file, text, 'utf-8');
   return file;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** One named source file in the role/cwd-scoped session dir. */
+function seedSource(store: SessionStore, role: string, name: string, text: string): string {
+  const dir = store.sessionDirFor(role, '/tmp/workspace');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, name);
+  writeFileSync(file, text, 'utf-8');
+  return file;
+}
+
+/** Backup file names (no directory), sorted, as the pass left them. */
+function backupNames(store: SessionStore): string[] {
+  return readdirSync(join(store.sessionsDir, 'backups')).filter((name) => name.endsWith('.bak')).sort();
+}
+
+/** The named state file the changed-only pass records its baseline in. */
+const baselinePath = (store: SessionStore): string => join(store.sessionsDir, 'backup-baseline.json');
+
+interface ParsedBaseline {
+  readonly version: number;
+  readonly sources: Record<string, { size: number; mtimeMs: number }>;
+}
+
+const readBaseline = (store: SessionStore): ParsedBaseline =>
+  JSON.parse(readFileSync(baselinePath(store), 'utf-8')) as ParsedBaseline;
 
 describe('SessionStore', () => {
   function replacementForeignHostLockFixture() {
@@ -405,8 +432,7 @@ describe('SessionStore', () => {
   });
 });
 
-describe('Perkins r1 regressions', () => {
-  it('W9: a second pass in the same ISO hour refreshes the slot (freshest wins)', () => {
+describe('Perkins r1 regressions', () => {  it('W9: a second pass in the same ISO hour refreshes the slot (freshest wins)', () => {
     const dataDir = tmpDataDir();
     const store = new SessionStore(dataDir, { retention: 5 });
     const file = seedSession(store, 'gru', 'early\n');
@@ -418,8 +444,9 @@ describe('Perkins r1 regressions', () => {
     expect(second.created.length).toBe(1);
     expect(second.created[0]).toBe(first.created[0]);
     expect(readFileSync(second.created[0]!, 'utf-8')).toBe('early\nlater\n');
+    // And the slot is one file, not a second generation.
+    expect(backupNames(store)).toHaveLength(1);
   });
-
   it('N28: a session file deleted while down is reported', () => {
     const dataDir = tmpDataDir();
     const first = new SessionStore(dataDir);
@@ -430,5 +457,211 @@ describe('Perkins r1 regressions', () => {
     expect(report.findings.length).toBe(1);
     expect(report.findings[0]!.kind).toBe('deleted');
     expect(report.findings[0]!.currentBytes).toBe(0);
+  });
+});
+
+describe('SessionStore changed-only backup pass', () => {
+  it('copies a source on change and skips it on a later unchanged pass', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    expect(first.created.length).toBe(1);
+    expect(first.skipped).toBe(0);
+
+    const second = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(second.created).toEqual([]);
+    expect(second.skipped).toBe(1);
+    expect(backupNames(store)).toHaveLength(1); // no slot for an unchanged source
+
+    appendFileSync(file, 'two\n', 'utf-8');
+    const third = store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    expect(third.created.length).toBe(1);
+    expect(third.created[0]).toContain('2026-10-01T12');
+    expect(backupNames(store)).toHaveLength(2);
+  });
+
+  it('a second store over the same data dir reads the persisted baseline and copies nothing for unchanged sources', () => {
+    const dataDir = tmpDataDir();
+    const first = new SessionStore(dataDir);
+    const gruFile = seedSource(first, 'gru', 'a.jsonl', 'one\n');
+    seedSource(first, 'minion', 'b.jsonl', 'two\n');
+    // Cold start: no baseline exists yet, so both sources are copied once.
+    expect(first.runBackup(new Date('2026-10-01T10:05:00Z')).created.length).toBe(2);
+
+    // A restart is a fresh store over the same data dir: it must read the
+    // persisted baseline instead of re-copying everything.
+    const restarted = new SessionStore(dataDir);
+    const pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(pass.created).toEqual([]);
+    expect(pass.skipped).toBe(2);
+    expect(backupNames(restarted)).toHaveLength(2);
+
+    appendFileSync(gruFile, 'more\n', 'utf-8');
+    const changed = restarted.runBackup(new Date('2026-10-01T12:05:00Z'));
+    expect(changed.created.length).toBe(1);
+    expect(changed.skipped).toBe(1);
+  });
+
+  it('a missing baseline copies every source once and records a fresh one', () => {
+    const store = new SessionStore(tmpDataDir());
+    const gruFile = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    seedSource(store, 'minion', 'b.jsonl', 'two\n');
+    expect(existsSync(baselinePath(store))).toBe(false);
+
+    const pass = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    expect(pass.created.length).toBe(2);
+    expect(pass.skipped).toBe(0);
+    const baseline = readBaseline(store);
+    expect(baseline.version).toBe(1);
+    // Keys are sessions-relative source paths (never absolute machine paths),
+    // and the recorded fingerprint is the copied content's size.
+    const keys = Object.keys(baseline.sources).sort();
+    expect(keys.every((key) => key.endsWith('.jsonl') && !key.startsWith('/'))).toBe(true);
+    expect(keys).toHaveLength(2);
+    const gruKey = keys.find((key) => key.startsWith('gru/'))!;
+    expect(baseline.sources[gruKey]!.size).toBe(statSync(gruFile).size);
+  });
+
+  it('a baseline that is unreadable copies every source once and rewrites a valid one', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    writeFileSync(baselinePath(store), 'not-json-at-all', 'utf-8');
+
+    const warnings: string[] = [];
+    const restarted = new SessionStore(dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    const pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(pass.created.length).toBe(1);
+    expect(pass.skipped).toBe(0);
+    expect(warnings.some((msg) => msg.includes('baseline is corrupt'))).toBe(true);
+    const baseline = readBaseline(restarted);
+    expect(baseline.version).toBe(1);
+    expect(Object.keys(baseline.sources)).toHaveLength(1);
+    // The rewritten baseline is trusted again: the next pass copies nothing.
+    expect(restarted.runBackup(new Date('2026-10-01T12:05:00Z')).created).toEqual([]);
+  });
+
+  it('a baseline with a malformed entry copies every source once and rewrites a valid one', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    writeFileSync(baselinePath(store), '{"version":1,"sources":{"gru/a.jsonl":{"size":"nope","mtimeMs":1}}}', 'utf-8');
+
+    const pass = new SessionStore(dataDir).runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(pass.created.length).toBe(1);
+    expect(pass.skipped).toBe(0);
+    const entries = Object.entries(readBaseline(store).sources);
+    expect(entries).toHaveLength(1);
+    const [key, entry] = entries[0]!;
+    expect(key).toMatch(/^gru\/.*a\.jsonl$/);
+    expect(entry).toEqual({ size: statSync(file).size, mtimeMs: statSync(file).mtimeMs });
+  });
+
+  it('one pass performs one tree walk and one stat per source for N sources with M changed copies', () => {
+    const store = new SessionStore(tmpDataDir());
+    const files = Array.from({ length: 6 }, (_, index) => seedSource(store, 'gru', `s${index}.jsonl`, `${index}\n`));
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    for (const file of files.slice(0, 2)) appendFileSync(file, 'changed\n', 'utf-8');
+
+    const walk = vi.spyOn(store, 'listSessionFiles');
+    const stat = vi.spyOn(store as unknown as { statSource(file: string): unknown }, 'statSource');
+    const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    // Exactly M copies for M changed sources; the rest are skipped.
+    expect(pass.created.length).toBe(2);
+    expect(pass.skipped).toBe(4);
+    // Cost: one directory walk (it used to walk twice per pass) and one
+    // stat per source — the same data feeds the copy decision, the prune
+    // and the size snapshot.
+    expect(walk).toHaveBeenCalledTimes(1);
+    expect(stat).toHaveBeenCalledTimes(files.length);
+    walk.mockRestore();
+    stat.mockRestore();
+  });
+});
+
+describe('SessionStore backup pass preservation', () => {
+  it('never modifies or removes a live session file', () => {
+    const store = new SessionStore(tmpDataDir());
+    const changed = seedSource(store, 'gru', 'changed.jsonl', 'one\n');
+    const unchanged = seedSource(store, 'minion', 'unchanged.jsonl', 'two\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(changed, 'more\n', 'utf-8');
+
+    const before = [changed, unchanged].map((file) => ({ file, bytes: readFileSync(file), stat: statSync(file) }));
+    const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(pass.created.length).toBe(1);
+    for (const snapshot of before) {
+      expect(existsSync(snapshot.file)).toBe(true);
+      expect(readFileSync(snapshot.file)).toEqual(snapshot.bytes);
+      expect(statSync(snapshot.file).size).toBe(snapshot.stat.size);
+      expect(statSync(snapshot.file).mtimeMs).toBe(snapshot.stat.mtimeMs);
+    }
+  });
+
+  it('still writes the bare size snapshot growth detection reads', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+
+    const snapshot = JSON.parse(readFileSync(join(dataDir, 'sessions', 'store-state.json'), 'utf-8')) as Record<string, number>;
+    // A bare size map keyed by session file — the new baseline is a separate
+    // file precisely so this shape (and growth detection's input) is untouched.
+    expect(Object.keys(snapshot)).toEqual([file]);
+    expect(snapshot[file]).toBe(statSync(file).size);
+    expect(new SessionStore(dataDir).detectGrowth().findings).toEqual([]);
+  });
+});
+
+describe('SessionStore backup prune safety', () => {
+  it('age-prunes an over-age generation even below the retention count', () => {
+    const store = new SessionStore(tmpDataDir(), { retention: 24, backupMaxAgeMs: 7 * DAY_MS });
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(file, 'two\n', 'utf-8');
+    const second = store.runBackup(new Date('2026-10-10T10:05:00Z')); // nine days later
+
+    expect(second.created.length).toBe(1);
+    expect(second.pruned).toEqual([first.created[0]]);
+    expect(backupNames(store)).toEqual([second.created[0]!.split('/').pop()!]);
+  });
+
+  it('never deletes the newest generation of a live source, however old it is', () => {
+    const store = new SessionStore(tmpDataDir(), { backupMaxAgeMs: 7 * DAY_MS });
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const only = store.runBackup(new Date('2026-10-01T10:05:00Z')); // no baseline yet: copied once
+    expect(existsSync(file)).toBe(true);
+
+    // A month later the source is still live but unchanged: its single
+    // generation is over-age, and it is that source's last snapshot.
+    const later = store.runBackup(new Date('2026-11-01T10:05:00Z'));
+    expect(later.created).toEqual([]);
+    expect(later.pruned).toEqual([]);
+    expect(backupNames(store)).toEqual([only.created[0]!.split('/').pop()!]);
+  });
+
+  it('a dead source keeps exactly its newest backup while older generations are age-pruned', () => {
+    const store = new SessionStore(tmpDataDir(), { backupMaxAgeMs: 7 * DAY_MS });
+    const file = seedSource(store, 'gru', 'gone.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(file, 'two\n', 'utf-8');
+    store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    appendFileSync(file, 'three\n', 'utf-8');
+    const third = store.runBackup(new Date('2026-10-01T14:05:00Z'));
+    expect(backupNames(store)).toHaveLength(3);
+
+    rmSync(file); // the live session file is gone
+    const pass = store.runBackup(new Date('2026-11-01T10:05:00Z'));
+    expect(pass.created).toEqual([]);
+    expect(pass.pruned).toHaveLength(2);
+    expect(backupNames(store)).toEqual([third.created[0]!.split('/').pop()!]);
+    // Its baseline entry is dropped rather than left stale.
+    expect(Object.keys(readBaseline(store).sources)).toEqual([]);
   });
 });

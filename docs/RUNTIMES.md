@@ -451,13 +451,22 @@ prompt/tool content, so nothing but the owner should traverse it.
   is rejected loudly, naming the holder. A stale lock (dead pid, heartbeat
   older than 60s) is stolen and logged. The lock is released on graceful
   shutdown and on handle dispose.
-- **Hourly rolling backup**: tracked session files are copied hourly into
-  `<data_dir>/sessions/backups/` with an ISO-hour suffix; per source file
-  the newest 24 backups are retained (pruned oldest-first). A backup pass
-  also runs at boot. The slot IS the ISO hour: a second pass in the same
-  hour refreshes that slot (freshest in-slot state wins). Backups copy
-  live files, so a trailing line may be partial — recovery tooling must
-  tolerate a torn tail.
+- **Hourly rolling backup**: an hourly pass (and one at boot) copies only
+  the tracked session files whose content changed since that source's
+  last recorded backup into `<data_dir>/sessions/backups/` with an
+  ISO-hour suffix; unchanged sources are not copied at all. The change
+  baseline is the separate file
+  `<data_dir>/sessions/backup-baseline.json`
+  (`{"version":1,"sources":{"<sessions-relative path>":{"size":N,"mtimeMs":M}}}`),
+  so a restart copies nothing for unchanged sources; a missing or corrupt
+  baseline copies each source once and rewrites it. Pruning keeps the
+  newest 24 generations of a live source and deletes generations older
+  than 7 days, but never a source's newest generation: a live source's
+  last snapshot is never deleted, and a source that is gone keeps exactly
+  its newest backup while its older generations age out. The slot IS the
+  ISO hour: a second pass in the same hour refreshes that slot (freshest
+  in-slot state wins). Backups copy live files, so a trailing line may be
+  partial — recovery tooling must tolerate a torn tail.
 - **Change detection on boot** (the emergency-console contract): the store
   snapshots session-file sizes at graceful shutdown and after each backup
   pass. On boot it re-scans; any file that grew OR shrank while the

@@ -72,6 +72,46 @@ export interface GrowthReport {
   readonly scannedAt: string;
 }
 
+/**
+ * One tracked session file as the backup pass sees it: enumerated once and
+ * stat'ed once, then reused for the copy decision, the prune and the size
+ * snapshot (SPEC ruling 12).
+ */
+export interface SessionSourceScan {
+  /** Absolute path of the live session file. */
+  readonly file: string;
+  /** Path relative to the sessions dir — the change-baseline key. */
+  readonly key: string;
+  /** Flattened key the backup file name is built from. */
+  readonly backupKey: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+/** Fingerprint of the content last copied into a source's backup. */
+export interface BackupBaselineEntry {
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+/** What one backup pass did (`skipped` = unchanged sources left alone). */
+export interface BackupPassResult {
+  readonly created: string[];
+  readonly pruned: string[];
+  readonly skipped: number;
+}
+
+/**
+ * `sessions/backup-baseline.json` — the recorded change baseline of the
+ * hourly backup pass. Keys are source paths relative to the sessions dir.
+ * Deliberately a SEPARATE file from `store-state.json`: that one is a bare
+ * size map whose keys growth detection reads as session files.
+ */
+export interface BackupBaseline {
+  readonly version: typeof BACKUP_BASELINE_VERSION;
+  readonly sources: { readonly [relativePath: string]: BackupBaselineEntry };
+}
+
 interface SizeSnapshot {
   readonly [file: string]: number;
 }
@@ -81,6 +121,15 @@ const LOCK_HEARTBEAT_MS = 5_000;
 const LOCK_STALE_MS = 60_000;
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // hourly (SPEC ruling 12)
 const BACKUP_SUFFIX = '.bak';
+const BACKUP_BASELINE_VERSION = 1;
+/**
+ * Maximum backup-generation age. A source that stopped changing would
+ * otherwise hold every generation it ever produced: the count retention only
+ * bounds sources that keep producing. Seven days matches the measured idle
+ * threshold of the live instance (sources idle longer than a week held the
+ * bulk of the generations nobody would ever restore from).
+ */
+const BACKUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Durable session store (EPICS E2 story 3; SPEC ruling 12).
@@ -97,7 +146,9 @@ export class SessionStore {
   private readonly bootId = `${process.pid}-${Date.now()}`;
   private readonly backupDir: string;
   private readonly stateFile: string;
+  private readonly baselineFile: string;
   private readonly retention: number;
+  private readonly backupMaxAgeMs: number;
   private readonly log: StoreLog;
   private readonly heldLocks = new Set<string>();
   private readonly heartbeats = new Map<string, ReturnType<typeof setInterval>>();
@@ -106,12 +157,19 @@ export class SessionStore {
 
   constructor(
     readonly dataDir: string,
-    opts: { retention?: number; log?: StoreLog } = {},
+    opts: { retention?: number; backupMaxAgeMs?: number; log?: StoreLog } = {},
   ) {
+    if (opts.backupMaxAgeMs !== undefined && (!Number.isSafeInteger(opts.backupMaxAgeMs) || opts.backupMaxAgeMs < 0)) {
+      throw new Error(
+        `session store backupMaxAgeMs must be a non-negative safe integer of milliseconds (got ${String(opts.backupMaxAgeMs)})`,
+      );
+    }
     this.sessionsDir = join(dataDir, 'sessions');
     this.backupDir = join(this.sessionsDir, 'backups');
     this.stateFile = join(this.sessionsDir, 'store-state.json');
+    this.baselineFile = join(this.sessionsDir, 'backup-baseline.json');
     this.retention = opts.retention ?? 24;
+    this.backupMaxAgeMs = opts.backupMaxAgeMs ?? BACKUP_MAX_AGE_MS;
     this.log = opts.log ?? (() => {});
     // Session transcripts carry full prompt/tool content — the sessions
     // dir is owner-only; nothing else should traverse it.
@@ -406,6 +464,18 @@ export class SessionStore {
         /* vanished mid-scan */
       }
     }
+    this.writeSnapshot(snapshot);
+  }
+
+  /** The snapshot a backup pass persists, built from its single scan. */
+  private persistSnapshotFromSources(sources: readonly SessionSourceScan[]): void {
+    const snapshot: Record<string, number> = {};
+    for (const source of sources) snapshot[source.file] = source.size;
+    this.writeSnapshot(snapshot);
+  }
+
+  /** Bare size map at `sessions/store-state.json` (shape pinned by tests). */
+  private writeSnapshot(snapshot: Record<string, number>): void {
     const staging = `${this.stateFile}.tmp-${process.pid}`;
     writeFileSync(staging, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf-8');
     renameSync(staging, this.stateFile);
@@ -451,31 +521,91 @@ export class SessionStore {
   }
 
   /**
-   * One backup pass: copy every tracked session file into the backup dir
-   * with an ISO-hour suffix (the slot IS the hour — a second pass in the
-   * same hour refreshes the slot), then prune oldest beyond retention.
-   * Also persists the size snapshot into the sessions dir.
+   * ONE directory walk plus ONE stat per source: the data the whole pass
+   * reuses (copy decision, prune live-source test, size snapshot). A pass
+   * that called this twice would pay a second full-tree stat walk.
    */
-  runBackup(now: Date = new Date()): { created: string[]; pruned: string[] } {
+  scanSessionSources(): readonly SessionSourceScan[] {
+    const sources: SessionSourceScan[] = [];
+    for (const file of this.listSessionFiles()) {
+      let stat: { readonly size: number; readonly mtimeMs: number };
+      try {
+        stat = this.statSource(file);
+      } catch {
+        continue; // vanished mid-scan
+      }
+      sources.push({
+        file,
+        key: relative(this.sessionsDir, file).replace(/\\/g, '/'),
+        backupKey: this.backupKeyFor(file),
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      });
+    }
+    return sources;
+  }
+
+  /** Stat seam: exactly one call per source per pass (the cost test counts it). */
+  private statSource(file: string): { readonly size: number; readonly mtimeMs: number } {
+    const stat = statSync(file);
+    return { size: stat.size, mtimeMs: stat.mtimeMs };
+  }
+
+  /** Flattened source key the backup file name is built from. */
+  private backupKeyFor(file: string): string {
+    return relative(this.sessionsDir, file).replace(/[/\\]/g, '__');
+  }
+
+  /**
+   * One backup pass: copy the tracked session files whose content changed
+   * since that source's last recorded backup into the backup dir with an
+   * ISO-hour suffix (the slot IS the hour — a second pass in the same hour
+   * refreshes the slot), prune, and persist both the size snapshot and the
+   * change baseline. Unchanged sources are not copied at all, however
+   * recently they were written.
+   */
+  runBackup(now: Date = new Date()): BackupPassResult {
     mkdirSync(this.backupDir, { recursive: true });
     const stamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 13); // ISO hour
+    const { baseline, state: baselineState } = this.readBackupBaseline();
+    if (baselineState === 'corrupt') {
+      this.log('warn', 'session backup baseline is corrupt — copying every source once and rewriting it', {
+        baselineFile: this.baselineFile,
+      });
+    }
+    const sources = this.scanSessionSources();
+    const live = new Set(sources.map((source) => source.backupKey));
+    const next: Record<string, BackupBaselineEntry> = {};
     const created: string[] = [];
-    for (const file of this.listSessionFiles()) {
-      const base = relative(this.sessionsDir, file).replace(/[/\\]/g, '__');
-      const dest = join(this.backupDir, `${base}.${stamp}${BACKUP_SUFFIX}`);
+    let skipped = 0;
+    for (const source of sources) {
+      const previous = baseline[source.key];
+      if (previous !== undefined && previous.size === source.size && previous.mtimeMs === source.mtimeMs) {
+        next[source.key] = previous; // unchanged since its last recorded backup
+        skipped += 1;
+        continue;
+      }
+      const dest = join(this.backupDir, `${source.backupKey}.${stamp}${BACKUP_SUFFIX}`);
       try {
-        copyFileSync(file, dest);
+        copyFileSync(source.file, dest);
         created.push(dest);
+        next[source.key] = { size: source.size, mtimeMs: source.mtimeMs };
       } catch (error) {
-        this.log('warn', 'session backup copy failed', { file, error: String(error) });
+        // Never recorded: the next pass retries this source.
+        this.log('warn', 'session backup copy failed', { file: source.file, error: String(error) });
       }
     }
-    const pruned = this.pruneBackups();
-    this.persistSnapshot();
-    if (created.length > 0) {
-      this.log('info', 'session backup pass', { created: created.length, pruned: pruned.length });
+    const pruned = this.pruneBackups(live, now);
+    this.persistSnapshotFromSources(sources);
+    this.writeBackupBaseline(next);
+    if (created.length > 0 || pruned.length > 0) {
+      this.log('info', 'session backup pass', {
+        created: created.length,
+        pruned: pruned.length,
+        unchanged: skipped,
+      });
     }
-    return { created, pruned };
+    return { created, pruned, skipped };
   }
 
   /** Start the hourly rolling backup (unref'd — never holds the event
@@ -494,11 +624,21 @@ export class SessionStore {
   }
 
   /**
-   * Retention prune: for each source file keep only the newest `retention`
-   * backups (the ISO-hour stamp in the name sorts chronologically), delete
-   * the rest. Names parse as `<source>.<YYYY-MM-DDTHH>.bak`.
+   * Retention prune, two rules and one floor. Names parse as
+   * `<flattened source>.<YYYY-MM-DDTHH>.bak` and sort chronologically.
+   *
+   * - **Count** (live sources only, unchanged): keep the newest `retention`
+   *   generations. A source whose live file is gone can never produce
+   *   another generation, so its generations are bounded by age instead.
+   * - **Age**: delete a generation whose ISO-hour stamp is older than
+   *   `backupMaxAgeMs` — an idle source would otherwise hold every
+   *   generation it ever produced forever.
+   * - **Floor**: the NEWEST generation of every source survives both rules.
+   *   It is that source's last snapshot: a live source's is never deleted,
+   *   and a dead source keeps exactly that one once its older generations
+   *   age out.
    */
-  private pruneBackups(): string[] {
+  private pruneBackups(liveSources: ReadonlySet<string>, now: Date): string[] {
     if (!existsSync(this.backupDir)) return [];
     const BACKUP_NAME = /^(.*)\.(\d{4}-\d{2}-\d{2}T\d{2})\.bak$/;
     const bySource = new Map<string, string[]>();
@@ -510,11 +650,21 @@ export class SessionStore {
       list.push(name);
       bySource.set(source, list);
     }
+    const cutoff = now.getTime() - this.backupMaxAgeMs;
     const pruned: string[] = [];
-    for (const names of bySource.values()) {
+    for (const [source, names] of bySource) {
       names.sort(); // ISO-hour stamps sort chronologically
-      const excess = names.slice(0, Math.max(0, names.length - this.retention));
-      for (const name of excess) {
+      const newest = names[names.length - 1]!;
+      const doomed = new Set<string>();
+      if (liveSources.has(source)) {
+        for (const name of names.slice(0, Math.max(0, names.length - this.retention))) doomed.add(name);
+      }
+      for (const name of names) {
+        if (this.backupStampMs(name) < cutoff) doomed.add(name);
+      }
+      doomed.delete(newest); // the floor: a source's last snapshot always survives
+      for (const name of names) {
+        if (!doomed.has(name)) continue;
         const target = join(this.backupDir, name);
         try {
           rmSync(target);
@@ -525,6 +675,60 @@ export class SessionStore {
       }
     }
     return pruned;
+  }
+
+  /** Epoch ms of a backup name's ISO-hour stamp, parsed by hand (UTC). */
+  private backupStampMs(name: string): number {
+    const match = /^(.*)\.(\d{4})-(\d{2})-(\d{2})T(\d{2})\.bak$/.exec(name);
+    if (match === null) return Number.NaN;
+    return Date.UTC(Number(match[2]), Number(match[3]) - 1, Number(match[4]), Number(match[5]));
+  }
+
+  /**
+   * The persisted change baseline. `missing` is the first-ever pass;
+   * `corrupt` (unreadable, wrong version/shape, or any malformed entry) is
+   * treated as no baseline at all — every source is copied once and the
+   * baseline is rewritten, never silently half-trusted.
+   */
+  private readBackupBaseline(): {
+    readonly baseline: { readonly [key: string]: BackupBaselineEntry };
+    readonly state: 'ok' | 'missing' | 'corrupt';
+  } {
+    let text: string;
+    try {
+      text = readFileSync(this.baselineFile, 'utf-8');
+    } catch (error) {
+      return {
+        baseline: {},
+        state: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'corrupt',
+      };
+    }
+    try {
+      const parsed = JSON.parse(text) as { version?: unknown; sources?: unknown } | null;
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { baseline: {}, state: 'corrupt' };
+      if (parsed.version !== BACKUP_BASELINE_VERSION) return { baseline: {}, state: 'corrupt' };
+      const raw = parsed.sources;
+      if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { baseline: {}, state: 'corrupt' };
+      const baseline: Record<string, BackupBaselineEntry> = {};
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        const size = (value as { size?: unknown } | null)?.size;
+        const mtimeMs = (value as { mtimeMs?: unknown } | null)?.mtimeMs;
+        if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return { baseline: {}, state: 'corrupt' };
+        if (typeof mtimeMs !== 'number' || !Number.isFinite(mtimeMs)) return { baseline: {}, state: 'corrupt' };
+        baseline[key] = { size, mtimeMs };
+      }
+      return { baseline, state: 'ok' };
+    } catch {
+      return { baseline: {}, state: 'corrupt' };
+    }
+  }
+
+  /** Atomic rewrite of the change baseline (staging + rename, like the snapshot). */
+  private writeBackupBaseline(sources: { readonly [key: string]: BackupBaselineEntry }): void {
+    const baseline: BackupBaseline = { version: BACKUP_BASELINE_VERSION, sources };
+    const staging = `${this.baselineFile}.tmp-${process.pid}`;
+    writeFileSync(staging, `${JSON.stringify(baseline, null, 2)}\n`, 'utf-8');
+    renameSync(staging, this.baselineFile);
   }
 
   /** All session jsonl files under the sessions dir (backups/state excluded). */

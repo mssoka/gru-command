@@ -383,10 +383,16 @@ next action as a NEW lane/job, never by rewriting the closed record.
 
 The service self-manages:
 
-- **Session transcripts** — hourly rolling copies into
-  `<data_dir>/sessions/backups/` (ISO-hour slots, newest 24 per file);
-  a pass also runs at boot. Recovery tooling must tolerate a torn tail
-  line.
+- **Session transcripts** — an hourly pass (and one at boot) copies only
+  the transcripts whose content changed since their last recorded copy
+  into `<data_dir>/sessions/backups/` (ISO-hour slots); the change
+  baseline is `<data_dir>/sessions/backup-baseline.json`. Unchanged
+  transcripts are never re-copied, however recently they were written.
+  Per source: the newest 24 backups are kept and any generation older
+  than 7 days is pruned — never the newest one, which is that
+  transcript's last snapshot. A transcript that is gone keeps exactly
+  its newest backup while its older generations age out. Recovery
+  tooling must tolerate a torn tail line.
 - **Chat frames + service log** — size-based rotation with retained
   shards (see above).
 

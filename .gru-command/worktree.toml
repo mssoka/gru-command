@@ -1148,3 +1148,10 @@ repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"
 # #511 main-suite-red: the two fast-phase tests that went red in CI run
 # 40402129444, run together so the fix is verifiable at one exact head.
 main-suite-red-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-build-reuse.test.ts test/review-build-identity.test.ts"
+
+# Session backups: changed-only copies, the persisted baseline and the
+# prune's newest-generation floor (session store + docs policy pins).
+session-backups-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/session-store.test.ts test/docs-contracts.test.ts"
+# RED evidence: the new changed-only/prune tests over the unchanged base
+# source, so the pre-fix failure is provable at one exact head.
+session-backups-red = 'set -e; root="$PWD"; base=c7ba172610a906492ec3ad867aa52920df8c389a; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-session-backups-red.XXXXXX"); trap "rm -rf -- $d" EXIT; git archive "$base" | tar -x -C "$d"; cp test/session-store.test.ts "$d/test/session-store.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "session-backups RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/session-store.test.ts'
