@@ -7,6 +7,7 @@ import { JobExecutionStop } from '../src/dispatch/job-stop.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { clearCreationIntent, readCreationIntent, writeCreationIntent } from '../src/worktrees/creation-intent.js';
 import type { LogLevel } from '../src/logger.js';
+import { attachBareOrigin } from './helpers/fixture-repo.js';
 import {
   acceptDirectly, cleanupContinuationFixtures, committedExitWithoutClose, committedStall, directory, fakeHandle, git, hasRawCreationToken, httpHarness,
   managerFixture, processGone, receiptFiles, request, retainedFixture, sha256, syntheticRetained, TOKEN, waitForState, type RetainedFixture,
@@ -536,6 +537,10 @@ describe('retained-creation continuation custody', () => {
     // the post-rollback surface, not the rollback catch.
     const sink = logSink();
     const h = managerFixture('review-rethrow-redaction', { log: sink.log });
+    // A review lane resolves its ref from a freshly fetched origin, never a
+    // stale local tip: give the fixture the bare origin the other suites use.
+    attachBareOrigin(h.repo);
+    git(h.repo, ['push', 'origin', 'main']);
     const parent = join(h.root, basename(h.repo.path));
     mkdirSync(parent, { recursive: true });
     chmodSync(parent, 0o555);
