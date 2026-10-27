@@ -670,7 +670,7 @@ describe('retained-creation continuation custody', () => {
     // fails carries the token into the setup error, which records durably.
     const h = managerFixture('setup-registry-redaction');
     const jobId = 'setup-registry-redaction';
-    h.repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "git worktree list --porcelain; exit 3"\n', 'setup that prints the lane registry');
+    h.repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "git worktree list --porcelain; git worktree list --porcelain 1>&2; exit 3"\n', 'setup that prints the lane registry on both streams');
     const retained = syntheticRetained(h, jobId);
     const thrown = await h.worktrees.createRetainedJobWorktree({
       repoPath: h.repo.path, jobId,
@@ -685,11 +685,21 @@ describe('retained-creation continuation custody', () => {
     expect(token).toBe(retained.token);
     expect(error.message).toContain('<redacted-creation-token>');
     expect(error.message).not.toContain(retained.token);
-    const cause = error.cause instanceof Error ? error.cause : null;
+    const cause = error.cause;
+    expect(cause).toBeInstanceOf(Error);
+    const setup = cause as unknown as { readonly output: { readonly stdout: { readonly text: string }; readonly stderr: { readonly text: string } } };
+    // BOTH recorded stream tails: git writes the registry to stdout here and
+    // the command also prints it to stderr, so neither branch can go
+    // unobserved (a per-stream redaction needs a fixture per stream).
+    for (const tail of [setup.output.stdout.text, setup.output.stderr.text]) {
+      expect(tail).toContain('locked ');
+      expect(tail).toContain('<redacted-creation-token>');
+      expect(tail).not.toContain(retained.token);
+    }
     expect(hasRawCreationToken(JSON.stringify({
       message: error.message,
       stack: error.stack,
-      cause: cause === null ? null : [cause.message, cause.stack, (cause as unknown as { output?: unknown }).output],
+      cause: [(cause as Error).message, (cause as Error).stack, setup.output],
     }))).toBe(false);
   });
 

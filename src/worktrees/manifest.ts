@@ -452,8 +452,9 @@ export interface SetupStreamTail {
 }
 
 /** A setup command failed, timed out or was stopped. The message names it
- * with a short output tail; `output` keeps each stream's bounded raw tail
- * for a caller that redacts before it records (#427 onboarding proof). */
+ * with a short output tail; `output` keeps each stream's bounded tail, with
+ * any creation token already redacted. A caller still applies its own
+ * credential redaction before it records (#427 onboarding proof). */
 export class WorktreeSetupError extends Error {
   constructor(
     message: string,
