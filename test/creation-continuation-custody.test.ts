@@ -457,7 +457,7 @@ describe('retained-creation continuation custody', () => {
       expect(rethrown.errors).toHaveLength(2);
       expect(String(rethrown.errors[0])).toMatch(/^Error: git worktree add --lock --reason /u);
       expect(String(rethrown.errors[1])).toMatch(/has no invocation-owned checkout reservation$/u);
-      expect(rethrown.message).toMatch(/^worktree creation failed \(git worktree add --lock --reason /u);
+      expect(rethrown.message).toMatch(/^worktree creation failed \(Error: git worktree add --lock --reason /u);
 
       // The exact token this creation minted: its durable receipt survives the
       // failed rollback, so the assertion is bound to the real secret.
