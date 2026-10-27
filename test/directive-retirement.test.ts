@@ -259,6 +259,14 @@ async function call(
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method,
     headers: {
+      // Every test boots its own server, and Node closes idle keep-alive
+      // sockets after 5s. Under co-tenant load this process can block past
+      // that between calls (ledger work, fixtures, execFileSync), leaving a
+      // half-closed pooled socket that the next fetch writes to and fails
+      // ECONNRESET — exactly the 2026-10-27 #511 full-run P37 failure. One
+      // fresh connection per call removes the race without touching what
+      // the server is asked to do.
+      connection: 'close',
       ...(token === undefined ? {} : { authorization: `Bearer ${token}` }),
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     },

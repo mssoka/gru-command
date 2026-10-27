@@ -1144,3 +1144,7 @@ gh315-r8-preack-mutant = "sh tools/scheduled-verification-review8-preack-mutant.
 # plain vitest invocations at unchanged budgets, RPC patch first.
 parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-build-identity.test.ts test/review-inputs-handoff.test.ts"
 repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"
+
+# #511 main-suite-red: the two fast-phase tests that went red in CI run
+# 40402129444, run together so the fix is verifiable at one exact head.
+main-suite-red-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-build-reuse.test.ts test/review-build-identity.test.ts"

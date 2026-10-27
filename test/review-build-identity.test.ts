@@ -192,6 +192,13 @@ function packageIdentity(): { root: string; identity: string } {
   return { root: installed, identity: reviewRuntimeVersion(installed) };
 }
 
+// The installed-tree cases build and walk the whole tarball. In the
+// four-worker fast phase their wall time tracks host load: a green Linux CI
+// run took 37s/54s/59s for the hoisted, freeze and boot cases, the same
+// cases took 76s/118s/124s on a loaded co-tenant host, and the failing
+// 2026-10-26 run reached 71s/62s/73s. The cases keep their work and their
+// assertions; the per-case ceilings below only stop co-tenant load from
+// reporting a still-progressing walk as a timeout (#511).
 describe('installed Perkins runtime identity', () => {
   it.skipIf(process.platform !== 'darwin')('fails closed on a missing pinned Python helper without leaking its output', () => {
     const root = fixture('gru-darwin-identity-');
@@ -209,6 +216,12 @@ describe('installed Perkins runtime identity', () => {
     expect(() => reviewRuntimeVersion(root)).toThrow('requires a usable pinned Python 3 executable');
     expect(() => reviewRuntimeVersion(root)).not.toThrow('credential-looking-secret');
   });
+  // The installed-tree fingerprint walks every executable file for each of
+  // the mutations below; on GitHub's Linux runners that is ~195-203s in a
+  // green full suite and 395s when the four-worker fast phase runs on a
+  // loaded co-tenant host (#511). 300s cut a run that was still making
+  // progress, so this case carries the budget its CPU-bound work needs
+  // rather than a suite-wide increase. The assertions are unchanged.
   it('fingerprints the actual npm tarball without a package-lock and fails closed on missing provenance', () => {
     const { root, identity } = packageIdentity();
     expect(identity).toMatch(/^[a-f0-9]{64}$/u);
@@ -280,7 +293,7 @@ describe('installed Perkins runtime identity', () => {
     rmSync(dependency);
     rmSync(join(root, 'dist', 'review-dependency-identity.json'));
     expect(() => reviewRuntimeVersion(root)).toThrow();
-  }, 300_000);
+  }, 600_000);
 
   it('resolves a hoisted installed dependency by the Node ancestor lookup', () => {
     const { root, identity } = packageIdentity();
@@ -296,7 +309,7 @@ describe('installed Perkins runtime identity', () => {
       writeFileSync(code, `${readFileSync(code, 'utf8')}\n// hoisted behavior change\n`);
       expect(reviewRuntimeVersion(root)).not.toBe(identity);
     }
-  }, 90_000);
+  }, 180_000);
 
   it('fails closed on the npm-ci esbuild hard link until the packaged postinstall unshares it', () => {
     // Owner incident 2026-10-07: esbuild's postinstall hard-links its
@@ -408,7 +421,7 @@ describe('installed Perkins runtime identity', () => {
       try { if (manager !== undefined && manager.getWorktree('installed-service-job') !== null) await manager.release({ worktreeId: 'installed-service-job' }); }
       finally { db.close(); repo.cleanup(); }
     }
-  }, 90_000);
+  }, 180_000);
 
   it('boots the installed main entrypoint and recovers checked lenses through its real service runner', async () => {
     // Linux's installed identity and both actual HTTP rounds must succeed
@@ -598,7 +611,7 @@ RuntimeRegistry.prototype.reserveReviewRound = async () => ({
       db.close();
       repo.cleanup();
     }
-  }, 120_000);
+  }, 240_000);
 
   it('builds a sanitized lock closure digest without hashing or publishing credential URLs', () => {
     const root = fixture('gru-review-lock-');

@@ -332,6 +332,12 @@ describe('child lane parent custody, called directly (#373)', () => {
     expect(f.h.ledger.getWorktree(f.parent.id)?.status).toBe('active');
   });
 
+  // This case builds 22 real parent fixtures (each a git repo plus a linked
+  // worktree) and corrupts one administration in each. On a co-tenant host
+  // the 2026-10-27 #511 full run observed a single fixture init take 30.6s
+  // (normally ~0.3s), so the 30s fast-phase default cut the case mid-loop.
+  // The work and its assertions are unchanged; the case carries the budget
+  // its real git workload needs under the load the suite actually sees.
   it('refuses a parent whose administration is not a linked worktree administration, by name', async () => {
     const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
     const corruptions: readonly (readonly [string, (f: Awaited<ReturnType<typeof parentFixture>>) => void, (f: Awaited<ReturnType<typeof parentFixture>>) => RegExp])[] = [
@@ -436,7 +442,7 @@ describe('child lane parent custody, called directly (#373)', () => {
       f.childLeftNothing();
       expect(f.h.ledger.getWorktree(f.parent.id)?.status, label).toBe('active');
     }
-  });
+  }, 120_000);
 
   it('a handoff begun for a path that cannot be resolved is refused by name, before any receipt', async () => {
     const f = await parentFixture('custody-begin-unresolved');
