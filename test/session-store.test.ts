@@ -1217,6 +1217,62 @@ describe('SessionStore baseline recovery', () => {
   );
 });
 
+describe('SessionStore interrupted-pass recovery', () => {
+  it('does not trust a pre-existing same-hour slot after a failed cold-start copy', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    const file = seedSource(store, 'gru', 'a.jsonl', 'aaaaaaaa\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z')); // writes the 10-slot generation
+    // Simulate an upgrade/corrupt-baseline pass in the same hour: no baseline
+    // at all, the 10-slot generation still there, and the copy fails.
+    rmSync(baselinePath(store));
+    writeFileSync(file, 'bbbb\n', 'utf-8');
+    const stagingObstruction = join(
+      store.sessionsDir,
+      'backups',
+      `${relativeKey(store, file)}.2026-10-01T10.bak.tmp-${process.pid}`,
+    );
+    mkdirSync(stagingObstruction);
+    const failed = store.runBackup(new Date('2026-10-01T10:35:00Z'));
+    expect(failed.created).toEqual([]);
+    rmSync(stagingObstruction, { recursive: true, force: true });
+    // The next pass must copy the changed content instead of skipping the
+    // stale 10-slot generation the pre-copy record must not have adopted.
+    const retried = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(retried.created.length).toBe(1);
+    expect(readFileSync(retried.created[0]!, 'utf-8')).toBe('bbbb\n');
+  });
+
+  it('promotes a complete staged copy the interrupted rename left behind', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(file, 'two\n', 'utf-8');
+    // A complete staged copy of the next generation, as an interrupted rename
+    // would leave it, plus the matching pre-copy record.
+    const generation = `${relativeKey(store, file)}.2026-10-01T11.bak`;
+    const staging = join(store.sessionsDir, 'backups', `${generation}.tmp-${process.pid}`);
+    writeFileSync(staging, 'one\ntwo\n', 'utf-8');
+    const baseline = readBaseline(store);
+    const key = Object.keys(baseline.sources)[0]!;
+    writeFileSync(
+      join(store.sessionsDir, 'backup-baseline.json.pending'),
+      JSON.stringify({
+        version: 1,
+        sources: { [key]: { size: Buffer.byteLength('one\ntwo\n'), mtimeMs: 1, ctimeMs: 1, backup: generation } },
+      }),
+      'utf-8',
+    );
+    rmSync(file); // the source is gone before the next pass
+
+    store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    const promoted = join(store.sessionsDir, 'backups', generation);
+    expect(existsSync(promoted)).toBe(true);
+    expect(readFileSync(promoted, 'utf-8')).toBe('one\ntwo\n');
+    expect(existsSync(staging)).toBe(false);
+  });
+});
+
 describe('SessionStore backup pass preservation', () => {
   it('never modifies or removes a live session file', () => {
     const store = new SessionStore(tmpDataDir());

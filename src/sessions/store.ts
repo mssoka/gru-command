@@ -615,10 +615,33 @@ export class SessionStore {
    * bound and recovery listings stay clean. Best effort: a cleanup failure
    * warns and the pass continues.
    */
-  private sweepStagingArtifacts(backupNames: ReadonlySet<string>): void {
-    const targets = [...backupNames]
-      .filter((name) => /\.tmp-\d+$/u.test(name))
-      .map((name) => join(this.backupDir, name));
+  private sweepStagingArtifacts(
+    backupNames: ReadonlySet<string>,
+    recorded: ReadonlyMap<string, BackupBaselineEntry>,
+  ): void {
+    const targets: string[] = [];
+    for (const name of backupNames) {
+      const match = /^(.*)\.tmp-\d+$/u.exec(name);
+      if (match === null) continue;
+      const generation = match[1]!;
+      const stagingPath = join(this.backupDir, name);
+      const destination = join(this.backupDir, generation);
+      const entry = recorded.get(generation);
+      // A staged copy left by an interrupted rename is COMPLETE: if the
+      // baseline records that generation and it is absent, promote the staged
+      // file into place instead of deleting the only copy of the newest bytes.
+      if (entry !== undefined && !existsSync(destination)) {
+        try {
+          if (statSync(stagingPath).size >= entry.size) {
+            renameSync(stagingPath, destination);
+            continue;
+          }
+        } catch {
+          /* fall through to the cleanup below */
+        }
+      }
+      targets.push(stagingPath);
+    }
     const stagingNames = [
       basename(this.baselineFile),
       basename(this.baselinePendingFile),
@@ -714,7 +737,10 @@ export class SessionStore {
     // own fresh listing afterwards, so the count rule still sees the copies
     // this pass adds.
     const presentBefore = this.listBackupGenerations();
-    this.sweepStagingArtifacts(presentBefore);
+    this.sweepStagingArtifacts(
+      presentBefore,
+      new Map(Object.values(baseline).map((entry) => [entry.backup, entry])),
+    );
     const scanned = new Set(sources.map((source) => source.key));
     const next: Record<string, BackupBaselineEntry> = {};
     // A source that is gone (or could not be inspected) keeps its recorded
@@ -766,14 +792,21 @@ export class SessionStore {
         ctimeMs: source.ctimeMs,
         backup: name,
       };
-      // A same-slot refresh (a second pass in the same ISO hour) keeps the
-      // PREVIOUS fingerprint in the pre-copy record: if the refresh fails or
-      // the process stops before it lands, the slot still holds the previous
-      // bytes, and the old fingerprint makes the next pass retry instead of
-      // trusting a stale generation whose size happens to satisfy the new
-      // one. A new slot is recorded up front (a missing generation is
-      // repaired), so no completed copy can ever be unrecorded.
-      next[source.key] = previous !== undefined && previous.backup === name ? previous : entry;
+      // The pre-copy record must never pair the new fingerprint with a
+      // generation this pass did not write: a same-slot refresh, or any
+      // destination name that already exists (a same-hour pass after an
+      // upgrade/corrupt baseline, or a backwards clock step), keeps the
+      // PREVIOUS entry — or no entry at all. A failed or interrupted copy
+      // then retries next pass instead of trusting stale bytes whose size
+      // happens to satisfy the new fingerprint. A genuinely new slot is
+      // recorded up front (a missing generation is repaired), so no completed
+      // copy can ever be unrecorded.
+      if (presentBefore.has(name)) {
+        if (previous !== undefined) next[source.key] = previous;
+        else delete next[source.key];
+      } else {
+        next[source.key] = entry;
+      }
       copies.push({ source, dest: join(this.backupDir, name), entry });
     }
     try {
