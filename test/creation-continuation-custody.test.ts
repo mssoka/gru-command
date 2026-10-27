@@ -530,6 +530,65 @@ describe('retained-creation continuation custody', () => {
     }
   });
 
+  it('redacts the token from the creation error a successful rollback rethrows', async () => {
+    // A branchless review lane has nothing to remove, so its rollback returns
+    // normally and the caller rethrows the failed `git worktree add` itself —
+    // the post-rollback surface, not the rollback catch.
+    const sink = logSink();
+    const h = managerFixture('review-rethrow-redaction', { log: sink.log });
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    chmodSync(parent, 0o555);
+    try {
+      const thrown = await h.worktrees.createReviewWorktree({ repoPath: h.repo.path, roundId: 'round-redaction', ref: 'origin/main' })
+        .then(() => null, (failure: unknown) => failure);
+      // The rollback succeeded: the catch that logs and rethrows never ran.
+      expect(sink.entries.filter((entry) => entry.msg === 'creation rollback custody unconfirmed; resources retained')).toHaveLength(0);
+      expect(thrown).toBeInstanceOf(Error);
+      const error = thrown as Error;
+      expect(error.message).toMatch(/^git worktree add --lock --reason /u);
+      expect(error.message).toContain('<redacted-creation-token>');
+      expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, String(error)]))).toBe(false);
+      // The operator meaning survives: the failed command and the lane path.
+      expect(error.message).toContain(join(parent, 'review-round-redaction'));
+      expect(error.message).toContain('failed (exit');
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
+  it('redacts the live receipt token when reconciliation refuses a foreign administration', async () => {
+    // reconcileInterruptedCreation queries the orphan administration directly,
+    // outside the rollback catch; its refusal names the receipt token, which is
+    // still LIVE because a retained receipt is deliberately kept.
+    const h = managerFixture('reconcile-redaction');
+    const jobId = 'reconcile-redaction';
+    const retained = syntheticRetained(h, jobId);
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    const admin = join(common, 'worktrees', 'foreign');
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(admin, 'gitdir'), `${join(realpathSync(parent), `job-${jobId}`, '.git')}\n`);
+    writeFileSync(join(admin, 'HEAD'), `ref: refs/heads/${retained.branch}\n`);
+    writeFileSync(join(admin, 'commondir'), '../..\n');
+    writeFileSync(join(admin, 'locked'), `gru-creation:${randomUUID()}\n`);
+    const thrown = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId }).then(() => null, (failure: unknown) => failure);
+    expect(thrown).toBeInstanceOf(Error);
+    const error = thrown as Error;
+    expect(error.message).toContain('lane administration');
+    expect(error.message).toContain('is locked for another creation');
+    expect(error.message).toContain('inspect it before retrying');
+    expect(error.message).toContain('<redacted-creation-token>');
+    expect(error.message).not.toContain(retained.token);
+    const cause = error.cause instanceof Error ? error.cause : null;
+    expect(JSON.stringify({
+      message: error.message,
+      stack: error.stack,
+      cause: cause === null ? null : [cause.message, cause.stack],
+    })).not.toMatch(/gru-creation:[0-9a-f]{8}-/u);
+  });
+
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
     const h = await retainedFixture('shutdown-cancel');
     const stop = new AbortController();
