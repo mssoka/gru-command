@@ -579,10 +579,30 @@ function tail(text: string, max = 2_000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`;
 }
 
+/** The note kept when the retained window began mid-line and its first line
+ * break leaves nothing: a fragment the earlier cut made is never shown. */
+const CUT_MID_LINE = '(output before this was cut mid-line; not shown)\n';
+
 /* Exported for its tests: the boundary rule is a function of the retained
  * window, and a pipe's chunk boundaries cannot be driven from a setup command. */
-/** A setup stream's bounded tail with any creation token redacted. */
+/** A setup stream's bounded tail with any creation token redacted. A window
+ * whose dropped start ended mid-line can begin inside a token
+ * (`gru-creation:<uuid>`): the prefix-anchored redaction cannot see a
+ * prefixless body, and the fixed prefix makes that body reconstructable. Such
+ * a first partial line is dropped before redaction, exactly as recordedTail
+ * ({@link recordedTail}) drops it for the same window, so no fragment of a
+ * token is ever kept. */
 export function redactedStreamTail(stream: SetupStreamTail): SetupStreamTail {
-  const text = redactCreationTokens(stream.text);
-  return text === stream.text ? stream : { ...stream, text };
+  let text = stream.text;
+  let startsAtLine = stream.startsAtLine;
+  if (stream.truncated && !startsAtLine) {
+    const line = text.indexOf('\n');
+    text = line === -1 ? CUT_MID_LINE : text.slice(line + 1);
+    if (text.trim() === '') text = CUT_MID_LINE;
+    startsAtLine = true;
+  }
+  const redacted = redactCreationTokens(text);
+  return redacted === stream.text && startsAtLine === stream.startsAtLine
+    ? stream
+    : { ...stream, text: redacted, startsAtLine };
 }
