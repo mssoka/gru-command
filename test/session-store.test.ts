@@ -1123,7 +1123,7 @@ describe('SessionStore backup prune safety', () => {
     });
     const copied = failing.runBackup(new Date('2026-10-01T11:05:00Z'));
     expect(copied.created.length).toBe(1);
-    expect(warnings.some((msg) => msg.includes('baseline could not be written'))).toBe(true);
+    expect(warnings.some((msg) => msg.includes('baseline could not be published'))).toBe(true);
 
     // Restore the last persisted baseline (it names the older copy only) and
     // remove the source: the unrecorded newest copy must not be age-pruned.
@@ -1244,7 +1244,9 @@ describe('SessionStore backup pass failure handling', () => {
     // next pass repairs it instead of trusting it forever.
     const entries = Object.entries(readBaseline(store).sources);
     expect(entries).toHaveLength(1);
-    expect(existsSync(join(store.sessionsDir, 'backups', entries[0]![1].backup))).toBe(false);
+    // The recording names the intended generation, which is not a regular
+    // file (the obstruction was a directory), so the next pass repairs it.
+    expect(statSync(join(store.sessionsDir, 'backups', entries[0]![1].backup)).isFile()).toBe(false);
 
     rmSync(join(store.sessionsDir, 'backups', destName), { recursive: true, force: true });
     const retried = store.runBackup(new Date('2026-10-01T12:05:00Z'));

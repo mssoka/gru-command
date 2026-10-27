@@ -764,6 +764,7 @@ export class SessionStore {
       return { created: [], pruned: [], skipped };
     }
     const created: string[] = [];
+    const failedPrevious: string[] = [];
     for (const copy of copies) {
       // Copy to a staging name and rename into the slot: a failed copy (disk
       // full, source gone mid-copy) must never truncate the generation this
@@ -780,20 +781,22 @@ export class SessionStore {
           /* nothing was written, or the cleanup raced the failure */
         }
         // The recorded generation is now missing; the next pass repairs it
-        // from the recorded fingerprint. The previous generation stays
-        // protected this pass by the union below.
+        // from the recorded fingerprint. The previous generation is protected
+        // this pass, so a failed copy never costs the source its last good
+        // snapshot.
+        const previous = baseline[copy.source.key];
+        if (previous !== undefined) failedPrevious.push(previous.backup);
         this.log('warn', 'session backup copy failed', { file: copy.source.file, error: String(error) });
       }
     }
     this.persistSnapshotFromSources(sources);
     // Every generation the baseline records — this pass's intended copies,
-    // an unchanged source's recorded copy, and every entry the previous
-    // baseline named — is protected from this pass's prune, so a failed copy
-    // never costs the source its last good snapshot and the baseline never
-    // names a file the pass deleted.
+    // an unchanged source's recorded copy, and the previous generation of a
+    // source whose copy failed — is protected from this pass's prune, so the
+    // baseline never names a file the pass deleted.
     const recordedGenerations = new Set([
       ...Object.values(next).map((entry) => entry.backup),
-      ...Object.values(baseline).map((entry) => entry.backup),
+      ...failedPrevious,
     ]);
     // A fresh flat listing for the prune, taken AFTER the copies so the count
     // rule sees the generations this pass added.
