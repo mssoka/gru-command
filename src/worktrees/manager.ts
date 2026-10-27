@@ -932,10 +932,16 @@ function gitTreeWithRequirementsPatch(repoPath: string, baseSha: string, require
 function runGit(repoPath: string, args: readonly string[], opts: SpawnGitOptions = {}): string {
   const { status, stdout, stderr, error } = spawnGit(repoPath, args, opts);
   if (status !== 0) {
+    // The argv can carry the creation token (`--lock --reason
+    // gru-creation:<token>`). Every creation path rethrows this error and
+    // callers record it (review handoff failures, child results), so the token
+    // never enters its message — stderr included, in case git ever echoes it.
     throw new Error(
-      `git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${
-        stderr.trim() || error || stdout.trim()
-      }`,
+      redactCreationTokens(
+        `git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${
+          stderr.trim() || error || stdout.trim()
+        }`,
+      ),
     );
   }
   return stdout.trim();
@@ -4010,7 +4016,11 @@ export class WorktreeManager {
         throw new Error('names a different common directory');
       }
       if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
-        throw new Error(`is locked for another creation, not ${custody.token}`);
+        // The receipt's token is LIVE here (a retained creation keeps it), and
+        // this error leaves reconciliation for callers that record it durably
+        // (a child's result summary, the service log). Name the custody
+        // condition, never the secret; the cause below inherits this text.
+        throw new Error(`is locked for another creation, not ${redactCreationTokens(custody.token)}`);
       }
     } catch (error) {
       throw new CreationIntentError(`lane administration ${admin} belongs to ${path} but ${error instanceof Error ? error.message : String(error)} — inspect it before retrying`, { cause: error });
