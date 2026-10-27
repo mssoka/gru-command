@@ -467,9 +467,10 @@ prompt/tool content, so nothing but the owner should traverse it.
   baseline copies each source once and rewrites it, and a live source whose
   recorded generation is gone is copied again. Pruning keeps the newest
   24 generations of a live source and deletes generations whose ISO hour
-  ended more than 7 days ago, but never a source's newest generation and
-  never a generation the baseline records: a live source's last snapshot is
-  never deleted, and a source that is gone keeps its newest backup while its
+  ended more than 7 days ago, but never a generation the baseline records —
+  that generation is the source's last snapshot (a source the baseline does
+  not know keeps its newest name): a live source's last snapshot is never
+  deleted, and a source that is gone keeps its newest backup while its
   older generations age out (the count rule does not apply to a source that
   can no longer produce generations, so it can hold up to a week of hourly
   generations); the entry recorded for a source that is gone stays in the

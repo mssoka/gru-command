@@ -59,7 +59,7 @@ describe('docs contracts: session backup policy', () => {
     expect(ops).toContain('its recorded entry stays in the baseline');
     // The chosen maximum age, derived from the code's default:
     expect(ops).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
-    expect(ops).toContain('never the newest one');
+    expect(ops).toContain('never the generation the baseline records');
     // The retired count-only and every-pass wording is gone from this section.
     expect(ops).not.toContain('newest 24 per file');
     expect(ops).not.toContain('hourly rolling copies');
@@ -98,7 +98,7 @@ describe('docs contracts: session backup policy', () => {
     // Both prune rules, their scopes and the floors:
     expect(spec).toContain('newest 24 generations of a live source');
     expect(spec).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
-    expect(spec).toContain('never the newest generation nor one the baseline records');
+    expect(spec).toContain('never the generation the baseline records');
     expect(spec).not.toContain('hourly rolling backup;');
   });
 });

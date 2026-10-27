@@ -534,7 +534,7 @@ describe('SessionStore changed-only backup pass', () => {
     expect(backupNames(store)).toContain(recorded.backup);
   });
 
-  it('a baseline that is unreadable copies every source once and rewrites a valid one', () => {
+  it('a baseline that is not valid JSON copies every source once and rewrites a valid one', () => {
     const dataDir = tmpDataDir();
     const store = new SessionStore(dataDir);
     seedSource(store, 'gru', 'a.jsonl', 'one\n');
@@ -729,6 +729,117 @@ describe('SessionStore changed-only backup pass', () => {
   });
 });
 
+describe('SessionStore backup artifacts stay trustworthy', () => {
+  it('re-copies when the recorded generation is not a regular file', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+    rmSync(first.created[0]!);
+    mkdirSync(join(store.sessionsDir, 'backups', recorded)); // a directory on the recorded name
+
+    const warnings: string[] = [];
+    const restarted = new SessionStore(store.dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    const pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+    // The directory is not a snapshot: the pass re-copies instead of skipping.
+    expect(pass.created.length).toBe(1);
+    expect(pass.skipped).toBe(0);
+    expect(warnings.some((msg) => msg.includes('recorded session backup is missing'))).toBe(true);
+    expect(readFileSync(pass.created[0]!, 'utf-8')).toBe('one\n');
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it('refuses a baseline whose recorded generation names another source', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const other = seedSource(store, 'minion', 'b.jsonl', 'two\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const baseline = readBaseline(store);
+    const keys = Object.keys(baseline.sources);
+    const gruKey = keys.find((key) => key.startsWith('gru/'))!;
+    const minionKey = keys.find((key) => key.startsWith('minion/'))!;
+    // Point the gru entry at the minion's existing generation: name existence
+    // alone must not satisfy it.
+    const tampered = {
+      version: 1,
+      sources: { ...baseline.sources, [gruKey]: { ...baseline.sources[gruKey]!, backup: baseline.sources[minionKey]!.backup } },
+    };
+    writeFileSync(baselinePath(store), JSON.stringify(tampered), 'utf-8');
+
+    const pass = new SessionStore(dataDir).runBackup(new Date('2026-10-01T11:05:00Z'));
+    // Whole baseline discarded: both sources are copied once.
+    expect(pass.created.length).toBe(2);
+    expect(pass.skipped).toBe(0);
+    expect(existsSync(other)).toBe(true);
+  });
+
+  it('a failed same-hour refresh leaves the recorded generation intact', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    expect(first.created.length).toBe(1);
+    const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+    const recordedPath = join(store.sessionsDir, 'backups', recorded);
+
+    appendFileSync(file, 'two\n', 'utf-8');
+    chmodSync(file, 0o000); // the copy cannot read the source
+    const warnings: string[] = [];
+    const logging = new SessionStore(store.dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    let pass: ReturnType<SessionStore['runBackup']> | null = null;
+    try {
+      pass = logging.runBackup(new Date('2026-10-01T10:35:00Z')); // same ISO hour: same slot
+    } finally {
+      chmodSync(file, 0o600);
+    }
+    expect(pass?.created ?? []).toEqual([]);
+    expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+    // The staging+rename copy must not have truncated the recorded generation.
+    expect(readFileSync(recordedPath, 'utf-8')).toBe('one\n');
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it('does not abort a pass when the baseline target cannot be replaced', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    rmSync(baselinePath(store));
+    mkdirSync(baselinePath(store)); // a directory where the baseline file belongs
+
+    const warnings: string[] = [];
+    const restarted = new SessionStore(dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    let thrown: unknown = null;
+    let pass: ReturnType<SessionStore['runBackup']> | null = null;
+    try {
+      pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+    } catch (error) {
+      thrown = error;
+    }
+    // The boot pass is unguarded: an un-replaceable baseline must be a warn,
+    // never a refused startup.
+    expect(thrown).toBeNull();
+    expect(warnings.some((msg) => msg.includes('baseline could not be written'))).toBe(true);
+    expect(pass?.created.length ?? 0).toBe(1);
+    // Once the target is replaceable again, the next pass records normally.
+    rmSync(baselinePath(store), { recursive: true, force: true });
+    expect(restarted.runBackup(new Date('2026-10-01T12:05:00Z')).created.length).toBe(1);
+    expect(Object.keys(readBaseline(restarted).sources)).toHaveLength(1);
+  });
+});
+
 describe('SessionStore backup pass preservation', () => {
   it('never modifies or removes a live session file', () => {
     const store = new SessionStore(tmpDataDir());
@@ -882,7 +993,8 @@ describe('SessionStore backup prune safety', () => {
   });
 
   it('ages a generation out only when its ISO hour has ended more than the maximum age ago', () => {
-    const store = new SessionStore(tmpDataDir(), { backupMaxAgeMs: 7 * DAY_MS });
+    // No explicit option: this pins the DEFAULT maximum age at its boundary.
+    const store = new SessionStore(tmpDataDir());
     const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
     const aged = store.runBackup(new Date('2026-10-01T10:05:00Z')); // slot 10:00-11:00
     appendFileSync(file, 'two\n', 'utf-8');

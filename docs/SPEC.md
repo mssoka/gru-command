@@ -52,7 +52,7 @@ integrated. Other users can install it on their laptops from GitHub.
     sessions/backup-baseline.json) and re-creates a live file's missing
     recorded backup; per source it keeps the newest 24 generations of a live source
     and prunes generations whose ISO hour ended more than 7 days ago, never
-    the newest generation nor one the baseline records; the pi CLI (or
+    the generation the baseline records; the pi CLI (or
     claude CLI) is the documented emergency console — stop service, open
     the newest session file, single-writer preserved by the stop; service
     detects jsonl growth while down and reloads.

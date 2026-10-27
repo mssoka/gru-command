@@ -594,10 +594,20 @@ export class SessionStore {
     return relative(this.sessionsDir, file).replace(/[/\\]/g, '__');
   }
 
-  /** One flat listing of the backup dir — never a tree walk. */
+  /** The only generation name shape this source's entry may record. */
+  private backupNameFor(key: string): RegExp {
+    const flattened = key.replace(/[/\\]/g, '__').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^${flattened}\\.\\d{4}-\\d{2}-\\d{2}T\\d{2}\\.bak$`, 'u');
+  }
+
+  /** One flat listing of the backup dir's regular files — never a tree walk. */
   private listBackupGenerations(): ReadonlySet<string> {
     try {
-      return new Set(readdirSync(this.backupDir));
+      return new Set(
+        readdirSync(this.backupDir, { withFileTypes: true })
+          .filter((entry) => entry.isFile())
+          .map((entry) => entry.name),
+      );
     } catch (error) {
       // The directory can vanish between mkdirSync and here (an out-of-band
       // reclaim racing the scan). Treat it as empty so the pass takes the
@@ -670,8 +680,13 @@ export class SessionStore {
       }
       const name = `${source.backupKey}.${stamp}${BACKUP_SUFFIX}`;
       const dest = join(this.backupDir, name);
+      // Copy to a staging name and rename into the slot: a failed copy (disk
+      // full, source gone mid-copy) must never truncate the generation this
+      // same slot may already hold and the baseline may already record.
+      const staging = `${dest}.tmp-${process.pid}`;
       try {
-        copyFileSync(source.file, dest);
+        copyFileSync(source.file, staging);
+        renameSync(staging, dest);
         created.push(dest);
         next[source.key] = {
           size: source.size,
@@ -680,6 +695,11 @@ export class SessionStore {
           backup: name,
         };
       } catch (error) {
+        try {
+          unlinkSync(staging);
+        } catch {
+          /* nothing was written, or the cleanup raced the failure */
+        }
         // The previous recorded generation stays protected (its older
         // fingerprint can never skip a changed source), and the next pass
         // retries this one.
@@ -696,7 +716,17 @@ export class SessionStore {
     const presentAfter = this.listBackupGenerations();
     const pruned = this.pruneBackups(live, recordedGenerations, presentAfter, now);
     this.persistSnapshotFromSources(sources);
-    this.writeBackupBaseline(next);
+    try {
+      this.writeBackupBaseline(next);
+    } catch (error) {
+      // The boot pass is NOT guarded (registry.boot calls runBackup directly);
+      // an un-replaceable baseline target must not refuse service startup.
+      // The copies and the size snapshot stay, and the next pass retries.
+      this.log('warn', 'session backup baseline could not be written — the next pass retries', {
+        baselineFile: this.baselineFile,
+        error: String(error),
+      });
+    }
     if (created.length > 0 || pruned.length > 0 || skipped > 0) {
       this.log('info', 'session backup pass', {
         created: created.length,
@@ -732,10 +762,11 @@ export class SessionStore {
    * - **Age**: delete a generation whose ISO-hour slot ended MORE than
    *   `backupMaxAgeMs` before this pass — an idle source would otherwise
    *   hold every generation it ever produced forever.
-   * - **Floor**: the NEWEST generation of every source survives both rules.
-   *   It is that source's last snapshot: a live source's is never deleted,
-   *   and a source that is gone keeps its newest backup while its older
-   *   generations age out (up to a week of hourly generations).
+   * - **Floor**: the generation the baseline records (that source's last
+   *   snapshot) survives both rules; a source the baseline does not know
+   *   falls back to its newest name. A live source's last snapshot is never
+   *   deleted, and a source that is gone keeps its newest backup while its
+   *   older generations age out (up to a week of hourly generations).
    * - **Recorded generations** (the entry the baseline names, whether it was
    *   copied this pass, an unchanged source's recorded copy, or the last copy
    *   of a source that is gone) are never pruned either: after a backwards
@@ -835,8 +866,10 @@ export class SessionStore {
         if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return { baseline: {}, state: 'corrupt' };
         if (typeof mtimeMs !== 'number' || !Number.isFinite(mtimeMs)) return { baseline: {}, state: 'corrupt' };
         if (typeof ctimeMs !== 'number' || !Number.isFinite(ctimeMs)) return { baseline: {}, state: 'corrupt' };
-        // The recorded generation must name a file INSIDE the backup dir.
-        if (typeof backup !== 'string' || backup === '' || backup === '.' || backup === '..' || /[/\\]/u.test(backup)) {
+        // The recorded generation must be a generation OF THIS SOURCE (a
+        // bare file name derived from the key), so a hand-edited baseline
+        // cannot point one source at another's backup or outside the dir.
+        if (typeof backup !== 'string' || !this.backupNameFor(key).test(backup)) {
           return { baseline: {}, state: 'corrupt' };
         }
         baseline[key] = { size, mtimeMs, ctimeMs, backup };
@@ -852,7 +885,16 @@ export class SessionStore {
     const baseline: BackupBaseline = { version: BACKUP_BASELINE_VERSION, sources };
     const staging = `${this.baselineFile}.tmp-${process.pid}`;
     writeFileSync(staging, `${JSON.stringify(baseline, null, 2)}\n`, 'utf-8');
-    renameSync(staging, this.baselineFile);
+    try {
+      renameSync(staging, this.baselineFile);
+    } catch (error) {
+      try {
+        unlinkSync(staging);
+      } catch {
+        /* nothing to clean up */
+      }
+      throw error;
+    }
   }
 
   /** All session jsonl files under the sessions dir (backups/state excluded). */
