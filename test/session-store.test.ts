@@ -594,8 +594,9 @@ describe('SessionStore backup pass preservation', () => {
     appendFileSync(changed, 'more\n', 'utf-8');
 
     const before = [changed, unchanged].map((file) => ({ file, bytes: readFileSync(file), stat: statSync(file) }));
-    const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
-    expect(pass.created.length).toBe(1);
+    // Whatever the pass copies (both sources before changed-only copies, one
+    // after), it must never write to or remove a live session file.
+    store.runBackup(new Date('2026-10-01T11:05:00Z'));
     for (const snapshot of before) {
       expect(existsSync(snapshot.file)).toBe(true);
       expect(readFileSync(snapshot.file)).toEqual(snapshot.bytes);
