@@ -1,5 +1,5 @@
 import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, pendingLaneHandoffPublished, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
-import { CreationIntentError, RetainedCreationFailedError, RetainedCreationRefusalError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane, type RetainedReceiptExpectation } from './creation-intent.js';
+import { CreationIntentError, RetainedCreationFailedError, RetainedCreationRefusalError, clearCreationIntent, readCreationIntent, redactCreationTokens, writeCreationIntent, type CreationIntent, type CreationIntentLane, type RetainedReceiptExpectation } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -985,6 +985,21 @@ function runGitAsync(repoPath: string, args: readonly string[], opts: Pick<Spawn
     if (opts.input !== undefined) child.stdin?.end(opts.input);
     else child.stdin?.end();
   });
+}
+
+/** An error that leaves the creation/rollback boundary carries redacted token
+ * text only: a token is custody authority, so neither its message nor its
+ * stack may spell one. An error whose message never carried a token keeps its
+ * exact identity; a token-bearing one is copied with its name and redacted
+ * stack, never its cause chain (that chain can spell the same token again). */
+function redactedCreationError(value: unknown): Error {
+  const source = value instanceof Error ? value : new Error(String(value));
+  const message = redactCreationTokens(source.message);
+  if (message === source.message) return source;
+  const copy = new Error(message);
+  copy.name = source.name;
+  if (source.stack !== undefined) copy.stack = redactCreationTokens(source.stack);
+  return copy;
 }
 
 /** Git's locked worktree reason survives a failed post-checkout hook and
@@ -4131,9 +4146,13 @@ export class WorktreeManager {
         runGit(repoPath, ['worktree', 'remove', '--force', '--force', path]);
       }
     } catch (error) {
-      this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: String(error) });
-      throw new AggregateError([originalError, error],
-        `worktree creation failed (${String(originalError)}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
+      // A creation token is custody authority: neither the rollback failure nor
+      // the creation failure may carry it into a log field, a rethrown message
+      // or an inner error. The path, the custody condition and what to inspect
+      // survive in both.
+      this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: redactCreationTokens(String(error)) });
+      throw new AggregateError([redactedCreationError(originalError), redactedCreationError(error)],
+        `worktree creation failed (${redactCreationTokens(String(originalError))}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
     }
   }
 
