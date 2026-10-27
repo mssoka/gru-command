@@ -616,7 +616,12 @@ export class SessionStore {
     const targets = [...backupNames]
       .filter((name) => /\.tmp-\d+$/u.test(name))
       .map((name) => join(this.backupDir, name));
-    const stagingNames = [basename(this.baselineFile), basename(this.stateFile), 'store-shutdown-checkpoint.json'].map(
+    const stagingNames = [
+      basename(this.baselineFile),
+      basename(this.baselinePendingFile),
+      basename(this.stateFile),
+      'store-shutdown-checkpoint.json',
+    ].map(
       (name) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.tmp-\\d+$`, 'u'),
     );
     for (const name of this.listSessionDirEntries()) {
@@ -716,7 +721,11 @@ export class SessionStore {
     // final baseline, then leaves a recorded generation that exists or that
     // the next pass repairs — never an unrecorded copy that a later prune can
     // delete.
-    const copies: { readonly source: SessionSourceScan; readonly dest: string }[] = [];
+    const copies: {
+      readonly source: SessionSourceScan;
+      readonly dest: string;
+      readonly entry: BackupBaselineEntry;
+    }[] = [];
     let skipped = 0;
     for (const source of sources) {
       const previous = baseline[source.key];
@@ -743,13 +752,21 @@ export class SessionStore {
         });
       }
       const name = `${source.backupKey}.${stamp}${BACKUP_SUFFIX}`;
-      next[source.key] = {
+      const entry: BackupBaselineEntry = {
         size: source.size,
         mtimeMs: source.mtimeMs,
         ctimeMs: source.ctimeMs,
         backup: name,
       };
-      copies.push({ source, dest: join(this.backupDir, name) });
+      // A same-slot refresh (a second pass in the same ISO hour) keeps the
+      // PREVIOUS fingerprint in the pre-copy record: if the refresh fails or
+      // the process stops before it lands, the slot still holds the previous
+      // bytes, and the old fingerprint makes the next pass retry instead of
+      // trusting a stale generation whose size happens to satisfy the new
+      // one. A new slot is recorded up front (a missing generation is
+      // repaired), so no completed copy can ever be unrecorded.
+      next[source.key] = previous !== undefined && previous.backup === name ? previous : entry;
+      copies.push({ source, dest: join(this.backupDir, name), entry });
     }
     try {
       this.writeBaseline(next, this.baselinePendingFile);
@@ -774,6 +791,7 @@ export class SessionStore {
         copyFileSync(copy.source.file, staging);
         renameSync(staging, copy.dest);
         created.push(copy.dest);
+        next[copy.source.key] = copy.entry;
       } catch (error) {
         try {
           unlinkSync(staging);
@@ -790,6 +808,16 @@ export class SessionStore {
       }
     }
     this.persistSnapshotFromSources(sources);
+    try {
+      this.writeBaseline(next, this.baselinePendingFile);
+    } catch (error) {
+      // The pre-copy record stands (a same-slot refresh then retries next
+      // pass, a new-slot copy is repaired), so publishing it is still safe.
+      this.log('warn', 'session backup baseline could not be rewritten after the copies — publishing the pre-copy record', {
+        baselineFile: this.baselineFile,
+        error: String(error),
+      });
+    }
     // Every generation the baseline records — this pass's intended copies,
     // an unchanged source's recorded copy, and the previous generation of a
     // source whose copy failed — is protected from this pass's prune, so the
@@ -984,8 +1012,8 @@ export class SessionStore {
   private writeBaseline(sources: { readonly [key: string]: BackupBaselineEntry }, path: string): void {
     const baseline: BackupBaseline = { version: BACKUP_BASELINE_VERSION, sources };
     const staging = `${path}.tmp-${process.pid}`;
-    writeFileSync(staging, `${JSON.stringify(baseline, null, 2)}\n`, 'utf-8');
     try {
+      writeFileSync(staging, `${JSON.stringify(baseline, null, 2)}\n`, 'utf-8');
       renameSync(staging, path);
     } catch (error) {
       try {

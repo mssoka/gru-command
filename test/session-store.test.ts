@@ -820,6 +820,42 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     },
   );
 
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'a failed same-slot refresh of a shrunk source retries instead of keeping stale bytes',
+    () => {
+      const store = new SessionStore(tmpDataDir());
+      const file = seedSource(store, 'gru', 'a.jsonl', 'aaaaaaaa\n');
+      store.runBackup(new Date('2026-10-01T10:05:00Z'));
+      const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+      const recordedPath = join(store.sessionsDir, 'backups', recorded);
+
+      // The source shrinks and its fingerprint changes, but the same-hour
+      // refresh cannot read it: the slot keeps the OLD (larger) bytes.
+      writeFileSync(file, 'bbbb\n', 'utf-8');
+      chmodSync(file, 0o000);
+      const warnings: string[] = [];
+      const logging = new SessionStore(store.dataDir, {
+        log: (level, msg) => {
+          if (level === 'warn') warnings.push(msg);
+        },
+      });
+      let failed: ReturnType<SessionStore['runBackup']> | null = null;
+      try {
+        failed = logging.runBackup(new Date('2026-10-01T10:35:00Z'));
+      } finally {
+        chmodSync(file, 0o600);
+      }
+      expect(failed?.created ?? []).toEqual([]);
+      expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+      // The pre-copy record keeps the OLD fingerprint, so the next pass sees
+      // the changed source and copies instead of trusting the stale slot.
+      expect(readFileSync(recordedPath, 'utf-8')).toBe('aaaaaaaa\n');
+      const retried = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+      expect(retried.created.length).toBe(1);
+      expect(readFileSync(retried.created[0]!, 'utf-8')).toBe('bbbb\n');
+    },
+  );
+
   it('does not abort a pass when the baseline target cannot be replaced', () => {
     const dataDir = tmpDataDir();
     const store = new SessionStore(dataDir);
@@ -944,7 +980,7 @@ describe('SessionStore backup artifact integrity', () => {
     seedSource(store, 'gru', 'a.jsonl', 'one\n');
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
     const staleBackupStaging = join(store.sessionsDir, 'backups', 'gru__a.jsonl.2026-10-01T10.bak.tmp-999999');
-    const staleBaselineStaging = join(store.sessionsDir, 'backup-baseline.json.tmp-999999');
+    const staleBaselineStaging = join(store.sessionsDir, 'backup-baseline.json.pending.tmp-999999');
     const staleStateStaging = join(store.sessionsDir, 'store-state.json.tmp-999999');
     const staleCheckpointStaging = join(store.sessionsDir, 'store-shutdown-checkpoint.json.tmp-999999');
     for (const path of [staleBackupStaging, staleBaselineStaging, staleStateStaging, staleCheckpointStaging]) {
@@ -1125,10 +1161,12 @@ describe('SessionStore backup prune safety', () => {
     expect(copied.created.length).toBe(1);
     expect(warnings.some((msg) => msg.includes('baseline could not be published'))).toBe(true);
 
-    // Restore the last persisted baseline (it names the older copy only) and
-    // remove the source: the unrecorded newest copy must not be age-pruned.
+    // Remove every record the copy could be named by (the pending record
+    // survived the failed publish), so the final pass has no record of it;
+    // the unrecorded copy must then survive on the newest-name floor alone.
     rmSync(baselinePath(store), { recursive: true, force: true });
-    writeFileSync(baselinePath(store), savedBaseline, 'utf-8');
+    rmSync(join(store.sessionsDir, 'backup-baseline.json.pending'), { force: true });
+    expect(savedBaseline.length).toBeGreaterThan(0);
     rmSync(file);
     const overAge = store.runBackup(new Date('2026-11-01T10:05:00Z'));
     expect(overAge.created).toEqual([]);
