@@ -1035,36 +1035,40 @@ describe('SessionStore backup artifact integrity', () => {
 });
 
 describe('SessionStore prune liveness', () => {
-  it('does not count-prune a source deleted during the pass', () => {
+  it('does not count-prune a source deleted between the scan and the prune', () => {
     const store = new SessionStore(tmpDataDir(), { retention: 2 });
     const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
     appendFileSync(file, 'two\n', 'utf-8');
     store.runBackup(new Date('2026-10-01T11:05:00Z'));
-    appendFileSync(file, 'three\n', 'utf-8');
-    store.runBackup(new Date('2026-10-01T12:05:00Z'));
-    expect(backupNames(store)).toHaveLength(3);
+    expect(backupNames(store)).toHaveLength(2);
 
-    // Delete the live file WHILE the pass runs (inside the recorded-generation
-    // stat): the prune must see a gone source, not the scan-time liveness.
-    const stat = vi.spyOn(store as unknown as { statGeneration(name: string): unknown }, 'statGeneration');
-    const real = stat.getMockImplementation();
+    // The source changes, the pass copies it, and then the transcript is
+    // deleted BEFORE the prune's own listing: the count rule must see a gone
+    // source (a dead source keeps its recent generations) rather than the
+    // scan-time liveness.
+    appendFileSync(file, 'three\n', 'utf-8');
+    const listing = vi.spyOn(store as unknown as { listBackupGenerations(): unknown }, 'listBackupGenerations');
+    const real = listing.getMockImplementation();
+    let calls = 0;
     let removed = false;
-    stat.mockImplementation((name: string) => {
-      const result = (real === undefined ? undefined : real(name)) as number | null;
-      if (!removed) {
+    listing.mockImplementation(() => {
+      calls += 1;
+      if (calls === 2) {
         rmSync(file);
         removed = true;
       }
-      return result;
+      return real === undefined ? new Set<string>() : real();
     });
-    const pass = store.runBackup(new Date('2026-10-01T13:05:00Z'));
-    stat.mockRestore();
+    const pass = store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    listing.mockRestore();
     expect(removed).toBe(true);
-    // A dead source keeps its recent generations: the count rule must not run.
+    expect(pass.created.length).toBe(1);
     expect(pass.pruned).toEqual([]);
     expect(backupNames(store)).toHaveLength(3);
   });
+});
+
 });
 
 describe('SessionStore backup pass preservation', () => {
