@@ -812,11 +812,12 @@ export class SessionStore {
         const previous = baseline[copy.source.key];
         if (previous !== undefined) {
           // Publish the last generation that actually exists, not the
-          // intended-but-absent one: the record must never name a file the
-          // source does not have, and the old fingerprint makes the next
-          // pass retry.
+          // intended-but-absent one: the old fingerprint makes the next pass
+          // retry.
           next[copy.source.key] = previous;
         }
+        // With no previous entry (a cold start) the intended generation stays
+        // recorded; it does not exist, so the next pass repairs it.
         this.log('warn', 'session backup copy failed', { file: copy.source.file, error: String(error) });
       }
     }
@@ -984,9 +985,9 @@ export class SessionStore {
     if (final.state !== 'ok') return pending;
     const merged: Record<string, BackupBaselineEntry> = { ...pending.baseline };
     for (const [key, entry] of Object.entries(pending.baseline)) {
-      if (existsSync(join(this.backupDir, entry.backup))) continue;
+      if (this.statGeneration(entry.backup) !== null) continue;
       const fallback = final.baseline[key];
-      if (fallback !== undefined && existsSync(join(this.backupDir, fallback.backup))) merged[key] = fallback;
+      if (fallback !== undefined && this.statGeneration(fallback.backup) !== null) merged[key] = fallback;
     }
     return { baseline: merged, state: 'ok' };
   }

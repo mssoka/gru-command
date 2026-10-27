@@ -367,7 +367,7 @@ const PINS: Record<string, number> = {
   'service-port-guard.test.ts': 14,
   'service-shutdown.test.ts': 15,
   'silas-deterministic-seam.test.ts': 2,
-  'session-store.test.ts': 71,
+  'session-store.test.ts': 73,
   'shutdown.test.ts': 8,
   'silas-driver.test.ts': 176,
   'silas-verification-debt.test.ts': 27,
