@@ -613,17 +613,14 @@ export class SessionStore {
     const targets = [...backupNames]
       .filter((name) => /\.tmp-\d+$/u.test(name))
       .map((name) => join(this.backupDir, name));
-    let sessionEntries: string[] = [];
-    try {
-      sessionEntries = readdirSync(this.sessionsDir);
-    } catch (error) {
-      this.log('warn', 'session staging sweep could not list the sessions dir', { error: String(error) });
-    }
-    const stagingPrefixes = [basename(this.baselineFile), basename(this.stateFile), 'store-shutdown-checkpoint.json'].map(
-      (name) => `${name}.tmp-`,
+    const stagingNames = [basename(this.baselineFile), basename(this.stateFile), 'store-shutdown-checkpoint.json'].map(
+      (name) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.tmp-\\d+$`, 'u'),
     );
-    for (const name of sessionEntries) {
-      if (stagingPrefixes.some((prefix) => name.startsWith(prefix))) targets.push(join(this.sessionsDir, name));
+    for (const name of this.listSessionDirEntries()) {
+      // Only this process's own staging shape: a hand-made copy such as
+      // `store-state.json.tmp-before-upgrade` (or a tracked `.jsonl` that
+      // merely starts with a staging prefix) is never deleted.
+      if (stagingNames.some((pattern) => pattern.test(name))) targets.push(join(this.sessionsDir, name));
     }
     for (const path of targets) {
       try {
@@ -631,6 +628,16 @@ export class SessionStore {
       } catch (error) {
         this.log('warn', 'session staging cleanup failed', { path, error: String(error) });
       }
+    }
+  }
+
+  /** Flat listing of the sessions dir (the staging sweep's seam, never a walk). */
+  private listSessionDirEntries(): readonly string[] {
+    try {
+      return readdirSync(this.sessionsDir);
+    } catch (error) {
+      this.log('warn', 'session staging sweep could not list the sessions dir', { error: String(error) });
+      return [];
     }
   }
 

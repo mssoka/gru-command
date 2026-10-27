@@ -633,13 +633,17 @@ describe('SessionStore changed-only backup pass', () => {
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
     for (const file of files.slice(0, 2)) appendFileSync(file, 'changed\n', 'utf-8');
 
+    const before = backupNames(store).length;
     const walk = vi.spyOn(store, 'listSessionFiles');
     const scan = vi.spyOn(store, 'scanSessionSources');
     const listing = vi.spyOn(store as unknown as { listBackupGenerations(): unknown }, 'listBackupGenerations');
+    const sessionListing = vi.spyOn(store as unknown as { listSessionDirEntries(): unknown }, 'listSessionDirEntries');
     const stat = vi.spyOn(store as unknown as { statSource(file: string): unknown }, 'statSource');
     const generationStat = vi.spyOn(store as unknown as { statGeneration(name: string): unknown }, 'statGeneration');
     const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
-    // Exactly M copies for M changed sources; the rest are skipped.
+    // Exactly M copies for M changed sources — observed at the backup
+    // DIRECTORY, not just the pass's return value; the rest are skipped.
+    expect(backupNames(store).length - before).toBe(2);
     expect(pass.created.length).toBe(2);
     expect(pass.skipped).toBe(4);
     // Cost: one directory walk (it used to walk twice per pass), one scan, two
@@ -649,6 +653,7 @@ describe('SessionStore changed-only backup pass', () => {
     expect(walk).toHaveBeenCalledTimes(1);
     expect(scan).toHaveBeenCalledTimes(1);
     expect(listing).toHaveBeenCalledTimes(2);
+    expect(sessionListing).toHaveBeenCalledTimes(1); // the staging sweep's flat listing
     expect(stat).toHaveBeenCalledTimes(files.length);
     // The recorded generation of each SKIPPED source is stat'ed once (an
     // unusable snapshot is repaired); changed sources are not.
@@ -656,6 +661,7 @@ describe('SessionStore changed-only backup pass', () => {
     walk.mockRestore();
     scan.mockRestore();
     listing.mockRestore();
+    sessionListing.mockRestore();
     stat.mockRestore();
     generationStat.mockRestore();
   });
@@ -881,6 +887,10 @@ describe('SessionStore backup artifact integrity', () => {
     for (const path of [staleBackupStaging, staleBaselineStaging, staleStateStaging, staleCheckpointStaging]) {
       writeFileSync(path, 'partial', 'utf-8');
     }
+    // A hand-made copy that merely starts with a staging prefix is an
+    // operator's file, not this process's staging: the sweep must not touch it.
+    const handMade = join(store.sessionsDir, 'store-state.json.tmp-before-upgrade');
+    writeFileSync(handMade, 'kept', 'utf-8');
 
     store.runBackup(new Date('2026-10-01T11:05:00Z'));
     // A crashed copy or write must not accumulate in the backup dir or the
@@ -888,6 +898,8 @@ describe('SessionStore backup artifact integrity', () => {
     for (const path of [staleBackupStaging, staleBaselineStaging, staleStateStaging, staleCheckpointStaging]) {
       expect(existsSync(path)).toBe(false);
     }
+    expect(existsSync(handMade)).toBe(true);
+    expect(readFileSync(handMade, 'utf-8')).toBe('kept');
     expect(backupNames(store)).toHaveLength(1);
   });
 

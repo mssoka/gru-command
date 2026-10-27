@@ -395,8 +395,11 @@ The service self-manages:
   more, with a `warn`, so an out-of-band reclaim of the backup directory
   cannot leave a live transcript without a snapshot. Per live transcript
   the newest 24 backups are kept, and any generation whose ISO hour ended
-  more than 7 days ago is pruned — never the generation the baseline
-  records, which is that transcript's last snapshot. A transcript that is
+  more than 7 days ago is pruned — never the newest generation and never the
+  generation the baseline records. After a clock step or a failed baseline
+  write those two can differ and the pass keeps both, because it cannot tell
+  which one holds the last bytes: restore from the one with the newest
+  content, not from the name alone. A transcript that is
   gone keeps its last recorded backup while its older generations age out, so
   it can hold up to a week
   of hourly generations; its recorded entry stays in the baseline so the
