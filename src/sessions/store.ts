@@ -628,17 +628,22 @@ export class SessionStore {
       const destination = join(this.backupDir, generation);
       const entry = recorded.get(generation);
       // A staged copy left by an interrupted rename is COMPLETE: if the
-      // baseline records that generation and it is absent, promote the staged
-      // file into place instead of deleting the only copy of the newest bytes.
-      if (entry !== undefined && !existsSync(destination)) {
+      // baseline records that generation and the destination is not a usable
+      // snapshot, promote the staged file into place (an unusable destination
+      // is replaced by the rename) instead of deleting the newest bytes.
+      if (entry !== undefined && this.statGeneration(generation) === null) {
         try {
           if (statSync(stagingPath).size >= entry.size) {
             renameSync(stagingPath, destination);
             continue;
           }
         } catch {
-          /* fall through to the cleanup below */
+          /* fall through */
         }
+        // The copy is recorded but cannot be promoted: keep it (and say so)
+        // rather than deleting a possible only copy of the newest bytes.
+        this.log('warn', 'session staging copy could not be promoted', { staging: name });
+        continue;
       }
       targets.push(stagingPath);
     }
@@ -676,22 +681,31 @@ export class SessionStore {
   }
 
   /**
-   * Whether an interrupted rename left a COMPLETE staged copy for this
-   * generation (`<generation>.tmp-<pid>`, at least the recorded size): the
-   * sweep promotes it instead of deleting it, so the baseline must keep the
-   * entry that names it.
+   * One flat listing of the staged copies an interrupted rename can leave
+   * (`<generation>.tmp-<pid>`): generation name -> largest staged size. Never
+   * a per-entry rescan (the boot pass is synchronous and unguarded).
    */
-  private hasCompleteStagedCopy(generation: string, expectedSize: number): boolean {
+  private stagedCompleteCopies(): ReadonlyMap<string, number> {
+    const out = new Map<string, number>();
+    let names: readonly string[];
     try {
-      for (const name of readdirSync(this.backupDir)) {
-        if (!name.startsWith(`${generation}.tmp-`) || !/\.tmp-\d+$/u.test(name)) continue;
-        const stat = statSync(join(this.backupDir, name));
-        if (stat.isFile() && stat.size >= expectedSize) return true;
-      }
+      names = readdirSync(this.backupDir);
     } catch {
-      /* no readable staging */
+      return out;
     }
-    return false;
+    for (const name of names) {
+      const match = /^(.*)\.tmp-\d+$/u.exec(name);
+      if (match === null) continue;
+      try {
+        const stat = statSync(join(this.backupDir, name));
+        if (!stat.isFile()) continue;
+        const generation = match[1]!;
+        out.set(generation, Math.max(out.get(generation) ?? 0, stat.size));
+      } catch {
+        /* vanishing staging */
+      }
+    }
+    return out;
   }
 
   /** Size of a readable recorded generation, or null when it is unusable. */
@@ -820,7 +834,15 @@ export class SessionStore {
       // happens to satisfy the new fingerprint. A genuinely new slot is
       // recorded up front (a missing generation is repaired), so no completed
       // copy can ever be unrecorded.
-      if (presentBefore.has(name)) {
+      let destinationTaken: boolean;
+      try {
+        statSync(join(this.backupDir, name));
+        destinationTaken = true; // a file or a directory already occupies it
+      } catch (error) {
+        // Absence is only proven by ENOENT: any other error refuses to adopt.
+        destinationTaken = (error as NodeJS.ErrnoException).code !== 'ENOENT';
+      }
+      if (destinationTaken) {
         if (previous !== undefined) next[source.key] = previous;
         else delete next[source.key];
       } else {
@@ -828,6 +850,9 @@ export class SessionStore {
       }
       copies.push({ source, dest: join(this.backupDir, name), entry });
     }
+    // The size snapshot belongs to every pass, including a pass that cannot
+    // record its copies and defers them.
+    this.persistSnapshotFromSources(sources);
     try {
       this.writeBaseline(next, this.baselinePendingFile);
     } catch (error) {
@@ -874,6 +899,8 @@ export class SessionStore {
       }
     }
     this.persistSnapshotFromSources(sources);
+    // The size snapshot belongs to every pass, including a pass that cannot
+    // record its copies and defers them.
     try {
       this.writeBaseline(next, this.baselinePendingFile);
     } catch (error) {
@@ -1035,14 +1062,19 @@ export class SessionStore {
     if (pending.state !== 'ok') return this.readBaselineFile(this.baselineFile);
     const final = this.readBaselineFile(this.baselineFile);
     if (final.state !== 'ok') return pending;
+    const staged = this.stagedCompleteCopies();
     const merged: Record<string, BackupBaselineEntry> = { ...pending.baseline };
     for (const [key, entry] of Object.entries(pending.baseline)) {
-      if (this.statGeneration(entry.backup) !== null) continue;
+      const size = this.statGeneration(entry.backup);
+      if (size !== null && size >= entry.size) continue;
       // An interrupted rename's complete staging copy is this entry's
       // generation: the sweep will promote it, so the pending entry stands.
-      if (this.hasCompleteStagedCopy(entry.backup, entry.size)) continue;
-      const fallback = final.baseline[key];
-      if (fallback !== undefined && this.statGeneration(fallback.backup) !== null) merged[key] = fallback;
+      const stagedSize = staged.get(entry.backup);
+      if (stagedSize !== undefined && stagedSize >= entry.size) continue;
+      const fallback = Object.hasOwn(final.baseline, key) ? final.baseline[key] : undefined;
+      if (fallback === undefined) continue;
+      const fallbackSize = this.statGeneration(fallback.backup);
+      if (fallbackSize !== null && fallbackSize >= fallback.size) merged[key] = fallback;
     }
     return { baseline: merged, state: 'ok' };
   }
