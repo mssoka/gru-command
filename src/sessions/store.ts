@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { basename, join, relative, resolve } from 'node:path';
 import { withSessionLockCoordination } from './lock-coordination.js';
 import type { LogLevel } from '../logger.js';
 
@@ -148,6 +148,8 @@ const BACKUP_BASELINE_VERSION = 1;
  * bulk of the generations nobody would ever restore from).
  */
 export const BACKUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Generations kept per live source (the default the docs state). */
+export const DEFAULT_BACKUP_RETENTION = 24;
 
 /**
  * Durable session store (EPICS E2 story 3; SPEC ruling 12).
@@ -189,7 +191,7 @@ export class SessionStore {
     this.backupDir = join(this.sessionsDir, 'backups');
     this.stateFile = join(this.sessionsDir, 'store-state.json');
     this.baselineFile = join(this.sessionsDir, 'backup-baseline.json');
-    this.retention = opts.retention ?? 24;
+    this.retention = opts.retention ?? DEFAULT_BACKUP_RETENTION;
     this.backupMaxAgeMs = opts.backupMaxAgeMs ?? BACKUP_MAX_AGE_MS;
     this.log = opts.log ?? (() => {});
     // Session transcripts carry full prompt/tool content — the sessions
@@ -600,6 +602,43 @@ export class SessionStore {
     return new RegExp(`^${flattened}\\.\\d{4}-\\d{2}-\\d{2}T\\d{2}\\.bak$`, 'u');
   }
 
+  /**
+   * Remove staging files a hard stop left behind (a mid-copy crash leaves a
+   * partial `<generation>.bak.tmp-<pid>`, and a crashed baseline write leaves
+   * `backup-baseline.json.tmp-<pid>`) so the backup dir cannot grow without
+   * bound and recovery listings stay clean. Best effort: a cleanup failure
+   * warns and the pass continues.
+   */
+  private sweepStagingArtifacts(backupNames: ReadonlySet<string>): void {
+    const backupStaging = [...backupNames].filter((name) => /\.tmp-\d+$/u.test(name));
+    let sessionEntries: string[] = [];
+    try {
+      sessionEntries = readdirSync(this.sessionsDir);
+    } catch (error) {
+      this.log('warn', 'session staging sweep could not list the sessions dir', { error: String(error) });
+    }
+    const baselinePrefix = `${basename(this.baselineFile)}.tmp-`;
+    const baselineStaging = sessionEntries.filter((name) => name.startsWith(baselinePrefix));
+    for (const name of [...backupStaging, ...baselineStaging]) {
+      const path = name.startsWith(baselinePrefix) ? join(this.sessionsDir, name) : join(this.backupDir, name);
+      try {
+        unlinkSync(path);
+      } catch (error) {
+        this.log('warn', 'session staging cleanup failed', { path, error: String(error) });
+      }
+    }
+  }
+
+  /** Size of a recorded generation, or null when it is gone/not a file. */
+  private statGeneration(name: string): number | null {
+    try {
+      const stat = statSync(join(this.backupDir, name));
+      return stat.isFile() ? stat.size : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** One flat listing of the backup dir's regular files — never a tree walk. */
   private listBackupGenerations(): ReadonlySet<string> {
     try {
@@ -647,6 +686,7 @@ export class SessionStore {
     // own fresh listing afterwards, so the count rule still sees the copies
     // this pass adds.)
     const presentBefore = this.listBackupGenerations();
+    this.sweepStagingArtifacts(presentBefore);
     const scanned = new Set(sources.map((source) => source.key));
     const next: Record<string, BackupBaselineEntry> = {};
     // A source that is gone (or could not be inspected) keeps its recorded
@@ -665,15 +705,18 @@ export class SessionStore {
         previous.mtimeMs === source.mtimeMs &&
         previous.ctimeMs === source.ctimeMs
       ) {
-        if (presentBefore.has(previous.backup)) {
+        // The recorded generation must still be a usable copy: present, a
+        // regular file, and at least as large as the source was when the copy
+        // was taken (a prefix/truncated file is not a snapshot). An
+        // out-of-band reclaim or a damaged generation is re-created rather
+        // than letting a live source run with no usable snapshot at all.
+        const recordedSize = this.statGeneration(previous.backup);
+        if (recordedSize !== null && recordedSize >= previous.size) {
           next[source.key] = previous; // unchanged since its last recorded backup
           skipped += 1;
           continue;
         }
-        // Unchanged content, but the generation it was recorded against is
-        // gone (an out-of-band reclaim of the backup dir): re-create it
-        // rather than let a live source run with no snapshot at all.
-        this.log('warn', 'recorded session backup is missing — re-copying its unchanged source', {
+        this.log('warn', 'recorded session backup is missing or unusable — re-copying its unchanged source', {
           file: source.file,
           backup: join(this.backupDir, previous.backup),
         });

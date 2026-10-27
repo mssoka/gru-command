@@ -637,6 +637,7 @@ describe('SessionStore changed-only backup pass', () => {
     const scan = vi.spyOn(store, 'scanSessionSources');
     const listing = vi.spyOn(store as unknown as { listBackupGenerations(): unknown }, 'listBackupGenerations');
     const stat = vi.spyOn(store as unknown as { statSource(file: string): unknown }, 'statSource');
+    const generationStat = vi.spyOn(store as unknown as { statGeneration(name: string): unknown }, 'statGeneration');
     const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
     // Exactly M copies for M changed sources; the rest are skipped.
     expect(pass.created.length).toBe(2);
@@ -650,10 +651,14 @@ describe('SessionStore changed-only backup pass', () => {
     expect(scan).toHaveBeenCalledTimes(1);
     expect(listing).toHaveBeenCalledTimes(2);
     expect(stat).toHaveBeenCalledTimes(files.length);
+    // The recorded generation of each SKIPPED source is stat'ed once (an
+    // unusable snapshot is repaired); changed sources are not.
+    expect(generationStat).toHaveBeenCalledTimes(4);
     walk.mockRestore();
     scan.mockRestore();
     listing.mockRestore();
     stat.mockRestore();
+    generationStat.mockRestore();
   });
 
   it('re-creates only the missing recorded generation, not the whole backup set', () => {
@@ -687,7 +692,7 @@ describe('SessionStore changed-only backup pass', () => {
     // untouched sibling is skipped, so this is not a cold-start pass.
     expect(pass.created.length).toBe(1);
     expect(pass.skipped).toBe(1);
-    expect(warnings.some((msg) => msg.includes('recorded session backup is missing'))).toBe(true);
+    expect(warnings.some((msg) => msg.includes('recorded session backup is missing or unusable'))).toBe(true);
     expect(existsSync(join(restarted.sessionsDir, 'backups', older))).toBe(true);
     const refreshed = backupNames(restarted).filter((name) => name.includes('gru__') && name.includes('2026-10-01T12'));
     expect(refreshed).toHaveLength(1);
@@ -748,7 +753,7 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     // The directory is not a snapshot: the pass re-copies instead of skipping.
     expect(pass.created.length).toBe(1);
     expect(pass.skipped).toBe(0);
-    expect(warnings.some((msg) => msg.includes('recorded session backup is missing'))).toBe(true);
+    expect(warnings.some((msg) => msg.includes('recorded session backup is missing or unusable'))).toBe(true);
     expect(readFileSync(pass.created[0]!, 'utf-8')).toBe('one\n');
     expect(existsSync(file)).toBe(true);
   });
@@ -778,7 +783,9 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     expect(existsSync(other)).toBe(true);
   });
 
-  it('a failed same-hour refresh leaves the recorded generation intact', () => {
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'a failed same-hour refresh leaves the recorded generation intact',
+    () => {
     const store = new SessionStore(tmpDataDir());
     const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
     const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
@@ -805,7 +812,8 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     // The staging+rename copy must not have truncated the recorded generation.
     expect(readFileSync(recordedPath, 'utf-8')).toBe('one\n');
     expect(existsSync(file)).toBe(true);
-  });
+    },
+  );
 
   it('does not abort a pass when the baseline target cannot be replaced', () => {
     const dataDir = tmpDataDir();
@@ -837,6 +845,60 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     rmSync(baselinePath(store), { recursive: true, force: true });
     expect(restarted.runBackup(new Date('2026-10-01T12:05:00Z')).created.length).toBe(1);
     expect(Object.keys(readBaseline(restarted).sources)).toHaveLength(1);
+  });
+});
+
+describe('SessionStore backup artifact integrity', () => {
+  it('re-copies when the recorded generation is truncated', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+    const recordedPath = join(store.sessionsDir, 'backups', recorded);
+    writeFileSync(recordedPath, '', 'utf-8'); // a present but unusable snapshot
+
+    const warnings: string[] = [];
+    const restarted = new SessionStore(store.dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    const pass = restarted.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(pass.created.length).toBe(1);
+    expect(pass.skipped).toBe(0);
+    expect(warnings.some((msg) => msg.includes('missing or unusable'))).toBe(true);
+    expect(readFileSync(pass.created[0]!, 'utf-8')).toBe('one\n');
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it('sweeps staging files a hard stop left behind', () => {
+    const store = new SessionStore(tmpDataDir());
+    seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const staleBackupStaging = join(store.sessionsDir, 'backups', 'gru__a.jsonl.2026-10-01T10.bak.tmp-999999');
+    const staleBaselineStaging = join(store.sessionsDir, 'backup-baseline.json.tmp-999999');
+    writeFileSync(staleBackupStaging, 'partial', 'utf-8');
+    writeFileSync(staleBaselineStaging, '{"version":1,"sources":{}}', 'utf-8');
+
+    store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    // A crashed copy/baseline write must not accumulate in the backup dir or
+    // the sessions dir.
+    expect(existsSync(staleBackupStaging)).toBe(false);
+    expect(existsSync(staleBaselineStaging)).toBe(false);
+    expect(backupNames(store)).toHaveLength(1);
+  });
+
+  it('a generation stat is taken only for a skipped source', () => {
+    const store = new SessionStore(tmpDataDir());
+    seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    seedSource(store, 'minion', 'b.jsonl', 'two\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+
+    const generationStat = vi.spyOn(store as unknown as { statGeneration(name: string): unknown }, 'statGeneration');
+    const pass = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(pass.skipped).toBe(2);
+    expect(generationStat).toHaveBeenCalledTimes(2);
+    generationStat.mockRestore();
   });
 });
 

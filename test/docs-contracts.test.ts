@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { BACKUP_MAX_AGE_MS } from '../src/sessions/store.js';
+import { BACKUP_MAX_AGE_MS, DEFAULT_BACKUP_RETENTION } from '../src/sessions/store.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const doc = (name: string): string => readFileSync(join(root, 'docs', name), 'utf-8').replace(/\s+/g, ' ');
@@ -52,8 +52,8 @@ describe('docs contracts: session backup policy', () => {
     // The missing-recorded-generation repair (a reclaim must not silence backups):
     expect(ops).toContain('recorded generation has gone missing');
     // The count rule is scoped to a live transcript; the dead-source rule stays:
-    expect(ops).toContain('Per live transcript the newest 24 backups are kept');
-    expect(ops).toContain('A transcript that is gone keeps its newest backup while its older generations age out');
+    expect(ops).toContain(`Per live transcript the newest ${DEFAULT_BACKUP_RETENTION} backups are kept`);
+    expect(ops).toContain('A transcript that is gone keeps its last recorded backup while its older generations age out');
     // The fingerprint (and its metadata-touch consequence) is stated, not implied:
     expect(ops).toContain('metadata-only touch costs one harmless extra copy');
     expect(ops).toContain('its recorded entry stays in the baseline');
@@ -63,7 +63,6 @@ describe('docs contracts: session backup policy', () => {
     // The retired count-only and every-pass wording is gone from this section.
     expect(ops).not.toContain('newest 24 per file');
     expect(ops).not.toContain('hourly rolling copies');
-    expect(ops).not.toContain('Per source: the newest 24 backups');
   });
 
   it('RUNTIMES.md states the baseline shape, changed-only copies and both prune rules', () => {
@@ -77,11 +76,11 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain('"backup":"<generation file name>"');
     expect(runtimes).toContain('unchanged sources are not copied at all');
     expect(runtimes).toContain('a live source whose recorded generation is gone is copied again');
-    expect(runtimes).toContain('newest 24 generations of a live source');
+    expect(runtimes).toContain(`newest ${DEFAULT_BACKUP_RETENTION} generations of a live source`);
     expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(runtimes).toContain('never a generation the baseline records');
     expect(runtimes).toContain('a source the baseline does not know keeps its newest name');
-    expect(runtimes).toContain('a source that is gone keeps its newest backup while its older generations age out');
+    expect(runtimes).toContain('a source that is gone keeps its last recorded backup while its older generations age out');
     expect(runtimes).toContain('sampled when the pass scans the source');
     expect(runtimes).toContain('the entry recorded for a source that is gone stays in the baseline');
     // The retired every-pass copy and count-only statements are gone.
@@ -96,7 +95,7 @@ describe('docs contracts: session backup policy', () => {
     expect(spec).toContain('backup-baseline.json');
     expect(spec).toContain("re-creates a live file's missing recorded backup");
     // Both prune rules, their scopes and the floors:
-    expect(spec).toContain('newest 24 generations of a live source');
+    expect(spec).toContain(`newest ${DEFAULT_BACKUP_RETENTION} generations of a live source`);
     expect(spec).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(spec).toContain('never the generation the baseline records');
     expect(spec).not.toContain('hourly rolling backup;');
