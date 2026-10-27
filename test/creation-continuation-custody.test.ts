@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { DispatchService } from '../src/dispatch/service.js';
 import { JobExecutionStop } from '../src/dispatch/job-stop.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
@@ -31,6 +32,38 @@ function heldFloor() {
 function logSink() {
   const entries: { readonly level: LogLevel; readonly msg: string; readonly fields: Record<string, unknown> }[] = [];
   return { entries, log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => { entries.push({ level, msg, fields: fields ?? {} }); } };
+}
+
+/** Put a synthetic git first on PATH that locks a lane's tree with its own
+ * creation token immediately before delegating `worktree remove` (the
+ * after-proof window), and delegates every other command unchanged. Returns
+ * the PATH to restore. */
+function lockBeforeRemovalGit(): string {
+  const root = directory();
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const script = join(root, 'git');
+  writeFileSync(script, [
+    '#!/usr/bin/env node',
+    'const cp = require("node:child_process"), fs = require("node:fs"), path = require("node:path");',
+    'const args = process.argv.slice(2);',
+    `const real = ${JSON.stringify(realGit)};`,
+    'const run = (a) => cp.spawnSync(real, a, { stdio: "inherit" }).status ?? 1;',
+    'if (args[0] === "worktree" && args[1] === "remove") {',
+    '  const target = args[args.length - 1];',
+    '  try {',
+    '    const gitFile = fs.readFileSync(path.join(target, ".git"), "utf8").trim();',
+    '    const admin = path.resolve(target, gitFile.slice("gitdir: ".length));',
+    '    const receipt = JSON.parse(fs.readFileSync(path.join(admin, "gru-creation-handoff.json"), "utf8"));',
+    '    cp.spawnSync(real, ["worktree", "lock", "--reason", receipt.token, target], { stdio: "ignore" });',
+    '  } catch { /* the real git still answers on its own terms */ }',
+    '  process.exit(run(args));',
+    '}',
+    'process.exit(run(args));',
+  ].join('\n') + '\n');
+  chmodSync(script, 0o755);
+  const originalPath = process.env.PATH ?? '';
+  vi.stubEnv('PATH', `${root}:${originalPath}`);
+  return originalPath;
 }
 
 /** Every event payload and the note of one job, as text. */
@@ -594,9 +627,10 @@ describe('retained-creation continuation custody', () => {
     })).not.toMatch(/gru-creation:[0-9a-f]{8}-/u);
   });
 
-  it('redacts the token a locked-tree removal echoes through the disk-budget release', async () => {
+  it('redacts the token an external lock makes the disk-budget removal echo', async () => {
     // The disk-budget release removes off the event loop (runGitAsync) with a
-    // single --force; git then refuses a locked tree and echoes its lock
+    // single --force. An actor that locks the lane after the release's custody
+    // proof but before git's own removal makes git refuse and echo the lock
     // reason — the creation token — into the release failure and its record.
     const sink = logSink();
     const h = managerFixture('locked-release-redaction', { log: sink.log });
@@ -605,22 +639,29 @@ describe('retained-creation continuation custody', () => {
     h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
     h.ledger.setJobStatus(jobId, 'working');
     const record = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId });
-    const token = `gru-creation:${randomUUID()}`;
-    git(h.repo, ['worktree', 'lock', '--reason', token, record.path]);
-    const thrown = await h.worktrees.release({ worktreeId: jobId, requireReleaseProofs: true, onLiveProcess: 'refuse', diskBudget: true })
-      .then(() => null, (failure: unknown) => failure);
-    // The async removal ran and its refusal was recorded, not silently dropped.
-    expect(thrown).toBeInstanceOf(Error);
-    const aborted = h.ledger.listJobEventsByKinds(jobId, ['worktree.release-aborted']);
-    expect(aborted).toHaveLength(1);
-    const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
-    expect(detail).toContain('cannot remove a locked working tree');
-    expect(detail).toContain('<redacted-creation-token>');
-    expect(detail).not.toContain(token);
-    const error = thrown as Error;
-    expect(error.message).not.toContain(token);
-    expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
-    expect(sink.entries.some((entry) => entry.msg === 'release aborted after its records; the tree is retained and a retry reuses what was saved')).toBe(true);
+    // The lane's own custody token, read from its completed handoff receipt.
+    const gitFile = readFileSync(join(record.path, '.git'), 'utf8').trim();
+    const admin = resolve(record.path, gitFile.slice('gitdir: '.length));
+    const token = (JSON.parse(readFileSync(join(admin, 'gru-creation-handoff.json'), 'utf8')) as { readonly token: string }).token;
+    expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+    const restore = lockBeforeRemovalGit();
+    try {
+      const thrown = await h.worktrees.release({ worktreeId: jobId, requireReleaseProofs: true, onLiveProcess: 'refuse', diskBudget: true })
+        .then(() => null, (failure: unknown) => failure);
+      // The async removal ran and its refusal was recorded, not silently dropped.
+      const aborted = h.ledger.listJobEventsByKinds(jobId, ['worktree.release-aborted']);
+      expect(aborted, `release rejected with: ${thrown instanceof Error ? thrown.message : String(thrown)}`).toHaveLength(1);
+      const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
+      expect(detail).toContain('cannot remove a locked working tree');
+      expect(detail).toContain('<redacted-creation-token>');
+      expect(detail).not.toContain(token);
+      const error = thrown as Error;
+      expect(error.message).not.toContain(token);
+      expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
+      expect(sink.entries.some((entry) => entry.msg === 'release aborted after its records; the tree is retained and a retry reuses what was saved')).toBe(true);
+    } finally {
+      vi.stubEnv('PATH', restore);
+    }
   });
 
   it('redacts the token a failing setup command prints from the lane registry', async () => {
