@@ -1336,7 +1336,8 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
     expect(groupHasLiveMember(0, 1_000)).toBe(false);
     expect(groupHasLiveMember(-1, 1_000)).toBe(false);
-    // ps listings: zombies alone are not executing; an unreadable line is unknown, so executing.
+    // ps listings: zombies alone are not executing; a line whose pid or group cannot be
+    // read is unknown, so executing (a foreign row's state is judged only when its group is ours — #511).
     expect(executingMember(psGroupMembers('  10    10 S\n  11    10 Z+\n  12    99 R\n', 10))).toBe(true);
     expect(executingMember(psGroupMembers('  11    10 Z\n  12    99 R\n', 10))).toBe(false);
     expect(psGroupMembers('  11    10 Z\ngarbage\n', 10)).toBeNull();
@@ -1425,7 +1426,10 @@ describe('Perkins admission preflight (gh-169)', () => {
     // spacing and flags — with the unrelated `?E` row added.
     const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8' });
     expect(listed.status).toBe(0);
-    const rows = listed.stdout.split('\n').filter((line) => line.trim() !== '');
+    // Only rows the parser accepts can enter the comparison: a line whose pid
+    // or group cannot be read voids the whole table by design (unknown, so
+    // live — pinned below), and no host can be asked to be perfectly formed.
+    const rows = listed.stdout.split('\n').filter((line) => /^\s*\d+\s+\d+\s+\S+\s*$/u.test(line));
     expect(rows.length).toBeGreaterThan(0);
     const table = `${rows.join('\n')}\n  41001 ${absent} Z\n  41002 ${absent} Z+\n  29833  86745 ?E\n`;
     expect(executingMember(psGroupMembers(table, absent))).toBe(false);
@@ -1447,8 +1451,10 @@ describe('Perkins admission preflight (gh-169)', () => {
     // the same call are pinned side by side: a listing that COMPLETES has no
     // rows for our group and answers stopped, while the same call on a budget
     // no listing can meet (production floors a zero budget to 1 ms) answers
-    // live. Only the failed-run branch can produce that pair, so this case
-    // proves which branch ran rather than passing through a live member.
+    // live. The branch itself is pinned BY CONSTRUCTION in
+    // perkins-group-liveness-ps.test.ts, which stubs the listing; this case
+    // keeps the real reader in the loop (a full listing takes ~14 ms here, so
+    // the 1 ms floor cannot complete).
     const realPlatform = OWNED_GIT_SEAMS.platform;
     const existence = vi.spyOn(process, 'kill').mockReturnValue(true);
     try {
@@ -1464,6 +1470,11 @@ describe('Perkins admission preflight (gh-169)', () => {
     // 4. A successful listing with no rows for our group is stopped, unchanged.
     expect(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent)).toEqual([]);
     expect(executingMember(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent))).toBe(false);
+    // 5. A line whose pid or group cannot be read is still unknown, so live:
+    //    that row cannot be proven foreign, so the table stays unreliable —
+    //    the residual #511 shape (no host `ps` observed prints one), pinned
+    //    rather than assumed away.
+    expect(executingMember(psGroupMembers(`  1x1  86745 S\n  41001 ${absent} Z\n`, absent))).toBe(true);
   });
 
   it('a /proc listing or read that never settles is bounded by the remaining budget — unknown, so live (#360 R5-E6)', async () => {

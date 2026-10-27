@@ -302,6 +302,7 @@ const PINS: Record<string, number> = {
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-findings-dedupe.test.ts': 11,
   'perkins-freeze-freshhead.test.ts': 25,
+  'perkins-group-liveness-ps.test.ts': 3,
   'perkins-integration-recovery.test.ts': 14,
   'perkins-integration-review.test.ts': 15,
   'perkins-lead-schema-compat.test.ts': 6,
