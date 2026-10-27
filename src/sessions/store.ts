@@ -1,6 +1,7 @@
 import {
   closeSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -700,7 +701,7 @@ export class SessionStore {
       });
     }
     const sources = this.scanSessionSources();
-    const live = new Set(sources.map((source) => source.backupKey));
+    const liveFiles = new Map(sources.map((source) => [source.backupKey, source.file]));
     // One listing taken BEFORE the copies: the skip decision needs to know
     // whether the recorded generation is still there. (The prune takes its
     // own fresh listing afterwards, so the count rule still sees the copies
@@ -781,7 +782,6 @@ export class SessionStore {
       return { created: [], pruned: [], skipped };
     }
     const created: string[] = [];
-    const failedPrevious: string[] = [];
     for (const copy of copies) {
       // Copy to a staging name and rename into the slot: a failed copy (disk
       // full, source gone mid-copy) must never truncate the generation this
@@ -803,7 +803,13 @@ export class SessionStore {
         // this pass, so a failed copy never costs the source its last good
         // snapshot.
         const previous = baseline[copy.source.key];
-        if (previous !== undefined) failedPrevious.push(previous.backup);
+        if (previous !== undefined) {
+          // Publish the last generation that actually exists, not the
+          // intended-but-absent one: the record must never name a file the
+          // source does not have, and the old fingerprint makes the next
+          // pass retry.
+          next[copy.source.key] = previous;
+        }
         this.log('warn', 'session backup copy failed', { file: copy.source.file, error: String(error) });
       }
     }
@@ -818,18 +824,16 @@ export class SessionStore {
         error: String(error),
       });
     }
-    // Every generation the baseline records — this pass's intended copies,
-    // an unchanged source's recorded copy, and the previous generation of a
+    // Every generation the baseline records — this pass's landed copies, an
+    // unchanged source's recorded copy, and the previous generation of a
     // source whose copy failed — is protected from this pass's prune, so the
-    // baseline never names a file the pass deleted.
-    const recordedGenerations = new Set([
-      ...Object.values(next).map((entry) => entry.backup),
-      ...failedPrevious,
-    ]);
+    // baseline never names a file the pass deleted and a failed copy never
+    // costs the source its last good snapshot.
+    const recordedGenerations = new Set(Object.values(next).map((entry) => entry.backup));
     // A fresh flat listing for the prune, taken AFTER the copies so the count
     // rule sees the generations this pass added.
     const presentAfter = this.listBackupGenerations();
-    const pruned = this.pruneBackups(live, recordedGenerations, presentAfter, now);
+    const pruned = this.pruneBackups(liveFiles, recordedGenerations, presentAfter, now);
     try {
       this.publishBaseline();
     } catch (error) {
@@ -889,7 +893,7 @@ export class SessionStore {
    *   must not delete the very copy the baseline points at.
    */
   private pruneBackups(
-    liveSources: ReadonlySet<string>,
+    liveSources: ReadonlyMap<string, string>,
     recordedGenerations: ReadonlySet<string>,
     present: ReadonlySet<string>,
     now: Date,
@@ -910,7 +914,11 @@ export class SessionStore {
       names.sort(); // ISO-hour stamps sort chronologically
       const newest = names[names.length - 1]!;
       const doomed = new Set<string>();
-      if (liveSources.has(source)) {
+      const liveFile = liveSources.get(source);
+      // Count rule for a live source — but re-test that the source is still
+      // there: a transcript deleted after the scan must not be count-pruned
+      // as if it were live.
+      if (liveFile !== undefined && existsSync(liveFile)) {
         for (const name of names.slice(0, Math.max(0, names.length - this.retention))) doomed.add(name);
       }
       for (const name of names) {

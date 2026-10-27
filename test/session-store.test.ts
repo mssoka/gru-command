@@ -820,6 +820,24 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
     },
   );
 
+  it('a failed copy into a new slot keeps the previous recorded entry', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+    appendFileSync(file, 'two\n', 'utf-8');
+    // An obstruction on the NEW slot makes the copy fail.
+    mkdirSync(join(store.sessionsDir, 'backups', `${relativeKey(store, file)}.2026-10-01T11.bak`));
+
+    const failed = store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(failed.created).toEqual([]);
+    // The record still names the generation that exists (not the intended,
+    // absent one), so a restore keyed on the baseline works.
+    const entry = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!;
+    expect(entry.backup).toBe(recorded);
+    expect(existsSync(first.created[0]!)).toBe(true);
+  });
+
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
     'a failed same-slot refresh of a shrunk source retries instead of keeping stale bytes',
     () => {
@@ -1013,6 +1031,39 @@ describe('SessionStore backup artifact integrity', () => {
     expect(pass.skipped).toBe(2);
     expect(generationStat).toHaveBeenCalledTimes(2);
     generationStat.mockRestore();
+  });
+});
+
+describe('SessionStore prune liveness', () => {
+  it('does not count-prune a source deleted during the pass', () => {
+    const store = new SessionStore(tmpDataDir(), { retention: 2 });
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(file, 'two\n', 'utf-8');
+    store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    appendFileSync(file, 'three\n', 'utf-8');
+    store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    expect(backupNames(store)).toHaveLength(3);
+
+    // Delete the live file WHILE the pass runs (inside the recorded-generation
+    // stat): the prune must see a gone source, not the scan-time liveness.
+    const stat = vi.spyOn(store as unknown as { statGeneration(name: string): unknown }, 'statGeneration');
+    const real = stat.getMockImplementation();
+    let removed = false;
+    stat.mockImplementation((name: string) => {
+      const result = (real === undefined ? undefined : real(name)) as number | null;
+      if (!removed) {
+        rmSync(file);
+        removed = true;
+      }
+      return result;
+    });
+    const pass = store.runBackup(new Date('2026-10-01T13:05:00Z'));
+    stat.mockRestore();
+    expect(removed).toBe(true);
+    // A dead source keeps its recent generations: the count rule must not run.
+    expect(pass.pruned).toEqual([]);
+    expect(backupNames(store)).toHaveLength(3);
   });
 });
 
