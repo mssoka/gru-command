@@ -493,9 +493,9 @@ export class SessionStore {
     // the pass's start-of-pass view, not a post-copy re-stat (Required 3 in
     // the approved intent forbids a second stat walk here). A hard stop
     // during the pass can therefore make the next boot's growth report
-    // include bytes written while the service was up — the same class of
-    // window the pre-existing post-snapshot writes already had. Do not
-    // "fix" this back into a second walk.
+    // include bytes written (or a file removed) while the service was up —
+    // the same class of window the pre-existing post-snapshot writes already
+    // had. Do not "fix" this back into a second walk.
   }
 
   /** Bare size map at `sessions/store-state.json` (shape pinned by tests). */
@@ -620,7 +620,14 @@ export class SessionStore {
     // own fresh listing afterwards, so the count rule still sees the copies
     // this pass adds.)
     const presentBefore = this.listBackupGenerations();
+    const scanned = new Set(sources.map((source) => source.key));
     const next: Record<string, BackupBaselineEntry> = {};
+    // A source that is gone (or could not be inspected) keeps its recorded
+    // entry: it names that source's last copy, which the prune must keep even
+    // when a backwards clock makes an older generation sort later.
+    for (const [key, entry] of Object.entries(baseline)) {
+      if (!scanned.has(key)) next[key] = entry;
+    }
     const created: string[] = [];
     let skipped = 0;
     for (const source of sources) {
@@ -656,7 +663,10 @@ export class SessionStore {
           backup: name,
         };
       } catch (error) {
-        // Never recorded: the next pass retries this source.
+        // The previous recorded generation stays protected (its older
+        // fingerprint can never skip a changed source), and the next pass
+        // retries this one.
+        if (previous !== undefined) next[source.key] = previous;
         this.log('warn', 'session backup copy failed', { file: source.file, error: String(error) });
       }
     }
@@ -707,10 +717,10 @@ export class SessionStore {
    *   and a source that is gone keeps its newest backup while its older
    *   generations age out (up to a week of hourly generations).
    * - **Recorded generations** (the entry the baseline names, whether it was
-   *   copied this pass or an unchanged source's recorded copy) are never
-   *   pruned either: after a backwards clock step a fresh slot sorts before
-   *   the older names, and the count rule must not delete the very copy the
-   *   baseline points at.
+   *   copied this pass, an unchanged source's recorded copy, or the last copy
+   *   of a source that is gone) are never pruned either: after a backwards
+   *   clock step a fresh slot sorts before the older names, and the count rule
+   *   must not delete the very copy the baseline points at.
    */
   private pruneBackups(liveSources: ReadonlySet<string>, recordedGenerations: ReadonlySet<string>, now: Date): string[] {
     if (!existsSync(this.backupDir)) return [];

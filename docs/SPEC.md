@@ -47,7 +47,8 @@ integrated. Other users can install it on their laptops from GitHub.
 12. **Session forensics preserved:** sessions persist as append-only
     jsonl in standard pi session-dir patterns (path declared via
     /health), flock'd, hourly rolling backup that copies only files whose
-    content changed since their last recorded copy (baseline in
+    size/mtime/ctime fingerprint changed since their last recorded copy
+    (baseline in
     sessions/backup-baseline.json) and re-creates a missing recorded
     backup; per source it keeps the newest 24 generations of a live source
     and prunes generations whose ISO hour ended more than 7 days ago, never

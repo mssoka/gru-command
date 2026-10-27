@@ -436,7 +436,8 @@ describe('SessionStore', () => {
   });
 });
 
-describe('Perkins r1 regressions', () => {  it('W9: a second pass in the same ISO hour refreshes the slot (freshest wins)', () => {
+describe('Perkins r1 regressions', () => {
+  it('W9: a second pass in the same ISO hour refreshes the slot (freshest wins)', () => {
     const dataDir = tmpDataDir();
     const store = new SessionStore(dataDir, { retention: 5 });
     const file = seedSession(store, 'gru', 'early\n');
@@ -804,8 +805,30 @@ describe('SessionStore backup prune safety', () => {
     expect(pass.created).toEqual([]);
     expect(pass.pruned).toHaveLength(2);
     expect(backupNames(store)).toEqual([third.created[0]!.split('/').pop()!]);
-    // Its baseline entry is dropped rather than left stale.
-    expect(Object.keys(readBaseline(store).sources)).toEqual([]);
+    // Its recorded entry stays, naming the backup that is its last snapshot.
+    const entries = Object.entries(readBaseline(store).sources);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]![1].backup).toBe(third.created[0]!.split('/').pop()!);
+  });
+
+  it('a dead source keeps the copy it actually wrote last, even when the clock steps back', () => {
+    const store = new SessionStore(tmpDataDir(), { backupMaxAgeMs: 7 * DAY_MS });
+    const file = seedSource(store, 'gru', 'gone.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z')); // generation stamped 10-01T10
+    appendFileSync(file, 'two\n', 'utf-8');
+    store.runBackup(new Date('2026-10-03T10:05:00Z')); // newer name, older content
+    appendFileSync(file, 'three\n', 'utf-8');
+    const last = store.runBackup(new Date('2026-10-02T10:05:00Z')); // clock stepped back: the ACTUAL last copy
+    expect(last.created.length).toBe(1);
+    expect(existsSync(file)).toBe(true);
+    rmSync(file); // now the source is gone
+
+    // Every generation is over-age; the name-newest (10-03) holds stale
+    // content, so only the recorded generation carries the last copy.
+    const pruned = store.runBackup(new Date('2026-10-20T10:05:00Z'));
+    expect(pruned.created).toEqual([]);
+    expect(existsSync(last.created[0]!)).toBe(true);
+    expect(readFileSync(last.created[0]!, 'utf-8')).toBe('one\ntwo\nthree\n');
   });
 
   it('a dead source keeps its recent generations: age bounds it, not the count rule', () => {
@@ -917,6 +940,39 @@ describe('SessionStore backup pass failure handling', () => {
     const retried = store.runBackup(new Date('2026-10-01T12:05:00Z'));
     expect(retried.created.length).toBe(1);
     expect(Object.keys(readBaseline(store).sources)).toHaveLength(1);
+  });
+
+  it('keeps the previous recorded generation when a copy fails', () => {
+    const store = new SessionStore(tmpDataDir(), { retention: 1 });
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    const first = store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const recorded = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+    expect(backupNames(store)).toContain(recorded);
+
+    appendFileSync(file, 'two\n', 'utf-8');
+    const destName = `${relativeKey(store, file)}.2026-10-01T11.bak`;
+    mkdirSync(join(store.sessionsDir, 'backups', destName));
+    const warnings: string[] = [];
+    const logging = new SessionStore(store.dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(failed.created).toEqual([]);
+    expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+    // The last good snapshot is still the recorded one and survives the prune.
+    expect(readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup).toBe(recorded);
+    expect(existsSync(first.created[0]!)).toBe(true);
+
+    rmSync(join(store.sessionsDir, 'backups', destName), { recursive: true, force: true });
+    expect(store.runBackup(new Date('2026-10-01T12:05:00Z')).created.length).toBe(1);
+  });
+
+  it('rejects an invalid backupMaxAgeMs instead of silently changing the policy', () => {
+    expect(() => new SessionStore(tmpDataDir(), { backupMaxAgeMs: -1 })).toThrow(/backupMaxAgeMs/);
+    expect(() => new SessionStore(tmpDataDir(), { backupMaxAgeMs: Number.NaN })).toThrow(/backupMaxAgeMs/);
+    expect(() => new SessionStore(tmpDataDir(), { backupMaxAgeMs: 1.5 })).toThrow(/backupMaxAgeMs/);
   });
 
   it('warns when a live source cannot be inspected, and stays quiet for one that vanished', () => {

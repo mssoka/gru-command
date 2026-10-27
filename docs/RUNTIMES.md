@@ -456,8 +456,10 @@ prompt/tool content, so nothing but the owner should traverse it.
   last recorded backup into `<data_dir>/sessions/backups/` with an
   ISO-hour suffix; unchanged sources are not copied at all. Change is
   detected from the source's size and mtime plus its ctime (a write
-  cannot restore the ctime), so a same-size rewrite still reads as
-  changed while a metadata-only touch costs one harmless extra copy. The
+  cannot restore the ctime), sampled when the pass scans the source, so a
+  same-size rewrite still reads as changed while a metadata-only touch
+  costs one harmless extra copy; a generation can therefore hold slightly
+  newer bytes than its recorded fingerprint (the next pass copies again). The
   change baseline is the separate file
   `<data_dir>/sessions/backup-baseline.json`
   (`{"version":1,"sources":{"<sessions-relative path>":{"size":N,"mtimeMs":M,"ctimeMs":C,"backup":"<generation file name>"}}}`),
@@ -470,16 +472,17 @@ prompt/tool content, so nothing but the owner should traverse it.
   never deleted, and a source that is gone keeps its newest backup while its
   older generations age out (the count rule does not apply to a source that
   can no longer produce generations, so it can hold up to a week of hourly
-  generations). The slot IS
+  generations); the entry recorded for a source that is gone stays in the
+  baseline, so its last snapshot is the one the pass protects. The slot IS
   the ISO hour: a second pass in the same hour refreshes that slot
   (freshest in-slot state wins). Backups copy live files, so a trailing
   line may be partial — recovery tooling must tolerate a torn tail.
 - **Change detection on boot** (the emergency-console contract): the store
   snapshots session-file sizes at graceful shutdown and after each backup
-  pass. On boot it re-scans; any file that grew OR shrank while the
-  service was down is reported via `/health`, and a file that VANISHED is
-  reported with kind `deleted` (a console delete must never pass
-  silently).
+  pass (the pass's snapshot carries that pass's scan sizes). On boot it
+  re-scans; any file that grew OR shrank since the last snapshot is reported
+  via `/health`, and a file that VANISHED is reported with kind `deleted` (a
+  console delete must never pass silently).
   (`liveness.signals.session_growth`) and a `warn` log line naming the
   file, the kind of change, and the byte delta. A missing snapshot means
   a first-ever boot; a corrupt snapshot is reported as `corrupt`

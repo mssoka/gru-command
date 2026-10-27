@@ -54,6 +54,9 @@ describe('docs contracts: session backup policy', () => {
     // The count rule is scoped to a live transcript; the dead-source rule stays:
     expect(ops).toContain('Per live transcript the newest 24 backups are kept');
     expect(ops).toContain('A transcript that is gone keeps its newest backup while its older generations age out');
+    // The fingerprint (and its metadata-touch consequence) is stated, not implied:
+    expect(ops).toContain('metadata-only touch costs one harmless extra copy');
+    expect(ops).toContain('its recorded entry stays in the baseline');
     // The chosen maximum age, derived from the code's default:
     expect(ops).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(ops).toContain('never the newest one');
@@ -79,6 +82,8 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain("never a source's newest generation");
     expect(runtimes).toContain('a source that is gone keeps its newest backup while its older generations age out');
     expect(runtimes).toContain('never a generation the baseline records');
+    expect(runtimes).toContain('sampled when the pass scans the source');
+    expect(runtimes).toContain('the entry recorded for a source that is gone stays in the baseline');
     // The retired every-pass copy and count-only statements are gone.
     expect(runtimes).not.toContain('tracked session files are copied hourly');
     expect(runtimes).not.toContain('the newest 24 backups are retained');
@@ -87,6 +92,7 @@ describe('docs contracts: session backup policy', () => {
   it('SPEC.md ruling 12 states changed-only copying, the repair and both prune rules', () => {
     const spec = section(doc('SPEC.md'), '12. **Session forensics preserved:**', '13. **Escalations');
     expect(spec).toContain('copies only');
+    expect(spec).toContain('size/mtime/ctime fingerprint');
     expect(spec).toContain('backup-baseline.json');
     expect(spec).toContain('re-creates a missing recorded backup');
     // Both prune rules, their scopes and the floors:
