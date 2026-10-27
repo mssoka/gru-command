@@ -50,7 +50,7 @@ describe('docs contracts: session backup policy', () => {
     expect(ops).toContain('copies only');
     expect(ops).toContain('backup-baseline.json');
     // The missing-recorded-generation repair (a reclaim must not silence backups):
-    expect(ops).toContain('recorded generation is missing, damaged or truncated');
+    expect(ops).toContain('recorded generation is missing, unreadable or truncated');
     // The count rule is scoped to a live transcript; the dead-source rule stays:
     expect(ops).toContain(`Per live transcript the newest ${DEFAULT_BACKUP_RETENTION} backups are kept`);
     expect(ops).toContain('A transcript that is gone keeps its last recorded backup while its older generations age out');
@@ -76,7 +76,7 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain('"backup":"<generation file name>"');
     expect(runtimes).toContain('unchanged sources are not copied at all');
     expect(runtimes).toContain('backup-baseline.json.pending');
-    expect(runtimes).toContain('a live source whose recorded generation is missing, damaged or truncated is copied again');
+    expect(runtimes).toContain('a live source whose recorded generation is missing, unreadable or truncated is copied again');
     expect(runtimes).toContain(`newest ${DEFAULT_BACKUP_RETENTION} generations of a live source`);
     expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(runtimes).toContain('never the newest generation and never a generation the baseline records');
@@ -94,7 +94,7 @@ describe('docs contracts: session backup policy', () => {
     expect(spec).toContain('copies only');
     expect(spec).toContain('size/mtime/ctime fingerprint');
     expect(spec).toContain('backup-baseline.json');
-    expect(spec).toContain("re-creates a live file's missing or damaged recorded backup");
+    expect(spec).toContain("re-creates a live file's missing or unusable recorded backup");
     // Both prune rules, their scopes and the floors:
     expect(spec).toContain(`newest ${DEFAULT_BACKUP_RETENTION} generations of a live source`);
     expect(spec).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);

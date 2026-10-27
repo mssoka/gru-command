@@ -50,7 +50,7 @@ integrated. Other users can install it on their laptops from GitHub.
     size/mtime/ctime fingerprint changed since their last recorded copy
     (baseline in
     sessions/backup-baseline.json) and re-creates a live file's missing or
-    damaged recorded backup; per source it keeps the newest 24 generations of a live source
+    unusable recorded backup; per source it keeps the newest 24 generations of a live source
     and prunes generations whose ISO hour ended more than 7 days ago, never
     the newest generation nor the one the baseline records; the pi CLI (or
     claude CLI) is the documented emergency console — stop service, open

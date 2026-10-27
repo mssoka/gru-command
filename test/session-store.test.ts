@@ -1048,8 +1048,11 @@ describe('SessionStore prune liveness', () => {
     // source (a dead source keeps its recent generations) rather than the
     // scan-time liveness.
     appendFileSync(file, 'three\n', 'utf-8');
+    // Capture the REAL bound method before spying: `getMockImplementation()`
+    // is undefined for a fresh spy, so relying on it would replace the
+    // listing with an empty set and make this pin vacuous.
+    const realListing = (store as unknown as { listBackupGenerations(): ReadonlySet<string> }).listBackupGenerations.bind(store);
     const listing = vi.spyOn(store as unknown as { listBackupGenerations(): unknown }, 'listBackupGenerations');
-    const real = listing.getMockImplementation();
     let calls = 0;
     let removed = false;
     listing.mockImplementation(() => {
@@ -1058,7 +1061,7 @@ describe('SessionStore prune liveness', () => {
         rmSync(file);
         removed = true;
       }
-      return real === undefined ? new Set<string>() : real();
+      return realListing();
     });
     const pass = store.runBackup(new Date('2026-10-01T12:05:00Z'));
     listing.mockRestore();

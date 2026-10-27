@@ -469,7 +469,7 @@ prompt/tool content, so nothing but the owner should traverse it.
   writes nothing; a record that cannot be published is preferred by the next
   pass, so a copy's identity is never lost). A missing or corrupt baseline
   copies each source once and rewrites it, and a live source whose recorded
-  generation is missing, damaged or truncated is copied again. Pruning keeps the newest
+  generation is missing, unreadable or truncated is copied again. Pruning keeps the newest
   24 generations of a live source and deletes generations whose ISO hour
   ended more than 7 days ago, but never the newest generation and never a
   generation the baseline records — they can differ after a clock step or a
