@@ -340,10 +340,10 @@ async function inTime<T>(read: Promise<T>, remaining: (() => number) | undefined
  * when OUR membership cannot be established (R8-3). A line whose pid or
  * group does not parse leaves the table unreliable, and so does a member of
  * ours whose state does not: unknown is live. A row whose pid and group both
- * parse and whose group is NOT ours says nothing about our group in ANY
- * state — `ps` prints `?` for a process it cannot fully stat, and one such
- * foreign row must never void the table (and with it a stopped group) as it
- * did in #511. */
+ * parse and whose group is NOT ours says nothing about our group, whatever
+ * state `ps` printed for it — `ps` prints `?` for a process it cannot fully
+ * stat, and one such foreign row must never void the table (and with it a
+ * stopped group) as it did in #511. */
 export function psGroupMembers(stdout: string, pgid: number): GroupMember[] | null {
   const members: GroupMember[] = [];
   for (const line of stdout.split('\n')) {
