@@ -76,7 +76,7 @@ describe('docs contracts: session backup policy', () => {
     expect(runtimes).toContain('"ctimeMs":C');
     expect(runtimes).toContain('"backup":"<generation file name>"');
     expect(runtimes).toContain('unchanged sources are not copied at all');
-    expect(runtimes).toContain('a source whose recorded generation is gone is copied again');
+    expect(runtimes).toContain('a live source whose recorded generation is gone is copied again');
     expect(runtimes).toContain('newest 24 generations of a live source');
     expect(runtimes).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);
     expect(runtimes).toContain("never a source's newest generation");
@@ -94,7 +94,7 @@ describe('docs contracts: session backup policy', () => {
     expect(spec).toContain('copies only');
     expect(spec).toContain('size/mtime/ctime fingerprint');
     expect(spec).toContain('backup-baseline.json');
-    expect(spec).toContain('re-creates a missing recorded backup');
+    expect(spec).toContain("re-creates a live file's missing recorded backup");
     // Both prune rules, their scopes and the floors:
     expect(spec).toContain('newest 24 generations of a live source');
     expect(spec).toContain(`ISO hour ended more than ${MAX_AGE_DAYS} days ago`);

@@ -464,7 +464,7 @@ prompt/tool content, so nothing but the owner should traverse it.
   `<data_dir>/sessions/backup-baseline.json`
   (`{"version":1,"sources":{"<sessions-relative path>":{"size":N,"mtimeMs":M,"ctimeMs":C,"backup":"<generation file name>"}}}`),
   so a restart copies nothing for unchanged sources; a missing or corrupt
-  baseline copies each source once and rewrites it, and a source whose
+  baseline copies each source once and rewrites it, and a live source whose
   recorded generation is gone is copied again. Pruning keeps the newest
   24 generations of a live source and deletes generations whose ISO hour
   ended more than 7 days ago, but never a source's newest generation and

@@ -49,8 +49,8 @@ integrated. Other users can install it on their laptops from GitHub.
     /health), flock'd, hourly rolling backup that copies only files whose
     size/mtime/ctime fingerprint changed since their last recorded copy
     (baseline in
-    sessions/backup-baseline.json) and re-creates a missing recorded
-    backup; per source it keeps the newest 24 generations of a live source
+    sessions/backup-baseline.json) and re-creates a live file's missing
+    recorded backup; per source it keeps the newest 24 generations of a live source
     and prunes generations whose ISO hour ended more than 7 days ago, never
     the newest generation nor one the baseline records; the pi CLI (or
     claude CLI) is the documented emergency console — stop service, open

@@ -65,7 +65,9 @@ export interface GrowthFinding {
 }
 
 export interface GrowthReport {
-  /** Files that changed (grew or shrank) while the service was down. */
+  /** Files that changed since the last persisted snapshot — normally while
+   * the service was down; a hard stop during a pass can also cover bytes
+   * written just before it. */
   readonly findings: readonly GrowthFinding[];
   /** ok = baseline read; missing = first boot ever; corrupt = baseline unreadable (degraded — findings are against an empty baseline). */
   readonly snapshotState: 'ok' | 'missing' | 'corrupt';
@@ -180,6 +182,9 @@ export class SessionStore {
       throw new Error(
         `session store backupMaxAgeMs must be a non-negative safe integer of milliseconds (got ${String(opts.backupMaxAgeMs)})`,
       );
+    }
+    if (opts.retention !== undefined && (!Number.isSafeInteger(opts.retention) || opts.retention < 0)) {
+      throw new Error(`session store retention must be a non-negative safe integer (got ${String(opts.retention)})`);
     }
     this.sessionsDir = join(dataDir, 'sessions');
     this.backupDir = join(this.sessionsDir, 'backups');
@@ -408,9 +413,10 @@ export class SessionStore {
   /**
    * Boot-time change detection (SPEC ruling 12): compare current session
    * file sizes against the persisted snapshot. Growth means the file was
-   * written while the service was down (emergency console) or by any
-   * other process; a SHRINK means the console truncated or rewrote it.
-   * New files count as growth from zero.
+   * written since the last snapshot — normally while the service was down
+   * (emergency console), but a hard stop during a pass also covers writes
+   * just before it — or by any other process; a SHRINK means the console
+   * truncated or rewrote it. New files count as growth from zero.
    */
   detectGrowth(): GrowthReport {
     const { snapshot: previous, state: snapshotState } = this.readSnapshot();
@@ -591,7 +597,19 @@ export class SessionStore {
 
   /** One flat listing of the backup dir — never a tree walk. */
   private listBackupGenerations(): ReadonlySet<string> {
-    return new Set(readdirSync(this.backupDir));
+    try {
+      return new Set(readdirSync(this.backupDir));
+    } catch (error) {
+      // The directory can vanish between mkdirSync and here (an out-of-band
+      // reclaim racing the scan). Treat it as empty so the pass takes the
+      // recorded-generation repair path: the boot pass is NOT guarded, and a
+      // throw here would refuse service startup.
+      this.log('warn', 'session backup directory could not be listed — treating recorded generations as missing', {
+        backupDir: this.backupDir,
+        error: String(error),
+      });
+      return new Set();
+    }
   }
 
   /**
@@ -677,7 +695,7 @@ export class SessionStore {
     const pruned = this.pruneBackups(live, recordedGenerations, now);
     this.persistSnapshotFromSources(sources);
     this.writeBackupBaseline(next);
-    if (created.length > 0 || pruned.length > 0) {
+    if (created.length > 0 || pruned.length > 0 || skipped > 0) {
       this.log('info', 'session backup pass', {
         created: created.length,
         pruned: pruned.length,
@@ -748,7 +766,12 @@ export class SessionStore {
         // hour ended MORE than the maximum age ago.
         if (this.backupStampMs(name) + BACKUP_SLOT_MS < cutoff) doomed.add(name);
       }
-      doomed.delete(newest); // the floor: a source's last snapshot always survives
+      // Floor: a source's last snapshot always survives. The baseline's
+      // recorded generation IS that snapshot (a backwards clock can make it
+      // sort before a stale, later-named generation); a source the baseline
+      // does not know falls back to its newest name.
+      const recordedLast = [...names].reverse().find((name) => recordedGenerations.has(name));
+      doomed.delete(recordedLast ?? newest);
       for (const name of recordedGenerations) doomed.delete(name); // never prune a recorded copy
       for (const name of names) {
         if (!doomed.has(name)) continue;

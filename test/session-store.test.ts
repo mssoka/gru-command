@@ -825,11 +825,13 @@ describe('SessionStore backup prune safety', () => {
     rmSync(file); // now the source is gone
 
     // Every generation is over-age; the name-newest (10-03) holds stale
-    // content, so only the recorded generation carries the last copy.
+    // content, so the recorded generation is the one that must survive — and
+    // the stale over-age name-newest is pruned with the rest.
     const pruned = store.runBackup(new Date('2026-10-20T10:05:00Z'));
     expect(pruned.created).toEqual([]);
     expect(existsSync(last.created[0]!)).toBe(true);
     expect(readFileSync(last.created[0]!, 'utf-8')).toBe('one\ntwo\nthree\n');
+    expect(backupNames(store)).toEqual([last.created[0]!.split('/').pop()!]);
   });
 
   it('a dead source keeps its recent generations: age bounds it, not the count rule', () => {
@@ -970,11 +972,62 @@ describe('SessionStore backup pass failure handling', () => {
     expect(store.runBackup(new Date('2026-10-01T12:05:00Z')).created.length).toBe(1);
   });
 
-  it('rejects an invalid backupMaxAgeMs instead of silently changing the policy', () => {
+  it('rejects invalid retention knobs instead of silently changing the policy', () => {
     expect(() => new SessionStore(tmpDataDir(), { backupMaxAgeMs: -1 })).toThrow(/backupMaxAgeMs/);
     expect(() => new SessionStore(tmpDataDir(), { backupMaxAgeMs: Number.NaN })).toThrow(/backupMaxAgeMs/);
     expect(() => new SessionStore(tmpDataDir(), { backupMaxAgeMs: 1.5 })).toThrow(/backupMaxAgeMs/);
+    expect(() => new SessionStore(tmpDataDir(), { retention: -1 })).toThrow(/retention/);
+    expect(() => new SessionStore(tmpDataDir(), { retention: Number.NaN })).toThrow(/retention/);
   });
+
+  it('logs an unchanged pass, so a healthy idle hour is still a heartbeat', () => {
+    const store = new SessionStore(tmpDataDir());
+    seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const lines: { readonly msg: string; readonly fields?: Record<string, unknown> }[] = [];
+    const logging = new SessionStore(store.dataDir, {
+      log: (level, msg, fields) => {
+        if (level === 'info') lines.push({ msg, fields });
+      },
+    });
+    const quiet = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(quiet.created).toEqual([]);
+    expect(quiet.skipped).toBe(1);
+    const passLine = lines.find((line) => line.msg === 'session backup pass');
+    expect(passLine).toBeDefined();
+    expect(passLine!.fields).toMatchObject({ created: 0, pruned: 0, unchanged: 1 });
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'degrades to the repair path when the backup directory cannot be listed',
+    () => {
+      const store = new SessionStore(tmpDataDir());
+      seedSource(store, 'gru', 'a.jsonl', 'one\n');
+      store.runBackup(new Date('2026-10-01T10:05:00Z'));
+      const backups = join(store.sessionsDir, 'backups');
+      chmodSync(backups, 0o000);
+      const warnings: string[] = [];
+      const logging = new SessionStore(store.dataDir, {
+        log: (level, msg) => {
+          if (level === 'warn') warnings.push(msg);
+        },
+      });
+      let thrown: unknown = null;
+      let pass: ReturnType<SessionStore['runBackup']> | null = null;
+      try {
+        pass = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
+      } catch (error) {
+        thrown = error;
+      } finally {
+        chmodSync(backups, 0o700);
+      }
+      // An unlistable backup dir must not abort the pass (the boot pass is
+      // unguarded): it warns and treats every recorded generation as missing.
+      expect(thrown).toBeNull();
+      expect(warnings.some((msg) => msg.includes('could not be listed'))).toBe(true);
+      expect(pass?.created ?? []).toEqual([]);
+    },
+  );
 
   it('warns when a live source cannot be inspected, and stays quiet for one that vanished', () => {
     const store = new SessionStore(tmpDataDir());
