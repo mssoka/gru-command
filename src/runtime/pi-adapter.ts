@@ -1294,7 +1294,8 @@ export class PiAgentHandle implements AgentHandle {
       // registry's own tools) before every prompt and next turn, which would
       // drop a one-time wrap after the first prompt. Guard every assignment.
       const agentState = session.agent.state;
-      const { get: readTools, set: writeTools } = assertToolFenceAccessor(agentState);
+      const toolsAccessor = assertToolFenceAccessor(agentState);
+      const { get: readTools, set: writeTools } = toolsAccessor;
       Object.defineProperty(agentState, 'tools', { ...toolsAccessor, set: (tools: SdkTool[]) => writeTools.call(agentState, tools.map(guardTool)) });
       agentState.tools = readTools.call(agentState);
       const beforeNextTurn = session.agent.prepareNextTurnWithContext;
