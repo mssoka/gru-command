@@ -88,10 +88,14 @@ describe('prune-stale-dist', () => {
     // the service boot's [env] step (dist/service-environment.js); #505
     // Nefario's briefing review (dist/briefing-review/*.js); and the
     // guarded pre-bootstrap dependency patch reader
-    // (dist/worktrees/prebootstrap-patch.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5235);
+    // (dist/worktrees/prebootstrap-patch.js). #521 replaced the installed
+    // part with the pi 1.4 closure (pi-coding-agent and pi-ai 1.4.0 with
+    // their pi-agent-core, pi-mcp, pi-codemode, pi-tui and pi-telemetry
+    // packages): 151 packages, from which the 0.85.1 shrinkwrap's esbuild,
+    // clipboard and AWS-crypto trees are gone.
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5298);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('038e4573980d8b081eec48cca8a744a873dca3e63aaca94502d09c5721397845');
+      .toBe('26a448485928ad8e6b5dea2185a103e30bb78ddec288071c3a9a3f6d21a587c3');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));
