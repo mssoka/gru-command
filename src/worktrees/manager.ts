@@ -1,5 +1,5 @@
 import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, pendingLaneHandoffPublished, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
-import { CreationIntentError, RetainedCreationFailedError, RetainedCreationRefusalError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane, type RetainedReceiptExpectation } from './creation-intent.js';
+import { CreationIntentError, RetainedCreationFailedError, RetainedCreationRefusalError, clearCreationIntent, readCreationIntent, redactCreationTokens, writeCreationIntent, type CreationIntent, type CreationIntentLane, type RetainedReceiptExpectation } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -932,10 +932,16 @@ function gitTreeWithRequirementsPatch(repoPath: string, baseSha: string, require
 function runGit(repoPath: string, args: readonly string[], opts: SpawnGitOptions = {}): string {
   const { status, stdout, stderr, error } = spawnGit(repoPath, args, opts);
   if (status !== 0) {
+    // The argv can carry the creation token (`--lock --reason
+    // gru-creation:<token>`). Every creation path rethrows this error and
+    // callers record it (review handoff failures, child results), so the token
+    // never enters its message — stderr included, in case git ever echoes it.
     throw new Error(
-      `git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${
-        stderr.trim() || error || stdout.trim()
-      }`,
+      redactCreationTokens(
+        `git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${
+          stderr.trim() || error || stdout.trim()
+        }`,
+      ),
     );
   }
   return stdout.trim();
@@ -969,7 +975,8 @@ function spawnGit(
 
 /** {@link runGit} off the event loop (#427), for git whose cost grows with
  * the tree (a full checkout, a listing of what a removal left). Resolves with
- * stdout as git printed it (untrimmed); rejects as runGit throws. */
+ * stdout as git printed it (untrimmed); rejects like runGit, with the creation
+ * token redacted from its message (git echoes a locked tree's lock reason). */
 function runGitAsync(repoPath: string, args: readonly string[], opts: Pick<SpawnGitOptions, 'indexFile' | 'input' | 'maxBuffer'> = {}): Promise<string> {
   return new Promise((resolveOut, reject) => {
     const child = execFile('git', [...args], {
@@ -979,12 +986,31 @@ function runGitAsync(repoPath: string, args: readonly string[], opts: Pick<Spawn
       env: { ...repositoryGitEnv(false), ...(opts.indexFile !== undefined ? { GIT_INDEX_FILE: opts.indexFile } : {}) },
     }, (error, stdout, stderr) => {
       if (error === null) resolveOut(stdout);
-      else reject(new Error(`git ${args.join(' ')} failed (exit ${String(error.code ?? error.signal)}) in ${repoPath}: ${stderr.trim() || error.message}`));
+      else {
+        reject(new Error(redactCreationTokens(
+          `git ${args.join(' ')} failed (exit ${String(error.code ?? error.signal)}) in ${repoPath}: ${stderr.trim() || error.message}`,
+        )));
+      }
     });
     child.stdin?.on('error', reject);
     if (opts.input !== undefined) child.stdin?.end(opts.input);
     else child.stdin?.end();
   });
+}
+
+/** An error that leaves the creation/rollback boundary carries redacted token
+ * text only: a token is custody authority, so neither its message nor its
+ * stack may spell one. An error whose message never carried a token keeps its
+ * exact identity; a token-bearing one is copied with its name and redacted
+ * stack, never its cause chain (that chain can spell the same token again). */
+function redactedCreationError(value: unknown): Error {
+  const source = value instanceof Error ? value : new Error(String(value));
+  const message = redactCreationTokens(source.message);
+  if (message === source.message) return source;
+  const copy = new Error(message);
+  copy.name = source.name;
+  if (source.stack !== undefined) copy.stack = redactCreationTokens(source.stack);
+  return copy;
 }
 
 /** Git's locked worktree reason survives a failed post-checkout hook and
@@ -3995,7 +4021,11 @@ export class WorktreeManager {
         throw new Error('names a different common directory');
       }
       if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
-        throw new Error(`is locked for another creation, not ${custody.token}`);
+        // The receipt's token is LIVE here (a retained creation keeps it), and
+        // this error leaves reconciliation for callers that record it durably
+        // (a child's result summary, the service log). Name the custody
+        // condition, never the secret; the cause below inherits this text.
+        throw new Error(`is locked for another creation, not ${redactCreationTokens(custody.token)}`);
       }
     } catch (error) {
       throw new CreationIntentError(`lane administration ${admin} belongs to ${path} but ${error instanceof Error ? error.message : String(error)} — inspect it before retrying`, { cause: error });
@@ -4131,9 +4161,13 @@ export class WorktreeManager {
         runGit(repoPath, ['worktree', 'remove', '--force', '--force', path]);
       }
     } catch (error) {
-      this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: String(error) });
-      throw new AggregateError([originalError, error],
-        `worktree creation failed (${String(originalError)}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
+      // A creation token is custody authority: neither the rollback failure nor
+      // the creation failure may carry it into a log field, a rethrown message
+      // or an inner error. The path, the custody condition and what to inspect
+      // survive in both.
+      this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: redactCreationTokens(String(error)) });
+      throw new AggregateError([redactedCreationError(originalError), redactedCreationError(error)],
+        `worktree creation failed (${redactCreationTokens(String(originalError))}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
     }
   }
 

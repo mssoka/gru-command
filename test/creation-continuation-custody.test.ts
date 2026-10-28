@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { DispatchService } from '../src/dispatch/service.js';
 import { JobExecutionStop } from '../src/dispatch/job-stop.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { clearCreationIntent, readCreationIntent, writeCreationIntent } from '../src/worktrees/creation-intent.js';
 import type { LogLevel } from '../src/logger.js';
+import { attachBareOrigin } from './helpers/fixture-repo.js';
 import {
   acceptDirectly, cleanupContinuationFixtures, committedExitWithoutClose, committedStall, directory, fakeHandle, git, hasRawCreationToken, httpHarness,
   managerFixture, processGone, receiptFiles, request, retainedFixture, sha256, syntheticRetained, TOKEN, waitForState, type RetainedFixture,
@@ -30,6 +32,38 @@ function heldFloor() {
 function logSink() {
   const entries: { readonly level: LogLevel; readonly msg: string; readonly fields: Record<string, unknown> }[] = [];
   return { entries, log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => { entries.push({ level, msg, fields: fields ?? {} }); } };
+}
+
+/** Put a synthetic git first on PATH that locks a lane's tree with its own
+ * creation token immediately before delegating `worktree remove` (the
+ * after-proof window), and delegates every other command unchanged. Returns
+ * the PATH to restore. */
+function lockBeforeRemovalGit(): string {
+  const root = directory();
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const script = join(root, 'git');
+  writeFileSync(script, [
+    '#!/usr/bin/env node',
+    'const cp = require("node:child_process"), fs = require("node:fs"), path = require("node:path");',
+    'const args = process.argv.slice(2);',
+    `const real = ${JSON.stringify(realGit)};`,
+    'const run = (a) => cp.spawnSync(real, a, { stdio: "inherit" }).status ?? 1;',
+    'if (args[0] === "worktree" && args[1] === "remove") {',
+    '  const target = args[args.length - 1];',
+    '  try {',
+    '    const gitFile = fs.readFileSync(path.join(target, ".git"), "utf8").trim();',
+    '    const admin = path.resolve(target, gitFile.slice("gitdir: ".length));',
+    '    const receipt = JSON.parse(fs.readFileSync(path.join(admin, "gru-creation-handoff.json"), "utf8"));',
+    '    cp.spawnSync(real, ["worktree", "lock", "--reason", receipt.token, target], { stdio: "ignore" });',
+    '  } catch { /* the real git still answers on its own terms */ }',
+    '  process.exit(run(args));',
+    '}',
+    'process.exit(run(args));',
+  ].join('\n') + '\n');
+  chmodSync(script, 0o755);
+  const originalPath = process.env.PATH ?? '';
+  vi.stubEnv('PATH', `${root}:${originalPath}`);
+  return originalPath;
 }
 
 /** Every event payload and the note of one job, as text. */
@@ -432,6 +466,239 @@ describe('retained-creation continuation custody', () => {
     expect(api.ledger.getJob(api.jobId)?.note).toMatch(/^dispatch failed: .*<redacted-creation-token>/u);
     expect(hasRawCreationToken(jobRecordText(api, api.jobId))).toBe(false);
     expect(api.spawns).toHaveLength(0);
+  });
+
+  it('redacts the creation token from the rollback rethrow and its inner errors', async () => {
+    // The failed `git worktree add --lock --reason gru-creation:<token>` and
+    // the rollback that cannot prove an invocation-owned reservation are two
+    // different errors; both leave through the rethrow, and neither may carry
+    // the custody token.
+    const h = managerFixture('rollback-rethrow-redaction');
+    const jobId = 'rollback-rethrow-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    // An unwritable lane root fails the checkout add before any path or
+    // orphan administration exists, so the rollback has no owned holder.
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    chmodSync(parent, 0o555);
+    try {
+      const thrown = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId }).then(() => null, (failure: unknown) => failure);
+      // The rethrow ran: the failed add and the failed rollback are paired.
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const rethrown = thrown as AggregateError;
+      expect(rethrown.errors).toHaveLength(2);
+      expect(String(rethrown.errors[0])).toMatch(/^Error: git worktree add --lock --reason /u);
+      expect(String(rethrown.errors[1])).toMatch(/has no invocation-owned checkout reservation$/u);
+      expect(rethrown.message).toMatch(/^worktree creation failed \(Error: git worktree add --lock --reason /u);
+
+      // The exact token this creation minted: its durable receipt survives the
+      // failed rollback, so the assertion is bound to the real secret.
+      const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+      const token = readCreationIntent(common, `gru/${jobId}`)?.token;
+      expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+      expect(receiptFiles(h.repo)).toHaveLength(1);
+
+      const text = JSON.stringify({
+        message: rethrown.message,
+        stack: rethrown.stack,
+        inner: rethrown.errors.map((error: Error) => [error.name, error.message, error.stack]),
+      });
+      expect(hasRawCreationToken(text)).toBe(false);
+      expect(text).not.toContain(token!);
+
+      // The operator meaning survives: the path, the custody condition and
+      // what to inspect, with only the secret replaced.
+      const path = join(parent, `job-${jobId}`);
+      expect(rethrown.message).toContain('<redacted-creation-token>');
+      expect(rethrown.message).toContain(`rollback custody unconfirmed for ${path}`);
+      expect(rethrown.message).toContain('inspect retained resources before retry');
+      expect(String(rethrown.errors[0])).toContain('<redacted-creation-token>');
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
+  it('redacts the creation token from the rollback log line that refuses an orphan administration', async () => {
+    // The rollback's own orphanCreationAdmin refusal names the custody token
+    // it expected; the manager log line that records it must not.
+    const sink = logSink();
+    const h = managerFixture('rollback-log-redaction', { log: sink.log });
+    const jobId = 'rollback-log-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    const path = join(parent, `job-${jobId}`);
+    const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    // An administration that claims this lane's path under another creation's
+    // lock: the rollback meets it and refuses by name.
+    const admin = join(common, 'worktrees', 'foreign');
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(admin, 'gitdir'), `${join(realpathSync(parent), `job-${jobId}`, '.git')}\n`);
+    writeFileSync(join(admin, 'HEAD'), `ref: refs/heads/gru/${jobId}\n`);
+    writeFileSync(join(admin, 'commondir'), '../..\n');
+    writeFileSync(join(admin, 'locked'), `gru-creation:${randomUUID()}\n`);
+    chmodSync(parent, 0o555);
+    try {
+      const thrown = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId }).then(() => null, (failure: unknown) => failure);
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const token = readCreationIntent(common, `gru/${jobId}`)?.token;
+      expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+
+      const refusal = sink.entries.find((entry) => entry.msg === 'creation rollback custody unconfirmed; resources retained');
+      expect(refusal, 'the rollback custody log line was emitted').toBeDefined();
+      expect(refusal!.level).toBe('error');
+      expect(refusal!.fields['path']).toBe(path);
+      const detail = String(refusal!.fields['error']);
+      expect(detail).toContain('lane administration');
+      expect(detail).toContain('is locked for another creation');
+      expect(detail).toContain('inspect it before retrying');
+      expect(detail).toContain('<redacted-creation-token>');
+      expect(detail).not.toContain(token!);
+      expect(hasRawCreationToken(JSON.stringify(sink.entries))).toBe(false);
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
+  it('redacts the token from the creation error a successful rollback rethrows', async () => {
+    // A branchless review lane has nothing to remove, so its rollback returns
+    // normally and the caller rethrows the failed `git worktree add` itself —
+    // the post-rollback surface, not the rollback catch.
+    const sink = logSink();
+    const h = managerFixture('review-rethrow-redaction', { log: sink.log });
+    // A review lane resolves its ref from a freshly fetched origin, never a
+    // stale local tip: give the fixture the bare origin the other suites use.
+    attachBareOrigin(h.repo);
+    git(h.repo, ['push', 'origin', 'main']);
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    chmodSync(parent, 0o555);
+    try {
+      const thrown = await h.worktrees.createReviewWorktree({ repoPath: h.repo.path, roundId: 'round-redaction', ref: 'origin/main' })
+        .then(() => null, (failure: unknown) => failure);
+      // The rollback succeeded: the catch that logs and rethrows never ran.
+      expect(sink.entries.filter((entry) => entry.msg === 'creation rollback custody unconfirmed; resources retained')).toHaveLength(0);
+      expect(thrown).toBeInstanceOf(Error);
+      const error = thrown as Error;
+      expect(error.message).toMatch(/^git worktree add --lock --reason /u);
+      expect(error.message).toContain('<redacted-creation-token>');
+      expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, String(error)]))).toBe(false);
+      // The operator meaning survives: the failed command and the lane path.
+      expect(error.message).toContain(join(parent, 'review-round-redaction'));
+      expect(error.message).toContain('failed (exit');
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
+  it('redacts the live receipt token when reconciliation refuses a foreign administration', async () => {
+    // reconcileInterruptedCreation queries the orphan administration directly,
+    // outside the rollback catch; its refusal names the receipt token, which is
+    // still LIVE because a retained receipt is deliberately kept.
+    const h = managerFixture('reconcile-redaction');
+    const jobId = 'reconcile-redaction';
+    const retained = syntheticRetained(h, jobId);
+    const parent = join(h.root, basename(h.repo.path));
+    mkdirSync(parent, { recursive: true });
+    const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    const admin = join(common, 'worktrees', 'foreign');
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(admin, 'gitdir'), `${join(realpathSync(parent), `job-${jobId}`, '.git')}\n`);
+    writeFileSync(join(admin, 'HEAD'), `ref: refs/heads/${retained.branch}\n`);
+    writeFileSync(join(admin, 'commondir'), '../..\n');
+    writeFileSync(join(admin, 'locked'), `gru-creation:${randomUUID()}\n`);
+    const thrown = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId }).then(() => null, (failure: unknown) => failure);
+    expect(thrown).toBeInstanceOf(Error);
+    const error = thrown as Error;
+    expect(error.message).toContain('lane administration');
+    expect(error.message).toContain('is locked for another creation');
+    expect(error.message).toContain('inspect it before retrying');
+    expect(error.message).toContain('<redacted-creation-token>');
+    expect(error.message).not.toContain(retained.token);
+    const cause = error.cause instanceof Error ? error.cause : null;
+    expect(JSON.stringify({
+      message: error.message,
+      stack: error.stack,
+      cause: cause === null ? null : [cause.message, cause.stack],
+    })).not.toMatch(/gru-creation:[0-9a-f]{8}-/u);
+  });
+
+  it('redacts the token an external lock makes the disk-budget removal echo', async () => {
+    // The disk-budget release removes off the event loop (runGitAsync) with a
+    // single --force. An actor that locks the lane after the release's custody
+    // proof but before git's own removal makes git refuse and echo the lock
+    // reason — the creation token — into the release failure and its record.
+    const sink = logSink();
+    const h = managerFixture('locked-release-redaction', { log: sink.log });
+    const jobId = 'locked-release-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    const record = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId });
+    // The lane's own custody token, read from its completed handoff receipt.
+    const gitFile = readFileSync(join(record.path, '.git'), 'utf8').trim();
+    const admin = resolve(record.path, gitFile.slice('gitdir: '.length));
+    const token = (JSON.parse(readFileSync(join(admin, 'gru-creation-handoff.json'), 'utf8')) as { readonly token: string }).token;
+    expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+    const restore = lockBeforeRemovalGit();
+    try {
+      const thrown = await h.worktrees.release({ worktreeId: jobId, requireReleaseProofs: true, onLiveProcess: 'refuse', diskBudget: true })
+        .then(() => null, (failure: unknown) => failure);
+      // The async removal ran and its refusal was recorded, not silently dropped.
+      const aborted = h.ledger.listJobEventsByKinds(jobId, ['worktree.release-aborted']);
+      expect(aborted, `release rejected with: ${thrown instanceof Error ? thrown.message : String(thrown)}`).toHaveLength(1);
+      const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
+      expect(detail).toContain('cannot remove a locked working tree');
+      // The recorded detail is cut at 400 points (oneLineErrorText), and a
+      // long temp path can push the placeholder past the cut: assert the
+      // secret's absence durably, and the placeholder on the untruncated error.
+      expect(detail).not.toContain(token);
+      expect(hasRawCreationToken(detail)).toBe(false);
+      const error = thrown as Error;
+      expect(error.message).toContain('<redacted-creation-token>');
+      expect(error.message).not.toContain(token);
+      expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
+      expect(sink.entries.some((entry) => entry.msg === 'release aborted after its records; the tree is retained and a retry reuses what was saved')).toBe(true);
+    } finally {
+      vi.stubEnv('PATH', restore);
+    }
+  });
+
+  it('redacts the token a locked-tree removal echoes through a proven release', async () => {
+    // The non-budget release removes on the event loop (runGit); the same
+    // after-proof lock window makes git echo the lock reason there.
+    const sink = logSink();
+    const h = managerFixture('locked-release-sync-redaction', { log: sink.log });
+    const jobId = 'locked-release-sync-redaction';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Briefing ${jobId}` });
+    h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: basename(h.repo.path), repoPath: h.repo.path } });
+    h.ledger.setJobStatus(jobId, 'working');
+    const record = await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId });
+    const gitFile = readFileSync(join(record.path, '.git'), 'utf8').trim();
+    const admin = resolve(record.path, gitFile.slice('gitdir: '.length));
+    const token = (JSON.parse(readFileSync(join(admin, 'gru-creation-handoff.json'), 'utf8')) as { readonly token: string }).token;
+    expect(token).toMatch(/^gru-creation:[0-9a-f]{8}-/u);
+    const restore = lockBeforeRemovalGit();
+    try {
+      const thrown = await h.worktrees.release({ worktreeId: jobId, requireReleaseProofs: true, onLiveProcess: 'refuse' })
+        .then(() => null, (failure: unknown) => failure);
+      const aborted = h.ledger.listJobEventsByKinds(jobId, ['worktree.release-aborted']);
+      expect(aborted, `release rejected with: ${thrown instanceof Error ? thrown.message : String(thrown)}`).toHaveLength(1);
+      const detail = String((aborted[0]!.payload as Record<string, unknown>)['error']);
+      expect(detail).toContain('cannot remove a locked working tree');
+      expect(detail).not.toContain(token);
+      expect(hasRawCreationToken(detail)).toBe(false);
+      const error = thrown as Error;
+      expect(error.message).toContain('<redacted-creation-token>');
+      expect(error.message).not.toContain(token);
+      expect(hasRawCreationToken(JSON.stringify([error.message, error.stack, sink.entries]))).toBe(false);
+    } finally {
+      vi.stubEnv('PATH', restore);
+    }
   });
 
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
