@@ -383,7 +383,8 @@ export async function applyWorktreeManifest(
       if (!groups.some(processGroupAlive)) throw error;
       const noOutput = { text: '', truncated: false, startsAtLine: true };
       throw new WorktreeSetupError(error instanceof Error ? error.message : String(error),
-        error instanceof WorktreeSetupError ? error.output : { stdout: noOutput, stderr: noOutput }, true);
+        error instanceof WorktreeSetupError ? error.output : { stdout: noOutput, stderr: noOutput }, true,
+        { cause: error });
     }
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
@@ -452,15 +453,19 @@ export interface SetupStreamTail {
 
 /** A setup command failed, timed out or was stopped. The message names it
  * with a short output tail; `output` keeps each stream's bounded raw tail
- * for a caller that redacts before it records (#427 onboarding proof). */
+ * for a caller that redacts before it records (#427 onboarding proof). A
+ * caller that converts an earlier failure into this one to report a
+ * surviving process group passes that failure as `cause`, so the refusal it
+ * wraps stays observable on the thrown value. */
 export class WorktreeSetupError extends Error {
   constructor(
     message: string,
     readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail },
     /** A setup step's process group still had a member when it failed. */
     readonly processesRemain = false,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'WorktreeSetupError';
   }
 }
