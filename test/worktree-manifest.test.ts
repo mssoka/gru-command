@@ -8,6 +8,7 @@ import {
   OutputTail,
   parseWorktreeManifest,
   resolveVerifyCommand,
+  WorktreeSetupError,
 } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
@@ -18,6 +19,17 @@ import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
 function manifestFile(repoPath: string): string {
   return join(repoPath, MANIFEST_PATH);
+}
+
+/** Messages on a thrown value's `cause` chain, the value itself excluded. */
+function causeMessages(error: Error): string[] {
+  const messages: string[] = [];
+  let cause: unknown = error.cause;
+  while (cause instanceof Error && messages.length < 10) {
+    messages.push(cause.message);
+    cause = cause.cause;
+  }
+  return messages;
 }
 
 describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
@@ -268,7 +280,20 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
       const worktreePath = join(repo.path, '..', 'fixture-termdaemon-wt');
       repo.git(['worktree', 'add', worktreePath, 'HEAD']);
       const applied = applyWorktreeManifest(manifest!, { sourceRoot: repo.path, worktreePath, setupTimeoutMs: 1_000 });
-      await expect(applied).rejects.toThrowError(/timed out after 1000ms/);
+      const thrown = await applied.then(
+        () => { throw new Error('the timed-out setup resolved instead of rejecting'); },
+        (error: unknown) => error,
+      );
+      expect(thrown).toBeInstanceOf(WorktreeSetupError);
+      const timeout = thrown as WorktreeSetupError;
+      expect(timeout.message).toMatch(/timed out after 1000ms/u);
+      // The failure the setup step threw stays on the wrapper that reports
+      // the group still alive behind it: the daemon's SIGTERM-proof member
+      // makes this surviving-group shape deterministic, so the wrapper's
+      // cause is pinned rather than left to the spawn-receipt race below.
+      expect(timeout.processesRemain).toBe(true);
+      expect(timeout.cause).toBeInstanceOf(WorktreeSetupError);
+      expect((timeout.cause as Error).message).toMatch(/timed out after 1000ms/u);
       // The daemon set its trap before the timeout: SIGTERM alone never ends it.
       expect(existsSync(join(worktreePath, '.daemon-ready'))).toBe(true);
       const pid = Number(readFileSync(join(worktreePath, '.daemon-pid'), 'utf-8').trim());
@@ -297,10 +322,19 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
           groupId = pid;
           throw new Error('synthetic spawn receipt failure');
         } });
-      await expect(applied).rejects.toThrow(expect.objectContaining({
-        message: expect.stringContaining('process ownership receipt failed'),
-        cause: expect.objectContaining({ message: 'synthetic spawn receipt failure' }),
-      }));
+      const thrown = await applied.then(
+        () => { throw new Error('the failed setup receipt resolved instead of rejecting'); },
+        (error: unknown) => error,
+      );
+      expect(thrown).toBeInstanceOf(Error);
+      const receipt = thrown as Error;
+      expect(receipt.message).toContain('process ownership receipt failed');
+      // The refusal stays observable whichever shape the ended group leaves:
+      // the bare refusal error carries it as `cause`, and the
+      // WorktreeSetupError wrapper emitted when a member still lives carries
+      // that refusal as its own cause. Either way the assertion is exact.
+      expect(causeMessages(receipt)).toContain('synthetic spawn receipt failure');
+      if (receipt instanceof WorktreeSetupError) expect(receipt.processesRemain).toBe(true);
       expect(groupId).toBeGreaterThan(0);
       await vi.waitFor(() => {
         expect(() => process.kill(-groupId, 0)).toThrow();

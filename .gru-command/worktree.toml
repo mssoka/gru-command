@@ -1148,3 +1148,8 @@ repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"
 # #511 main-suite-red: the two fast-phase tests that went red in CI run
 # 40402129444, run together so the fix is verifiable at one exact head.
 main-suite-red-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-build-reuse.test.ts test/review-build-identity.test.ts"
+
+# main CI run 40604161762 red: the spawn-receipt refusal case in the worktree
+# bootstrap manifest suite, run alone at one exact head so the fix is
+# verifiable without the full suite.
+main-red-spawn-receipt-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/worktree-manifest.test.ts"

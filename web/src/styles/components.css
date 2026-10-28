@@ -465,11 +465,18 @@ body {
   50% { opacity: 0.35; }
 }
 
-/* ── Cockpit KPI cards (cockpit rework 2026-10-17): six cards at the top
+/* ── Cockpit KPI cards (cockpit rework 2026-10-17): the strip at the top
    of the board column — heists, megaminions, crew, PRs, reviews, Vector
-   raids. Two columns, three from 520px, six from 1000px (the wrapper is a
-   size container, so a collapsed chat or a dragged splitter re-flows them
-   like a resize). Never nowrap-clipped: facts wrap. ── */
+   raids, Nefario. A card never squeezes below 180px: auto-fit drops in
+   another column exactly when the wrapper can hold one (a collapsed chat
+   or a dragged splitter re-flows them like a resize; the wrapper is the
+   size container). The strip stops at SEVEN columns — 7×180 + 6×10 gap =
+   1320px — and centres in a wider column, so an ultrawide cockpit keeps a
+   dashboard's strip instead of stretching cards across the whole board.
+   A row with fewer cards than tracks collapses the empty tracks (five
+   cards stay five across); empty space below a short card is expected and
+   is never filled. Never nowrap-clipped: labels, units, asides and facts
+   all wrap. ── */
 .cockpit-kpis {
   container: kpis / inline-size;
   min-width: 0;
@@ -478,32 +485,42 @@ body {
 .cockpit-kpis__grid {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: 1320px;
+  margin-inline: auto;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
-@container kpis (min-width: 520px) {
-  .cockpit-kpis__grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+/* Two columns is the strip's floor (a phone): below 370px auto-fit would
+   drop to a single track, and one 180px card per row is not a dashboard. */
+@container kpis (max-width: 369px) {
+  .cockpit-kpis__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
-@container kpis (min-width: 1000px) {
-  .cockpit-kpis__grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-  /* No raids block (an older server): five cards fill five columns. */
-  .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-  /* Nefario's card (GH-505): seven cards still fill ONE row on a wide board
-     (the 2400px cockpit), never six with a hole at the end. */
-  .cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-}
-
+/* Each card takes TWO tracks of the strip's own grid: its head and its
+   body. The head track is shared by every card in the row (subgrid), so a
+   row where one card's label or aside wraps to a second line gives every
+   card in that row the same head height — and a row where nothing wraps
+   pays nothing for the guarantee. The card's own 4px gap is the internal
+   row gap; the strip's 10px stays between rows of cards. */
 .cockpit-card {
   min-width: 0;
   display: grid;
-  align-content: start;
+  grid-template-rows: subgrid;
+  grid-row: span 2;
   gap: 4px;
   padding: 10px 13px 11px;
   border: var(--outline);
   border-radius: var(--radius-md);
   background: var(--card);
   box-shadow: var(--shadow-btn);
+}
+
+/* The headline, the stage bar and the facts: everything below the head. */
+.cockpit-card__body {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
 }
 
 /* An off feature (raids before opt-in): dashed and flat, never alarming. */
@@ -513,12 +530,17 @@ body {
   box-shadow: none;
 }
 
+/* The label and its aside; the aside drops to a second line when both do
+   not fit, and the row's shared track (above) keeps every card's head the
+   same height either way. */
 .cockpit-card__head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 2px 7px;
   min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.2;
 }
 
 .cockpit-card__mark {
@@ -544,18 +566,19 @@ body {
   font-weight: 800;
   letter-spacing: 0.14em;
   color: var(--muted);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
-/* The aside sits at the head's end, and wraps under the label on a card
-   too narrow for both (a phone's two columns) — never cut to "1…". */
+/* The aside sits at the head's end, and wraps (never ellipsizes) under the
+   label on a card too narrow for both — a phone's two columns, or a
+   board column squeezed by the splitters. */
 .cockpit-card__aside {
   margin-left: auto;
   min-width: 0;
   max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-size: 11.5px;
   font-weight: 700;
   color: var(--faint);
@@ -582,11 +605,13 @@ body {
   color: var(--faint);
 }
 
+/* The headline number keeps its own line and its unit wraps beside it —
+   under it, when the unit is longer than the room left on the line. Never
+   cut to "111 on t…". */
 .cockpit-card__unit {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: break-word;
   font-size: 13px;
   font-weight: 700;
   color: var(--muted);
@@ -628,7 +653,9 @@ body {
   display: inline-flex;
   align-items: baseline;
   gap: 4px;
-  white-space: nowrap;
+  /* A count and its label wrap inside their own box when the card is too
+     narrow for the pair — the facts row never pushes past the card. */
+  white-space: normal;
 }
 
 .cockpit-fact__num {
