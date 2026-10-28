@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, truncateSync, writeFileSync, writeSync, closeSync } from 'node:fs';
+import { closeSync, copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -373,6 +373,20 @@ describe('transcript service', () => {
       [1, 'tool_result', 'no matches', 'Grep', true],
       [2, 'system', 'turn result: error_max_turns', null, true],
     ]);
+  });
+
+  it('a session file written by pi 0.85.1 reads back as its captured golden with no torn lines (#521)', () => {
+    const { dir, svc } = tmpStore();
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    copyFileSync(join(import.meta.dirname, 'fixtures', 'pi-0.85-session.jsonl'), join(dir, 'sessions', 'minion', 'd', 'pi-0.85-session.jsonl'));
+    // The golden was captured with the 0.85.1 SDK before the 1.x upgrade.
+    const golden = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', 'pi-0.85-session.golden.json'), 'utf-8')) as {
+      entries: unknown[]; tornLines: number;
+    };
+    expect(golden.entries.map((entry) => (entry as { kind: string }).kind)).toEqual(['user', 'assistant', 'tool_result', 'assistant']);
+    const result = svc.read('minion/d/pi-0.85-session.jsonl');
+    expect(result).toEqual(golden);
+    expect(result.tornLines).toBe(0);
   });
 
   it('an empty session file pages cleanly (total 0)', () => {

@@ -1,0 +1,45 @@
+{
+  "entries": [
+    {
+      "index": 0,
+      "ts": 1700000001000,
+      "kind": "user",
+      "role": "user",
+      "text": "List the files in the project root.",
+      "thinking": null,
+      "toolName": null,
+      "isError": false
+    },
+    {
+      "index": 1,
+      "ts": 1700000002000,
+      "kind": "assistant",
+      "role": "assistant",
+      "text": "Listing the project root.",
+      "thinking": "The user wants a directory listing; the ls tool answers that.",
+      "toolName": null,
+      "isError": false
+    },
+    {
+      "index": 2,
+      "ts": 1700000003000,
+      "kind": "tool_result",
+      "role": "tool",
+      "text": "README.md\nsrc",
+      "thinking": null,
+      "toolName": "ls",
+      "isError": false
+    },
+    {
+      "index": 3,
+      "ts": 1700000004000,
+      "kind": "assistant",
+      "role": "assistant",
+      "text": "The project root holds README.md and src.",
+      "thinking": "Two entries came back; summarize them.",
+      "toolName": null,
+      "isError": false
+    }
+  ],
+  "tornLines": 0
+}

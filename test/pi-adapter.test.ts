@@ -3,7 +3,7 @@ import { ModelRuntime, createBashToolDefinition, defineTool, type ToolDefinition
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -64,6 +64,9 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
     },
   };
 });
+
+/** A session written by the real pi 0.85.1 SessionManager (recorded cwd /fixture/project). */
+const PI_085_SESSION = join(import.meta.dirname, 'fixtures', 'pi-0.85-session.jsonl');
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -2285,6 +2288,37 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       await resumed.prompt('continue', { owner: 'alice' });
       const entriesAfter = readFileSync(file, 'utf-8').trim().split('\n').length;
       expect(entriesAfter).toBeGreaterThan(entriesBefore);
+    } finally {
+      await resumed.dispose();
+    }
+  });
+
+  it('opens and resumes a session file written by pi 0.85.1 (#521)', async () => {
+    const fx = await fixture([{ deltas: ['after the upgrade'] }]);
+    const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+    const sessionDir = join(fx.store.sessionsDir, 'gru', 'pi-0-85-fixture');
+    mkdirSync(sessionDir, { recursive: true });
+    const copyOf = (name: string): string => {
+      const copy = join(sessionDir, name);
+      copyFileSync(PI_085_SESSION, copy);
+      return copy;
+    };
+    // The adapter opens a resumed file with SessionManager.open(file, dir, cwd);
+    // the fixture's own neutral cwd opens cleanly with its four messages.
+    const sdkCopy = copyOf('sdk-open.jsonl');
+    const opened = SessionManager.open(sdkCopy, sessionDir, '/fixture/project');
+    expect(opened.getCwd()).toBe('/fixture/project');
+    expect(opened.buildSessionContext().messages).toHaveLength(4);
+
+    // The adapter's own resume path (a spawn cwd must exist, so the session
+    // runs in the fixture workspace while its recorded cwd stays old).
+    const adapterCopy = copyOf('adapter-resume.jsonl');
+    const resumed = await fx.runtime.spawn('gru', { resumeFile: adapterCopy, model: `${STUB_PROVIDER_ID}/${STUB_MODEL_ID}` });
+    try {
+      expect(resumed.sessionFile).toBe(adapterCopy);
+      await resumed.prompt('continue', { owner: 'alice' });
+      expect(fx.script.calls.map((c) => c.prompt)).toEqual(['continue']);
+      expect(readFileSync(adapterCopy, 'utf-8')).toContain('List the files in the project root.');
     } finally {
       await resumed.dispose();
     }
