@@ -631,7 +631,8 @@ export class SessionStore {
       // baseline records that generation and the destination is not a usable
       // snapshot, promote the staged file into place (an unusable destination
       // is replaced by the rename) instead of deleting the newest bytes.
-      if (entry !== undefined && this.statGeneration(generation) === null) {
+      const destinationSize = this.statGeneration(generation);
+      if (entry !== undefined && (destinationSize === null || destinationSize < entry.size)) {
         try {
           if (statSync(stagingPath).size >= entry.size) {
             renameSync(stagingPath, destination);
@@ -873,9 +874,6 @@ export class SessionStore {
       const staging = `${copy.dest}.tmp-${process.pid}`;
       try {
         copyFileSync(copy.source.file, staging);
-        renameSync(staging, copy.dest);
-        created.push(copy.dest);
-        next[copy.source.key] = copy.entry;
       } catch (error) {
         try {
           unlinkSync(staging);
@@ -893,20 +891,38 @@ export class SessionStore {
           // retry.
           next[copy.source.key] = previous;
         }
-        // With no previous entry (a cold start) the intended generation stays
-        // recorded; it does not exist, so the next pass repairs it.
+        // With no previous entry (a cold start) no entry is adopted here.
         this.log('warn', 'session backup copy failed', { file: copy.source.file, error: String(error) });
+        continue;
+      }
+      try {
+        renameSync(staging, copy.dest);
+        created.push(copy.dest);
+        next[copy.source.key] = copy.entry;
+      } catch (error) {
+        // The staged copy is COMPLETE: keep it for the staging sweep to
+        // promote (the record already names this generation when the slot was
+        // new) instead of deleting the only copy of the newest bytes.
+        this.log('warn', 'session backup rename failed — the staged copy is kept for recovery', {
+          staging,
+          dest: copy.dest,
+          error: String(error),
+        });
       }
     }
     this.persistSnapshotFromSources(sources);
     // The size snapshot belongs to every pass, including a pass that cannot
     // record its copies and defers them.
+    let recordIsCurrent = true;
     try {
       this.writeBaseline(next, this.baselinePendingFile);
     } catch (error) {
-      // The pre-copy record stands (a same-slot refresh then retries next
-      // pass, a new-slot copy is repaired), so publishing it is still safe.
-      this.log('warn', 'session backup baseline could not be rewritten after the copies — publishing the pre-copy record', {
+      // The pre-copy record is what will be published. The prune may only
+      // delete what that record does not name, so it is skipped: pruning
+      // against the un-recorded post-copy state could delete a generation the
+      // published record still names.
+      recordIsCurrent = false;
+      this.log('warn', 'session backup baseline could not be rewritten after the copies — publishing the pre-copy record without pruning', {
         baselineFile: this.baselineFile,
         error: String(error),
       });
@@ -919,8 +935,9 @@ export class SessionStore {
     const recordedGenerations = new Set(Object.values(next).map((entry) => entry.backup));
     // A fresh flat listing for the prune, taken AFTER the copies so the count
     // rule sees the generations this pass added.
-    const presentAfter = this.listBackupGenerations();
-    const pruned = this.pruneBackups(liveFiles, recordedGenerations, presentAfter, now);
+    const pruned = recordIsCurrent
+      ? this.pruneBackups(liveFiles, recordedGenerations, this.listBackupGenerations(), now)
+      : [];
     try {
       this.publishBaseline();
     } catch (error) {

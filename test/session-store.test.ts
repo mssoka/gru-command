@@ -1273,6 +1273,53 @@ describe('SessionStore interrupted-pass recovery', () => {
   });
 });
 
+describe('SessionStore staged-copy recovery', () => {
+  it('promotes a complete staged copy over a present-but-truncated generation', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    const generation = readBaseline(store).sources[Object.keys(readBaseline(store).sources)[0]!]!.backup;
+    const recordedPath = join(store.sessionsDir, 'backups', generation);
+    writeFileSync(recordedPath, '', 'utf-8'); // present but short
+    const staging = join(store.sessionsDir, 'backups', `${generation}.tmp-${process.pid}`);
+    writeFileSync(staging, 'one\n', 'utf-8'); // a complete staged copy
+    rmSync(file);
+
+    store.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(readFileSync(recordedPath, 'utf-8')).toBe('one\n');
+    expect(existsSync(staging)).toBe(false);
+  });
+
+  it('keeps a complete staged copy when the rename fails, and promotes it next pass', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
+    store.runBackup(new Date('2026-10-01T10:05:00Z'));
+    appendFileSync(file, 'two\n', 'utf-8');
+    const generation = `${relativeKey(store, file)}.2026-10-01T11.bak`;
+    // A non-empty directory on the destination name makes the rename fail
+    // after the copy has been staged.
+    const obstruction = join(store.sessionsDir, 'backups', generation);
+    mkdirSync(obstruction);
+    writeFileSync(join(obstruction, 'keep'), 'x', 'utf-8');
+
+    const warnings: string[] = [];
+    const logging = new SessionStore(store.dataDir, {
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    });
+    const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
+    expect(failed.created).toEqual([]);
+    expect(warnings.some((msg) => msg.includes('staged copy is kept for recovery'))).toBe(true);
+    const staging = join(store.sessionsDir, 'backups', `${generation}.tmp-${process.pid}`);
+    expect(existsSync(staging)).toBe(true);
+
+    rmSync(obstruction, { recursive: true, force: true });
+    store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    expect(readFileSync(join(store.sessionsDir, 'backups', generation), 'utf-8')).toBe('one\ntwo\n');
+  });
+});
+
 describe('SessionStore backup pass preservation', () => {
   it('never modifies or removes a live session file', () => {
     const store = new SessionStore(tmpDataDir());
