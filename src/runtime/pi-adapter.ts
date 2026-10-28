@@ -11,7 +11,7 @@ import {
   SettingsManager,
 } from '@earendil-works/pi-coding-agent';
 import type { InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
-import { getCurrentSystemPrompt, type Api, type Model, type ThinkingLevel } from '@earendil-works/pi-ai';
+import { contentText, getCurrentSystemMessage, getCurrentSystemPrompt, type Api, type Model, type ThinkingLevel } from '@earendil-works/pi-ai';
 import { realpathSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -58,6 +58,20 @@ import { DirectiveBookkeepingError, DirectiveCheckpointError, isNativeDirectiveR
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
 type SdkTool = AgentSession['agent']['state']['tools'][number];
+
+/** Whether `text` is the prompt that `parts` render as, in some order. Pi 1.x
+ * renders a transcript's sections in the order they were first written and
+ * builds its own prompt in a fixed one, so a section a later patch added sits
+ * elsewhere in the replay: the same text, the same sections, another order. */
+function rendersAs(text: string, parts: readonly string[]): boolean {
+  if (parts.length === 0) return text === '';
+  return parts.some((part, index) => {
+    if (!text.startsWith(part)) return false;
+    const rest = parts.filter((_, other) => other !== index);
+    if (rest.length === 0) return text === part;
+    return text.startsWith(`${part}\n\n`) && rendersAs(text.slice(part.length + 2), rest);
+  });
+}
 
 /** The tools accessor the directive executor fence is installed on. Pi 1.x
  * re-applies the tool loadout through it before every prompt and next turn. */
@@ -1389,6 +1403,20 @@ export class PiAgentHandle implements AgentHandle {
     return this.session instanceof AgentSession ? this.session.agent.state.systemPrompt : null;
   }
 
+  /** The replayed prompt, once it is proven to be the prompt the authority
+   * manifest bound: the requests are built from the transcript, so text its
+   * system messages carry beyond the effective prompt would reach the model
+   * unapproved. */
+  private boundTranscriptPrompt(): string | null {
+    if (!(this.session instanceof AgentSession)) return null;
+    const replayed = getCurrentSystemMessage(this.session.agent.state.messages);
+    const parts = replayed === undefined ? [] : [contentText(replayed.content), ...Object.values(replayed.sections ?? {})].filter((part): part is string => part !== null && part.length > 0);
+    if (!rendersAs(this.session.systemPrompt, parts)) {
+      throw new DirectiveCheckpointError('native directive transcript prompt differs from the prompt its authority manifest bound');
+    }
+    return this.transcriptPrompt();
+  }
+
   /** Pi 1.x lets an extension's input handler consume a queued message
    * ("handled"): nothing was queued, so the log says so. */
   private noteInputDisposition(kind: 'steer' | 'follow-up', disposition: unknown): void {
@@ -1583,6 +1611,7 @@ export class PiAgentHandle implements AgentHandle {
     if (this.session instanceof AgentSession && !this.session.agent.state.messages.some((message) => message.role === 'system')) {
       throw new DirectiveCheckpointError('native directive continuation needs the system prompt persisted in its transcript; this one predates pi 1.x and is not safely resumable');
     }
+    this.boundTranscriptPrompt();
     beforeContinuation();
     this.prepareDirectiveProducer(identity);
     const directive = { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} };
@@ -1591,7 +1620,7 @@ export class PiAgentHandle implements AgentHandle {
       // Exact original admission was inspected above and its continuation
       // claim just committed; no new user entry or admission is synthesized.
       this.publishedDirectiveAdmission = directive;
-      this.admittedTranscriptPrompt = this.transcriptPrompt();
+      this.admittedTranscriptPrompt = this.boundTranscriptPrompt();
       return this.session.agent!.continue();
     });
     await turn.done;
@@ -2027,7 +2056,9 @@ export class PiAgentHandle implements AgentHandle {
     if (mapped !== undefined) promptOptions['images'] = mapped;
     // A real AgentSession is guarded in agent.prompt (see the constructor); any
     // other session still reports its acceptance through the pre-1.x hook.
-    if (directive !== undefined && !(this.session instanceof AgentSession)) promptOptions['preflightResult'] = () => this.assertDirectivePreflight(directive);
+    if (directive !== undefined && !(this.session instanceof AgentSession)) {
+      promptOptions['preflightResult'] = (accepted?: unknown) => { if (accepted !== false) this.assertDirectivePreflight(directive); };
+    }
     let captured: PromptTurnVerdict = { ok: true, error: null };
     const turn = (continuation === undefined ? this.session.prompt(text, promptOptions) : continuation())
       .catch((error: unknown) => {
@@ -2268,10 +2299,13 @@ export class PiAgentHandle implements AgentHandle {
             try {
               // The readback with its binding write, and the ledger's publication, are GC's own bookkeeping.
               const binding = withOwnIo('admission receipt', () => inspectDirectiveAdmission(this.sessionFile, directive.identity));
+              // The prompt patch is persisted ahead of the receipt: what the
+              // transcript replays now is what this turn's requests carry.
+              const transcriptPrompt = this.boundTranscriptPrompt();
               withOwnIo('admission publication', () => directive.onAdmitted(binding));
               if (this.liveDirective === directive) {
                 this.publishedDirectiveAdmission = directive;
-                this.admittedTranscriptPrompt = this.transcriptPrompt();
+                this.admittedTranscriptPrompt = transcriptPrompt;
               }
             } catch (error) {
               if (this.liveDirective === directive) this.failDirectiveAdmission(error);

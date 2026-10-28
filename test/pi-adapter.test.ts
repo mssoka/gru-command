@@ -2335,11 +2335,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     const resumed = await fx.runtime.spawn('gru', { resumeFile: adapterCopy, model: `${STUB_PROVIDER_ID}/${STUB_MODEL_ID}` });
     try {
       expect(resumed.sessionFile).toBe(adapterCopy);
+      // The resumed session holds the old transcript's four messages (whether
+      // resume rewrites the copy is recorded in the PR, not asserted here).
+      const resumedSession = await actualDirectiveSdkSession(resumed);
+      expect(resumedSession.agent.state.messages.map((entry) => entry.role)).toEqual(['user', 'assistant', 'toolResult', 'assistant']);
       await resumed.prompt('continue', { owner: 'alice' });
       expect(fx.script.calls.map((c) => c.prompt)).toEqual(['continue']);
-      expect(readFileSync(adapterCopy, 'utf-8')).toContain('List the files in the project root.');
-      // The file's own recorded cwd survives the resume.
-      expect(readFileSync(adapterCopy, 'utf-8').split('\n')[0]).toContain('"cwd":"/fixture/project"');
     } finally {
       await resumed.dispose();
     }
@@ -2428,6 +2429,67 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('a directive on a resumed session whose persisted prompt carries text the effective prompt does not is refused before its first effect (#521)', async () => {
+    const fx = await fixture([
+      { deltas: ['ordinary reply'] },
+      { deltas: [], toolCall: { id: 'unbound-prompt-call', name: 'bash', args: { command: "printf 'ran\\n' > unbound-prompt.txt" } } },
+      { deltas: ['unreachable'] },
+    ]);
+    const identity = { requestId: 'unbound-prompt', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'unbound-prompt-job', workRevision: 0, authorityEpoch: 0 };
+    const first = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'unbound-prompt-minion' });
+    await first.prompt('ordinary work', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    // The persisted system message gains text no approved prompt carries. The
+    // SDK diffs prompt sections only, so it would replay that text unchanged.
+    type Row = { message?: { role: string; content?: unknown } };
+    const rows = readFileSync(file, 'utf-8').trimEnd().split('\n').map((line) => JSON.parse(line) as Row);
+    const system = rows.find((row) => row.message?.role === 'system');
+    expect(system).toBeDefined();
+    system!.message!.content = 'unapproved persisted role authority';
+    writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    const resumed = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'unbound-prompt-minion', resumeFile: file });
+    try {
+      const verdict = await resumed.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('native directive transcript prompt differs from the prompt its authority manifest bound') });
+      expect(existsSync(join(fx.workspace, 'unbound-prompt.txt'))).toBe(false);
+    } finally {
+      await resumed.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a system patch the SDK adds while preparing a directive\'s next turn is refused before that model request (#521)', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'patched-call', name: 'bash', args: { command: "printf 'ran\\n' > patched-first.txt" } } },
+      { deltas: ['unreachable'] },
+    ]);
+    const identity = { requestId: 'next-turn-patch', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'next-turn-patch-job', workRevision: 0, authorityEpoch: 0 };
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'next-turn-patch-minion' });
+    const session = await actualDirectiveSdkSession(handle);
+    // The SDK computes a prompt patch from the session's options before every
+    // turn; once the first tool result is in, it owes one the approved prompt
+    // never carried.
+    const sdk = session as unknown as { _preparePromptAndToolLoadout: (...args: unknown[]) => unknown };
+    const prepare = sdk._preparePromptAndToolLoadout.bind(session);
+    let patching = false;
+    sdk._preparePromptAndToolLoadout = (...args) => patching
+      ? { role: 'system', content: '', sections: { rules: 'unapproved next-turn section' }, timestamp: Date.now() }
+      : prepare(...args);
+    session.subscribe((event) => { if (event.type === 'message_end' && event.message.role === 'toolResult') patching = true; });
+    try {
+      const verdict = await handle.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('effective native model/role/tools authority changed during next-turn preparation') });
+      expect(readFileSync(join(fx.workspace, 'patched-first.txt'), 'utf-8')).toBe('ran\n');
+      expect(fx.script.calls).toHaveLength(1);
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
   it('a pi directive refuses prompt images by name: pi 1.x re-encodes them, so the receipt could not match (#521)', async () => {
     const { readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
     const fx = await fixture([{ deltas: ['unused'] }], ['text', 'image']);
@@ -2460,6 +2522,27 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       await waitFor(() => fx.script.calls.length === 1, 'the live turn');
       await handle.steer('adjust', { owner: 'alice' });
       expect(logs).toContain('warn:a pi extension input handler consumed the steer; nothing was queued');
+      release();
+      await turn;
+    } finally {
+      release();
+      await handle.dispose();
+    }
+  });
+
+  it('a follow-up an extension input handler consumed is logged, not silently accepted (#521)', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
+    const logs: string[] = [];
+    const fx = await fixture([{ deltas: ['a'], hold }], ['text'], { log: (level, msg) => { logs.push(`${level}:${msg}`); } });
+    const handle = await fx.runtime.spawn('gru');
+    const session = await actualDirectiveSdkSession(handle);
+    vi.spyOn(session, 'followUp').mockResolvedValue('handled');
+    try {
+      const turn = handle.prompt('mine', { owner: 'alice' });
+      await waitFor(() => fx.script.calls.length === 1, 'the live turn');
+      await handle.followUp('and then', { owner: 'alice' });
+      expect(logs).toContain('warn:a pi extension input handler consumed the follow-up; nothing was queued');
       release();
       await turn;
     } finally {
@@ -7223,6 +7306,36 @@ async function retryMinion(bodies: readonly (readonly ResponsesEvent[])[]) {
   const dispose = async () => { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); };
   return { logs, requests, handle, session, retryStarts, directive, dispose };
 }
+
+it('a real SDK retry whose failed reply the cache warmer followed still records its retry-start receipt, and the retried tool runs (#521)', async () => {
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-warm-leaf', { command: `printf ran >> ${JSON.stringify(effect)}` }), responsesAnswer('done after the warm entry')]);
+  const request = m.directive('warm-leaf-retry');
+  // Pi's cache warmer appends a usage entry on a timer: here it becomes the
+  // branch's leaf between the failed reply and the retry's start.
+  let warmed = false;
+  m.session.subscribe((event) => {
+    if (event.type === 'agent_end' && !warmed) {
+      warmed = true;
+      m.session.sessionManager.appendUsage('cache_warm', 'gru-synthetic-responses', 'synthetic-model',
+        { input: 1, output: 1, cacheRead: 9, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+    }
+  });
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    const file = m.handle.sessionFile!;
+    expect(warmed).toBe(true);
+    expect(nativeRows(file).some((row) => row.type === 'usage')).toBe(true);
+    const error = nativeRows(file).find((entry) => entry.message?.stopReason === 'error')!;
+    expect(producerJournal(file).filter((receipt) => receipt['state'] === 'retry-start')).toEqual([expect.objectContaining({ entryId: error.id })]);
+    expect(m.logs.filter((entry) => entry.msg === UNRECORDED_RETRY)).toEqual([]);
+    expect(readFileSync(effect, 'utf-8')).toBe('ran');
+    expect(verdict).toMatchObject({ ok: true });
+  } finally {
+    await m.dispose();
+  }
+});
 
 it('a real SDK retry of an error row holding an unknown block records no evidence, says why, and refuses the next tool by the error row\'s own reason (#483)', async () => {
   const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);

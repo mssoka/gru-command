@@ -379,7 +379,13 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
         seen.add(entry.id);
         let parentId = entry.parentId ?? null;
         while (parentId !== null && warmed.has(parentId)) parentId = warmed.get(parentId)!;
-        if (isCacheWarm(entry)) { warmed.set(entry.id, parentId); continue; }
+        if (isCacheWarm(entry)) {
+          // A warm entry resolving to itself closes a parent cycle the walk above
+          // would never leave: it is evidence of another writer, not a warm entry.
+          if (parentId === entry.id) { entries.push('malformed'); continue; }
+          warmed.set(entry.id, parentId);
+          continue;
+        }
         entries.push(parentId === (entry.parentId ?? null) ? entry : { ...entry, parentId });
       }
       return entries[index];

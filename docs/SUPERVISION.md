@@ -127,8 +127,12 @@ only in the form it is written in, linked on the chain:
   edit on a resumed session). Walked past before a directive's receipt and
   before a later bound request; one inside a turn is refused as another
   writer's authority change. The authority manifest binds the prompt the run
-  carries (the SDK's effective prompt), and once admission is published the
-  transcript's replayed prompt must equal it;
+  carries (the SDK's effective prompt). At admission, and before a
+  continuation, the transcript's replayed prompt must be that prompt (the
+  same sections, in whatever order the transcript first wrote them): text a
+  persisted system message carries beyond it would reach the model unapproved,
+  so it refuses the directive by name. From admission on, the replay may not
+  change for the rest of the turn;
 - **omitting context edits:** before Pi retries a failed reply, or compacts
   and retries it, it durably omits that reply from the model's context with a
   `context_edit` entry (null replacement) linked on it. The edit is part of

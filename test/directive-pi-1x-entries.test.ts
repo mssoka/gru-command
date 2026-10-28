@@ -104,6 +104,14 @@ describe('pi 1.x system message entries ahead of a directive receipt (#521)', ()
     expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'actual native request receipt unavailable' });
   });
 
+  it('a system message that is not linked on the baseline is no part of the receipt chain: admission is refused', () => {
+    const file = boundFile();
+    message(file, 'system-1', 'elsewhere', system);
+    message(file, 'receipt', 'system-1', userMessage(text));
+    expect(() => inspectDirectiveAdmission(file, identity)).toThrow(new DirectiveCheckpointError('actual native admission user receipt unavailable/changed'));
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+  });
+
   it('a system message inside the turn is another writer\'s authority change: the checkpoint is refused by name', () => {
     const { file } = scene(['system-1']);
     inspectDirectiveAdmission(file, identity);
@@ -147,6 +155,48 @@ describe('pi 1.x context edits around a retried reply (#521)', () => {
       message(file, 'answer', 'result', answer);
       expect(inspectDirectiveCheckpoint(file, identity), label).toMatchObject({ state: 'unknown' });
     }
+  });
+
+  it('a context edit that rewrites a row inside the turn is no omission of a failed reply: the checkpoint and the next tool are refused', () => {
+    const rewrite = { targetId: 'result', replacement: { role: 'toolResult', toolCallId: call.id, toolName: 'bash', isError: false, content: [{ type: 'text', text: 'rewritten' }] } };
+    const { file } = scene(['system-1']);
+    message(file, 'invocation', 'receipt', invocation);
+    message(file, 'result', 'invocation', result);
+    contextEdit(file, 'rewrite-result', 'result', rewrite);
+    message(file, 'answer', 'rewrite-result', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+    const second = scene(['system-1']);
+    const next = { ...call, id: 'call-second' };
+    const nextInvocation = { ...invocation, content: [next] };
+    message(second.file, 'invocation', 'receipt', invocation);
+    message(second.file, 'result', 'invocation', result);
+    contextEdit(second.file, 'rewrite-result', 'result', rewrite);
+    message(second.file, 'next-invocation', 'rewrite-result', nextInvocation);
+    expect(() => flushDirectiveToolIntent(second.file, nextInvocation, next, identity)).toThrow(DirectiveCheckpointError);
+  });
+
+  it('a context edit after the compact-and-retry that rewrites its compaction is refused ahead of a later bound request', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'retry-error', 'receipt', { ...failed, errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum' });
+    contextEdit(file, 'omit-error', 'retry-error');
+    compaction(file, 'retry-compaction', 'omit-error');
+    contextEdit(file, 'rewrite-compaction', 'retry-compaction', { replacement: { role: 'user', content: 'rewritten' } });
+    laterRequest(file, 'rewrite-compaction');
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native context edit does not omit the completed checkpoint' });
+  });
+
+  it('an edit linked on a sibling branch is not the omission of the terminal error row it names', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'retry-error', 'receipt', failed);
+    contextEdit(file, 'omit-error', 'receipt', { targetId: 'retry-error' });
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+  });
+
+  it('an edit that omits a reply which did not fail is no retry\'s omission: the checkpoint is refused', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'answer', 'receipt', answer);
+    contextEdit(file, 'omit-answer', 'answer');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
   });
 
   it('a retry abandoned after the context edit leaves the omitted error row as the turn\'s terminal: not ok, with that error', () => {
@@ -278,6 +328,23 @@ describe('pi 1.x cache-warm usage entries (#521)', () => {
     // Prepared while the warm entry is the last one: that entry is its baseline.
     laterRequest(file, 'warm-1', 'later-system');
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a warm entry that is its own parent closes a cycle, not a chain: admission and the checkpoint refuse it', () => {
+    const file = boundFile();
+    cacheWarm(file, 'warm-self', 'warm-self');
+    message(file, 'receipt', 'warm-self', userMessage(text));
+    expect(() => inspectDirectiveAdmission(file, identity)).toThrow(DirectiveCheckpointError);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+  });
+
+  it('two warm entries that are each other\'s parent close a cycle too: the walk ends and the receipt is refused', () => {
+    const file = boundFile();
+    cacheWarm(file, 'warm-a', 'warm-b');
+    cacheWarm(file, 'warm-b', 'warm-a');
+    message(file, 'receipt', 'warm-b', userMessage(text));
+    expect(() => inspectDirectiveAdmission(file, identity)).toThrow(DirectiveCheckpointError);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
   });
 
   it('a usage entry of any other kind is an unknown entry: the checkpoint refuses it by name', () => {
