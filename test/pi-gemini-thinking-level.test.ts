@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { streamSimple } from '@earendil-works/pi-ai/api/google-vertex';
-import type { Model } from '@earendil-works/pi-ai';
+import { normalizeContext, type Model } from '@earendil-works/pi-ai';
 
 /**
  * #521: Vertex rejects a Gemini 4 request that carries `thinkingBudget`
@@ -29,7 +29,8 @@ it('a Gemini 4 request with a requested reasoning level carries a thinking level
   let payload: unknown;
   const result = await streamSimple(
     gemini4,
-    { messages: [{ role: 'user', content: 'hello', timestamp: 0 }] },
+    // pi-ai 1.x providers take a normalized transcript context, not a raw Context.
+    normalizeContext({ messages: [{ role: 'user', content: 'hello', timestamp: 0 }] }),
     {
       reasoning: 'medium',
       // Top-level project/location options are dropped by streamSimple; the

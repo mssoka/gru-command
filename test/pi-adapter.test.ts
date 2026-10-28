@@ -1,5 +1,5 @@
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import { ModelRuntime, createBashToolDefinition, defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, createBashToolDefinition, defineTool, type AgentSession, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -6244,7 +6244,7 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
       expect(foreign.health().state).toBe('streaming');
     } else if (manifest) {
       const session = f.sessions.at(-1)!;
-      if (fault.startsWith('manifest-role')) session.agent.state.systemPrompt = 'unapproved live system authority';
+      if (fault.startsWith('manifest-role')) rewriteSystemPrompt(session, 'unapproved live system authority');
       else if (fault.startsWith('manifest-model')) session.agent.state.model = { ...session.model!, maxTokens: session.model!.maxTokens - 1 };
       else if (fault === 'manifest-execution-mode') session.agent.toolExecution = 'parallel';
       else session.agent.state.tools = session.agent.state.tools.filter((tool) => tool.name !== 'read');
@@ -6325,6 +6325,14 @@ it('refuses directive admission when a custom native tool has no explicit closur
   expect(f.script.calls).toHaveLength(0);
   await handle.dispose();
 });
+
+/** SDK 1.x derives `agent.state.systemPrompt` from the transcript's system
+ * messages (it is read-only): rewrite the leading one, as a live role change. */
+function rewriteSystemPrompt(session: AgentSession, text: string): void {
+  const [leading, ...rest] = session.agent.state.messages;
+  if (leading?.role !== 'system') throw new Error('expected the session transcript to lead with its system message');
+  session.agent.state.messages = [{ ...leading, content: text }, ...rest];
+}
 
 async function actualDirectiveSdkSession(handle: AgentHandle) {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
@@ -6564,7 +6572,7 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
     await waitFor(() => f.fx.script.calls.length === 1, 'actual guarded SDK model await');
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!; const file = row.nativeTarget!.sessionFile;
     const handle = f.registry.getHandle(row.nativeTarget!.agentId)!;
-    f.sessions[0]!.agent.state.systemPrompt = 'unapproved current role authority'; release(); await run;
+    rewriteSystemPrompt(f.sessions[0]!, 'unapproved current role authority'); release(); await run;
     expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(1);
     // While its tool refusals' receipts are owed, the refusal at the next model request is durable: never ordinary work.
     expect(checkpoint.inspectDirectiveCheckpoint(file, f.scene.identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });

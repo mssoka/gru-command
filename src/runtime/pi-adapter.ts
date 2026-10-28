@@ -11,7 +11,7 @@ import {
   SettingsManager,
 } from '@earendil-works/pi-coding-agent';
 import type { InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
-import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
+import { getCurrentSystemPrompt, type Api, type Model, type ThinkingLevel } from '@earendil-works/pi-ai';
 import { realpathSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -164,7 +164,7 @@ export const COMPACTION_END_RECONCILE_MS = 5_000;
 /**
  * Bound on the pi adapter's native-settlement proof (abort + waitForIdle) before
  * it may attest 'ceased' through the runtime-neutral `adapterCessationEvidence`
- * contract (issue #341, Option A; claude-code proves cessation by observed child close). SDK 0.85.1 `AgentSession.dispose()` is synchronous
+ * contract (issue #341, Option A; claude-code proves cessation by observed child close). SDK 1.4 `AgentSession.dispose()` is synchronous
  * and never awaits `waitForIdle`, so the adapter follows disposal with a
  * bounded session `waitForIdle` before it may report 'ceased'. Mirrors the 5s
  * bridge-teardown cap in `review-mcp-bridge.ts` (`BRIDGE_CLOSE_TIMEOUT_MS`):
@@ -1187,10 +1187,13 @@ export class PiAgentHandle implements AgentHandle {
     role: Role,
     private readonly session: {
       prompt(text: string, options?: unknown): Promise<void>;
-      steer(text: string, images?: unknown): Promise<void>;
-      followUp(text: string, images?: unknown): Promise<void>;
+      // SDK 1.x resolves steer/followUp with a "queued" | "handled" disposition
+      // (a handled input is consumed by an extension input handler); the
+      // adapter only awaits acceptance, as it did when these resolved void.
+      steer(text: string, images?: unknown): Promise<unknown>;
+      followUp(text: string, images?: unknown): Promise<unknown>;
       subscribe(listener: (event: unknown) => void): () => void;
-      /** SDK 0.85.1 dispose is synchronous cleanup, NOT native idle proof.
+      /** SDK 1.4 dispose is synchronous cleanup, NOT native idle proof.
        * GH286 independently awaits owned native/adapter quiescence below. */
       dispose(): Promise<void> | void;
       abort?(): Promise<void>;
@@ -1278,7 +1281,8 @@ export class PiAgentHandle implements AgentHandle {
             this.assertDirectiveExecutionAuthority(directive, signal);
             const context = update?.context ?? turn.context;
             if ((update?.model !== undefined && !isDeepStrictEqual(update.model, session.model)) ||
-                context.systemPrompt !== session.agent.state.systemPrompt || !isDeepStrictEqual(context.tools, session.agent.state.tools)) {
+                getCurrentSystemPrompt(context.messages) !== session.agent.state.systemPrompt ||
+                !isDeepStrictEqual(context.tools ?? [], session.agent.state.tools)) {
               throw new DirectiveCheckpointError('effective native model/role/tools authority changed during next-turn preparation');
             }
           }

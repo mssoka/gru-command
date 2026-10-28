@@ -404,7 +404,7 @@ class PiAncestry {
  */
 function linkedCompactionRefusal(entry: NativeEntry, parentId: string | null, ancestry: PiAncestry): string | null {
   if (parentId === null || entry.parentId !== parentId) return 'native compaction is not linked to the active checkpoint';
-  // The SDK GC ships (^0.85.1) always writes fromHook; without it, refused.
+  // The SDK GC ships (^1.4.0) always writes fromHook; without it, refused.
   if (entry.fromHook === true) return 'native compaction summary was authored by an extension hook';
   if (entry.fromHook !== false) return 'native compaction hook marker is malformed';
   if (typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '') return 'native compaction lacks a timestamp';

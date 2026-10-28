@@ -94,7 +94,7 @@ when it is a Pi-authored summary, with a timestamp, a summary and a token
 count, linked directly on the active chain, with its kept entry on that
 chain. `fromHook: false` marks a Pi-authored summary: an automatic one, or
 a manual compact, which GC runs only on an idle session and so never inside
-a live turn. The SDK GC ships (^0.85.1) always writes `fromHook`; a
+a live turn. The SDK GC ships (^1.4.0) always writes `fromHook`; a
 compaction without it is refused. Such a compaction is walked past in one
 of four places:
 
