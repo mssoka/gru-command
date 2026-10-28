@@ -6038,7 +6038,8 @@ async function assertJoinedCompaction(scenario: 'held-preparation' | 'past-deadl
       clock.mockRestore(); clock = null; polls.mockRestore();
       releaseJoinedSummary();
     }
-    await waitFor(() => nativeEnds === 2 && waiters.size === 1, 'next-turn preparation waiting after both native compactions');
+    try { await waitFor(() => nativeEnds === 2 && waiters.size === 1, 'next-turn preparation waiting after both native compactions'); }
+    catch (error) { console.log('DEBUG-JOINED', JSON.stringify({ scenario, nativeEnds, waiters: waiters.size, replies, summaries, events: events.map((e) => e.type), calls: f.script.calls.map((c) => c.prompt.slice(0, 30)) })); throw error; }
     expect(compactingAfterPreparation).toBeNull();
     // The second native start joined the open episode: one start, nothing published yet.
     expect(events.filter((event) => event.type === 'compaction_start' || event.type === 'compaction_end').map((event) => event.type)).toEqual(['compaction_start']);
