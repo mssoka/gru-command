@@ -147,15 +147,15 @@ function syntheticCompletionStream(): Response {
   const chunk = (payload: Record<string, unknown>): string => `data: ${JSON.stringify(payload)}\n\n`;
   const body = [
     chunk({
-      id: 'chatcmpl-schema-compat', object: 'chat.completion.chunk', created: 0, model: 'deepseek-v4-flash',
+      id: 'chatcmpl-schema-compat', object: 'chat.completion.chunk', created: 0, model: 'deepseek-flash',
       choices: [{ index: 0, delta: { role: 'assistant', content: 'ready' }, finish_reason: null }],
     }),
     chunk({
-      id: 'chatcmpl-schema-compat', object: 'chat.completion.chunk', created: 0, model: 'deepseek-v4-flash',
+      id: 'chatcmpl-schema-compat', object: 'chat.completion.chunk', created: 0, model: 'deepseek-flash',
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     }),
     chunk({
-      id: 'chatcmpl-schema-compat', object: 'chat.completion.chunk', created: 0, model: 'deepseek-v4-flash',
+      id: 'chatcmpl-schema-compat', object: 'chat.completion.chunk', created: 0, model: 'deepseek-flash',
       choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     }),
     'data: [DONE]\n\n',
@@ -200,12 +200,12 @@ async function capturedSpawn(
     const handle = await runtime.spawn('perkins', mode === 'lead'
       ? {
           cwd: workspace,
-          model: 'deepseek/deepseek-v4-flash',
+          model: 'deepseek/deepseek-flash',
           reviewLead: { systemPrompt: policy.systemPrompt, tools: [...policy.tools], nativeTools },
         }
       : {
           cwd: workspace,
-          model: 'deepseek/deepseek-v4-flash',
+          model: 'deepseek/deepseek-flash',
           isolatedReview: { systemPrompt: policy.systemPrompt, tools: [...policy.tools], nativeTools },
         });
     try {
@@ -338,7 +338,7 @@ describe.skipIf(!LIVE || !hasDeepseekCredential())('live deepseek lead registrat
     try {
       const handle = await runtime.spawn('perkins', {
         cwd: workspace,
-        model: 'deepseek/deepseek-v4-flash',
+        model: 'deepseek/deepseek-flash',
         thinkingLevel: 'max',
         reviewLead: {
           systemPrompt: captured.lead.systemPrompt,

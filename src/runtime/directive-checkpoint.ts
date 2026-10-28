@@ -435,7 +435,7 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
  * for such a reply. Returns that compaction; the named refusal when the
  * compaction on such a reply is not Pi's, or the error reply it continued
  * holds content that is not history; null when nothing continued `reply`. */
-function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): readonly NativeEntry[] | string | null {
+function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
   const stop = reply.message?.stopReason;
   if (reply.message?.role !== 'assistant' || !(stop === 'error' || stop === 'length' && !holdsToolCalls(reply.message))) return null;
   // Pi 1.x omits a failed reply from the model's context with a context edit
@@ -444,15 +444,18 @@ function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3
   const edit = typeof first === 'object' && omitsErrorRow(first, reply) ? first : null;
   const compaction = edit === null ? first : after(2);
   if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
-  // The compaction hangs off the edit, so its chain is checked through it.
+  // The compaction hangs off the edit, so its chain is checked through it; the
+  // callers link the compaction and skip the edit with it (see compactionSpan).
   if (edit !== null) ancestry.link(edit);
   const refusal = linkedCompactionRefusal(compaction, (edit ?? reply).id, ancestry);
   if (refusal !== null) return refusal;
   const retried = edit === null ? after(2) : after(3);
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
   if (stop === 'error' && !validRetryErrorContent(reply.message.content)) return 'native compaction retries an error row holding content that is not history';
-  return edit === null ? [compaction] : [edit, compaction];
+  return compaction;
 }
+/** How many entries a compact-and-retry spans after the failed reply: the compaction, and Pi 1.x's omitting context edit it hangs off when there is one. */
+const compactionSpan = (reply: NativeEntry, compaction: NativeEntry): 1 | 2 => compaction.parentId === reply.id ? 1 : 2;
 /** Pi 1.x keeps a failed reply in the transcript and durably omits it from
  * the model's context with a `context_edit` entry linked on it (`replacement`
  * null) when it retries the reply or compacts and retries it. A failed reply
@@ -798,9 +801,9 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
         if (retries.has(entry.id)) return unknown(RETRIED_TWICE);
         resumeTurn();
         // The failed reply is history; the turn continues on the compaction.
-        for (const walked of retry) ancestry.link(walked);
-        previous = retry[retry.length - 1]!;
-        index += retry.length;
+        ancestry.link(retry);
+        previous = retry;
+        index += compactionSpan(entry, retry);
         lastMessage = message;
         continue;
       }
@@ -1462,9 +1465,9 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
       if (typeof retry === 'string') refuse(retry);
       else if (retry !== null) {
         if (retries.has(entry.id)) refuse(RETRIED_TWICE);
-        for (const walked of retry) ancestry.link(walked);
-        previous = retry[retry.length - 1]!;
-        at += retry.length;
+        ancestry.link(retry);
+        previous = retry;
+        at += compactionSpan(entry, retry);
         continue;
       }
       if (message!.stopReason === 'error') {
