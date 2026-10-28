@@ -1253,7 +1253,11 @@ export class PiAgentHandle implements AgentHandle {
       // Use the SDK's ordinary active tool setup, retaining each real executor
       // in the authority fingerprint. Preparation is not an effect boundary:
       // parallel batches prepare every call before any executor is invoked.
-      session.agent.state.tools = session.agent.state.tools.map((tool) => {
+      const guardedTools = new WeakMap<SdkTool, SdkTool>();
+      const guardTool = (tool: SdkTool): SdkTool => {
+        if (directiveExecutorOrigins.has(tool.execute)) return tool;
+        const known = guardedTools.get(tool);
+        if (known !== undefined) return known;
         const originalExecute = tool.execute;
         const execute: SdkTool['execute'] = (toolCallId, args, signal, onUpdate) => {
           const guard = this.preparedDirectiveEffects.get(toolCallId);
@@ -1264,8 +1268,21 @@ export class PiAgentHandle implements AgentHandle {
           return originalExecute.call(tool, toolCallId, effectiveArgs, signal, onUpdate);
         };
         directiveExecutorOrigins.set(execute, originalExecute);
-        return { ...tool, execute };
-      });
+        const guarded = { ...tool, execute };
+        guardedTools.set(tool, guarded);
+        return guarded;
+      };
+      // SDK 1.x re-applies the active tool loadout (`agent.state.tools = ` the
+      // registry's own tools) before every prompt and next turn, which would
+      // drop a one-time wrap after the first prompt. Guard every assignment.
+      const agentState = session.agent.state;
+      const toolsAccessor = Object.getOwnPropertyDescriptor(agentState, 'tools');
+      if (toolsAccessor?.get === undefined || toolsAccessor.set === undefined || toolsAccessor.configurable !== true) {
+        throw new Error('the pi SDK agent state no longer exposes an assignable tools accessor; refusing to run without the directive executor fence');
+      }
+      const { get: readTools, set: writeTools } = toolsAccessor;
+      Object.defineProperty(agentState, 'tools', { ...toolsAccessor, set: (tools: SdkTool[]) => writeTools.call(agentState, tools.map(guardTool)) });
+      agentState.tools = readTools.call(agentState);
       const beforeNextTurn = session.agent.prepareNextTurnWithContext;
       session.agent.prepareNextTurnWithContext = async (turn, signal) => {
         const directive = this.liveDirective;

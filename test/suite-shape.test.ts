@@ -390,7 +390,7 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 6,
   'supervisor.test.ts': 243,
   'tool-heartbeat.test.ts': 2,
-  'transcripts.test.ts': 17,
+  'transcripts.test.ts': 18,
   'uploads-dir.test.ts': 6,
   'vector-attack.test.ts': 7,
   'vector-raid-runner.test.ts': 37,

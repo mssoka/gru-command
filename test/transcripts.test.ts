@@ -389,6 +389,29 @@ describe('transcript service', () => {
     expect(result.tornLines).toBe(0);
   });
 
+  it('a pi 1.x session file\'s system message entry is scaffolding: it yields no transcript entry (#521)', () => {
+    const { dir, svc } = tmpStore();
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    const system = {
+      type: 'message', id: 'sys-1', parentId: null, timestamp: T0,
+      message: {
+        role: 'system', content: '', timestamp: 500,
+        sections: { identity: 'You are a minion.' },
+        toolsAdded: [{ name: 'read', description: 'Read a file', parameters: { type: 'object' } }],
+      },
+    };
+    writeFileSync(
+      join(dir, 'sessions', 'minion', 'd', 'pi-1x.jsonl'),
+      sessionFile([header(), system, userEntry('u1', 'sys-1', 'hello'), assistantEntry('a1', 'u1', 'hi there', 'greet back')]),
+    );
+    const result = svc.read('minion/d/pi-1x.jsonl');
+    expect(result.tornLines).toBe(0);
+    expect(result.entries.map((entry) => [entry.index, entry.kind, entry.text, entry.thinking])).toEqual([
+      [0, 'user', 'hello', null],
+      [1, 'assistant', 'hi there', 'greet back'],
+    ]);
+  });
+
   it('an empty session file pages cleanly (total 0)', () => {
     const { dir, svc } = tmpStore();
     mkdirSync(join(dir, 'sessions', 'gru', 'd'), { recursive: true });

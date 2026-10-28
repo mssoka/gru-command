@@ -469,16 +469,36 @@ function controlRefusal(control: NativeEntry, tip: NativeEntry, ancestry: PiAnce
       (typeof control.thinkingLevel !== 'string' || !PI_THINKING_CONTROL_LEVELS.includes(control.thinkingLevel))) return 'native thinking-level control is malformed';
   return null;
 }
+/** Pi 1.x persists the prompt and tool declarations as `system` message
+ * entries: the session's leading one, and a patch whenever the SDK finds its
+ * sections or tools changed. They sit directly ahead of the prompt that
+ * carries them, run no tool and send no message, so one linked on the chain
+ * is walked past. An authority change in them is refused by the live
+ * authority manifest (it hashes the effective prompt and tools), not here. */
+function linkedSystemMessage(entry: NativeEntry | 'malformed' | undefined, parentId: string | null): entry is NativeEntry {
+  return typeof entry === 'object' && entry.type === 'message' && entry.message?.role === 'system' && entry.parentId === parentId;
+}
 /** Where a directive's user receipt is: directly after its baseline, or after
- * Pi's pre-prompt compaction linked on the baseline. A compaction there that
- * is not that evidence is refused by its reason. */
+ * Pi's pre-prompt compaction linked on the baseline, then after the system
+ * messages Pi 1.x writes ahead of the prompt (linkedSystemMessage). A
+ * compaction there that is not that evidence is refused by its reason. */
 function piReceiptAt(turn: PiTurn, baseline: string | null, ancestry: PiAncestry): { readonly index: number; readonly parentId: string | null } | string {
+  let index = 0;
+  let parentId = baseline;
   const first = turn(0);
-  if (typeof first !== 'object' || first.type !== 'compaction') return { index: 0, parentId: baseline };
-  const refusal = linkedCompactionRefusal(first, baseline, ancestry);
-  if (refusal !== null) return refusal;
-  ancestry.link(first);
-  return { index: 1, parentId: first.id };
+  if (typeof first === 'object' && first.type === 'compaction') {
+    const refusal = linkedCompactionRefusal(first, baseline, ancestry);
+    if (refusal !== null) return refusal;
+    ancestry.link(first);
+    index = 1;
+    parentId = first.id;
+  }
+  for (let entry = turn(index); linkedSystemMessage(entry, parentId); entry = turn(index)) {
+    ancestry.link(entry);
+    index += 1;
+    parentId = entry.id;
+  }
+  return { index, parentId };
 }
 /** Header facts come from the first line alone. They identify a session/cwd,
  * never admission, completion or work authority. */
@@ -577,8 +597,16 @@ function laterBoundRequestRefusal(file: string, native: PiTurn, identity: Direct
     tip = control;
     nextIndex += 1;
   }
+  // Pi 1.x writes its system messages ahead of the later prompt (see
+  // linkedSystemMessage); the later binding's baseline is still `tip`.
+  let promptParent: NativeEntry = tip;
+  for (let entry = native(nextIndex); linkedSystemMessage(entry, promptParent.id); entry = native(nextIndex)) {
+    ancestry.link(entry);
+    promptParent = entry;
+    nextIndex += 1;
+  }
   const immediate = native(nextIndex);
-  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== tip.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
+  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== promptParent.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
   // The later binding's baseline is the receipt's parent, or the entry Pi
   // compacted on before that prompt (see piReceiptAt).
   const baselines = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];

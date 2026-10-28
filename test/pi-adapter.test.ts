@@ -65,6 +65,10 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
   };
 });
 
+/** A real 1x1 PNG. Pi 1.x decodes prompt images and drops (with a hint in the
+ * prompt text) bytes that are not an image, so transport tests need a real one. */
+const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+
 /** A session written by the real pi 0.85.1 SessionManager (recorded cwd /fixture/project). */
 const PI_085_SESSION = join(import.meta.dirname, 'fixtures', 'pi-0.85-session.jsonl');
 
@@ -3165,7 +3169,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(handle.capabilities.images).toBe(true);
       await handle.prompt('look at this', {
         owner: 'alice',
-        images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
+        images: [{ mediaType: 'image/png', data: PNG_1X1_BASE64 }],
       });
       expect(fx.script.calls.length).toBe(1);
       expect(fx.script.calls[0]!.imageCount).toBe(1);
@@ -3352,10 +3356,10 @@ describe('Perkins r1 regressions', () => {
     try {
       await handle.prompt('look', {
         owner: 'alice',
-        images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
+        images: [{ mediaType: 'image/png', data: PNG_1X1_BASE64 }],
       });
       expect(fx.script.calls[0]!.images).toEqual([
-        { data: 'aGVsbG8=', mimeType: 'image/png' },
+        { data: PNG_1X1_BASE64, mimeType: 'image/png' },
       ]);
     } finally {
       await handle.dispose();
