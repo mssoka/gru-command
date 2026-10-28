@@ -1165,6 +1165,10 @@ export class PiAgentHandle implements AgentHandle {
    * fault is no object): each is logged once, first failure or not. */
   private readonly loggedBookkeepingFaults = new WeakSet<object>();
   private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
+  /** The prompt the session's transcript replays once the directive's admission
+   * is published (Pi 1.x replays it from persisted system messages). Nothing
+   * may change it for the rest of the turn. */
+  private admittedTranscriptPrompt: string | null = null;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'` holding no tool calls).
    * Reset per turn; the settle capture reads it before `drain()` starts a
@@ -1313,11 +1317,10 @@ export class PiAgentHandle implements AgentHandle {
             this.assertDirectiveExecutionAuthority(directive, signal);
             const context = update?.context ?? turn.context;
             if ((update?.model !== undefined && !isDeepStrictEqual(update.model, session.model)) ||
-                // The request carries the transcript plus the messages (the prompt
-                // patch among them) the SDK appends first: that replay is the SDK's
-                // effective prompt, and the live agent state is checked against it
-                // by the authority check above.
-                getCurrentSystemPrompt([...context.messages, ...(update?.messages ?? [])]) !== session.systemPrompt ||
+                // The request carries the transcript plus the messages (a prompt
+                // patch among them) the SDK appends first: that replay is the prompt
+                // admission saw, and a patch arriving now is refused before the request.
+                getCurrentSystemPrompt([...context.messages, ...(update?.messages ?? [])]) !== this.admittedTranscriptPrompt ||
                 !isDeepStrictEqual(context.tools ?? [], session.agent.state.tools)) {
               throw new DirectiveCheckpointError('effective native model/role/tools authority changed during next-turn preparation');
             }
@@ -1381,6 +1384,11 @@ export class PiAgentHandle implements AgentHandle {
     }
   }
 
+  /** The prompt the session's transcript replays (a real AgentSession only). */
+  private transcriptPrompt(): string | null {
+    return this.session instanceof AgentSession ? this.session.agent.state.systemPrompt : null;
+  }
+
   /** Pi 1.x lets an extension's input handler consume a queued message
    * ("handled"): nothing was queued, so the log says so. */
   private noteInputDisposition(kind: 'steer' | 'follow-up', disposition: unknown): void {
@@ -1423,10 +1431,10 @@ export class PiAgentHandle implements AgentHandle {
       throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${thrownText(failure.error, 'string')}`, { cause: failure.error });
     }
     if (this.publishedDirectiveAdmission !== directive) throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
-    // Past admission this run's prompt patch is persisted, so the transcript the
-    // requests are built from must replay the prompt the manifest bound.
-    if (this.session instanceof AgentSession && this.session.agent.state.systemPrompt !== this.session.systemPrompt) {
-      throw new DirectiveCheckpointError('live native directive transcript prompt differs from the session\'s effective prompt');
+    // Past admission this run's prompt patch is persisted: the transcript the
+    // requests are built from may not replay a different prompt from here on.
+    if (this.admittedTranscriptPrompt !== null && this.transcriptPrompt() !== this.admittedTranscriptPrompt) {
+      throw new DirectiveCheckpointError('live native directive transcript prompt changed after its admission');
     }
     // Each GC bookkeeping call runs by itself: a fault there is GC's refusal.
     if (recheckCurrentAdmission) withOwnIo('authority check', () => directive.beforeAdmission());
@@ -1570,6 +1578,11 @@ export class PiAgentHandle implements AgentHandle {
     if (proof.state !== 'resumable' || proof.checkpointId !== checkpointId || proof.binding.agentId !== this.id || proof.binding.sessionId !== this.nativeSessionId || proof.binding.authorityManifest !== this.directiveAuthorityManifest?.()) {
       throw new DirectiveCheckpointError('native directive checkpoint changed or is not safely resumable');
     }
+    // Pi 1.x builds a continuation's requests from the persisted transcript and
+    // adds no system prompt of its own: one written before the upgrade has none.
+    if (this.session instanceof AgentSession && !this.session.agent.state.messages.some((message) => message.role === 'system')) {
+      throw new DirectiveCheckpointError('native directive continuation needs the system prompt persisted in its transcript; this one predates pi 1.x and is not safely resumable');
+    }
     beforeContinuation();
     this.prepareDirectiveProducer(identity);
     const directive = { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} };
@@ -1578,6 +1591,7 @@ export class PiAgentHandle implements AgentHandle {
       // Exact original admission was inspected above and its continuation
       // claim just committed; no new user entry or admission is synthesized.
       this.publishedDirectiveAdmission = directive;
+      this.admittedTranscriptPrompt = this.transcriptPrompt();
       return this.session.agent!.continue();
     });
     await turn.done;
@@ -2007,6 +2021,7 @@ export class PiAgentHandle implements AgentHandle {
     this.directiveAdmissionFailure = null;
     this.nativeDirectiveRefusals.clear();
     this.publishedDirectiveAdmission = undefined;
+    this.admittedTranscriptPrompt = null;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
@@ -2254,7 +2269,10 @@ export class PiAgentHandle implements AgentHandle {
               // The readback with its binding write, and the ledger's publication, are GC's own bookkeeping.
               const binding = withOwnIo('admission receipt', () => inspectDirectiveAdmission(this.sessionFile, directive.identity));
               withOwnIo('admission publication', () => directive.onAdmitted(binding));
-              if (this.liveDirective === directive) this.publishedDirectiveAdmission = directive;
+              if (this.liveDirective === directive) {
+                this.publishedDirectiveAdmission = directive;
+                this.admittedTranscriptPrompt = this.transcriptPrompt();
+              }
             } catch (error) {
               if (this.liveDirective === directive) this.failDirectiveAdmission(error);
             }

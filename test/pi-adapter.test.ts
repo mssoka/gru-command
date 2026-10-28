@@ -5146,6 +5146,30 @@ it('restart recovery continues a durable SDK user checkpoint without replaying i
   } finally { await f.runtime.dispose(); f.store.dispose(); }
 });
 
+it('restart recovery refuses to continue a checkpoint whose transcript predates pi 1.x: no system prompt would reach the model (#521)', async () => {
+  const f = await fixture([{ deltas: ['must not run'] }]);
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const identity = { requestId: 'pre-1x-checkpoint', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'pre-1x-job', workRevision: 0, authorityEpoch: 0 };
+  const original = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'pre-1x-minion' });
+  const file = original.sessionFile!;
+  let preflights = 0;
+  try {
+    await expect(original.prompt('already accepted request', { directive: { identity,
+      beforeAdmission: () => { if (++preflights > 1) throw new Error('fixture stops before native acceptance'); },
+      onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
+    } })).rejects.toThrow('fixture stops before native acceptance');
+    await original.dispose();
+    // What a 0.85.1 host persisted: the user receipt with no system message before it.
+    SessionManager.open(file).appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted request' }], timestamp: Date.now() });
+    const proof = inspectDirectiveCheckpoint(file, identity);
+    if (proof.state !== 'resumable') throw new Error('pre-1.x checkpoint fixture is not resumable');
+    const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
+    await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => {})).rejects.toThrow('this one predates pi 1.x and is not safely resumable');
+    expect(f.script.calls).toHaveLength(0);
+  } finally { await f.runtime.dispose(); f.store.dispose(); }
+});
+
 it('restart recovery retains UNKNOWN and its writer lock through pending or failed actual SDK disposal', async () => {
   let release!: () => void;
   const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
