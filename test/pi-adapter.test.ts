@@ -10,7 +10,7 @@ import { join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { afterAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
-import { COMPACTION_END_RECONCILE_MS, PiRuntime, laneBashTool, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
+import { COMPACTION_END_RECONCILE_MS, PiRuntime, laneBashTool, normalizeSessionPath, rendersAs, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import type { DirectiveProducer } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, applyThinkingFallback, ledgerReviewOwnerCessation, serviceRegistryOptions } from '../src/runtime/registry.js';
@@ -2429,7 +2429,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('a directive on a resumed session whose persisted prompt carries text the effective prompt does not is refused before its first effect (#521)', async () => {
+  it('a directive on a resumed session whose persisted prompt carries text the effective prompt does not is refused before its receipt and its first request (#521)', async () => {
     const fx = await fixture([
       { deltas: ['ordinary reply'] },
       { deltas: [], toolCall: { id: 'unbound-prompt-call', name: 'bash', args: { command: "printf 'ran\\n' > unbound-prompt.txt" } } },
@@ -2450,14 +2450,49 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
     const resumed = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'unbound-prompt-minion', resumeFile: file });
     try {
-      const verdict = await resumed.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
-      expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('native directive transcript prompt differs from the prompt its authority manifest bound') });
+      await expect(resumed.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow('native directive transcript prompt differs from the prompt its authority manifest bound');
+      // Refused ahead of the receipt: the unapproved text never reaches the model.
+      expect(fx.script.calls.map((call) => call.prompt)).toEqual(['ordinary work']);
       expect(existsSync(join(fx.workspace, 'unbound-prompt.txt'))).toBe(false);
+      expect(readFileSync(file, 'utf-8')).not.toContain('approved directive');
     } finally {
       await resumed.dispose();
       await fx.runtime.dispose();
       fx.store.dispose();
     }
+  });
+
+  it('the effective prompt is the replay\'s parts in any order, and a mismatch costs no search however many parts repeat (#521)', () => {
+    expect(rendersAs('', [])).toBe(true);
+    expect(rendersAs('one\n\ntwo\n\nthree', ['three', 'one', 'two'])).toBe(true);
+    expect(rendersAs('one\n\ntwo', ['one', 'two', 'two'])).toBe(false);
+    expect(rendersAs('one\n\ntwo', ['one', 'three'])).toBe(false);
+    expect(rendersAs('one two', ['one', 'two'])).toBe(false);
+    expect(rendersAs('one\n\ntwo\n\nextra', ['one', 'two'])).toBe(false);
+    // 60 equal sections that are not the text: every order was once tried.
+    const repeated = Array.from({ length: 60 }, () => 'section');
+    const started = Date.now();
+    expect(rendersAs([...repeated.slice(1), 'other'].join('\n\n'), repeated)).toBe(false);
+    expect(rendersAs(repeated.join('\n\n'), repeated)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('a session keeps the pre-1.x request pattern: prompt-cache warming is off unless the user\'s own Pi settings name a mode (#521)', async () => {
+    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }]);
+    const mode = async (spawn: () => Promise<AgentHandle>) => {
+      const handle = await spawn();
+      try { return (await actualDirectiveSdkSession(handle)).settingsManager.getCacheWarmingMode(); } finally { await handle.dispose(); }
+    };
+    expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace }))).toBe('off');
+    const review = await fx.runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'isolated policy', tools: [] } });
+    try {
+      expect((twinGate.lastOptions as { settingsManager: { getCacheWarmingMode(): string } }).settingsManager.getCacheWarmingMode()).toBe('off');
+    } finally { await review.dispose(); }
+    const settings = join(fx.agentDir, 'settings.json');
+    writeFileSync(settings, JSON.stringify({ ...(existsSync(settings) ? JSON.parse(readFileSync(settings, 'utf-8')) as object : {}), cacheWarming: 'streaming' }));
+    expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace }))).toBe('streaming');
+    expect(JSON.parse(readFileSync(settings, 'utf-8'))).toMatchObject({ cacheWarming: 'streaming' });
   });
 
   it('a system patch the SDK adds while preparing a directive\'s next turn is refused before that model request (#521)', async () => {
@@ -5249,6 +5284,33 @@ it('restart recovery refuses to continue a checkpoint whose transcript predates 
     if (proof.state !== 'resumable') throw new Error('pre-1.x checkpoint fixture is not resumable');
     const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
     await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => {})).rejects.toThrow('this one predates pi 1.x and is not safely resumable');
+    expect(f.script.calls).toHaveLength(0);
+  } finally { await f.runtime.dispose(); f.store.dispose(); }
+});
+
+it('restart recovery refuses to continue a checkpoint whose persisted prompt carries text the effective prompt does not: nothing reaches the model (#521)', async () => {
+  const f = await fixture([{ deltas: ['must not run'] }]);
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const identity = { requestId: 'unbound-checkpoint', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'unbound-checkpoint-job', workRevision: 0, authorityEpoch: 0 };
+  const original = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'unbound-checkpoint-minion' });
+  const file = original.sessionFile!;
+  let preflights = 0;
+  try {
+    // What a 1.x host persists ahead of the receipt, with text its prompt never carried.
+    const system = { ...persistedSystemMessage(await actualDirectiveSdkSession(original)), content: 'unapproved persisted role authority' };
+    await expect(original.prompt('already accepted request', { directive: { identity,
+      beforeAdmission: () => { if (++preflights > 1) throw new Error('fixture stops before native acceptance'); },
+      onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
+    } })).rejects.toThrow('fixture stops before native acceptance');
+    await original.dispose();
+    const manager = SessionManager.open(file);
+    manager.appendMessage(system);
+    manager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted request' }], timestamp: Date.now() });
+    const proof = inspectDirectiveCheckpoint(file, identity);
+    if (proof.state !== 'resumable') throw new Error('checkpoint fixture is not resumable');
+    const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
+    await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => {})).rejects.toThrow('native directive transcript prompt differs from the prompt its authority manifest bound');
     expect(f.script.calls).toHaveLength(0);
   } finally { await f.runtime.dispose(); f.store.dispose(); }
 });

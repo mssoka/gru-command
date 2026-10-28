@@ -112,6 +112,25 @@ describe('pi 1.x system message entries ahead of a directive receipt (#521)', ()
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
   });
 
+  it('a compaction that keeps history older than the system message ahead of the receipt crosses that message: the turn stays readable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-pi-1x-entries-'));
+    dirs.push(dir);
+    const file = join(dir, 'session.jsonl');
+    writeFileSync(file, `${JSON.stringify({ type: 'session', id: 'pi-session', version: 3, cwd: '/lane' })}\n`);
+    message(file, 'old-question', null, userMessage('earlier work'));
+    message(file, 'old-answer', 'old-question', answer);
+    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text, authorityManifest: 'manifest' });
+    message(file, 'system-1', 'old-answer', system);
+    message(file, 'receipt', 'system-1', userMessage(text));
+    expect(inspectDirectiveAdmission(file, identity).userEntryId).toBe('receipt');
+    message(file, 'invocation', 'receipt', invocation);
+    message(file, 'result', 'invocation', result);
+    append(file, { type: 'compaction', id: 'mid-compaction', parentId: 'result', timestamp: '2026-10-28T00:00:00.000Z', summary: 'Pi automatic compaction summary',
+      firstKeptEntryId: 'old-answer', tokensBefore: 90_000, fromHook: false });
+    message(file, 'answer', 'mid-compaction', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
   it('a system message inside the turn is another writer\'s authority change: the checkpoint is refused by name', () => {
     const { file } = scene(['system-1']);
     inspectDirectiveAdmission(file, identity);

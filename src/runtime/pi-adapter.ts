@@ -62,15 +62,41 @@ type SdkTool = AgentSession['agent']['state']['tools'][number];
 /** Whether `text` is the prompt that `parts` render as, in some order. Pi 1.x
  * renders a transcript's sections in the order they were first written and
  * builds its own prompt in a fixed one, so a section a later patch added sits
- * elsewhere in the replay: the same text, the same sections, another order. */
-function rendersAs(text: string, parts: readonly string[]): boolean {
+ * elsewhere in the replay: the same text, the same sections, another order.
+ * The parts come from a transcript, so the search is bounded: the lengths must
+ * agree, equal parts are one choice, and a state already refused is not tried
+ * again. */
+export function rendersAs(text: string, parts: readonly string[]): boolean {
   if (parts.length === 0) return text === '';
-  return parts.some((part, index) => {
-    if (!text.startsWith(part)) return false;
-    const rest = parts.filter((_, other) => other !== index);
-    if (rest.length === 0) return text === part;
-    return text.startsWith(`${part}\n\n`) && rendersAs(text.slice(part.length + 2), rest);
-  });
+  if (parts.reduce((length, part) => length + part.length, 2 * (parts.length - 1)) !== text.length) return false;
+  const left = new Map<string, number>();
+  for (const part of parts) left.set(part, (left.get(part) ?? 0) + 1);
+  const refused = new Set<string>();
+  const walk = (offset: number, count: number): boolean => {
+    if (count === 0) return offset === text.length + 2;
+    const state = `${offset}:${[...left.values()].join(',')}`;
+    if (refused.has(state)) return false;
+    for (const [part, remaining] of left) {
+      if (remaining === 0 || !text.startsWith(part, offset) || (count > 1 && !text.startsWith('\n\n', offset + part.length))) continue;
+      left.set(part, remaining - 1);
+      const found = walk(offset + part.length + 2, count - 1);
+      left.set(part, remaining);
+      if (found) return true;
+    }
+    refused.add(state);
+    return false;
+  };
+  return walk(0, parts.length);
+}
+
+/** Pi 1.x resumes a session's cache-warming mode from the user's own Pi
+ * settings and otherwise warms by default: a paid request on a timer that
+ * the directive fence does not see and the yield report does not count.
+ * A session keeps the pre-1.x request pattern unless those settings name a
+ * mode; nothing is written to them. */
+function withoutImplicitCacheWarming(settings: SettingsManager): SettingsManager {
+  if (settings.getGlobalSettings().cacheWarming === undefined) settings.getCacheWarmingMode = () => 'off';
+  return settings;
 }
 
 /** The tools accessor the directive executor fence is installed on. Pi 1.x
@@ -927,6 +953,7 @@ export class PiRuntime implements AgentRuntime {
       const isolatedSettings = reviewMode === undefined
         ? undefined
         : SettingsManager.inMemory({}, { projectTrusted: false });
+      const sessionSettings = withoutImplicitCacheWarming(isolatedSettings ?? SettingsManager.create(cwd, this.agentDir));
       // Issue #283: the lane-bound GC-managed BMAD runtime rides beside the
       // project's own skills and wins a name collision. Review sessions
       // never carry it (they load no skills at all).
@@ -1009,7 +1036,7 @@ export class PiRuntime implements AgentRuntime {
             ? { customTools: [...(laneBash !== null ? [laneBash] : []), ...nativeTools] }
             : {}),
         resourceLoader: loader,
-        ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
+        settingsManager: sessionSettings,
         sessionManager,
         modelRuntime: await this.runtime(),
       });
@@ -1351,7 +1378,10 @@ export class PiAgentHandle implements AgentHandle {
       const startPrompt = session.agent.prompt.bind(session.agent);
       session.agent.prompt = (async (...args: Parameters<typeof startPrompt>) => {
         const directive = this.liveDirective;
-        if (directive !== undefined) this.assertDirectivePreflight(directive);
+        if (directive !== undefined) {
+          const [input] = args;
+          this.assertDirectivePreflight(directive, Array.isArray(input) ? input : typeof input === 'object' && input !== null ? [input] : []);
+        }
         return startPrompt(...args);
       }) as typeof startPrompt;
       const before = session.agent.beforeToolCall;
@@ -1407,14 +1437,14 @@ export class PiAgentHandle implements AgentHandle {
    * manifest bound: the requests are built from the transcript, so text its
    * system messages carry beyond the effective prompt would reach the model
    * unapproved. */
-  private boundTranscriptPrompt(): string | null {
+  private boundTranscriptPrompt(starting: AgentSession['agent']['state']['messages'] = []): string | null {
     if (!(this.session instanceof AgentSession)) return null;
-    const replayed = getCurrentSystemMessage(this.session.agent.state.messages);
+    const replayed = getCurrentSystemMessage([...this.session.agent.state.messages, ...starting]);
     const parts = replayed === undefined ? [] : [contentText(replayed.content), ...Object.values(replayed.sections ?? {})].filter((part): part is string => part !== null && part.length > 0);
     if (!rendersAs(this.session.systemPrompt, parts)) {
       throw new DirectiveCheckpointError('native directive transcript prompt differs from the prompt its authority manifest bound');
     }
-    return this.transcriptPrompt();
+    return starting.length === 0 ? this.transcriptPrompt() : getCurrentSystemPrompt([...this.session.agent.state.messages, ...starting]);
   }
 
   /** Pi 1.x lets an extension's input handler consume a queued message
@@ -1428,7 +1458,7 @@ export class PiAgentHandle implements AgentHandle {
    * compaction terminal is published if Pi's gate has cleared. If one is
    * still withheld, or the handle was disposed (the reconcile bound
    * disposes), the directive is not admitted. */
-  private assertDirectivePreflight(directive: NonNullable<PromptOptions['directive']>): void {
+  private assertDirectivePreflight(directive: NonNullable<PromptOptions['directive']>, starting: AgentSession['agent']['state']['messages'] = []): void {
     try {
       if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
       if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
@@ -1438,6 +1468,10 @@ export class PiAgentHandle implements AgentHandle {
       if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest?.()) {
         throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
       }
+      // The SDK hands the prompt patch it persists to the run here, ahead of the
+      // receipt and the first request: the transcript those requests replay is
+      // the stored messages plus these.
+      this.boundTranscriptPrompt(starting);
     } catch (error) {
       // The prompt rejects with this very object. GC's authority or
       // compaction refusal here keeps a durable authority receipt, as a fence
