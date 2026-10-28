@@ -627,24 +627,30 @@ export class SessionStore {
       const stagingPath = join(this.backupDir, name);
       const destination = join(this.backupDir, generation);
       const entry = recorded.get(generation);
-      // A staged copy left by an interrupted rename is COMPLETE: if the
-      // baseline records that generation and the destination is not a usable
-      // snapshot, promote the staged file into place (an unusable destination
-      // is replaced by the rename) instead of deleting the newest bytes.
-      const destinationSize = this.statGeneration(generation);
-      if (entry !== undefined && (destinationSize === null || destinationSize < entry.size)) {
+      if (entry !== undefined) {
+        // A staged copy left by an interrupted or failed rename is COMPLETE:
+        // when the baseline records that generation, promote the staged file
+        // into place if it holds more than the destination does (an unusable
+        // destination holds nothing; a usable one still holds the OLDER bytes
+        // of a same-slot refresh). Session files are append-only, so the
+        // larger copy of the same source is the newer one. Anything else is a
+        // stale or partial staging and is deleted below.
+        const destinationSize = this.statGeneration(generation);
         try {
-          if (statSync(stagingPath).size >= entry.size) {
+          const staged = statSync(stagingPath);
+          if (staged.size >= entry.size && staged.size > (destinationSize ?? -1)) {
             renameSync(stagingPath, destination);
             continue;
           }
         } catch {
           /* fall through */
         }
-        // The copy is recorded but cannot be promoted: keep it (and say so)
-        // rather than deleting a possible only copy of the newest bytes.
-        this.log('warn', 'session staging copy could not be promoted', { staging: name });
-        continue;
+        if (destinationSize === null || destinationSize < entry.size) {
+          // The copy is recorded but cannot be promoted: keep it (and say so)
+          // rather than deleting a possible only copy of the newest bytes.
+          this.log('warn', 'session staging copy could not be promoted', { staging: name });
+          continue;
+        }
       }
       targets.push(stagingPath);
     }
@@ -890,8 +896,12 @@ export class SessionStore {
           // intended-but-absent one: the old fingerprint makes the next pass
           // retry.
           next[copy.source.key] = previous;
+        } else {
+          // A cold-start copy that did not land has no snapshot to point at:
+          // drop the pre-copy intent so the baseline never names a generation
+          // that does not exist. The next pass copies the source again.
+          delete next[copy.source.key];
         }
-        // With no previous entry (a cold start) no entry is adopted here.
         this.log('warn', 'session backup copy failed', { file: copy.source.file, error: String(error) });
         continue;
       }
@@ -910,19 +920,19 @@ export class SessionStore {
         });
       }
     }
-    this.persistSnapshotFromSources(sources);
-    // The size snapshot belongs to every pass, including a pass that cannot
-    // record its copies and defers them.
     let recordIsCurrent = true;
     try {
       this.writeBaseline(next, this.baselinePendingFile);
     } catch (error) {
-      // The pre-copy record is what will be published. The prune may only
-      // delete what that record does not name, so it is skipped: pruning
-      // against the un-recorded post-copy state could delete a generation the
-      // published record still names.
+      // The pre-copy record stays in the pending file, unpublished: it may
+      // name a generation a failed copy never wrote, and publishing it would
+      // replace the final baseline's entry for the last generation that
+      // exists (the next pass reads the pending record first and falls back
+      // to the final entry for an intent-only one). The prune is skipped too:
+      // pruning against the un-recorded post-copy state could delete a
+      // generation the record still names.
       recordIsCurrent = false;
-      this.log('warn', 'session backup baseline could not be rewritten after the copies — publishing the pre-copy record without pruning', {
+      this.log('warn', 'session backup baseline could not be rewritten after the copies — the pre-copy record is kept unpublished and nothing is pruned', {
         baselineFile: this.baselineFile,
         error: String(error),
       });
@@ -938,17 +948,19 @@ export class SessionStore {
     const pruned = recordIsCurrent
       ? this.pruneBackups(liveFiles, recordedGenerations, this.listBackupGenerations(), now)
       : [];
-    try {
-      this.publishBaseline();
-    } catch (error) {
-      // The unguarded boot pass must not refuse startup over an
-      // un-replaceable final path: the pending record stays and is preferred
-      // by the next pass, so no recorded identity is lost.
-      this.log('warn', 'session backup baseline could not be published — the pending record is kept', {
-        baselineFile: this.baselineFile,
-        pendingFile: this.baselinePendingFile,
-        error: String(error),
-      });
+    if (recordIsCurrent) {
+      try {
+        this.publishBaseline();
+      } catch (error) {
+        // The unguarded boot pass must not refuse startup over an
+        // un-replaceable final path: the pending record stays and is preferred
+        // by the next pass, so no recorded identity is lost.
+        this.log('warn', 'session backup baseline could not be published — the pending record is kept', {
+          baselineFile: this.baselineFile,
+          pendingFile: this.baselinePendingFile,
+          error: String(error),
+        });
+      }
     }
     if (created.length > 0 || pruned.length > 0 || skipped > 0) {
       this.log('info', 'session backup pass', {
@@ -1037,7 +1049,10 @@ export class SessionStore {
       // write never landed. A backwards clock makes the two differ, and the
       // pass cannot tell which holds the last bytes, so neither is deleted.
       doomed.delete(newest);
-      for (const name of recordedGenerations) doomed.delete(name); // never prune a recorded copy
+      // Never prune a recorded copy. Membership is tested per name: the
+      // recorded set holds one entry per transcript ever, so sweeping it for
+      // every source would make the pass quadratic.
+      for (const name of names) if (recordedGenerations.has(name)) doomed.delete(name);
       for (const name of names) {
         if (!doomed.has(name)) continue;
         const target = join(this.backupDir, name);
