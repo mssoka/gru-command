@@ -1155,3 +1155,8 @@ session-backups-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest
 # RED evidence: the new changed-only/prune tests over the unchanged base
 # source, so the pre-fix failure is provable at one exact head.
 session-backups-red = 'set -e; root="$PWD"; base=c7ba172610a906492ec3ad867aa52920df8c389a; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-session-backups-red.XXXXXX"); trap "rm -rf -- $d" EXIT; git archive "$base" | tar -x -C "$d"; cp test/session-store.test.ts "$d/test/session-store.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "session-backups RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/session-store.test.ts'
+
+# main CI run 40604161762 red: the spawn-receipt refusal case in the worktree
+# bootstrap manifest suite, run alone at one exact head so the fix is
+# verifiable without the full suite.
+main-red-spawn-receipt-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/worktree-manifest.test.ts"

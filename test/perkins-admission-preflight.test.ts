@@ -1336,7 +1336,8 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
     expect(groupHasLiveMember(0, 1_000)).toBe(false);
     expect(groupHasLiveMember(-1, 1_000)).toBe(false);
-    // ps listings: zombies alone are not executing; an unreadable line is unknown, so executing.
+    // ps listings: zombies alone are not executing; a line whose pid or group cannot be
+    // read is unknown, so executing (a foreign row's state is judged only when its group is ours — #511).
     expect(executingMember(psGroupMembers('  10    10 S\n  11    10 Z+\n  12    99 R\n', 10))).toBe(true);
     expect(executingMember(psGroupMembers('  11    10 Z\n  12    99 R\n', 10))).toBe(false);
     expect(psGroupMembers('  11    10 Z\ngarbage\n', 10)).toBeNull();
@@ -1405,6 +1406,59 @@ describe('Perkins admission preflight (gh-169)', () => {
       OWNED_GIT_SEAMS.procFsAsync = realProcAsync;
       process.kill(-pgid, 'SIGKILL');
     }
+  });
+
+  it('a ps row the host cannot fully stat (?E) is proven not to be OUR group, so it never makes a stopped group read as running (#511)', () => {
+    // The incident table in its simplest shape: an unrelated `ps` row whose
+    // state the kernel would not fully report (`?E`) sits beside rows for OUR
+    // group, which are stopped. Membership used to be validated over EVERY
+    // line, so one foreign unreadable state voided the whole table — and an
+    // unknown table is a live group (R8-3), which is the settle loop's
+    // "cleanup unconfirmed" refusal. A row whose pid and group both parse and
+    // whose group is not ours cannot speak for ours in any state.
+    // Above every platform's pid_max: provably no live process shares this
+    // group, so the live listing cannot contribute a member of "ours".
+    const absent = 2_000_000_001;
+    const incident = `  29833  86745 ?E\n  41001 ${absent} Z\n  41002 ${absent} Z+\n`;
+    expect(psGroupMembers(incident, absent)).toEqual([{ pid: 41_001, state: 'Z' }, { pid: 41_002, state: 'Z+' }]);
+    expect(executingMember(psGroupMembers(incident, absent))).toBe(false);
+    // The same reading over a REAL listing from this host — its own rows,
+    // spacing and flags — with the unrelated `?E` row added.
+    const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8' });
+    expect(listed.status).toBe(0);
+    // Only rows the parser accepts can enter the comparison: a line whose pid
+    // or group cannot be read voids the whole table by design (unknown, so
+    // live — pinned below), and no host can be asked to be perfectly formed.
+    const rows = listed.stdout.split('\n').filter((line) => /^\s*\d+\s+\d+\s+\S+\s*$/u.test(line));
+    expect(rows.length).toBeGreaterThan(0);
+    const table = `${rows.join('\n')}\n  41001 ${absent} Z\n  41002 ${absent} Z+\n  29833  86745 ?E\n`;
+    expect(executingMember(psGroupMembers(table, absent))).toBe(false);
+  });
+
+  it('ps membership stays fail-closed where it must — a sleeping member of ours, our own unreadable state, a failed ps run (pinned by construction in perkins-group-liveness-ps.test.ts) — while a clean listing without our group is stopped (#511 preservation)', () => {
+    // Above every platform's pid_max: provably no live process shares this
+    // group, so a clean listing really has no rows for it.
+    const absent = 2_000_000_001;
+    // 1. An unrelated `?E` row never erases a LIVE member of our group.
+    expect(executingMember(psGroupMembers(`  29833  86745 ?E\n  41001 ${absent} S\n`, absent))).toBe(true);
+    // 2. A row for OUR group whose state cannot be parsed is unknown, so live.
+    expect(executingMember(psGroupMembers(`  41001 ${absent} Zbroken\n`, absent))).toBe(true);
+    expect(executingMember(psGroupMembers(`  41001 ${absent} z\n`, absent))).toBe(true);
+    // 3. A `ps` run that fails (non-zero status, or no string to read) is
+    // unknown, so live — pinned BY CONSTRUCTION in
+    // perkins-group-liveness-ps.test.ts, whose file-scoped `node:child_process`
+    // stub decides the branch with no deadline, spawn latency or host table.
+    // The real reader cannot prove it here: on Linux a listing completes
+    // inside the 1 ms floor production floors a zero budget to, so the same
+    // assertion would red on a host where the code is right.
+    // 4. A successful listing with no rows for our group is stopped, unchanged.
+    expect(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent)).toEqual([]);
+    expect(executingMember(psGroupMembers('  10    10 Ss\n  11    99 Z\n', absent))).toBe(false);
+    // 5. A line whose pid or group cannot be read is still unknown, so live:
+    //    that row cannot be proven foreign, so the table stays unreliable —
+    //    the residual #511 shape (no host `ps` observed prints one), pinned
+    //    rather than assumed away.
+    expect(executingMember(psGroupMembers(`  1x1  86745 S\n  41001 ${absent} Z\n`, absent))).toBe(true);
   });
 
   it('a /proc listing or read that never settles is bounded by the remaining budget — unknown, so live (#360 R5-E6)', async () => {

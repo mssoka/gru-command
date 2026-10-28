@@ -1198,7 +1198,12 @@ export class BoardView {
     if (card.headline.kpi !== null) big.dataset.kpi = card.headline.kpi;
     big.title = card.headline.title;
     headline.append(big, el('span', 'cockpit-card__unit', card.headline.unit));
-    node.append(head, headline);
+    // The card is the strip grid's own two-track subgrid: head above, body
+    // below. The head track is shared by the row, so every card's head is
+    // exactly as tall as the row's tallest without reserving blank height.
+    const body = el('div', 'cockpit-card__body');
+    body.append(headline);
+    node.append(head, body);
     const flow = card.flow;
     if (flow !== null) {
       const bar = el('div', 'cockpit-flow');
@@ -1210,7 +1215,7 @@ export class BoardView {
         segment.style.flexGrow = String(stage.value);
         bar.append(segment);
       }
-      node.append(bar);
+      body.append(bar);
     }
     const facts = el('p', 'cockpit-card__facts');
     for (const fact of card.facts) {
@@ -1227,7 +1232,7 @@ export class BoardView {
       facts.append(item);
     }
     for (const text of card.notes) facts.append(el('span', 'cockpit-fact cockpit-fact--note', text));
-    if (facts.childElementCount > 0) node.append(facts);
+    if (facts.childElementCount > 0) body.append(facts);
     return node;
   }
 
