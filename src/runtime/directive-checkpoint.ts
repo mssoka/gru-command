@@ -198,6 +198,7 @@ interface NativeEntry {
   readonly timestamp?: unknown;
   readonly targetId?: unknown;
   readonly replacement?: unknown;
+  readonly kind?: unknown;
 }
 /*
  * Native transcripts grow for a session's whole life (#469), so inspection
@@ -310,6 +311,16 @@ class NativeTurn {
 /** The pi turn's entry at `index`: `malformed` without a unique, non-empty
  * id; undefined past the turn's end. */
 type PiTurn = (index: number) => NativeEntry | 'malformed' | undefined;
+/** Pi 1.x's cache warmer appends these on a timer; they are no conversation. */
+function isCacheWarm(entry: { readonly type: string; readonly kind?: unknown }): boolean {
+  return entry.type === 'usage' && entry.kind === 'cache_warm';
+}
+/** A branch's last entry that is part of the conversation: a cache-warm usage
+ * entry may be the leaf when Pi emits an event about the entry before it. */
+export function conversationTail<T extends { readonly type: string; readonly kind?: unknown }>(branch: readonly T[]): T | undefined {
+  for (let at = branch.length - 1; at >= 0; at -= 1) if (!isCacheWarm(branch[at]!)) return branch[at];
+  return undefined;
+}
 /** A pi transcript split after its `baseline` entry (after the header when
  * null). Entries through the split are kept only as their ids and parent ids. */
 interface PiTranscript {
@@ -324,6 +335,9 @@ interface PiTranscript {
   readonly endTurn: () => void;
   /** Takes back endTurn (see NativeTurn.resume). */
   readonly resumeTurn: () => void;
+  /** The cache-warm usage entries read so far in the turn, by id, to the id of
+   * the entry they hang off. The turn is read as if they were not there. */
+  readonly warmed: ReadonlyMap<string, string | null>;
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
@@ -346,21 +360,31 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {} });
+      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {}, warmed: new Map() });
     }
     const after = new NativeTurn(fd, lines.end, tail);
     const seen = new Set<string>();
     const entries: (NativeEntry | 'malformed')[] = [];
+    // Pi 1.x's cache warmer appends a `usage` entry (kind cache_warm) as a child
+    // of the current leaf on a timer. It joins no conversation and runs no tool,
+    // so the turn is read as if it were not there: a child's parent is the usage
+    // entry's own parent. Any other usage kind is read as the unknown entry it is.
+    const warmed = new Map<string, string | null>();
     const turn: PiTurn = (index) => {
       while (entries.length <= index) {
         const line = after.next();
         if (line === undefined) return undefined;
         const entry = JSON.parse(line) as NativeEntry | null;
-        if (fresh(entry, seen)) { seen.add(entry.id); entries.push(entry); } else entries.push('malformed');
+        if (!fresh(entry, seen)) { entries.push('malformed'); continue; }
+        seen.add(entry.id);
+        let parentId = entry.parentId ?? null;
+        while (parentId !== null && warmed.has(parentId)) parentId = warmed.get(parentId)!;
+        if (isCacheWarm(entry)) { warmed.set(entry.id, parentId); continue; }
+        entries.push(parentId === (entry.parentId ?? null) ? entry : { ...entry, parentId });
       }
       return entries[index];
     };
-    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume() });
+    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume(), warmed });
   });
 }
 /** One inspection's parent links: the turn entries it has walked, over the
@@ -604,7 +628,7 @@ const UNBOUND_TAIL = 'native entries follow the correlated terminal checkpoint w
  * durably bound admission, or null when they are. Reads only the few entries
  * after the checkpoint (#469); a read refusal propagates, a binding that does
  * not read back is no later request. */
-function laterBoundRequestRefusal(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): string | null {
+function laterBoundRequestRefusal(file: string, native: PiTurn, warmed: ReadonlyMap<string, string | null>, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): string | null {
   const checkpoint = native(checkpointIndex);
   if (typeof checkpoint !== 'object') return UNBOUND_TAIL;
   let tip = checkpoint;
@@ -631,7 +655,10 @@ function laterBoundRequestRefusal(file: string, native: PiTurn, identity: Direct
   if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== promptParent.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
   // The later binding's baseline is the receipt's parent, or the entry Pi
   // compacted on before that prompt (see piReceiptAt).
-  const baselines = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];
+  // A cache-warm usage entry the later binding was prepared on is read through
+  // (see withPiTranscript), so it names the entry it hangs off as its baseline too.
+  const anchors = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];
+  const baselines = anchors.flatMap((anchor) => [anchor, ...[...warmed].filter(([, parent]) => parent === anchor).map(([usage]) => usage)]);
   try {
     const hash = contentHash(immediate.message.content);
     const matching = readDirectiveBindings(file).filter((candidate) => candidate.identity.requestId !== identity.requestId &&
@@ -733,20 +760,34 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
   // a grep with no match). One it never answered may be an interrupted effect,
   // unless it is the SDK's own "not executed" result for a length row's call.
   let unanswered = false;
+  // Where a compaction may follow the terminal: directly, or after the context
+  // edit Pi 1.x writes first when it omits a failed terminal reply.
+  let terminalSpan = 1;
   const notExecuted = new Set<string>();
   for (let index = at.index + 1; ; index += 1) {
     const entry = native(index);
     if (entry === undefined) break;
     if (entry === 'malformed') return unknown(MALFORMED);
     if (terminal !== null) {
-      // A retry cancelled during its backoff leaves the failed reply, which
-      // Pi 1.x has already omitted from context, as the turn's terminal.
-      if (index === terminal.index + 1 && entry.type === 'context_edit' && native(index + 1) === undefined) {
-        return omitsErrorRow(entry, previous) ? completed(terminal) : unknown('native branch/control/partial checkpoint');
+      // Pi 1.x has omitted a failed terminal reply from context before the
+      // retry it cancelled during its backoff, or before the recovery
+      // compaction a lost host never followed: either way the reply stays the
+      // turn's terminal. An edit followed by something else is one of a later
+      // request's controls, judged below.
+      if (index === terminal.index + 1 && entry.type === 'context_edit') {
+        if (!omitsErrorRow(entry, previous)) return unknown('native branch/control/partial checkpoint');
+        const following = native(index + 1);
+        if (following === undefined) return completed(terminal);
+        if (typeof following === 'object' && following.type === 'compaction') {
+          ancestry.link(entry);
+          previous = entry;
+          terminalSpan = 2;
+          continue;
+        }
       }
       // Pi's post-run compaction follows the final assistant directly. It is
       // lookahead: the terminal it follows stays this turn's checkpoint.
-      if (index === terminal.index + 1 && entry.type === 'compaction') {
+      if (index === terminal.index + terminalSpan && entry.type === 'compaction') {
         const refusal = linkedCompactionRefusal(entry, previous.id, ancestry);
         if (refusal !== null) return unknown(refusal);
         ancestry.link(entry);
@@ -757,7 +798,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       // distinct, durably read-back admission binds it. Keep the earlier
       // checkpoint readable without treating an unbound/replayed user tail
       // as proof that the old request completed.
-      const refusal = laterBoundRequestRefusal(file, native, identity, terminal.index, ancestry);
+      const refusal = laterBoundRequestRefusal(file, native, transcript.warmed, identity, terminal.index, ancestry);
       return refusal === null ? completed(terminal) : unknown(refusal);
     }
     if (entry.type === 'compaction') {

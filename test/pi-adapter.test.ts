@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { afterAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
@@ -38,6 +38,8 @@ const twinGate = vi.hoisted(() => ({
   fail0: null as null | (() => void),
   release1: null as null | (() => void),
   lastOptions: null as unknown,
+  /** The created session's agent state loses its assignable tools accessor. */
+  breakToolsAccessor: false,
 }));
 
 vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
@@ -49,6 +51,11 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
     ...actual,
     createAgentSession: async (opts: unknown) => {
       twinGate.lastOptions = opts;
+      if (twinGate.breakToolsAccessor) {
+        const created = await actual.createAgentSession(opts as never);
+        Object.defineProperty(created.session.agent.state, 'tools', { value: [], writable: true, configurable: true, enumerable: true });
+        return created;
+      }
       if (!twinGate.armed) {
         return actual.createAgentSession(opts as never);
       }
@@ -2331,8 +2338,133 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       await resumed.prompt('continue', { owner: 'alice' });
       expect(fx.script.calls.map((c) => c.prompt)).toEqual(['continue']);
       expect(readFileSync(adapterCopy, 'utf-8')).toContain('List the files in the project root.');
+      // The file's own recorded cwd survives the resume.
+      expect(readFileSync(adapterCopy, 'utf-8').split('\n')[0]).toContain('"cwd":"/fixture/project"');
     } finally {
       await resumed.dispose();
+    }
+  });
+
+  it('the executor fence survives the SDK re-applying the tool loadout, and a session registers no MCP, codemode or tool-search tool (#521)', async () => {
+    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }]);
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    const session = await actualDirectiveSdkSession(handle);
+    // The SDK's own tool registry: what it hands the agent before the adapter's guard.
+    const registry = (session as unknown as { readonly _toolRegistry: ReadonlyMap<string, { readonly execute: unknown }> })._toolRegistry;
+    const guarded = () => session.agent.state.tools.every((tool) => tool.execute !== registry.get(tool.name)!.execute);
+    try {
+      const executors = session.agent.state.tools.map((tool) => tool.execute);
+      expect(guarded()).toBe(true);
+      await handle.prompt('first', { owner: 'alice' });
+      await handle.prompt('second', { owner: 'alice' });
+      // Pi 1.x re-applies the loadout before every prompt: the same guarded executors must still stand.
+      expect(guarded()).toBe(true);
+      expect(session.agent.state.tools.map((tool) => tool.execute)).toEqual(executors);
+      expect(session.getAllTools().map((tool) => tool.name).sort()).toEqual(['bash', 'edit', 'find', 'grep', 'ls', 'read', 'write']);
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a session whose agent state no longer exposes an assignable tools accessor is refused by name before anything is registered (#521)', async () => {
+    const fx = await fixture([]);
+    twinGate.breakToolsAccessor = true;
+    try {
+      await expect(fx.runtime.spawn('minion', { cwd: fx.workspace })).rejects.toThrow(
+        'the pi SDK agent state no longer exposes an assignable tools accessor; refusing to run without the directive executor fence',
+      );
+    } finally { twinGate.breakToolsAccessor = false; }
+    // No lock was taken and no session file is held by the refused spawn.
+    expect((readdirSync(fx.store.sessionsDir, { recursive: true }) as string[]).filter((name) => name.endsWith('.lock'))).toEqual([]);
+    await fx.runtime.dispose();
+    fx.store.dispose();
+  });
+
+  it('a session the installed SDK wrote reads back through the transcript service without its scaffolding entries (#521)', async () => {
+    const { TranscriptService } = await import('../src/transcripts/service.js');
+    const fx = await fixture([{ deltas: [], toolCall: { id: 'call-1', name: 'ls', args: {} } }, { deltas: ['listed'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await handle.prompt('list my files', { owner: 'alice' });
+      expect(readFileSync(handle.sessionFile!, 'utf-8')).toContain('"role":"system"');
+      const result = new TranscriptService(fx.store.sessionsDir).read(relative(fx.store.sessionsDir, handle.sessionFile!));
+      expect(result.tornLines).toBe(0);
+      expect(result.entries.map((entry) => [entry.kind, entry.toolName])).toEqual([['user', null], ['assistant', null], ['tool_result', 'ls'], ['assistant', null]]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a directive on a resumed session whose prompt inputs changed runs its tool: the manifest binds the prompt the run carries (#521)', async () => {
+    const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+    const fx = await fixture([
+      { deltas: ['ordinary reply'] },
+      { deltas: [], toolCall: { id: 'changed-prompt-call', name: 'bash', args: { command: "printf 'ran\\n' > changed-prompt.txt" } } },
+      { deltas: ['done'] },
+    ]);
+    const identity = { requestId: 'changed-prompt', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'changed-prompt-job', workRevision: 0, authorityEpoch: 0 };
+    const first = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'changed-prompt-minion' });
+    await first.prompt('ordinary work', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    // A project rule file changes between the two runs, so the resumed run's
+    // prompt differs from the persisted one and Pi persists a system patch
+    // ahead of the directive's receipt.
+    writeFileSync(join(fx.workspace, 'AGENTS.md'), 'Project rule: changed after the first run.\n');
+    const resumed = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'changed-prompt-minion', resumeFile: file });
+    try {
+      const verdict = await resumed.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      expect(verdict).toMatchObject({ ok: true });
+      expect(readFileSync(join(fx.workspace, 'changed-prompt.txt'), 'utf-8')).toBe('ran\n');
+      const rows = readFileSync(file, 'utf-8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly message?: { readonly role: string } });
+      expect(rows.filter((row) => row.message?.role === 'system')).toHaveLength(2);
+      expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true });
+    } finally {
+      await resumed.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a pi directive refuses prompt images by name: pi 1.x re-encodes them, so the receipt could not match (#521)', async () => {
+    const { readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
+    const fx = await fixture([{ deltas: ['unused'] }], ['text', 'image']);
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    const identity = { requestId: 'directive-image', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'directive-image-job', workRevision: 0, authorityEpoch: 0 };
+    try {
+      await expect(handle.prompt('with an image', {
+        directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} },
+        images: [{ mediaType: 'image/png', data: PNG_1X1_BASE64 }],
+      })).rejects.toThrow('a pi directive carries text only');
+      expect(fx.script.calls).toHaveLength(0);
+      expect(readDirectiveBinding(handle.sessionFile!, identity.requestId)).toBeNull();
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a steer an extension input handler consumed is logged, not silently accepted (#521)', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
+    const logs: string[] = [];
+    const fx = await fixture([{ deltas: ['a'], hold }], ['text'], { log: (level, msg) => { logs.push(`${level}:${msg}`); } });
+    const handle = await fx.runtime.spawn('gru');
+    const session = await actualDirectiveSdkSession(handle);
+    vi.spyOn(session, 'steer').mockResolvedValue('handled');
+    try {
+      const turn = handle.prompt('mine', { owner: 'alice' });
+      await waitFor(() => fx.script.calls.length === 1, 'the live turn');
+      await handle.steer('adjust', { owner: 'alice' });
+      expect(logs).toContain('warn:a pi extension input handler consumed the steer; nothing was queued');
+      release();
+      await turn;
+    } finally {
+      release();
+      await handle.dispose();
     }
   });
 

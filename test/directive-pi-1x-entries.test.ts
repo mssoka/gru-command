@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
-  DirectiveCheckpointError, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint, prepareDirectiveBinding,
+  DirectiveCheckpointError, conversationTail, flushDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint, prepareDirectiveBinding,
   prepareDirectiveProducer, recordDirectiveRetryStart, type DirectiveTurnIdentity,
 } from '../src/runtime/directive-checkpoint.js';
 
@@ -12,7 +12,9 @@ import {
  *  - `system` message entries (the prompt sections and tool declarations),
  *    persisted directly ahead of the prompt that carries them;
  *  - a `context_edit` entry that omits a failed reply from the model's
- *    context before the SDK retries it, or compacts and retries it.
+ *    context before the SDK retries it, or compacts and retries it;
+ *  - a `usage` entry (kind cache_warm) its cache warmer appends on a timer,
+ *    anywhere in a turn.
  * Only these exact shapes, linked on the chain, are walked past. Every
  * control differs from an admitted case in one fact, so each refusal is that
  * fact's.
@@ -50,13 +52,31 @@ function compaction(file: string, id: string, parentId: string) {
   return append(file, { type: 'compaction', id, parentId, timestamp: '2026-10-28T00:00:00.000Z', summary: 'Pi automatic compaction summary',
     firstKeptEntryId: 'receipt', tokensBefore: 90_000, fromHook: false });
 }
+/** Pi's cache warmer: a usage entry on the current leaf. */
+function cacheWarm(file: string, id: string, parentId: string | null, kind = 'cache_warm') {
+  return append(file, { type: 'usage', id, parentId, timestamp: '2026-10-28T00:00:00.000Z', kind, provider: 'anthropic', model: 'fixture-model',
+    usage: { input: 1, output: 1, cacheRead: 9, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+}
 /** A directive bound at the header, with `systemIds` persisted ahead of its receipt (each parented on the one before). */
-function scene(systemIds: readonly string[] = [], receiptParent?: string | null) {
+function boundFile(): string {
   const dir = mkdtempSync(join(tmpdir(), 'gru-pi-1x-entries-'));
   dirs.push(dir);
   const file = join(dir, 'session.jsonl');
   writeFileSync(file, `${JSON.stringify({ type: 'session', id: 'pi-session', version: 3, cwd: '/lane' })}\n`);
   prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text, authorityManifest: 'manifest' });
+  return file;
+}
+/** A later directive prepared on the current last entry and admitted after `parentId` (through a system message when `systemId` names one). */
+function laterRequest(file: string, parentId: string, systemId?: string): void {
+  const later: DirectiveTurnIdentity = { ...identity, requestId: 'later-request', payloadHash: 'b'.repeat(64) };
+  prepareDirectiveBinding({ identity: later, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text: 'a later directive', authorityManifest: 'manifest' });
+  let parent = parentId;
+  if (systemId !== undefined) { message(file, systemId, parent, system); parent = systemId; }
+  message(file, 'later-receipt', parent, userMessage('a later directive'));
+  expect(inspectDirectiveAdmission(file, later).userEntryId).toBe('later-receipt');
+}
+function scene(systemIds: readonly string[] = [], receiptParent?: string | null) {
+  const file = boundFile();
   let parent: string | null = null;
   for (const id of systemIds) { message(file, id, parent, system); parent = id; }
   message(file, 'receipt', receiptParent === undefined ? parent : receiptParent, userMessage(text));
@@ -96,11 +116,7 @@ describe('pi 1.x system message entries ahead of a directive receipt (#521)', ()
     const { file } = scene(['system-1']);
     inspectDirectiveAdmission(file, identity);
     message(file, 'answer', 'receipt', answer);
-    const later: DirectiveTurnIdentity = { ...identity, requestId: 'later-request', payloadHash: 'b'.repeat(64) };
-    prepareDirectiveBinding({ identity: later, runtime: 'pi', agentId: 'minion', sessionId: 'pi-session', sessionFile: file, text: 'a later directive', authorityManifest: 'manifest' });
-    message(file, 'later-system', 'answer', system);
-    message(file, 'later-receipt', 'later-system', userMessage('a later directive'));
-    expect(inspectDirectiveAdmission(file, later).userEntryId).toBe('later-receipt');
+    laterRequest(file, 'answer', 'later-system');
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
   });
 });
@@ -180,5 +196,101 @@ describe('pi 1.x context edits around a retried reply (#521)', () => {
     message(file, 'invocation', 'retry-compaction', invocation);
     expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).toThrow(DirectiveCheckpointError);
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+  });
+
+  it('a lost host after the omitting edit and the recovery compaction reads the failed reply\'s terminal, not ok', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'retry-error', 'receipt', { ...failed, errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum' });
+    contextEdit(file, 'omit-error', 'retry-error');
+    compaction(file, 'retry-compaction', 'omit-error');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'retry-error' });
+  });
+
+  it('a later bound request after that edit and compaction leaves the earlier turn terminal, not ok', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'retry-error', 'receipt', { ...failed, errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum' });
+    contextEdit(file, 'omit-error', 'retry-error');
+    compaction(file, 'retry-compaction', 'omit-error');
+    laterRequest(file, 'retry-compaction');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, checkpointId: 'retry-error' });
+  });
+
+  it('an abandoned retry followed by a later bound request, through its system message, leaves the earlier turn terminal, not ok', () => {
+    const { file, producer } = scene(['system-1']);
+    const error = message(file, 'retry-error', 'receipt', failed);
+    expect(recordDirectiveRetryStart(producer, retryEvent, error)).toBeNull();
+    contextEdit(file, 'omit-error', 'retry-error');
+    laterRequest(file, 'omit-error', 'later-system');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: false, error: ERROR, checkpointId: 'retry-error' });
+  });
+
+  it('the same abandoned retry whose edit replaces its target is no omission: the earlier turn stays unknown', () => {
+    const { file, producer } = scene(['system-1']);
+    const error = message(file, 'retry-error', 'receipt', failed);
+    expect(recordDirectiveRetryStart(producer, retryEvent, error)).toBeNull();
+    contextEdit(file, 'omit-error', 'retry-error', { replacement: { role: 'user', content: 'rewritten' } });
+    laterRequest(file, 'omit-error', 'later-system');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+  });
+});
+
+describe('pi 1.x cache-warm usage entries (#521)', () => {
+  it('a warm entry between the baseline and the receipt is read through: admission and the checkpoint see the receipt on the baseline', () => {
+    const file = boundFile();
+    // Appended by the timer after the binding was prepared, ahead of the prompt's own entries.
+    cacheWarm(file, 'warm-1', null);
+    message(file, 'system-1', 'warm-1', system);
+    message(file, 'receipt', 'system-1', userMessage(text));
+    expect(inspectDirectiveAdmission(file, identity).userEntryId).toBe('receipt');
+    message(file, 'answer', 'receipt', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a warm entry mid-turn, even between a tool call and its result, leaves the tool guard and the checkpoint intact', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'invocation', 'receipt', invocation);
+    cacheWarm(file, 'warm-1', 'invocation');
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).not.toThrow();
+    message(file, 'result', 'warm-1', result);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'resumable', checkpointId: 'result' });
+    cacheWarm(file, 'warm-2', 'result');
+    message(file, 'answer', 'warm-2', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a warm entry on a failed reply, before its omitting edit, keeps the retry history readable', () => {
+    const { file, producer } = scene(['system-1']);
+    const error = message(file, 'retry-error', 'receipt', failed);
+    expect(recordDirectiveRetryStart(producer, retryEvent, error)).toBeNull();
+    cacheWarm(file, 'warm-1', 'retry-error');
+    contextEdit(file, 'omit-error', 'retry-error');
+    message(file, 'invocation', 'omit-error', invocation);
+    expect(() => flushDirectiveToolIntent(file, invocation, call, identity)).not.toThrow();
+    message(file, 'result', 'invocation', result);
+    message(file, 'answer', 'result', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a later directive prepared on a warm entry that follows the earlier turn is still its own bound request', () => {
+    const { file } = scene(['system-1']);
+    message(file, 'answer', 'receipt', answer);
+    cacheWarm(file, 'warm-1', 'answer');
+    // Prepared while the warm entry is the last one: that entry is its baseline.
+    laterRequest(file, 'warm-1', 'later-system');
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+  });
+
+  it('a usage entry of any other kind is an unknown entry: the checkpoint refuses it by name', () => {
+    const { file } = scene(['system-1']);
+    cacheWarm(file, 'usage-1', 'receipt', 'extension_note');
+    message(file, 'answer', 'usage-1', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native branch/control/partial checkpoint' });
+  });
+
+  it('the retry-start receipt reads the conversation tail, never a warm entry that became the leaf', () => {
+    const entries = [{ type: 'message', id: 'retry-error' }, { type: 'usage', kind: 'cache_warm', id: 'warm-1' }, { type: 'usage', kind: 'cache_warm', id: 'warm-2' }];
+    expect(conversationTail(entries)?.id).toBe('retry-error');
+    expect(conversationTail([...entries, { type: 'usage', kind: 'extension_note', id: 'usage-3' }])?.id).toBe('usage-3');
+    expect(conversationTail(entries.slice(1))).toBeUndefined();
   });
 });

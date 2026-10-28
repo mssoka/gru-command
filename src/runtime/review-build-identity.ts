@@ -335,7 +335,7 @@ export function reviewRuntimeVersion(packageRoot: string): string {
           // directory can never redirect file reads to unchecked bytes.
           includeTree(path, `${relativePath}/`, installed, directoryFd, tree, `${treePrefix}${name}/`, packageName);
         } else if (info.isFile() && (installed
-          ? /\.(?:js|mjs|cjs|node|wasm)$/u.test(name) ||
+          ? /\.(?:js|mjs|cjs|node|wasm|so)$/u.test(name) ||
             (relativePath.includes('/dist/providers/data/') && /\.json$/u.test(name)) ||
             // Public esbuild platform binaries have no extension. These
             // exact package/file pairs are audited in the finite catalog.

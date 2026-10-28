@@ -280,6 +280,12 @@ describe('installed Perkins runtime identity', () => {
     writeFileSync(wasm, Buffer.concat([readFileSync(wasm), Buffer.from('changed public wasm executable')]));
     expect(reviewRuntimeVersion(root)).not.toBe(latest);
     latest = reviewRuntimeVersion(root);
+    // quickjs-wasi's side modules carry a `.so` name but are WebAssembly code.
+    const sideModule = join(root, 'node_modules', 'quickjs-wasi', 'extensions', 'url', 'url.so');
+    expect(existsSync(sideModule)).toBe(true);
+    writeFileSync(sideModule, Buffer.concat([readFileSync(sideModule), Buffer.from('changed public wasm side module')]));
+    expect(reviewRuntimeVersion(root)).not.toBe(latest);
+    latest = reviewRuntimeVersion(root);
     const prebuilds = join(root, 'node_modules', '@earendil-works', 'pi-tui', 'native', process.platform, 'prebuilds', `${process.platform}-${process.arch}`);
     const native = existsSync(prebuilds) ? readdirSync(prebuilds).find((name) => name.endsWith('.node')) : undefined;
     if (native !== undefined) {

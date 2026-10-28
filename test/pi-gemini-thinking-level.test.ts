@@ -50,6 +50,6 @@ it('a Gemini 4 request with a requested reasoning level carries a thinking level
   expect(config?.thinkingConfig).toBeDefined();
   const thinkingConfig = config!.thinkingConfig!;
   expect(thinkingConfig['includeThoughts']).toBe(true);
-  expect(typeof thinkingConfig['thinkingLevel']).toBe('string');
+  expect(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH']).toContain(thinkingConfig['thinkingLevel']);
   expect(Object.keys(thinkingConfig)).not.toContain('thinkingBudget');
 });

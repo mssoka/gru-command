@@ -92,10 +92,11 @@ describe('prune-stale-dist', () => {
     // part with the pi 1.4 closure (pi-coding-agent and pi-ai 1.4.0 with
     // their pi-agent-core, pi-mcp, pi-codemode, pi-tui and pi-telemetry
     // packages): 151 packages, from which the 0.85.1 shrinkwrap's esbuild,
-    // clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5298);
+    // clipboard and AWS-crypto trees are gone, and the fingerprint now also
+    // hashes `.so` files (quickjs-wasi's five WebAssembly side modules).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5303);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('26a448485928ad8e6b5dea2185a103e30bb78ddec288071c3a9a3f6d21a587c3');
+      .toBe('0e5f32476d9dd3616418c84ef52e6ec94b88172ea83e3b1b59121787a21bbcd8');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

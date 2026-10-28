@@ -118,6 +118,29 @@ of four places:
   `retry-start` receipt is refused by name: Pi auto-retries a reply or
   compacts and retries it, never both.
 
+Pi 1.x adds three entry shapes to a directive's transcript, each walked past
+only in the form it is written in, linked on the chain:
+
+- **system messages:** the prompt sections and tool declarations Pi persists
+  directly ahead of the prompt that carries them (the session's first, and a
+  patch when the sections or tools changed, for example after an `AGENTS.md`
+  edit on a resumed session). Walked past before a directive's receipt and
+  before a later bound request; one inside a turn is refused as another
+  writer's authority change. The authority manifest binds the prompt the run
+  carries (the SDK's effective prompt), and once admission is published the
+  transcript's replayed prompt must equal it;
+- **omitting context edits:** before Pi retries a failed reply, or compacts
+  and retries it, it durably omits that reply from the model's context with a
+  `context_edit` entry (null replacement) linked on it. The edit is part of
+  the retry history and of the compact-and-retry; a turn lost after it, with
+  or without the recovery compaction, still reads as the failed reply's
+  terminal (not ok). An edit that names another row or replaces it is
+  refused;
+- **cache-warm usage entries:** with prompt-cache warming on (the SDK
+  default), Pi appends a `usage` entry of kind `cache_warm` on a timer. It
+  joins no conversation, so the turn is read as if it were not there. A usage
+  entry of any other kind is refused as the unknown entry it is.
+
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the
 chain or one of the turn's own compactions, a compaction inside an open
