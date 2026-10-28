@@ -73,6 +73,13 @@ const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4
 /** A session written by the real pi 0.85.1 SessionManager (recorded cwd /fixture/project). */
 const PI_085_SESSION = join(import.meta.dirname, 'fixtures', 'pi-0.85-session.jsonl');
 
+/** A compaction summary request. Pi 1.x summarizes the history before the cut
+ * with a `<conversation>` prompt and a split turn's prefix with a
+ * `# Conversation` one; the scripted provider holds or answers either. */
+function isSummaryRequest(prompt: string): boolean {
+  return prompt.startsWith('<conversation>') || prompt.startsWith('# Conversation');
+}
+
 const cleanupDirs: string[] = [];
 afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
@@ -224,7 +231,7 @@ async function observeCompactionCancellation(
   });
   let summaryCalls = 0;
   const fx = await fixture((prompt, index) => {
-    if (prompt.startsWith('<conversation>')) {
+    if (isSummaryRequest(prompt)) {
       summaryCalls += 1;
       return summaryCalls === 1
         ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
@@ -416,7 +423,7 @@ async function observeCompactionCancellation(
     // Anchor the abort-settlement marker to the FIRST summary call (the
     // stalled one), not any later summary that the same signal could abort.
     const firstSummary = fx.script.calls.find((call) =>
-      call.prompt.startsWith('<conversation>'),
+      isSummaryRequest(call.prompt),
     );
     // The recovered reply must be observable as a delta AND as a successful
     // assistant message, not only as model admission. The durable check reads
@@ -499,7 +506,7 @@ async function observeCompactionCancellation(
       rawSdkCompactionEnds: rawSdkEvents.filter((type) => type === 'compaction_end').length,
       summarySettledByAbort: firstSummary?.aborted === true,
       stalledSummaryCalls: fx.script.calls.filter((call) =>
-        call.prompt.startsWith('<conversation>'),
+        isSummaryRequest(call.prompt),
       ).length,
       continuationReachedModel: fx.script.calls.some(
         (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
@@ -577,7 +584,7 @@ async function observeNativeFollowUpCancellation(
   });
   let summaryCalls = 0;
   const fx = await fixture((prompt, index) => {
-    if (prompt.startsWith('<conversation>')) {
+    if (isSummaryRequest(prompt)) {
       summaryCalls += 1;
       return summaryCalls === 1
         ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
@@ -757,7 +764,7 @@ async function observeNativeFollowUpCancellation(
         error: event.error ?? null,
       })),
       summarySettledByAbort: fx.script.calls.some(
-        (call) => call.prompt.startsWith('<conversation>') && call.aborted,
+        (call) => isSummaryRequest(call.prompt) && call.aborted,
       ),
       idle: internal.session.isIdle,
       disposed: handle.health().state === 'disposed',
@@ -2022,7 +2029,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         releaseSummary = resolve;
       });
       const fx = await fixture((prompt, index) => {
-        if (prompt.startsWith('<conversation>')) return { deltas: [], hold: summaryHold };
+        if (isSummaryRequest(prompt)) return { deltas: [], hold: summaryHold };
         if (index === 0) return { deltas: ['history '.repeat(12_000)] };
         if (index === 1) {
           return {
@@ -5510,12 +5517,12 @@ it('automatic SDK compaction completes before the same admitted native authority
   let runError: unknown = null;
   try {
     const running = executeAcceptedDirective({ ...f.deps, pendingProducerBlockers: supervisor.pendingProducerBlockers.bind(supervisor) }, f.scene.request.requestId);
-    await waitFor(() => rawCompaction.includes('compaction_start') && f.fx.script.calls.some((call) => call.prompt.startsWith('<conversation>')), 'held automatic compaction summary');
+    await waitFor(() => rawCompaction.includes('compaction_start') && f.fx.script.calls.some((call) => isSummaryRequest(call.prompt)), 'held automatic compaction summary');
     const active = sample();
     expect(active).not.toBeNull();
     expect(active).toMatchObject({ openControl: true, openTurn: false, openToolCalls: 0, adapterCompacting: true, ownNative: true });
     expect(active?.exactBlockers.some((blocker) => blocker.includes('open turn/control/tool'))).toBe(true);
-    expect(f.fx.script.calls.filter((call) => !call.prompt.startsWith('<conversation>'))).toHaveLength(1);
+    expect(f.fx.script.calls.filter((call) => !isSummaryRequest(call.prompt))).toHaveLength(1);
     releaseSummary();
     try { await running; } catch (error) { runError = error; }
 
@@ -5611,7 +5618,7 @@ it('Pi post-run compaction after the directive terminal settles the original com
     const [final, compaction] = rows.slice(-2);
     expect(final).toMatchObject({ type: 'message', message: { role: 'assistant', stopReason: 'stop' } });
     expect(compaction).toMatchObject({ type: 'compaction', parentId: final!.id });
-    expect(f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
+    expect(f.fx.script.calls.map((call) => isSummaryRequest(call.prompt))).toEqual([false, true]);
     expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final!.id, binding: row.nativeBinding });
     expect(row.state).toBe('settled');
     const deliveries = f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
@@ -5681,7 +5688,7 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
     expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
       .filter((event) => (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId)).toHaveLength(1);
     expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
-    expect(f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, false, true, false, false]);
+    expect(f.fx.script.calls.map((call) => isSummaryRequest(call.prompt))).toEqual([false, false, true, false, false]);
     expect(f.sessions[0]!.prompt).toHaveBeenCalledTimes(1);
   } finally { supervisor.dispose(); await f.cleanup(); }
 });
@@ -5768,7 +5775,7 @@ it('Pi pre-prompt compaction before a directive receipt is admitted and the dire
   // The earlier reply crosses the threshold but its post-run summary fails, so
   // Pi compacts again before the next prompt: after the directive's baseline.
   const f = await fixture((prompt, index) => {
-    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
+    if (isSummaryRequest(prompt)) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
     return index === 0 ? { deltas: ['history '.repeat(100)], usageTokens: 90_000 } : { deltas: ['directive done'] };
   });
   writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
@@ -5796,7 +5803,7 @@ it('Pi pre-prompt compaction before a directive receipt is admitted and the dire
     expect(admission).toMatchObject({ baseline, userEntryId: user!.id });
     expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'admitted', nativeBinding: admission });
     expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final!.id });
-    expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>') ? 'summary' : call.prompt)).toEqual(['earlier ordinary work', 'summary', 'summary', 'approved directive']);
+    expect(f.script.calls.map((call) => isSummaryRequest(call.prompt) ? 'summary' : call.prompt)).toEqual(['earlier ordinary work', 'summary', 'summary', 'approved directive']);
   } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
 });
 
@@ -5851,7 +5858,7 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose' | 'deadline
     // Abort: the turn settled while the terminal was still withheld. Dispose and the deadline publish it as failed.
     expect(events.filter((event) => event.type === 'compaction_end')).toEqual(by === 'abort' ? [] :
       [{ type: 'compaction_end', success: false, error: by === 'dispose' ? 'agent session disposed during native compaction' : 'native compaction state did not settle after its terminal event' }]);
-    expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
+    expect(f.script.calls.map((call) => isSummaryRequest(call.prompt))).toEqual([false, true]);
     expect(readFileSync(join(scene.lane.path, 'wait-effect.txt'), 'utf8')).toBe('once\n');
     const refusals = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trimEnd().split('\n')
       .map((line) => JSON.parse(line) as { readonly state: string; readonly boundary?: string; readonly reason?: string }).filter((record) => record.state === 'guard-refused');
@@ -5877,7 +5884,7 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed' | 'disposed-at
   const { DirectiveCheckpointError, readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
   let summaries = 0; let replies = 0;
   const f = await fixture((prompt) => {
-    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
+    if (isSummaryRequest(prompt)) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
     return [{ deltas: ['history '.repeat(100)], usageTokens: 90_000 }][replies++] ?? { deltas: ['directive reply that must never be requested'] };
   });
   writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
@@ -5978,7 +5985,7 @@ async function assertJoinedCompaction(scenario: 'held-preparation' | 'past-deadl
   const joinedSummaryHold = new Promise<void>((resolveHold) => { releaseJoinedSummary = resolveHold; });
   let summaries = 0; let replies = 0; let joinedSummaryStarted = false;
   const f = await fixture((prompt) => {
-    if (prompt.startsWith('<conversation>')) {
+    if (isSummaryRequest(prompt)) {
       if (summaries++ === 1 && scenario === 'past-deadline') { joinedSummaryStarted = true; return { deltas: ['automatic summary'], hold: joinedSummaryHold }; }
       return { deltas: ['automatic summary'] };
     }

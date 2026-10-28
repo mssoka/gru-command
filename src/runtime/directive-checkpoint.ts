@@ -196,6 +196,8 @@ interface NativeEntry {
   readonly tokensBefore?: unknown;
   readonly fromHook?: unknown;
   readonly timestamp?: unknown;
+  readonly targetId?: unknown;
+  readonly replacement?: unknown;
 }
 /*
  * Native transcripts grow for a session's whole life (#469), so inspection
@@ -433,17 +435,28 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
  * for such a reply. Returns that compaction; the named refusal when the
  * compaction on such a reply is not Pi's, or the error reply it continued
  * holds content that is not history; null when nothing continued `reply`. */
-function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
+function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): readonly NativeEntry[] | string | null {
   const stop = reply.message?.stopReason;
   if (reply.message?.role !== 'assistant' || !(stop === 'error' || stop === 'length' && !holdsToolCalls(reply.message))) return null;
-  const compaction = after(1);
+  // Pi 1.x omits a failed reply from the model's context with a context edit
+  // before it compacts and retries; the compaction then hangs off that edit.
+  const first = after(1);
+  const edit = typeof first === 'object' && omitsErrorRow(first, reply) ? first : null;
+  const compaction = edit === null ? first : after(2);
   if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
-  const refusal = linkedCompactionRefusal(compaction, reply.id, ancestry);
+  const refusal = linkedCompactionRefusal(compaction, (edit ?? reply).id, ancestry);
   if (refusal !== null) return refusal;
-  const retried = after(2);
+  const retried = edit === null ? after(2) : after(3);
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
   if (stop === 'error' && !validRetryErrorContent(reply.message.content)) return 'native compaction retries an error row holding content that is not history';
-  return compaction;
+  return edit === null ? [compaction] : [edit, compaction];
+}
+/** Pi 1.x keeps a failed reply in the transcript and durably omits it from
+ * the model's context with a `context_edit` entry linked on it (`replacement`
+ * null) when it retries the reply. It runs no tool and sends no message. */
+function omitsErrorRow(edit: NativeEntry, row: NativeEntry): boolean {
+  return edit.type === 'context_edit' && edit.parentId === row.id && edit.targetId === row.id && edit.replacement === null &&
+    row.type === 'message' && row.message?.role === 'assistant' && row.message.stopReason === 'error';
 }
 /** The level Pi's session records in a thinking_level_change: what
  * setThinkingLevel was given, or clamped to (through Pi's own nested copies). */
@@ -463,6 +476,7 @@ const PI_THINKING_CONTROL_LEVELS: [Exclude<ModelThinkingLevel | PiRecordedThinki
 function controlRefusal(control: NativeEntry, tip: NativeEntry, ancestry: PiAncestry): string | null {
   if (control.type === 'compaction') return tip.type === 'compaction' ? 'native compaction follows another compaction' : linkedCompactionRefusal(control, tip.id, ancestry);
   if (control.parentId !== tip.id) return 'native control is not linked to the completed checkpoint';
+  if (control.type === 'context_edit' && !omitsErrorRow(control, tip)) return 'native context edit does not omit the completed checkpoint';
   if (control.type === 'model_change' &&
       (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim())) return 'native model control is malformed';
   if (control.type === 'thinking_level_change' &&
@@ -590,7 +604,7 @@ function laterBoundRequestRefusal(file: string, native: PiTurn, identity: Direct
   // These controls change the NEXT request's model, or compact the model's
   // context (Pi's post-run and pre-prompt compaction), not the completed
   // request's ancestry. No branch or unbound effect is skipped.
-  for (let control = native(nextIndex); typeof control === 'object' && ['model_change', 'thinking_level_change', 'compaction'].includes(control.type); control = native(nextIndex)) {
+  for (let control = native(nextIndex); typeof control === 'object' && ['model_change', 'thinking_level_change', 'compaction', 'context_edit'].includes(control.type); control = native(nextIndex)) {
     const refusal = controlRefusal(control, tip, ancestry);
     if (refusal !== null) return refusal;
     ancestry.link(control);
@@ -717,6 +731,11 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
     if (entry === undefined) break;
     if (entry === 'malformed') return unknown(MALFORMED);
     if (terminal !== null) {
+      // A retry cancelled during its backoff leaves the failed reply, which
+      // Pi 1.x has already omitted from context, as the turn's terminal.
+      if (index === terminal.index + 1 && entry.type === 'context_edit' && native(index + 1) === undefined) {
+        return omitsErrorRow(entry, previous) ? completed(terminal) : unknown('native branch/control/partial checkpoint');
+      }
       // Pi's post-run compaction follows the final assistant directly. It is
       // lookahead: the terminal it follows stays this turn's checkpoint.
       if (index === terminal.index + 1 && entry.type === 'compaction') {
@@ -740,6 +759,14 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       previous = entry;
       continue;
     }
+    if (entry.type === 'context_edit') {
+      // Only the omission of the failed reply just walked, which the retry
+      // checks above read ahead and accepted.
+      if (!omitsErrorRow(entry, previous)) return unknown('native branch/control/partial checkpoint');
+      ancestry.link(entry);
+      previous = entry;
+      continue;
+    }
     if (entry.type !== 'message' || entry.parentId !== previous.id || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
     ancestry.link(entry);
     previous = entry;
@@ -754,7 +781,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       // one lookahead; each entry is read, and charged, once.
       const lookahead = (offset: number) => { endTurn(); return native(index + offset); };
       // A receipted error row is history when the SDK's retried answer follows it (#483).
-      if (isRetryHistoryRow(entry, () => lookahead(1), retries)) {
+      if (isRetryHistoryRow(entry, lookahead, retries)) {
         resumeTurn();
         lastMessage = message;
         continue;
@@ -766,9 +793,9 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
         if (retries.has(entry.id)) return unknown(RETRIED_TWICE);
         resumeTurn();
         // The failed reply is history; the turn continues on the compaction.
-        ancestry.link(retry);
-        previous = retry;
-        index += 1;
+        for (const walked of retry) ancestry.link(walked);
+        previous = retry[retry.length - 1]!;
+        index += retry.length;
         lastMessage = message;
         continue;
       }
@@ -1241,9 +1268,14 @@ function isReceiptedErrorRow(entryId: string, message: Record<string, unknown>, 
  * never enter the pending set, so a result naming one is unmatched. Without
  * that answer (a retry cancelled during backoff) the row is the turn's
  * terminal. `successor` is read only for a receipted row. */
-function isRetryHistoryRow(entry: NativeEntry, successor: () => NativeEntry | 'malformed' | undefined, evidence: ReadonlyMap<string, string>): boolean {
+function isRetryHistoryRow(entry: NativeEntry, successor: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, evidence: ReadonlyMap<string, string>): boolean {
   if (entry.message === undefined || !isReceiptedErrorRow(entry.id, entry.message, evidence)) return false;
-  const next = successor();
+  const next = successor(1);
+  if (typeof next === 'object' && omitsErrorRow(next, entry)) {
+    // Pi 1.x: the retried answer follows the context edit that omits the row.
+    const retried = successor(2);
+    return typeof retried === 'object' && retried.type === 'message' && retried.parentId === next.id && retried.message?.role === 'assistant';
+  }
   return typeof next === 'object' && next.type === 'message' && next.parentId === entry.id && next.message?.role === 'assistant';
 }
 /** The SDK auto-retries an error reply or compacts and retries it, never
@@ -1407,21 +1439,27 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
       previous = entry;
       continue;
     }
+    if (entry.type === 'context_edit') {
+      if (!omitsErrorRow(entry, previous)) refuse();
+      ancestry.link(entry);
+      previous = entry;
+      continue;
+    }
     if (entry.type !== 'message' || entry.parentId !== previous.id || !message) refuse();
     ancestry.link(entry);
     previous = entry;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
       // An error row the live SDK retried past is history, not a tool invocation (#483).
-      if (isRetryHistoryRow(entry, () => native[at + 1], retries)) continue;
+      if (isRetryHistoryRow(entry, (offset) => native[at + offset], retries)) continue;
       // Nor is a failed reply Pi compacted on and continued (#481).
       const retry = compactAndRetryCompaction(entry, (offset) => native[at + offset], ancestry);
       if (typeof retry === 'string') refuse(retry);
       else if (retry !== null) {
         if (retries.has(entry.id)) refuse(RETRIED_TWICE);
-        ancestry.link(retry);
-        previous = retry;
-        at += 1;
+        for (const walked of retry) ancestry.link(walked);
+        previous = retry[retry.length - 1]!;
+        at += retry.length;
         continue;
       }
       if (message!.stopReason === 'error') {

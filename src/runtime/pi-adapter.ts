@@ -1315,6 +1315,18 @@ export class PiAgentHandle implements AgentHandle {
           return update;
         } catch (error) { this.refuseDirectiveGuard(directive, undefined, error); }
       };
+      // Pi 1.x runs a prompt's preparation (compaction, prompt and tool
+      // loadout) and then hands the starting messages to agent.prompt, which
+      // writes the receipt. Its own preflight hook runs before the SDK's
+      // cleanup frame, so a throw there leaves the session busy forever;
+      // refusing here, inside the run's frame, rejects the prompt with no
+      // receipt and lets the session settle.
+      const startPrompt = session.agent.prompt.bind(session.agent);
+      session.agent.prompt = (async (...args: Parameters<typeof startPrompt>) => {
+        const directive = this.liveDirective;
+        if (directive !== undefined) this.assertDirectivePreflight(directive);
+        return startPrompt(...args);
+      }) as typeof startPrompt;
       const before = session.agent.beforeToolCall;
       session.agent.beforeToolCall = async (input, signal) => {
         const directive = this.liveDirective;
@@ -1356,6 +1368,34 @@ export class PiAgentHandle implements AgentHandle {
         for (const producer of this.directiveProducers.values()) recordDirectiveIndependentController(producer);
         return executeBash(...args);
       };
+    }
+  }
+
+  /** The last check before a directive's prompt runs and its receipt is
+   * written; a throw rejects the prompt with no receipt. A withheld
+   * compaction terminal is published if Pi's gate has cleared. If one is
+   * still withheld, or the handle was disposed (the reconcile bound
+   * disposes), the directive is not admitted. */
+  private assertDirectivePreflight(directive: NonNullable<PromptOptions['directive']>): void {
+    try {
+      if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
+      if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
+      if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
+      if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
+      withOwnIo('authority check', () => directive.beforeAdmission());
+      if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest?.()) {
+        throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
+      }
+    } catch (error) {
+      // The prompt rejects with this very object. GC's authority or
+      // compaction refusal here keeps a durable authority receipt, as a fence
+      // refusal does (an unrecorded one rejects as its AggregateError). A
+      // bookkeeping fault before acceptance keeps none, so it never blocks the
+      // resume of a checkpoint the SDK writes.
+      if (error instanceof DirectiveCheckpointError && !(error instanceof DirectiveBookkeepingError)) this.refuseDirectiveGuard(directive, undefined, error);
+      this.recordDirectiveRefusal(error);
+      this.logBookkeepingFault(error);
+      throw error;
     }
   }
 
@@ -1946,34 +1986,6 @@ export class PiAgentHandle implements AgentHandle {
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
-    if (directive !== undefined) promptOptions['preflightResult'] = (accepted: boolean) => {
-      if (!accepted) return;
-      // Pi calls this synchronously before it runs the prompt and writes the
-      // receipt; a throw here rejects the prompt with no receipt. A withheld
-      // compaction terminal is published if Pi's gate has cleared. If one is
-      // still withheld, or the handle was disposed (the reconcile bound
-      // disposes), the directive is not admitted.
-      try {
-        if (this.pendingCompactionEnd !== null) this.flushCompactionEndWhenSettled();
-        if (this.disposed) throw new DirectiveCheckpointError('native directive owner disposed during prompt preparation');
-        if (this.pendingCompactionEnd !== null) throw new DirectiveCheckpointError('native compaction terminal still withheld at directive admission');
-        if (this.nativeCompactionOpen) throw new DirectiveCheckpointError('native compaction still running at directive admission');
-        withOwnIo('authority check', () => directive.beforeAdmission());
-        if (withOwnIo('binding read', () => readDirectiveBinding(this.sessionFile, directive.identity.requestId))?.authorityManifest !== this.directiveAuthorityManifest?.()) {
-          throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
-        }
-      } catch (error) {
-        // Pi calls this outside its own try: the prompt rejects with this very
-        // object. GC's authority or compaction refusal here keeps a durable
-        // authority receipt, as a fence refusal does (an unrecorded one rejects
-        // as its AggregateError). A bookkeeping fault before acceptance keeps
-        // none, so it never blocks the resume of a checkpoint the SDK writes.
-        if (error instanceof DirectiveCheckpointError && !(error instanceof DirectiveBookkeepingError)) this.refuseDirectiveGuard(directive, undefined, error);
-        this.recordDirectiveRefusal(error);
-        this.logBookkeepingFault(error);
-        throw error;
-      }
-    };
     let captured: PromptTurnVerdict = { ok: true, error: null };
     const turn = (continuation === undefined ? this.session.prompt(text, promptOptions) : continuation())
       .catch((error: unknown) => {
