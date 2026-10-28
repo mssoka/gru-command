@@ -1,6 +1,6 @@
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { ModelRuntime, createBashToolDefinition, defineTool, type AgentSession, type ToolDefinition } from '@earendil-works/pi-coding-agent';
-import { createInitialSystemMessage, toToolDeclaration } from '@earendil-works/pi-ai';
+import { toToolDeclaration } from '@earendil-works/pi-ai';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -4996,8 +4996,11 @@ it('restart recovery continues a durable SDK user checkpoint without replaying i
       onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
     } })).rejects.toThrow('fixture stops before native acceptance');
     expect(f.script.calls).toHaveLength(0);
+    // Pi 1.x persists the prompt and tool declarations directly ahead of the first prompt.
+    const system = persistedSystemMessage(await actualDirectiveSdkSession(original));
     await original.dispose();
     const manager = SessionManager.open(file);
+    manager.appendMessage(system);
     manager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted SDK request' }], timestamp: Date.now() });
     const proof = inspectDirectiveCheckpoint(file, identity);
     expect(proof.state).toBe('resumable');
@@ -5643,6 +5646,7 @@ async function superviseDirectiveFixture(f: Awaited<ReturnType<typeof sdkDirecti
 /** The native transcript's entries, in file order. */
 function nativeEntries(file: string) {
   return readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly type: string; readonly id: string; readonly parentId?: string | null;
+    readonly targetId?: string; readonly replacement?: unknown;
     readonly message?: { readonly role: string; readonly stopReason?: string; readonly toolCallId?: string; readonly isError?: boolean } });
 }
 
@@ -5672,8 +5676,10 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
     const rows = nativeEntries(row.nativeTarget!.sessionFile);
     const failed = rows.findIndex((entry) => entry.message?.stopReason === 'error');
-    expect(rows[failed + 1]).toMatchObject({ type: 'compaction', parentId: rows[failed]!.id });
-    expect(rows[failed + 2]).toMatchObject({ type: 'message', parentId: rows[failed + 1]!.id, message: { role: 'assistant', stopReason: 'toolUse' } });
+    // Pi 1.x omits the failed reply from context with an edit, then compacts on it.
+    expect(rows[failed + 1]).toMatchObject({ type: 'context_edit', parentId: rows[failed]!.id, targetId: rows[failed]!.id, replacement: null });
+    expect(rows[failed + 2]).toMatchObject({ type: 'compaction', parentId: rows[failed + 1]!.id });
+    expect(rows[failed + 3]).toMatchObject({ type: 'message', parentId: rows[failed + 2]!.id, message: { role: 'assistant', stopReason: 'toolUse' } });
     expect(readFileSync(join(f.scene.lane.path, 'overflow-effect.txt'), 'utf8')).toBe('before\nafter\n');
     // The compaction's terminal is published before the continued reply's tool
     // starts. No next-turn preparation precedes a continued reply's first call:
@@ -5910,21 +5916,18 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed' | 'disposed-at
     }
   });
   if (by === 'disposed-at-admission' || by === 'running') {
-    // Act as Pi calls preflightResult: the bound is crossed there, so admission's
-    // own flush is the first re-check past it; or a compaction starts there.
-    const nativePrompt = session.prompt.bind(session);
-    (session as unknown as { prompt: (text: string, options?: Record<string, unknown>) => Promise<void> }).prompt = (text, options) => {
-      const preflight = options?.['preflightResult'] as ((accepted: boolean) => void) | undefined;
-      if (preflight === undefined) return nativePrompt(text, options as never);
-      return nativePrompt(text, { ...options, preflightResult: (accepted: boolean) => {
-        if (accepted && armed && by === 'running') internal.onPiEvent({ type: 'compaction_start' });
-        if (accepted && armed && by === 'disposed-at-admission') {
-          const now = Date.now.bind(Date);
-          clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
-        }
-        preflight(accepted);
-      } } as never);
-    };
+    // Act as Pi hands over to the run (agent.prompt, after its preparation and
+    // compaction): the bound is crossed there, so admission's own flush is the
+    // first re-check past it; or a compaction starts there.
+    const nativePrompt = session.agent.prompt.bind(session.agent);
+    session.agent.prompt = (async (...args: Parameters<typeof nativePrompt>) => {
+      if (armed && by === 'running') internal.onPiEvent({ type: 'compaction_start' });
+      if (armed && by === 'disposed-at-admission') {
+        const now = Date.now.bind(Date);
+        clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
+      }
+      return nativePrompt(...args);
+    }) as typeof nativePrompt;
   }
   const events = collect(handle);
   // Once the bound published its failed terminal the gate opens, so disposal can prove quiescence.
@@ -6038,8 +6041,7 @@ async function assertJoinedCompaction(scenario: 'held-preparation' | 'past-deadl
       clock.mockRestore(); clock = null; polls.mockRestore();
       releaseJoinedSummary();
     }
-    try { await waitFor(() => nativeEnds === 2 && waiters.size === 1, 'next-turn preparation waiting after both native compactions'); }
-    catch (error) { console.log('DEBUG-JOINED', JSON.stringify({ scenario, nativeEnds, waiters: waiters.size, replies, summaries, events: events.map((e) => e.type + (e.type === 'error' ? ':' + String((e as { error?: unknown }).error).slice(0, 300) : '')), calls: f.script.calls.map((c) => c.prompt.slice(0, 30)) })); throw error; }
+    await waitFor(() => nativeEnds === 2 && waiters.size === 1, 'next-turn preparation waiting after both native compactions');
     expect(compactingAfterPreparation).toBeNull();
     // The second native start joined the open episode: one start, nothing published yet.
     expect(events.filter((event) => event.type === 'compaction_start' || event.type === 'compaction_end').map((event) => event.type)).toEqual(['compaction_start']);
@@ -6159,7 +6161,7 @@ async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveEx
   // Pi 1.x persists the session's prompt and tool declarations as a system
   // message directly ahead of the first prompt, so a real host that ceased
   // after its receipt left that entry before it.
-  session.sessionManager.appendMessage(createInitialSystemMessage(session.systemPrompt, session.agent.state.tools.map(toToolDeclaration))!);
+  session.sessionManager.appendMessage(persistedSystemMessage(session));
   const receipt = session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
   afterReceipt?.(session, receipt);
   const proof = inspectDirectiveCheckpoint(original.sessionFile!, identity);
@@ -6349,6 +6351,18 @@ function rewriteSystemPrompt(session: AgentSession, text: string): void {
   const [leading, ...rest] = session.agent.state.messages;
   if (leading?.role !== 'system') throw new Error('expected the session transcript to lead with its system message');
   session.agent.state.messages = [{ ...leading, content: text }, ...rest];
+}
+
+/** What a real pi 1.x host persists directly ahead of a session's first
+ * prompt: the SDK's prompt-sections patch carrying the tool declarations. */
+function persistedSystemMessage(session: AgentSession) {
+  const sdk = session as unknown as {
+    readonly _baseSystemPromptOptions: object;
+    _preparePromptAndToolLoadout(options: object): { readonly role: 'system'; readonly content: string; readonly sections: Record<string, string | null>; readonly timestamp: number } | undefined;
+  };
+  const patch = sdk._preparePromptAndToolLoadout(structuredClone(sdk._baseSystemPromptOptions));
+  if (patch === undefined) throw new Error('a session that has not prompted must owe its prompt sections');
+  return { ...patch, toolsAdded: session.agent.state.tools.map(toToolDeclaration) };
 }
 
 async function actualDirectiveSdkSession(handle: AgentHandle) {
@@ -6803,6 +6817,7 @@ async function registerSyntheticResponses(modelRuntime: ModelRuntime, providerId
   return () => requests;
 }
 interface NativeRow {
+  readonly type?: string; readonly targetId?: string; readonly replacement?: unknown;
   readonly id: string; readonly parentId: string | null;
   readonly message?: { readonly role?: string; readonly stopReason?: string; readonly errorMessage?: string; readonly toolCallId?: string; readonly isError?: boolean; readonly content?: readonly unknown[] };
 }
@@ -6813,6 +6828,13 @@ function producerJournal(file: string): readonly Readonly<Record<string, unknown
   return readFileSync(`${file}.producers.jsonl`, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 const toolResultsOf = (rows: readonly NativeRow[]) => rows.filter((row) => row.message?.role === 'toolResult').map((row) => [row.message?.toolCallId, row.message?.isError]);
+/** Pi 1.x omits a failed reply from context with an edit linked on it; the
+ * SDK's retried replies hang off that edit, read here by stop reason. */
+function retriedReplies(rows: readonly NativeRow[], error: NativeRow) {
+  const edits = rows.filter((entry) => entry.parentId === error.id);
+  expect(edits).toEqual([expect.objectContaining({ type: 'context_edit', targetId: error.id, replacement: null })]);
+  return rows.filter((entry) => entry.parentId === edits[0]!.id).map((entry) => entry.message?.stopReason);
+}
 
 it('a real SDK retry after a truncated Responses stream settles the directive once, and its checkpoint outlives the turn and the minion (#483)', async () => {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
@@ -6832,7 +6854,7 @@ it('a real SDK retry after a truncated Responses stream settles the directive on
     const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
     const answer = rows.filter((entry) => entry.message?.role === 'assistant' && entry.message.stopReason === 'stop').at(-1)!;
     expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
-    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(retriedReplies(rows, error)).toEqual(['toolUse']);
     expect(toolResultsOf(rows)).toEqual([['failing-call|item-1', true], ['following-call|item-3', false]]);
     expect(requests()).toBe(4);
     expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
@@ -6849,14 +6871,17 @@ it('a real SDK retry after a truncated Responses stream settles the directive on
   } finally { await f.cleanup(); }
 });
 
-it('a real SDK retry of the directive\'s first request, after a fractional backoff, lets its next tool call run once and the directive settles (#483)', async () => {
+it('a real SDK retry of the directive\'s first request, after a short backoff, lets its next tool call run once and the directive settles (#483)', async () => {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const retryStarts: unknown[] = [];
   const f = await sdkDirectiveExecutionFixture([], (session) => {
     session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); });
   });
-  // SDK delayMs is baseDelayMs·2^(attempt-1): a fractional base stays fractional.
-  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 0.5 } }));
+  // SDK delayMs is baseDelayMs·2^(attempt-1). Pi 1.x treats a non-integer as
+  // unsafe and sleeps its 60 s cap instead, so a fractional delay can no longer
+  // reach the adapter from the SDK; the validator's acceptance of one stays
+  // pinned in directive-retry-history.test.ts.
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
   const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
   const effect = join(effects, 'ran.log');
   const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
@@ -6871,8 +6896,8 @@ it('a real SDK retry of the directive\'s first request, after a fractional backo
     const user = rows.find((entry) => entry.message?.role === 'user')!;
     const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
     expect(error.parentId).toBe(user.id);
-    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 0.5, errorMessage: error.message?.errorMessage })]);
-    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1, errorMessage: error.message?.errorMessage })]);
+    expect(retriedReplies(rows, error)).toEqual(['toolUse']);
     expect(toolResultsOf(rows)).toEqual([['once-call|item-2', false]]);
     expect(readFileSync(effect, 'utf8')).toBe('ran');
     expect(requests()).toBe(3);
@@ -6927,7 +6952,7 @@ it('a real SDK retry of a truncated stream holding a partial tool call continues
     expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
     expect(error.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', name: 'bash' }));
     expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1, errorMessage: error.message?.errorMessage })]);
-    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(retriedReplies(rows, error)).toEqual(['toolUse']);
     expect(toolResultsOf(rows)).toEqual([['retried-call|item-2', false]]);
     expect(readFileSync(effect, 'utf8')).toBe('ran');
     expect(requests()).toBe(3);

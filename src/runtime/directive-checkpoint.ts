@@ -444,6 +444,8 @@ function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3
   const edit = typeof first === 'object' && omitsErrorRow(first, reply) ? first : null;
   const compaction = edit === null ? first : after(2);
   if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
+  // The compaction hangs off the edit, so its chain is checked through it.
+  if (edit !== null) ancestry.link(edit);
   const refusal = linkedCompactionRefusal(compaction, (edit ?? reply).id, ancestry);
   if (refusal !== null) return refusal;
   const retried = edit === null ? after(2) : after(3);
