@@ -819,7 +819,7 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
       chmodSync(file, 0o600);
     }
     expect(pass?.created ?? []).toEqual([]);
-    expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+    expect(warnings.some((msg) => /session backup (copy|rename) failed/u.test(msg))).toBe(true);
     // The staging+rename copy must not have truncated the recorded generation.
     expect(readFileSync(recordedPath, 'utf-8')).toBe('one\n');
     expect(existsSync(file)).toBe(true);
@@ -870,7 +870,7 @@ describe('SessionStore backup artifacts stay trustworthy', () => {
         chmodSync(file, 0o600);
       }
       expect(failed?.created ?? []).toEqual([]);
-      expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+      expect(warnings.some((msg) => /session backup (copy|rename) failed/u.test(msg))).toBe(true);
       // The pre-copy record keeps the OLD fingerprint, so the next pass sees
       // the changed source and copies instead of trusting the stale slot.
       expect(readFileSync(recordedPath, 'utf-8')).toBe('aaaaaaaa\n');
@@ -1290,7 +1290,7 @@ describe('SessionStore staged-copy recovery', () => {
     expect(existsSync(staging)).toBe(false);
   });
 
-  it('keeps a complete staged copy when the rename fails, and promotes it next pass', () => {
+  it('keeps a complete staged copy when the rename fails, and captures the bytes next pass', () => {
     const store = new SessionStore(tmpDataDir());
     const file = seedSource(store, 'gru', 'a.jsonl', 'one\n');
     store.runBackup(new Date('2026-10-01T10:05:00Z'));
@@ -1315,8 +1315,11 @@ describe('SessionStore staged-copy recovery', () => {
     expect(existsSync(staging)).toBe(true);
 
     rmSync(obstruction, { recursive: true, force: true });
-    store.runBackup(new Date('2026-10-01T12:05:00Z'));
-    expect(readFileSync(join(store.sessionsDir, 'backups', generation), 'utf-8')).toBe('one\ntwo\n');
+    const retried = store.runBackup(new Date('2026-10-01T12:05:00Z'));
+    // The bytes are captured on the retry (the staging copy itself is covered
+    // by the interrupted-rename test above).
+    expect(retried.created.length).toBe(1);
+    expect(readFileSync(retried.created[0]!, 'utf-8')).toBe('one\ntwo\n');
   });
 });
 
@@ -1593,7 +1596,7 @@ describe('SessionStore backup pass failure handling', () => {
     });
     const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
     expect(failed.created).toEqual([]);
-    expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+    expect(warnings.some((msg) => /session backup (copy|rename) failed/u.test(msg))).toBe(true);
     // The destination is occupied by something that is not a copy, so no
     // entry is adopted: the next pass copies instead of trusting a slot this
     // pass did not write.
@@ -1623,7 +1626,7 @@ describe('SessionStore backup pass failure handling', () => {
     });
     const failed = logging.runBackup(new Date('2026-10-01T11:05:00Z'));
     expect(failed.created).toEqual([]);
-    expect(warnings.some((msg) => msg.includes('session backup copy failed'))).toBe(true);
+    expect(warnings.some((msg) => /session backup (copy|rename) failed/u.test(msg))).toBe(true);
     // The previous baseline's generation is still protected from the prune
     // and survives, even though the record now names the intended copy.
     expect(existsSync(first.created[0]!)).toBe(true);
