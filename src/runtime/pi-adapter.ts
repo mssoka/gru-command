@@ -59,6 +59,15 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
 type SdkTool = AgentSession['agent']['state']['tools'][number];
 
+/** The prompt a session runs with. Pi 1.x derives `agent.state.systemPrompt`
+ * from the transcript's system messages, which a session only has once its
+ * first prompt ran; before that the SDK's own effective prompt is the
+ * session's, and both name the same text afterwards. */
+function effectiveSystemPrompt(session: AgentSession): string {
+  return session.agent.state.messages.some((message) => message.role === 'system')
+    ? session.agent.state.systemPrompt : session.systemPrompt;
+}
+
 /**
  * In-process SDK extension that blocks a known unscheduled verification
  * producer in the bash tool before it executes (issue #315). It intercepts
@@ -1037,7 +1046,7 @@ export class PiRuntime implements AgentRuntime {
           if (unboundNativeTools.length > 0) {
             throw new Error(`native directive tools lack stable authority manifests: ${unboundNativeTools.map((tool) => tool.name).join(', ')}`);
           }
-          return createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.agent.state.systemPrompt,
+          return createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: effectiveSystemPrompt(session),
             toolExecution: session.agent.toolExecution,
             tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters,
               executionMode: tool.executionMode ?? null, guarded: directiveExecutorOrigins.has(tool.execute),

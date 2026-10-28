@@ -1,5 +1,6 @@
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { ModelRuntime, createBashToolDefinition, defineTool, type AgentSession, type ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { createInitialSystemMessage, toToolDeclaration } from '@earendil-works/pi-ai';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -6147,6 +6148,10 @@ async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveEx
     sessionFile: original.sessionFile!, text, authorityManifest: authority });
   // Accountable checkpoint fixture: the SDK's public persistence primitive
   // writes the original user receipt. No model, effects or terminal is forged.
+  // Pi 1.x persists the session's prompt and tool declarations as a system
+  // message directly ahead of the first prompt, so a real host that ceased
+  // after its receipt left that entry before it.
+  session.sessionManager.appendMessage(createInitialSystemMessage(session.systemPrompt, session.agent.state.tools.map(toToolDeclaration))!);
   const receipt = session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
   afterReceipt?.(session, receipt);
   const proof = inspectDirectiveCheckpoint(original.sessionFile!, identity);
