@@ -5959,9 +5959,9 @@ const RESTORE_ERROR_TAIL_BYTES = 4 * 1024;
 
 /** A failed restore's error as recorded, at most 4 KiB, redacted before
  * any cut. A setup command's failure is its reason line (redacted, then cut
- * to one line) and its output tail cut from the streams the error keeps —
- * whose creation tokens are already redacted — as the onboarding proof cuts
- * it ({@link recordedTail}): each stream redacted whole, then from a line start, or of one longer line its last words
+ * to one line) and its output tail cut from the raw streams as the
+ * onboarding proof cuts it ({@link recordedTail}): each stream redacted
+ * whole, then from a line start, or of one longer line its last words
  * marked as starting mid-line, or with no word to start at a note that the
  * line is not shown; a stream whose dropped start ended mid-line loses that
  * first line (or, with no line break, is only noted as cut), so no fragment

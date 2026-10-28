@@ -4,7 +4,6 @@ import { dirname, isAbsolute, join, relative, resolve, win32 } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
-import { redactCreationTokens } from './creation-intent.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -452,9 +451,8 @@ export interface SetupStreamTail {
 }
 
 /** A setup command failed, timed out or was stopped. The message names it
- * with a short output tail; `output` keeps each stream's bounded tail, with
- * any creation token already redacted. A caller still applies its own
- * credential redaction before it records (#427 onboarding proof). */
+ * with a short output tail; `output` keeps each stream's bounded raw tail
+ * for a caller that redacts before it records (#427 onboarding proof). */
 export class WorktreeSetupError extends Error {
   constructor(
     message: string,
@@ -558,17 +556,9 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   }
 
   opts.onOutcome?.({ code: outcome.code, signal: outcome.signal, timedOut, stopped });
-  // A setup command can print a lane's own registry (`git worktree list
-  // --porcelain` shows the lock reason while the lane is still locked for its
-  // creation). Its output text is recorded durably through this error (a
-  // child's result summary, the retained failure reason, the service log), so
-  // the creation token is redacted here, before the error exists.
-  const output = {
-    stdout: redactedStreamTail(stdout.stream()),
-    stderr: redactedStreamTail(stderr.stream()),
-  };
+  const output = { stdout: stdout.stream(), stderr: stderr.stream() };
   const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
-  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(redactCreationTokens(`${what}: ${command}\noutput tail:\n${outputTail}`), output);
+  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);
   if (stopped) throw failed('worktree setup command was stopped (its caller aborted)');
   if (timedOut) throw failed(`worktree setup command timed out after ${timeoutMs}ms`);
   if (outcome.code === null) throw failed(`worktree setup command was killed by ${String(outcome.signal)}`);
@@ -577,32 +567,4 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
 
 function tail(text: string, max = 2_000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`;
-}
-
-/** The note kept when the retained window began mid-line and its first line
- * break leaves nothing: a fragment the earlier cut made is never shown. */
-const CUT_MID_LINE = '(output before this was cut mid-line; not shown)\n';
-
-/* Exported for its tests: the boundary rule is a function of the retained
- * window, and a pipe's chunk boundaries cannot be driven from a setup command. */
-/** A setup stream's bounded tail with any creation token redacted. A window
- * whose dropped start ended mid-line can begin inside a token
- * (`gru-creation:<uuid>`): the prefix-anchored redaction cannot see a
- * prefixless body, and the fixed prefix makes that body reconstructable. Such
- * a first partial line is dropped before redaction, exactly as recordedTail
- * ({@link recordedTail}) drops it for the same window, so no fragment of a
- * token is ever kept. */
-export function redactedStreamTail(stream: SetupStreamTail): SetupStreamTail {
-  let text = stream.text;
-  let startsAtLine = stream.startsAtLine;
-  if (stream.truncated && !startsAtLine) {
-    const line = text.indexOf('\n');
-    text = line === -1 ? CUT_MID_LINE : text.slice(line + 1);
-    if (text.trim() === '') text = CUT_MID_LINE;
-    startsAtLine = true;
-  }
-  const redacted = redactCreationTokens(text);
-  return redacted === stream.text && startsAtLine === stream.startsAtLine
-    ? stream
-    : { ...stream, text: redacted, startsAtLine };
 }

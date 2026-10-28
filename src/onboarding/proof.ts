@@ -319,8 +319,8 @@ async function ignoredPaths(dir: string): Promise<readonly string[]> {
 }
 
 /** Setup's thrown message is `<what failed>\noutput tail:\n<tail>`; the
- * recorded tail is cut from the streams the error keeps, whose creation
- * tokens are already redacted. Exported for its tests. */
+ * recorded tail is cut from the raw streams the error keeps. Exported for
+ * its tests. */
 export function splitFailure(error: unknown): { readonly reason: string; readonly tail: string } {
   const message = error instanceof Error ? error.message : String(error);
   const at = message.indexOf('\noutput tail:\n');

@@ -4,7 +4,6 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { DispatchService } from '../src/dispatch/service.js';
-import { OutputTail, redactedStreamTail } from '../src/worktrees/manifest.js';
 import { JobExecutionStop } from '../src/dispatch/job-stop.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { clearCreationIntent, readCreationIntent, writeCreationIntent } from '../src/worktrees/creation-intent.js';
@@ -700,110 +699,6 @@ describe('retained-creation continuation custody', () => {
     } finally {
       vi.stubEnv('PATH', restore);
     }
-  });
-
-  it('redacts the token a failing setup command prints from the lane registry', async () => {
-    // While a lane is still locked for its creation, `git worktree list
-    // --porcelain` prints its lock reason. A setup command that prints it and
-    // fails carries the token into the setup error, which records durably.
-    const h = managerFixture('setup-registry-redaction');
-    const jobId = 'setup-registry-redaction';
-    h.repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "git worktree list --porcelain; git worktree list --porcelain 1>&2; exit 3"\n', 'setup that prints the lane registry on both streams');
-    const retained = syntheticRetained(h, jobId);
-    const thrown = await h.worktrees.createRetainedJobWorktree({
-      repoPath: h.repo.path, jobId,
-      expected: { receiptTokenSha256: sha256(retained.token), producerSettlementSeq: settlements(h, jobId)[0]!.seq },
-    }).then(() => null, (failure: unknown) => failure);
-    expect(thrown).toBeInstanceOf(Error);
-    const error = thrown as Error;
-    expect(error.message).toContain('worktree setup command exited 3');
-    // The continuation kept its receipt, so the exact token is still readable.
-    const common = realpathSync(git(h.repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
-    const token = readCreationIntent(common, retained.branch)?.token;
-    expect(token).toBe(retained.token);
-    expect(error.message).toContain('<redacted-creation-token>');
-    expect(error.message).not.toContain(retained.token);
-    const cause = error.cause;
-    expect(cause).toBeInstanceOf(Error);
-    const setup = cause as unknown as { readonly output: { readonly stdout: { readonly text: string }; readonly stderr: { readonly text: string } } };
-    // BOTH recorded stream tails: git writes the registry to stdout here and
-    // the command also prints it to stderr, so neither branch can go
-    // unobserved (a per-stream redaction needs a fixture per stream).
-    for (const tail of [setup.output.stdout.text, setup.output.stderr.text]) {
-      expect(tail).toContain('locked ');
-      expect(tail).toContain('<redacted-creation-token>');
-      expect(tail).not.toContain(retained.token);
-    }
-    expect(hasRawCreationToken(JSON.stringify({
-      message: error.message,
-      stack: error.stack,
-      cause: [(cause as Error).message, (cause as Error).stack, setup.output],
-    }))).toBe(false);
-  });
-
-  it('does not keep a prefixless token body cut at the setup retention boundary', () => {
-    // The retained setup window keeps whole pipe chunks; a token line that
-    // straddles a chunk boundary loses its fixed prefix, and the
-    // prefix-anchored redaction can then no longer see the body — the prefix
-    // is a known literal, so a surviving body reconstructs a live custody
-    // token. A pipe's chunk boundaries cannot be driven from a setup command
-    // (an end-to-end attempt at this head passed without touching the leak),
-    // so the window is built directly.
-    const uuid = randomUUID();
-    const kept = new OutputTail();
-    const split = `gru-creation:${uuid.slice(0, 8)}`;
-    kept.push(Buffer.from(`${'x'.repeat(65_536 - split.length)}${split}`));
-    kept.push(Buffer.from(`${uuid.slice(8)}\nrecorded after\n`));
-    const stream = kept.stream();
-    expect(stream.truncated).toBe(true);
-    expect(stream.startsAtLine).toBe(false);
-    expect(stream.text).toContain(uuid.slice(8)); // the raw window holds the body
-    const redacted = redactedStreamTail(stream);
-    // The partial first line is dropped, not kept as a prefixless body.
-    expect(redacted.text).not.toContain(uuid);
-    expect(redacted.text).not.toContain(uuid.slice(8));
-    expect(redacted.text).toContain('recorded after');
-    expect(redacted.startsAtLine).toBe(true);
-    // The no-line-break arm: when nothing follows the partial line, only the
-    // cut note is kept — the window is exactly the prefixless body.
-    const nothing = new OutputTail();
-    nothing.push(Buffer.from(`${'y'.repeat(65_536 - split.length)}${split}`));
-    nothing.push(Buffer.from(uuid.slice(8)));
-    const noLine = nothing.stream();
-    expect(noLine.truncated).toBe(true);
-    expect(noLine.startsAtLine).toBe(false);
-    expect(noLine.text).toContain(uuid.slice(8));
-    const noLineRedacted = redactedStreamTail(noLine);
-    expect(noLineRedacted.text).not.toContain(uuid);
-    expect(noLineRedacted.text).not.toContain(uuid.slice(8));
-    expect(noLineRedacted.text).toContain('cut mid-line');
-    expect(noLineRedacted.startsAtLine).toBe(true);
-    // A truncated window that starts at a line boundary has nothing partial
-    // to drop: its first complete line must still be redacted, not dropped.
-    const aligned = new OutputTail();
-    aligned.push(Buffer.from(`${'z'.repeat(65_536)}\n`));
-    aligned.push(Buffer.from(`locked gru-creation:${uuid}\nrecorded after\n`));
-    const alignedStream = aligned.stream();
-    expect(alignedStream.truncated).toBe(true);
-    expect(alignedStream.startsAtLine).toBe(true);
-    expect(alignedStream.text).toContain(`gru-creation:${uuid}`);
-    const alignedRedacted = redactedStreamTail(alignedStream);
-    expect(alignedRedacted.text.startsWith('locked ')).toBe(true);
-    expect(alignedRedacted.text).toContain('<redacted-creation-token>');
-    expect(alignedRedacted.text).not.toContain(uuid);
-    expect(alignedRedacted.text).toContain('recorded after');
-    // A mid-line window whose later line carries a complete token: the
-    // partial first line is dropped AND the later token is still redacted.
-    const mixed = new OutputTail();
-    mixed.push(Buffer.from(`${'w'.repeat(65_536 - 8)}partial`));
-    mixed.push(Buffer.from(`\nlocked gru-creation:${uuid}\nrecorded after\n`));
-    const mixedStream = mixed.stream();
-    expect(mixedStream.truncated).toBe(true);
-    expect(mixedStream.startsAtLine).toBe(false);
-    const mixedRedacted = redactedStreamTail(mixedStream);
-    expect(mixedRedacted.text).toContain('<redacted-creation-token>');
-    expect(mixedRedacted.text).not.toContain(uuid);
-    expect(mixedRedacted.text).toContain('recorded after');
   });
 
   it('reads back custody-unknown when shutdown cancels the automatic retries after the prompt was sent', async () => {
