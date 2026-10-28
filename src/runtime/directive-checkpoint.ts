@@ -455,10 +455,13 @@ function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3
 }
 /** Pi 1.x keeps a failed reply in the transcript and durably omits it from
  * the model's context with a `context_edit` entry linked on it (`replacement`
- * null) when it retries the reply. It runs no tool and sends no message. */
+ * null) when it retries the reply or compacts and retries it. A failed reply
+ * is an error row, or a call-less length row, the same two compactAndRetryCompaction
+ * reads. The edit runs no tool and sends no message. */
 function omitsErrorRow(edit: NativeEntry, row: NativeEntry): boolean {
+  const stop = row.message?.stopReason;
   return edit.type === 'context_edit' && edit.parentId === row.id && edit.targetId === row.id && edit.replacement === null &&
-    row.type === 'message' && row.message?.role === 'assistant' && row.message.stopReason === 'error';
+    row.type === 'message' && row.message?.role === 'assistant' && (stop === 'error' || stop === 'length' && !holdsToolCalls(row.message));
 }
 /** The level Pi's session records in a thinking_level_change: what
  * setThinkingLevel was given, or clamped to (through Pi's own nested copies). */
