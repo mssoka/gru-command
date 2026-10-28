@@ -451,19 +451,45 @@ prompt/tool content, so nothing but the owner should traverse it.
   is rejected loudly, naming the holder. A stale lock (dead pid, heartbeat
   older than 60s) is stolen and logged. The lock is released on graceful
   shutdown and on handle dispose.
-- **Hourly rolling backup**: tracked session files are copied hourly into
-  `<data_dir>/sessions/backups/` with an ISO-hour suffix; per source file
-  the newest 24 backups are retained (pruned oldest-first). A backup pass
-  also runs at boot. The slot IS the ISO hour: a second pass in the same
-  hour refreshes that slot (freshest in-slot state wins). Backups copy
-  live files, so a trailing line may be partial — recovery tooling must
-  tolerate a torn tail.
+- **Hourly rolling backup**: an hourly pass (and one at boot) copies only
+  the tracked session files whose content changed since that source's
+  last recorded backup into `<data_dir>/sessions/backups/` with an
+  ISO-hour suffix; unchanged sources are not copied at all. Change is
+  detected from the source's size and mtime plus its ctime (a write
+  cannot restore the ctime), sampled when the pass scans the source, so a
+  same-size rewrite still reads as changed while a metadata-only touch
+  costs one harmless extra copy; a generation can therefore hold slightly
+  newer bytes than its recorded fingerprint (the next pass copies again). The
+  change baseline is the separate file
+  `<data_dir>/sessions/backup-baseline.json`
+  (`{"version":1,"sources":{"<sessions-relative path>":{"size":N,"mtimeMs":M,"ctimeMs":C,"backup":"<generation file name>"}}}`),
+  so a restart copies nothing for unchanged sources; each pass records its
+  intended copies in `backup-baseline.json.pending` BEFORE copying and
+  publishes that record when the pass completes (a pass that cannot record
+  writes nothing; a record that cannot be published is preferred by the next
+  pass, so a copy's identity is never lost). A missing or corrupt baseline
+  copies each source once and rewrites it, and a live source whose recorded
+  generation is missing, unreadable or truncated is copied again. Pruning keeps the newest
+  24 generations of a live source and deletes generations whose ISO hour
+  ended more than 7 days ago, but never the newest generation and never a
+  generation the baseline records — they can differ after a clock step or a
+  failed baseline write, and the pass keeps both rather than guess which holds
+  the last bytes (a source the baseline does not know keeps its newest name):
+  a live source's last snapshot is never
+  deleted, and a source that is gone keeps its last recorded backup while its
+  older generations age out (the count rule does not apply to a source that
+  can no longer produce generations, so it can hold up to a week of hourly
+  generations); the entry recorded for a source that is gone stays in the
+  baseline, so its last snapshot is the one the pass protects. The slot IS
+  the ISO hour: a second pass in the same hour refreshes that slot
+  (freshest in-slot state wins). Backups copy live files, so a trailing
+  line may be partial — recovery tooling must tolerate a torn tail.
 - **Change detection on boot** (the emergency-console contract): the store
   snapshots session-file sizes at graceful shutdown and after each backup
-  pass. On boot it re-scans; any file that grew OR shrank while the
-  service was down is reported via `/health`, and a file that VANISHED is
-  reported with kind `deleted` (a console delete must never pass
-  silently).
+  pass (the pass's snapshot carries that pass's scan sizes). On boot it
+  re-scans; any file that grew OR shrank since the last snapshot is reported
+  via `/health`, and a file that VANISHED is reported with kind `deleted` (a
+  console delete must never pass silently).
   (`liveness.signals.session_growth`) and a `warn` log line naming the
   file, the kind of change, and the byte delta. A missing snapshot means
   a first-ever boot; a corrupt snapshot is reported as `corrupt`
@@ -487,8 +513,9 @@ runtime registry and session store (`stubbed: false`):
 - `agent_session` — aggregate session state (`no-session` / `idle` /
   `streaming`) plus the most recent activity timestamp.
 - `session_growth` — the boot report: `none`, or the list of files that
-  grew, shrank, or were deleted while the service was down (file, kind,
-  byte delta).
+  grew, shrank, or were deleted since the last snapshot — normally while the
+  service was down; a hard stop during a pass can also surface writes from
+  just before it (file, kind, byte delta).
 
 Note: `/health` discloses absolute paths (workspace, data dir, session
 files) — stage-consistent with the loopback-only bind of the pre-UI

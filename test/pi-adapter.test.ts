@@ -3676,7 +3676,7 @@ describe('Perkins r1 boot-surface pins', () => {
     expect(growth.findings.length).toBe(1);
     expect(growth.findings[0]!.kind).toBe('grew');
     // N13: the warn log names file + kind + byte delta:
-    const warn = logs.find((l) => l.level === 'warn' && l.msg.includes('changed while service was down'));
+    const warn = logs.find((l) => l.level === 'warn' && l.msg.includes('changed since the last snapshot'));
     expect(warn).toBeDefined();
     expect(warn!.fields).toMatchObject({ file, kind: 'grew', byte_delta: 19 });
     // N12: the boot backup pass left a copy in the backups dir:

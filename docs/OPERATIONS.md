@@ -383,10 +383,28 @@ next action as a NEW lane/job, never by rewriting the closed record.
 
 The service self-manages:
 
-- **Session transcripts** — hourly rolling copies into
-  `<data_dir>/sessions/backups/` (ISO-hour slots, newest 24 per file);
-  a pass also runs at boot. Recovery tooling must tolerate a torn tail
-  line.
+- **Session transcripts** — an hourly pass (and one at boot) copies only
+  the transcripts whose content changed since their last recorded copy
+  into `<data_dir>/sessions/backups/` (ISO-hour slots); the change
+  baseline is `<data_dir>/sessions/backup-baseline.json` (the source's
+  size, mtime and ctime when the pass scanned it, plus the generation's file
+  name). Change means that fingerprint moved, so an in-place rewrite is
+  copied and a metadata-only touch costs one harmless extra copy. Unchanged
+  transcripts are never re-copied, however recently they were written; a
+  transcript whose recorded generation is missing, unreadable or truncated is
+  copied once more, with a `warn`, so an out-of-band reclaim (or damage) of
+  the backup directory cannot leave a live transcript without a snapshot. Per live transcript
+  the newest 24 backups are kept, and any generation whose ISO hour ended
+  more than 7 days ago is pruned — never the newest generation and never the
+  generation the baseline records. After a clock step or a failed baseline
+  write those two can differ and the pass keeps both, because it cannot tell
+  which one holds the last bytes: restore from the one with the newest
+  content, not from the name alone. A transcript that is
+  gone keeps its last recorded backup while its older generations age out, so
+  it can hold up to a week
+  of hourly generations; its recorded entry stays in the baseline so the
+  pass knows which backup is that transcript's last. Recovery tooling must
+  tolerate a torn tail line.
 - **Chat frames + service log** — size-based rotation with retained
   shards (see above).
 
