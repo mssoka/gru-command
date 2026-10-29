@@ -171,6 +171,56 @@ through existing surfaces:
   those writes refused live directives), the same card, unbound, naming
   retirement and abandonment.
 
+### One card per request and generation (#523)
+
+The card the `reconsider` pass raises (`surfaceDirectiveRecovery`) is one
+incident per request and recovery-debt generation, not one per pass:
+
+- **Identity line.** The first line of its detail is
+  `incident: <request_id> generation <n>`, where `<n>` is the generation of
+  the recovery debt the pass just opened. The rest of the detail, the reason
+  text included, is as before.
+- **No reissue.** When no card of the kind is active and the newest card of
+  the kind, in any state, carries the same identity line, the pass posts
+  nothing: resolving the card (for example `POST
+  /api/notifications/<id>/disposition`) is Gru's answer for that request and
+  generation. Resolving a card never settles, retires, replays or authorizes
+  the request, never clears producer uncertainty and never acknowledges an
+  owner stop. In every other case the pass behaves as before: an open card is
+  reused and its detail refreshed in place (#363), including an open card
+  that names another generation, which now names the current one; a new card
+  is posted when none is active and the newest has another identity or no
+  identity line.
+- **Generations.** A visited request's generation changes with its debt's
+  lifecycle (a settled or superseded debt starts a new one). A retired
+  predecessor's reopened debt (`reopenStrandedRecoveryDebts`) resolves its
+  own card, and `surfaceDirectiveRecovery` never visits a retired request.
+- **Mailbox basis.** For a `silas.directive-unreconciled.*` row whose detail
+  starts with the identity line of the request its kind names, the item
+  basis hashes the row's identity, kind, identity line and severity instead of
+  the whole detail. Refreshing the reason text therefore keeps the basis, and
+  a mailbox disposition recorded against it (`POST
+  /api/mailbox/<id>/disposition`) stays in force; a new identity, or a
+  changed severity, is a new basis as before. A row without the line keeps
+  the detail-based basis.
+- **Signal.** `incidentSignalOf` maps `silas.directive-unreconciled.<request>`
+  to `directive-unreconciled`, as it maps the rebrief kind to
+  `rebrief-unreconciled`, so a decision's `covers` fits the 64-character
+  signal bound whatever the request id. Subject and basis checks of decisions
+  and mailbox dispositions are unchanged, and the kind stays a hard floor: a
+  decision hold never defers its wake.
+- **Unchanged.** The terminal-job card (`observeTerminalJobDirective`), the
+  boot reconcile card (`reconcilePendingDirectives`) and the
+  `silas.rebrief-unreconciled.*` kind write no identity line and keep their
+  behavior; so do the closeout's suppression and resolve (above).
+- **Upgrade effects.** An existing card without the line counts as another
+  identity, so one more card may be posted once per request after the upgrade
+  (when the old one was resolved); an open card the new code refreshes gains
+  the line and its mailbox basis changes once; a decision or disposition
+  recorded against an old long-form signal
+  (`directive-unreconciled.<request>`) stops matching once, and is recorded
+  again against `directive-unreconciled`.
+
 ## After retirement: the continuation hold
 
 Retirement leaves a durable continuation hold on the request row
