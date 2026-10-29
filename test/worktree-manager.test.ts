@@ -2791,3 +2791,59 @@ describe('#534: raw in memory, masked on the way out', () => {
     expect(credentialedDetail!.name).toBe(twinDetail!.name);
   });
 });
+
+it('masks argv credentials in a later paused result (survivors and newcomers)', async () => {
+  // The mask is applied once, in `release()`, over returns the first pause
+  // never reaches: a process that survives the acknowledged kill, and one
+  // that arrived after the pause. Both are exercised here with a credential.
+  const h = harness();
+  const repo = h.make();
+  ledgerJob(h, 'job-argv-later', repo);
+  await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-later' });
+  const credential = `curl -H 'Authorization: Bearer ${ARGV_SENTINEL}' --token ${ARGV_SENTINEL} https://host/x`;
+  const attested = { pid: 880001, command: credential, evidence: 'argv' as const };
+  const newcomer = { pid: 880002, command: `node server.js --token ${ARGV_SENTINEL}`, evidence: 'argv' as const };
+
+  h.enumerator.mockReturnValue([attested]);
+  expect((await h.manager.release({ worktreeId: 'job-argv-later' })).status).toBe('paused');
+
+  // It survives both signals (the OS-failure shape): the second result is a
+  // paused one the first pause never produced.
+  const kill = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+  try {
+    const survived = await h.manager.release({ worktreeId: 'job-argv-later', confirmKill: true });
+    expect(survived.status).toBe('paused');
+    if (survived.status !== 'paused') return;
+    expect(survived.note).toMatch(/survived the acknowledged kill/);
+    expectMasked('the survivor paused result', survived.processes.find((proc) => proc.pid === attested.pid)?.command);
+  } finally {
+    kill.mockRestore();
+  }
+
+  // The acknowledged pid leaves (the real signal now fails, which is "gone"),
+  // and a credential-bearing newcomer is asked about on its own.
+  h.enumerator.mockReturnValue([attested, newcomer]);
+  const later = await h.manager.release({ worktreeId: 'job-argv-later', confirmKill: true });
+  expect(later.status).toBe('paused');
+  if (later.status !== 'paused') return;
+  expect(later.note).toMatch(/the acknowledged kill did not cover/);
+  expectMasked('the newcomer paused result', later.processes.find((proc) => proc.pid === newcomer.pid)?.command);
+
+  // Each later pause's callback, event payload and row are masked too.
+  const survivorPause = h.pauses[1]!;
+  const newcomerPause = h.pauses[2]!;
+  expectMasked('a survivor details[].command', survivorPause.details.find((detail) => detail.pid === attested.pid)?.command);
+  expectMasked('a survivor processes[].command', survivorPause.processes.find((proc) => proc.pid === attested.pid)?.command);
+  expectMasked('a newcomer details[].command', newcomerPause.details.find((detail) => detail.pid === newcomer.pid)?.command);
+  expectMasked('a newcomer processes[].command', newcomerPause.processes.find((proc) => proc.pid === newcomer.pid)?.command);
+  const events = h.ledger.listEvents({ limit: 500 });
+  for (const pause of [survivorPause, newcomerPause]) {
+    const event = events.find((candidate) => candidate.kind === 'worktree.paused'
+      && (candidate.payload as { pause_id?: string }).pause_id === pause.pauseId);
+    const processes = (event?.payload as { processes?: readonly { pid: number; command: string }[] } | undefined)?.processes ?? [];
+    expect(processes.length, pause.pauseId).toBeGreaterThan(0);
+    for (const proc of processes) expectMasked('a later worktree.paused payload', proc.command);
+  }
+  expectMasked('the newcomer row', h.ledger.listWorktreeProcesses('job-argv-later').find((proc) => proc.pid === newcomer.pid)?.command);
+  expect(JSON.stringify([h.pauses.slice(1), events, h.ledger.listWorktreeProcesses('job-argv-later')])).not.toContain(ARGV_SENTINEL);
+});

@@ -261,6 +261,13 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     [`/bin/sh -c cli --token "${ARGV_SECRET}" --verbose`, `/bin/sh -c cli --token ${REDACTION_PLACEHOLDER} --verbose`],
     // A password that starts with a dash is still a password after `user:`.
     [`curl -u deploy:-${ARGV_SECRET}`, `curl -u deploy:${REDACTION_PLACEHOLDER}`],
+    // A quoted password (its quotes are part of the `ps` line), a quoted
+    // user, and a whole quoted value whose password holds a space.
+    [`curl -u deploy:'${ARGV_SECRET}' https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy:"${ARGV_SECRET}" https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u "deploy":${ARGV_SECRET} https://host/x`, `curl -u "deploy":${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u "deploy:${ARGV_SECRET} word" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    [`curl -u 'deploy:${ARGV_SECRET} word' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     // Each occurrence in one command line.
     [`cli --token ${ARGV_SECRET} -u a:${ARGV_SECRET}`, `cli --token ${REDACTION_PLACEHOLDER} -u a:${REDACTION_PLACEHOLDER}`],
   ];
@@ -280,6 +287,8 @@ it('keeps argv near misses unchanged: a flag with no credential value, a short, 
     'docker run -u 1000:1000 image',
     'docker run -u 165536:165536 image',
     'curl -u deploy:1234567 https://host/x',
+    'curl -u "deploy:1234567" https://host/x',
+    'curl -u \'deploy:1234567\' https://host/x',
     'docker exec -u alice bash',
     'git push -u origin main',
     'git push -u origin HEAD:refs/heads/main',

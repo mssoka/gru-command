@@ -230,7 +230,9 @@ the checks that need it (tree matching, token naming, `ps -E`
 provenance). An acknowledged pid is compared against its recorded row
 masked, so the answer to a recorded pause is still honored; a row written
 before the masking that still holds a credential never matches, so its
-process is asked about again and the fresh row replaces it.
+process is asked about again and the fresh row replaces it. A row whose
+process exits without being paused again keeps its recorded text: there is
+no backfill of existing rows.
 
 Each row also carries the lane's **token** (`lane_token`, #486): random per
 lane incarnation, minted when the row is registered (lanes not yet swept

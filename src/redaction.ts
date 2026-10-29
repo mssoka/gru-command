@@ -32,9 +32,11 @@ const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])
 const ARGV_VALUE = `(?!-)${KEYWORD_VALUE}`;
 
 /** The password of `-u user:password`: at least 6 characters with a letter
- * (a uid:gid pair such as `165536:165536` is no credential). It may start
- * with `-`: only the user is a flag's neighbour. */
-const PASSWORD_VALUE = '(?=[^\\s`\'"]*[A-Za-z])[^\\s`\'"]{6,}';
+ * (a uid:gid pair such as `165536:165536` is no credential), bare or a
+ * quoted shell word (`-u deploy:'…'`), whose quotes are part of the value
+ * a `ps` line shows. A bare one may start with `-`: only the user is a
+ * flag's neighbour. */
+const PASSWORD_VALUE = '(?:"(?=[^"]*[A-Za-z])[^"]{6,}"|\'(?=[^\']*[A-Za-z])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z])[^\\s`\'"]{6,})';
 
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret
@@ -126,9 +128,13 @@ const REDACTIONS: readonly Redaction[] = [
   // <value>` (GitHub's scheme), `--token <value>` with a space (the `=` form
   // is the keyword rule's), and curl's `-u <user>:<password>`, whose `-u` is
   // not the tail of a longer flag. A flag with no such value masks nothing.
+  // A whole quoted value (`-u "deploy:secret with space"`) runs to its own
+  // closing quote, so the password's spaces are inside the mask.
   replacing(new RegExp(`(\\bAuthorization\\s*:\\s*token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
   replacing(new RegExp(`(?<![A-Za-z0-9-])(--token\\s+)${ARGV_VALUE}`, 'gu'), keepPrefix),
-  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-][^\\s:'"\`]*:)${PASSWORD_VALUE}`, 'gu'), keepPrefix),
+  replacing(/(?<![A-Za-z0-9-])(-u\s+(["'])[^"':]{1,64}:)(?=[^"']*[A-Za-z])[^"']{6,}\2/gu,
+    (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-][^\\s:'"\`]*["']?:)${PASSWORD_VALUE}`, 'gu'), keepPrefix),
   redactNpmrcAuth,
   // A key, then an optional closing quote (JSON's `"password": "…"`), then
   // `:` or `=`. One whose identifier starts right after a `/` is part of a

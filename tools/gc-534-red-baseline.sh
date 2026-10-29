@@ -13,8 +13,8 @@
 #       `Authorization: token <v>`;
 #   A6  a live row holding a raw credential (seeded below the ledger API)
 #       was acknowledged and killed instead of asked about again;
-#   A7  a verification scope whose command carries a credential was recorded
-#       in the lane's registry row as listed.
+#   READBACK  a verification scope whose command carries a credential was
+#       recorded in the lane's registry row as listed.
 # The fast files and the heavy files run under their own Vitest configs;
 # their JSON reports are merged and classified once by
 # tools/assert-named-red-baseline.mjs, which exits 2 (FAILS-BEFORE CLAIM
@@ -46,9 +46,9 @@ a1='redacts argv credentials in every recorded and returned process command'
 a2='redacts argv credentials in the verify registry write'
 a3='redacts argv credentials: new token, user and auth-scheme forms'
 a6='redacts argv credentials: a raw live row from before the redaction is asked about again, not killed, and recorded redacted'
-a7title='records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)'
-a7="POST /api/verify $a7title"
-for pair in "worktree-manager:$a1" "ledger-api:$a2" "redaction:$a3" "worktree-manager:$a6" "verification-server:$a7title"; do
+readbackTitle='records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)'
+readback="POST /api/verify $readbackTitle"
+for pair in "worktree-manager:$a1" "ledger-api:$a2" "redaction:$a3" "worktree-manager:$a6" "verification-server:$readbackTitle"; do
   file=${pair%%:*}
   title=${pair#*:}
   if ! grep -qF "it('$title'" "test/$file.test.ts"; then
@@ -77,6 +77,6 @@ node -e '
     testResults: reports.flatMap((report) => report.testResults),
   }));
 ' "$d/results.json" "$d/fast-results.json" "$d/heavy-results.json"
-node "$root/tools/assert-named-red-baseline.mjs" gc-534 "$d/results.json" "$a1" "$a2" "$a3" "$a6" "$a7" || exit 2
+node "$root/tools/assert-named-red-baseline.mjs" gc-534 "$d/results.json" "$a1" "$a2" "$a3" "$a6" "$readback" || exit 2
 echo "EXPECTED-NONZERO: the argv-redaction regressions A1, A2, A3, A6 and the verification readback failed behaviorally against the unredacted base"
 exit 1
