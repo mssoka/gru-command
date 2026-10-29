@@ -27,6 +27,9 @@ interface ToolResultShape {
   readonly toolName?: string;
   readonly isError?: boolean;
 }
+interface SystemShape {
+  readonly role: 'system';
+}
 interface UserShape {
   readonly role: 'user';
   readonly content: string | readonly (TextBlock | ImageBlock)[];
@@ -354,7 +357,11 @@ export function parseTranscriptContent(content: string): {
   for (const entry of parsed) {
     if (entry.type === 'session') continue; // header
     if (entry.type === 'message') {
-      const message = (entry as { message: AnyMessage }).message;
+      const message = (entry as { message: AnyMessage | SystemShape }).message;
+      // Pi 1.x persists the session's prompt and tool declarations as system
+      // message entries ahead of the first prompt: scaffolding, not part of
+      // the conversation, so they yield no entry (like claude's init frame).
+      if (message.role === 'system') continue;
       entries.push(entryFromMessage(entries.length, message));
       continue;
     }
