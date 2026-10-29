@@ -514,6 +514,38 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(`${afterDelimiters(64)}\n${afterDelimiters(0)}`, rule)).toEqual(prohibited('x-secret.md'));
   });
 
+  it('keeps the matched line text out of the record: a date, a clock time or prose in the text is no path', () => {
+    // A colon-closed line number ends the path region: `:7:Updated on 2026-10-29`
+    // offers no head at the date, so the private text never rides `path` or `detail`.
+    for (const text of ['Updated on 2026-10-29 by Alice', 'meeting at 12:30:45 today', '2026-10-29']) {
+      const hits = scan(match(named('HEAD', 'docs/issues/x.md'), 7, text));
+      expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited('docs/issues/x.md'));
+      expect(JSON.stringify(hits), text).not.toContain(text);
+    }
+    // A context line has no colon-closed number: its path region ends where the
+    // text starts, so a later head that holds whitespace is not a candidate.
+    const hits = scan(context('docs/issues/x.md', 7, 'Prior review: finding 2 closed 2026-10-29-x'));
+    expect(hits.map((hit) => `${hit.code}:${hit.path}`)).toEqual(prohibited('docs/issues/x.md'));
+    expect(JSON.stringify(hits)).not.toContain('finding 2 closed');
+  });
+
+  it('records no revision under a non-prefix exclusion rule, and no text behind the line number', () => {
+    const rule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude **/*.md', amendments: [] });
+    // The raw `<rev>:<path>` head names a revision, never a repository path.
+    expect(recorded(match(named('HEAD', 'notes/a.md'), 7, 'x'), rule)).toEqual(prohibited('notes/a.md'));
+    expect(recorded(context(named('origin/main', 'notes/a.md'), 7, 'x'), rule)).toEqual(prohibited('notes/a.md'));
+    // A line that merely quotes an excluded name after its own line number is clean.
+    expect(recorded(match('src/a.ts', 7, '// see README.md:12: for details'), rule)).toEqual([]);
+    expect(recorded(context('src/a.ts', 7, '// see README.md'), rule)).toEqual([]);
+  });
+
+  it('reads `git grep -n <pat> <rev>:` (the tree root) and `--column` output as the repository path', () => {
+    // `git grep -n needle HEAD:` prints `HEAD::docs/issues/notes.md:1:needle`.
+    expect(recorded(match(named('HEAD', ':docs/issues/notes.md'), 1, 'needle'))).toEqual(prohibited('docs/issues/notes.md'));
+    // `--column` adds a column number after the line number.
+    expect(recorded(match(named('HEAD', 'docs/issues/notes.md'), 2, '1:needle one'))).toEqual(prohibited('docs/issues/notes.md'));
+  });
+
   it('reading these tests is no excluded read: no line of this file, as written or as a read gutter or diff shows it, reads as a grep hit', () => {
     const own = readFileSync(new URL(import.meta.url), 'utf8').split('\n');
     // Lines a reviewer sees: the file itself, a numbered read, a diff line. The two
