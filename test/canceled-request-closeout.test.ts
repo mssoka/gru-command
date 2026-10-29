@@ -609,7 +609,8 @@ describe('canceled-request closeout — body and actors (test 9)', () => {
 
   it('9c. a missing by is stored as unattributed, and so is any other label', async () => {
     const first = await deferred();
-    expect(mustRequest(first, undefined).status).toBe(200);
+    // No `by` at all (the helper's default would supply one).
+    expect(first.closeout.requestBinning(first.jobId, { status: 'binned' })?.status).toBe(200);
     expect(first.ledger.latestCloseoutForJob(first.jobId)?.requestedBy).toBe('unattributed');
     const second = await deferred();
     expect(mustRequest(second, 'Gru').status).toBe(200);
