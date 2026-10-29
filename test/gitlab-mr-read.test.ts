@@ -72,6 +72,8 @@ describe('GitLab merge request link parsing', () => {
       'https://git.example.test/acme/app/-/merge_requests/3',
       'https://evil.gitlab.attacker.test/acme/app/-/merge_requests/3',
       'https://github.com/acme/app/-/merge_requests/3',
+      // GitHub claims this host first, as the head probe's dispatch does.
+      'https://gitlab.github.com/acme/app/-/merge_requests/3',
     ]) expect(parseGitLabMrLink(link), link).toEqual({ kind: 'unsupported-host' });
     for (const link of [
       `http://${HOST}/acme/app/-/merge_requests/3`,
@@ -125,7 +127,7 @@ describe('readGitLabMr', () => {
 
   it('refuses to attach a token to a host the service does not support, before any request', async () => {
     const { calls, fetch: fetchDouble } = double(() => json(mrBody()));
-    for (const host of ['git.example.test', 'github.com', 'evil.gitlab.attacker.test']) {
+    for (const host of ['git.example.test', 'github.com', 'evil.gitlab.attacker.test', 'gitlab.github.com']) {
       await expect(readGitLabMr({ ...REQUEST, host }, { fetch: fetchDouble, env: ENV })).rejects.toThrow(/not a GitLab host/u);
     }
     expect(calls).toHaveLength(0);

@@ -441,6 +441,12 @@ describe('GitLab merge request CI evidence', () => {
     expect(bindGitLab(glObserved({ host: 'gitlab.other.test' })).record.state).toBe('not-matched');
   });
 
+  it('A3: compares shas exactly, as the GitHub binding and the admission check do', () => {
+    const upper = TARGET.toUpperCase();
+    expect(bindGitLab(glObserved({ head_sha: upper }, { sha: upper })).record.state).toBe('not-matched');
+    expect(bindGitLab(glObserved({}, { sha: upper })).record.state).toBe('not-matched');
+  });
+
   it('A4: a merged, closed or locked merge request is UNAVAILABLE and the reason names the state', () => {
     for (const state of ['merged', 'closed', 'locked']) {
       const observed = glObserved({ state });

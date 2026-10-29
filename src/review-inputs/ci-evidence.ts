@@ -600,10 +600,10 @@ function renderGitLabMrEvidence(
   }
   const pipeline = observed.headPipeline;
   if (pipeline === null) return unavailableEvidence('the merge request has no head pipeline', from);
-  if (observed.headSha.toLowerCase() !== targetSha.toLowerCase()) {
+  if (observed.headSha !== targetSha) {
     return notMatched(`the merge request head ${observed.headSha} is not the frozen review target ${targetSha}`);
   }
-  if (pipeline.sha.toLowerCase() !== observed.headSha.toLowerCase()) {
+  if (pipeline.sha !== observed.headSha) {
     return notMatched(
       `head pipeline #${pipeline.id} ran on ${pipeline.sha}, not on the merge request head ${observed.headSha}; ` +
         'a merged-results pipeline runs on a merge commit and cannot bind to the reviewed head',

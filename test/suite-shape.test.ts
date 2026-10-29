@@ -342,7 +342,7 @@ const PINS: Record<string, number> = {
   'review-build-identity.test.ts': 9,
   'review-model-identity.test.ts': 2,
   'review-git-environment.test.ts': 98,
-  'review-ci-evidence.test.ts': 30,
+  'review-ci-evidence.test.ts': 31,
   'review-directory-entries.test.ts': 3,
   'review-evidence-intake.test.ts': 11,
   'review-inputs-handoff.test.ts': 10,

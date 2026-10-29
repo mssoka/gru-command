@@ -5,7 +5,7 @@ import {
   GITLAB_MR_READ_FAILED_EVENT,
   type GitLabMrReadErrorKind,
 } from '../../review-inputs/ci-evidence.js';
-import { isGitLabRemote, parseGitLabMrLink, parseGitLabMrPath } from '../review-path.js';
+import { isGitLabMrHost, parseGitLabMrLink, parseGitLabMrPath } from '../review-path.js';
 import { PROBE_TIMEOUT_MS } from './fresh-head.js';
 
 /**
@@ -163,7 +163,7 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
  * is checked again here, where the token is attached.
  */
 export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrReadDeps = {}): Promise<GitLabMrReadOutcome> {
-  if (!isGitLabRemote(request.host)) {
+  if (!isGitLabMrHost(request.host)) {
     throw new Error(`refusing to send a GitLab token to ${request.host}: not a GitLab host this service supports`);
   }
   const env = deps.env ?? process.env;
