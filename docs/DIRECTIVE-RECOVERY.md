@@ -372,8 +372,9 @@ Responses of the closeout path (body `reason` ≤ 500 characters, optional
 
 - `200` — the job object plus `closeout: {state: "complete", id, generation}`.
 - `400 invalid_reason` — `reason` is longer than 500 characters (counted in
-  characters, not UTF-16 units; checked first, for any binned request) or, on
-  the closeout path, not a string (`null` reads as absent).
+  characters, not UTF-16 units; checked first, for any binned request) or, when
+  a closeout is started, not a string (`null` reads as absent; a repeat that
+  resumes an existing intent stores nothing and ignores the field).
 - `409 request_closeout_refused` — `{error, blockers}`: a guard refused
   before S1 (each blocker `{code, detail}` keeps the guard's own code; no
   intent row, no event).

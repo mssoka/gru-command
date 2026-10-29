@@ -218,6 +218,20 @@ async function postJson(
   return { status: res.status, body: await res.json() };
 }
 
+/** A job whose only live request was deferred before reaching its worker, with its recovery debt and
+ * card exactly as the restart reconsideration opens them (#523). */
+async function deferRequest(wired: Awaited<ReturnType<typeof boot>>, worktrees: InMemoryWorktreePort, repo: ReturnType<typeof makeFixtureRepo>, jobId: string, requestId: string): Promise<void> {
+  const { api } = wired;
+  api.addJob({ id: jobId, repo: 'demo-repo', title: jobId, briefing: `briefing for ${jobId}` });
+  api.setJobStatus(jobId, 'working');
+  await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
+  api.beginRebriefIntent({ jobId, note: 'redo the work', holder: 'silas-ops', requestId });
+  expect(api.claimDirectiveDispatch(requestId)).toBe(true);
+  const start = api.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-started', requestId)!;
+  api.recordDirectiveDispatchDeferral(api.directiveTurnIdentity(requestId), start.seq, 'a supervised producer held the lane');
+  surfaceDirectiveRecovery({ ledger: api, notifications: wired.notifications }, requestId, 'deferred before reaching its worker');
+}
+
 describe('board server — HTTP API', () => {
   let harness: Awaited<ReturnType<typeof boot>>;
 
@@ -359,17 +373,7 @@ describe('board server — HTTP API', () => {
     try {
       const { api, port } = wired;
       const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), api);
-      const defer = async (jobId: string, requestId: string): Promise<void> => {
-        api.addJob({ id: jobId, repo: 'demo-repo', title: jobId, briefing: `briefing for ${jobId}` });
-        api.setJobStatus(jobId, 'working');
-        await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
-        api.beginRebriefIntent({ jobId, note: 'redo the work', holder: 'silas-ops', requestId });
-        expect(api.claimDirectiveDispatch(requestId)).toBe(true);
-        const start = api.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-started', requestId)!;
-        api.recordDirectiveDispatchDeferral(api.directiveTurnIdentity(requestId), start.seq, 'a supervised producer held the lane');
-        // The recovery debt and its card, exactly as the restart reconsideration opens them.
-        surfaceDirectiveRecovery({ ledger: api, notifications: wired.notifications }, requestId, 'deferred before reaching its worker');
-      };
+      const defer = (jobId: string, requestId: string): Promise<void> => deferRequest(wired, worktrees, repo, jobId, requestId);
       await defer('job-cancel', 'req-cancel');
       // Until the closeout exists the route is today's: the live request refuses the bin.
       const early = await postJson(port, '/api/jobs/job-cancel/status', 'board-test-token', { status: 'binned', by: 'gru' });
@@ -410,6 +414,35 @@ describe('board server — HTTP API', () => {
       expect(plain.status).toBe(200);
       expect(plain.body).not.toHaveProperty('closeout');
       expect((plain.body as { status: string }).status).toBe('binned');
+    } finally {
+      await wired.close();
+      repo.cleanup();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('#523 a status request other than binned never reaches the closeout, whatever the job holds', async () => {
+    let closeout: CanceledRequestCloseout | undefined;
+    const wired = await boot('board-test-token', { binningCloseout: binningCloseoutRoute(() => closeout) });
+    const dir = mkdtempSync(join(tmpdir(), 'gru-board-closeout-pause-'));
+    const repo = makeFixtureRepo('board-closeout-pause-app');
+    try {
+      const { api, port } = wired;
+      const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), api);
+      closeout = new CanceledRequestCloseout({ ledger: api, worktrees, pendingProducerBlockers: () => [] });
+      await deferRequest(wired, worktrees, repo, 'job-pause', 'req-pause');
+      const before = api.latestEventSeq();
+      const parked = await postJson(port, '/api/jobs/job-pause/status', 'board-test-token', { status: 'parked', by: 'gru', reason: 'pause, not cancel' });
+      expect(parked.status).toBe(200);
+      expect(parked.body).toMatchObject({ id: 'job-pause', status: 'parked' });
+      expect(parked.body).not.toHaveProperty('closeout');
+      expect(api.getJob('job-pause')?.status).toBe('parked');
+      expect(api.getDirective('req-pause')?.state).toBe('dispatching');
+      expect(api.latestCloseoutForJob('job-pause')).toBeNull();
+      expect(api.listJobEvents('job-pause').filter((event) => event.seq > before).map((event) => event.kind)).not.toContain('silas.closeout-intent');
+      // Resuming is as plain.
+      expect((await postJson(port, '/api/jobs/job-pause/status', 'board-test-token', { status: 'working', by: 'gru' })).status).toBe(200);
+      expect(api.latestCloseoutForJob('job-pause')).toBeNull();
     } finally {
       await wired.close();
       repo.cleanup();

@@ -150,6 +150,14 @@ const MUTATIONS = [
   { id: 'M52', test: 1, what: 'the closeout records a dispatch after completing', run: NEW, fails: ['1a', '1b'],
     edits: [{ file: EXEC, find: "if (completed.kind === 'superseded') return { kind: 'superseded', intent: completed.intent };",
       replace: "if (completed.kind === 'superseded') return { kind: 'superseded', intent: completed.intent };\n    ledger.appendCustomEvent({ kind: 'silas.directive-dispatch-started', jobId: completed.intent.jobId, payload: { request_id: completed.intent.requestId } });" }] },
+  { id: 'M54', test: 7, what: 'P4 is revalidated only before S3, not before S2', run: NEW, fails: ['7h'],
+    edits: [{ file: API, find: "if (control.length > own.length || own.length > 1) return { reason: 'control-event', retired };", replace: "if (before === 'bin' && (control.length > own.length || own.length > 1)) return { reason: 'control-event', retired };" }] },
+  { id: 'M55', test: 9, what: 'the intent event is attributed to the requester instead of the closeout', run: NEW, fails: ['1b'],
+    edits: [{ file: API, find: "job_status: job.status, requested_by: input.requestedBy, reason: input.reason, by: CLOSEOUT_ACTOR } });", replace: "job_status: job.status, requested_by: input.requestedBy, reason: input.reason, by: input.requestedBy } });" }] },
+  { id: 'M56', test: 9, what: 'the complete event carries no actor', run: NEW, fails: ['1b'],
+    edits: [{ file: API, find: "payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation, by: CLOSEOUT_ACTOR } });\n      return { kind: 'complete' as const", replace: "payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation } });\n      return { kind: 'complete' as const" }] },
+  { id: 'M57', test: 12, what: 'the board status route offers every status to the closeout, not only binned', run: BOARD, fails: ['#523 a status request other than binned'],
+    edits: [{ file: 'src/board/server.ts', find: "if (status === 'binned') {\n            const closeout = options.binningCloseout?.(id, body) ?? null;", replace: "{\n            const closeout = options.binningCloseout?.(id, body) ?? null;" }] },
 ];
 
 function escapeRegex(text) {

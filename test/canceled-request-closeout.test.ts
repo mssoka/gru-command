@@ -233,6 +233,12 @@ describe('canceled-request closeout — the cancel (test 1)', () => {
     expect(jobEvents(ctx, 'silas.directive-retired')).toHaveLength(1);
     expect(binnedEvents(ctx)).toHaveLength(1);
     expect(jobEvents(ctx, 'silas.closeout-complete')).toHaveLength(1);
+    // The closeout's own events: exact payloads, attributed to the closeout.
+    const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-intent')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId, generation: 1,
+      payload_hash: intent.payloadHash, job_status: 'working', requested_by: 'gru', reason: null, by: CLOSEOUT_ACTOR });
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-complete')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId, generation: 1, by: CLOSEOUT_ACTOR });
+    expect(jobEvents(ctx, 'silas.closeout-intent')[0]!.seq).toBe(intent.intentSeq);
     expectNoOwnerAttribution(ctx);
   });
 });
@@ -539,6 +545,23 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
 });
 
 describe('canceled-request closeout — a stale intent, further cases (test 7)', () => {
+  it('7h. an amendment accepted after S1 and before S2 supersedes the intent (control-event) and nothing is retired', async () => {
+    const ctx = await deferred();
+    once(ctx, 'intent', () => {
+      const contract = ctx.ledger.effectiveContract(ctx.jobId)!;
+      expect(ctx.ledger.addJobAmendment({ jobId: ctx.jobId, body: 'a clarified requirement', effect: 'administrative',
+        approval: { by: 'fixture-approver', reference: 'closeout test' }, expectedContractSha256: contract.contractSha256 }).status).toBe('accepted');
+    });
+    const superseded = mustRequest(ctx);
+    expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'control-event' });
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'control-event' });
+    // Revalidation runs BEFORE the retirement: the request was never touched.
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
+    expect(jobEvents(ctx, 'silas.directive-retired')).toEqual([]);
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
+    expectNoOwnerAttribution(ctx);
+  });
+
   it('7e. a change to the request itself after S1 supersedes the intent (request-state) and lifts the fence', async () => {
     const ctx = await deferred();
     once(ctx, 'intent', () => { ctx.ledger.failDirective({ requestId: ctx.requestId, reason: 'refused before any prompt' }); });
