@@ -126,6 +126,7 @@ function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeMa
     worktrees: new WorktreeManager({
       ledger, root, preserveRoot: directory(),
       setupTimeoutMs: 30_000, enumerateProcesses: () => [],
+      committedRefCloseMs: 1_000,
     }),
   };
 }
