@@ -10,6 +10,7 @@ import { newLaneToken } from '../worktrees/lane-provenance.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
+import { redactCredentials } from '../redaction.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
 import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
@@ -1753,7 +1754,7 @@ export class LedgerApi {
           .get(identity.pid, input.jobId, input.runId);
         if (conflicting !== undefined) continue;
         for (const row of this.listWorktreeProcesses(input.worktreeId)) {
-          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== identity.command || !absent(row.pid) || !absent(-row.pid)) continue;
+          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== redactCredentials(identity.command) || !absent(row.pid) || !absent(-row.pid)) continue;
           this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
           this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
             request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
@@ -3605,7 +3606,10 @@ export class LedgerApi {
   /** Observed-process records (SPEC ruling 18b's spawned-processes arm):
    * every pid a pause or confirmed kill is grounded on lands here — the
    * registry is the authoritative map job → worktree → branch →
-   * processes, so the ask can always name what was live. */
+   * processes, so the ask can always name what was live. A command line is
+   * recorded with its credentials masked (#534), whoever the writer is: a
+   * caller keeps the raw line to match against and compares it as
+   * `redactCredentials(raw)`. */
   recordWorktreeProcesses(input: {
     worktreeId: string;
     processes: readonly { pid: number; command: string; evidence: string }[];
@@ -3639,7 +3643,7 @@ export class LedgerApi {
            evidence = CASE WHEN excluded.evidence = 'lane-token' OR (state <> 'live' AND excluded.state = 'live') THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
-        upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
+        upsert.run(input.worktreeId, proc.pid, redactCredentials(proc.command), proc.evidence, input.state, ts, ts);
       }
       this.appendEvent({
         kind: 'worktree.processes',

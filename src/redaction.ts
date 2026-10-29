@@ -26,6 +26,15 @@ const keepPrefix = (_match: string, prefix: string): string => `${prefix}${REDAC
  * digit, so a diagnostic such as `Unexpected token: ')'` is left whole. */
 const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,})';
 
+/** The value a command line gives a credential flag or auth scheme (#534):
+ * the keyword rule's value, and one that does not start with `-`, so the
+ * next flag (`--token --verbose`) is no value. */
+const ARGV_VALUE = `(?!-)${KEYWORD_VALUE}`;
+
+/** The password of `-u user:password`: the keyword rule's unquoted value.
+ * It may start with `-`: only the user is a flag's neighbour. */
+const PASSWORD_VALUE = '(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,}';
+
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret
  * access key, a private key in JSON (a service-account file), kubeconfig's
@@ -112,6 +121,13 @@ const REDACTIONS: readonly Redaction[] = [
   // rescans a long run of scheme characters: linear in the text.
   replacing(/(?<=[A-Za-z0-9+.-])(:\/\/)[^\s/@:]+:[^\s/@]+(?=@)/gu, keepPrefix),
   replacing(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix),
+  // The forms a process's command line carries (#534). `Authorization: token
+  // <value>` (GitHub's scheme), `--token <value>` with a space (the `=` form
+  // is the keyword rule's), and curl's `-u <user>:<password>`, whose `-u` is
+  // not the tail of a longer flag. A flag with no such value masks nothing.
+  replacing(new RegExp(`(\\bAuthorization\\s*:\\s*token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(--token\\s+)${ARGV_VALUE}`, 'gu'), keepPrefix),
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-][^\\s:'"\`]*:)${PASSWORD_VALUE}`, 'gu'), keepPrefix),
   redactNpmrcAuth,
   // A key, then an optional closing quote (JSON's `"password": "…"`), then
   // `:` or `=`. One whose identifier starts right after a `/` is part of a
