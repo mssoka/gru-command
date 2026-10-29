@@ -127,8 +127,15 @@ path>/merge_requests/<iid>` with `PRIVATE-TOKEN` from `GITLAB_TOKEN` (falling
 back to `GL_TOKEN`), a 30 s timeout, and no redirect following (the token never
 follows a redirect). There is no timer and no background poll: a second round
 reads again, an earlier round's read is never reused. The request ends with the
-round's setup: a shutdown or supersession during the read cancels it and records
-nothing. The token never appears in
+round's setup: a shutdown or supersession during the read cancels it, and the
+cancelled read is recorded as an `other` failure like any other.
+
+**The link must name the lane.** Before any request, the link's host and project
+(compared case-insensitively, as the verdict poster compares them) must be the
+origin remote of the job's repository. A minion-reported link to another project
+or host, or a lane with no resolvable origin, makes **no request** (no token goes
+anywhere) and records one `gitlab.mr-read-failed` with `error_kind` `other` whose
+`detail` says so; the block reads `UNAVAILABLE`. The token never appears in
 a recorded event, a log line, the frozen block or the manifest: `detail` is
 credential-redacted and every occurrence of the token value is replaced with
 `[redacted]` first.
@@ -148,7 +155,9 @@ round. The event's `host` and `project` come from the response's `web_url` and
   other status, including 5xx and a redirect, any other failure, or a body that
   is not valid JSON, is not a JSON object, lacks `web_url`, `iid`, `state` or
   `sha`, has a `web_url` that is not a merge request URL or a non-integer `iid`,
-  or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`).
+  or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`; or the
+  read was refused before any request because the link does not name the lane's
+  origin, or was cancelled with the round's setup).
   `detail` is at most 300 characters.
 
 **Binding order.** Only the event this round's read recorded governs; earlier
@@ -173,20 +182,25 @@ named, not gated.
 
 **Merged-results pipelines never bind.** A merged-results pipeline runs on a
 merge commit GitLab creates, so `head_pipeline.sha` is not the MR head and rule 5
-renders `NOT-MATCHED`; its reason says so. Only a pipeline that ran on the exact
-reviewed commit certifies it.
+renders `NOT-MATCHED`; its reason says so (a pipeline for an earlier head, which
+a freeze right after a push can also read, is rejected the same way). Only a
+pipeline that ran on the exact reviewed commit certifies it.
 
-**Frozen record.** The manifest record keeps the same keys as for GitHub. The
-rendered block names the source (`gitlab.mr-observed` / `gitlab.mr-read-failed`)
-but not when the read happened or its ledger seq; the record carries both, so
-two rounds that read the same facts freeze the same spec bytes, and a replacement
-round at the same head can still reuse the earlier round's specialist work
-(recovery treats `observedAt` and `sourceSeq` as provenance of the read, not as an
-effective input).
+**Frozen record.** The manifest record keeps the same keys as for GitHub.
 `repo` is `<host>/<project>`, `pr` is the MR iid, `sha` is the pipeline's sha,
 and `observedAt`, `sourceKind` and `sourceSeq` are the recording event's time,
-kind and seq. A bound record's check (or, for `FAILED`, failure, with
-`conclusion` equal to the pipeline status) is `pipeline #<id> (<source>)` with
+kind and seq.
+
+Every rendered block names the recording event's kind (in a `source:` line, or in
+the `observed:` line of `NOT-MATCHED`) but not when the read happened or its ledger
+seq; the record carries both. Two rounds that read the same facts therefore freeze
+the same spec bytes, and a replacement round at the same head can still reuse the
+earlier round's specialist work (recovery treats `observedAt` and `sourceSeq` of a
+`gitlab.*` record as provenance of the read, not as an effective input; GitHub
+records are compared whole, as before).
+
+A bound record's check (or, for `FAILED`, failure, with `conclusion` equal to the
+pipeline status) is `pipeline #<id> (<source>)` with
 the pipeline URL. A `NOT-MATCHED` record carries the observed host/project,
 iid and head sha; an `UNAVAILABLE` record from a GitLab event carries only the
 event provenance and a reason. Local scheduled verification never satisfies this

@@ -5,7 +5,7 @@ import {
   GITLAB_MR_READ_FAILED_EVENT,
   type GitLabMrReadErrorKind,
 } from '../../review-inputs/ci-evidence.js';
-import { isGitLabMrHost, parseGitLabMrLink, parseGitLabMrPath } from '../review-path.js';
+import { isGitLabMrHost, parseGitLabMrLink, parseGitLabMrPath, type RepoRemote } from '../review-path.js';
 import { PROBE_TIMEOUT_MS } from './fresh-head.js';
 
 /**
@@ -18,6 +18,10 @@ import { PROBE_TIMEOUT_MS } from './fresh-head.js';
  * `ci-evidence.ts` binds that event, and only that event, to the frozen
  * target. Nothing here polls, and nothing is read for a job whose link is not
  * a GitLab merge request on a host `isGitLabRemote` accepts.
+ *
+ * The link must also name the lane's own origin (host and project, as the
+ * verdict poster requires): a minion-reported link to another project or host
+ * makes no request and carries no token anywhere.
  *
  * The token goes in a `PRIVATE-TOKEN` header to that one host. A recorded
  * detail is credential-redacted and has the token value itself replaced, so a
@@ -210,14 +214,27 @@ export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrR
 
 type Log = (level: 'info' | 'warn', msg: string, fields?: Record<string, unknown>) => void;
 
+/** Why a link does not name the lane's origin, or null when it does. Host and
+ * project path compare case-insensitively, as the verdict poster compares. */
+function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): string | null {
+  if (origin === null) {
+    return `the merge request link names ${link.host}/${link.project}, but this lane has no resolvable origin remote to bind it to; no request was made`;
+  }
+  const originProject = `${origin.owner}/${origin.repo}`;
+  if (origin.host.toLowerCase() === link.host.toLowerCase() && originProject.toLowerCase() === link.project.toLowerCase()) return null;
+  return `the merge request link names ${link.host}/${link.project}, which is not this lane's origin (${origin.host}/${originProject}); no request was made`;
+}
+
 /**
  * The one read a round makes. Returns null — no request, no event — unless
  * the job's PR link is a GitLab merge request on an accepted host. Otherwise
  * appends exactly one `gitlab.mr-observed` / `gitlab.mr-read-failed` event
  * to the job (tagged with the round) and returns it with the link identity
- * the binding compares the response against. When `signal` aborts (the setup
- * was cancelled while the request was in flight) nothing is recorded and null
- * is returned: the caller is already unwinding.
+ * the binding compares the response against. A link that does not name the
+ * lane's `origin` makes no request and records an `other` failure saying so.
+ * A read cancelled by `signal` (the setup was cancelled while the request was
+ * in flight) records its `other` failure like any other: the caller is
+ * already unwinding.
  */
 export async function recordGitLabMrRead(input: {
   readonly ledger: Pick<LedgerApi, 'appendCustomEvent'>;
@@ -226,13 +243,20 @@ export async function recordGitLabMrRead(input: {
   readonly prUrl: string | null;
   readonly deps?: GitLabMrReadDeps;
   readonly signal?: AbortSignal;
+  /** The lane's origin remote, looked up only for a link that would be read. */
+  readonly origin: () => RepoRemote | null;
   readonly log?: Log;
 }): Promise<{ readonly event: EventRecord; readonly link: GitLabMrReadRequest } | null> {
   const parsed = input.prUrl === null ? null : parseGitLabMrLink(input.prUrl);
   if (parsed === null || parsed.kind !== 'supported') return null;
   const link: GitLabMrReadRequest = { host: parsed.host, project: parsed.project, iid: parsed.iid };
-  const outcome = await readGitLabMr(link, input.signal === undefined ? input.deps : { ...input.deps, signal: input.signal });
-  if (input.signal?.aborted === true) return null;
+  const mismatch = originMismatch(link, input.origin());
+  const outcome: GitLabMrReadOutcome = mismatch !== null
+    ? {
+        ok: false,
+        failure: { host: link.host, project: link.project, mr_iid: link.iid, error_kind: 'other', detail: safeDetail(mismatch, null) },
+      }
+    : await readGitLabMr(link, input.signal === undefined ? input.deps : { ...input.deps, signal: input.signal });
   const event = outcome.ok
     ? input.ledger.appendCustomEvent({
         kind: GITLAB_MR_OBSERVED_EVENT,

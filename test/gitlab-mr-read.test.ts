@@ -23,6 +23,7 @@ const SENTINEL = 'glpat-SENTINEL-9f3b1c7e5a2d4086';
 const REQUEST = { host: HOST, project: PROJECT, iid: 7 };
 const URL_FOR_REQUEST = `https://${HOST}/api/v4/projects/acme%2Fplatform%2Fapp/merge_requests/7`;
 const ENV = { GITLAB_TOKEN: SENTINEL } as const;
+const ORIGIN = { host: HOST, owner: 'acme/platform', repo: 'app' } as const;
 
 function mrBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -73,9 +74,13 @@ describe('GitLab merge request link parsing', () => {
       'https://git.example.test/acme/app/-/merge_requests/3',
       'https://evil.gitlab.attacker.test/acme/app/-/merge_requests/3',
       'https://github.com/acme/app/-/merge_requests/3',
-      // GitHub claims this host first, as the head probe's dispatch does.
+      // GitHub claims this host first, as the head probe's dispatch does, port or not.
       'https://gitlab.github.com/acme/app/-/merge_requests/3',
+      'https://gitlab.github.com:8443/acme/app/-/merge_requests/3',
     ]) expect(parseGitLabMrLink(link), link).toEqual({ kind: 'unsupported-host' });
+    expect(parseGitLabMrLink(`https://${HOST}:8443/acme/app/-/merge_requests/3`)).toEqual({
+      kind: 'supported', host: `${HOST}:8443`, project: 'acme/app', iid: 3,
+    });
     for (const link of [
       `http://${HOST}/acme/app/-/merge_requests/3`,
       `https://user:pass@${HOST}/acme/app/-/merge_requests/3`,
@@ -343,7 +348,7 @@ describe('recordGitLabMrRead', () => {
     const logs: Array<{ level: string; msg: string; fields?: Record<string, unknown> }> = [];
     const recorded = await recordGitLabMrRead({
       ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`,
-      deps: { fetch: fetchDouble, env: ENV },
+      deps: { fetch: fetchDouble, env: ENV }, origin: () => ORIGIN,
       log: (level, msg, fields) => logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }),
     });
     expect(calls).toHaveLength(1);
@@ -372,7 +377,7 @@ describe('recordGitLabMrRead', () => {
     const logs: string[] = [];
     const recorded = await recordGitLabMrRead({
       ledger: api, jobId: 'job-1', roundId: 'round-2', prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`,
-      deps: { fetch: fetchDouble, env: ENV },
+      deps: { fetch: fetchDouble, env: ENV }, origin: () => ORIGIN,
       log: (level, msg, fields) => logs.push(JSON.stringify({ level, msg, fields })),
     });
     const events = gitlabEvents(api);
@@ -388,6 +393,70 @@ describe('recordGitLabMrRead', () => {
     expect(logs).toHaveLength(1);
   });
 
+  it('makes no request for a link that does not name the lane\'s origin, and records one other failure saying so', async () => {
+    const cases: ReadonlyArray<readonly [string, { host: string; owner: string; repo: string } | null, string]> = [
+      ['another project', { host: HOST, owner: 'acme/platform', repo: 'other' }, 'not this lane\'s origin'],
+      ['another group', { host: HOST, owner: 'acme/elsewhere', repo: 'app' }, 'not this lane\'s origin'],
+      ['another host', { host: 'gitlab.attacker.test', owner: 'acme/platform', repo: 'app' }, 'not this lane\'s origin'],
+      ['no origin', null, 'no resolvable origin remote'],
+    ];
+    for (const [label, origin, said] of cases) {
+      const api = ledger();
+      const { calls, fetch: fetchDouble } = double(() => json(mrBody()));
+      const recorded = await recordGitLabMrRead({
+        ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`,
+        deps: { fetch: fetchDouble, env: ENV }, origin: () => origin,
+      });
+      expect(calls, label).toHaveLength(0);
+      expect(recorded?.event.kind, label).toBe('gitlab.mr-read-failed');
+      expect(gitlabEvents(api), label).toHaveLength(1);
+      expect(gitlabEvents(api)[0]!.payload, label).toMatchObject({
+        host: HOST, project: PROJECT, mr_iid: 7, error_kind: 'other', round_id: 'round-1',
+        detail: expect.stringContaining(said),
+      });
+    }
+  });
+
+  it('reads when the link names the origin, the host and project compared case-insensitively', async () => {
+    const api = ledger();
+    const { calls, fetch: fetchDouble } = double(() => json(mrBody()));
+    const recorded = await recordGitLabMrRead({
+      ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`,
+      deps: { fetch: fetchDouble, env: ENV }, origin: () => ({ host: 'GitLab.Example.Test', owner: 'ACME/Platform', repo: 'App' }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(recorded?.event.kind).toBe('gitlab.mr-observed');
+  });
+
+  it('looks the origin up only for a link it would read', async () => {
+    const api = ledger();
+    const { fetch: fetchDouble } = double(() => json(mrBody()));
+    const lookups: string[] = [];
+    for (const prUrl of [null, 'https://github.com/acme/app/pull/3', 'https://git.example.test/acme/app/-/merge_requests/3']) {
+      await recordGitLabMrRead({
+        ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl, deps: { fetch: fetchDouble, env: ENV },
+        origin: () => { lookups.push(String(prUrl)); return ORIGIN; },
+      });
+    }
+    expect(lookups).toEqual([]);
+  });
+
+  it('records a read cancelled by the setup signal as one other failure', async () => {
+    const api = ledger();
+    const controller = new AbortController();
+    const { fetch: fetchDouble } = double(({ init }) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+      controller.abort();
+    }));
+    const recorded = await recordGitLabMrRead({
+      ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`,
+      deps: { fetch: fetchDouble, env: ENV }, origin: () => ORIGIN, signal: controller.signal,
+    });
+    expect(recorded?.event.kind).toBe('gitlab.mr-read-failed');
+    expect(gitlabEvents(api)).toHaveLength(1);
+    expect(gitlabEvents(api)[0]!.payload).toMatchObject({ error_kind: 'other', round_id: 'round-1' });
+  });
+
   it('makes no request and records nothing for a missing link, a GitHub link, or a link on a rejected host', async () => {
     const api = ledger();
     const { calls, fetch: fetchDouble } = double(() => json(mrBody()));
@@ -400,7 +469,7 @@ describe('recordGitLabMrRead', () => {
       'garbage',
     ]) {
       const recorded = await recordGitLabMrRead({
-        ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl, deps: { fetch: fetchDouble, env: ENV },
+        ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl, deps: { fetch: fetchDouble, env: ENV }, origin: () => ORIGIN,
       });
       expect(recorded, String(prUrl)).toBeNull();
     }

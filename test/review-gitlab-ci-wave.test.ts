@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WaveRunner, type FallbackGateOutcome, type WaveOutcome } from '../src/dispatch/perkins.js';
 import { compatibleReviewIdentity, freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import type { RepoRemote } from '../src/dispatch/review-path.js';
 import { appendCiEvidence, renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -82,6 +83,8 @@ interface World {
   readonly escalations: string[];
   /** What the GitLab double answers; replace per case. */
   answer: (call: Call) => Response | Promise<Response>;
+  /** The lane's origin remote, as git would report it. */
+  origin: RepoRemote | null;
   /** The branch tip the next round freezes. */
   target: string;
   jobs: number;
@@ -130,6 +133,7 @@ async function makeWorld(): Promise<World> {
   const escalations: string[] = [];
   const world: World = {
     repo, ledger, port, artifacts, calls, logs, escalations, target, jobs: 0,
+    origin: { host: HOST, owner: 'acme/platform', repo: 'app' },
     answer: () => json(mrBody(world)),
     wave: new WaveRunner({
       ledger,
@@ -138,6 +142,7 @@ async function makeWorld(): Promise<World> {
       reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe(BRANCH),
       reconcileReviewAgent: async () => true,
+      repoOrigin: () => world.origin,
       gitlabMrFetch: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
         const call = { url: String(input), init };
         calls.push(call);
@@ -487,6 +492,17 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     expect(compatibleReviewIdentity(reread, prior.directory)).toBe(true);
     const changed = freeze('changed', 'failed', 90, '2026-10-29T11:00:00.000Z');
     expect(compatibleReviewIdentity(changed, prior.directory)).toBe(false);
+    // A GitHub record is compared whole, as before: its time and seq are the poll's event.
+    const github = (roundId: string, seq: number) => freezeReviewInputs({
+      roundId, repoPath: world.repo.path, artifactRoot: root, baseRef: 'main', targetRef: world.target, spec: 'review', recoveryIdentity,
+      ciEvidence: {
+        state: 'green', repo: 'acme/fixture', pr: 141, sha: world.target, observedAt: '2026-10-29T10:00:00.000Z',
+        sourceKind: 'github.ci-green', sourceSeq: seq, checks: [{ name: 'CI', url: null }], failures: [], reason: null,
+      },
+    });
+    const githubPrior = github('github-prior', 5);
+    expect(compatibleReviewIdentity(github('github-same', 5), githubPrior.directory)).toBe(true);
+    expect(compatibleReviewIdentity(github('github-reobserved', 6), githubPrior.directory)).toBe(false);
     await world.wave.shutdown();
   });
 
@@ -509,7 +525,7 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     await world.wave.shutdown();
   });
 
-  it('a shutdown while the merge request is being read freezes nothing and records no event', async () => {
+  it('a shutdown while the merge request is being read freezes nothing and records the cancelled read', async () => {
     const world = await makeWorld();
     let entered = false;
     world.answer = (call) => new Promise<Response>((_resolve, reject) => {
@@ -523,9 +539,66 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     await world.wave.shutdown();
     const outcome = await settled;
     expect(String(outcome)).toMatch(/shut down during review setup|shutting down/u);
-    expect(world.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind.startsWith('gitlab.'))).toEqual([]);
+    // The cancelled read is still the round's one read: one other failure, no frozen inputs.
+    const events = world.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind.startsWith('gitlab.'));
+    expect(events.map((event) => event.kind)).toEqual(['gitlab.mr-read-failed']);
+    expect(events[0]!.payload).toMatchObject({ error_kind: 'other', mr_iid: IID });
     expect(world.ledger.latestJobEvent(jobId, 'round.review-inputs-frozen')).toBeNull();
     expect(world.escalations).toEqual([]);
+  });
+
+  it('A3: a merged-results pipeline at the freeze is NOT-MATCHED, naming it, and never binds', async () => {
+    const world = await makeWorld();
+    world.answer = () => json(mrBody(world, {}, { sha: 'f'.repeat(40), status: 'success' }));
+    const frozen = await freezeJob(world, MR_URL);
+    expect(frozen.ci).toMatchObject({
+      state: 'not-matched', repo: `${HOST}/${PROJECT}`, pr: IID, sha: world.target, checks: [], failures: [],
+      reason: expect.stringContaining('merged-results'),
+    });
+    expect(stateLine(frozen.block)).toBe('state: NOT-MATCHED — NO BOUND CI RECEIPT');
+    expect(frozen.block).not.toContain('GREEN');
+    await world.wave.shutdown();
+  });
+
+  it('origin: a link to another project than the lane\'s origin makes no request and binds nothing', async () => {
+    const world = await makeWorld();
+    world.origin = { host: HOST, owner: 'acme/platform', repo: 'a-different-project' };
+    const frozen = await freezeJob(world, MR_URL);
+    expect(world.calls).toHaveLength(0);
+    expect(frozen.gitlabEvents).toHaveLength(1);
+    expect(frozen.gitlabEvents[0]!.kind).toBe('gitlab.mr-read-failed');
+    expect(frozen.gitlabEvents[0]!.payload).toMatchObject({
+      host: HOST, project: PROJECT, mr_iid: IID, error_kind: 'other', detail: expect.stringContaining('not this lane\'s origin'),
+    });
+    expect(frozen.ci).toMatchObject({ state: 'unavailable', reason: expect.stringContaining('error_kind: other') });
+    expect(frozen.block).not.toContain('GREEN');
+    await world.wave.shutdown();
+  });
+
+  it('origin: an explicitly pinned round on a link to a foreign gitlab host sends no token anywhere', async () => {
+    const world = await makeWorld();
+    const jobId = await prepareJob(world, 'https://gitlab.attacker.test/acme/platform/app/-/merge_requests/7');
+    const begun = await world.wave.beginRound({ jobId, targetRef: world.target });
+    const outcome = asWave(await begun.run);
+    expect(world.calls).toHaveLength(0);
+    const events = world.ledger.listEvents({ limit: 1000 }).filter((event) => event.jobId === jobId && event.kind.startsWith('gitlab.'));
+    expect(events.map((event) => event.kind)).toEqual(['gitlab.mr-read-failed']);
+    expect(events[0]!.payload).toMatchObject({ host: 'gitlab.attacker.test', error_kind: 'other' });
+    const manifest = JSON.parse(readFileSync(join(world.artifacts, outcome.round.id, 'manifest.json'), 'utf8')) as {
+      reviewEvidence: { ci: { state: string } };
+    };
+    expect(manifest.reviewEvidence.ci.state).toBe('unavailable');
+    await world.wave.shutdown();
+  });
+
+  it('origin: a lane with no resolvable origin makes no request', async () => {
+    const world = await makeWorld();
+    world.origin = null;
+    const frozen = await freezeJob(world, MR_URL);
+    expect(world.calls).toHaveLength(0);
+    expect(frozen.gitlabEvents[0]!.payload).toMatchObject({ error_kind: 'other', detail: expect.stringContaining('no resolvable origin remote') });
+    expect(frozen.ci).toMatchObject({ state: 'unavailable' });
+    await world.wave.shutdown();
   });
 
   it('A8: a GitLab merge request job never renders the no-PR-URL reason', async () => {

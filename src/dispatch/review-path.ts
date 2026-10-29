@@ -175,9 +175,10 @@ export function isGitLabRemote(host: string): boolean {
 }
 
 /** A host a GitLab token may be sent to for a merge request: the head probe
- * dispatches by host with GitHub first, so a host GitHub claims is never one. */
+ * dispatches by host with GitHub first, so a host GitHub claims is never one.
+ * GitHub's rule is asked about the name without a port (`host` carries it). */
 export function isGitLabMrHost(host: string): boolean {
-  return !isGitHubRemote(host) && isGitLabRemote(host);
+  return !isGitHubRemote(host.replace(/:\d+$/u, '')) && isGitLabRemote(host);
 }
 
 /** The project path and iid a GitLab merge-request URL pathname names

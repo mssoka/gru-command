@@ -491,6 +491,7 @@ describe('GitLab merge request CI evidence', () => {
       });
       expect(reasonLine(block), kind).toContain(`error_kind: ${kind}`);
       expect(block, kind).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
+      expect(block, kind).toContain(`source: ${GL_FAILED} (the host's read of this round;`);
       expect(block, kind).not.toContain('GREEN');
     }
   });

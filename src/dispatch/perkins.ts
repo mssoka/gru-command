@@ -101,6 +101,7 @@ import {
   skillInstalled,
   triageFallbackFindings,
   type FallbackFinding,
+  type RepoRemote,
   type ReviewCapabilityFailure,
   type ReviewPreflightResult,
 } from './review-path.js';
@@ -1943,6 +1944,9 @@ export interface WaveRunnerOptions {
    * CI evidence of a GitLab MR job) uses. Production uses the global
    * `fetch`; tests inject a deterministic double. */
   readonly gitlabMrFetch?: GitLabMrFetch;
+  /** The origin remote of a job's repository, which a GitLab merge request
+   * link must name before the freeze reads it. Production asks git. */
+  readonly repoOrigin?: (repoPath: string) => RepoRemote | null;
   readonly log?: Log;
 }
 
@@ -5885,6 +5889,7 @@ export class WaveRunner {
         roundId: round.id,
         prUrl: job.prUrl,
         signal: setupSignal,
+        origin: () => (this.opts.repoOrigin ?? ((repoPath: string) => repoRemote(repoPath)))(jobWorktree.repoPath),
         ...(this.opts.gitlabMrFetch !== undefined ? { deps: { fetch: this.opts.gitlabMrFetch } } : {}),
         log: (level, msg, fields) => this.log(level, msg, fields),
       });
