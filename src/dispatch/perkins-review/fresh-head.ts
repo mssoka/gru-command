@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { isGitHubRemote, isGitLabRemote } from '../review-path.js';
+import { isGitHubRemote, isGitLabRemote, parseGitLabMrPath } from '../review-path.js';
 import { repositoryGitEnv } from './artifacts.js';
 
 /**
@@ -27,7 +27,7 @@ import { repositoryGitEnv } from './artifacts.js';
 
 const GIT_TIMEOUT_MS = 30_000;
 const FETCH_TIMEOUT_MS = 60_000;
-const PROBE_TIMEOUT_MS = 30_000;
+export const PROBE_TIMEOUT_MS = 30_000;
 const COMMIT_SHA = /^[0-9a-f]{40}$/iu;
 
 export interface PrHeadIdentity {
@@ -163,12 +163,11 @@ function githubPrHead(url: URL): PrHeadIdentity {
 /** GitLab merge-request head probe: the same REST identity the GitLab
  * poster reads, with the same token fallbacks. */
 async function gitlabPrHead(url: URL): Promise<PrHeadIdentity> {
-  const match = /^\/(.+)\/-\/merge_requests\/(\d+)\/?$/u.exec(url.pathname);
-  if (match === null) {
+  const mr = parseGitLabMrPath(url.pathname);
+  if (mr === null) {
     throw new PrHeadVerificationError('probe-failed', `not a GitLab merge request URL: ${url.href}`);
   }
-  const projectPath = match[1]!;
-  const iid = match[2]!;
+  const { project: projectPath, iid } = mr;
   const token = process.env['GITLAB_TOKEN'] ?? process.env['GL_TOKEN'];
   if (token === undefined || token.trim() === '') {
     throw new PrHeadVerificationError('probe-failed', 'GitLab review-target verification requires GITLAB_TOKEN or GL_TOKEN');

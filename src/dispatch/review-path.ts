@@ -174,6 +174,38 @@ export function isGitLabRemote(host: string): boolean {
   return lowered === 'gitlab.com' || lowered.split('.')[0] === 'gitlab';
 }
 
+/** The project path and iid a GitLab merge-request URL pathname names
+ * (`/<group>[/<subgroup>…]/<project>/-/merge_requests/<iid>`), or null. The
+ * one parser the head probe, the CI-evidence reader and the evidence
+ * binding share, so none of them can disagree about what an MR URL is. */
+export function parseGitLabMrPath(pathname: string): { readonly project: string; readonly iid: string } | null {
+  const match = /^\/(.+)\/-\/merge_requests\/(\d+)\/?$/u.exec(pathname);
+  return match === null ? null : { project: match[1]!, iid: match[2]! };
+}
+
+/** A job's PR link read as a GitLab merge request. `supported` is an https
+ * link without credentials on a host `isGitLabRemote` accepts (the only
+ * links a request or a token ever goes to); `unsupported-host` is an MR-
+ * shaped link on a host it rejects. Anything else is not a GitLab MR link. */
+export type GitLabMrLink =
+  | { readonly kind: 'supported'; readonly host: string; readonly project: string; readonly iid: number }
+  | { readonly kind: 'unsupported-host' };
+
+export function parseGitLabMrLink(prUrl: string): GitLabMrLink | null {
+  let url: URL;
+  try {
+    url = new URL(prUrl.trim());
+  } catch {
+    return null;
+  }
+  const path = parseGitLabMrPath(url.pathname);
+  if (path === null) return null;
+  if (!isGitLabRemote(url.host)) return { kind: 'unsupported-host' };
+  const iid = Number(path.iid);
+  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || !Number.isSafeInteger(iid)) return null;
+  return { kind: 'supported', host: url.host, project: path.project, iid };
+}
+
 /** Cheap GitHub probe: the gh token must read the exact remote repo. */
 export function probeGitHubRemote(remote: RepoRemote, binary = 'gh'): void {
   const result = spawnSync(

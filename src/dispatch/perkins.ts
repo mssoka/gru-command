@@ -94,6 +94,7 @@ import {
   isGitHubRemote,
   isGitLabRemote,
   parseFallbackFindingsReport,
+  parseGitLabMrLink,
   preflightAdvisoryFields,
   renderFixDirective,
   repoRemote,
@@ -114,6 +115,7 @@ import {
   resolveFreshPrHead,
   type PrHeadProbe,
 } from './perkins-review/fresh-head.js';
+import { recordGitLabMrRead, type GitLabMrFetch } from './perkins-review/gitlab-mr-read.js';
 
 /** Transport wait slice for one fallback-review turn: on expiry the live
  * minion is reported still-running and the SAME session is re-attached — the
@@ -1937,6 +1939,10 @@ export interface WaveRunnerOptions {
    * round's fetched branch tip is validated against. Production probes the
    * code host; tests inject a deterministic double. */
   readonly prHeadProbe?: PrHeadProbe;
+  /** The `fetch` the freeze's one GitLab merge-request read (the exact-head
+   * CI evidence of a GitLab MR job) uses. Production uses the global
+   * `fetch`; tests inject a deterministic double. */
+  readonly gitlabMrFetch?: GitLabMrFetch;
   readonly log?: Log;
 }
 
@@ -5644,7 +5650,7 @@ export class WaveRunner {
     let spec: string | undefined;
     let acceptance: FreezeReviewInput['acceptance'];
     let ci!: ReturnType<typeof renderRecordedCiEvidence>;
-    const assembleReviewInputs = (): void => {
+    const assembleReviewInputs = (gitlabMr: Awaited<ReturnType<typeof recordGitLabMrRead>>): void => {
       // Zero amendments render the original briefing bytes exactly — legacy
       // jobs are unaffected.
       const amendments = this.opts.ledger.listJobAmendments(job.id);
@@ -5657,6 +5663,10 @@ export class WaveRunner {
       // into the manifest even when no spec is supplied (no-spec rounds
       // keep their mode).
       const prIdentity = job.prUrl !== null ? parseGitHubPrUrl(job.prUrl) : null;
+      // A GitLab MR job binds the event THIS round's read recorded (never an
+      // earlier gitlab.* event); a GitLab-shaped link on a host the service
+      // does not send credentials to says so instead of the generic reason.
+      const mrLink = job.prUrl !== null && prIdentity === null && gitlabMr === null ? parseGitLabMrLink(job.prUrl) : null;
       ci = renderRecordedCiEvidence({
         events: {
           branchState: this.opts.ledger.latestJobEvent(job.id, CI_BRANCH_STATE_EVENT),
@@ -5666,6 +5676,12 @@ export class WaveRunner {
         targetSha,
         expectedRepo: prIdentity !== null ? `${prIdentity.owner}/${prIdentity.repo}` : null,
         expectedPr: prIdentity?.number ?? null,
+        ...(gitlabMr !== null
+          ? { gitlabMr: { host: gitlabMr.link.host, project: gitlabMr.link.project, iid: gitlabMr.link.iid, event: gitlabMr.event } }
+          : {}),
+        ...(mrLink?.kind === 'unsupported-host'
+          ? { unboundReason: 'PR link is a GitLab merge request on an unsupported host' }
+          : {}),
       });
       // Recorded verification evidence (2026-09-22 fix): a completed
       // scheduler run on the exact frozen target (clean tree) is handed to
@@ -5860,8 +5876,23 @@ export class WaveRunner {
         }
       }
       // Late binding: amendments/CI/verification are read NOW, after every
-      // await in setup, so the frozen round carries the newest records.
-      assembleReviewInputs();
+      // await in setup, so the frozen round carries the newest records. A
+      // GitLab merge request is the one input read over the network: once
+      // per round, here, so its pipeline is the one the frozen head has.
+      const gitlabMr = await recordGitLabMrRead({
+        ledger: this.opts.ledger,
+        jobId: job.id,
+        roundId: round.id,
+        prUrl: job.prUrl,
+        ...(this.opts.gitlabMrFetch !== undefined ? { deps: { fetch: this.opts.gitlabMrFetch } } : {}),
+        log: (level, msg, fields) => this.log(level, msg, fields),
+      });
+      if (this.shuttingDown || setupSignal.aborted) {
+        throw setupSignal.reason instanceof ReviewSupersededError
+          ? setupSignal.reason
+          : new Error('Perkins review service shut down during review setup');
+      }
+      assembleReviewInputs(gitlabMr);
       const runtime = this.opts.reviewRuntimeIdentity?.();
       const model = input.reviewModel;
       if (input.reviewThinkingLevel !== undefined &&
