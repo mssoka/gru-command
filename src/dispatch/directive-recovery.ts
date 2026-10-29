@@ -88,6 +88,58 @@ export function resolveRetirementLane(
   return candidates[0] as WorktreeLane;
 }
 
+/** The ports a retirement reads beside the ledger. */
+export type RetirementRouteInput = Pick<DirectiveRetirementRequest, 'worktrees' | 'workerGate' | 'pendingProducerBlockers'> & {
+  readonly ledger: Pick<LedgerApi, 'listAgents'>;
+};
+
+/** The route-level cessation evidence for a live request's job, in the order
+ * the retirement route evaluates it: the single live lane, the supervisor's
+ * pending producer ownership, the pace-queue entry waiting for this job and
+ * the lane checkout's actual HEAD. Every refusal is a typed
+ * `DirectiveRetirementError`. The retirement route and the canceled-request
+ * closeout share this, so producers and queued work count identically. */
+export function retirementRouteEvidence(
+  input: RetirementRouteInput,
+  jobId: string,
+): { readonly lane: WorktreeLane; readonly resolvedHead: string } {
+  const lane = resolveRetirementLane(input.worktrees, jobId);
+  let producerBlockers: readonly string[];
+  try {
+    producerBlockers = input.pendingProducerBlockers(jobId);
+  } catch (error) {
+    throw new DirectiveRetirementError('live_work',
+      `job "${jobId}" supervisor ownership is unreadable (${String(error).slice(0, 200)}) — cannot prove cessation`,
+      ['supervisor ownership unavailable']);
+  }
+  if (producerBlockers.length > 0) {
+    throw new DirectiveRetirementError('live_work', `job "${jobId}" has pending supervised producer ownership`, producerBlockers);
+  }
+  if (input.workerGate !== undefined) {
+    const agentIds = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === jobId).map((agent) => agent.id));
+    const queued = input.workerGate.view().worker.queued.find((entry) => entry.id === jobId || agentIds.has(entry.id));
+    if (queued !== undefined) {
+      throw new DirectiveRetirementError(
+        'live_work',
+        `job "${jobId}" has a queued worker turn waiting for a pace slot — retirement would race it`,
+        [`queued worker turn: ${queued.label}`],
+      );
+    }
+  }
+  let resolvedHead: string;
+  try {
+    // Bind the checkout that actually holds the work. A detached or
+    // switched lane can leave its registered branch tip unchanged.
+    resolvedHead = resolveGitCommit(lane.path, 'HEAD');
+  } catch (error) {
+    throw new DirectiveRetirementError(
+      'lane_unavailable',
+      `job "${jobId}" lane head is unresolvable (${String(error).slice(0, 200)}) — cannot bind the cessation evidence`,
+    );
+  }
+  return { lane, resolvedHead };
+}
+
 /** The one public entry point used by the retirement route. */
 export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRequest): DirectiveRetirementOutcome {
   const row = input.ledger.getDirective(input.requestId);
@@ -111,40 +163,7 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
   // settled/failed row refuses. No fresh lane evidence exists to require.
   if (!RETIRABLE_STATES.includes(row.state as LiveDirectiveState)) return callLedger();
 
-  const lane = resolveRetirementLane(input.worktrees, row.jobId);
-  let producerBlockers: readonly string[];
-  try {
-    producerBlockers = input.pendingProducerBlockers(row.jobId);
-  } catch (error) {
-    throw new DirectiveRetirementError('live_work',
-      `job "${row.jobId}" supervisor ownership is unreadable (${String(error).slice(0, 200)}) — cannot prove cessation`,
-      ['supervisor ownership unavailable']);
-  }
-  if (producerBlockers.length > 0) {
-    throw new DirectiveRetirementError('live_work', `job "${row.jobId}" has pending supervised producer ownership`, producerBlockers);
-  }
-  if (input.workerGate !== undefined) {
-    const agentIds = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === row.jobId).map((agent) => agent.id));
-    const queued = input.workerGate.view().worker.queued.find((entry) => entry.id === row.jobId || agentIds.has(entry.id));
-    if (queued !== undefined) {
-      throw new DirectiveRetirementError(
-        'live_work',
-        `job "${row.jobId}" has a queued worker turn waiting for a pace slot — retirement would race it`,
-        [`queued worker turn: ${queued.label}`],
-      );
-    }
-  }
-  let resolvedHead: string;
-  try {
-    // Bind the checkout that actually holds the work. A detached or
-    // switched lane can leave its registered branch tip unchanged.
-    resolvedHead = resolveGitCommit(lane.path, 'HEAD');
-  } catch (error) {
-    throw new DirectiveRetirementError(
-      'lane_unavailable',
-      `job "${row.jobId}" lane head is unresolvable (${String(error).slice(0, 200)}) — cannot bind the cessation evidence`,
-    );
-  }
+  const { lane, resolvedHead } = retirementRouteEvidence(input, row.jobId);
   return callLedger({ id: lane.id, resolvedHead });
 }
 

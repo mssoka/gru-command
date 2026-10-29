@@ -422,6 +422,9 @@ export interface ProductionDeterministicPassDeps {
   /** Reads the live wave handle at each pass (late-bound). */
   readonly getWave: () => { reconcilePendingHandoffs(): void } | undefined;
   readonly directiveProgress?: { reconsider(): void };
+  /** Canceled-request closeouts (#523): resumed after the reconsideration,
+   * which skips the requests they own. */
+  readonly closeout?: { resumePending(): unknown };
   readonly budget?: DurableReconcileBudget;
 }
 
@@ -438,7 +441,7 @@ export function createProductionDeterministicPass(
     ledger: deps.ledger,
     notifications: deps.notifications,
     ...(deps.log !== undefined ? { log: deps.log } : {}),
-    wave: { reconcilePendingHandoffs: () => { deps.getWave()?.reconcilePendingHandoffs(); deps.directiveProgress?.reconsider(); } },
+    wave: { reconcilePendingHandoffs: () => { deps.getWave()?.reconcilePendingHandoffs(); deps.directiveProgress?.reconsider(); deps.closeout?.resumePending(); } },
     ...(deps.budget !== undefined ? { budget: deps.budget } : {}),
   });
 }
