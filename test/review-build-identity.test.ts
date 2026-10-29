@@ -118,43 +118,6 @@ describe('identity fixture reliability (darwin paths)', () => {
   });
 });
 
-interface NpmPackManifest {
-  readonly filename: string;
-  readonly files: readonly { readonly path: string }[];
-}
-
-/** npm 10 emits one --json manifest as a singleton array; npm 12 emits the
- * same manifest as a name-keyed object. Normalize only those two explicit
- * one-package shapes and retain the downstream file-identity assertions. */
-function parseNpmPackManifest(stdout: string): NpmPackManifest {
-  const parsed: unknown = JSON.parse(stdout);
-  const entries: unknown[] = Array.isArray(parsed)
-    ? parsed
-    : typeof parsed === 'object' && parsed !== null
-      ? Object.values(parsed)
-      : [];
-  expect(entries, 'npm pack --json must describe exactly one package').toHaveLength(1);
-  const manifest = entries[0];
-  expect(manifest).toMatchObject({ filename: expect.any(String), files: expect.any(Array) });
-  const result = manifest as NpmPackManifest;
-  expect(result.files.every((file) => typeof file.path === 'string')).toBe(true);
-  return result;
-}
-
-describe('npm pack manifest output normalization', () => {
-  it('preserves single-package file assertions for npm array and name-keyed object JSON output', () => {
-    const manifest: NpmPackManifest = {
-      filename: 'gru-command-1.0.2.tgz',
-      files: [{ path: 'package.json' }, { path: 'dist/review-dependency-identity.json' }],
-    };
-    expect(parseNpmPackManifest(JSON.stringify([manifest]))).toEqual(manifest);
-    expect(parseNpmPackManifest(JSON.stringify({ 'gru-command@1.0.2': manifest }))).toEqual(manifest);
-    expect(() => parseNpmPackManifest('[]')).toThrow(/exactly one package/u);
-    expect(() => parseNpmPackManifest(JSON.stringify({ 'gru-command@1.0.2': { filename: 'missing-files.tgz' } })))
-      .toThrow(/files/u);
-  });
-});
-
 function packageTarball(): { tarballPath: string } {
   if (packageTarballCache !== null) return packageTarballCache;
   // Standalone test: compile in an isolated tree rather than assuming npm
@@ -168,13 +131,13 @@ function packageTarball(): { tarballPath: string } {
   }
   symlinkSync(join(source, 'node_modules'), join(build, 'node_modules'), 'dir');
   execFileSync('npm', ['run', 'build'], { cwd: build, timeout: 120_000 });
-  const manifest = parseNpmPackManifest(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', root], {
+  const manifest = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', root], {
     cwd: build, encoding: 'utf8', timeout: 60_000,
-  }));
-  expect(manifest.files.some((entry) => entry.path === 'package-lock.json')).toBe(false);
-  expect(manifest.files.some((entry) => entry.path === 'dist/review-dependency-identity.json')).toBe(true);
+  })) as [{ filename: string; files: Array<{ path: string }> }];
+  expect(manifest[0]!.files.some((entry) => entry.path === 'package-lock.json')).toBe(false);
+  expect(manifest[0]!.files.some((entry) => entry.path === 'dist/review-dependency-identity.json')).toBe(true);
   packageTarballCache = {
-    tarballPath: join(root, manifest.filename),
+    tarballPath: join(root, manifest[0]!.filename),
   };
   return packageTarballCache;
 }
