@@ -67,12 +67,9 @@ export const BRIEFING_REVIEW_CODE_MAX = 80;
 export const BRIEFING_REVIEW_EVIDENCE_MIN = 8;
 export const BRIEFING_REVIEW_EVIDENCE_MAX = 2000;
 export const BRIEFING_REVIEW_WHY_MAX = 1000;
-/** Trailing CHANGES-NEEDED rounds after which a further revision is a
- * disagreement for the owner, not a drafting problem. */
+/** Trailing CHANGES-NEEDED rounds after which a further revision is refused
+ * and the cap's push-back/dispatch/amendment path applies. */
 export const BRIEFING_REVIEW_ROUND_CAP = 3;
-/** The owner escalation a capped chain is routed through. */
-export const BRIEFING_REVIEW_OWNER_ESCALATION =
-  'POST /api/notifications/needs-owner with reserved class scope-design';
 
 const FINDING_CODE = /^[A-Za-z][A-Za-z0-9_.:-]*$/u;
 const SHA256_HEX = /^[0-9a-f]{64}$/u;

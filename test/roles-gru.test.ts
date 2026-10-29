@@ -57,6 +57,17 @@ describe('gru role definition', () => {
     expect(gru).toContain('never by itself justifies replacing a worktree, branch or PR');
     expect(gru).toContain('Ask the question, not your workaround');
     expect(gru).toContain('holds only the step it gates');
+    // Owner ruling j-1200: a round cap records a push-back, dispatches the
+    // last reviewed text and appends one material corrective amendment; it is
+    // never an owner escalation. Briefings are written to settle in one round.
+    expect(gru).toContain('record a push-back on the last reviewed text');
+    expect(gru).toContain('POST /api/dispatch/amendment');
+    expect(gru).toContain('journal j-1200');
+    expect(gru).toContain('cannot be met as stated');
+    expect(gru).not.toContain('when the lenses disagree with the intent');
+    expect(gru).toContain('read the code the change touches');
+    expect(gru).toContain('choose the tier by risk');
+    expect(gru).toContain('advisory findings never start a new round');
   });
 
   it('the chief owns a red default branch: fix heist from the current head, the repository hold is a restriction (#446)', () => {

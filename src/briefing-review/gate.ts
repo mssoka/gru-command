@@ -184,7 +184,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
         'briefing_review_not_ready',
         409,
         `review ${exact.reviewId} holds CHANGES-NEEDED and ${stageLabel(stage)} enforces ${exact.tier}-tier readiness: fix the briefing and re-commission at this tier, ` +
-          'escalate to the owner, or record a push-back with POST /api/briefing-review/pushback and dispatch without the block',
+          'or record a push-back with POST /api/briefing-review/pushback and dispatch without the block',
         'changes-needed',
       );
     }
@@ -207,7 +207,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
       input,
       'briefing_review_not_ready',
       409,
-      `${stageLabel(stage)} review ${exact.reviewId} holds CHANGES-NEEDED: fix the briefing, escalate to the owner, ` +
+      `${stageLabel(stage)} review ${exact.reviewId} holds CHANGES-NEEDED: fix the briefing and re-commission at this tier, ` +
         'or record a push-back with POST /api/briefing-review/pushback',
       'changes-needed',
     );

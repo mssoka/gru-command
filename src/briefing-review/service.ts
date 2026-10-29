@@ -37,7 +37,6 @@ import {
 import { BRIEFING_REVIEW_HELPER, loadBriefingReviewHelper, type BriefingReviewHelper } from './helper.js';
 import {
   assertFindingEvidence,
-  BRIEFING_REVIEW_OWNER_ESCALATION,
   BRIEFING_REVIEW_ROUND_CAP,
   BriefingReviewError,
   briefingReviewIdentity,
@@ -414,8 +413,9 @@ export class BriefingReviewService {
     if (trailing >= BRIEFING_REVIEW_ROUND_CAP) {
       throw new BriefingReviewError(
         'briefing_review_round_cap',
-        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; another revision is a disagreement, not a drafting problem — ` +
-          `escalate to the owner through ${BRIEFING_REVIEW_OWNER_ESCALATION} instead of revising again`,
+        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; record a push-back on the last reviewed text, dispatch that exact text, ` +
+          'then immediately append one material corrective amendment with POST /api/dispatch/amendment (its approval.reference names owner ruling journal j-1200) ' +
+          "that fixes that round's blocking findings",
         409,
       );
     }
@@ -578,7 +578,7 @@ export class BriefingReviewService {
         `Lens jobs: ${jobs}.`,
         input.verdict === 'READY'
           ? `This revision caught ${String(input.caught)} blocking finding(s) the previous round would have sent to a lane.`
-          : 'Fix the briefing and re-commission at this tier, escalate to the owner through POST /api/notifications/needs-owner (reserved class scope-design), or record a push-back with POST /api/briefing-review/pushback.',
+          : 'Fix the briefing and re-commission at this tier, or record a push-back with POST /api/briefing-review/pushback.',
         'The review is binding on readiness and advisory on content; it never changes scope or overrides an owner ruling.',
       ].join('\n'),
     });

@@ -174,6 +174,30 @@ const advisory: BriefingReviewFinding = {
   whyItBlocks: 'one case only; an ordering bug would not fail it',
 };
 
+/** Assertions normalise message whitespace first, so a wrapped line can
+ * neither pass a negative check nor hide a phrase. */
+const normalise = (value: string): string => value.replace(/\s+/gu, ' ');
+
+/** The routed CHANGES-NEEDED guidance: push-back, never owner escalation. */
+function expectPushbackGuidance(message: string): void {
+  expect(message).toContain('push-back');
+  expect(message).not.toMatch(/escalate/iu);
+  expect(message).not.toMatch(/needs-owner/iu);
+}
+
+/** Capture a refusal (a passing call breaks the test rather than reading as
+ * an absent message). */
+function refusalOf(action: () => unknown): unknown {
+  try {
+    action();
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected a refusal');
+}
+
+const refusalMessage = (error: unknown): string => normalise((error as Error).message);
+
 describe('Nefario briefing review — commission and identity', () => {
   it('arms one review and dispatches one read-only lens job per lens, carrying the verbatim briefing, its own helper section and the result contract', async () => {
     const h = harness();
@@ -432,7 +456,9 @@ describe('Nefario briefing review — evidence-bound results', () => {
     const [notice] = [...h.notices.values()];
     expect(notice).toMatchObject({ kind: BRIEFING_REVIEW_NOTIFICATION_KIND, routing: 'action-required', severity: 'error' });
     expect(String(notice!['title'])).toContain('CHANGES-NEEDED');
-    expect(String(notice!['detail'])).toContain('POST /api/notifications/needs-owner');
+    // The routed guidance is push-back, never an owner escalation. This
+    // inverts the pre-ruling assertion that required the needs-owner URL.
+    expectPushbackGuidance(normalise(String(notice!['detail'])));
   });
 
   it('all lenses READY is one decisive verdict whose caught count is the blocking findings of the superseded round', async () => {
@@ -500,7 +526,7 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     })).toThrow(expect.objectContaining({ code: 'briefing_review_already_ready', status: 409 }));
   });
 
-  it('caps a chain at three trailing CHANGES-NEEDED rounds with an owner-escalation instruction, still converges an exact re-commission, and resets on READY', async () => {
+  it('caps a chain at three trailing CHANGES-NEEDED rounds with the push-back/dispatch/amendment path, still converges an exact re-commission, and resets on READY', async () => {
     const h = harness();
     const revision = (n: number): string => `${BRIEFING}\n- Revision ${String(n)} settles the empty-history case.`;
     // Rounds 1 and 2 reach CHANGES-NEEDED; round 3 reaches READY, which ends
@@ -520,9 +546,14 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
       h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
     }
     const capped = commission(h, { briefing: revision(7) });
-    await expect(h.service.commission(capped)).rejects.toMatchObject({ code: 'briefing_review_round_cap', status: 409 });
-    await expect(h.service.commission(capped)).rejects.toThrow(/POST \/api\/notifications\/needs-owner/u);
-    await expect(h.service.commission(capped)).rejects.toThrow(/scope-design/u);
+    const capRefusal = refusalOf(() => h.service.commission(capped));
+    expect(capRefusal).toMatchObject({ code: 'briefing_review_round_cap', status: 409 });
+    const cappedMessage = refusalMessage(capRefusal);
+    expect(cappedMessage).toContain('push-back');
+    expect(cappedMessage).toContain('POST /api/dispatch/amendment');
+    expect(cappedMessage).toContain('journal j-1200');
+    expect(cappedMessage).not.toMatch(/escalate/iu);
+    expect(cappedMessage).not.toMatch(/needs-owner/iu);
     // The refused revision created nothing; an exact re-commission of the
     // decided sixth round still converges.
     expect(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] })).toHaveLength(6);
@@ -632,7 +663,10 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     });
     expect(attempt).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
     h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
-    expect(attempt).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    const notReady = refusalOf(attempt);
+    expect(notReady).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    // The no-block branch names the push-back path, never an escalation.
+    expectPushbackGuidance(refusalMessage(notReady));
     // A revised briefing is a new sha: the older round does not cover it.
     const revised = `${BRIEFING}\n- The empty history returns an empty array.`;
     expect(() => h.service.admitDispatch({
@@ -648,6 +682,25 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     expect(refusals[2]!.payload).toMatchObject({ repo_path: h.repo.path, title: 'Refunds endpoint', job_id: 'job-9', tier: 'high' });
     // A build that never reached the service leaves no job row behind.
     expect(h.ledger.getJob('job-9')).toBeNull();
+  });
+
+  it('a matching CHANGES-NEEDED block on an enforced tier names the push-back path, never an owner escalation', async () => {
+    // The supplied-block branch (`briefing_review_not_ready` at gate.ts:187)
+    // is separate from the no-block branch: only a caller that carries the
+    // block reaches it, so it needs its own dispatch test.
+    const h = harness({ stage: 3 });
+    await h.service.commission(commission(h, { tier: 'medium' }));
+    const armed = armedOf(h);
+    h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
+    const refusal = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-block-changes',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: { rounds: 1, verdict: 'CHANGES-NEEDED', briefingSha256: armed.briefingSha256 },
+    }));
+    expect(refusal).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectPushbackGuidance(refusalMessage(refusal));
   });
 
   it('stage 3 enforces medium as well as high; low stays advisory, and stage 2 leaves medium advisory', async () => {
@@ -683,13 +736,15 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
       requested: undefined,
     })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
     s3.service.submitResult(result(s3, { lens: 'stranger', findings: [blocking()] }));
-    expect(() => s3.service.admitDispatch({
+    const mediumNotReady = refusalOf(() => s3.service.admitDispatch({
       jobId: 'job-medium-s3',
       repoPath: s3.repo.path,
       title: 'Refunds endpoint',
       briefing: BRIEFING,
       requested: undefined,
-    })).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    }));
+    expect(mediumNotReady).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectPushbackGuidance(refusalMessage(mediumNotReady));
     expect(s3.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_REFUSED] })[0]!.payload).toMatchObject({ tier: 'medium', reason: 'pending' });
 
     // Low is advisory even at stage 3: a pending low review never holds a dispatch.
@@ -716,13 +771,15 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
       requested: undefined,
     })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
     high.service.submitResult(result(high, { lens: 'stranger', findings: [blocking()] }));
-    expect(() => high.service.admitDispatch({
+    const highNotReady = refusalOf(() => high.service.admitDispatch({
       jobId: 'job-high-s3',
       repoPath: high.repo.path,
       title: 'Refunds endpoint',
       briefing: BRIEFING,
       requested: undefined,
-    })).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    }));
+    expect(highNotReady).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectPushbackGuidance(refusalMessage(highNotReady));
 
     // Stage 3 medium: a revised briefing under the reviewed chain is refused
     // as required (with the medium tier on the refusal event), not admitted.
@@ -777,6 +834,7 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     }
     expect(refusal).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
     expect((refusal as Error).message).toContain('auto-by-tier');
+    expectPushbackGuidance(refusalMessage(refusal));
 
     const low = harness({ stage: 'auto' });
     await low.service.commission(commission(low, { tier: 'low' }));
