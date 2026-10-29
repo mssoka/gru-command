@@ -6342,7 +6342,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       dbs.push(db);
       const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
       const port = new GitReviewPort(root, branch, target, ledger);
-      const lane = await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-gl-publication-newline' });
+      await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-gl-publication-newline' });
       const job = ledger.addJob({ id: 'job-gl-publication-newline', repo: 'fixture', title: 'GitLab newline', baseBranch: 'main', briefing: 'review' });
       ledger.setJobStatus(job.id, 'working');
       settleLane(ledger, job.id);
