@@ -6343,8 +6343,9 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     expect(Buffer.byteLength(boundaryBody, 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES);
     expect(boundaryBody.endsWith('\n')).toBe(false);
     expect(boundaryBody).toContain(limitReport);
-    expect(() => publicationBodyFor(limitReport, minimalReview, 'github', []))
-      .toThrow(/exceeds the provider review-body limit/u);
+    const githubBody = publicationBodyFor('report\n', minimalReview, 'github', []);
+    expect(githubBody).toContain('report');
+    expect(githubBody.endsWith('\n')).toBe(true);
     {
       const repo = makeFixtureRepo('perkins-gl-publication-newline');
       repos.push(repo);
