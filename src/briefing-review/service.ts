@@ -560,6 +560,20 @@ export class BriefingReviewService {
     };
   }
 
+  /** The proactive routing text. At the cap a re-commission is refused, so
+   * the notification names the cap's push-back/dispatch/amendment path instead
+   * of pointing at an action the service will reject. */
+  private changesNeededGuidance(armed: ArmedReview): string {
+    if (trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
+      return (
+        'This is the round cap: record a push-back on the last reviewed text, dispatch that exact text, then immediately append ' +
+        'one material corrective amendment with POST /api/dispatch/amendment (its approval.reference names owner ruling journal j-1200) ' +
+        "that fixes this round's blocking findings."
+      );
+    }
+    return 'Fix the briefing and re-commission at this tier, or record a push-back with POST /api/briefing-review/pushback.';
+  }
+
   /** One notification per decisive (reviewId, generation); the id makes a
    * converged retry silent because the center returns the existing row. */
   private announce(armed: ArmedReview, input: { readonly verdict: BriefingReviewVerdict; readonly caught: number }): void {
@@ -578,7 +592,7 @@ export class BriefingReviewService {
         `Lens jobs: ${jobs}.`,
         input.verdict === 'READY'
           ? `This revision caught ${String(input.caught)} blocking finding(s) the previous round would have sent to a lane.`
-          : 'Fix the briefing and re-commission at this tier, or record a push-back with POST /api/briefing-review/pushback.',
+          : this.changesNeededGuidance(armed),
         'The review is binding on readiness and advisory on content; it never changes scope or overrides an owner ruling.',
       ].join('\n'),
     });
@@ -611,8 +625,8 @@ export class BriefingReviewService {
     }
   }
 
-  /** Gru's third path: one durable reason that admits the exact sha at an
-   * enforced stage without claiming the review said READY. */
+  /** Gru's recorded-override path: one durable reason that admits the exact
+   * sha at an enforced stage without claiming the review said READY. */
   pushback(value: unknown): BriefingReviewPushbackOutcome {
     const request = parsePushbackRequest(value);
     const armed = armedByBriefingSha(this.ledger, request.briefingSha256, request.repoPath);

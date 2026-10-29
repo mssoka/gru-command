@@ -22,13 +22,15 @@ Source: GH-505. Internal identifier: `briefing-review`.
 3. **The review aggregates.** Any CHANGES-NEEDED is decisive at once; READY
    needs every armed lens to be READY.
 4. **Gru routes** the result: fix the briefing and re-commission; or record a
-   push-back, dispatch the exact reviewed text, and immediately append one
-   material corrective amendment (`POST /api/dispatch/amendment`) that fixes
-   that round's blocking findings; its `approval.reference` names owner ruling
-   journal j-1200. A plain disagreement never escalates. The one exception is a
-   finding whose content says the owner's requested outcome cannot be met as
-   stated: it cannot be repaired by an amendment without changing the owner's
-   scope, so escalate that finding and hold only the step it gates.
+   push-back with a reason when you judged the finding and are shipping as
+   written. At the round cap, record a push-back on the last reviewed text,
+   dispatch that exact text, and immediately append one material corrective
+   amendment (`POST /api/dispatch/amendment`) that fixes that round's blocking
+   findings; its `approval.reference` names owner ruling journal j-1200. A plain
+   disagreement never escalates. The one exception is a finding whose content
+   says the owner's requested outcome cannot be met as stated: it cannot be
+   repaired by an amendment without changing the owner's scope, so escalate that
+   finding and hold only the step it gates.
 5. **Dispatch carries provenance**: the exact reviewed text, its sha and the
    round/verdict, recorded on the job.
 

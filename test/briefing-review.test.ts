@@ -178,10 +178,12 @@ const advisory: BriefingReviewFinding = {
  * neither pass a negative check nor hide a phrase. */
 const normalise = (value: string): string => value.replace(/\s+/gu, ' ');
 
-/** The routed CHANGES-NEEDED guidance: push-back, never owner escalation. */
+/** The routed CHANGES-NEEDED guidance: push-back, never owner escalation.
+ * `/escalat/` also rejects the noun form ("owner-escalation path"), which a
+ * bare `/escalate/` would miss. */
 function expectPushbackGuidance(message: string): void {
   expect(message).toContain('push-back');
-  expect(message).not.toMatch(/escalate/iu);
+  expect(message).not.toMatch(/escalat/iu);
   expect(message).not.toMatch(/needs-owner/iu);
 }
 
@@ -536,7 +538,7 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     })).toThrow(expect.objectContaining({ code: 'briefing_review_already_ready', status: 409 }));
   });
 
-  it('caps a chain at three trailing CHANGES-NEEDED rounds with the push-back/dispatch/amendment path, still converges an exact re-commission, and resets on READY', async () => {
+  it('caps a chain at three trailing CHANGES-NEEDED rounds, names the push-back/dispatch/amendment path, still converges an exact re-commission, and resets on READY', async () => {
     const h = harness();
     const revision = (n: number): string => `${BRIEFING}\n- Revision ${String(n)} settles the empty-history case.`;
     // Rounds 1 and 2 reach CHANGES-NEEDED; round 3 reaches READY, which ends
@@ -560,10 +562,19 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     expect(capRefusal).toMatchObject({ code: 'briefing_review_round_cap', status: 409 });
     const cappedMessage = refusalMessage(capRefusal);
     expect(cappedMessage).toContain('push-back');
+    expect(cappedMessage).toContain('dispatch that exact text');
     expect(cappedMessage).toContain('POST /api/dispatch/amendment');
     expect(cappedMessage).toContain('journal j-1200');
-    expect(cappedMessage).not.toMatch(/escalate/iu);
+    expect(cappedMessage).not.toMatch(/escalat/iu);
     expect(cappedMessage).not.toMatch(/needs-owner/iu);
+    // The third trailing round's decisive notification must already name the
+    // cap path; re-commissioning there is refused.
+    const capNotice = [...h.notices.values()].at(-1);
+    const capNoticeDetail = normalise(String(capNotice!['detail']));
+    expectPushbackGuidance(capNoticeDetail);
+    expect(capNoticeDetail).toContain('dispatch that exact text');
+    expect(capNoticeDetail).toContain('POST /api/dispatch/amendment');
+    expect(capNoticeDetail).toContain('journal j-1200');
     // The refused revision created nothing; an exact re-commission of the
     // decided sixth round still converges.
     expect(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] })).toHaveLength(6);

@@ -61,6 +61,7 @@ describe('gru role definition', () => {
     // last reviewed text and appends one material corrective amendment; it is
     // never an owner escalation. Briefings are written to settle in one round.
     expect(gru).toContain('record a push-back on the last reviewed text');
+    expect(gru).toContain('dispatch that exact text');
     expect(gru).toContain('POST /api/dispatch/amendment');
     expect(gru).toContain('journal j-1200');
     expect(gru).toContain('cannot be met as stated');
