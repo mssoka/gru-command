@@ -565,6 +565,10 @@ describe('canceled-request closeout — refusal and fall-through (test 8)', () =
     markHistoricalDirectiveFixture(ctx.ledger, intent.requestId);
     const sent = ctx.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-admitted', payload: { request_id: intent.requestId, minion_id: 'minion-a' } });
     ctx.ledger.recordDirectiveAdmission({ requestId: intent.requestId, minionId: 'minion-a', eventSeq: sent.seq });
+    // Admission alone is what excludes it: it carries a request kind and a dispatch claim again.
+    ctx.db.handle.prepare("UPDATE pending_directives SET request_kind = 'directive', dispatch_started_at = ? WHERE request_id = ?")
+      .run(new Date().toISOString(), intent.requestId);
+    expect(ctx.ledger.getDirective('req-admitted')).toMatchObject({ state: 'admitted', requestKind: 'directive' });
     expect(request(ctx)).toBeNull();
   });
 
@@ -586,6 +590,23 @@ describe('canceled-request closeout — refusal and fall-through (test 8)', () =
     expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
     expect(() => ctx.ledger.setJobStatus(ctx.jobId, 'binned')).toThrow(/pending re-brief marker/);
     expect(ctx.ledger.latestEventSeq()).toBe(seq);
+  });
+
+  it('8p. S1 evaluates once more inside its transaction: a guard that appears after the pre-check still refuses with no intent row', async () => {
+    const ctx = await deferred();
+    let calls = 0;
+    // The first evaluation (the pre-check) sees no producer; the second (S1, in its transaction) does.
+    ctx.closeout = new CanceledRequestCloseout({ ledger: ctx.ledger, worktrees: ctx.worktrees,
+      pendingProducerBlockers: () => { calls += 1; return calls > 1 ? ['late producer'] : []; } });
+    const seq = ctx.ledger.latestEventSeq();
+    const result = mustRequest(ctx);
+    expect(calls).toBe(2);
+    expect(result.status).toBe(409);
+    expect(bodyOf(result).error).toBe('request_closeout_refused');
+    expect(blockersOf(result)).toEqual([{ code: 'live_work', detail: 'late producer' }]);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toBeNull();
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
   });
 
   it('8n. a reason longer than 500 characters is a 400 invalid_reason, whatever the job', async () => {

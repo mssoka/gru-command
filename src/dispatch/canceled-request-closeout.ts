@@ -165,10 +165,10 @@ export class CanceledRequestCloseout {
     const { ledger } = this.deps;
     const row = ledger.getDirective(requestId);
     const intent = ledger.latestCloseoutForRequest(requestId);
-    const candidate = row === null ? null : ledger.closeoutCandidate(row.jobId);
-    if (candidate === null || candidate.requestId !== requestId) return { path: 'binning', eligible: false, blockers: [], intent };
-    const blockers = this.retirementBlockers(candidate);
-    return { path: 'closeout', eligible: blockers.length === 0, blockers, intent };
+    const evaluation = row === null ? null : this.evaluateCloseout(row.jobId);
+    // The eligibility rule names one request of the job; any other request reads as plain binning.
+    if (evaluation === null || evaluation.request?.requestId !== requestId) return { path: 'binning', eligible: false, blockers: [], intent };
+    return { path: 'closeout', eligible: evaluation.blockers.length === 0, blockers: evaluation.blockers, intent };
   }
 
   /** Route a binning request (`POST /api/jobs/{id}/status` `{"status":"binned"}`).
@@ -198,9 +198,10 @@ export class CanceledRequestCloseout {
     // 4. An eligible job takes the closeout; 5. anything else falls through.
     const evaluation = this.evaluateCloseout(jobId);
     if (evaluation.request === null) return null;
-    const request = evaluation.request;
-    const begun = ledger.beginCloseout({ jobId, requestId: request.requestId, requestedBy: closeoutRequester(body['by']), reason,
-      evaluate: () => this.retirementBlockers(request) });
+    if (evaluation.blockers.length > 0) return refusedBody(evaluation.blockers);
+    // S1 evaluates once more inside its transaction: the same function.
+    const begun = ledger.beginCloseout({ jobId, requestId: evaluation.request.requestId, requestedBy: closeoutRequester(body['by']), reason,
+      evaluate: () => this.evaluateCloseout(jobId).blockers });
     if (begun.kind === 'refused') return refusedBody(begun.blockers);
     this.deps.afterStep?.('intent', begun.intent);
     return this.respond(this.drive(begun.intent));
