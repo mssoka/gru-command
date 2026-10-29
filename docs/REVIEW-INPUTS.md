@@ -114,34 +114,37 @@ below), and needs `GITLAB_TOKEN` (or `GL_TOKEN`) in the service environment.
 ### GitLab merge requests
 
 A job whose PR link is `https://<host>/<group>[/<subgroup>…]/<project>/-/merge_requests/<iid>`
-on a host the service supports for GitLab (`gitlab.com`, or a host whose first
-label is `gitlab` and that GitHub's host rule does not claim first, as in the head
-probe; the same rule that decides where a GitLab token may go) binds the **head
-pipeline of that merge request**. Any other link, or none,
-makes no request and records no `gitlab.*` event.
+on a host the service supports for GitLab binds the **head pipeline of that merge
+request**. A supported host is `gitlab.com`, or a host whose first label is
+`gitlab` and that GitHub's host rule does not claim (as in the head probe, but
+asked about the host name without its port); it is the same rule that decides
+where a GitLab token may go. Any other link, or none, makes no request and
+records no `gitlab.*` event.
 
 **One read per round.** After the freeze-time guards and immediately before the
 round's inputs are assembled, the host makes exactly one request, the same one
 the freeze head probe makes: `GET https://<host>/api/v4/projects/<url-encoded
 path>/merge_requests/<iid>` with `PRIVATE-TOKEN` from `GITLAB_TOKEN` (falling
-back to `GL_TOKEN`), a 30 s timeout, and no redirect following (the token never
-follows a redirect). There is no timer and no background poll: a second round
-reads again, an earlier round's read is never reused. The request ends with the
-round's setup: a shutdown or supersession during the read cancels it, and the
-cancelled read is recorded as an `other` failure like any other.
+back to `GL_TOKEN`) and a 30 s timeout, except that it does not follow redirects
+(the token never follows one). There is no timer and no background poll: a
+second round reads again, an earlier round's read is never reused. The request
+ends with the round's setup: a shutdown or supersession during the read cancels
+it, and the cancelled read is recorded as an `other` failure like any other.
 
 **The link must name the lane.** Before any request, the link's host and project
-(compared case-insensitively, as the verdict poster compares them) must be the
-origin remote of the job's repository. An origin that names a port, as an https
-remote does, must match the link's port too; an origin that names none, as an ssh
-remote, matches the link's host name on any port (a web UI on another port is the
-same machine). A minion-reported link to another project
-or host, or a lane with no resolvable origin, makes **no request** (no token goes
-anywhere) and records one `gitlab.mr-read-failed` with `error_kind` `other` whose
-`detail` says so; the block reads `UNAVAILABLE`. The token never appears in
-a recorded event, a log line, the frozen block or the manifest: `detail` is
-credential-redacted and every occurrence of the token value is replaced with
-`[redacted]` first.
+must be the origin remote of the job's repository, compared case-insensitively as
+the verdict poster compares them: the host with its port (only the default `:443`
+is not a port, so an origin written with it matches the same link without it) and
+the project path. An ssh origin names no web port, so it does not match a link on
+a non-default port, exactly as the poster would refuse to deliver to it. A
+minion-reported link to another project or host, or a lane with no resolvable
+origin, makes **no request** (no token goes anywhere) and records one
+`gitlab.mr-read-failed` with `error_kind` `other` whose `detail` says so; the
+block reads `UNAVAILABLE`.
+
+**No credential is recorded.** The token never appears in a recorded event, a log
+line, the frozen block or the manifest: `detail` is credential-redacted and every
+occurrence of the token value is replaced with `[redacted]` first.
 
 **Recorded events.** Each read records exactly one job event, tagged with the
 round. The event's `host` and `project` come from the response's `web_url` and
@@ -162,7 +165,7 @@ round. The event's `host` and `project` come from the response's `web_url` and
   or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`; or the
   read was refused before any request because the link does not name the lane's
   origin, or was cancelled with the round's setup).
-  `detail` is at most 300 characters.
+  `detail` is at most 300 characters; for `other`, which joins several causes, the frozen reason carries it (`; detail: …`).
 
 **Binding order.** Only the event this round's read recorded governs; earlier
 `gitlab.*` events are never used, and no `github.*` event is consulted. The first

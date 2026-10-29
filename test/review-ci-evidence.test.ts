@@ -501,6 +501,8 @@ describe('GitLab merge request CI evidence', () => {
         reason: expect.stringContaining(`error_kind: ${kind}`),
       });
       expect(reasonLine(block), kind).toContain(`error_kind: ${kind}`);
+      // `other` joins several causes, so its recorded detail rides in the reason; the rest say it themselves.
+      expect(reasonLine(block)?.includes('detail: whatever GitLab said'), kind).toBe(kind === 'other');
       expect(block, kind).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
       expect(block, kind).toContain(`source: ${GL_FAILED} (the host's read of this round;`);
       expect(block, kind).not.toContain('GREEN');

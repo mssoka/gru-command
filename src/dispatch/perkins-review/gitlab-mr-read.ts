@@ -221,24 +221,21 @@ export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrR
 
 type Log = (level: 'info' | 'warn', msg: string, fields?: Record<string, unknown>) => void;
 
-/** Whether a link host is the origin's host. An origin that names a port
- * (an https remote) must be matched exactly; one that names none (an ssh remote
- * carries no web port) matches the link's host name on any port, since a web UI
- * on another port is the same machine. */
-function hostMatches(originHost: string, linkHost: string): boolean {
-  const origin = originHost.toLowerCase();
-  const link = linkHost.toLowerCase();
-  return /:\d+$/u.test(origin) ? origin === link : origin === link.replace(/:\d+$/u, '');
+/** A host as a URL parser writes it: lower-case, without the default https
+ * port (the link's host has already been through one; an origin may spell it). */
+function normalizedHost(host: string): string {
+  return host.toLowerCase().replace(/:443$/u, '');
 }
 
-/** Why a link does not name the lane's origin, or null when it does. Host and
- * project path compare case-insensitively, as the verdict poster compares. */
+/** Why a link does not name the lane's origin, or null when it does. Host (with
+ * its port) and project path compare case-insensitively, as the verdict poster
+ * compares them. */
 function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): string | null {
   if (origin === null) {
     return `the merge request link names ${link.host}/${link.project}, but this lane has no resolvable origin remote to bind it to; no request was made`;
   }
   const originProject = `${origin.owner}/${origin.repo}`;
-  if (hostMatches(origin.host, link.host) && originProject.toLowerCase() === link.project.toLowerCase()) return null;
+  if (normalizedHost(origin.host) === normalizedHost(link.host) && originProject.toLowerCase() === link.project.toLowerCase()) return null;
   return `the merge request link names ${link.host}/${link.project}, which is not this lane's origin (${origin.host}/${originProject}); no request was made`;
 }
 

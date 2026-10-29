@@ -427,31 +427,22 @@ describe('recordGitLabMrRead', () => {
     }
   });
 
-  it('compares the origin by host name and project, not by port', async () => {
-    const api = ledger();
-    const { calls, fetch: fetchDouble } = double(() => json(mrBody({ web_url: `https://${HOST}:8443/${PROJECT}/-/merge_requests/7` })));
-    // A web UI on :8443 with an ssh origin (which carries no port) is one machine.
-    const recorded = await recordGitLabMrRead({
-      ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}:8443/${PROJECT}/-/merge_requests/7`,
-      deps: { fetch: fetchDouble, env: ENV }, origin: () => ORIGIN,
-    });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe(`https://${HOST}:8443/api/v4/projects/acme%2Fplatform%2Fapp/merge_requests/7`);
-    expect(recorded?.event.kind).toBe('gitlab.mr-observed');
-    expect(recorded?.event.payload).toMatchObject({ host: `${HOST}:8443` });
-  });
-
-  it('matches a port exactly when the origin names one, and ignores it when the origin names none', async () => {
+  it('compares host and port exactly, as the verdict poster does, with only the default https port normalised away', async () => {
     const cases: ReadonlyArray<readonly [string, string, string, boolean]> = [
-      ['an https origin and the same port', `${HOST}:8443`, `${HOST}:8443`, true],
-      ['an https origin and another port', `${HOST}:8443`, `${HOST}:9999`, false],
-      ['an https origin with a port and a link without one', `${HOST}:8443`, HOST, false],
-      ['an origin without a port and a link with one', HOST, `${HOST}:8443`, true],
-      ['an origin without a port and a link without one', HOST, HOST, true],
+      ['the same port', `${HOST}:8443`, `${HOST}:8443`, true],
+      ['another port', `${HOST}:8443`, `${HOST}:9999`, false],
+      ['an origin with a port and a link without one', `${HOST}:8443`, HOST, false],
+      ['an origin without a port and a link on another port (an ssh origin)', HOST, `${HOST}:8443`, false],
+      ['neither names a port', HOST, HOST, true],
+      ['an origin that spells the default port and a link that does not', `${HOST}:443`, HOST, true],
+      ['an origin that spells the default port and a link that spells it too', `${HOST}:443`, `${HOST}:443`, true],
+      ['an origin without a port and a link that spells the default port', HOST, `${HOST}:443`, true],
     ];
     for (const [label, originHost, linkHost, reads] of cases) {
       const api = ledger();
-      const { calls, fetch: fetchDouble } = double(() => json(mrBody({ web_url: `https://${linkHost}/${PROJECT}/-/merge_requests/7` })));
+      // The reader sends the request to the link's host as a URL parser writes it.
+      const requestHost = linkHost.replace(/:443$/u, '');
+      const { calls, fetch: fetchDouble } = double(() => json(mrBody({ web_url: `https://${requestHost}/${PROJECT}/-/merge_requests/7` })));
       await recordGitLabMrRead({
         ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${linkHost}/${PROJECT}/-/merge_requests/7`,
         deps: { fetch: fetchDouble, env: ENV }, origin: () => ({ host: originHost, owner: 'acme/platform', repo: 'app' }),

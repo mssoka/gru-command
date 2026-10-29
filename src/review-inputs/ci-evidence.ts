@@ -79,7 +79,7 @@ const GITLAB_MR_READ_ERROR_MEANING: Readonly<Record<GitLabMrReadErrorKind, strin
   'not-found': 'GitLab answered 404',
   'rate-limit': 'GitLab answered 429',
   timeout: 'the request timed out',
-  other: 'the read failed, was refused before any request (the link does not name the lane\'s origin) or got a response that is not a usable merge request; the gitlab.mr-read-failed event\'s detail says which',
+  other: 'the read failed, was refused before any request, or got a response that is not a usable merge request',
 };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -566,10 +566,13 @@ function renderGitLabMrEvidence(
   if (event.kind === GITLAB_MR_READ_FAILED_EVENT) {
     const kind = payload === null ? null : clean(payload['error_kind']);
     const known = GITLAB_MR_READ_ERROR_KINDS.find((candidate) => candidate === kind);
+    // `other` joins several causes; its recorded (already redacted, bounded)
+    // detail says which one. The other kinds say it themselves.
+    const detail = known === 'other' && payload !== null ? clean(payload['detail']) : null;
     return unavailableEvidence(
       known === undefined
         ? 'the recorded GitLab merge request read failure names no recognised error_kind'
-        : `the GitLab merge request read for this round failed (error_kind: ${known}): ${GITLAB_MR_READ_ERROR_MEANING[known]}`,
+        : `the GitLab merge request read for this round failed (error_kind: ${known}): ${GITLAB_MR_READ_ERROR_MEANING[known]}${detail === null ? '' : `; detail: ${detail}`}`,
       from,
     );
   }

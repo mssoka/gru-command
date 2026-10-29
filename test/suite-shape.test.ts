@@ -251,7 +251,7 @@ const PINS: Record<string, number> = {
   'directive-transcript-bounds.test.ts': 35,
   'fix-directive.test.ts': 60,
   'github-poll.test.ts': 45,
-  'gitlab-mr-read.test.ts': 28,
+  'gitlab-mr-read.test.ts': 27,
   'gru-cli.test.ts': 12,
   'gru-mailbox.test.ts': 39,
   'report-artifact-handback.test.ts': 9,
