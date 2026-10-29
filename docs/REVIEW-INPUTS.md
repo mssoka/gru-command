@@ -572,8 +572,10 @@ Everything else is answered with a named refusal that writes no event:
 - `409 blind_coverage_not_blind`: no blind admission, or a role other than
   `blind` (a claims, unclassified or historical review holds no blind coverage).
 - `409 blind_coverage_live`: any other status (`dispatched`, `working`,
-  `in-review`, `blocked`, `parked`, `binned`, `merged`). A live failed reviewer
-  is parked or binned instead, which the reuse check already skips.
+  `in-review`, `blocked`, `parked`, `binned`, `merged`; the offending one is in
+  `job_status`). A `blocked`, `parked` or `binned` reviewer is already skipped by
+  the reuse check, so it needs no release; a failed reviewer that is still
+  working is parked or binned instead.
 - `409 blind_coverage_not_owned`: the state is `invalidated`, `unattested` or
   `unobserved` (named in `coverage_state`); such a report owns nothing, so the
   corrected commission is already admitted.
@@ -597,6 +599,8 @@ no longer refuses on that sibling and lists it in `replaces`; a live, unreleased
 `qualifying` sibling still refuses, so there is never a duplicate live reviewer,
 and the replacement owns the coverage from its own admission on, however its
 handback is later dispositioned. A release record that cannot be read fails loud
-by name (the job's readback errors and a commission naming it as a sibling is
-answered `409 blind_coverage_unreadable`) instead of reading as not released.
+by name (the job's readback errors, and a commission with it as a sibling is
+answered `409 blind_coverage_unreadable` whose correction names the
+`review.blind-coverage-released` event to repair) instead of reading as not
+released.
 

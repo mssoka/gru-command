@@ -330,7 +330,9 @@ export function admitBlindReview(input: {
           status: 409,
           message: `blind coverage of sibling review "${sibling.id}" cannot be read: ${error instanceof Error ? error.message : String(error)}`,
           violations: [],
-          correction: `Inspect and repair "${sibling.id}"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`,
+          correction: error instanceof BlindReleaseRecordError
+            ? `Inspect and repair "${sibling.id}"'s ${BLIND_RELEASED_EVENT} event in the ledger (its coverage cannot be computed until it is readable), then commission again.`
+            : `Inspect and repair "${sibling.id}"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`,
           details: { coverage_job_id: sibling.id },
         }),
         rule.sha256,
@@ -659,9 +661,15 @@ export function recordObservedAccess(
   return blindCoverageOf(ledger, jobId);
 }
 
+/** A job's `review.blind-coverage-released` record is not a well-formed
+ * release: it must never read as "not released", so the coverage cannot be
+ * computed until the record is repaired. */
+export class BlindReleaseRecordError extends Error {
+  constructor(message: string) { super(message); this.name = 'BlindReleaseRecordError'; }
+}
+
 /** The recorded release of a job's coverage, or null when none was recorded.
- * A record that is not a well-formed release throws by name: a release that
- * cannot be read must never read as "not released". */
+ * A record that is not a well-formed release throws BlindReleaseRecordError. */
 function releaseOf(
   ledger: Pick<LedgerApi, 'latestJobEvent'>,
   jobId: string,
@@ -670,7 +678,7 @@ function releaseOf(
   if (event === null) return null;
   const payload = event.payload as { reason?: unknown; by?: unknown } | null;
   if (typeof payload !== 'object' || payload === null || typeof payload.reason !== 'string' || payload.reason.trim() === '' || payload.by !== BLIND_RELEASE_ACTOR) {
-    throw new Error(
+    throw new BlindReleaseRecordError(
       `job "${jobId}": its ${BLIND_RELEASED_EVENT} record (event ${String(event.seq)}) is malformed — a release names a reason and "${BLIND_RELEASE_ACTOR}" as its actor`,
     );
   }
@@ -746,11 +754,15 @@ export function releaseBlindCoverage(
     );
   }
   if (job.status !== 'delivered' && job.status !== 'done') {
+    // A blocked, parked or binned sibling is already skipped by the reuse check.
+    const skipped = job.status === 'blocked' || job.status === 'parked' || job.status === 'binned';
     throw releaseRefusal(
       'blind_coverage_live',
       409,
       `job "${jobId}" is ${job.status} — only a delivered or done blind report can have its coverage released`,
-      'A reviewer that is still running has not delivered a report. A live failed reviewer keeps its coverage until it is parked or binned, which the reuse check then skips; release applies to a report that was delivered or dismissed.',
+      skipped
+        ? `A ${job.status} reviewer is already skipped by the reuse check: a corrected same-target commission is admitted without a release.`
+        : `A reviewer that is ${job.status} has not settled a report, so it keeps its coverage; release applies only to a report that was delivered or dismissed. Park or bin a failed reviewer that is still working: the reuse check then skips it.`,
       { job_status: job.status },
     );
   }

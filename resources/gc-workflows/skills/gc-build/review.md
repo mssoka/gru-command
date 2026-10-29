@@ -43,8 +43,9 @@ parallel when the runtime supports it:
   `.txt`/`.rst`/`.adoc`, whatever it is named) with a correction path; other file types are
   path-checked only. Never hand a
   blind reviewer an unfiltered historical diff, and never count a blind report as
-  independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
-  `qualifying`; settling a report is not validity.
+  independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` reads
+  `qualifying: true` (a released report keeps `state: "qualifying"` with `qualifying: false`);
+  settling a report is not validity.
 - [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code
   only: never the spec, intent, task list or author's explanation. Commission it
   with `"review_role": "claims"` and no `required_inputs`.
@@ -89,7 +90,7 @@ Do not manufacture defects to fill a target. These rules apply to both routes.
 Triage only after every launched reviewer has reported or ended without a report.
 A failed lens is a reviewer job that ended without a report (crashed, cancelled,
 refused or stopped), reported its content missing or unreadable, or delivered a
-blind report that `blind-coverage` does not rate `qualifying`. Record it,
+blind report that `blind-coverage` does not read `qualifying: true`. Record it,
 re-commission it or report the infrastructure failure as above, and treat that
 lens's coverage as missing until a replacement reports. A replacement or later
 re-review of that lens covers from the last head where it had counted coverage (or
@@ -101,13 +102,14 @@ the coverage. For a report that was delivered or dismissed (job `delivered` or
 `done`), release it with `POST /api/dispatch/jobs/<failed job>/blind-coverage/release`
 and `{ "reason": "<why it cannot serve as a completed review>", "by": "gru" }`: one
 audited event, nothing else changes, and the replacement is admitted and names it in
-`replaces`. A live failed job (still working, blocked or otherwise unsettled) cannot be
-released; it must be parked or binned. Decide after triaging the other lenses: when
-fixes follow, commission the blind lens again on the new head; otherwise release the
-failed report (or, for a live job, escalate to the owner with its id until it is
-parked or binned) and commission the replacement on the then-current head. Release a
-report only because it cannot serve as the completed review, never to ask for a
-second opinion on a report that did serve.
+`replaces`. A failed job that is still working or awaiting review cannot be released;
+it must be parked or binned (a blocked, parked or binned job is already skipped, so
+the replacement is admitted without a release). Decide after triaging the other
+lenses: when fixes follow, commission the blind lens again on the new head; otherwise
+release the failed report (or, for a job that is still working, escalate to the owner
+with its id until it is parked or binned) and commission the replacement on the
+then-current head. Release a report only because it cannot serve as the completed
+review, never to ask for a second opinion on a report that did serve.
 Review stays incomplete until every required lens is covered;
 only the edge-case lens on a knowledge-root-only change may instead be recorded
 not applicable. Disregard any

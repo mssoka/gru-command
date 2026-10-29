@@ -12,7 +12,7 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
-import { flipJobToWorking } from '../src/dispatch/fix-directive.js';
+import { flipJobToWorking, recordFollowUpDelivery } from '../src/dispatch/fix-directive.js';
 import { BLIND_RELEASED_EVENT, blindCoverageOf } from '../src/dispatch/blind-review.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
@@ -48,6 +48,7 @@ interface Harness {
   readonly port: number;
   readonly ledger: LedgerApi;
   readonly dispatch: DispatchService;
+  readonly worktrees: InMemoryWorktreePort;
   readonly repo: FixtureRepo;
   /** The raw event rows of one job, oldest first, exactly as stored. */
   rows(jobId: string): string[];
@@ -114,6 +115,7 @@ async function boot(): Promise<Harness> {
     port: (http.address() as AddressInfo).port,
     ledger,
     dispatch,
+    worktrees,
     repo,
     rows: (jobId) => (db.handle.prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq ASC').all(jobId) as unknown[]).map((row) => JSON.stringify(row)),
     hold(jobId) {
@@ -301,6 +303,10 @@ describe('blind coverage release (issue #513)', () => {
       const refused = await release(h, 'rev-1');
       expect(refused.status, status).toBe(409);
       expect(refused.json, status).toMatchObject({ error: 'blind_coverage_live', job_status: status });
+      // A blocked, parked or binned reviewer is already skipped by the reuse check: the answer says so.
+      const correction = String(refused.json['correction']);
+      if (status === 'in-review') expect(correction, status).toMatch(/has not settled a report/u);
+      else expect(correction, status).toMatch(/already skipped by the reuse check/u);
       expect(h.rows('rev-1'), status).toEqual(before);
     }
     expect(h.ledger.latestJobEvent('rev-1', RELEASE_KIND)).toBeNull();
@@ -425,6 +431,15 @@ describe('blind coverage release (issue #513)', () => {
     expect((await call(h.port, 'GET', coveragePath('rev-1'))).json).toMatchObject({
       state: 'invalidated', qualifying: false, released: { event_seq: event.seq },
     });
+    // Its state is no longer qualifying, yet a repeat of the release reads it back (and a new reason is still refused).
+    const afterInvalidation = h.rows('rev-1');
+    const repeated = await release(h, 'rev-1');
+    expect(repeated.status, JSON.stringify(repeated.json)).toBe(200);
+    expect(repeated.json).toMatchObject({ idempotent: true, event: { seq: event.seq } });
+    const renamed = await release(h, 'rev-1', { reason: 'another reason', by: 'gru' });
+    expect(renamed.status).toBe(409);
+    expect(renamed.json).toMatchObject({ error: 'blind_coverage_already_released' });
+    expect(h.rows('rev-1')).toEqual(afterInvalidation);
   });
 
   it('A6: the same release twice yields one event; a different reason afterwards is refused', async () => {
@@ -458,15 +473,26 @@ describe('blind coverage release (issue #513)', () => {
     // A directive re-opens the delivered lane (delivered -> working).
     flipJobToWorking(h.ledger, 'rev-1');
     expect(h.ledger.getJob('rev-1')?.status).toBe('working');
+    // While it works, a repeat of the release reads it back and a new reason is refused: neither is "live".
+    const whileWorking = h.rows('rev-1');
+    const repeatedWhileWorking = await release(h, 'rev-1');
+    expect(repeatedWhileWorking.status, JSON.stringify(repeatedWhileWorking.json)).toBe(200);
+    expect(repeatedWhileWorking.json).toMatchObject({ idempotent: true });
+    const renamedWhileWorking = await release(h, 'rev-1', { reason: 'another reason', by: 'gru' });
+    expect(renamedWhileWorking.status).toBe(409);
+    expect(renamedWhileWorking.json).toMatchObject({ error: 'blind_coverage_already_released' });
+    expect(h.rows('rev-1')).toEqual(whileWorking);
     const replacement = await commission(h, 'rev-2');
     expect(replacement.status, JSON.stringify(replacement.json)).toBe(202);
     expect(h.ledger.latestJobEvent('rev-2', 'review.blind-input-admitted')?.payload).toMatchObject({ replaces: ['rev-1'] });
     await waitFor(() => h.ledger.getJob('rev-2')?.status === 'delivered');
     settleAgents(h, 'rev-2');
 
-    // It delivers again: a clean settle scan, then the delivered status.
+    // It delivers again as a directive turn does: the settle-time access scan, the delivery receipt, then the delivered status.
     h.dispatch.observeBlindSession('rev-1', null);
+    recordFollowUpDelivery({ ledger: h.ledger, worktrees: h.worktrees, jobId: 'rev-1', agentId: null, source: 'silas-directive', workRevision: 0 });
     h.ledger.setJobStatus('rev-1', 'delivered');
+    expect(h.ledger.latestJobEvent('rev-1', 'job.delivered')?.payload).toMatchObject({ source: 'silas-directive' });
     expect((await call(h.port, 'GET', coveragePath('rev-1'))).json).toMatchObject({ state: 'qualifying', qualifying: false, released: releasedAt });
     // A repeat of the release reads it back, whatever the lane did meanwhile.
     expect((await release(h, 'rev-1')).json).toMatchObject({ idempotent: true });
@@ -505,6 +531,9 @@ describe('blind coverage release (issue #513)', () => {
     expect(replacement.status).toBe(409);
     expect(replacement.json).toMatchObject({ error: 'blind_coverage_unreadable', coverage_job_id: 'rev-1' });
     expect(String(replacement.json['detail'])).toContain('review.blind-coverage-released');
+    // The pointer names the record that is actually unreadable, not the access events.
+    expect(String(replacement.json['correction'])).toContain('review.blind-coverage-released');
+    expect(String(replacement.json['correction'])).not.toContain('review.blind-access-observed');
     expect(h.ledger.getJob('rev-2')).toBeNull();
   });
 });

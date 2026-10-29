@@ -87,7 +87,7 @@ function record() {
   const mutated = run(dir, only);
   if (mutated.crashed) { print(`mutated run crashed: ${mutated.stderr}`); return 2; }
   const failed = mutated.tests.filter((test) => test.status === 'failed');
-  for (const test of mutated.tests) print(`  ${test.status} ${test.fullName}`);
+  for (const test of mutated.tests.filter((candidate) => candidate.status !== 'skipped' && candidate.status !== 'pending')) print(`  ${test.status} ${test.fullName}`);
   for (const test of failed) print(`failure of "${test.fullName}":\n${test.failureMessages.join('\n').split('\n').slice(0, 6).join('\n')}`);
   const a1 = mutated.tests.find((test) => test.fullName.includes(' A1: '));
   const a1Red = a1 !== undefined && a1.status === 'failed' && a1.failureMessages.join('\n').includes('blind_coverage_owned');
