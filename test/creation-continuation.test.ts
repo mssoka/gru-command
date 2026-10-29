@@ -9,9 +9,10 @@ import { BriefingReviewError } from '../src/briefing-review/types.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import type { DiskFloorGate, FloorAdmission } from '../src/maintenance/disk.js';
 import { writeCreationIntent } from '../src/worktrees/creation-intent.js';
+import type { LogLevel } from '../src/logger.js';
 import {
-  cleanupContinuationFixtures, directory, git, httpHarness, managerFixture, receiptFiles, request, requestPayloadSha256,
-  retainedFixture, routeHarness, syntheticRetained, TOKEN, waitForState,
+  admitDirectly, cleanupContinuationFixtures, directory, git, httpHarness, managerFixture, receiptFiles, request, requestPayloadSha256,
+  restartService, retainedFixture, routeHarness, syntheticRetained, TOKEN, waitForState,
 } from './helpers/creation-continuation.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
@@ -386,6 +387,105 @@ describe('same-job retained initial-creation continuation', () => {
     expect(api.spawns).toHaveLength(0);
     expect(api.prompts).toHaveLength(0);
     expect(h.ledger.listJobEventsByKinds(h.job.id, ['job.handoff'], { limit: 5 })).toHaveLength(1);
+  });
+
+  it('keeps an admitted continuation custody-unknown across a real ledger close and reopen and never relaunches it', async () => {
+    const h = await retainedFixture('continuation-reopen-restart');
+    const requestId = 'reopen-restart-request';
+    const { lane, agentId, spawnedSeq } = await admitDirectly(h, requestId);
+    const first = await httpHarness(h);
+    const before = (await request(first.base, 'GET', { job_id: h.job.id, request_id: requestId })).body['readback'] as Record<string, unknown>;
+    expect(before).toMatchObject({ state: 'custody-unknown', active: false, admission: { agent_id: agentId, event_seq: spawnedSeq }, delivery: null });
+    // The first process is gone: its service and server stopped and the
+    // ledger file closed; the second opens that same file from disk.
+    const restarted = await restartService(h, first);
+    const { api, fixture } = restarted;
+    const continuationEvents = () => api.ledger.listJobEventsByKinds(h.job.id, ['job.creation-continuation'], { limit: 50 });
+    expect(fixture.db).not.toBe(h.db);
+    expect(fixture.db.dbPath).toBe(h.db.dbPath);
+    expect(api.ledger).not.toBe(h.ledger);
+    expect(api.worktrees).not.toBe(h.worktrees);
+    expect(api.dispatch).not.toBe(first.dispatch);
+    expect(api.base).not.toBe(first.base);
+    expect(api.ledger.getJob(h.job.id)?.status).toBe('working');
+    expect(api.ledger.getAgent(agentId)).toMatchObject({ jobId: h.job.id, role: 'minion' });
+    expect(api.ledger.getWorktree(h.job.id)).toMatchObject({ id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha, baseSource: lane.baseSource });
+    expect(api.ledger.getCreationContinuation(h.job.id, requestId)?.events.map((event) => (event.payload as Record<string, unknown>)['stage']))
+      .toEqual(['accepted', 'custody-adopted', 'minion-spawned']);
+    const eventsBefore = continuationEvents();
+    expect(eventsBefore).toHaveLength(3);
+
+    const read = await request(api.base, 'GET', { job_id: h.job.id, request_id: requestId });
+    expect(read.status).toBe(200);
+    const readback = read.body['readback'] as Record<string, unknown>;
+    expect(readback).toMatchObject({
+      state: 'custody-unknown', active: false, job_status: 'working', delivery: null,
+      original: { handoff_repo_path: h.repo.path, repo_path: h.inspection.repoPath, branch: h.inspection.branch, base_sha: h.inspection.sha, producer_settlement_seq: h.inspection.producerSettlementSeq },
+      custody: { worktree_id: h.job.id, branch: lane.branch, sha: lane.sha, status: 'active', evidence: 'manager-reconciliation' },
+      admission: { agent_id: agentId, event_seq: spawnedSeq },
+    });
+    expect((readback['timeline'] as readonly Record<string, unknown>[]).map((entry) => entry['stage'])).toEqual(['accepted', 'custody-adopted', 'minion-spawned']);
+    // The reopened ledger answers exactly what the first process answered.
+    expect(readback).toEqual(before);
+
+    const retry = await request(api.base, 'POST', { job_id: h.job.id, request_id: requestId });
+    expect(retry.status).toBe(409);
+    expect(retry.body).toMatchObject({ error: 'creation_continuation_unknown', readback: { state: 'custody-unknown', active: false } });
+    expect(retry.body['readback']).toEqual(before);
+    expect([...first.spawns, ...api.spawns, ...first.prompts, ...api.prompts]).toEqual([]);
+    expect(continuationEvents()).toEqual(eventsBefore);
+    expect(api.ledger.listJobEventsByKinds(h.job.id, ['job.minion-spawned'])).toHaveLength(1);
+    expect(api.ledger.listJobEventsByKinds(h.job.id, ['job.handoff'], { limit: 5 })).toHaveLength(1);
+    expect(api.ledger.listAgents().filter((agent) => agent.jobId === h.job.id).map((agent) => agent.id)).toEqual([agentId]);
+    expect(api.ledger.getJob(h.job.id)?.status).toBe('working');
+    expect(git(api.repo, ['rev-parse', `refs/heads/gru/${h.job.id}`])).toBe(h.inspection.sha);
+  });
+
+  it('records exactly one request and starts at most one owner when the client aborts during the held inspection', async () => {
+    const h = await retainedFixture('continuation-client-abort');
+    const inspect = h.worktrees.inspectRetainedJobCreation.bind(h.worktrees);
+    let reached!: () => void;
+    const inspecting = new Promise<void>((resolve) => { reached = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    h.worktrees.inspectRetainedJobCreation = async (input) => { reached(); await held; return inspect(input); };
+    const logs: { readonly level: LogLevel; readonly msg: string; readonly fields: Record<string, unknown> | undefined }[] = [];
+    const api = await httpHarness(h, { serverLog: (level, msg, fields) => { logs.push({ level, msg, fields }); } });
+    const body = { job_id: api.jobId, request_id: 'client-abort-request' };
+    const continuations = () => api.ledger.listJobEventsByKinds(api.jobId, ['job.creation-continuation'], { limit: 50 });
+
+    const controller = new AbortController();
+    const aborted = request(api.base, 'POST', body, TOKEN, controller.signal).then(() => 'answered', (error: unknown) => (error as Error).name);
+    await inspecting;
+    expect(continuations()).toEqual([]);
+    controller.abort();
+    expect(await aborted).toBe('AbortError');
+    // The server saw the client leave while the inspection was still held.
+    await vi.waitFor(() => {
+      expect(logs.filter((entry) => entry.msg === 'dispatch request' && entry.fields?.['method'] === 'POST')).toHaveLength(1);
+    });
+    expect(continuations()).toEqual([]);
+    release();
+
+    // The request is recorded after the inspection returns, whoever is still listening.
+    await vi.waitFor(() => { expect(api.ledger.getCreationContinuation(api.jobId, body.request_id)).not.toBeNull(); });
+    const recorded = api.ledger.getCreationContinuation(api.jobId, body.request_id)!;
+    expect(recorded.identity.generation).toBe(1);
+    const retry = await request(api.base, 'POST', body);
+    expect(retry.status).toBe(200);
+    expect(retry.body['readback']).toMatchObject({ job_id: api.jobId, request_id: body.request_id, generation: 1, payload_sha256: recorded.identity.payloadSha256 });
+    const readback = await waitForState(api.base, api.jobId, body.request_id, 'delivered');
+    expect(readback).toMatchObject({ generation: 1, active: false, admission: { agent_id: api.spawns[0] } });
+
+    const requests = new Set(continuations().map((event) => (event.payload as Record<string, unknown>)['request_id']));
+    expect([...requests]).toEqual([body.request_id]);
+    expect(new Set(continuations().map((event) => (event.payload as Record<string, unknown>)['generation']))).toEqual(new Set([1]));
+    expect(continuations().filter((event) => (event.payload as Record<string, unknown>)['stage'] === 'accepted')).toHaveLength(1);
+    expect(api.spawns).toHaveLength(1);
+    expect(api.prompts).toHaveLength(1);
+    expect(api.ledger.listJobEventsByKinds(api.jobId, ['job.minion-spawned'])).toHaveLength(1);
+    expect(api.ledger.listJobEventsByKinds(api.jobId, ['job.handoff'], { limit: 5 })).toHaveLength(1);
+    expect(logs.filter((entry) => entry.level === 'error')).toEqual([]);
   });
 
   it('journals positive producer closure when the owned branch transaction succeeds', async () => {

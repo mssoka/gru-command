@@ -1186,3 +1186,13 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
+
+# #503 creation-continuation finding 4d: the restart test closes and reopens the
+# ledger file, the abort test aborts a real client request. `-focused` runs the
+# creation-continuation suites over the registry pins; `-static` is the lint +
+# typecheck + build gate; `-mutations` applies one production-source mutation at
+# a time to a scratch extract of HEAD and requires the named tests to fail and the
+# existing same-ledger restart tests to still pass (gru-output/gc-503-p1-restart).
+gc-503-p1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/creation-continuation.test.ts test/creation-continuation-custody.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-503-p1-static = "npm run lint && npm run typecheck && npm run build"
+gc-503-p1-mutations = "node gru-output/gc-503-p1-restart/mutations.mjs"

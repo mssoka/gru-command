@@ -28,16 +28,20 @@ export const TOKEN = 'synthetic-continuation-test-token';
 const repos: FixtureRepo[] = [];
 const dirs: string[] = [];
 const dbs: LedgerDb[] = [];
-const servers: { readonly server: HttpServer; readonly api: ReturnType<typeof createDispatchServer> }[] = [];
+/** The data directory each tracked ledger was opened on, so a restart can reopen the same file. */
+const dbDirs = new WeakMap<LedgerDb, string>();
+interface RunningServer { readonly server: HttpServer; readonly api: ReturnType<typeof createDispatchServer> }
+const servers: RunningServer[] = [];
+
+async function closeServer(current: RunningServer): Promise<void> {
+  current.api.dispose();
+  await new Promise<void>((resolve, reject) => current.server.close((error) => error ? reject(error) : resolve()));
+}
 
 /** afterEach: close servers, ledgers, temp directories and fixture repos. */
 export async function cleanupContinuationFixtures(): Promise<void> {
   vi.unstubAllEnvs();
-  while (servers.length > 0) {
-    const current = servers.pop()!;
-    current.api.dispose();
-    await new Promise<void>((resolve, reject) => current.server.close((error) => error ? reject(error) : resolve()));
-  }
+  while (servers.length > 0) await closeServer(servers.pop()!);
   while (dbs.length > 0) dbs.pop()!.close();
   while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
   while (repos.length > 0) repos.pop()!.cleanup();
@@ -49,8 +53,9 @@ export function directory(): string {
   return path;
 }
 
-export function trackedDb(): LedgerDb {
-  const db = new LedgerDb(directory());
+export function trackedDb(dataDir: string = directory()): LedgerDb {
+  const db = new LedgerDb(dataDir);
+  dbDirs.set(db, dataDir);
   dbs.push(db);
   return db;
 }
@@ -62,6 +67,10 @@ export function git(repo: FixtureRepo, args: readonly string[]): string {
   }).trim();
 }
 
+function fixtureManager(ledger: LedgerApi, root: string, preserveRoot: string, options: Partial<WorktreeManagerOptions>): WorktreeManager {
+  return new WorktreeManager({ ledger, root, preserveRoot, setupTimeoutMs: 30_000, enumerateProcesses: () => [], ...options });
+}
+
 export function managerFixture(name: string, options: Partial<WorktreeManagerOptions> = {}) {
   const repo = makeFixtureRepo(name);
   repos.push(repo);
@@ -70,8 +79,8 @@ export function managerFixture(name: string, options: Partial<WorktreeManagerOpt
   const bus = new EventBus();
   const db = trackedDb();
   const ledger = new LedgerApi(db.handle, { bus });
-  const worktrees = new WorktreeManager({ ledger, root, preserveRoot, setupTimeoutMs: 30_000, enumerateProcesses: () => [], ...options });
-  return { repo, root, bus, db, ledger, worktrees };
+  const worktrees = fixtureManager(ledger, root, preserveRoot, options);
+  return { repo, root, preserveRoot, managerOptions: options, bus, db, ledger, worktrees };
 }
 
 /** Put a synthetic `git` first on PATH; returns the PATH to restore. */
@@ -230,9 +239,39 @@ export async function httpHarness(h: HarnessSource, options: HarnessOptions = {}
     if (!api.requestHook(req, res, path)) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); }
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  servers.push({ server, api });
+  const running: RunningServer = { server, api };
+  servers.push(running);
   const address = server.address() as AddressInfo;
-  return { base: `http://127.0.0.1:${address.port}`, dispatch, ledger: h.ledger, worktrees: h.worktrees, prompts, spawns, disposed, repo: h.repo, jobId: h.job.id, inspection: h.inspection ?? null };
+  /** Dispose this service and close its HTTP server, as a stopping process does. */
+  const stop = async (): Promise<void> => {
+    const index = servers.indexOf(running);
+    if (index >= 0) servers.splice(index, 1);
+    await closeServer(running);
+  };
+  return { base: `http://127.0.0.1:${address.port}`, dispatch, ledger: h.ledger, worktrees: h.worktrees, prompts, spawns, disposed, repo: h.repo, jobId: h.job.id, inspection: h.inspection ?? null, stop };
+}
+
+export type ContinuationHarness = Awaited<ReturnType<typeof httpHarness>>;
+
+/** A service restart over the same ledger FILE: stop the running HTTP
+ * service, close the ledger, reopen the same database file, and build a fresh
+ * manager, dispatch service and HTTP server over the reopened ledger. Only the
+ * ledger file, the repository and the checkout roots carry over, so a fact the
+ * old process held only in memory is gone. */
+export async function restartService(h: RetainedFixture, running: ContinuationHarness, options: HarnessOptions = {}) {
+  await running.stop();
+  const dataDir = dbDirs.get(h.db);
+  if (dataDir === undefined) throw new Error('restartService needs a ledger opened through trackedDb(): its data directory is unknown');
+  dbs.splice(dbs.indexOf(h.db), 1);
+  h.db.close();
+  const db = trackedDb(dataDir);
+  const bus = new EventBus();
+  const ledger = new LedgerApi(db.handle, { bus });
+  const worktrees = fixtureManager(ledger, h.root, h.preserveRoot, h.managerOptions);
+  const job = ledger.getJob(h.job.id);
+  if (job === null) throw new Error(`job "${h.job.id}" is missing from the reopened ledger ${db.dbPath}`);
+  const fixture: RetainedFixture = { ...h, bus, db, ledger, worktrees, job };
+  return { fixture, api: await httpHarness(fixture, options) };
 }
 
 /** A route-only server over a stand-in dispatch service. */
@@ -252,9 +291,10 @@ export async function routeHarness(dispatch: DispatchService, options: { readonl
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
-export async function request(base: string, method: 'GET' | 'POST', body?: unknown, token: string | null = TOKEN) {
+export async function request(base: string, method: 'GET' | 'POST', body?: unknown, token: string | null = TOKEN, signal?: AbortSignal) {
   const response = await fetch(`${base}/api/dispatch/creation-continuation${method === 'GET' ? `?job_id=${encodeURIComponent(String((body as { job_id?: string } | undefined)?.job_id ?? ''))}&request_id=${encodeURIComponent(String((body as { request_id?: string } | undefined)?.request_id ?? ''))}` : ''}`, {
     method,
+    ...(signal === undefined ? {} : { signal }),
     ...(body === undefined || method === 'GET' ? {} : { headers: { 'content-type': 'application/json', ...(token === null ? {} : { authorization: `Bearer ${token}` }) }, body: JSON.stringify(body) }),
     ...(method === 'GET' ? { headers: token === null ? {} : { authorization: `Bearer ${token}` } } : {}),
   });
@@ -292,6 +332,43 @@ export function acceptDirectly(h: RetainedFixture, requestId: string) {
     branch: h.inspection.branch, baseSha: h.inspection.sha, baseSource: h.inspection.baseSource,
     producerSettlementSeq: h.inspection.producerSettlementSeq, receiptTokenSha256: h.inspection.receiptTokenSha256,
   });
+}
+
+/** Leave a request where an owner lost with its process leaves it: accepted
+ * with its exact identity, custody adopted into a registered lane, the job
+ * working and the minion's spawn receipt recorded, with no delivery. Every
+ * write goes through the ledger, so a reopen of the same file must keep it. */
+export async function admitDirectly(h: RetainedFixture, requestId: string, agentId = 'admitted-before-restart') {
+  const handoff = h.ledger.listJobEventsByKinds(h.job.id, ['job.handoff'], { limit: 2 })[0]!;
+  const briefingSha256 = sha256(h.job.briefing!);
+  const identityPayload = {
+    schema: 'same-job-retained-creation-continuation-v1', job_id: h.job.id, request_id: requestId,
+    handoff_seq: handoff.seq, briefing_sha256: briefingSha256, handoff_repo_path: h.repo.path, repo_path: h.inspection.repoPath,
+    branch: h.inspection.branch, base_sha: h.inspection.sha, base_source: h.inspection.baseSource,
+    producer_settlement_seq: h.inspection.producerSettlementSeq,
+    receipt_token_sha256: h.inspection.receiptTokenSha256,
+  };
+  const accepted = h.ledger.acceptCreationContinuation({
+    jobId: h.job.id, requestId, payloadSha256: requestPayloadSha256(identityPayload),
+    handoffSeq: handoff.seq, briefingSha256, handoffRepoPath: h.repo.path, repoPath: h.inspection.repoPath,
+    branch: h.inspection.branch, baseSha: h.inspection.sha, baseSource: h.inspection.baseSource,
+    producerSettlementSeq: h.inspection.producerSettlementSeq, receiptTokenSha256: h.inspection.receiptTokenSha256,
+  });
+  expect(accepted.timeline.state).toBe('accepted');
+  const { generation } = accepted.timeline.identity;
+  const lane = await h.worktrees.createRetainedJobWorktree({ repoPath: h.repo.path, jobId: h.job.id, expected: h.inspection });
+  h.ledger.recordCreationContinuationState({
+    jobId: h.job.id, requestId, generation, stage: 'custody-adopted',
+    details: { worktree_id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha, base_source: lane.baseSource, worktree_status: lane.status },
+  });
+  h.ledger.setJobStatus(h.job.id, 'working');
+  h.ledger.registerAgent({ id: agentId, role: 'minion', jobId: h.job.id, parentage: 'top-level' });
+  const spawned = h.ledger.appendCustomEvent({
+    kind: 'job.minion-spawned', jobId: h.job.id,
+    payload: { agentId, worktree: lane.path, branch: lane.branch, creation_continuation_request_id: requestId, creation_continuation_generation: generation },
+  });
+  h.ledger.recordCreationContinuationState({ jobId: h.job.id, requestId, generation, state: 'admitted', stage: 'minion-spawned', details: { agent_id: agentId } });
+  return { generation, lane, agentId, spawnedSeq: spawned.seq };
 }
 
 export const receiptFiles = (repo: FixtureRepo): string[] => {
