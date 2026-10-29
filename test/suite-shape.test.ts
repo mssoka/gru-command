@@ -420,6 +420,7 @@ const PINS: Record<string, number> = {
   'child-workers.test.ts': 36,
   'creation-intent.test.ts': 5,
   'directive-markers.test.ts': 15,
+  'directive-recovery-attention.test.ts': 13,
   'escalation-identity.test.ts': 7,
   'dispatch-review-inputs.test.ts': 4,
   'durable-reconcile.test.ts': 15,

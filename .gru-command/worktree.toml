@@ -1186,3 +1186,17 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
+
+# #523 second PR: the reconsider-driven directive recovery card is not raised
+# again after Gru resolves it, keeps a recorded mailbox disposition across a
+# text-only refresh and has a decision signal that fits the decision API.
+# `-focused` is the new suite plus the registry pins; `-guards` runs the
+# suites that pin the neighbouring behavior (refresh in place, terminal-job
+# replacement, markers, closeout suppression, hard floor, mailbox, decisions);
+# `-static` is the lint + typecheck + build gate. `-red` archives the dispatch
+# base and runs the fail-before tests A1-A6 against the base source: it exits
+# non-zero by design, and only those six run.
+gc-523-attention-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-recovery-attention.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-523-attention-guards = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/directive-retirement.test.ts test/directive-markers.test.ts test/incident.test.ts test/awareness.test.ts test/board-server.test.ts test/gru-mailbox.test.ts && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts test/canceled-request-closeout.test.ts test/decisions-service-integration.test.ts"
+gc-523-attention-static = "npm run lint && npm run typecheck && npm run build"
+gc-523-attention-red = 'base=ccd6337fb629f3fc69bea725d06873733b363182; root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-523-attention-red.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp test/directive-recovery-attention.test.ts "$d/test/directive-recovery-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-523-attention RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; code=0; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-recovery-attention.test.ts -t "A[1-6]\. " --reporter=verbose || code=$?; cd "$root"; rm -rf "$d"; exit $code'
