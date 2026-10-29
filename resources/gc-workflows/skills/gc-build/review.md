@@ -96,11 +96,19 @@ re-review of that lens covers from the last head where it had counted coverage (
 the base), never a narrower focused delta; triage its findings when they arrive.
 A failed blind report never counts as coverage, whatever `blind-coverage` says. If
 its replacement is refused `409 blind_coverage_owned`, do not retry in a loop: the
-service accepts a same-head replacement only once the failed job is parked or
-binned. Decide after triaging the other lenses: when fixes follow, commission the
-blind lens again on the new head; otherwise escalate to the owner with the failed
-job's id, and once that job is parked or binned commission the replacement on the
-then-current head. Review stays incomplete until every required lens is covered;
+service accepts a same-head replacement only once the failed report no longer owns
+the coverage. For a report that was delivered or dismissed (job `delivered` or
+`done`), release it with `POST /api/dispatch/jobs/<failed job>/blind-coverage/release`
+and `{ "reason": "<why it cannot serve as a completed review>", "by": "gru" }`: one
+audited event, nothing else changes, and the replacement is admitted and names it in
+`replaces`. A live failed job (still working, blocked or otherwise unsettled) cannot be
+released; it must be parked or binned. Decide after triaging the other lenses: when
+fixes follow, commission the blind lens again on the new head; otherwise release the
+failed report (or, for a live job, escalate to the owner with its id until it is
+parked or binned) and commission the replacement on the then-current head. Release a
+report only because it cannot serve as the completed review, never to ask for a
+second opinion on a report that did serve.
+Review stays incomplete until every required lens is covered;
 only the edge-case lens on a knowledge-root-only change may instead be recorded
 not applicable. Disregard any
 severity a reviewer assigned. Record one row per finding in the review triage log

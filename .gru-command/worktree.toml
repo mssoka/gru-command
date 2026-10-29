@@ -1186,3 +1186,15 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
+
+# #513 blind coverage release: `gc-513-focused` is the new endpoint/readback
+# suite, the suites that must keep passing with their assertions unchanged
+# (heavy ones routed through the heavy config), the playbook wording and the
+# registry pins; the packaged workflow suite needs a built dist, so `full`
+# runs it. `-static` is the lint + typecheck + build gate (the build runs the
+# workflow-runtime verifier). `-red` runs test A1 alone in a scratch extract of
+# HEAD with the release check removed from `blindCoverageOf` and must fail
+# with 409 blind_coverage_owned (gru-output/gc-513-blind-coverage-release).
+gc-513-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/blind-coverage-release.test.ts test/blind-input.test.ts test/blind-input-dispatch.test.ts test/blind-review.test.ts test/rebrief-recovery.test.ts test/provider-recovery-resume.test.ts test/workflow-runtime.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/fix-directive.test.ts"
+gc-513-static = "npm run lint && npm run typecheck && npm run build"
+gc-513-red = "node gru-output/gc-513-blind-coverage-release/red.mjs"

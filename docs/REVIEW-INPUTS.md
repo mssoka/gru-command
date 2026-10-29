@@ -514,7 +514,8 @@ sha256 and git blob id, diff digest and paths). A refusal records
 **Validity is not settlement.** `GET /api/dispatch/jobs/<id>/blind-coverage`
 answers `qualifying | invalidated | unattested | unobserved | not-blind | unclassified`,
 derived only from the admission, `review.blind-access-observed` and
-`job.blind-access-unobservable` facts. The reviewer's session tool results are
+`job.blind-access-unobservable` facts (plus, for whether a `qualifying` report
+still owns its coverage, the commissioner's release below). The reviewer's session tool results are
 scanned at turn settle (grep lines landing in excluded paths, paged reads
 returning history-bearing text, and any file-content tool call — pi `read`/`edit`,
 Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit`, and a content
@@ -543,8 +544,59 @@ naming the job to reuse (or `409 blind_coverage_unreadable` naming a sibling
 whose recorded blind-access facts cannot be counted — repair them in the ledger
 first). A blocked, parked or binned sibling is skipped. Any other blind sibling
 whose coverage is not `qualifying` (`invalidated`, `unattested` or `unobserved`,
-terminal or not) may be replaced: the new admission lists it in `replaces`, and
-its report stays exactly as recorded. Replacing does not stop it: a sibling
-still running keeps running, and a report it delivers later is recorded as it
-is.
+terminal or not, or `qualifying` but released, below) may be replaced: the new
+admission lists it in `replaces`, and its report stays exactly as recorded.
+Replacing does not stop it: a sibling still running keeps running, and a report
+it delivers later is recorded as it is.
+
+**Releasing coverage (#513).** A clean blind reviewer can still deliver a report
+that cannot serve as a completed review (its package lacked material its
+commission required, and it correctly stopped without reading excluded files).
+Dismissing that handback does not change what the reviewer read, so its coverage
+stays `qualifying` and a corrected commission of the same target is refused
+`409 blind_coverage_owned`. The commissioner releases it explicitly:
+
+    POST /api/dispatch/jobs/<job>/blind-coverage/release
+    { "reason": "<1-500 characters>", "by": "gru" }
+
+It appends one `review.blind-coverage-released` event on that job
+(`{ reason, by, target_sha, package_sha256 }`) and changes nothing else: no
+access event, no status change, no disposition, no report edit. `reason` is
+trimmed before it is checked and kept. Only a blind report whose status is
+`delivered` or `done` and whose coverage `state` is `qualifying` is releasable.
+Everything else is answered with a named refusal that writes no event:
+
+- `400 invalid_request`: `reason` missing, blank, not a string or over 500
+  characters; `by` other than `gru`; or a body that is not a JSON object.
+- `404 job_not_found`: no such job.
+- `409 blind_coverage_not_blind`: no blind admission, or a role other than
+  `blind` (a claims, unclassified or historical review holds no blind coverage).
+- `409 blind_coverage_live`: any other status (`dispatched`, `working`,
+  `in-review`, `blocked`, `parked`, `binned`, `merged`). A live failed reviewer
+  is parked or binned instead, which the reuse check already skips.
+- `409 blind_coverage_not_owned`: the state is `invalidated`, `unattested` or
+  `unobserved` (named in `coverage_state`); such a report owns nothing, so the
+  corrected commission is already admitted.
+- `409 blind_coverage_already_released`: released earlier with a different
+  reason; the first reason is in `released`.
+
+The same release repeated (the reason compared after trimming) answers `200`
+with the existing event and `idempotent: true`, whatever the job's status or
+state has become since, and appends nothing. A success answers `200`
+`{ job_id, idempotent, event: { seq, ts, kind, payload }, coverage }`.
+
+Readback (`GET /api/dispatch/jobs/<job>/blind-coverage`, and the `coverage` in
+the answer above) gains `released`: `null`, or `{ by, reason, at, event_seq }`.
+`state` is exactly what the admission and the observed access say; a release
+never rewrites it. `qualifying` is `state === "qualifying"` and not released,
+and a release adds the reason `coverage released by gru: <reason>`. A release is
+permanent: a released job that is later re-opened by a directive and delivers
+again is still released, and a later prohibited read still moves `state` to
+`invalidated` while `released` stays. With the release in place the reuse check
+no longer refuses on that sibling and lists it in `replaces`; a live, unreleased
+`qualifying` sibling still refuses, so there is never a duplicate live reviewer,
+and the replacement owns the coverage from its own admission on, however its
+handback is later dispositioned. A release record that cannot be read fails loud
+by name (the job's readback errors and a commission naming it as a sibling is
+answered `409 blind_coverage_unreadable`) instead of reading as not released.
 
