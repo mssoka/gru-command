@@ -26,6 +26,7 @@ import type { MailboxItem } from '../src/ledger/mailbox.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { binningCloseoutRoute, CanceledRequestCloseout } from '../src/dispatch/canceled-request-closeout.js';
+import { surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
@@ -366,8 +367,8 @@ describe('board server — HTTP API', () => {
         expect(api.claimDirectiveDispatch(requestId)).toBe(true);
         const start = api.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-started', requestId)!;
         api.recordDirectiveDispatchDeferral(api.directiveTurnIdentity(requestId), start.seq, 'a supervised producer held the lane');
-        wired.notifications.postIncident({ kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
-          title: `Directive ${requestId}: decision owed`, detail: 'deferred before reaching its worker', dedupe: 'active' });
+        // The recovery debt and its card, exactly as the restart reconsideration opens them.
+        surfaceDirectiveRecovery({ ledger: api, notifications: wired.notifications }, requestId, 'deferred before reaching its worker');
       };
       await defer('job-cancel', 'req-cancel');
       // Until the closeout exists the route is today's: the live request refuses the bin.
