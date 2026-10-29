@@ -427,7 +427,7 @@ describe('recordGitLabMrRead', () => {
     }
   });
 
-  it('compares host and port exactly, as the verdict poster does, with only the default https port normalised away', async () => {
+  it('compares host and port exactly like the verdict poster, and also lets an origin spelling the default https port match', async () => {
     const cases: ReadonlyArray<readonly [string, string, string, boolean]> = [
       ['the same port', `${HOST}:8443`, `${HOST}:8443`, true],
       ['another port', `${HOST}:8443`, `${HOST}:9999`, false],
@@ -449,6 +449,11 @@ describe('recordGitLabMrRead', () => {
       });
       expect(calls.length, label).toBe(reads ? 1 : 0);
       expect(gitlabEvents(api)[0]!.kind, label).toBe(reads ? 'gitlab.mr-observed' : 'gitlab.mr-read-failed');
+      if (reads) {
+        // The token goes to the link's own host and port, never to a normalised one.
+        expect(calls[0]!.url, label).toBe(`https://${requestHost}/api/v4/projects/acme%2Fplatform%2Fapp/merge_requests/7`);
+        expect(gitlabEvents(api)[0]!.payload, label).toMatchObject({ host: requestHost });
+      }
     }
   });
 

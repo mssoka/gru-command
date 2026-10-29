@@ -132,11 +132,12 @@ ends with the round's setup: a shutdown or supersession during the read cancels
 it, and the cancelled read is recorded as an `other` failure like any other.
 
 **The link must name the lane.** Before any request, the link's host and project
-must be the origin remote of the job's repository, compared case-insensitively as
-the verdict poster compares them: the host with its port (only the default `:443`
-is not a port, so an origin written with it matches the same link without it) and
-the project path. An ssh origin names no web port, so it does not match a link on
-a non-default port, exactly as the poster would refuse to deliver to it. A
+must be the origin remote of the job's repository, compared case-insensitively
+like the verdict poster compares them: the host with its port and the project path.
+The one difference is that the default `:443` is not a port, so an origin written
+with it also matches the same link without it. An ssh origin names no web port, so
+it does not match a link on a non-default port, just as the poster refuses to
+deliver to it. A
 minion-reported link to another project or host, or a lane with no resolvable
 origin, makes **no request** (no token goes anywhere) and records one
 `gitlab.mr-read-failed` with `error_kind` `other` whose `detail` says so; the
@@ -165,7 +166,7 @@ round. The event's `host` and `project` come from the response's `web_url` and
   or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`; or the
   read was refused before any request because the link does not name the lane's
   origin, or was cancelled with the round's setup).
-  `detail` is at most 300 characters; for `other`, which joins several causes, the frozen reason carries it (`; detail: …`).
+  `detail` is at most 300 characters. It stays in the event: the frozen reason is fixed text per kind, and for `other` (which joins several causes) it points at the event the record's `sourceSeq` names, and all of it fits the 200-character line of the published appendix.
 
 **Binding order.** Only the event this round's read recorded governs; earlier
 `gitlab.*` events are never used, and no `github.*` event is consulted. The first

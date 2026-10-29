@@ -79,7 +79,7 @@ const GITLAB_MR_READ_ERROR_MEANING: Readonly<Record<GitLabMrReadErrorKind, strin
   'not-found': 'GitLab answered 404',
   'rate-limit': 'GitLab answered 429',
   timeout: 'the request timed out',
-  other: 'the read failed, was refused before any request, or got a response that is not a usable merge request',
+  other: 'no usable merge request (the request failed, was refused before any request, or the response was unusable); the event at sourceSeq says which',
 };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -566,13 +566,14 @@ function renderGitLabMrEvidence(
   if (event.kind === GITLAB_MR_READ_FAILED_EVENT) {
     const kind = payload === null ? null : clean(payload['error_kind']);
     const known = GITLAB_MR_READ_ERROR_KINDS.find((candidate) => candidate === kind);
-    // `other` joins several causes; its recorded (already redacted, bounded)
-    // detail says which one. The other kinds say it themselves.
-    const detail = known === 'other' && payload !== null ? clean(payload['detail']) : null;
+    // The reason is fixed text per kind (the recorded detail is remote text: it
+    // stays in the ledger event, out of the prompt, and out of the bytes two
+    // rounds that read the same facts must share). Short enough that the
+    // published appendix line (200 characters) keeps all of it.
     return unavailableEvidence(
       known === undefined
         ? 'the recorded GitLab merge request read failure names no recognised error_kind'
-        : `the GitLab merge request read for this round failed (error_kind: ${known}): ${GITLAB_MR_READ_ERROR_MEANING[known]}${detail === null ? '' : `; detail: ${detail}`}`,
+        : `the GitLab merge request read failed (error_kind: ${known}): ${GITLAB_MR_READ_ERROR_MEANING[known]}`,
       from,
     );
   }

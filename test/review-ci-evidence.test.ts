@@ -502,7 +502,10 @@ describe('GitLab merge request CI evidence', () => {
       });
       expect(reasonLine(block), kind).toContain(`error_kind: ${kind}`);
       // `other` joins several causes, so its recorded detail rides in the reason; the rest say it themselves.
-      expect(reasonLine(block)?.includes('detail: whatever GitLab said'), kind).toBe(kind === 'other');
+      // Fixed text per kind: the recorded detail is remote text and stays in the ledger event.
+      expect(reasonLine(block), kind).not.toContain('whatever GitLab said');
+      // Short enough that the 200-character appendix line keeps the whole reason.
+      expect(record.reason!.length, kind).toBeLessThanOrEqual(200);
       expect(block, kind).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
       expect(block, kind).toContain(`source: ${GL_FAILED} (the host's read of this round;`);
       expect(block, kind).not.toContain('GREEN');
