@@ -11,6 +11,7 @@ import {
   AutoVerdictPoster,
   DefiniteNonDeliveryError,
   GhPrPoster,
+  canonicalGitLabPublicationBody,
   publicationProviderKindFor,
   GitLabMrPoster,
   WaveRunner,
@@ -6328,6 +6329,10 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     // Production assembly and the real GitLab poster share the exact bytes
     // persisted before the irreversible POST. The fake provider models the
     // observed one-terminal-LF normalization without any live GitLab call.
+    expect(canonicalGitLabPublicationBody('report\n')).toBe('report');
+    expect(canonicalGitLabPublicationBody('before\nreport\n')).toBe('before\nreport');
+    expect(canonicalGitLabPublicationBody('report\n\n')).toBe('report\n');
+    expect(canonicalGitLabPublicationBody('report')).toBe('report');
     {
       const repo = makeFixtureRepo('perkins-gl-publication-newline');
       repos.push(repo);
