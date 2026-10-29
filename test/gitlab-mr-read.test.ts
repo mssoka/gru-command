@@ -187,6 +187,7 @@ describe('readGitLabMr', () => {
       ['a string iid', JSON.stringify(mrBody({ iid: '7' }))],
       ['a web_url that is not an MR url', JSON.stringify(mrBody({ web_url: `https://${HOST}/${PROJECT}` }))],
       ['a web_url that is not a url', JSON.stringify(mrBody({ web_url: 'nonsense' }))],
+      ['a web_url naming another merge request than the iid', JSON.stringify(mrBody({ web_url: `https://${HOST}/${PROJECT}/-/merge_requests/9` }))],
       ['a head_pipeline without an id', JSON.stringify(mrBody({ head_pipeline: { sha: TARGET, status: 'success' } }))],
       ['a head_pipeline that is a string', JSON.stringify(mrBody({ head_pipeline: 'success' }))],
     ];
@@ -415,6 +416,20 @@ describe('recordGitLabMrRead', () => {
         detail: expect.stringContaining(said),
       });
     }
+  });
+
+  it('compares the origin by host name and project, not by port', async () => {
+    const api = ledger();
+    const { calls, fetch: fetchDouble } = double(() => json(mrBody({ web_url: `https://${HOST}:8443/${PROJECT}/-/merge_requests/7` })));
+    // A web UI on :8443 with an ssh origin (which carries no port) is one machine.
+    const recorded = await recordGitLabMrRead({
+      ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}:8443/${PROJECT}/-/merge_requests/7`,
+      deps: { fetch: fetchDouble, env: ENV }, origin: () => ORIGIN,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(`https://${HOST}:8443/api/v4/projects/acme%2Fplatform%2Fapp/merge_requests/7`);
+    expect(recorded?.event.kind).toBe('gitlab.mr-observed');
+    expect(recorded?.event.payload).toMatchObject({ host: `${HOST}:8443` });
   });
 
   it('reads when the link names the origin, the host and project compared case-insensitively', async () => {

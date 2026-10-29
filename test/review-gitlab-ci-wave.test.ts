@@ -509,12 +509,13 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
   it('A7: a round refused at a freeze guard makes no request and records no event', async () => {
     const world = await makeWorld();
     const jobId = await prepareJob(world, MR_URL);
-    // The lane turns terminal while the review worktree is being created: the
-    // freeze-time guard refuses, and that must happen before any read.
+    // The lane turns terminal while the review worktree is being created (merged:
+    // the ledger refuses to bin a lane with a pending round): the freeze-time
+    // guard refuses, and that must happen before any read.
     const original = world.port.createReviewWorktree.bind(world.port);
     const created = vi.spyOn(world.port, 'createReviewWorktree').mockImplementation(async (input) => {
       const lane = await original(input);
-      world.ledger.setJobStatus(jobId, 'binned');
+      world.ledger.setJobStatus(jobId, 'merged');
       return lane;
     });
     await expect(world.wave.beginRound({ jobId })).rejects.toThrow(/terminal lanes do not go back under review/u);

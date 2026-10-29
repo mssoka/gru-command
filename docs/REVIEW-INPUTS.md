@@ -130,9 +130,10 @@ reads again, an earlier round's read is never reused. The request ends with the
 round's setup: a shutdown or supersession during the read cancels it, and the
 cancelled read is recorded as an `other` failure like any other.
 
-**The link must name the lane.** Before any request, the link's host and project
-(compared case-insensitively, as the verdict poster compares them) must be the
-origin remote of the job's repository. A minion-reported link to another project
+**The link must name the lane.** Before any request, the link's host name and
+project (compared case-insensitively, as the verdict poster compares them; a port
+is ignored, so a web UI on another port is the same machine) must be the origin
+remote of the job's repository. A minion-reported link to another project
 or host, or a lane with no resolvable origin, makes **no request** (no token goes
 anywhere) and records one `gitlab.mr-read-failed` with `error_kind` `other` whose
 `detail` says so; the block reads `UNAVAILABLE`. The token never appears in
@@ -154,7 +155,8 @@ round. The event's `host` and `project` come from the response's `web_url` and
   (404), `rate-limit` (429), `timeout` (the request timed out) or `other` (any
   other status, including 5xx and a redirect, any other failure, or a body that
   is not valid JSON, is not a JSON object, lacks `web_url`, `iid`, `state` or
-  `sha`, has a `web_url` that is not a merge request URL or a non-integer `iid`,
+  `sha`, has a `web_url` that is not a merge request URL, a non-integer `iid` or an `iid`
+  that is not the one its `web_url` names,
   or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`; or the
   read was refused before any request because the link does not name the lane's
   origin, or was cancelled with the round's setup).

@@ -137,15 +137,16 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
   if (iid === null || state === null || headSha === null || webUrl === null) {
     return { problem: 'the merge request response lacks web_url, iid, state or sha' };
   }
-  let identity: { readonly host: string; readonly project: string } | null = null;
+  let identity: { readonly host: string; readonly project: string; readonly iid: number } | null = null;
   try {
     const url = new URL(webUrl);
     const path = parseGitLabMrPath(url.pathname);
-    if (path !== null) identity = { host: url.host, project: path.project };
+    if (path !== null) identity = { host: url.host, project: path.project, iid: Number(path.iid) };
   } catch {
     // Not a URL: reported below as an unusable web_url.
   }
   if (identity === null) return { problem: 'the merge request response web_url is not a merge request URL' };
+  if (identity.iid !== iid) return { problem: 'the merge request response web_url names another merge request than its iid' };
   const rawPipeline = parsed['head_pipeline'];
   let headPipeline: GitLabMrHeadPipeline | null = null;
   if (rawPipeline !== null && rawPipeline !== undefined) {
@@ -158,7 +159,7 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
     headPipeline = { id, sha, status, source: nonEmpty(rawPipeline['source']), web_url: nonEmpty(rawPipeline['web_url']) };
   }
   return {
-    observed: { ...identity, mr_iid: iid, state, head_sha: headSha, head_pipeline: headPipeline },
+    observed: { host: identity.host, project: identity.project, mr_iid: iid, state, head_sha: headSha, head_pipeline: headPipeline },
   };
 }
 
@@ -214,14 +215,20 @@ export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrR
 
 type Log = (level: 'info' | 'warn', msg: string, fields?: Record<string, unknown>) => void;
 
-/** Why a link does not name the lane's origin, or null when it does. Host and
- * project path compare case-insensitively, as the verdict poster compares. */
+/** The host name without a port, lower-cased: an ssh origin carries no port and
+ * a web UI on another port is still the same machine. */
+function hostName(host: string): string {
+  return host.toLowerCase().replace(/:\d+$/u, '');
+}
+
+/** Why a link does not name the lane's origin, or null when it does. Host name
+ * and project path compare case-insensitively, as the verdict poster compares. */
 function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): string | null {
   if (origin === null) {
     return `the merge request link names ${link.host}/${link.project}, but this lane has no resolvable origin remote to bind it to; no request was made`;
   }
   const originProject = `${origin.owner}/${origin.repo}`;
-  if (origin.host.toLowerCase() === link.host.toLowerCase() && originProject.toLowerCase() === link.project.toLowerCase()) return null;
+  if (hostName(origin.host) === hostName(link.host) && originProject.toLowerCase() === link.project.toLowerCase()) return null;
   return `the merge request link names ${link.host}/${link.project}, which is not this lane's origin (${origin.host}/${originProject}); no request was made`;
 }
 

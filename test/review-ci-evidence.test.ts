@@ -447,17 +447,28 @@ describe('GitLab merge request CI evidence', () => {
     expect(bindGitLab(glObserved({}, { sha: upper })).record.state).toBe('not-matched');
   });
 
-  it('A4: a merged, closed or locked merge request is UNAVAILABLE and the reason names the state', () => {
-    for (const state of ['merged', 'closed', 'locked']) {
-      const observed = glObserved({ state });
-      const { record, block } = bindGitLab(observed);
-      expect(record, state).toEqual({
-        state: 'unavailable', repo: null, pr: null, sha: null, ...provenance(observed), checks: [], failures: [],
-        reason: `the merge request is ${state}, not opened`,
-      });
-      expect(reasonLine(block), state).toBe(`reason: the merge request is ${state}, not opened`);
-      expect(block, state).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
-    }
+  /** A merge request in a state other than opened: UNAVAILABLE, the reason naming the state. */
+  function expectStateUnavailable(state: string): void {
+    const observed = glObserved({ state });
+    const { record, block } = bindGitLab(observed);
+    expect(record).toEqual({
+      state: 'unavailable', repo: null, pr: null, sha: null, ...provenance(observed), checks: [], failures: [],
+      reason: `the merge request is ${state}, not opened`,
+    });
+    expect(reasonLine(block)).toBe(`reason: the merge request is ${state}, not opened`);
+    expect(block).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
+  }
+
+  it('A4: a merged merge request is UNAVAILABLE and the reason names the state', () => {
+    expectStateUnavailable('merged');
+  });
+
+  it('A4: a closed merge request is UNAVAILABLE and the reason names the state', () => {
+    expectStateUnavailable('closed');
+  });
+
+  it('A4: a locked merge request is UNAVAILABLE and the reason names the state', () => {
+    expectStateUnavailable('locked');
   });
 
   it('A4: a merge request with no head pipeline is UNAVAILABLE', () => {
