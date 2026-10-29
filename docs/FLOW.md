@@ -390,8 +390,13 @@ and recorded on the job as
 delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
-the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). On GitHub the
+the GitLab probe, the poster and the freeze's CI-evidence read resolve their
+token identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). For a job whose
+PR link is a GitLab merge request, the round's frozen CI evidence is the merge
+request's own head pipeline, read once by the host just before the freeze
+(`gitlab.mr-observed` / `gitlab.mr-read-failed`, bound to the exact reviewed SHA;
+a merged-results pipeline never binds; see
+[REVIEW-INPUTS.md](./REVIEW-INPUTS.md#gitlab-merge-requests)). On GitHub the
 delivery carries the eligible native judgment as its WANTED event: a
 completed whole-change READY that owes no final whole-change pass is
 published as a formal approval (`APPROVE`), a confirmed blocker set as a

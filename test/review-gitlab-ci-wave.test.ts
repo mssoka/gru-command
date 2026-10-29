@@ -469,24 +469,24 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     await world.wave.shutdown();
   });
 
-  it('A10: a token echoed in a 500 body and in a rejection message reaches no event, log, block or manifest', async () => {
+  it('A10: a token echoed in a 500 body and in a rejection message reaches no event, log, block, manifest or thrown error', async () => {
     const world = await makeWorld();
     const echoes = [
       () => new Response(`internal error: PRIVATE-TOKEN ${TOKEN} was rejected`, { status: 500 }),
       () => { throw new TypeError(`connect failed while sending ${TOKEN}`); },
     ];
     const frozen: FrozenCase[] = [];
+    const thrown: string[] = [];
     for (const answer of echoes) {
       world.answer = answer;
-      frozen.push(await freezeJob(world, MR_URL));
+      try {
+        frozen.push(await freezeJob(world, MR_URL));
+      } catch (error) {
+        thrown.push(error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error));
+      }
     }
-    expect(world.calls).toHaveLength(2);
-    expect(frozen.map((entry) => entry.gitlabEvents[0]!.kind)).toEqual(['gitlab.mr-read-failed', 'gitlab.mr-read-failed']);
-    const detail = (entry: FrozenCase): string => String((entry.gitlabEvents[0]!.payload as { detail: unknown }).detail);
-    for (const entry of frozen) {
-      expect(detail(entry)).toContain('[redacted]');
-      expect(detail(entry).length).toBeLessThanOrEqual(300);
-    }
+    expect(thrown).toEqual([]);
+    expect(frozen).toHaveLength(2);
     const everything = [
       JSON.stringify(world.ledger.listEvents({ limit: 5000 })),
       world.logs.join('\n'),
@@ -496,7 +496,29 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
       ]),
     ].join('\n');
     expect(everything).not.toContain(TOKEN);
-    expect(world.logs.some((line) => line.includes('GitLab merge request read failed'))).toBe(true);
+    await world.wave.shutdown();
+  });
+
+  it('A10: the recorded detail of a failed read replaces the token with a placeholder and stays within 300 characters', async () => {
+    const world = await makeWorld();
+    const echoes = [
+      () => new Response(`internal error: PRIVATE-TOKEN ${TOKEN} was rejected ${'x'.repeat(2000)}`, { status: 500 }),
+      () => { throw new TypeError(`connect failed while sending ${TOKEN}`); },
+    ];
+    const frozen: FrozenCase[] = [];
+    for (const answer of echoes) {
+      world.answer = answer;
+      frozen.push(await freezeJob(world, MR_URL));
+    }
+    expect(world.calls).toHaveLength(2);
+    expect(frozen.map((entry) => entry.gitlabEvents[0]!.kind)).toEqual(['gitlab.mr-read-failed', 'gitlab.mr-read-failed']);
+    for (const entry of frozen) {
+      const detail = String((entry.gitlabEvents[0]!.payload as { detail: unknown }).detail);
+      expect(detail).toContain('[redacted]');
+      expect(detail).not.toContain(TOKEN);
+      expect(detail.length).toBeLessThanOrEqual(300);
+    }
+    expect(world.logs.some((line) => line.includes('GitLab merge request read failed') && line.includes('[redacted]'))).toBe(true);
     await world.wave.shutdown();
   });
 });

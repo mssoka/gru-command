@@ -346,7 +346,7 @@ const PINS: Record<string, number> = {
   'review-directory-entries.test.ts': 3,
   'review-evidence-intake.test.ts': 11,
   'review-inputs-handoff.test.ts': 10,
-  'review-gitlab-ci-wave.test.ts': 15,
+  'review-gitlab-ci-wave.test.ts': 16,
   'review-inputs-wave.test.ts': 1,
   'review-mcp-transport.test.ts': 18,
   'stage1-baseline-scope.test.ts': 11,

@@ -79,11 +79,14 @@ frozen receipt includes capture time so readers can tell.
 
 ## 2. Exact-target CI evidence
 
-No operator action is required. The GitHub poll records
+No operator action is required for a GitHub PR. The GitHub poll records
 `github.ci-green` / `github.ci-failed` / `github.branch-state` for tracked
 lanes; at freeze the host binds the latest observation to the exact
 repository/PR/SHA and renders it into the frozen spec context (beside, and
 distinct from, the local scheduler verification block) and into the manifest.
+A job whose PR link is a GitLab merge request has no such poll; its evidence is
+read by the host itself at the freeze (see [GitLab merge requests](#gitlab-merge-requests)
+below), and needs `GITLAB_TOKEN` (or `GL_TOKEN`) in the service environment.
 
 - GREEN/PENDING/FAILED render the recorded state with check names/URLs,
   observation time and source event (kind + seq). A host string that lands in
@@ -94,7 +97,10 @@ distinct from, the local scheduler verification block) and into the manifest.
   an explicit `UNAVAILABLE` / `NOT-MATCHED` limitation — never a PASS and
   never a fabricated failure. A job with no resolvable PR URL renders
   UNAVAILABLE: a receipt cannot be repository-bound, and an unverified
-  observation is never rendered as one.
+  observation is never rendered as one. A link that is a GitLab merge request
+  on a host the service does not send credentials to (see below) renders
+  UNAVAILABLE with the reason `PR link is a GitLab merge request on an
+  unsupported host`.
 - The latest recorded observation at the target SHA governs: a newer
   observation carrying no usable CI result (no check runs yet, malformed
   payload) degrades to an explicit UNAVAILABLE and never falls back to an
@@ -104,6 +110,76 @@ distinct from, the local scheduler verification block) and into the manifest.
   fit, the freeze is refused rather than shipping a spec with no CI
   limitation. The structured record stays in the manifest.
 - Frozen rounds stay historically stable; late results do not rewrite them.
+
+### GitLab merge requests
+
+A job whose PR link is `https://<host>/<group>[/<subgroup>…]/<project>/-/merge_requests/<iid>`
+on a host the service supports for GitLab (`gitlab.com`, or a host whose first
+label is `gitlab`; the same rule that decides where a GitLab token may go)
+binds the **head pipeline of that merge request**. Any other link, or none,
+makes no request and records no `gitlab.*` event.
+
+**One read per round.** After the freeze-time guards and immediately before the
+round's inputs are assembled, the host makes exactly one request, the same one
+the freeze head probe makes: `GET https://<host>/api/v4/projects/<url-encoded
+path>/merge_requests/<iid>` with `PRIVATE-TOKEN` from `GITLAB_TOKEN` (falling
+back to `GL_TOKEN`), a 30 s timeout, and no redirect following (the token never
+follows a redirect). There is no timer and no background poll: a second round
+reads again, an earlier round's read is never reused. The token never appears in
+a recorded event, a log line, the frozen block or the manifest: `detail` is
+credential-redacted and every occurrence of the token value is replaced with
+`[redacted]` first.
+
+**Recorded events.** Each read records exactly one job event, tagged with the
+round. The event's `host` and `project` come from the response's `web_url` and
+`mr_iid` from its `iid`, never from the request URL.
+
+- `gitlab.mr-observed`, for a parsed 2xx response:
+  `{ host, project, mr_iid, state, head_sha, head_pipeline: { id, sha, status,
+  source, web_url } | null, round_id }`. `head_sha` is the response's `sha`.
+- `gitlab.mr-read-failed`, otherwise:
+  `{ host, project, mr_iid, error_kind, detail, round_id }`, with `host`,
+  `project` and `mr_iid` from the request URL. `error_kind` is `token-missing`
+  (no token; no request is made), `auth` (401), `permission` (403), `not-found`
+  (404), `rate-limit` (429), `timeout` (the request timed out) or `other` (any
+  other status, including 5xx and a redirect, any other failure, or a body that
+  is not valid JSON or lacks `web_url`, `iid`, `state` or `sha`). `detail` is at
+  most 300 characters.
+
+**Binding order.** Only the event this round's read recorded governs; earlier
+`gitlab.*` events are never used, and no `github.*` event is consulted. The first
+rule that applies wins:
+
+1. `gitlab.mr-read-failed` → `UNAVAILABLE`; the reason names the `error_kind`.
+2. The response's `host`, `project` or `mr_iid` differs from the job's MR link
+   (hosts compare case-insensitively, project paths, subgroups included,
+   exactly) → `NOT-MATCHED`.
+3. `state` is not `opened` → `UNAVAILABLE`; the reason names the state.
+4. `head_pipeline` is null → `UNAVAILABLE` ("no head pipeline").
+5. `head_sha` differs from the frozen target SHA, or `head_pipeline.sha`
+   differs from `head_sha` → `NOT-MATCHED`.
+6. `head_pipeline.status`: `success` → `GREEN`; `failed`, `canceled`, `skipped`
+   → `FAILED`; `created`, `waiting_for_resource`, `preparing`, `pending`,
+   `running`, `scheduled`, `manual` → `PENDING — NOT PASS`; any other status →
+   `UNAVAILABLE`.
+
+The governing pipeline is GitLab's `head_pipeline`; its `source` is recorded and
+named, not gated.
+
+**Merged-results pipelines never bind.** A merged-results pipeline runs on a
+merge commit GitLab creates, so `head_pipeline.sha` is not the MR head and rule 5
+renders `NOT-MATCHED`; its reason says so. Only a pipeline that ran on the exact
+reviewed commit certifies it.
+
+**Frozen record.** The manifest record keeps the same keys as for GitHub.
+`repo` is `<host>/<project>`, `pr` is the MR iid, `sha` is the pipeline's sha,
+and `observedAt`, `sourceKind` and `sourceSeq` are the recording event's time,
+kind and seq. A bound record's check (or, for `FAILED`, failure, with
+`conclusion` equal to the pipeline status) is `pipeline #<id> (<source>)` with
+the pipeline URL. A `NOT-MATCHED` record carries the observed host/project,
+iid and head sha; an `UNAVAILABLE` record from a GitLab event carries only the
+event provenance and a reason. Local scheduled verification never satisfies this
+block, and no `github.*` event is ever synthesized for a merge request.
 
 ## 3. Approved canonical amendments
 
