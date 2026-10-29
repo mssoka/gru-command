@@ -866,7 +866,7 @@ describe('canceled-request closeout — the readback path (test 10)', () => {
 });
 
 describe('canceled-request closeout — the blocker fingerprint', () => {
-  it('is the sha256 of the sorted codes and details: order-independent and sensitive to both', () => {
+  it('5d. the blocker fingerprint is the sha256 of the sorted codes and details: order-independent and sensitive to both', () => {
     const live = { code: 'live_work', detail: 'in-flight admission(s): x' };
     const receipt = { code: 'terminal_receipt_present', detail: 'receipt at seq 9' };
     const expected = createHash('sha256').update(JSON.stringify([['live_work', 'in-flight admission(s): x'], ['terminal_receipt_present', 'receipt at seq 9']])).digest('hex');

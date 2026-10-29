@@ -100,7 +100,7 @@ const MUTATIONS = [
   { id: 'M29', test: 8, what: 'a pending re-brief marker is ignored by the eligibility rule', run: NEW, fails: ['8o'],
     edits: [{ file: API, find: 'if (live.length !== 1 || this.listPendingRebriefs({ jobId }).length > 0) return null;', replace: 'if (live.length !== 1) return null;' }] },
   { id: 'M30', test: 8, what: 'the 500-character reason limit is not enforced', run: NEW, fails: ['8n'],
-    edits: [{ file: EXEC, find: '(typeof rawReason !== \'string\' || Array.from(rawReason).length > CLOSEOUT_REASON_MAX_CHARS)', replace: "(typeof rawReason !== 'string')" }] },
+    edits: [{ file: EXEC, find: "typeof rawReason === 'string' && Array.from(rawReason).length > CLOSEOUT_REASON_MAX_CHARS", replace: 'false' }] },
   { id: 'M31', test: 8, what: 'S1 does not evaluate again inside its transaction', run: NEW, fails: ['8p'],
     edits: [{ file: API, find: 'const blockers = input.evaluate();\n      if (blockers.length > 0) return { kind: \'refused\' as const, blockers };', replace: '' }] },
   { id: 'M31b', test: 8, what: 'the executor evaluates nothing: no guard refuses a binning request', run: NEW, fails: ['8a', '8b', '8c', '8d', '8e', '8f', '8g', '8p'],
@@ -131,7 +131,7 @@ const MUTATIONS = [
     edits: [{ file: EXEC, find: "if (stale !== null) return { kind: 'superseded', intent: stale };", replace: '' }] },
   { id: 'M44', test: 5, what: 'a binned retry after another writer binned the job answers 409 instead of the plain 200', run: NEW, fails: ['7g'],
     edits: [{ file: EXEC, find: "if (resumed.kind === 'superseded' && ledger.getJob(jobId)?.status === 'binned') return null;", replace: '' }] },
-  { id: 'M45', test: 5, what: 'the blocker fingerprint depends on blocker order', run: NEW, fails: ['blocker fingerprint'],
+  { id: 'M45', test: 5, what: 'the blocker fingerprint depends on blocker order', run: NEW, fails: ['5d'],
     edits: [{ file: CLOSEOUTS, find: '.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));', replace: ';' }] },
   { id: 'M46', test: 3, what: 'the resume loop reads every pending row outside its per-intent guard', run: NEW, fails: ['3e'],
     edits: [{ file: EXEC, find: 'for (const closeoutId of this.deps.ledger.listActiveCloseoutIds()) {', replace: 'for (const closeoutId of this.deps.ledger.listActiveCloseoutIds().filter((id) => this.deps.ledger.getCloseout(id) !== null)) {' }] },
@@ -168,6 +168,20 @@ function runSpec(dir, spec, failsOnly) {
 }
 
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+
+// --check: every edit must match its file at HEAD exactly once; nothing is run.
+if (process.argv.includes('--check')) {
+  let stale = 0;
+  for (const mutation of MUTATIONS) {
+    for (const edit of mutation.edits) {
+      const text = execFileSync('git', ['show', `${head}:${edit.file}`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      const count = text.split(edit.find).length - 1;
+      if (count !== 1) { stale += 1; print(`${mutation.id}: ${edit.file} matches ${count} times`); }
+    }
+  }
+  print(`${MUTATIONS.length} mutations checked at ${head}: ${stale === 0 ? 'every edit matches exactly once' : `${stale} stale`}`);
+  process.exit(stale === 0 ? 0 : 1);
+}
 const dir = mkdtempSync(join(tmpdir(), 'gru-523-mutations.'));
 let exitCode = 0;
 const rows = [];
