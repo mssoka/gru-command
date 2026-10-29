@@ -14,7 +14,7 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * Characterization of issue #523 at the base commit (223ccbbb), run in a
- * scratch extract of that commit by the `canceled-request-closeout-before`
+ * scratch extract of that commit by the `closeout-523-before`
  * verify scope. It performs the MANUAL cleanup Gru had to stitch together —
  * `/retire` for the deferred request, then the status write `binned` — and
  * records what it leaves behind. The assertions encode the residue, so the

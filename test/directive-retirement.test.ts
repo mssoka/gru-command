@@ -3739,7 +3739,10 @@ describe('canceled-request closeout readback (#523)', () => {
     const after = (await readback('req-rb')).closeout;
     expect(after).toMatchObject({ path: 'binning', eligible: false, blockers: [],
       intent: { state: 'complete', generation: 1, requested_by: 'gru', reason: 'canceled', request_id: 'req-rb', job_id: 'job-rb' } });
-    expect(field<string>((await call(h.port, 'GET', '/api/silas/directives/req-rb', undefined, TOKEN)).json, 'state')).toBe('retired');
+    const retired = (await call(h.port, 'GET', '/api/silas/directives/req-rb', undefined, TOKEN)).json;
+    expect(field<string>(retired, 'state')).toBe('retired');
+    expect(field<string>(retired, 'retired_by')).toBe('canceled-request-closeout');
+    expect(field<string>(retired, 'retire_reason')).toContain('canceled');
   });
 
   it('the readback omits the closeout member when the service is not passed to createDispatchServer', async () => {

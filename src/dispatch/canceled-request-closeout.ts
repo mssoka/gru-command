@@ -143,7 +143,12 @@ export class CanceledRequestCloseout {
    * `terminalLiveWorkBlockers` lists the request itself while it is
    * `dispatching`, so it stays inside `setJobStatus` as the S3 race refusal. */
   evaluateCloseout(jobId: string): CloseoutEvaluation {
-    const request = this.deps.ledger.closeoutCandidate(jobId);
+    const { ledger } = this.deps;
+    // An open or stopped intent keeps its job on the closeout path: a binning
+    // request resumes it, and what refuses is the step it is waiting on.
+    const active = ledger.activeCloseoutForJob(jobId);
+    if (active !== null) return { path: 'closeout', request: ledger.getDirective(active.requestId), blockers: this.currentBlockers(active) };
+    const request = ledger.closeoutCandidate(jobId);
     if (request === null) return { path: 'binning', request: null, blockers: [] };
     return { path: 'closeout', request, blockers: this.retirementBlockers(request) };
   }
@@ -166,7 +171,7 @@ export class CanceledRequestCloseout {
     const row = ledger.getDirective(requestId);
     const intent = ledger.latestCloseoutForRequest(requestId);
     const evaluation = row === null ? null : this.evaluateCloseout(row.jobId);
-    // The eligibility rule names one request of the job; any other request reads as plain binning.
+    // The closeout path names one request of the job; any other request reads as plain binning.
     if (evaluation === null || evaluation.request?.requestId !== requestId) return { path: 'binning', eligible: false, blockers: [], intent };
     return { path: 'closeout', eligible: evaluation.blockers.length === 0, blockers: evaluation.blockers, intent };
   }
@@ -175,19 +180,20 @@ export class CanceledRequestCloseout {
    * `null` falls through to today's `ledger.setJobStatus`, unchanged. */
   requestBinning(jobId: string, body: Record<string, unknown>): CloseoutHttpResult | null {
     const { ledger } = this.deps;
-    // 1. Validate the body.
+    // 1. Validate the body: a reason is at most 500 characters, whatever the job.
     const rawReason = body['reason'];
-    if (rawReason !== undefined && rawReason !== null &&
-        (typeof rawReason !== 'string' || Array.from(rawReason).length > CLOSEOUT_REASON_MAX_CHARS)) {
-      return { status: 400, body: { error: 'invalid_reason', detail: `reason must be a string of at most ${CLOSEOUT_REASON_MAX_CHARS} characters` } };
-    }
+    const invalidReason: CloseoutHttpResult = { status: 400, body: { error: 'invalid_reason', detail: `reason must be a string of at most ${CLOSEOUT_REASON_MAX_CHARS} characters` } };
+    if (typeof rawReason === 'string' && Array.from(rawReason).length > CLOSEOUT_REASON_MAX_CHARS) return invalidReason;
     const reason = typeof rawReason === 'string' && rawReason !== '' ? rawReason : null;
     // 2. An open or stopped intent has the lifecycle.
     const active = ledger.activeCloseoutForJob(jobId);
     if (active !== null) {
       const resumed = this.resume(active);
       // Unchanged blockers: the recorded refusal stands, nothing is written.
-      return resumed === null ? stoppedBody(active) : this.respond(resumed);
+      if (resumed === null) return stoppedBody(active);
+      // The job reached `binned` by another writer: the binned retry stays the idempotent 200.
+      if (resumed.kind === 'superseded' && ledger.getJob(jobId)?.status === 'binned') return null;
+      return this.respond(resumed);
     }
     // 3. A completed closeout answers again with its original member.
     const job = ledger.getJob(jobId);
@@ -198,6 +204,8 @@ export class CanceledRequestCloseout {
     // 4. An eligible job takes the closeout; 5. anything else falls through.
     const evaluation = this.evaluateCloseout(jobId);
     if (evaluation.request === null) return null;
+    // The closeout stores the reason, so a malformed one is refused here and nowhere else.
+    if (rawReason !== undefined && rawReason !== null && typeof rawReason !== 'string') return invalidReason;
     if (evaluation.blockers.length > 0) return refusedBody(evaluation.blockers);
     // S1 evaluates once more inside its transaction: the same function.
     const begun = ledger.beginCloseout({ jobId, requestId: evaluation.request.requestId, requestedBy: closeoutRequester(body['by']), reason,
@@ -214,17 +222,18 @@ export class CanceledRequestCloseout {
   resumePending(): CloseoutResumeReport {
     const counts = { examined: 0, completed: 0, stopped: 0, superseded: 0, untouched: 0 };
     const failures: { closeoutId: string; error: string }[] = [];
-    for (const intent of this.deps.ledger.listActiveCloseouts()) {
+    for (const closeoutId of this.deps.ledger.listActiveCloseoutIds()) {
       counts.examined += 1;
       try {
+        const intent = this.deps.ledger.getCloseout(closeoutId) as CloseoutIntent;
         const outcome = this.resume(intent);
         if (outcome === null) counts.untouched += 1;
         else if (outcome.kind === 'complete') counts.completed += 1;
         else if (outcome.kind === 'stopped') counts.stopped += 1;
         else counts.superseded += 1;
       } catch (error) {
-        failures.push({ closeoutId: intent.closeoutId, error: String(error) });
-        this.deps.log?.('error', 'canceled-request closeout could not resume', { closeout: intent.closeoutId, request: intent.requestId, error: String(error) });
+        failures.push({ closeoutId, error: String(error) });
+        this.deps.log?.('error', 'canceled-request closeout could not resume', { closeout: closeoutId, error: String(error) });
       }
     }
     return { ...counts, failures };
@@ -233,7 +242,12 @@ export class CanceledRequestCloseout {
   /** Resume one active intent. A `stopped` intent whose blockers are
    * unchanged is left alone (`null`): no event, no card. */
   private resume(intent: CloseoutIntent): DriveOutcome | null {
-    if (intent.state === 'stopped' && closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;
+    if (intent.state === 'stopped') {
+      // Whatever still blocks it, an intent whose basis changed no longer describes the job.
+      const stale = this.deps.ledger.supersedeStaleCloseout(intent.closeoutId);
+      if (stale !== null) return { kind: 'superseded', intent: stale };
+      if (closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;
+    }
     return this.drive(intent);
   }
 

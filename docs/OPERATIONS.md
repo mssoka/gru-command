@@ -385,7 +385,8 @@ a durable intent, resuming after a crash or restart. Optional body fields:
 and `by` (`gru` is kept, anything else is stored `unattributed`; `owner` is
 never recorded). It adds `409 request_closeout_refused` /
 `request_closeout_stopped` / `request_closeout_superseded` and
-`400 invalid_reason`; every other job is unchanged
+`400 invalid_reason`; every other job is unchanged except that a `reason`
+longer than 500 characters is refused first, whatever the job
 ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523)).
 
 There is no unbin: a mistaken bin is corrected by recording the honest

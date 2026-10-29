@@ -135,9 +135,9 @@ completion, a merged PR, a passing review, or a stopped process.
 When the heist's only live request is a directive or re-brief request that
 was deferred before it reached its worker, the same binning request closes
 that request out completely: the service retires it, bins the job and
-resolves its recovery card, then resumes after a crash. Never call
+resolves its recovery card, then resumes after a crash. Do not run
 `/retire` by hand for it, and never write `by: "owner"`: send `by: "gru"`
-and, if useful, a `reason` of at most 500 characters. A `409
+and, if useful, a `reason` (up to 500 characters). A `409
 request_closeout_refused` or `request_closeout_stopped` names the guard
 that holds it (`blockers`): release that guard, then repeat the request; a
 `request_closeout_superseded` means the job changed since, so judge again. There is

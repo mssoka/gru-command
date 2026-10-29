@@ -170,9 +170,12 @@ export function hasActiveCloseout(db: DatabaseSync, requestId: string): boolean 
   return db.prepare("SELECT 1 FROM request_closeouts WHERE request_id = ? AND state IN ('open', 'stopped') LIMIT 1").get(requestId) !== undefined;
 }
 
-/** Every `open` or `stopped` intent, oldest first. */
-export function selectActiveCloseouts(db: DatabaseSync): readonly CloseoutIntent[] {
-  return (db.prepare("SELECT * FROM request_closeouts WHERE state IN ('open', 'stopped') ORDER BY rowid").all() as Row[]).map(closeoutFromRow);
+/** The id of every `open` or `stopped` intent, oldest first. Ids, not parsed
+ * rows: a resume loop reads each row inside its own guard, so one row that
+ * cannot be parsed never hides the others. */
+export function selectActiveCloseoutIds(db: DatabaseSync): readonly string[] {
+  return (db.prepare("SELECT closeout_id FROM request_closeouts WHERE state IN ('open', 'stopped') ORDER BY rowid").all() as Row[])
+    .map((row) => String(row['closeout_id']));
 }
 
 export function nextCloseoutGeneration(db: DatabaseSync, requestId: string): number {

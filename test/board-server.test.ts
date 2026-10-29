@@ -395,6 +395,8 @@ describe('board server — HTTP API', () => {
       expect(done.body).toMatchObject({ id: 'job-cancel', status: 'binned', closeout: { state: 'complete', generation: 1 } });
       expect(api.getDirective('req-cancel')).toMatchObject({ state: 'retired', retiredBy: 'canceled-request-closeout' });
       expect(api.findNotificationByKind('silas.directive-unreconciled.req-cancel', 'active')).toBeNull();
+      expect(api.findNotificationByKind('silas.directive-unreconciled.req-cancel', 'any')).toMatchObject({ resolvedBy: 'canceled-request-closeout', ackedAt: null });
+      expect(api.listJobEvents('job-cancel').filter((event) => (event.payload as { by?: unknown }).by === 'owner')).toEqual([]);
       // A repeat answers from the completed closeout and writes nothing.
       const before = api.latestEventSeq();
       const again = await postJson(port, '/api/jobs/job-cancel/status', 'board-test-token', { status: 'binned', by: 'gru' });

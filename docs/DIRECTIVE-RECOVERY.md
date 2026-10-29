@@ -355,15 +355,21 @@ then `resumePending()`) and every deterministic pass finish it; no timer was
 added. A guard that passed preflight but refuses later (a race) records the
 intent `stopped` with its `blockers` and `blocker_fingerprint`; a repeated
 request or `resumePending()` with an unchanged fingerprint writes nothing,
-a changed fingerprint resumes. `complete` answers a repeat with the original
-`closeout` member and no event; `superseded` lifts the fence, and a new
-binning request starts the request's next generation if it is still eligible.
+a changed fingerprint resumes. A `stopped` intent is also looked at again on
+every repeat and pass against the same revalidation predicates: when the facts
+it was made against changed, it is superseded even though the same guard still
+blocks it. `complete` answers a repeat with the original `closeout` member and
+no event; `superseded` lifts the fence, and a new binning request starts the
+request's next generation if it is still eligible. If another writer binned the
+job while the intent was open, the binned retry is the plain idempotent `200`.
 
 Responses of the closeout path (body `reason` ≤ 500 characters, optional
 `by`; `gru` is stored as `gru`, any other value as `unattributed`):
 
 - `200` — the job object plus `closeout: {state: "complete", id, generation}`.
-- `400 invalid_reason` — `reason` is not a string of at most 500 characters.
+- `400 invalid_reason` — `reason` is longer than 500 characters (checked first,
+  for any binned request) or, on the closeout path, not a string (`null` reads
+  as absent).
 - `409 request_closeout_refused` — `{error, blockers}`: a guard refused
   before S1 (each blocker `{code, detail}` keeps the guard's own code; no
   intent row, no event).
@@ -373,9 +379,11 @@ Responses of the closeout path (body `reason` ≤ 500 characters, optional
 
 `GET /api/silas/directives/<request>` carries
 `closeout: {path, eligible, blockers, intent}`: `path` is `closeout` when this
-request is the one the eligibility rule names and `binning` otherwise,
-`eligible` is true when the path is `closeout` and the same evaluation finds
-no blockers, and `intent` is the request's latest intent row or null. No
+request is the one the eligibility rule names, or one an `open`/`stopped`
+intent owes its end (after S2 the blockers are then the live work binning would
+meet), and `binning` otherwise; `eligible` is true when the path is `closeout`
+and the same evaluation finds no blockers, and `intent` is the request's latest
+intent row or null. No
 directive-recovery hold is released on the now-terminal job: a hold on a
 terminal job is already inert.
 

@@ -9,7 +9,7 @@
 //   node gru-output/gc-523-closeout/mutations.mjs [--only M01,M07]
 //
 // Exit 0 only when the unmutated baseline passes and every mutation is killed
-// by the tests it names. Run through the `canceled-request-closeout-mutations`
+// by the tests it names. Run through the `closeout-523-mutations`
 // verify scope (the lane's declared scheduler entry).
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -45,7 +45,7 @@ const MUTATIONS = [
   { id: 'M04', test: 3, what: 'S2 is re-run although the request is already retired', run: NEW, fails: ['3b'],
     edits: [{ file: EXEC, find: 'if (!guard.retired) {', replace: 'if (true) {' }] },
   { id: 'M05', test: 3, what: 'resumePending resumes nothing', run: NEW, fails: ['3a', '3b', '3d'],
-    edits: [{ file: EXEC, find: 'for (const intent of this.deps.ledger.listActiveCloseouts()) {', replace: 'for (const intent of [] as CloseoutIntent[]) {' }] },
+    edits: [{ file: EXEC, find: 'for (const closeoutId of this.deps.ledger.listActiveCloseoutIds()) {', replace: 'for (const closeoutId of [] as string[]) {' }] },
   { id: 'M06', test: 4, what: 'no redispatch fence (claimDirectiveDispatch and assertDirectiveAuthority)', run: NEW, fails: ['4a', '4b'],
     edits: [{ file: API, find: '    return this.transaction(() => {\n      this.assertNoPendingCloseout(requestId);\n      const identity = this.directiveTurnIdentity(requestId);', replace: '    return this.transaction(() => {\n      const identity = this.directiveTurnIdentity(requestId);' },
       { file: API, find: '    validateDirectiveIdentity(identity);\n    this.assertNoPendingCloseout(identity.requestId);', replace: '    validateDirectiveIdentity(identity);' }] },
@@ -61,10 +61,10 @@ const MUTATIONS = [
   { id: 'M11', test: 5, what: 'the S3 live-work refusal is not caught', run: NEW, fails: ['5b'],
     edits: [{ file: EXEC, find: 'if (!(error instanceof TerminalLiveWorkError)) throw error;', replace: 'throw error;' }] },
   { id: 'M12', test: 5, what: 'a stopped intent with an unchanged fingerprint is re-driven and re-recorded', run: NEW, fails: ['5a', '5b'],
-    edits: [{ file: EXEC, find: "if (intent.state === 'stopped' && closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;", replace: '' },
+    edits: [{ file: EXEC, find: "if (closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;", replace: '' },
       { file: API, find: "if (intent.state === 'stopped' && intent.blockerFingerprint === closeoutBlockerFingerprint(blockers)) return intent;", replace: '' }] },
   { id: 'M13', test: 5, what: 'a stopped intent never resumes, whatever changed', run: NEW, fails: ['5a', '5b', '5c'],
-    edits: [{ file: EXEC, find: "if (intent.state === 'stopped' && closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;", replace: "if (intent.state === 'stopped') return null;" }] },
+    edits: [{ file: EXEC, find: "if (closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;", replace: 'return null;' }] },
   { id: 'M14', test: 5, what: 'the blocker fingerprint ignores the blocker details', run: NEW, fails: ['5c'],
     edits: [{ file: CLOSEOUTS, find: 'blockers.map(({ code, detail }) => [code, detail] as const)', replace: "blockers.map(({ code }) => [code, ''] as const)" }] },
   { id: 'M15', test: 6, what: 'a completed closeout is not answered again', run: NEW, fails: ['6'],
@@ -112,7 +112,7 @@ const MUTATIONS = [
   { id: 'M34', test: 9, what: 'the retirement is attributed to the owner', run: NEW, fails: ['1a', '1b', '9a', '9d'],
     edits: [{ file: EXEC, find: 'reason: intent.reason === null ? base : `${base}: ${intent.reason}`,\n        by: CLOSEOUT_ACTOR,', replace: "reason: intent.reason === null ? base : `${base}: ${intent.reason}`,\n        by: 'owner'," }] },
   { id: 'M35', test: 10, what: 'the readback calls a blocked closeout eligible', run: NEW, fails: ['10', '10b'],
-    edits: [{ file: EXEC, find: "eligible: blockers.length === 0, blockers, intent };", replace: 'eligible: true, blockers, intent };' }] },
+    edits: [{ file: EXEC, find: "eligible: evaluation.blockers.length === 0, blockers: evaluation.blockers, intent };", replace: 'eligible: true, blockers: evaluation.blockers, intent };' }] },
   { id: 'M36', test: 11, what: 'boot recovery resumes before it reconsiders', run: NEW, fails: ['11a'],
     edits: [{ file: EXEC, find: '  deps.directiveProgress.reconsider();\n  return deps.closeout.resumePending();', replace: '  const report = deps.closeout.resumePending();\n  deps.directiveProgress.reconsider();\n  return report;' }] },
   { id: 'M37', test: 11, what: 'binningCloseoutRoute never reaches the closeout', run: NEW, fails: ['11b'],
@@ -123,6 +123,31 @@ const MUTATIONS = [
     edits: [{ file: 'src/board/server.ts', find: 'const closeout = options.binningCloseout?.(id, body) ?? null;', replace: 'const closeout = null;' }] },
   { id: 'M40', test: 12, what: 'the directive readback omits the closeout member', run: READBACK, fails: ['GET /api/silas/directives/{id} names the closeout path'],
     edits: [{ file: 'src/dispatch/server.ts', find: '...(options.closeout === undefined ? {} : { closeout: closeoutReadback(options.closeout, requestId) }),', replace: '' }] },
+  { id: 'M41', test: 8, what: 'a request that already carries a recovery decision is eligible', run: NEW, fails: ['8q', '10'],
+    edits: [{ file: API, find: ' || request.recoveryDecision !== null) return null;', replace: ') return null;' }] },
+  { id: 'M42', test: 7, what: 'P2: a change to the request itself is not revalidated before S2', run: NEW, fails: ['7e'],
+    edits: [{ file: API, find: "if (!pending && !retired) return { reason: 'request-state', retired };", replace: '' }] },
+  { id: 'M43', test: 5, what: 'a stopped intent whose basis changed is never superseded', run: NEW, fails: ['7f', '7g'],
+    edits: [{ file: EXEC, find: "if (stale !== null) return { kind: 'superseded', intent: stale };", replace: '' }] },
+  { id: 'M44', test: 5, what: 'a binned retry after another writer binned the job answers 409 instead of the plain 200', run: NEW, fails: ['7g'],
+    edits: [{ file: EXEC, find: "if (resumed.kind === 'superseded' && ledger.getJob(jobId)?.status === 'binned') return null;", replace: '' }] },
+  { id: 'M45', test: 5, what: 'the blocker fingerprint depends on blocker order', run: NEW, fails: ['blocker fingerprint'],
+    edits: [{ file: CLOSEOUTS, find: '.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));', replace: ';' }] },
+  { id: 'M46', test: 3, what: 'the resume loop reads every pending row outside its per-intent guard', run: NEW, fails: ['3e'],
+    edits: [{ file: EXEC, find: 'for (const closeoutId of this.deps.ledger.listActiveCloseoutIds()) {', replace: 'for (const closeoutId of this.deps.ledger.listActiveCloseoutIds().filter((id) => this.deps.ledger.getCloseout(id) !== null)) {' }] },
+  { id: 'M47', test: 10, what: 'the readback ignores an open or stopped intent (reads binning after S2)', run: NEW, fails: ['10d'],
+    edits: [{ file: EXEC, find: "if (active !== null) return { path: 'closeout', request: ledger.getDirective(active.requestId), blockers: this.currentBlockers(active) };", replace: '' }] },
+  { id: 'M48', test: 10, what: 'the readback calls every request of an eligible job the closeout path', run: NEW, fails: ['10c'],
+    edits: [{ file: EXEC, find: 'if (evaluation === null || evaluation.request?.requestId !== requestId)', replace: 'if (evaluation === null || evaluation.request === null)' }] },
+  { id: 'M49', test: 8, what: 'a non-string reason is accepted by the closeout path', run: NEW, fails: ['8n'],
+    edits: [{ file: EXEC, find: "if (rawReason !== undefined && rawReason !== null && typeof rawReason !== 'string') return invalidReason;", replace: '' }] },
+  { id: 'M50', test: 7, what: 'a supersession writes no silas.closeout-superseded event', run: NEW, fails: ['7a', '7b'],
+    edits: [{ file: API, find: "kind: 'silas.closeout-superseded'", replace: "kind: 'silas.closeout-supersededx'" }] },
+  { id: 'M51', test: 5, what: 'the stopped event does not carry the blocker fingerprint', run: NEW, fails: ['5a'],
+    edits: [{ file: API, find: 'blocker_fingerprint: stopped.blockerFingerprint, by: CLOSEOUT_ACTOR', replace: 'by: CLOSEOUT_ACTOR' }] },
+  { id: 'M52', test: 1, what: 'the closeout records a dispatch after completing', run: NEW, fails: ['1a', '1b'],
+    edits: [{ file: EXEC, find: "if (completed.kind === 'superseded') return { kind: 'superseded', intent: completed.intent };",
+      replace: "if (completed.kind === 'superseded') return { kind: 'superseded', intent: completed.intent };\n    ledger.appendCustomEvent({ kind: 'silas.directive-dispatch-started', jobId: completed.intent.jobId, payload: { request_id: completed.intent.requestId } });" }] },
 ];
 
 function escapeRegex(text) {

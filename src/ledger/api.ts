@@ -170,7 +170,7 @@ import {
   nextCloseoutGeneration,
   selectActiveCloseoutForJob,
   selectActiveCloseoutForRequest,
-  selectActiveCloseouts,
+  selectActiveCloseoutIds,
   selectCloseout,
   selectLatestCloseoutForJob,
   selectLatestCloseoutForRequest,
@@ -10559,9 +10559,9 @@ export class LedgerApi {
     return selectActiveCloseoutForJob(this.db, jobId);
   }
 
-  /** Every `open` or `stopped` intent, oldest first. */
-  listActiveCloseouts(): readonly CloseoutIntent[] {
-    return selectActiveCloseouts(this.db);
+  /** The id of every `open` or `stopped` intent, oldest first. */
+  listActiveCloseoutIds(): readonly string[] {
+    return selectActiveCloseoutIds(this.db);
   }
 
   /** True while an `open` or `stopped` intent owes this request its end. */
@@ -10693,6 +10693,19 @@ export class LedgerApi {
       const stale = this.closeoutStaleReason(intent, 'retire');
       if (stale.reason !== null) return { ok: false as const, intent: this.supersedeCloseout(intent, stale.reason) };
       return { ok: true as const, retired: stale.retired, intent };
+    });
+  }
+
+  /** A `stopped` intent is looked at again without taking a step: when the
+   * facts it was made against no longer hold (whatever still blocks it), it is
+   * superseded and its fence lifted. Returns the superseded intent, or null
+   * when the intent still stands. */
+  supersedeStaleCloseout(closeoutId: string): CloseoutIntent | null {
+    return this.transaction(() => {
+      const intent = this.activeCloseoutOrThrow(closeoutId);
+      const retired = this.getDirective(intent.requestId)?.state === 'retired';
+      const stale = this.closeoutStaleReason(intent, retired ? 'bin' : 'retire');
+      return stale.reason === null ? null : this.supersedeCloseout(intent, stale.reason);
     });
   }
 

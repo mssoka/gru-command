@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -54,6 +55,8 @@ interface Ctx {
   closeout: CanceledRequestCloseout;
   readonly jobId: string;
   readonly requestId: string;
+  /** The ledger's newest event once the fixture is built. */
+  baselineSeq: number;
   /** Reopen the ledger on the same database file (a service restart). */
   restart(): void;
 }
@@ -77,7 +80,7 @@ function boot(jobId: string, requestId: string): Ctx {
   const db = new LedgerDb(dir);
   const ledger = new LedgerApi(db.handle, { bus });
   const ctx: Ctx = {
-    dir, repo, bus, jobId, requestId, spawns: [], supervised: [], queued: [], hook: undefined,
+    dir, repo, bus, jobId, requestId, baselineSeq: 0, spawns: [], supervised: [], queued: [], hook: undefined,
     worktrees: new InMemoryWorktreePort(join(dir, 'wtroot'), ledger),
     db, ledger, notifications: new NotificationCenter({ ledger, bus }),
     closeout: undefined as unknown as CanceledRequestCloseout,
@@ -97,10 +100,7 @@ function boot(jobId: string, requestId: string): Ctx {
 /** The "deferred" fixture, in the briefing's order: job and lane; a re-brief
  * request claimed for dispatch and positively deferred before any native
  * effect; the recovery debt and its card; the job parked last (when asked). */
-async function deferred(opts: { park?: boolean; jobId?: string; requestId?: string } = {}): Promise<Ctx> {
-  const jobId = opts.jobId ?? 'job-closeout';
-  const requestId = opts.requestId ?? 'req-closeout';
-  const ctx = boot(jobId, requestId);
+async function seedDeferred(ctx: Ctx, jobId: string, requestId: string): Promise<void> {
   ctx.ledger.addJob({ id: jobId, repo: 'closeout-app', title: jobId, briefing: `briefing for ${jobId}` });
   ctx.ledger.setJobStatus(jobId, 'working');
   await ctx.worktrees.createJobWorktree({ repoPath: ctx.repo.path, jobId });
@@ -109,7 +109,15 @@ async function deferred(opts: { park?: boolean; jobId?: string; requestId?: stri
   const start = ctx.ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-started', requestId)!;
   ctx.ledger.recordDirectiveDispatchDeferral(ctx.ledger.directiveTurnIdentity(requestId), start.seq, 'a supervised producer held the lane');
   surfaceDirectiveRecovery({ ledger: ctx.ledger, notifications: ctx.notifications }, requestId, 'deferred before reaching its worker');
+}
+
+async function deferred(opts: { park?: boolean; jobId?: string; requestId?: string } = {}): Promise<Ctx> {
+  const jobId = opts.jobId ?? 'job-closeout';
+  const requestId = opts.requestId ?? 'req-closeout';
+  const ctx = boot(jobId, requestId);
+  await seedDeferred(ctx, jobId, requestId);
   if (opts.park === true) ctx.ledger.setJobStatus(jobId, 'parked');
+  ctx.baselineSeq = ctx.ledger.latestEventSeq();
   return ctx;
 }
 
@@ -143,6 +151,19 @@ function once(ctx: Ctx, step: CloseoutStep, action: () => void): void {
   ctx.hook = (current) => { if (current === step) { ctx.hook = undefined; action(); } };
 }
 
+/** The manual `/retire` of the deferred request, as Gru did before the closeout existed. */
+function retireByHand(ctx: Ctx): void {
+  const authority = ctx.ledger.directiveCurrentAuthority(ctx.jobId);
+  const obligation = ctx.ledger.recoveryObligation(ctx.jobId, 'directive', ctx.requestId);
+  const lane = ctx.worktrees.listWorktrees({ jobId: ctx.jobId })[0]!;
+  ctx.ledger.retireInterruptedDirective({ requestId: ctx.requestId, expectedJobId: ctx.jobId, expectedState: 'dispatching',
+    expectedPayloadHash: ctx.ledger.getDirective(ctx.requestId)!.payloadHash, expectedHead: lane.sha,
+    expectedGeneration: obligation?.generation ?? null, expectedPlanRevision: obligation?.planRevision ?? null,
+    expectedObligationState: obligation?.state ?? null, expectedAuthorityEpoch: authority.authorityEpoch,
+    expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
+    lane: { id: ctx.jobId, resolvedHead: lane.sha }, reason: 'retired by hand', by: 'silas-ops' });
+}
+
 /** The end state of a completed cancel (test 1), shared by the interrupt tests. */
 function expectCancelled(ctx: Ctx): void {
   expect(ctx.ledger.getDirective(ctx.requestId)).toMatchObject({ state: 'retired', retiredBy: CLOSEOUT_ACTOR });
@@ -155,6 +176,12 @@ function expectCancelled(ctx: Ctx): void {
   expect(JSON.stringify(items)).not.toContain(ctx.requestId);
   expect(ctx.spawns).toEqual([]);
   expect(ctx.ledger.listPendingDirectives({ jobId: ctx.jobId })).toHaveLength(1);
+  // "No spawn" at the persisted record: the closeout never claimed a dispatch, started a producer,
+  // admitted a turn or accepted a request after the fixture was built.
+  const dispatched = ctx.ledger.listJobEvents(ctx.jobId).filter((event) => event.seq > ctx.baselineSeq && [
+    'agent.spawned', 'silas.directive-intent', 'silas.directive-dispatch-started', 'silas.directive-producer-reserved',
+    'silas.directive-producer-started', 'silas.directive-sent', 'silas.rebrief'].includes(event.kind));
+  expect(dispatched.map((event) => event.kind)).toEqual([]);
 }
 
 /** Nothing the closeout wrote is attributed to the owner. */
@@ -262,6 +289,7 @@ describe('canceled-request closeout — interrupt and retry (test 3)', () => {
     expect(resumed.status).toBe(200);
     expectCancelled(ctx);
     expect(jobEvents(ctx, 'silas.closeout-intent')).toHaveLength(1);
+    expectNoOwnerAttribution(ctx);
   });
 
   it('3d. a failing intent is reported and logged, never thrown, and stays open for the next pass', async () => {
@@ -276,6 +304,25 @@ describe('canceled-request closeout — interrupt and retry (test 3)', () => {
     expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)?.state).toBe('open');
     ctx.hook = undefined;
     expect(ctx.closeout.resumePending()).toMatchObject({ completed: 1, failures: [] });
+  });
+});
+
+describe('canceled-request closeout — a poisoned row (test 3)', () => {
+  it('3e. one intent whose row cannot be read is reported and never hides or blocks the others', async () => {
+    const ctx = await deferred();
+    await seedDeferred(ctx, 'job-second', 'req-second');
+    ctx.hook = (step) => { if (step === 'intent') throw new Error('crash after S1'); };
+    expect(() => request(ctx)).toThrow('crash after S1');
+    expect(() => ctx.closeout.requestBinning('job-second', { status: 'binned', by: 'gru' })).toThrow('crash after S1');
+    ctx.hook = undefined;
+    // Damage the first intent's stored blockers: building the list of pending intents must not throw.
+    ctx.db.handle.prepare("UPDATE request_closeouts SET blockers = 'not json' WHERE job_id = ?").run(ctx.jobId);
+    const report = ctx.closeout.resumePending();
+    expect(report).toMatchObject({ examined: 2, completed: 1 });
+    expect(report.failures).toHaveLength(1);
+    expect(report.failures[0]?.error).toMatch(/JSON/u);
+    expect(ctx.ledger.getJob('job-second')?.status).toBe('binned');
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
   });
 });
 
@@ -342,6 +389,8 @@ describe('canceled-request closeout — stopped and retry (test 5)', () => {
     expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
     expect(jobEvents(ctx, 'silas.closeout-stopped')).toHaveLength(1);
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-stopped')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId, generation: 1,
+      blockers: intent.blockers, blocker_fingerprint: intent.blockerFingerprint, by: CLOSEOUT_ACTOR });
     const seq = ctx.ledger.latestEventSeq(); const before = cards(ctx);
     expect(mustRequest(ctx)).toEqual(stopped);
     expect(ctx.closeout.resumePending()).toMatchObject({ examined: 1, untouched: 1, completed: 0 });
@@ -397,6 +446,7 @@ describe('canceled-request closeout — stopped and retry (test 5)', () => {
     releases.pop()!();
     expect(mustRequest(ctx).status).toBe(200);
     expectCancelled(ctx);
+    expectNoOwnerAttribution(ctx);
   });
 });
 
@@ -412,6 +462,7 @@ describe('canceled-request closeout — complete repeat (test 6)', () => {
     expect(ctx.ledger.latestEventSeq()).toBe(seq);
     expect(jobEvents(ctx, 'silas.closeout-intent')).toHaveLength(1);
     expect(jobEvents(ctx, 'silas.closeout-complete')).toHaveLength(1);
+    expectNoOwnerAttribution(ctx);
   });
 });
 
@@ -423,6 +474,8 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
     expect(superseded.status).toBe(409);
     expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'job-status' });
     expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'job-status', generation: 1 });
+    expect(jobEvents(ctx, 'silas.closeout-superseded').map(payloadOf)).toEqual([{ closeout_id: ctx.ledger.latestCloseoutForJob(ctx.jobId)!.closeoutId,
+      request_id: ctx.requestId, generation: 1, superseded_reason: 'job-status', by: CLOSEOUT_ACTOR }]);
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('delivered');
     expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
     // The fence is lifted: a claim is no longer refused by the closeout.
@@ -436,6 +489,7 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
     expect(next.status).toBe(200);
     expect(bodyOf(next).closeout).toMatchObject({ state: 'complete', generation: 2 });
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('binned');
+    expectNoOwnerAttribution(ctx);
   });
 
   it('7b. new work accepted after S2 supersedes the intent (later-work) and leaves the new request untouched', async () => {
@@ -448,6 +502,8 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
     const superseded = mustRequest(ctx);
     expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'later-work' });
     expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'later-work' });
+    expect(jobEvents(ctx, 'silas.closeout-superseded')).toHaveLength(1);
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-superseded')[0]!)).toMatchObject({ request_id: ctx.requestId, superseded_reason: 'later-work', by: CLOSEOUT_ACTOR });
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
     expect(fresh).not.toBeNull();
     expect(ctx.ledger.getDirective('req-fresh')).toEqual(fresh);
@@ -468,20 +524,54 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
 
   it('7d. a request retired by hand after S1 satisfies S2 (the manual retire path stays valid)', async () => {
     const ctx = await deferred();
-    once(ctx, 'intent', () => {
-      const authority = ctx.ledger.directiveCurrentAuthority(ctx.jobId);
-      const obligation = ctx.ledger.recoveryObligation(ctx.jobId, 'directive', ctx.requestId);
-      ctx.ledger.retireInterruptedDirective({ requestId: ctx.requestId, expectedJobId: ctx.jobId, expectedState: 'dispatching',
-        expectedPayloadHash: ctx.ledger.getDirective(ctx.requestId)!.payloadHash, expectedHead: ctx.worktrees.listWorktrees({ jobId: ctx.jobId })[0]!.sha,
-        expectedGeneration: obligation?.generation ?? null, expectedPlanRevision: obligation?.planRevision ?? null,
-        expectedObligationState: obligation?.state ?? null, expectedAuthorityEpoch: authority.authorityEpoch,
-        expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
-        lane: { id: ctx.jobId, resolvedHead: ctx.worktrees.listWorktrees({ jobId: ctx.jobId })[0]!.sha }, reason: 'retired by hand', by: 'silas-ops' });
-    });
+    once(ctx, 'intent', () => retireByHand(ctx));
     expect(mustRequest(ctx).status).toBe(200);
     expect(ctx.ledger.getDirective(ctx.requestId)).toMatchObject({ state: 'retired', retiredBy: 'silas-ops' });
     expect(jobEvents(ctx, 'silas.directive-retired')).toHaveLength(1);
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('binned');
+    // The hand retirement keeps its own attribution; the closeout's writes are still never the owner's.
+    expectNoOwnerAttribution(ctx);
+  });
+});
+
+describe('canceled-request closeout — a stale intent, further cases (test 7)', () => {
+  it('7e. a change to the request itself after S1 supersedes the intent (request-state) and lifts the fence', async () => {
+    const ctx = await deferred();
+    once(ctx, 'intent', () => { ctx.ledger.failDirective({ requestId: ctx.requestId, reason: 'refused before any prompt' }); });
+    const superseded = mustRequest(ctx);
+    expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'request-state' });
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'request-state' });
+    expect(ctx.ledger.hasPendingCloseout(ctx.requestId)).toBe(false);
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('failed');
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
+  });
+
+  it('7f. a stopped intent whose basis changed is superseded although the same guard still blocks it', async () => {
+    const ctx = await deferred();
+    let release = (): void => {};
+    once(ctx, 'intent', () => { release = ctx.ledger.beginJobAdmission(ctx.jobId, 'late admission'); });
+    expect(bodyOf(mustRequest(ctx))).toMatchObject({ error: 'request_closeout_stopped' });
+    cleanups.push(() => release());
+    ctx.ledger.setJobStatus(ctx.jobId, 'delivered');
+    // The admission still holds the lane, so the blockers are unchanged; the job status is not.
+    const superseded = mustRequest(ctx);
+    expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'job-status' });
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'job-status' });
+    expect(ctx.ledger.hasPendingCloseout(ctx.requestId)).toBe(false);
+    expect(ctx.closeout.resumePending()).toMatchObject({ examined: 0 });
+  });
+
+  it('7g. a job binned by another writer while its intent is stopped answers the binned retry with the plain 200', async () => {
+    const ctx = await deferred();
+    let release = (): void => {};
+    once(ctx, 'retire', () => { release = ctx.ledger.beginJobAdmission(ctx.jobId, 'late admission'); });
+    expect(bodyOf(mustRequest(ctx))).toMatchObject({ error: 'request_closeout_stopped' });
+    release();
+    // The request is retired and nothing else lives: the plain status write bins the job.
+    expect(ctx.ledger.setJobStatus(ctx.jobId, 'binned').status).toBe('binned');
+    expect(request(ctx)).toBeNull();
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'job-status' });
+    expect(ctx.ledger.setJobStatus(ctx.jobId, 'binned').status).toBe('binned');
   });
 });
 
@@ -535,6 +625,8 @@ describe('canceled-request closeout — refusal and fall-through (test 8)', () =
     const ctx = boot('job-plain', 'req-none');
     ctx.ledger.addJob({ id: 'job-plain', repo: 'closeout-app', title: 'plain', briefing: 'b' });
     expect(request(ctx)).toBeNull();
+    // A reason the closeout would never store does not change today's response.
+    expect(request(ctx, 'gru', { reason: 42 })).toBeNull();
     expect(ctx.ledger.setJobStatus('job-plain', 'binned').status).toBe('binned');
     expect(ctx.ledger.latestCloseoutForJob('job-plain')).toBeNull();
   });
@@ -590,6 +682,25 @@ describe('canceled-request closeout — refusal and fall-through (test 8)', () =
     expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
     expect(() => ctx.ledger.setJobStatus(ctx.jobId, 'binned')).toThrow(/pending re-brief marker/);
     expect(ctx.ledger.latestEventSeq()).toBe(seq);
+  });
+
+  it('8q. a deferred request that already carries a recovery decision falls through', async () => {
+    const ctx = await deferred();
+    ctx.db.handle.prepare('UPDATE pending_directives SET recovery_decision = ? WHERE request_id = ?')
+      .run(JSON.stringify({ fingerprint: 'decided', successorId: null, eventSeq: 1 }), ctx.requestId);
+    expect(ctx.ledger.getDirective(ctx.requestId)?.recoveryDecision).not.toBeNull();
+    const seq = ctx.ledger.latestEventSeq();
+    expect(request(ctx)).toBeNull();
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
+    expect(() => ctx.ledger.setJobStatus(ctx.jobId, 'binned')).toThrow(/live directive request/);
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+  });
+
+  it('8r. a null reason is read as absent', async () => {
+    const ctx = await deferred();
+    expect(mustRequest(ctx, 'gru', { reason: null }).status).toBe(200);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)?.reason).toBeNull();
+    expect(ctx.ledger.getDirective(ctx.requestId)?.retireReason).not.toContain('null');
   });
 
   it('8p. S1 evaluates once more inside its transaction: a guard that appears after the pre-check still refuses with no intent row', async () => {
@@ -694,6 +805,21 @@ describe('canceled-request closeout — shared eligibility (test 10)', () => {
     await compare('receipt', (ctx) => { ctx.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: ctx.jobId, payload: { request_id: ctx.requestId, sha: ctx.repo.head() } }); }, 'refused');
     await compare('legacy', (ctx) => { markHistoricalDirectiveFixture(ctx.ledger, ctx.requestId); }, 'fall-through');
     await compare('terminal', (ctx) => { markLegacyTerminalJobFixture(ctx.ledger, ctx.jobId, 'binned'); }, 'fall-through');
+    await compare('turn', (ctx) => {
+      ctx.ledger.registerAgent({ id: 'minion-open', role: 'minion', jobId: ctx.jobId, sessionFile: join(ctx.dir, 'open.jsonl') });
+      ctx.ledger.setAgentState('minion-open', 'streaming');
+    }, 'refused');
+    await compare('round', (ctx) => { ctx.ledger.addRound({ jobId: ctx.jobId }); }, 'refused');
+    await compare('verification', (ctx) => { ctx.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: ctx.jobId, payload: { run_id: 'run-open' } }); }, 'refused');
+    await compare('marker', (ctx) => {
+      ctx.db.handle.prepare(`INSERT INTO pending_rebriefs (id, job_id, kind, payload, payload_hash, baseline_seq, requested_at, updated_at)
+        VALUES ('legacy-marker', ?, 'silas.rebrief', '{"note":"fold","briefing":"b"}', 'legacy-hash', 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(ctx.jobId);
+    }, 'fall-through');
+    await compare('decided', (ctx) => {
+      ctx.db.handle.prepare('UPDATE pending_directives SET recovery_decision = ? WHERE request_id = ?')
+        .run(JSON.stringify({ fingerprint: 'decided', successorId: null, eventSeq: 1 }), ctx.requestId);
+    }, 'fall-through');
+    await compare('unclaimed', (ctx) => { ctx.db.handle.prepare('UPDATE pending_directives SET dispatch_started_at = NULL WHERE request_id = ?').run(ctx.requestId); }, 'fall-through');
   });
 
   it('10b. a stopped intent reads back as the closeout path with its blockers', async () => {
@@ -707,6 +833,49 @@ describe('canceled-request closeout — shared eligibility (test 10)', () => {
     expect(view.blockers).toEqual(view.intent?.blockers);
     release();
     expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
+  });
+});
+
+describe('canceled-request closeout — the readback path (test 10)', () => {
+  it('10c. only the request the closeout path names reads back as closeout; an earlier request of the job reads as binning', async () => {
+    const ctx = await deferred();
+    retireByHand(ctx);
+    ctx.ledger.beginRebriefIntent({ jobId: ctx.jobId, note: 'second try', holder: 'silas-ops', requestId: 'req-second' });
+    expect(ctx.ledger.claimDirectiveDispatch('req-second')).toBe(true);
+    const start = ctx.ledger.latestJobEventByRequestId(ctx.jobId, 'silas.directive-dispatch-started', 'req-second')!;
+    ctx.ledger.recordDirectiveDispatchDeferral(ctx.ledger.directiveTurnIdentity('req-second'), start.seq, 'deferred again');
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false, blockers: [] });
+    expect(ctx.closeout.describe('req-second')).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
+  });
+
+  it('10d. a request an open or stopped intent owes its end reads back as the closeout path after S2 too, with the S3 blockers', async () => {
+    const ctx = await deferred();
+    let release = (): void => {};
+    once(ctx, 'retire', () => { release = ctx.ledger.beginJobAdmission(ctx.jobId, 'late admission'); });
+    const stopped = mustRequest(ctx);
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('retired');
+    const view = ctx.closeout.describe(ctx.requestId);
+    expect(view).toMatchObject({ path: 'closeout', eligible: false });
+    expect(view.blockers).toEqual(blockersOf(stopped));
+    expect(view.intent).toMatchObject({ state: 'stopped' });
+    release();
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
+    expect(mustRequest(ctx).status).toBe(200);
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
+  });
+});
+
+describe('canceled-request closeout — the blocker fingerprint', () => {
+  it('is the sha256 of the sorted codes and details: order-independent and sensitive to both', () => {
+    const live = { code: 'live_work', detail: 'in-flight admission(s): x' };
+    const receipt = { code: 'terminal_receipt_present', detail: 'receipt at seq 9' };
+    const expected = createHash('sha256').update(JSON.stringify([['live_work', 'in-flight admission(s): x'], ['terminal_receipt_present', 'receipt at seq 9']])).digest('hex');
+    expect(closeoutBlockerFingerprint([live, receipt])).toBe(expected);
+    expect(closeoutBlockerFingerprint([receipt, live])).toBe(expected);
+    expect(closeoutBlockerFingerprint([live])).not.toBe(expected);
+    expect(closeoutBlockerFingerprint([{ ...live, detail: 'other' }])).not.toBe(closeoutBlockerFingerprint([live]));
+    expect(closeoutBlockerFingerprint([{ ...live, code: 'other' }])).not.toBe(closeoutBlockerFingerprint([live]));
+    expect(closeoutBlockerFingerprint([])).toBe(createHash('sha256').update('[]').digest('hex'));
   });
 });
 
@@ -724,6 +893,7 @@ describe('canceled-request closeout — resume drivers (test 11)', () => {
     expect(order).toEqual(['reconsider:open', 'resume']);
     expect(report).toMatchObject({ examined: 1, completed: 1, failures: [] });
     expectCancelled(ctx);
+    expectNoOwnerAttribution(ctx);
   });
 
   it('11b. binningCloseoutRoute answers null until the closeout exists, and its result after', async () => {
@@ -737,5 +907,6 @@ describe('canceled-request closeout — resume drivers (test 11)', () => {
     expect(result?.status).toBe(200);
     expect(bodyOf(result).closeout).toMatchObject({ state: 'complete' });
     expectCancelled(ctx);
+    expectNoOwnerAttribution(ctx);
   });
 });
