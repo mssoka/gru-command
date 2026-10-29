@@ -146,8 +146,10 @@ round. The event's `host` and `project` come from the response's `web_url` and
   (no token; no request is made), `auth` (401), `permission` (403), `not-found`
   (404), `rate-limit` (429), `timeout` (the request timed out) or `other` (any
   other status, including 5xx and a redirect, any other failure, or a body that
-  is not valid JSON or lacks `web_url`, `iid`, `state` or `sha`). `detail` is at
-  most 300 characters.
+  is not valid JSON, is not a JSON object, lacks `web_url`, `iid`, `state` or
+  `sha`, has a `web_url` that is not a merge request URL or a non-integer `iid`,
+  or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`).
+  `detail` is at most 300 characters.
 
 **Binding order.** Only the event this round's read recorded governs; earlier
 `gitlab.*` events are never used, and no `github.*` event is consulted. The first

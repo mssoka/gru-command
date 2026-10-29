@@ -1,7 +1,8 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { PROBE_TIMEOUT_MS, defaultPrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 import { readGitLabMr, recordGitLabMrRead } from '../src/dispatch/perkins-review/gitlab-mr-read.js';
 import { parseGitLabMrLink, parseGitLabMrPath } from '../src/dispatch/review-path.js';
 import { EventBus } from '../src/events/bus.js';
@@ -241,6 +242,72 @@ describe('readGitLabMr', () => {
     expect(detail).not.toContain(SENTINEL);
     expect(detail).not.toContain('hunter2hunter2');
     expect(detail).toContain('[REDACTED]');
+  });
+
+  it('bounds the request with the head probe timeout, and a real expiry of that signal is the timeout kind', async () => {
+    const expired = AbortSignal.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => expired);
+    try {
+      const { calls, fetch: fetchDouble } = double(({ init }) => {
+        if (init?.signal?.aborted === true) throw init.signal.reason;
+        return json(mrBody());
+      });
+      const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV });
+      expect(timeoutSpy).toHaveBeenCalledWith(PROBE_TIMEOUT_MS);
+      expect(PROBE_TIMEOUT_MS).toBe(30_000);
+      expect(calls).toHaveLength(1);
+      expect(outcome).toMatchObject({ ok: false, failure: { error_kind: 'timeout' } });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('cancels the request with the caller\'s signal', async () => {
+    const controller = new AbortController();
+    const { fetch: fetchDouble } = double(({ init }) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+      controller.abort();
+    }));
+    const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV, signal: controller.signal });
+    expect(outcome).toMatchObject({ ok: false, failure: { error_kind: 'other' } });
+  });
+
+  it('makes the same request the production head probe makes for the same link', async () => {
+    const saved = { GITLAB_TOKEN: process.env['GITLAB_TOKEN'], GL_TOKEN: process.env['GL_TOKEN'] };
+    process.env['GITLAB_TOKEN'] = 'tok_probe_plain_7c1d';
+    delete process.env['GL_TOKEN'];
+    const probeCalls: Call[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      probeCalls.push({ url: String(input), init });
+      return json({ source_branch: 'feature/review', sha: TARGET });
+    }) as typeof fetch);
+    try {
+      const head = await defaultPrHeadProbe({ prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`, repoPath: '', branchRef: '' });
+      expect(head).toEqual({ headRefName: 'feature/review', headSha: TARGET });
+      const readerCalls = double(() => json(mrBody()));
+      await readGitLabMr(REQUEST, { fetch: readerCalls.fetch, env: { GITLAB_TOKEN: 'tok_probe_plain_7c1d' } });
+      expect(probeCalls).toHaveLength(1);
+      expect(readerCalls.calls).toHaveLength(1);
+      expect(probeCalls[0]!.url).toBe(URL_FOR_REQUEST);
+      expect(readerCalls.calls[0]!.url).toBe(probeCalls[0]!.url);
+      expect(readerCalls.calls[0]!.init?.headers).toEqual(probeCalls[0]!.init?.headers);
+      expect(probeCalls[0]!.init?.headers).toEqual({ 'PRIVATE-TOKEN': 'tok_probe_plain_7c1d' });
+    } finally {
+      fetchSpy.mockRestore();
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it('replaces both spellings of a padded token that no credential pattern recognises', async () => {
+    const plain = 'tok_Plain9f3b1c7e5a2d4086';
+    const padded = `  ${plain}  `;
+    const { fetch: fetchDouble } = double(() => new Response(`one [${padded}] two [${plain}] three`, { status: 500 }));
+    const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: { GITLAB_TOKEN: padded } });
+    const detail = outcome.ok ? '' : outcome.failure.detail;
+    expect(detail).toBe('GitLab answered HTTP 500: one [[redacted]] two [[redacted]] three');
   });
 
   it('puts no token in a thrown error either', async () => {

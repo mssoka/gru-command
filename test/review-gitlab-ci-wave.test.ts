@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WaveRunner, type FallbackGateOutcome, type WaveOutcome } from '../src/dispatch/perkins.js';
 import { compatibleReviewIdentity, freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
@@ -487,6 +487,25 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     expect(compatibleReviewIdentity(reread, prior.directory)).toBe(true);
     const changed = freeze('changed', 'failed', 90, '2026-10-29T11:00:00.000Z');
     expect(compatibleReviewIdentity(changed, prior.directory)).toBe(false);
+    await world.wave.shutdown();
+  });
+
+  it('A7: a round refused at a freeze guard makes no request and records no event', async () => {
+    const world = await makeWorld();
+    const jobId = await prepareJob(world, MR_URL);
+    // The lane turns terminal while the review worktree is being created: the
+    // freeze-time guard refuses, and that must happen before any read.
+    const original = world.port.createReviewWorktree.bind(world.port);
+    const created = vi.spyOn(world.port, 'createReviewWorktree').mockImplementation(async (input) => {
+      const lane = await original(input);
+      world.ledger.setJobStatus(jobId, 'binned');
+      return lane;
+    });
+    await expect(world.wave.beginRound({ jobId })).rejects.toThrow(/terminal lanes do not go back under review/u);
+    expect(created).toHaveBeenCalledTimes(1);
+    expect(world.calls).toHaveLength(0);
+    expect(world.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind.startsWith('gitlab.'))).toEqual([]);
+    expect(world.ledger.latestJobEvent(jobId, 'round.review-inputs-frozen')).toBeNull();
     await world.wave.shutdown();
   });
 
