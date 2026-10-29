@@ -253,9 +253,19 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     [`node cli.js --token ${ARGV_SECRET}`, `node cli.js --token ${REDACTION_PLACEHOLDER}`],
     [`curl -u deploy:${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
     [`curl -u deploy:${ARGV_SECRET}`, `curl -u deploy:${REDACTION_PLACEHOLDER}`],
-    // A user that looks like an address is still a user; only a value after
-    // `-u` that is a URL (below) is not a password.
+    // A user that looks like an address is still a user; a `//` tail after
+    // the colon (a scheme URL) is masked like any other value, so no
+    // credential spelling is left whole.
     [`curl -u user@example.com:${ARGV_SECRET} https://host/x`, `curl -u user@example.com:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy://${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u "deploy://${ARGV_SECRET}" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    // curl accepts an empty user; the part after the colon is the credential.
+    [`curl -u :${ARGV_SECRET} https://host/x`, `curl -u :${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u ":${ARGV_SECRET}" https://host/x`, `curl -u ":${REDACTION_PLACEHOLDER}" https://host/x`],
+    // A whole-quoted value may hold the other quote character in its password.
+    [`curl -u "deploy:it's-${ARGV_SECRET}" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    [`curl -u 'deploy:say"hi-${ARGV_SECRET}' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl -u deploy:"it's-${ARGV_SECRET}" https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
     ['docker run -u postgres:postgres image', `docker run -u postgres:${REDACTION_PLACEHOLDER} image`],
@@ -298,10 +308,6 @@ it('keeps argv near misses unchanged: a flag with no credential value, a short, 
     'docker exec -u alice bash',
     'git push -u origin main',
     'git push -u origin HEAD:refs/heads/main',
-    'git push -u https://github.com/org/repo.git',
-    'git push -u https://github.com/org/other.git main',
-    'git push -u ssh://github.com/org/repo.git',
-    'git push -u "https://github.com/org/repo.git"',
     'cli --token abc12',
     'cli --token ******',
     'cli --tokenize abcdefgh',
@@ -312,10 +318,6 @@ it('keeps argv near misses unchanged: a flag with no credential value, a short, 
     'curl -H Authorization: tokens abcdefghij',
     'cli -u:abcdefghij',
   ]) expect(redactCredentials(kept), kept).toBe(kept);
-  // Two distinct non-credential arguments stay distinct: the recorded-command
-  // identity the acknowledged kill compares must not collapse them (#534).
-  expect(redactCredentials('git push -u https://github.com/org/repo.git'))
-    .not.toBe(redactCredentials('git push -u https://github.com/org/other.git'));
 });
 
 it('redacts a command line once: a redacted argv redacts to itself', () => {

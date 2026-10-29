@@ -35,11 +35,11 @@ const ARGV_VALUE = `(?!-)${KEYWORD_VALUE}`;
  * (a uid:gid pair such as `165536:165536` is no credential), bare or a
  * quoted shell word (`-u deploy:'…'`), whose quotes are part of the value
  * a `ps` line shows. A bare one may start with `-`: only the user is a
- * flag's neighbour. A value that is not a `user:password` pair — a URL after
- * a non-credential `-u` (`git push -u https://host/path`) — is left alone by
- * the `(?!\/\/)` guard: masking the host/path there would collapse distinct
- * commands to one recorded identity. A `user@host:path` or `user:group`
- * value is still masked, since it is indistinguishable from a password. */
+ * flag's neighbour. The user may be empty (`-u :password`); the value after
+ * the colon is masked however it looks, so a `scheme://` tail is masked
+ * too — the mask is also the recorded-command identity the acknowledged
+ * kill compares, and masking no credential there would be worse than
+ * collapsing two non-credential `-u` arguments. */
 const PASSWORD_VALUE = '(?:"(?=[^"]*[A-Za-z])[^"]{6,}"|\'(?=[^\']*[A-Za-z])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z])[^\\s`\'"]{6,})';
 
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
@@ -136,9 +136,17 @@ const REDACTIONS: readonly Redaction[] = [
   // closing quote, so the password's spaces are inside the mask.
   replacing(new RegExp(`(\\bAuthorization\\s*:\\s*token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
   replacing(new RegExp(`(?<![A-Za-z0-9-])(--token\\s+)${ARGV_VALUE}`, 'gu'), keepPrefix),
-  replacing(/(?<![A-Za-z0-9-])(-u\s+(["'])[^"':]{1,64}:(?!\/\/))(?=[^"']*[A-Za-z])[^"']{6,}\2/gu,
+  // A whole-quoted value runs to its own closing quote, so a password that
+  // holds the other quote character (`-u "deploy:it's-secret"`) still masks
+  // whole; the two delimiter-specific passes keep the quotes as `ps` shows
+  // them. The user may be empty (`-u ":secret"`).
+  replacing(/(?<![A-Za-z0-9-])(-u\s+"[^":]{0,64}:)(?=[^"]*[A-Za-z])[^"]{6,}"/gu,
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
-  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-][^\\s:'"\`]*["']?:(?!\\/\\/))${PASSWORD_VALUE}`, 'gu'), keepPrefix),
+  replacing(/(?<![A-Za-z0-9-])(-u\s+'[^':]{0,64}:)(?=['^']*[A-Za-z])[^']{6,}'/gu,
+    (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
+  // A bare user (an empty one too: `-u :secret`) with a bare or quoted
+  // password. The lookbehind keeps `cli -u:value` and `--tokenize` alone.
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-]?[^\\s:'"\`]*["']?:)${PASSWORD_VALUE}`, 'gu'), keepPrefix),
   redactNpmrcAuth,
   // A key, then an optional closing quote (JSON's `"password": "…"`), then
   // `:` or `=`. One whose identifier starts right after a `/` is part of a

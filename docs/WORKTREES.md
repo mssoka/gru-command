@@ -225,14 +225,17 @@ whoever writes it: `redactCredentials` runs inside the ledger write, so a
 pause, a reap and the verification scheduler's `registry` rows all record
 the masked line, and every process record that leaves GC — the release's
 paused result, the `worktree.paused` payload, the `onSweepPaused`
-processes and details — carries it. The raw `ps` line stays in memory for
+processes and details, and the refusal error's processes — carries it.
+The raw `ps` line stays in memory for
 the checks that need it (tree matching, token naming, `ps -E`
 provenance). An acknowledged pid is compared against its recorded row
 masked, so the answer to a recorded pause is still honored; a row written
 before the masking that still holds a credential never matches, so its
-process is asked about again and the fresh row replaces it. A row whose
-process exits without being paused again keeps its recorded text: there is
-no backfill of existing rows.
+process is asked about again and the fresh row replaces it. A registry row
+written before the masking is closed by its terminal readback (the stored
+text is masked before the comparison, and the reconcile audit carries the
+masked text). A row whose process exits without being paused again keeps
+its recorded text: there is no backfill of existing rows.
 
 Each row also carries the lane's **token** (`lane_token`, #486): random per
 lane incarnation, minted when the row is registered (lanes not yet swept

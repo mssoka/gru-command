@@ -1754,11 +1754,14 @@ export class LedgerApi {
           .get(identity.pid, input.jobId, input.runId);
         if (conflicting !== undefined) continue;
         for (const row of this.listWorktreeProcesses(input.worktreeId)) {
-          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== redactCredentials(identity.command) || !absent(row.pid) || !absent(-row.pid)) continue;
+          // Compare the stored text masked: a row written before #534 still holds
+          // the raw line, and the mask is idempotent for rows written since. The
+          // audit carries the masked text, never a legacy row's credential.
+          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || redactCredentials(row.command) !== redactCredentials(identity.command) || !absent(row.pid) || !absent(-row.pid)) continue;
           this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
           this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
             request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
-            pid: row.pid, command: row.command, evidence: 'original-pid-and-process-group-absent',
+            pid: row.pid, command: redactCredentials(row.command), evidence: 'original-pid-and-process-group-absent',
           } });
         }
       }
