@@ -152,8 +152,10 @@ only in the form it is written in, linked on the chain:
   growth, a torn warm line included, still refuses by name. Warming follows
   the SDK's default and the user's own Pi settings (`cacheWarming` in the
   agent directory's `settings.json`): GC does not override the mode and
-  never writes those settings. A warm is a paid provider request that the
-  directive fence does not see and the yield report does not count.
+  never writes those settings. Isolated review sessions run on in-memory
+  settings that never read that file, so they take the SDK default whatever
+  the user has set. A warm is a paid provider request that the directive
+  fence does not see and the yield report does not count.
 
 Two more 1.x differences are refused by name rather than walked: a Pi
 directive carries text only (1.x re-encodes prompt images, so the receipt

@@ -2475,6 +2475,11 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     const started = Date.now();
     expect(rendersAs([...repeated.slice(1), 'other'].join('\n\n'), repeated)).toBe(false);
     expect(rendersAs(repeated.join('\n\n'), repeated)).toBe(true);
+    // More sections than any prompt has: refused, never a stack overflow or a long search.
+    const thousands = Array.from({ length: 5000 }, () => 'section');
+    expect(rendersAs(thousands.join('\n\n'), thousands)).toBe(false);
+    const distinct = Array.from({ length: 3000 }, (_, index) => `section ${index}`);
+    expect(rendersAs([...distinct.slice(1), 'other'].join('\n\n'), distinct)).toBe(false);
     // Sections that contain one another: each pair is also a section of its own,
     // so every pair could be matched whole or in halves, and only the last section
     // fails. Every combination was once a state (1.3 s at 18 pairs, over 25 s at 30).

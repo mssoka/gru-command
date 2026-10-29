@@ -63,6 +63,10 @@ type SdkTool = AgentSession['agent']['state']['tools'][number];
  * prompt Pi renders has a handful of sections and matches in about one choice
  * per section; only a transcript built to overlap its own sections comes near. */
 const RENDERS_AS_CHOICES = 20_000;
+/** The most parts `rendersAs` considers: more sections than any prompt Pi
+ * renders is a transcript someone else wrote, and the search recurses once per
+ * part. */
+const RENDERS_AS_PARTS = 256;
 
 /** Whether `text` is the prompt that `parts` render as, in some order. Pi 1.x
  * renders a transcript's sections in the order they were first written and
@@ -73,6 +77,7 @@ const RENDERS_AS_CHOICES = 20_000;
  * again, and a search past its budget refuses. */
 export function rendersAs(text: string, parts: readonly string[]): boolean {
   if (parts.length === 0) return text === '';
+  if (parts.length > RENDERS_AS_PARTS) return false;
   if (parts.reduce((length, part) => length + part.length, 2 * (parts.length - 1)) !== text.length) return false;
   const left = new Map<string, number>();
   for (const part of parts) left.set(part, (left.get(part) ?? 0) + 1);
@@ -1060,7 +1065,7 @@ export class PiRuntime implements AgentRuntime {
         throw error;
       }
       this.activeFiles.add(sessionFile);
-      const directiveExecutorOrigins = new Map<SdkTool['execute'], SdkTool['execute']>();
+      const directiveExecutorOrigins = new WeakMap<SdkTool['execute'], SdkTool['execute']>();
       const executableIds = new WeakMap<object, number>();
       let nextExecutableId = 0;
       const executableId = (execute: object): number => {
@@ -1290,7 +1295,7 @@ export class PiAgentHandle implements AgentHandle {
     agentId?: string,
     private readonly directiveAuthorityManifest?: () => string,
     private readonly directiveCompletionHead?: () => string,
-    directiveExecutorOrigins = new Map<SdkTool['execute'], SdkTool['execute']>(),
+    directiveExecutorOrigins = new WeakMap<SdkTool['execute'], SdkTool['execute']>(),
   ) {
     this.role = role;
     // The SDK-minted session identity, retained separately from the

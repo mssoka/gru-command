@@ -274,6 +274,20 @@ describe('pi 1.x context edits around a retried reply (#521)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
   });
 
+  it('a length reply that holds a tool call is not an omission target: the edit linked on it is refused by the checkpoint and the flush', () => {
+    const { file } = scene(['system-1']);
+    const cutOff = { role: 'assistant', stopReason: 'length', content: [call] };
+    message(file, 'truncated', 'receipt', cutOff);
+    contextEdit(file, 'omit-truncated', 'truncated');
+    message(file, 'answer', 'omit-truncated', answer);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+    const second = scene(['system-1']);
+    message(second.file, 'truncated', 'receipt', cutOff);
+    contextEdit(second.file, 'omit-truncated', 'truncated');
+    message(second.file, 'invocation', 'omit-truncated', invocation);
+    expect(() => flushDirectiveToolIntent(second.file, invocation, call, identity)).toThrow(DirectiveCheckpointError);
+  });
+
   it('a compaction that skips the omitting edit is not linked on the failed reply: refused', () => {
     const { file } = scene(['system-1']);
     message(file, 'retry-error', 'receipt', { ...failed, errorMessage: 'prompt is too long: 150000 tokens > 100000 maximum' });
