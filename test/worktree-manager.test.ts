@@ -2600,7 +2600,6 @@ describe('issue #243 F-H1 automatic release proofs', () => {
   });
 });
 
-
 /**
  * #534: a worktree process's command line reaches the ledger, an event, a
  * response and a card with its credentials masked, while the raw line stays

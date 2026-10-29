@@ -249,7 +249,8 @@ describe('POST /api/verify', () => {
     const h = await boot({ manifest: `[verify]\nfull = "node verify.mjs pass --token ${secret}"\n` });
     try {
       const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
-      h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      // The port may be ledger-backed (the row exists) or a test double (it does not).
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
       const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
       const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
       // What the server recorded at the run's spawn and settlement.
