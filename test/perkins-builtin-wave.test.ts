@@ -6324,7 +6324,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     };
   }
 
-  it('delivers on head equality with a verified note receipt — the recorded base is refreshed, never a refusal', async () => {
+  it('does not record a reconciled delivery failure when GitLab removes one terminal LF from new publication', async () => {
     // Production assembly and the real GitLab poster share the exact bytes
     // persisted before the irreversible POST. The fake provider models the
     // observed one-terminal-LF normalization without any live GitLab call.
@@ -6402,33 +6402,6 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       ]);
     }
 
-    // Historical artifacts are immutable: a normalized match keeps an old
-    // LF-terminated attempt unresolved, not absent and not eligible to repost.
-    {
-      const old = fixture();
-      try {
-        const calls: Array<{ readonly url: string; readonly method?: string }> = [];
-        const poster = new GitLabMrPoster({
-          token: 'glpat-token',
-          fetchImpl: async (url, init) => {
-            calls.push({ url, ...(init?.method !== undefined ? { method: init.method } : {}) });
-            if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
-            if (url.includes('/notes?')) return { ok: true, status: 200, text: async () => JSON.stringify([
-              { id: 713, body: 'legacy artifact', author: { username: 'gru-bot' } },
-            ]) };
-            return { ok: true, status: 200, text: async () => JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) };
-          },
-        });
-        await expect(poster.reconcile!({
-          prUrl: mrUrl, host: 'gitlab.example.test', repoPath: old.repoPath, body: 'legacy artifact\n',
-          targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
-        })).rejects.toThrow(/historical match is NOT delivery evidence|stays unresolved/u);
-        expect(calls.some((call) => call.method === 'POST')).toBe(false);
-      } finally {
-        old.cleanup();
-      }
-    }
-
     const { repoPath, cleanup } = fixture();
     try {
       const calls: Array<{ url: string; init?: unknown }> = [];
@@ -6468,6 +6441,31 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       });
       await expect(echoed.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/receipt body does not match/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('does not record a reconciled delivery from a legacy LF-terminated attempt beside its normalized GitLab note', async () => {
+    const { repoPath, cleanup } = fixture();
+    try {
+      const calls: Array<{ readonly url: string; readonly method?: string }> = [];
+      const poster = new GitLabMrPoster({
+        token: 'glpat-token',
+        fetchImpl: async (url, init) => {
+          calls.push({ url, ...(init?.method !== undefined ? { method: init.method } : {}) });
+          if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
+          if (url.includes('/notes?')) return { ok: true, status: 200, text: async () => JSON.stringify([
+            { id: 713, body: 'legacy artifact', author: { username: 'gru-bot' } },
+          ]) };
+          return { ok: true, status: 200, text: async () => JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) };
+        },
+      });
+      await expect(poster.reconcile!({
+        prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'legacy artifact\n',
+        targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
+      })).rejects.toThrow(/historical match is NOT delivery evidence|stays unresolved/u);
+      expect(calls.some((call) => call.method === 'POST')).toBe(false);
     } finally {
       cleanup();
     }
