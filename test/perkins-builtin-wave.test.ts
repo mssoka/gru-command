@@ -6386,7 +6386,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       expect(outcome.verdict).toBe('approved');
       expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
       expect(outcome.posted).toBe(true);
-      expect(outcome.round.status).toBe('completed');
+      expect(outcome.round.status).toBe('verdict-posted');
       const events = ledger.listEvents({ limit: 500 }).filter((event) => event.roundId === outcome.round.id);
       const posted = events.find((event) => event.kind === 'round.posted');
       const attempt = events.find((event) => event.kind === 'round.publication-attempt');
