@@ -238,8 +238,7 @@ describe('directive recovery card attention (#523)', () => {
       woke.push(woke.length);
       if (injection !== null) awareness.noteWakeOutcome(true, undefined, injection);
     });
-    rig.api.resolveNotificationById(card.id, 'gru');
-    rig.notifications.post({ kind: card.kind, routing: card.routing, severity: card.severity, title: card.title, detail: card.detail });
+    // Attaching the sink wakes for the open card (the backlog), through the same admission path as a live row.
     expect(woke).toHaveLength(1);
     expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
   });
@@ -276,7 +275,7 @@ describe('directive recovery card attention (#523)', () => {
     await pass();
     await pass();
     expect(rowsOf(rig, 'req-a6').map((row) => row.id).sort()).toEqual([legacy.id, fresh.id].sort());
-    expect(createdEvents(rig, 'req-a6')).toHaveLength(1);
+    expect(createdEvents(rig, 'req-a6')).toHaveLength(2);
   });
 });
 
