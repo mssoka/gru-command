@@ -244,6 +244,30 @@ describe('POST /api/verify', () => {
     await h.close();
   });
 
+  it('records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-readback';
+    const h = await boot({ manifest: `[verify]\nfull = "node verify.mjs pass --token ${secret}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      // What the server recorded at the run's spawn and settlement.
+      const recorded = h.ledger.listWorktreeProcesses(lane.id);
+      expect(recorded.length).toBeGreaterThan(0);
+      for (const row of recorded) { expect(row.command).not.toContain(secret); expect(row.command).toContain('[REDACTED]'); }
+      // The run's process is gone; its row, live again, is closed by the readback of the original receipts.
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; command: string; cwd: string };
+      h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
+      expect(h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid)).toMatchObject({ state: 'live' });
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command: facts.command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid)).toMatchObject({ state: 'killed' });
+      const audit = h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled');
+      expect(audit?.payload).toMatchObject({ pid: facts.pid, request_id: requestId });
+      expect(String((audit?.payload as { command: string }).command)).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
   it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     expect(manifest).not.toBeNull();

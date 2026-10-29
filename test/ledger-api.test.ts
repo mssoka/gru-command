@@ -2564,3 +2564,29 @@ describe('GH-305 additive mailbox metadata authority', () => {
   });
 
 });
+
+it('redacts argv credentials in the verify registry write', () => {
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const dir = tmpDir();
+  const db = new LedgerDb(dir);
+  const api = new LedgerApi(db.handle);
+  try {
+    api.addJob({ id: 'registry-write', repo: 'r', title: 'j' });
+    api.registerWorktree({ id: 'registry-write', kind: 'job', repoPath: '/tmp/registry-repo', repoName: 'r', path: '/tmp/registry-write', branch: 'gru/registry-write', sha: 'a'.repeat(40), jobId: 'registry-write' });
+    const command = `/bin/sh -c curl -H 'Authorization: Bearer ${secret}' --token ${secret} https://user:${secret}@host/x`;
+    // What the verification server records at spawn (evidence 'registry'), and settles after.
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'live', processes: [{ pid: 4242, command, evidence: 'registry' }] });
+    const stored = api.listWorktreeProcesses('registry-write').find((proc) => proc.pid === 4242);
+    expect(stored).toMatchObject({ evidence: 'registry', state: 'live' });
+    expect(stored?.command).not.toContain(secret);
+    expect(stored?.command).toContain('[REDACTED]');
+    expect(stored?.command).toContain('/bin/sh -c curl -H');
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'killed', processes: [{ pid: 4242, command, evidence: 'registry' }] });
+    // The table itself, and what the writes put on the event stream, hold no credential.
+    expect(JSON.stringify(db.handle.prepare('SELECT * FROM worktree_processes').all())).not.toContain(secret);
+    expect(JSON.stringify(api.listEvents({ limit: 100 }))).not.toContain(secret);
+    // Recording a masked line again changes nothing.
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'killed', processes: [{ pid: 4242, command: stored!.command, evidence: 'registry' }] });
+    expect(api.listWorktreeProcesses('registry-write').find((proc) => proc.pid === 4242)?.command).toBe(stored?.command);
+  } finally { db.close(); }
+});

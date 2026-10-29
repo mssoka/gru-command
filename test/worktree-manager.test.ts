@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { commandReferencesTree, psEnumerator, WorktreeManager, type PausedProcess, type TreeProcess, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
+import { commandReferencesTree, LaneLiveProcessError, processTableAsync, psEnumerator, WorktreeManager, type PausedProcess, type TreeProcess, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
+import { REDACTION_PLACEHOLDER } from '../src/redaction.js';
 import { laneProvenanceFromLedger } from '../src/worktrees/lane-provenance.js';
 import { loadConfig, type RuntimeId } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
@@ -37,8 +38,11 @@ interface Harness {
   manager: WorktreeManager;
   ledger: LedgerApi;
   escalations: { title: string; detail: string }[];
-  /** #486: each pause's id and what it said about each process. */
-  pauses: { pauseId: string; details: readonly PausedProcess[] }[];
+  /** #486: each pause's id and what it said about each process; #534: the
+   * processes the callback was handed beside them. */
+  pauses: { pauseId: string; details: readonly PausedProcess[]; processes: readonly TreeProcess[] }[];
+  /** The ledger database, for rows a test seeds below the ledger API. */
+  ledgerDb: LedgerDb;
   swept: string[];
   baseFallbacks: BaseFallbackNotice[];
   logs: { level: string; msg: string; fields: Record<string, unknown> }[];
@@ -70,7 +74,7 @@ function makeHarness(useDefaultEnumerator = false, extra: Partial<WorktreeManage
         title: `paused: ${worktree.id}`,
         detail: processes.map((p) => p.pid).join(','),
       });
-      pauses.push({ pauseId, details });
+      pauses.push({ pauseId, details, processes });
     },
     onSwept: ({ worktree }) => {
       swept.push(worktree.id);
@@ -84,6 +88,7 @@ function makeHarness(useDefaultEnumerator = false, extra: Partial<WorktreeManage
     repos,
     manager,
     ledger,
+    ledgerDb,
     escalations,
     pauses,
     swept,
@@ -2592,5 +2597,208 @@ describe('issue #243 F-H1 automatic release proofs', () => {
     expect(result.status).toBe('swept');
     // Lossless since #427: the operator's sweep keeps the edit on a ref.
     expect(result.status === 'swept' ? result.snapshot?.files : null).toBe(1);
+  });
+});
+
+
+/**
+ * #534: a worktree process's command line reaches the ledger, an event, a
+ * response and a card with its credentials masked, while the raw line stays
+ * in memory for the checks that need it. The children are real: a long-lived
+ * node whose cwd is in the tree and whose argv, after `--`, carries every
+ * credential form the sweep's `ps` listing shows.
+ */
+const ARGV_SENTINEL = 'Kq7ZmW3xP9tR2vLd8Nc4';
+const ARGV_CREDENTIALS: readonly string[] = [
+  '-H', `Authorization: Bearer ${ARGV_SENTINEL}`,
+  '-H', `PRIVATE-TOKEN: ${ARGV_SENTINEL}`,
+  `--token=${ARGV_SENTINEL}`,
+  '--token', ARGV_SENTINEL,
+  '-u', `user:${ARGV_SENTINEL}`,
+  '-H', `Authorization: token ${ARGV_SENTINEL}`,
+  `https://user:${ARGV_SENTINEL}@host/x`,
+];
+const argvChildren: ChildProcess[] = [];
+afterEach(() => {
+  for (const child of argvChildren.splice(0)) {
+    try { child.kill('SIGKILL'); } catch { /* reaped by the release */ }
+  }
+});
+
+/** A long-lived child with `args` after `--`, and none of the lane variables
+ * a suite run inside a GC lane inherited. */
+function argvChild(cwd: string | undefined, args: readonly string[]): ChildProcess {
+  const env = { ...process.env };
+  delete env['GRU_LANE_TOKEN'];
+  delete env['GRU_LANE_JOB'];
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', '--', ...args], {
+    ...(cwd !== undefined ? { cwd } : {}),
+    stdio: 'ignore',
+    env,
+  });
+  argvChildren.push(child);
+  return child;
+}
+
+async function listedBy(path: string, pid: number): Promise<TreeProcess> {
+  let found: TreeProcess | undefined;
+  await vi.waitFor(() => {
+    found = psEnumerator(path).find((proc) => proc.pid === pid);
+    expect(found).toBeDefined();
+  }, { timeout: 5_000 });
+  return found!;
+}
+
+function expectMasked(where: string, text: string | undefined): void {
+  expect(text, where).toBeDefined();
+  expect(text, where).not.toContain(ARGV_SENTINEL);
+  expect(text, where).toContain(REDACTION_PLACEHOLDER);
+}
+
+it('redacts argv credentials in every recorded and returned process command', async () => {
+  const h = harness(true);
+  const repo = h.make();
+  ledgerJob(h, 'job-argv', repo);
+  const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv' });
+  const child = argvChild(row.path, ARGV_CREDENTIALS);
+  const pid = child.pid!;
+  // The listing is raw: every form carries the sentinel in memory.
+  expect((await listedBy(row.path, pid)).command).toContain(ARGV_SENTINEL);
+
+  const paused = await h.manager.release({ worktreeId: 'job-argv' });
+  expect(paused.status).toBe('paused');
+  expect(() => process.kill(pid, 0)).not.toThrow();
+  if (paused.status !== 'paused') return;
+
+  expectMasked('the release() paused result', paused.processes.find((proc) => proc.pid === pid)?.command);
+  expectMasked('the worktree_processes row', h.ledger.listWorktreeProcesses('job-argv').find((proc) => proc.pid === pid)?.command);
+  const event = h.ledger.listEvents({ limit: 200 }).find((candidate) => candidate.kind === 'worktree.paused');
+  const eventProcesses = (event?.payload as { processes?: readonly { pid: number; command: string }[] }).processes ?? [];
+  expectMasked('the worktree.paused event payload', eventProcesses.find((proc) => proc.pid === pid)?.command);
+  const details = h.pauses.flatMap((pause) => pause.details).filter((detail) => detail.pid === pid);
+  expect(details).toHaveLength(1);
+  for (const detail of details) expectMasked('a details[].command handed to onSweepPaused', detail.command);
+  for (const handed of h.pauses.flatMap((pause) => pause.processes).filter((proc) => proc.pid === pid)) {
+    expectMasked('a processes[].command handed to onSweepPaused', handed.command);
+  }
+
+  // Each credential form is masked, and nothing else the pause wrote or
+  // returned carries the sentinel: not the result, not any event, not a row.
+  const written = JSON.stringify([
+    paused, h.pauses, h.ledger.listEvents({ limit: 500 }), h.ledger.listWorktreeProcesses('job-argv'),
+    h.ledgerDb.handle.prepare('SELECT * FROM worktree_processes').all(),
+  ]);
+  expect(written).not.toContain(ARGV_SENTINEL);
+  expect(JSON.stringify(h.logs)).not.toContain(ARGV_SENTINEL);
+  // What was masked is only the credential: the executable, the flags and the host stay.
+  const recorded = h.ledger.listWorktreeProcesses('job-argv').find((proc) => proc.pid === pid)!.command;
+  for (const kept of [process.execPath, '-H', 'Authorization: Bearer', '--', 'host/x']) expect(recorded).toContain(kept);
+});
+
+describe('#534: raw in memory, masked on the way out', () => {
+  it('a refused release (nobody answers it) throws a LaneLiveProcessError whose processes carry no credential', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-refuse', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-refuse' });
+    const child = argvChild(row.path, ARGV_CREDENTIALS);
+    await listedBy(row.path, child.pid!);
+
+    const error = await h.manager.release({ worktreeId: 'job-argv-refuse', onLiveProcess: 'refuse' }).then(() => null, (thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(LaneLiveProcessError);
+    const refused = error as LaneLiveProcessError;
+    expectMasked('LaneLiveProcessError.processes', refused.processes.find((proc) => proc.pid === child.pid)?.command);
+    expect(JSON.stringify([refused.processes, refused.message])).not.toContain(ARGV_SENTINEL);
+  });
+
+  it('A5: a recorded pause is still confirmed: the acknowledged pid is killed, though its recorded command is masked', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-ack', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-ack' });
+    const child = argvChild(row.path, ARGV_CREDENTIALS);
+    const pid = child.pid!;
+    await listedBy(row.path, pid);
+
+    expect((await h.manager.release({ worktreeId: 'job-argv-ack' })).status).toBe('paused');
+    expect(h.ledger.listWorktreeProcesses('job-argv-ack').find((proc) => proc.pid === pid)).toMatchObject({ state: 'live' });
+    const confirmed = await h.manager.release({ worktreeId: 'job-argv-ack', confirmKill: true, confirmKillPids: [pid] });
+    expect(confirmed.status).toBe('swept');
+    expect(h.ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'worktree.kill-confirmed')?.payload).toMatchObject({ pids: [pid] });
+    expect(h.ledger.listWorktreeProcesses('job-argv-ack').find((proc) => proc.pid === pid)).toMatchObject({ state: 'killed' });
+    expect(child.kill(0)).toBe(false);
+    expect(existsSync(row.path)).toBe(false);
+  });
+
+  it('A6: a live row recorded before the masking, holding a raw credential, is asked about again and replaced by the masked text; the next answer kills', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-old', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-old' });
+    const child = argvChild(row.path, ARGV_CREDENTIALS);
+    const pid = child.pid!;
+    const raw = (await listedBy(row.path, pid)).command;
+    expect(raw).toContain(ARGV_SENTINEL);
+    // The state an earlier build left: the lane paused, the process's row live with its raw command line.
+    h.ledger.setWorktreeStatus('job-argv-old', 'paused', 'sweep paused: an earlier build recorded the raw line');
+    h.ledgerDb.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('job-argv-old', ?, ?, 'argv', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(pid, raw);
+    expect(h.ledger.listWorktreeProcesses('job-argv-old').find((proc) => proc.pid === pid)?.command).toBe(raw);
+
+    const again = await h.manager.release({ worktreeId: 'job-argv-old', confirmKill: true, confirmKillPids: [pid] });
+    expect(again.status).toBe('paused');
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.kill-confirmed')).toBe(false);
+    const replaced = h.ledger.listWorktreeProcesses('job-argv-old').find((proc) => proc.pid === pid);
+    expect(replaced).toMatchObject({ state: 'live' });
+    expectMasked('the replaced row', replaced?.command);
+    expect(JSON.stringify(h.ledgerDb.handle.prepare('SELECT * FROM worktree_processes').all())).not.toContain(ARGV_SENTINEL);
+
+    // That ask is the one the owner answers: the recorded, masked pause is confirmed.
+    const answered = await h.manager.release({ worktreeId: 'job-argv-old', confirmKill: true, confirmKillPids: [pid] });
+    expect(answered.status).toBe('swept');
+    expect(child.kill(0)).toBe(false);
+  });
+
+  it('A7: a process tied to the tree by a path in its argv that also carries --token is still matched by argv, and a token in its raw argv still names it', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-match', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-match' });
+    const session = 'session-9b1d4c7e-argv-534';
+    // Its cwd is outside the tree: only the path in argv ties it to the lane.
+    const child = argvChild(undefined, [row.path, `--token=${ARGV_SENTINEL}`, session]);
+    const pid = child.pid!;
+    const matched = await listedBy(row.path, pid);
+    expect(matched.evidence).toBe('argv');
+    expect(matched.command).toContain(ARGV_SENTINEL);
+
+    const table = await processTableAsync({ onCwdError: (error) => { throw error; }, listCwds: async () => new Map([[pid, tmpdir()]]) });
+    expect(table.naming(session)).toEqual([expect.objectContaining({ pid, evidence: 'argv', command: expect.stringContaining(ARGV_SENTINEL) })]);
+    expect(table.naming(ARGV_SENTINEL).map((proc) => proc.pid)).toEqual([pid]);
+    expect(table.rootedIn(row.path).find((proc) => proc.pid === pid)).toMatchObject({ evidence: 'argv', command: expect.stringContaining(ARGV_SENTINEL) });
+  });
+
+  it('A8: the real lane-token read still reads the credential-bearing process, so its provenance is its credential-free twin\'s', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-twins', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-twins' });
+    const credentialed = argvChild(row.path, ARGV_CREDENTIALS).pid!;
+    const twin = argvChild(row.path, ['no', 'credentials', 'here']).pid!;
+    await listedBy(row.path, credentialed);
+    await listedBy(row.path, twin);
+
+    expect((await h.manager.release({ worktreeId: 'job-argv-twins' })).status).toBe('paused');
+    const details = h.pauses[0]!.details;
+    const credentialedDetail = details.find((detail) => detail.pid === credentialed);
+    const twinDetail = details.find((detail) => detail.pid === twin);
+    expect(credentialedDetail).toBeDefined();
+    expect(twinDetail).toBeDefined();
+    expect(credentialedDetail!.provenance).toBe(twinDetail!.provenance);
+    // Where GC can read a process's environment it did read it: a mask that
+    // broke the macOS `ps -E` match would read `unreadable` here.
+    if (process.platform === 'darwin' || process.platform === 'linux') expect(credentialedDetail!.provenance).toBe('no-token');
+    expect(credentialedDetail!.name).toBe(twinDetail!.name);
   });
 });

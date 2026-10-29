@@ -239,3 +239,67 @@ describe('redactCredentialWindow', () => {
     expect(redactCredentialWindow('before\n-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIEsecretbody\n')).toBe(`before\n${REDACTION_PLACEHOLDER}`);
   });
 });
+
+/**
+ * Process command lines (#534): a worktree process's argv reaches the ledger,
+ * an event and a response through `redactCredentials`. These top-level cases
+ * keep their Vitest `fullName`s exactly the names the heist's red scope passes.
+ */
+const ARGV_SECRET = 'Zx9Kq3Lm7Pw2Vb5Nc8Td';
+
+it('redacts argv credentials: new token, user and auth-scheme forms', () => {
+  const cases: readonly (readonly [string, string])[] = [
+    [`curl --token ${ARGV_SECRET} https://host/x`, `curl --token ${REDACTION_PLACEHOLDER} https://host/x`],
+    [`node cli.js --token ${ARGV_SECRET}`, `node cli.js --token ${REDACTION_PLACEHOLDER}`],
+    [`curl -u deploy:${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy:${ARGV_SECRET}`, `curl -u deploy:${REDACTION_PLACEHOLDER}`],
+    [`curl -H Authorization: token ${ARGV_SECRET} https://host/x`, `curl -H Authorization: token ${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -H authorization:Token ${ARGV_SECRET}`, `curl -H authorization:Token ${REDACTION_PLACEHOLDER}`],
+    // Inside a shell string, the quote ends the value.
+    [`/bin/sh -c curl -H 'Authorization: token ${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -H 'Authorization: token ${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`/bin/sh -c curl -u 'deploy:${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`/bin/sh -c cli --token "${ARGV_SECRET}" --verbose`, `/bin/sh -c cli --token ${REDACTION_PLACEHOLDER} --verbose`],
+    // A password that starts with a dash is still a password after `user:`.
+    [`curl -u deploy:-${ARGV_SECRET}`, `curl -u deploy:${REDACTION_PLACEHOLDER}`],
+    // Each occurrence in one command line.
+    [`cli --token ${ARGV_SECRET} -u a:${ARGV_SECRET}`, `cli --token ${REDACTION_PLACEHOLDER} -u a:${REDACTION_PLACEHOLDER}`],
+  ];
+  for (const [text, expected] of cases) {
+    const redacted = redactCredentials(text);
+    expect(redacted, text).not.toContain(ARGV_SECRET);
+    expect(redacted, text).toContain(REDACTION_PLACEHOLDER);
+    expect(redacted, text).toBe(expected);
+  }
+});
+
+it('keeps argv near misses unchanged: a flag with no credential value, a short or symbol-only value, an id pair', () => {
+  for (const kept of [
+    '--token --verbose',
+    'node cli.js --token',
+    'node cli.js --token --verbose build',
+    'docker run -u 1000:1000 image',
+    'docker exec -u alice bash',
+    'git push -u origin main',
+    'git push -u origin HEAD:refs/heads/main',
+    'cli --token abc12',
+    'cli --token ******',
+    'cli --tokenize abcdefgh',
+    'cli --token-file /tmp/token-file',
+    'curl -H Authorization: token',
+    'curl -H Authorization: token --verbose',
+    'curl -H Authorization: token abc',
+    'curl -H Authorization: tokens abcdefghij',
+    'cli -u:abcdefghij',
+  ]) expect(redactCredentials(kept), kept).toBe(kept);
+});
+
+it('redacts a command line once: a redacted argv redacts to itself', () => {
+  for (const text of [
+    `curl -H Authorization: Bearer ${ARGV_SECRET} --token ${ARGV_SECRET} -u me:${ARGV_SECRET} -H Authorization: token ${ARGV_SECRET} https://me:${ARGV_SECRET}@host/x`,
+    `cli --token=${ARGV_SECRET} -H PRIVATE-TOKEN: ${ARGV_SECRET}`,
+  ]) {
+    const once = redactCredentials(text);
+    expect(once).not.toContain(ARGV_SECRET);
+    expect(redactCredentials(once)).toBe(once);
+  }
+});
