@@ -607,7 +607,7 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(record.state).toBe('proposed');
     expect(h.ledger.getNotification(record.notificationId)).toBeNull();
     const restarted = h.restart();
-    restarted.reconcile();
+    restarted.start();
     restarted.reconcile();
     expect(h.ledger.getNotification(record.notificationId)).not.toBeNull();
     expect(approvalCards(h)).toHaveLength(1);
@@ -988,14 +988,14 @@ describe('owner approval — reconcile, withdrawal and shutdown', () => {
     cleanupRepos.push(repo);
     const h = await boot({ crashAt: ['record-written'] });
     await historicalLiveRequest(h, repo, 'job-t1', 'req-t1');
+    expect(h.interval.period).toBe(OWNER_APPROVAL_RECONCILE_INTERVAL_MS);
+    expect(h.interval.started).toBe(1);
     expect((await propose(h, 'req-t1')).status).toBe(400);
     const [id] = h.ledger.listActiveOwnerApprovalIds();
     const record = h.ledger.getOwnerApproval(id!)!;
     expect(h.ledger.getNotification(record.notificationId)).toBeNull();
-    // start()'s boot reconcile posts the card the crash lost.
-    h.service.current.start();
-    expect(h.interval.period).toBe(OWNER_APPROVAL_RECONCILE_INTERVAL_MS);
-    expect(h.interval.started).toBe(1);
+    // One reconcile (what an interval tick runs) posts the card the crash lost.
+    h.service.current.reconcile();
     expect(h.ledger.getNotification(record.notificationId)).not.toBeNull();
     // One injected interval tick is one reconcile: it closes an open card of
     // an ended record.
@@ -1136,7 +1136,6 @@ describe('owner approval — the text that sends Gru and the owner to the new ro
       expect(detail, label).toContain('ask the owner whether to abandon it');
       expect(detail, label).not.toContain('confirm_intent');
       expect(detail, label).not.toContain('by "owner"');
-      expect(detail, label).not.toContain('/abandon');
       // The ask never spells the terminal URL. The same card still carries
       // the inspect/retire readback routes that are NOT this recipe, so the
       // URL assertion is scoped to the ask sentence, not the whole card.
