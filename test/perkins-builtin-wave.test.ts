@@ -16,6 +16,8 @@ import {
   GitLabMrPoster,
   WaveRunner,
   parsePostedEventPayload,
+  PUBLICATION_BODY_MAX_BYTES,
+  publicationBodyFor,
   hostDisclosureAppendix,
   redactReviewForPublication,
   settledExecutionFactsLine,
@@ -6333,6 +6335,15 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     expect(canonicalGitLabPublicationBody('before\nreport\n')).toBe('before\nreport');
     expect(canonicalGitLabPublicationBody('report\n\n')).toBe('report\n');
     expect(canonicalGitLabPublicationBody('report')).toBe('report');
+    const minimalReview = { findings: [], specialistRuns: [], priorDispositions: [] };
+    const emptyBody = publicationBodyFor('', minimalReview, 'gitlab', []);
+    const limitReport = 'x'.repeat(PUBLICATION_BODY_MAX_BYTES + 1 - Buffer.byteLength(emptyBody, 'utf8'));
+    const boundaryBody = publicationBodyFor(limitReport, minimalReview, 'gitlab', []);
+    expect(Buffer.byteLength(boundaryBody, 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES);
+    expect(boundaryBody.endsWith('\n')).toBe(false);
+    expect(boundaryBody).toContain(limitReport);
+    expect(() => publicationBodyFor(limitReport, minimalReview, 'github', []))
+      .toThrow(/exceeds the provider review-body limit/u);
     {
       const repo = makeFixtureRepo('perkins-gl-publication-newline');
       repos.push(repo);
