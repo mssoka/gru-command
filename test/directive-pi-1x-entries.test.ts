@@ -280,7 +280,8 @@ describe('pi 1.x context edits around a retried reply (#521)', () => {
     message(file, 'truncated', 'receipt', cutOff);
     contextEdit(file, 'omit-truncated', 'truncated');
     message(file, 'answer', 'omit-truncated', answer);
-    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+    // Refused as an edit that omits no failed reply, not later as unanswered calls.
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native branch/control/partial checkpoint' });
     const second = scene(['system-1']);
     message(second.file, 'truncated', 'receipt', cutOff);
     contextEdit(second.file, 'omit-truncated', 'truncated');
