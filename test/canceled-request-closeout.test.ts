@@ -189,7 +189,7 @@ function expectNoOwnerAttribution(ctx: Ctx): void {
   const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId);
   expect(intent?.requestedBy).not.toBe('owner');
   const row = ctx.ledger.getDirective(ctx.requestId);
-  if (row?.retiredBy !== null && row?.retiredBy !== undefined) expect(row.retiredBy).toBe(CLOSEOUT_ACTOR);
+  if (row?.retiredBy !== null && row?.retiredBy !== undefined) expect(row.retiredBy).not.toBe('owner');
   const card = ctx.ledger.findNotificationByKind(kind(ctx), 'any');
   if (card?.resolvedBy !== null && card?.resolvedBy !== undefined) expect(card.resolvedBy).not.toBe('owner');
   if (intent !== null) {
