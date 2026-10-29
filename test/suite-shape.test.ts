@@ -247,7 +247,7 @@ const PINS: Record<string, number> = {
   'directive-retirement.test.ts': 108,
   'directive-pi-1x-entries.test.ts': 30,
   'directive-retry-history.test.ts': 41,
-  'directive-transcript-bounds.test.ts': 32,
+  'directive-transcript-bounds.test.ts': 35,
   'fix-directive.test.ts': 60,
   'github-poll.test.ts': 45,
   'gru-cli.test.ts': 12,

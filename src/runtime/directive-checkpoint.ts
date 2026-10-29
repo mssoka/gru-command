@@ -217,7 +217,10 @@ function withNativeTranscript<T>(file: string, inspect: (fd: number) => T): T {
   try { return inspect(fd); } finally { closeSync(fd); }
 }
 /** Complete lines read on demand from `start`, each bounded and fatally
- * decoded. A torn final line is never decoded: it only sets `partial`. */
+ * decoded. A torn final line is never decoded: it only sets `partial`.
+ * `tolerateWarmGrowth` (a pi session) reads on when the file grew by nothing
+ * but complete cache-warm usage entries between the read that found its end
+ * and the check of its size; any other growth still refuses. */
 class NativeLines {
   private readonly decoder = utf8Decoder();
   private readonly buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
@@ -227,7 +230,26 @@ class NativeLines {
   /** The offset after the last complete line read. */
   end: number;
   partial = false;
-  constructor(private readonly fd: number, start: number) { this.position = start; this.end = start; }
+  constructor(private readonly fd: number, start: number, private readonly tolerateWarmGrowth = false) { this.position = start; this.end = start; }
+  /** Pi 1.x's cache warmer appends a `usage` entry on a timer, so the file may
+   * grow between the read that returned nothing and the check of its size.
+   * That growth is harmless only when it is whole lines, each a cache-warm
+   * usage entry: the turn is read through them as it is everywhere else. */
+  private grewByWarmEntriesOnly(size: number): boolean {
+    const grown = size - this.position;
+    if (grown <= 0 || grown > READ_CHUNK_BYTES) return false;
+    const appended = Buffer.allocUnsafe(grown);
+    if (readSync(this.fd, appended, 0, grown, this.position) !== grown || appended[grown - 1] !== 10) return false;
+    const decoder = utf8Decoder();
+    for (let at = 0; at < grown;) {
+      const newline = appended.indexOf(10, at);
+      let entry: unknown;
+      try { entry = JSON.parse(decodeEvidence(appended.subarray(at, newline), 'native transcript', decoder)); } catch { return false; }
+      if (typeof entry !== 'object' || entry === null || !isCacheWarm(entry as { readonly type: string; readonly kind?: unknown })) return false;
+      at = newline + 1;
+    }
+    return true;
+  }
   /** The next complete line, or null at the end; one longer than `limit` bytes refuses. */
   next(limit: number, oversized: string): string | null {
     const pieces: Buffer[] = [];
@@ -236,7 +258,11 @@ class NativeLines {
       if (this.chunk.length === 0) {
         const count = readSync(this.fd, this.buffer, 0, this.buffer.length, this.position);
         if (count === 0) {
-          if (fstatSync(this.fd).size !== this.position) throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+          const size = fstatSync(this.fd).size;
+          if (size !== this.position) {
+            if (this.tolerateWarmGrowth && bytes === 0 && this.grewByWarmEntriesOnly(size)) continue;
+            throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+          }
           if (bytes > 0) this.partial = true;
           return null;
         }
@@ -277,7 +303,7 @@ class NativeTurn {
   private count = 0;
   private scope = 'native directive turn';
   private ended: { readonly start: number; readonly count: number } | null = null;
-  constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
+  constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted', tolerateWarmGrowth = false) { this.lines = new NativeLines(fd, start, tolerateWarmGrowth); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
    * nor refused as, this turn. Idempotent until resume(): a chained retry
@@ -341,7 +367,7 @@ interface PiTranscript {
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
-    const lines = new NativeLines(fd, 0);
+    const lines = new NativeLines(fd, 0, true);
     const first = lines.nextEntry();
     const header = first === null ? null : JSON.parse(first) as NativeEntry | null;
     const parentIds = new Map<string, string | null>();
@@ -362,7 +388,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
       return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {}, warmed: new Map() });
     }
-    const after = new NativeTurn(fd, lines.end, tail);
+    const after = new NativeTurn(fd, lines.end, tail, true);
     const seen = new Set<string>();
     const entries: (NativeEntry | 'malformed')[] = [];
     // Pi 1.x's cache warmer appends a `usage` entry (kind cache_warm) as a child
@@ -580,7 +606,7 @@ export function prepareDirectiveBinding(input: {
   if (prior !== null) throw new DirectiveCheckpointError(`request ${input.identity.requestId} already has native association — inspect it; never replay`);
   // The baseline is the last entry: the whole session streams past, one line at a time.
   const baseline = withNativeTranscript(input.sessionFile, (fd) => {
-    const lines = new NativeLines(fd, 0);
+    const lines = new NativeLines(fd, 0, true);
     let last: string | null = null;
     for (let line = lines.nextEntry(); line !== null; line = lines.nextEntry()) {
       const entry = JSON.parse(line) as NativeEntry;

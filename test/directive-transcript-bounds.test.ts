@@ -450,6 +450,54 @@ describe('bounded reads (#469)', () => {
   });
 });
 
+describe('the pi readers read through the cache warmer (#521, contract revision 5)', () => {
+  /** Pi 1.x's cache warmer: a usage entry appended on a timer. */
+  const warm = (id: string, parentId: string, kind = 'cache_warm') => `${JSON.stringify({ type: 'usage', id, parentId, kind, timestamp: '2026-10-29T00:00:00.000Z', provider: 'p', model: 'm',
+    usage: { input: 1, output: 1, cacheRead: 9, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } })}\n`;
+  /** `appended` lands at the read that finds the end of the file, before the check of its size. */
+  const landsAtEnd = (file: string, appended: string): void => { reads.onEof = { ino: statSync(file).ino, append: () => appendFileSync(file, appended) }; };
+
+  it('lets the tool-intent flush finish when the warmer appends between its last read and the check of the size', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const receipt = piEntry(file, 'receipt', null, prompt(text));
+    piEntry(file, 'invocation', receipt, invocation);
+    landsAtEnd(file, warm('warm-1', 'invocation'));
+    expect(() => flushDirectiveToolIntent(file, invocation, toolCall, identity)).not.toThrow();
+    expect(reads.onEof).toBeNull();
+    expect(readFileSync(file, 'utf8')).toContain('"id":"warm-1"');
+  });
+
+  it('lets the checkpoint and the next directive\'s baseline read through a warm entry that lands as they reach the end', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    piEntry(file, 'receipt', null, prompt(text));
+    piEntry(file, 'answer', 'receipt', answer);
+    landsAtEnd(file, warm('warm-1', 'answer'));
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer' });
+    expect(reads.onEof).toBeNull();
+    landsAtEnd(file, warm('warm-2', 'warm-1'));
+    expect(preparePi(file, laterIdentity, 'a later directive')).toMatchObject({ baseline: 'warm-2' });
+    expect(reads.onEof).toBeNull();
+  });
+
+  it('still refuses growth that is anything but whole cache-warm entries', () => {
+    const grown: readonly (readonly [string, string])[] = [
+      ['a warm entry followed by an entry of another kind', `${warm('warm-1', 'receipt')}{"type":"late"}\n`],
+      ['a torn warm entry', warm('warm-1', 'receipt').trimEnd()],
+      ['a usage entry of another kind', warm('usage-1', 'receipt', 'extension_note')],
+      ['a line that is not JSON', 'not json\n'],
+    ];
+    for (const [label, appended] of grown) {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      piEntry(file, 'receipt', null, prompt(text));
+      landsAtEnd(file, appended);
+      expect(() => inspectDirectiveCheckpoint(file, identity), label).toThrow(/^native transcript changed during bounded inspection$/u);
+    }
+  });
+});
+
 describe('the pi tool fence reads its own admission and the whole live turn (#469)', () => {
   const RECEIPT_CHANGED = /^actual native admission user receipt unavailable\/changed$/u;
   const NOT_PERSISTED = /^native tool intent is not persisted before execution or its invocation\/results changed$/u;

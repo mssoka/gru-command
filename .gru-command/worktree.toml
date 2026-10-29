@@ -1163,7 +1163,7 @@ main-red-spawn-receipt-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx
 
 # #521 pi SDK 1.4 upgrade: the Gemini 4 thinking-level request, the 0.85.1
 # transcript golden and session resume, over the registry pins.
-pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-gemini-thinking-level.test.ts test/transcripts.test.ts test/directive-pi-1x-entries.test.ts test/directive-retry-history.test.ts test/pi-adapter.test.ts test/decisions.test.ts test/perkins-lead-schema-compat.test.ts test/suite-shape.test.ts"
+pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-gemini-thinking-level.test.ts test/transcripts.test.ts test/directive-pi-1x-entries.test.ts test/directive-retry-history.test.ts test/directive-transcript-bounds.test.ts test/pi-adapter.test.ts test/decisions.test.ts test/perkins-lead-schema-compat.test.ts test/suite-shape.test.ts"
 # The audited review-closure catalogs (names, loader fields, executable paths)
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.

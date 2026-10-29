@@ -2485,26 +2485,32 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
-  it('a session keeps the pre-1.x request pattern: prompt-cache warming is off unless the user\'s own Pi settings name a mode (#521)', async () => {
-    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }]);
-    const mode = async (spawn: () => Promise<AgentHandle>) => {
-      const handle = await spawn();
-      try { return (await actualDirectiveSdkSession(handle)).settingsManager.getCacheWarmingMode(); } finally { await handle.dispose(); }
-    };
-    expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace }))).toBe('off');
+  it('the adapter leaves the prompt-cache warming mode to the SDK: a session answers what a fresh SettingsManager over the same settings answers (#521, contract revision 5)', async () => {
+    const { SettingsManager } = await import('@earendil-works/pi-coding-agent');
+    const fx = await fixture([{ deltas: ['one'] }]);
+    const settings = join(fx.agentDir, 'settings.json');
+    const base = existsSync(settings) ? JSON.parse(readFileSync(settings, 'utf-8')) as object : {};
+    const modes: string[] = [];
+    for (const named of [undefined, 'off', 'idle', 'streaming']) {
+      writeFileSync(settings, JSON.stringify(named === undefined ? base : { ...base, cacheWarming: named }));
+      const before = readFileSync(settings, 'utf-8');
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      try {
+        const mode = (await actualDirectiveSdkSession(handle)).settingsManager.getCacheWarmingMode();
+        expect(mode, String(named)).toBe(SettingsManager.create(fx.workspace, fx.agentDir).getCacheWarmingMode());
+        modes.push(mode);
+      } finally { await handle.dispose(); }
+      // GC reads the user's Pi settings and never writes them.
+      expect(readFileSync(settings, 'utf-8')).toBe(before);
+    }
+    // The setting does reach the session: the cases are not all one mode.
+    expect(new Set(modes).size).toBeGreaterThan(1);
+    // An isolated review session runs on in-memory settings, as the SDK builds them.
     const review = await fx.runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'isolated policy', tools: [] } });
     try {
-      expect((twinGate.lastOptions as { settingsManager: { getCacheWarmingMode(): string } }).settingsManager.getCacheWarmingMode()).toBe('off');
+      const reviewSettings = (twinGate.lastOptions as { settingsManager: { getCacheWarmingMode(): string } }).settingsManager;
+      expect(reviewSettings.getCacheWarmingMode()).toBe(SettingsManager.inMemory({}, { projectTrusted: false }).getCacheWarmingMode());
     } finally { await review.dispose(); }
-    const settings = join(fx.agentDir, 'settings.json');
-    writeFileSync(settings, JSON.stringify({ ...(existsSync(settings) ? JSON.parse(readFileSync(settings, 'utf-8')) as object : {}), cacheWarming: 'streaming' }));
-    expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace }))).toBe('streaming');
-    expect(JSON.parse(readFileSync(settings, 'utf-8'))).toMatchObject({ cacheWarming: 'streaming' });
-    // A value the SDK does not recognize is read as its warming default: not a choice the user made.
-    for (const unrecognized of ['stream', true, null]) {
-      writeFileSync(settings, JSON.stringify({ ...(JSON.parse(readFileSync(settings, 'utf-8')) as object), cacheWarming: unrecognized }));
-      expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace })), String(unrecognized)).toBe('off');
-    }
   });
 
   it('a system patch the SDK adds while preparing a directive\'s next turn is refused before that model request (#521)', async () => {

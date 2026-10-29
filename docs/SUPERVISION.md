@@ -146,11 +146,14 @@ only in the form it is written in, linked on the chain:
   `usage` entry of kind `cache_warm` on a timer. It joins no conversation,
   so the turn is read as if it were not there (a warm entry that is its own
   parent is a malformed entry). A usage entry of any other kind is refused as
-  the unknown entry it is. Warming is the SDK's default, but a GC session
-  keeps the pre-1.x request pattern: its settings answer `off` unless the
-  user's own Pi settings name a `cacheWarming` mode, because a warm is a paid
-  request the directive fence does not see and the yield report does not
-  count.
+  the unknown entry it is. The timer can also append between the read that
+  finds the end of the transcript and the check of its size, so that growth is
+  read on when it is whole cache-warm lines and nothing else; any other
+  growth, a torn warm line included, still refuses by name. Warming follows
+  the SDK's default and the user's own Pi settings (`cacheWarming` in the
+  agent directory's `settings.json`): GC does not override the mode and
+  never writes those settings. A warm is a paid provider request that the
+  directive fence does not see and the yield report does not count.
 
 Two more 1.x differences are refused by name rather than walked: a Pi
 directive carries text only (1.x re-encodes prompt images, so the receipt

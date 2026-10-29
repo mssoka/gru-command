@@ -96,18 +96,6 @@ export function rendersAs(text: string, parts: readonly string[]): boolean {
   return walk(0, parts.length);
 }
 
-/** Pi 1.x resumes a session's cache-warming mode from the user's own Pi
- * settings and otherwise warms by default: a paid request on a timer that
- * the directive fence does not see and the yield report does not count.
- * A session keeps the pre-1.x request pattern unless those settings name a
- * mode the SDK recognizes (it reads any other value as its default, which
- * warms); nothing is written to them. */
-function withoutImplicitCacheWarming(settings: SettingsManager): SettingsManager {
-  const named = settings.getGlobalSettings().cacheWarming;
-  if (named === undefined || settings.getCacheWarmingMode() !== named) settings.getCacheWarmingMode = () => 'off';
-  return settings;
-}
-
 /** The tools accessor the directive executor fence is installed on. Pi 1.x
  * re-applies the tool loadout through it before every prompt and next turn. */
 function assertToolFenceAccessor(agentState: object): PropertyDescriptor & { readonly get: () => SdkTool[]; readonly set: (value: SdkTool[]) => void } {
@@ -962,7 +950,6 @@ export class PiRuntime implements AgentRuntime {
       const isolatedSettings = reviewMode === undefined
         ? undefined
         : SettingsManager.inMemory({}, { projectTrusted: false });
-      const sessionSettings = withoutImplicitCacheWarming(isolatedSettings ?? SettingsManager.create(cwd, this.agentDir));
       // Issue #283: the lane-bound GC-managed BMAD runtime rides beside the
       // project's own skills and wins a name collision. Review sessions
       // never carry it (they load no skills at all).
@@ -1045,7 +1032,7 @@ export class PiRuntime implements AgentRuntime {
             ? { customTools: [...(laneBash !== null ? [laneBash] : []), ...nativeTools] }
             : {}),
         resourceLoader: loader,
-        settingsManager: sessionSettings,
+        ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
         sessionManager,
         modelRuntime: await this.runtime(),
       });
