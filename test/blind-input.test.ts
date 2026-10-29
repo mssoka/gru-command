@@ -395,7 +395,16 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
 });
 
 describe('observed reviewer access — the forms `git grep` prints for revisions and context lines (#520)', () => {
-  const ARTIFACT = '_bmad-output/implementation-artifacts/deferred-work.md';
+  const ARTIFACT_DIR = '_bmad-output/implementation-artifacts';
+  const ARTIFACT = `${ARTIFACT_DIR}/deferred-work.md`;
+  // The fixtures are assembled from parts, never written out as `rev:path:N:`
+  // in this file: a reviewer reading it would otherwise be recorded as having
+  // read the excluded path its fixtures name.
+  /** A `git grep -n` match line: `<name>:<n>:<text>`. */
+  const match = (name: string, n: number, text = 'x'): string => [name, String(n), text].join(':');
+  /** A `git grep -n -C` context line: `<name>-<n>-<text>`. */
+  const context = (name: string, n: number, text = 'x'): string => [name, String(n), text].join('-');
+  const named = (rev: string, path: string): string => [rev, path].join(':');
   const scan = (text: string, rule = DEFAULT_BLIND_ISOLATION_RULE) => scanObservedAccess([{ index: 4, toolName: 'bash', text }], rule);
   /** What the record holds for one tool result: `code:path` per hit. */
   const recorded = (text: string, rule = DEFAULT_BLIND_ISOLATION_RULE): readonly string[] =>
@@ -403,7 +412,7 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   const prohibited = (path: string): readonly string[] => [`excluded-path-read:${path}`];
 
   it('A1: a hit prefixed by a 40-hex revision is a read of the excluded repository path', () => {
-    const text = `${'a'.repeat(40)}:${ARTIFACT}:7: matched symbol`;
+    const text = match(named('a'.repeat(40), ARTIFACT), 7, ' matched symbol');
     expect(recorded(text)).toEqual(prohibited(ARTIFACT));
     // Digest only: the private text never rides the record.
     expect(JSON.stringify(scan(text))).not.toContain('matched symbol');
@@ -413,71 +422,78 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
 
   it('A2: any revision spelling, as a match line or a context line, is stripped from the recorded path', () => {
     for (const rev of ['abc1234', 'HEAD', 'HEAD~1', 'origin/main', 'refs/heads/feature/x', 'v1.0.1']) {
-      expect(recorded(`${rev}:${ARTIFACT}:7: matched symbol`), `${rev} match`).toEqual(prohibited(ARTIFACT));
-      expect(recorded(`${rev}:${ARTIFACT}-7- matched symbol`), `${rev} context`).toEqual(prohibited(ARTIFACT));
+      expect(recorded(match(named(rev, ARTIFACT), 7, ' matched symbol')), `${rev} match`).toEqual(prohibited(ARTIFACT));
+      expect(recorded(context(named(rev, ARTIFACT), 7, ' matched symbol')), `${rev} context`).toEqual(prohibited(ARTIFACT));
     }
   });
 
   it('A3: a hit against `<rev>:<dir>` joins its directory and file with a slash', () => {
-    expect(recorded(`HEAD:_bmad-output/implementation-artifacts:deferred-work.md:7:x`)).toEqual(prohibited(ARTIFACT));
-    expect(recorded(`HEAD:_bmad-output/implementation-artifacts:deferred-work.md-7-x`)).toEqual(prohibited(ARTIFACT));
-    expect(recorded(`${'b'.repeat(40)}:docs:issues:notes.md:3:x`)).toEqual(prohibited('docs/issues/notes.md'));
+    expect(recorded(match(named('HEAD', `${ARTIFACT_DIR}:deferred-work.md`), 7))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(context(named('HEAD', `${ARTIFACT_DIR}:deferred-work.md`), 7))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(match(named('b'.repeat(40), 'docs:issues:notes.md'), 3))).toEqual(prohibited('docs/issues/notes.md'));
   });
 
   it('A4: a spaced excluded path behind a revision is judged whole', () => {
-    expect(recorded('HEAD:docs/issues/prior review.md:1:x')).toEqual(prohibited('docs/issues/prior review.md'));
-    expect(recorded('HEAD:docs/issues/prior review.md-1-x')).toEqual(prohibited('docs/issues/prior review.md'));
+    expect(recorded(match(named('HEAD', 'docs/issues/prior review.md'), 1))).toEqual(prohibited('docs/issues/prior review.md'));
+    expect(recorded(context(named('HEAD', 'docs/issues/prior review.md'), 1))).toEqual(prohibited('docs/issues/prior review.md'));
   });
 
   it('A5: a worktree context line names its path up to the line number, not a date inside it', () => {
-    expect(recorded(`${ARTIFACT}-7-ctx`)).toEqual(prohibited(ARTIFACT));
+    expect(recorded(context(ARTIFACT, 7, 'ctx'))).toEqual(prohibited(ARTIFACT));
     // `-10-` and `-29-` are delimiters too: the longest excluded head is the file, not `docs/issues/2026`.
-    expect(recorded('docs/issues/2026-10-29-notes.md-7-x')).toEqual(prohibited('docs/issues/2026-10-29-notes.md'));
-    expect(recorded('./docs/issues/prior review.md-4-context line')).toEqual(prohibited('./docs/issues/prior review.md'));
+    expect(recorded(context('docs/issues/2026-10-29-notes.md', 7))).toEqual(prohibited('docs/issues/2026-10-29-notes.md'));
+    expect(recorded(context('./docs/issues/prior review.md', 4, 'context line'))).toEqual(prohibited('./docs/issues/prior review.md'));
   });
 
   it('records the longest excluded candidate, the earliest delimiter on a tie, and the repository spelling of `<dir>:<file>`', () => {
+    const hit = (path: string): string => match(named('HEAD', path), 1);
     // Two lines, two excluded heads: the longer one is recorded whatever the order.
-    expect(recorded('HEAD:docs/issues/a.md:1:x\nHEAD:docs/issues/long-name.md:1:x')).toEqual(prohibited('docs/issues/long-name.md'));
-    expect(recorded('HEAD:docs/issues/long-name.md:1:x\nHEAD:docs/issues/a.md:1:x')).toEqual(prohibited('docs/issues/long-name.md'));
+    expect(recorded([hit('docs/issues/a.md'), hit('docs/issues/long-name.md')].join('\n'))).toEqual(prohibited('docs/issues/long-name.md'));
+    expect(recorded([hit('docs/issues/long-name.md'), hit('docs/issues/a.md')].join('\n'))).toEqual(prohibited('docs/issues/long-name.md'));
     // Equal lengths: the earlier line wins.
-    expect(recorded('HEAD:docs/issues/a.md:1:x\nHEAD:docs/issues/b.md:1:x')).toEqual(prohibited('docs/issues/a.md'));
+    expect(recorded([hit('docs/issues/a.md'), hit('docs/issues/b.md')].join('\n'))).toEqual(prohibited('docs/issues/a.md'));
     // `<rev>:<dir>:<file>` offers the colon form and the slash form at one delimiter, equally long and both excluded: the slash form is the repository path.
-    expect(recorded('HEAD:docs/issues/x:a.md:1:x')).toEqual(prohibited('docs/issues/x/a.md'));
+    expect(recorded(hit('docs/issues/x:a.md'))).toEqual(prohibited('docs/issues/x/a.md'));
   });
 
-  it('keeps the existing hit when the same result also carries a revision-prefixed one, and records line-unsafe paths as their literal', () => {
-    expect(recorded('HEAD:docs/issues/a.md:1:x\n_bmad-output/b.md:2:y')).toEqual(prohibited('_bmad-output/b.md'));
-    expect(recorded('src/ok.ts:1:x\nHEAD:docs/issues/a.md:1:x')).toEqual(prohibited('docs/issues/a.md'));
-    const [hit] = scan('HEAD:docs/issues/a\u202eb.md:1:x');
-    expect(hit).toMatchObject({ code: 'excluded-path-read', path: '"docs/issues/a\\u202eb.md"' });
-    expect(hit!.detail).not.toMatch(/\u202e/u);
+  it('keeps the existing hit when the same result also carries a revision-prefixed one, even a longer one, and records line-unsafe paths as their literal', () => {
+    const rev = (path: string): string => match(named('HEAD', path), 1);
+    const plain = (path: string): string => match(path, 2, 'y');
+    // The `path:N:` form is read first: a revision-prefixed path, longer or shorter, never replaces it.
+    expect(recorded([rev('docs/issues/a.md'), plain('_bmad-output/b.md')].join('\n'))).toEqual(prohibited('_bmad-output/b.md'));
+    expect(recorded([rev('docs/issues/long-name.md'), plain('_bmad-output/b.md')].join('\n'))).toEqual(prohibited('_bmad-output/b.md'));
+    expect(recorded([plain('src/ok.ts'), rev('docs/issues/a.md')].join('\n'))).toEqual(prohibited('docs/issues/a.md'));
+    const [line] = scan(rev('docs/issues/a\u202eb.md'));
+    expect(line).toMatchObject({ code: 'excluded-path-read', path: '"docs/issues/a\\u202eb.md"' });
+    expect(line!.detail).not.toMatch(/\u202e/u);
   });
 
   it('judges the new candidates by the isolation globs only: an absolute, `..` or drive-letter head is no hit through them', () => {
-    for (const text of ['HEAD:/etc/hosts:1:x', 'HEAD:../docs/issues/a.md:1:x', 'HEAD:C:/Data/a.md:1:x', 'HEAD:C:\\Data\\a.md:1:x', 'v1:/srv/x:3:y']) {
-      expect(recorded(text), text).toEqual([]);
+    for (const path of ['/etc/hosts', '../docs/issues/a.md', 'C:/Data/a.md', 'C:\\Data\\a.md']) {
+      expect(recorded(match(named('HEAD', path), 1)), path).toEqual([]);
     }
+    expect(recorded(match(named('v1', '/srv/x'), 3, 'y'))).toEqual([]);
     // ...while the parent's own exclusions apply to the revision-stripped path.
     const rule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude vendor/**', amendments: [] });
-    expect(recorded('HEAD:vendor/lib/a.ts:9:x', rule)).toEqual(prohibited('vendor/lib/a.ts'));
-    expect(recorded('HEAD:src/a.ts:9:x', rule)).toEqual([]);
+    expect(recorded(match(named('HEAD', 'vendor/lib/a.ts'), 9), rule)).toEqual(prohibited('vendor/lib/a.ts'));
+    expect(recorded(match(named('HEAD', 'src/a.ts'), 9), rule)).toEqual([]);
   });
 
   it('A7-A11: lines that only mention an excluded path, and clock times, stay no hit', () => {
+    const mention = "  const glob = '_bmad-output/**'";
     for (const text of [
-      "src/config.ts:12:  const glob = '_bmad-output/**'",
-      "HEAD:src/config.ts:12:  const glob = '_bmad-output/**'",
-      'src/a.ts:3:HEAD:_bmad-output/x.md:7: foo',
-      'src/a.ts-3-note _bmad-output/x.md-7-ctx',
-      '12:34:56 build finished',
+      match('src/config.ts', 12, mention),
+      match(named('HEAD', 'src/config.ts'), 12, mention),
+      match('src/a.ts', 3, match(named('HEAD', '_bmad-output/x.md'), 7, ' foo')),
+      ['src/a.ts-3-note ', context('_bmad-output/x.md', 7, 'ctx')].join(''),
+      ['12', '34', '56 build finished'].join(':'),
     ]) {
       expect(scan(text), text).toEqual([]);
     }
   });
 
   it('A12: a drive-letter hit is recorded exactly as before, one hit', () => {
-    for (const text of ['C:/Data/a.md:1:x', 'C:\\Data\\a.md:1:x']) {
+    for (const text of [match('C:/Data/a.md', 1), match('C:\\Data\\a.md', 1)]) {
       const hits = scan(text);
       expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(['excluded-path-read:C:/Data/a.md']);
       expect(hits[0]!.detail, text).toBe('invalid package path "C:/Data/a.md" (must be a relative path inside the repository)');
@@ -487,7 +503,7 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   it('considers at most the first 64 delimiters of a line, and no head longer than 4096 characters', () => {
     const rule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude **/secret.md', amendments: [] });
     // `k` earlier delimiters, then the one right after `secret.md`: it is delimiter k + 1.
-    const afterDelimiters = (k: number): string => `x${'-1'.repeat(k)}-secret.md-2-y`;
+    const afterDelimiters = (k: number): string => ['x', ...Array.from({ length: k }, () => '1'), 'secret.md'].join('-') + '-2-y';
     expect(recorded(afterDelimiters(63), rule)).toEqual(prohibited(afterDelimiters(63).slice(0, -'-2-y'.length)));
     expect(recorded(afterDelimiters(64), rule)).toEqual([]);
     // A head of exactly 4096 characters is judged; one character more is skipped.
@@ -496,6 +512,16 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(`${head(4097)}-2-y`, rule)).toEqual([]);
     // The cap counts per line: a later line is judged afresh.
     expect(recorded(`${afterDelimiters(64)}\n${afterDelimiters(0)}`, rule)).toEqual(prohibited('x-secret.md'));
+  });
+
+  it('reading these tests is no excluded read: no line of this file, as written or as a read gutter or diff shows it, reads as a grep hit', () => {
+    const own = readFileSync(new URL(import.meta.url), 'utf8').split('\n');
+    // Lines a reviewer sees: the file itself, a numbered read, a diff line. The two
+    // older fixtures that name an outside path by shape are the only lines of this
+    // file that were already recorded before the revision forms were read.
+    const shapes = (line: string, index: number): readonly string[] => [line, `${String(index + 1).padStart(6)}→${line}`, `+${line}`];
+    const flagged = own.flatMap((line, index) => shapes(line, index).flatMap((shown) => scan(shown).map((hit) => `${index + 1}: ${hit.path ?? ''}`)));
+    expect([...new Set(flagged)].filter((entry) => !/\/\/host\/share\/f\.md$/u.test(entry))).toEqual([]);
   });
 });
 

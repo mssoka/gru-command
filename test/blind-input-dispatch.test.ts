@@ -496,7 +496,9 @@ describe('blind review commissioning (issue #316)', () => {
     const coverage = (): Promise<{ status: number; json: Record<string, unknown> }> => call(h.port, 'GET', '/api/dispatch/jobs/rev-gitref/blind-coverage');
     expect((await coverage()).json).toMatchObject({ qualifying: true, prohibitedAccess: 0, accessObserved: true });
 
-    const text = `${'a'.repeat(40)}:_bmad-output/implementation-artifacts/deferred-work.md:7: matched symbol`;
+    // Assembled, never written as `rev:path:N:`: a reviewer reading this file must not read as having read the path.
+    const artifact = '_bmad-output/implementation-artifacts/deferred-work.md';
+    const text = `${'a'.repeat(40)}:${artifact}:7: matched symbol`;
     const submit = (): Promise<{ status: number; json: Record<string, unknown> }> =>
       call(h.port, 'POST', '/api/dispatch/blind-access', { job_id: 'rev-gitref', tool_results: [{ tool_name: 'bash', text }] });
     const first = await submit();
@@ -511,7 +513,7 @@ describe('blind review commissioning (issue #316)', () => {
     const events = h.ledger.listJobEvents('rev-gitref', { kinds: [BLIND_ACCESS_EVENT], order: 'asc' });
     // Everything recorded before the change is untouched; the two submissions are appended beside it.
     expect(events.slice(0, recordedBefore.length)).toEqual(recordedBefore);
-    const entry = { toolName: 'bash', code: 'excluded-path-read', path: '_bmad-output/implementation-artifacts/deferred-work.md' };
+    const entry = { toolName: 'bash', code: 'excluded-path-read', path: artifact };
     const withEntries = events.slice(recordedBefore.length).map((event) => (event.payload as { prohibited: unknown[] }).prohibited).filter((prohibited) => prohibited.length > 0);
     expect(withEntries).toEqual([[expect.objectContaining(entry)], [expect.objectContaining(entry)]]);
     expect(withEntries[1]).toEqual(withEntries[0]);
