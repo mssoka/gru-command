@@ -1166,14 +1166,14 @@ main-red-spawn-receipt-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx
 # registry pins. `-static` is the lint + typecheck + build gate; `-heavy`
 # re-runs the restart-recovery and dispatch-server suites that exercise the
 # redispatch fence and the extracted retirement preflight.
-canceled-request-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/board-server.test.ts test/directive-retirement.test.ts test/silas-deterministic-seam.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/suite-shape.test.ts test/prune-stale-dist.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/canceled-request-closeout.test.ts"
-canceled-request-closeout-static = "npm run lint && npm run typecheck && npm run build"
-canceled-request-closeout-heavy = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts test/dispatch-server.test.ts test/fix-directive.test.ts"
-canceled-request-closeout-new = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/canceled-request-closeout.test.ts"
+closeout-523 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/board-server.test.ts test/directive-retirement.test.ts test/silas-deterministic-seam.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/suite-shape.test.ts test/prune-stale-dist.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/canceled-request-closeout.test.ts"
+closeout-523-static = "npm run lint && npm run typecheck && npm run build"
+closeout-523-heavy = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts test/dispatch-server.test.ts test/fix-directive.test.ts"
+closeout-523-new = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/canceled-request-closeout.test.ts"
 # #523 evidence. `-before` runs the manual retire-then-bin cleanup in a scratch
 # extract of the base commit and asserts the residue the issue describes (the
 # card stays active, the mailbox still lists the incident); `-mutations`
 # disables one guard, step or call at a time in a scratch extract of the head
 # and requires the covering tests to fail (gru-output/gc-523-closeout).
-canceled-request-closeout-before = 'base=223ccbbbc2bd3a804728a2aefa1230a5b8af287a; root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-523-before.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp gru-output/gc-523-closeout/characterize-manual-bin.scratch.ts "$d/test/characterize-manual-bin.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; code=0; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/characterize-manual-bin.test.ts || code=$?; cd "$root"; rm -rf "$d"; exit $code'
-canceled-request-closeout-mutations = "node gru-output/gc-523-closeout/mutations.mjs"
+closeout-523-before = 'base=223ccbbbc2bd3a804728a2aefa1230a5b8af287a; root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-523-before.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp gru-output/gc-523-closeout/characterize-manual-bin.scratch.ts "$d/test/characterize-manual-bin.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; code=0; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/characterize-manual-bin.test.ts || code=$?; cd "$root"; rm -rf "$d"; exit $code'
+closeout-523-mutations = "node gru-output/gc-523-closeout/mutations.mjs"
