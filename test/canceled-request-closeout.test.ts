@@ -341,6 +341,7 @@ describe('canceled-request closeout — the redispatch fence (test 4)', () => {
     expect(admissions).not.toHaveBeenCalled();
     expect(ctx.spawns).toEqual([]);
     expect(cards(ctx)).toBe(before);
+    expectNoOwnerAttribution(ctx);
   });
 
   it('4b. a stopped intent (the S2 race): the same fence holds and reconsider skips the request', async () => {
@@ -360,6 +361,7 @@ describe('canceled-request closeout — the redispatch fence (test 4)', () => {
     expect(admissions).not.toHaveBeenCalled();
     expect(ctx.spawns).toEqual([]);
     expect(cards(ctx)).toBe(before);
+    expectNoOwnerAttribution(ctx);
   });
 
   it('4c. surfaceDirectiveRecovery posts no card for a request a closeout owes its end', async () => {
@@ -507,6 +509,7 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
     expect(fresh).not.toBeNull();
     expect(ctx.ledger.getDirective('req-fresh')).toEqual(fresh);
+    expectNoOwnerAttribution(ctx);
   });
 
   it('7c. an amendment accepted after S2 supersedes the intent (control-event)', async () => {
@@ -520,6 +523,7 @@ describe('canceled-request closeout — stale intent (test 7)', () => {
     expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'control-event' });
     expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'control-event' });
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
+    expectNoOwnerAttribution(ctx);
   });
 
   it('7d. a request retired by hand after S1 satisfies S2 (the manual retire path stays valid)', async () => {
@@ -544,21 +548,31 @@ describe('canceled-request closeout — a stale intent, further cases (test 7)',
     expect(ctx.ledger.hasPendingCloseout(ctx.requestId)).toBe(false);
     expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('failed');
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
+    expectNoOwnerAttribution(ctx);
   });
 
-  it('7f. a stopped intent whose basis changed is superseded although the same guard still blocks it', async () => {
+  it('7f. a stopped intent whose blockers are unchanged writes nothing even when its basis changed; once the guard clears it is superseded', async () => {
     const ctx = await deferred();
     let release = (): void => {};
     once(ctx, 'intent', () => { release = ctx.ledger.beginJobAdmission(ctx.jobId, 'late admission'); });
-    expect(bodyOf(mustRequest(ctx))).toMatchObject({ error: 'request_closeout_stopped' });
+    const stopped = mustRequest(ctx);
+    expect(bodyOf(stopped)).toMatchObject({ error: 'request_closeout_stopped' });
     cleanups.push(() => release());
     ctx.ledger.setJobStatus(ctx.jobId, 'delivered');
-    // The admission still holds the lane, so the blockers are unchanged; the job status is not.
-    const superseded = mustRequest(ctx);
-    expect(bodyOf(superseded)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'job-status' });
+    // The admission still holds the lane, so the blockers are unchanged: nothing is written and the answer stands.
+    const seq = ctx.ledger.latestEventSeq();
+    expect(mustRequest(ctx)).toEqual(stopped);
+    expect(ctx.closeout.resumePending()).toMatchObject({ examined: 1, untouched: 1, superseded: 0 });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)?.state).toBe('stopped');
+    // The readback says what the next request would do.
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: false });
+    release();
+    // The guard cleared: the intent resumes, finds the job status changed and is superseded (the fence is lifted).
+    expect(ctx.closeout.resumePending()).toMatchObject({ examined: 1, superseded: 1, completed: 0 });
     expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'job-status' });
     expect(ctx.ledger.hasPendingCloseout(ctx.requestId)).toBe(false);
-    expect(ctx.closeout.resumePending()).toMatchObject({ examined: 0 });
+    expectNoOwnerAttribution(ctx);
   });
 
   it('7g. a job binned by another writer while its intent is stopped answers the binned retry with the plain 200', async () => {
@@ -572,6 +586,7 @@ describe('canceled-request closeout — a stale intent, further cases (test 7)',
     expect(request(ctx)).toBeNull();
     expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'job-status' });
     expect(ctx.ledger.setJobStatus(ctx.jobId, 'binned').status).toBe('binned');
+    expectNoOwnerAttribution(ctx);
   });
 });
 
@@ -833,19 +848,25 @@ describe('canceled-request closeout — shared eligibility (test 10)', () => {
     expect(view.blockers).toEqual(view.intent?.blockers);
     release();
     expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
+    expectNoOwnerAttribution(ctx);
   });
 });
 
 describe('canceled-request closeout — the readback path (test 10)', () => {
-  it('10c. only the request the closeout path names reads back as closeout; an earlier request of the job reads as binning', async () => {
+  it('10c. the path is the job\'s: every request of an eligible job reads closeout, each with its own latest intent', async () => {
     const ctx = await deferred();
     retireByHand(ctx);
     ctx.ledger.beginRebriefIntent({ jobId: ctx.jobId, note: 'second try', holder: 'silas-ops', requestId: 'req-second' });
     expect(ctx.ledger.claimDirectiveDispatch('req-second')).toBe(true);
     const start = ctx.ledger.latestJobEventByRequestId(ctx.jobId, 'silas.directive-dispatch-started', 'req-second')!;
     ctx.ledger.recordDirectiveDispatchDeferral(ctx.ledger.directiveTurnIdentity('req-second'), start.seq, 'deferred again');
-    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false, blockers: [] });
-    expect(ctx.closeout.describe('req-second')).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: true, blockers: [], intent: null });
+    expect(ctx.closeout.describe('req-second')).toMatchObject({ path: 'closeout', eligible: true, blockers: [], intent: null });
+    // A binning request closes out the request the rule names, and the earlier request's own intent stays null.
+    expect(mustRequest(ctx).status).toBe(200);
+    expect(ctx.ledger.latestCloseoutForRequest('req-second')).toMatchObject({ state: 'complete' });
+    expect(ctx.ledger.latestCloseoutForRequest(ctx.requestId)).toBeNull();
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
   });
 
   it('10d. a request an open or stopped intent owes its end reads back as the closeout path after S2 too, with the S3 blockers', async () => {
@@ -862,6 +883,22 @@ describe('canceled-request closeout — the readback path (test 10)', () => {
     expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
     expect(mustRequest(ctx).status).toBe(200);
     expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
+    expectNoOwnerAttribution(ctx);
+  });
+});
+
+describe('canceled-request closeout — the readback of a stale intent (test 10)', () => {
+  it('10e. an open intent whose basis changed reads as not eligible, and the next binning request supersedes it', async () => {
+    const ctx = await deferred();
+    crashAt(ctx, 'intent');
+    expect(() => request(ctx)).toThrow('crash after intent');
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'closeout', eligible: true, blockers: [] });
+    ctx.ledger.failDirective({ requestId: ctx.requestId, reason: 'refused before any prompt' });
+    const view = ctx.closeout.describe(ctx.requestId);
+    expect(view).toMatchObject({ path: 'closeout', eligible: false });
+    expect(view.blockers).toEqual([{ code: 'intent_stale', detail: expect.stringContaining('request-state') }]);
+    expect(bodyOf(mustRequest(ctx))).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'request-state' });
+    expectNoOwnerAttribution(ctx);
   });
 });
 

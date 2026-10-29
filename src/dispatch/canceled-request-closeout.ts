@@ -143,12 +143,7 @@ export class CanceledRequestCloseout {
    * `terminalLiveWorkBlockers` lists the request itself while it is
    * `dispatching`, so it stays inside `setJobStatus` as the S3 race refusal. */
   evaluateCloseout(jobId: string): CloseoutEvaluation {
-    const { ledger } = this.deps;
-    // An open or stopped intent keeps its job on the closeout path: a binning
-    // request resumes it, and what refuses is the step it is waiting on.
-    const active = ledger.activeCloseoutForJob(jobId);
-    if (active !== null) return { path: 'closeout', request: ledger.getDirective(active.requestId), blockers: this.currentBlockers(active) };
-    const request = ledger.closeoutCandidate(jobId);
+    const request = this.deps.ledger.closeoutCandidate(jobId);
     if (request === null) return { path: 'binning', request: null, blockers: [] };
     return { path: 'closeout', request, blockers: this.retirementBlockers(request) };
   }
@@ -165,15 +160,27 @@ export class CanceledRequestCloseout {
   }
 
   /** The readback of one request: which path a binning request would take
-   * for its job, whether the closeout would proceed, and its latest intent. */
+   * for its job, whether the closeout would proceed, and the request's latest
+   * intent. An `open` or `stopped` intent keeps its job on the closeout path
+   * (a binning request resumes it) and what refuses is the step it waits on:
+   * after S2 the live work binning would meet, and an intent whose basis no
+   * longer holds reads as not eligible, because the next binning request
+   * supersedes it instead of completing it. */
   describe(requestId: string): { readonly path: 'closeout' | 'binning'; readonly eligible: boolean; readonly blockers: readonly CloseoutBlocker[]; readonly intent: CloseoutIntent | null } {
     const { ledger } = this.deps;
     const row = ledger.getDirective(requestId);
     const intent = ledger.latestCloseoutForRequest(requestId);
-    const evaluation = row === null ? null : this.evaluateCloseout(row.jobId);
-    // The closeout path names one request of the job; any other request reads as plain binning.
-    if (evaluation === null || evaluation.request?.requestId !== requestId) return { path: 'binning', eligible: false, blockers: [], intent };
-    return { path: 'closeout', eligible: evaluation.blockers.length === 0, blockers: evaluation.blockers, intent };
+    if (row === null) return { path: 'binning', eligible: false, blockers: [], intent };
+    const active = ledger.activeCloseoutForJob(row.jobId);
+    if (active !== null) {
+      const waiting = this.currentBlockers(active);
+      const stale = waiting.length > 0 ? null : ledger.closeoutStaleness(active.closeoutId);
+      const blockers = stale === null ? waiting
+        : [{ code: 'intent_stale', detail: `the closeout intent no longer describes the job (${stale}) — the next binning request supersedes it` }];
+      return { path: 'closeout', eligible: blockers.length === 0, blockers, intent };
+    }
+    const evaluation = this.evaluateCloseout(row.jobId);
+    return { path: evaluation.path, eligible: evaluation.path === 'closeout' && evaluation.blockers.length === 0, blockers: evaluation.blockers, intent };
   }
 
   /** Route a binning request (`POST /api/jobs/{id}/status` `{"status":"binned"}`).
@@ -242,18 +249,13 @@ export class CanceledRequestCloseout {
   /** Resume one active intent. A `stopped` intent whose blockers are
    * unchanged is left alone (`null`): no event, no card. */
   private resume(intent: CloseoutIntent): DriveOutcome | null {
-    if (intent.state === 'stopped') {
-      // Whatever still blocks it, an intent whose basis changed no longer describes the job.
-      const stale = this.deps.ledger.supersedeStaleCloseout(intent.closeoutId);
-      if (stale !== null) return { kind: 'superseded', intent: stale };
-      if (closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;
-    }
+    if (intent.state === 'stopped' && closeoutBlockerFingerprint(this.currentBlockers(intent)) === intent.blockerFingerprint) return null;
     return this.drive(intent);
   }
 
   /** What would refuse the step the intent is waiting on: the retirement
    * guards while the request is still `dispatching`, the live work binning
-   * refuses once it is retired. A stale intent has none: `drive` supersedes it. */
+   * refuses once it is retired. An intent that is stale has none: `drive` supersedes it. */
   private currentBlockers(intent: CloseoutIntent): readonly CloseoutBlocker[] {
     const request = this.deps.ledger.getDirective(intent.requestId);
     if (request === null) return [];

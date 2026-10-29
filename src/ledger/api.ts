@@ -10696,17 +10696,13 @@ export class LedgerApi {
     });
   }
 
-  /** A `stopped` intent is looked at again without taking a step: when the
-   * facts it was made against no longer hold (whatever still blocks it), it is
-   * superseded and its fence lifted. Returns the superseded intent, or null
-   * when the intent still stands. */
-  supersedeStaleCloseout(closeoutId: string): CloseoutIntent | null {
-    return this.transaction(() => {
-      const intent = this.activeCloseoutOrThrow(closeoutId);
-      const retired = this.getDirective(intent.requestId)?.state === 'retired';
-      const stale = this.closeoutStaleReason(intent, retired ? 'bin' : 'retire');
-      return stale.reason === null ? null : this.supersedeCloseout(intent, stale.reason);
-    });
+  /** Why an active intent no longer describes the job (the first failing
+   * revalidation predicate), or null while it still does. A read: nothing is
+   * superseded here; the next step does that. */
+  closeoutStaleness(closeoutId: string): CloseoutSupersededReason | null {
+    const intent = this.activeCloseoutOrThrow(closeoutId);
+    const retired = this.getDirective(intent.requestId)?.state === 'retired';
+    return this.closeoutStaleReason(intent, retired ? 'bin' : 'retire').reason;
   }
 
   /** The blockers binning would meet right now: the live work `setJobStatus`
