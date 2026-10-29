@@ -24,7 +24,6 @@ import process from 'node:process';
 const print = (text) => process.stdout.write(`${text}\n`);
 
 const root = process.cwd();
-const only = process.argv.includes('--only') ? new Set(process.argv[process.argv.indexOf('--only') + 1].split(',')) : null;
 
 const FILE = 'test/creation-continuation.test.ts';
 const RESTART = 'across a real ledger close and reopen';
@@ -78,6 +77,18 @@ const MUTATIONS = [
       { file: API, find: LEDGER_DEDUPE, replace: "      const prior = undefined as EventRecord[] | undefined;\n      if (prior !== undefined) {" },
     ], fails: [ABORT], holds: [] },
 ];
+
+// --only names mutations to run; an absent value or an unknown id is refused by
+// name, so a typo can never read as a pass with nothing proven.
+const ids = MUTATIONS.map((mutation) => mutation.id);
+let only = null;
+if (process.argv.includes('--only')) {
+  const value = process.argv[process.argv.indexOf('--only') + 1];
+  if (value === undefined || value.startsWith('--')) throw new Error(`--only needs a comma-separated list of mutation ids (${ids.join(', ')})`);
+  only = new Set(value.split(','));
+  const unknown = [...only].filter((id) => !ids.includes(id));
+  if (unknown.length > 0) throw new Error(`--only names unknown mutation id(s) ${unknown.join(', ')}; valid ids: ${ids.join(', ')}`);
+}
 
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -175,4 +186,5 @@ try {
 print('\n| Mutation | Disabled | Must fail | Must still pass | Verdict | Restored |\n|---|---|---|---|---|---|');
 for (const row of rows) print(`| ${row.id} | ${row.what} | ${row.fails.join('; ')} | ${row.holds.join('; ')} | ${row.verdict} | ${row.restored ? 'yes' : 'NO'} |`);
 print(`\n${rows.filter((row) => row.verdict === 'killed').length}/${rows.length} mutations killed`);
+if (rows.length === 0) { print('no mutation ran: nothing is proven'); exitCode = 1; }
 process.exit(exitCode);
