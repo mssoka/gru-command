@@ -6535,7 +6535,7 @@ async function assertGuardedSdkDelivery(resume: boolean) {
 it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver #contract:native-directive-admission:pi', () => assertGuardedSdkDelivery(false));
 it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
 
-async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'branch-model-await' | 'branch-hook' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode') {
+async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'branch-model-await' | 'branch-hook' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode' | 'manifest-effective-prompt') {
   const hook = fault === 'prior-hook-await' || fault.endsWith('-hook');
   const manifest = fault.startsWith('manifest-');
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
@@ -6593,6 +6593,7 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
       if (fault.startsWith('manifest-role')) rewriteSystemPrompt(session, 'unapproved live system authority');
       else if (fault.startsWith('manifest-model')) session.agent.state.model = { ...session.model!, maxTokens: session.model!.maxTokens - 1 };
       else if (fault === 'manifest-execution-mode') session.agent.toolExecution = 'parallel';
+      else if (fault === 'manifest-effective-prompt') rewriteEffectivePrompt(session, 'unapproved effective prompt');
       else session.agent.state.tools = session.agent.state.tools.filter((tool) => tool.name !== 'read');
       expect(f.scene.ledger.directiveTurnIdentity(active.requestId)).toEqual(f.scene.identity);
     } else if (fault.startsWith('branch-')) {
@@ -6609,6 +6610,8 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
     if (manifest) {
       expect(f.fx.script.calls).toHaveLength(1); // last-effect refusal also fences the next model request
       expect(readFileSync(`${active.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('guard-refused');
+      // The transcript is untouched, so only the manifest's prompt term can refuse this one.
+      if (fault === 'manifest-effective-prompt') expect(readFileSync(`${active.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('role/tools/model authority changed before effect or completion');
       const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
       const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
       await service?.dispose(); service = null; f.scene.db.close();
@@ -6678,6 +6681,14 @@ function rewriteSystemPrompt(session: AgentSession, text: string): void {
   const [leading, ...rest] = session.agent.state.messages;
   if (leading?.role !== 'system') throw new Error('expected the session transcript to lead with its system message');
   session.agent.state.messages = [{ ...leading, content: text }, ...rest];
+}
+
+/** The SDK's effective prompt (`session.systemPrompt`) changes without a persisted
+ * patch when the options it is built from change (a reload, a tool change). */
+function rewriteEffectivePrompt(session: AgentSession, text: string): void {
+  const sdk = session as unknown as { _runSystemPromptOptions?: { appendSystemPrompt?: string }; readonly _baseSystemPromptOptions: { appendSystemPrompt?: string } };
+  (sdk._runSystemPromptOptions ?? sdk._baseSystemPromptOptions).appendSystemPrompt = text;
+  if (!session.systemPrompt.includes(text)) throw new Error('the effective prompt does not carry the rewritten option');
 }
 
 /** What a real pi 1.x host persists directly ahead of a session's first
@@ -6960,6 +6971,7 @@ it('actual SDK post-commit refusal journal failure fsync-retries exact receipts 
 
 it('real SDK system mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-role'));
 it('real SDK tools mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-tools'));
+it('real SDK effective-prompt change with the transcript untouched is refused by the authority manifest before native effects and the next model request', () => assertProductionSdkFence(false, 'manifest-effective-prompt'));
 it('real SDK system mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-role-hook'));
 it('real SDK model mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-model-hook'));
 

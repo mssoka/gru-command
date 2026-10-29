@@ -412,6 +412,27 @@ describe('transcript service', () => {
     ]);
   });
 
+  it('a pi 1.x session file\'s cache-warm usage and context-edit entries are no conversation: they yield no transcript entry and are not torn lines (#521)', () => {
+    const { dir, svc } = tmpStore();
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    const warm = {
+      type: 'usage', id: 'warm-1', parentId: 'a1', timestamp: T0, kind: 'cache_warm', provider: 'anthropic', model: 'fixture-model',
+      usage: { input: 1, output: 1, cacheRead: 9, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    const omit = { type: 'context_edit', id: 'omit-1', parentId: 'warm-1', timestamp: T0, targetId: 'a1', replacement: null };
+    writeFileSync(
+      join(dir, 'sessions', 'minion', 'd', 'pi-1x-entries.jsonl'),
+      sessionFile([header(), userEntry('u1', null, 'hello'), assistantEntry('a1', 'u1', 'hi there', 'greet back'), warm, omit, userEntry('u2', 'omit-1', 'again')]),
+    );
+    const result = svc.read('minion/d/pi-1x-entries.jsonl');
+    expect(result.tornLines).toBe(0);
+    expect(result.entries.map((entry) => [entry.index, entry.kind, entry.text])).toEqual([
+      [0, 'user', 'hello'],
+      [1, 'assistant', 'hi there'],
+      [2, 'user', 'again'],
+    ]);
+  });
+
   it('an empty session file pages cleanly (total 0)', () => {
     const { dir, svc } = tmpStore();
     mkdirSync(join(dir, 'sessions', 'gru', 'd'), { recursive: true });

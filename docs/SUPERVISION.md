@@ -129,12 +129,17 @@ only in the form it is written in, linked on the chain:
   writer's authority change. The authority manifest binds the prompt the run
   carries (the SDK's effective prompt). Before the receipt and the first
   request (over the stored messages plus the prompt patch the SDK hands the
-  run), at admission, and before a continuation, the transcript's replayed
-  prompt must be that prompt (the same sections, in whatever order the
-  transcript first wrote them): text a persisted system message carries
-  beyond it would reach the model unapproved, so it refuses the directive by
-  name. From admission on, the replay may not change for the rest of the
-  turn;
+  run), at admission, and before a continuation, the prompt the transcript
+  replays (the net of all its system messages) must be that prompt (the same
+  sections, in whatever order the transcript first wrote them): text that
+  survives the replay beyond it, such as a persisted `content` the SDK never
+  corrects, would reach the model unapproved, so it refuses the directive by
+  name. The check bounds the net replay, not each persisted message: an
+  earlier system message is history, like an earlier turn, and the SDK
+  rewrites a stale section or tool declaration with a corrective patch (the
+  agent loop reconciles the transcript's tools with the live ones before
+  every request). From admission on, the replay may not change for the rest
+  of the turn;
 - **omitting context edits:** before Pi retries a failed reply, or compacts
   and retries it, it durably omits that reply from the model's context with a
   `context_edit` entry (null replacement) linked on it. The edit is part of
