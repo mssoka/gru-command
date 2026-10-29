@@ -470,21 +470,31 @@ describe('same-job retained initial-creation continuation', () => {
     // The request is recorded after the inspection returns, whoever is still listening.
     await vi.waitFor(() => { expect(api.ledger.getCreationContinuation(api.jobId, body.request_id)).not.toBeNull(); });
     const recorded = api.ledger.getCreationContinuation(api.jobId, body.request_id)!;
+    const durable = () => {
+      const events = continuations().map((event) => event.payload as Record<string, unknown>);
+      return {
+        requestIds: [...new Set(events.map((payload) => payload['request_id']))],
+        generations: [...new Set(events.map((payload) => payload['generation']))],
+        accepted: events.filter((payload) => payload['stage'] === 'accepted').length,
+      };
+    };
+    expect(durable()).toEqual({ requestIds: [body.request_id], generations: [1], accepted: 1 });
     expect(recorded.identity.generation).toBe(1);
+
+    // The client retries with the same id: it reads that request back and records nothing new.
     const retry = await request(api.base, 'POST', body);
+    expect(durable()).toEqual({ requestIds: [body.request_id], generations: [1], accepted: 1 });
     expect(retry.status).toBe(200);
     expect(retry.body['readback']).toMatchObject({ job_id: api.jobId, request_id: body.request_id, generation: 1, payload_sha256: recorded.identity.payloadSha256 });
     const readback = await waitForState(api.base, api.jobId, body.request_id, 'delivered');
     expect(readback).toMatchObject({ generation: 1, active: false, admission: { agent_id: api.spawns[0] } });
 
-    const requests = new Set(continuations().map((event) => (event.payload as Record<string, unknown>)['request_id']));
-    expect([...requests]).toEqual([body.request_id]);
-    expect(new Set(continuations().map((event) => (event.payload as Record<string, unknown>)['generation']))).toEqual(new Set([1]));
-    expect(continuations().filter((event) => (event.payload as Record<string, unknown>)['stage'] === 'accepted')).toHaveLength(1);
+    expect(durable()).toEqual({ requestIds: [body.request_id], generations: [1], accepted: 1 });
     expect(api.spawns).toHaveLength(1);
     expect(api.prompts).toHaveLength(1);
     expect(api.ledger.listJobEventsByKinds(api.jobId, ['job.minion-spawned'])).toHaveLength(1);
     expect(api.ledger.listJobEventsByKinds(api.jobId, ['job.handoff'], { limit: 5 })).toHaveLength(1);
+    // A client leaving is not a server fault.
     expect(logs.filter((entry) => entry.level === 'error')).toEqual([]);
   });
 
