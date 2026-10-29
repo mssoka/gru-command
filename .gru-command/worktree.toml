@@ -1196,3 +1196,16 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts && npx vitest run test/review-ci-evidence.test.ts test/gitlab-mr-read.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-519-static = "npm run lint && npm run typecheck && npm run build"
 gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
+# #532 committed-ref close wait: the Git child that has confirmed `commit` gets
+# `committedRefCloseMs` (default 30 s) to close; every other wait stays 1 s.
+# `-focused` is the edited custody/continuation/Git-environment suites plus the
+# worktree manager suite and the registry pins; `-static` is the lint +
+# typecheck + build gate; `-red` runs the slow-close test alone (A1) against a
+# `git archive` extract of the base commit with the candidate test and helper
+# copied in, and is expected to fail there.
+# `-mutants` changes one bound at a time in a scratch extract of the head and
+# requires the tests that guard it to fail (gru-output/gc-532-git-close-wait).
+gc-532-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/creation-continuation.test.ts test/creation-continuation-custody.test.ts test/review-git-environment.test.ts test/worktree-manager.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-532-static = "npm run lint && npm run typecheck && npm run build"
+gc-532-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-532-red.XXXXXX"); trap "rm -rf -- $d" EXIT; git archive "$base" | tar -x -C "$d"; cp test/creation-continuation-custody.test.ts "$d/test/creation-continuation-custody.test.ts"; cp test/helpers/creation-continuation.ts "$d/test/helpers/creation-continuation.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-532 RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts test/creation-continuation-custody.test.ts --testNamePattern "creates the job when a committed Git child closes after the old one-second bound"'
+gc-532-mutants = "node tools/patch-vitest-rpc-timeout.mjs && node gru-output/gc-532-git-close-wait/mutations.mjs"

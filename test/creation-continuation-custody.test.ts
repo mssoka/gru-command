@@ -10,7 +10,7 @@ import { clearCreationIntent, readCreationIntent, writeCreationIntent } from '..
 import type { LogLevel } from '../src/logger.js';
 import { attachBareOrigin } from './helpers/fixture-repo.js';
 import {
-  acceptDirectly, cleanupContinuationFixtures, committedExitWithoutClose, committedStall, directory, fakeHandle, git, hasRawCreationToken, httpHarness,
+  acceptDirectly, cleanupContinuationFixtures, committedExitWithoutClose, committedSlowClose, committedStall, directory, fakeHandle, git, hasRawCreationToken, httpHarness,
   managerFixture, processGone, receiptFiles, request, retainedFixture, sha256, syntheticRetained, TOKEN, waitForState, type RetainedFixture,
 } from './helpers/creation-continuation.js';
 
@@ -92,7 +92,7 @@ const settlements = (h: Pick<RetainedFixture, 'ledger'>, jobId: string) => h.led
 
 describe('retained-creation continuation custody', () => {
   it('settles an exited Git producer once, only after the holder of its pipes releases them, and the continuation is then admissible', async () => {
-    const h = managerFixture('late-close');
+    const h = managerFixture('late-close', { committedRefCloseMs: 1_000 });
     const jobId = 'late-close';
     const { holder, release } = await exitedWithoutClose(h, jobId);
     expect(processGone(holder)).toBe(false);
@@ -111,7 +111,7 @@ describe('retained-creation continuation custody', () => {
   });
 
   it('never counts the close its own released pipes cause as producer settlement', async () => {
-    const h = managerFixture('released-close', { creationCloseWindowMs: 100 });
+    const h = managerFixture('released-close', { creationCloseWindowMs: 100, committedRefCloseMs: 1_000 });
     const jobId = 'released-close';
     const { holder, release } = await exitedWithoutClose(h, jobId);
     // A timer due after the 100 ms window: the window has released the pipes.
@@ -150,6 +150,35 @@ describe('retained-creation continuation custody', () => {
     expect(h.ledger.getWorktree(jobId)).toMatchObject({ status: 'active', branch: `gru/${jobId}` });
     expect(receiptFiles(h.repo)).toHaveLength(0);
     expect(sink.entries).toContainEqual(expect.objectContaining({ level: 'error', msg: expect.stringMatching(/producer settlement could not be recorded/u) }));
+  });
+
+  it('creates the job when a committed Git child closes after the old one-second bound (#532)', async () => {
+    const h = managerFixture('slow-committed-close');
+    const jobId = 'slow-committed-close';
+    const restore = committedSlowClose(1_500);
+    const prompts: string[] = [];
+    const dispatch = new DispatchService({ ledger: h.ledger, worktrees: h.worktrees, spawner: async () => fakeHandle('slow-close-minion', prompts) });
+    const outcome = await dispatch.dispatch({ jobId, repoPath: h.repo.path, title: 'slow close', briefing: 'slow close briefing' });
+    expect(await outcome.settled).toEqual({ ok: true });
+    vi.stubEnv('PATH', restore);
+    expect(h.ledger.getJob(jobId)?.status).toBe('delivered');
+    expect(h.ledger.getWorktree(jobId)).toMatchObject({ status: 'active', branch: `gru/${jobId}` });
+    expect(receiptFiles(h.repo)).toHaveLength(0);
+    expect(settlements(h, jobId)).toHaveLength(1);
+    expect(settlements(h, jobId)[0]!.payload).toMatchObject({ close_observed: true, exit_code: 0, signal: null });
+  });
+
+  it('names the committed close bound it used when a committed Git child never closes (#532)', async () => {
+    const h = managerFixture('committed-bound-named', { committedRefCloseMs: 1_250 });
+    const jobId = 'committed-bound-named';
+    h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Original briefing ${jobId}` });
+    h.ledger.setJobStatus(jobId, 'working');
+    const restore = committedStall();
+    await expect(h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId })).rejects.toThrow(/did not close within 1250ms/u);
+    vi.stubEnv('PATH', restore);
+    expect(h.ledger.getWorktree(jobId)).toBeNull();
+    expect(git(h.repo, ['rev-parse', `refs/heads/gru/${jobId}`])).toBe(git(h.repo, ['rev-parse', 'HEAD']));
+    expect(receiptFiles(h.repo)).toHaveLength(1);
   });
 
   it('runs the configured setup in the continuation lane', async () => {
@@ -814,7 +843,7 @@ describe('retained-creation continuation custody', () => {
   });
 
   it('continues a job dispatched through a symlinked repository path, and the ledger ties the path to its realpath', async () => {
-    const h = managerFixture('symlinked-repository');
+    const h = managerFixture('symlinked-repository', { committedRefCloseMs: 1_000 });
     const alias = join(directory(), 'linked-checkout');
     symlinkSync(h.repo.path, alias);
     const jobId = 'symlinked-repository';
@@ -891,7 +920,7 @@ describe('retained-creation continuation custody', () => {
   });
 
   it('reads failed before the manager when the handoff symlink is gone at the floor, and a later request proceeds once it is back', async () => {
-    const h = managerFixture('symlink-gone-at-floor');
+    const h = managerFixture('symlink-gone-at-floor', { committedRefCloseMs: 1_000 });
     const alias = join(directory(), 'linked-checkout');
     symlinkSync(h.repo.path, alias);
     const jobId = 'symlink-gone-at-floor';
