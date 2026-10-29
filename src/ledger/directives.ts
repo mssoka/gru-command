@@ -282,12 +282,14 @@ export function directiveRecoveryIdentityLine(requestId: string, generation: num
 
 /** A recovery card's identity line, or null when its detail does not start
  * with one for the request its kind names (a card written before the line
- * existed, another producer's card, or a line naming another request). */
+ * existed, another producer's card, or a line naming another request). The
+ * request id is matched whole, so one that holds a newline still reads. */
 export function directiveRecoveryCardIdentity(card: { readonly kind: string; readonly detail: string | null }): string | null {
   if (!card.kind.startsWith(DIRECTIVE_RECOVERY_CARD_PREFIX) || card.detail === null) return null;
-  const first = card.detail.split('\n', 1)[0] ?? '';
   const prefix = `incident: ${card.kind.slice(DIRECTIVE_RECOVERY_CARD_PREFIX.length)} generation `;
-  return first.startsWith(prefix) && /^\d+$/u.test(first.slice(prefix.length)) ? first : null;
+  if (!card.detail.startsWith(prefix)) return null;
+  const generation = /^\d+(?=\n|$)/u.exec(card.detail.slice(prefix.length));
+  return generation === null ? null : `${prefix}${generation[0]}`;
 }
 
 /** Producer-custody uncertainty a supervisor or ledger reports: a producer

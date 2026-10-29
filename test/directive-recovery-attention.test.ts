@@ -354,6 +354,23 @@ describe('directive recovery card attention — edges (#523)', () => {
     expect((await mailboxItemOf(rig, foreign.id)).basis).not.toBe(foreignBase);
   });
 
+  it('a request id that holds a newline still gets one card per generation and a stable basis', async () => {
+    const rig = await boot();
+    const requestId = 'req-e7\nsecond-line';
+    seed(rig, 'job-e7', requestId);
+    const { generation } = rig.api.openDirectiveRecoveryDebt(requestId, 'recovery owed');
+    surface(rig, requestId, 'first blocker');
+    const card = activeCard(rig, requestId);
+    expect(card.detail!.startsWith(`${identity(requestId, generation)}\n`)).toBe(true);
+    const before = await mailboxItemOf(rig, card.id);
+    surface(rig, requestId, 'second blocker');
+    expect(activeCard(rig, requestId).detail).toContain('second blocker');
+    expect((await mailboxItemOf(rig, card.id)).basis).toBe(before.basis);
+    rig.api.resolveNotificationById(card.id, 'gru');
+    surface(rig, requestId, 'second blocker');
+    expect(rowsOf(rig, requestId).map((row) => row.id)).toEqual([card.id]);
+  });
+
   it('the rebrief family signal and the colon-scoped families are unchanged', () => {
     const row = (kind: string) => ({ kind, title: 'x', routing: 'action-required' as const });
     expect(incidentSignalOf(row('silas.rebrief-unreconciled.job-1'))).toBe('rebrief-unreconciled');

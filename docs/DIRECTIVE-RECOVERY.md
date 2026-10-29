@@ -179,7 +179,8 @@ incident per request and recovery-debt generation, not one per pass:
 - **Identity line.** The first line of its detail is
   `incident: <request_id> generation <n>`, where `<n>` is the generation of
   the recovery debt the pass just opened. The rest of the detail, the reason
-  text included, is as before.
+  text included, is as before. (A request id that itself contains a newline
+  is matched by the whole line text, not by its first physical line.)
 - **No reissue.** When no card of the kind is active and the newest card of
   the kind, in any state, carries the same identity line, the pass posts
   nothing: resolving the card (for example `POST
@@ -207,19 +208,32 @@ incident per request and recovery-debt generation, not one per pass:
   to `directive-unreconciled`, as it maps the rebrief kind to
   `rebrief-unreconciled`, so a decision's `covers` fits the 64-character
   signal bound whatever the request id. Subject and basis checks of decisions
-  and mailbox dispositions are unchanged, and the kind stays a hard floor: a
-  decision hold never defers its wake.
+  and mailbox dispositions are unchanged (the subject,
+  `incident:<kind>:<title>`, keeps its own 256-character bound, so a request
+  id of roughly 137 characters or more still cannot be named as a decision
+  subject), and the kind stays a hard floor: a decision hold never defers its
+  wake.
 - **Unchanged.** The terminal-job card (`observeTerminalJobDirective`), the
   boot reconcile card (`reconcilePendingDirectives`) and the
   `silas.rebrief-unreconciled.*` kind write no identity line and keep their
-  behavior; so do the closeout's suppression and resolve (above).
+  behavior; so do the closeout's suppression and resolve (see *Canceled-request
+  closeout (#523)* below). Both card writers can act on the same legacy
+  request: the boot card posted over an open card replaces its detail, so the
+  card loses its identity line (and its mailbox basis falls back to the
+  detail) until the next pass writes the line again, and a boot card posted
+  after Gru resolved the pass's card is a new card, as before.
 - **Upgrade effects.** An existing card without the line counts as another
   identity, so one more card may be posted once per request after the upgrade
-  (when the old one was resolved); an open card the new code refreshes gains
-  the line and its mailbox basis changes once; a decision or disposition
-  recorded against an old long-form signal
-  (`directive-unreconciled.<request>`) stops matching once, and is recorded
-  again against `directive-unreconciled`.
+  (when the old one was resolved). The signal is part of a mailbox item's
+  basis, so every open `silas.directive-unreconciled.*` card's item (the
+  terminal-job and boot cards included, with or without the line) takes a new
+  basis once at the upgrade: a mailbox disposition recorded before it stops
+  matching, the item reads `needs-gru` again and its attention key changes, so
+  Gru is notified once more; read the item and record the disposition again.
+  An open card without the line gains it the first time a pass refreshes it,
+  which changes its basis once more. A decision recorded with `covers` of the
+  old long-form signal (`directive-unreconciled.<request>`) stops covering and
+  is recorded again with `directive-unreconciled`.
 
 ## After retirement: the continuation hold
 
