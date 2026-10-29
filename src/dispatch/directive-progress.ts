@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import type { LedgerApi } from '../ledger/api.js';
-import { LIVE_DIRECTIVE_STATES, isDirectiveTerminal } from '../ledger/directives.js';
+import { DIRECTIVE_RECOVERY_CARD_PREFIX, LIVE_DIRECTIVE_STATES, directiveRecoveryCardIdentity, directiveRecoveryIdentityLine, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
@@ -475,9 +475,18 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
   const debt = deps.ledger.openDirectiveRecoveryDebt(requestId, reason);
   const current = deps.ledger.directiveCurrentAuthority(row.jobId);
   const custody = deps.ledger.directiveCustodyGaps(row);
-  postRecoveryIncident(deps.notifications, { kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
+  const kind = `${DIRECTIVE_RECOVERY_CARD_PREFIX}${requestId}`;
+  const identityLine = directiveRecoveryIdentityLine(requestId, debt.generation);
+  // Gru resolved the card for this request and debt generation, and nothing about
+  // either changed since: a new pass does not raise it again (#523). A card of
+  // another generation, or one written before the identity line, is not that answer.
+  if (deps.ledger.findNotificationByKind(kind, 'active') === null) {
+    const newest = deps.ledger.latestNotificationByKind(kind);
+    if (newest !== null && directiveRecoveryCardIdentity(newest) === identityLine) return;
+  }
+  postRecoveryIncident(deps.notifications, { kind, routing: 'action-required', severity: 'error',
     title: `Directive ${requestId}: concrete Gru recovery decision owed (job ${row.jobId})`,
-    detail: `Request ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
+    detail: `${identityLine}\nRequest ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
       `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}. Inspect GET /api/silas/directives/${requestId}, ` +
       (custody.length > 0
         ? `but its producer custody is unknown (${custody.join('; ')}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`

@@ -1186,3 +1186,17 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
+
+# #523 second PR: the reconsider-driven directive recovery card is not raised
+# again after Gru resolves it, keeps a recorded mailbox disposition across a
+# text-only refresh and has a decision signal that fits the decision API.
+# `-focused` is the new suite plus the registry pins; `-static` is the lint +
+# typecheck + build gate. `-red` (gru-output/gc-523-attention/red.sh) archives
+# the dispatch base and runs the fail-before tests A1-A6 against the base
+# source: it exits 1 (vitest's red) by design, and only those six run; a
+# failed setup exits 2. The neighbouring suites (refresh in place,
+# terminal-job replacement, markers, closeout suppression, mailbox, decisions)
+# run in `full`.
+gc-523-attention-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-recovery-attention.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-523-attention-static = "npm run lint && npm run typecheck && npm run build"
+gc-523-attention-red = "sh gru-output/gc-523-attention/red.sh"
