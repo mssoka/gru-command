@@ -2346,6 +2346,60 @@ if (argv.includes('POST')) {
     }
   });
 
+  it('keeps the one-second close wait of a failure before commit when the committed close bound is longer (#532)', async () => {
+    const repo = fixture('issue-532-pre-commit');
+    // manager() pins the committed bound to 1 s for the stall tests, which would hide a merged bound.
+    const { ledger, root } = manager();
+    const worktrees = new WorktreeManager({ ledger, root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [], committedRefCloseMs: 30_000 });
+    ledger.addJob({ id: 'bounded-job', repo: 'assigned', title: 'bounded', baseBranch: 'main' });
+    // The proxy outlives the abort and leaves on its own after 6 s: only a 1 s wait signals it first.
+    const proxy = transactionProxy(repo, 'protocol');
+    vi.stubEnv('PATH', `${proxy.root}:${process.env.PATH ?? ''}`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'bounded-job' })).rejects.toThrow(/invalid prepare confirmation/);
+    await vi.waitFor(() => expect(readFileSync(proxy.term, 'utf8')).toBe('owned SIGTERM'));
+    await vi.waitFor(() => expect(() => process.kill(JSON.parse(readFileSync(proxy.proof, 'utf8')).pid, 0)).toThrow());
+  });
+
+  it('waits 30 s by default for a committed close, then 1 s for each signal it sends (#532)', async () => {
+    const repo = fixture('issue-532-committed');
+    const { ledger, root } = manager();
+    // manager() pins the committed bound to 1 s for the stall tests; this one needs the default.
+    const worktrees = new WorktreeManager({ ledger, root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+    ledger.addJob({ id: 'bounded-job', repo: 'assigned', title: 'bounded', baseBranch: 'main' });
+    const proxy = transactionProxy(repo, 'commit-stop');
+    vi.stubEnv('PATH', `${proxy.root}:${process.env.PATH ?? ''}`);
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const delays: number[] = [];
+    const long: { readonly timer: ReturnType<typeof setTimeout>; readonly expire: () => void; readonly index: number }[] = [];
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay?: number) => {
+      const timer = originalSetTimeout(callback, delay);
+      if (typeof delay === 'number') delays.push(delay);
+      if (delay === 30_000) long.push({ timer, expire: callback, index: delays.length - 1 });
+      return timer;
+    }) as typeof setTimeout);
+    const gitPid = (): number | undefined => { try { return JSON.parse(readFileSync(proxy.proof, 'utf8')).gitPid; } catch { return undefined; } };
+    const gone = (pid: number): boolean => { try { process.kill(pid, 0); return false; } catch { return true; } };
+    try {
+      const creation = worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'bounded-job' });
+      const refusal = expect(creation).rejects.toThrow(/did not close within 30000ms/);
+      // The service ends the child's stdin right after the commit reply and starts its close wait in the same turn:
+      // the real Git child leaving shows that wait is running, and it is then the newest 30 s timer. Expire it.
+      for (let tick = 0; tick < 1000 && !(gitPid() !== undefined && gone(gitPid()!)); tick++) await new Promise((done) => originalSetTimeout(done, 10));
+      const wait = long.at(-1);
+      expect(wait).toBeDefined();
+      originalClearTimeout(wait!.timer);
+      wait!.expire();
+      await refusal;
+      expect(delays.slice(wait!.index, wait!.index + 3)).toEqual([30_000, 1_000, 1_000]);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(readFileSync(proxy.term, 'utf8')).toBe('owned SIGTERM');
+    assertOwnedChildDead(proxy);
+    expect(git(repo.path, ['rev-parse', 'refs/heads/gru/bounded-job'])).toBe(repo.head());
+  });
+
   it('records durable custody before the ref transaction it authorizes (#453)', async () => {
     const repo = fixture('issue-453-before-ref');
     const { ledger, worktrees } = manager();

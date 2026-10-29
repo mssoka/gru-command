@@ -340,7 +340,7 @@ const PINS: Record<string, number> = {
   'runtime-disposal-aggregation.test.ts': 12,
   'review-build-identity.test.ts': 9,
   'review-model-identity.test.ts': 2,
-  'review-git-environment.test.ts': 98,
+  'review-git-environment.test.ts': 100,
   'review-ci-evidence.test.ts': 13,
   'review-directory-entries.test.ts': 3,
   'review-evidence-intake.test.ts': 11,
