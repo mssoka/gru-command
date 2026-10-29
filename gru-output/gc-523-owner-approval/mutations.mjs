@@ -12,6 +12,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import process from 'node:process';
 
 const root = process.argv[2];
 if (root === undefined) throw new Error('usage: mutations.mjs <snapshot-root>');

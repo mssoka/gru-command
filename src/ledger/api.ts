@@ -183,7 +183,6 @@ import {
 } from './closeouts.js';
 import {
   insertOwnerApproval,
-  isOwnerApprovalTerminal,
   OWNER_APPROVAL_CARD_KIND,
   OWNER_APPROVAL_ENDINGS,
   OWNER_APPROVAL_MAX_ATTEMPTS,

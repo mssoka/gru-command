@@ -33,9 +33,9 @@ export type OwnerApprovalState = (typeof OWNER_APPROVAL_STATES)[number];
 export const OWNER_APPROVAL_TERMINAL_STATES: readonly OwnerApprovalState[] = ['succeeded', 'denied', 'refused', 'withdrawn'];
 export const OWNER_APPROVAL_ACTIVE_STATES: readonly OwnerApprovalState[] = ['proposed', 'approved', 'executing'];
 
-export function isOwnerApprovalTerminal(state: OwnerApprovalState): boolean {
-  return OWNER_APPROVAL_TERMINAL_STATES.includes(state);
-}
+/** The two state sets as SQL predicates (`?` per state, bound in order), so a
+ * new state can never be forgotten by one hand-written list. */
+const stateIn = (states: readonly OwnerApprovalState[]): string => `state IN (${states.map(() => '?').join(', ')})`;
 
 /** Attempts at carrying the action out (counting the first) before the record
  * is refused as `execution-error`. */
@@ -196,8 +196,8 @@ export function selectOwnerApprovalByNotification(db: DatabaseSync, notification
 /** The one `proposed`, `approved` or `executing` record of a request (the
  * partial unique index allows at most one). */
 export function selectActiveOwnerApprovalForRequest(db: DatabaseSync, requestId: string): OwnerApprovalRecord | null {
-  const row = db.prepare("SELECT * FROM owner_approvals WHERE request_id = ? AND state IN ('proposed', 'approved', 'executing')")
-    .get(requestId) as Row | undefined;
+  const row = db.prepare(`SELECT * FROM owner_approvals WHERE request_id = ? AND ${stateIn(OWNER_APPROVAL_ACTIVE_STATES)}`)
+    .get(requestId, ...OWNER_APPROVAL_ACTIVE_STATES) as Row | undefined;
   return row === undefined ? null : ownerApprovalFromRow(row);
 }
 
@@ -205,16 +205,16 @@ export function selectActiveOwnerApprovalForRequest(db: DatabaseSync, requestId:
  * reconcile reads each record inside its own guard, so one row that cannot be
  * parsed never hides the others. */
 export function selectActiveOwnerApprovalIds(db: DatabaseSync): readonly string[] {
-  return (db.prepare("SELECT id FROM owner_approvals WHERE state IN ('proposed', 'approved', 'executing') ORDER BY rowid").all() as Row[])
-    .map((row) => String(row['id']));
+  return (db.prepare(`SELECT id FROM owner_approvals WHERE ${stateIn(OWNER_APPROVAL_ACTIVE_STATES)} ORDER BY rowid`)
+    .all(...OWNER_APPROVAL_ACTIVE_STATES) as Row[]).map((row) => String(row['id']));
 }
 
 /** The id of every ended record whose card is still open, oldest first. */
 export function selectEndedOwnerApprovalIdsWithOpenCard(db: DatabaseSync): readonly string[] {
   return (db.prepare(
     `SELECT a.id FROM owner_approvals a JOIN notifications n ON n.id = a.notification_id
-      WHERE a.state IN ('succeeded', 'denied', 'refused', 'withdrawn') AND n.resolved_at IS NULL ORDER BY a.rowid`,
-  ).all() as Row[]).map((row) => String(row['id']));
+      WHERE ${stateIn(OWNER_APPROVAL_TERMINAL_STATES).replaceAll('state ', 'a.state ')} AND n.resolved_at IS NULL ORDER BY a.rowid`,
+  ).all(...OWNER_APPROVAL_TERMINAL_STATES) as Row[]).map((row) => String(row['id']));
 }
 
 export function insertOwnerApproval(db: DatabaseSync, record: Omit<OwnerApprovalRecord, 'state' | 'attempts' | 'executingSeq' | 'abandonmentEventSeq' | 'refusal' | 'jobId'>): void {
