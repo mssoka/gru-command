@@ -728,7 +728,7 @@ describe('canceled-request closeout — resume drivers (test 11)', () => {
 
   it('11b. binningCloseoutRoute answers null until the closeout exists, and its result after', async () => {
     const ctx = await deferred();
-    let current: CanceledRequestCloseout | undefined;
+    let current: CanceledRequestCloseout | undefined = undefined;
     const route = binningCloseoutRoute(() => current);
     expect(route(ctx.jobId, { status: 'binned', by: 'gru' })).toBeNull();
     expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');

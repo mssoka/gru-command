@@ -1164,7 +1164,7 @@ async function main(): Promise<number> {
   // directive progress service exist, after the board — the same late-binding
   // pattern as `briefingReviewBoardCounts`. Until it is set the board's
   // binning route answers `null` and today's status write runs.
-  let closeout: CanceledRequestCloseout | undefined;
+  let closeout: CanceledRequestCloseout | undefined = undefined;
   const board = createBoardServer({
     config,
     engine,

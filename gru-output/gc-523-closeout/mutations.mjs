@@ -15,6 +15,9 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import process from 'node:process';
+
+const print = (text) => process.stdout.write(`${text}\n`);
 
 const root = process.cwd();
 const only = process.argv.includes('--only') ? new Set(process.argv[process.argv.indexOf('--only') + 1].split(',')) : null;
@@ -147,7 +150,7 @@ try {
   execFileSync('sh', ['-c', `git archive ${head} | tar -x -C "${dir}"`], { cwd: root });
   symlinkSync(join(root, 'node_modules'), join(dir, 'node_modules'));
   execFileSync(process.execPath, ['tools/patch-vitest-rpc-timeout.mjs'], { cwd: dir, stdio: 'ignore' });
-  console.log(`mutation record at ${head}`);
+  print(`mutation record at ${head}`);
 
   const baselines = new Map();
   const baseline = (spec) => {
@@ -156,8 +159,8 @@ try {
       const filter = spec.only === undefined ? undefined : spec.only.map(escapeRegex).join('|');
       const result = runSpec(dir, spec, filter);
       baselines.set(spec, result);
-      console.log(`baseline ${spec.name}: ${result.passed} passed, ${result.failed.length} failed (${Date.now() - started} ms)`);
-      if (result.crashed || result.failed.length > 0 || result.passed === 0) { exitCode = 1; console.log('  BASELINE FAILED', result.failed.slice(0, 5), result.stderr ?? ''); }
+      print(`baseline ${spec.name}: ${result.passed} passed, ${result.failed.length} failed (${Date.now() - started} ms)`);
+      if (result.crashed || result.failed.length > 0 || result.passed === 0) { exitCode = 1; print('  BASELINE FAILED', result.failed.slice(0, 5), result.stderr ?? ''); }
     }
     return baselines.get(spec);
   };
@@ -171,7 +174,7 @@ try {
       const path = join(dir, edit.file);
       const text = originals.has(path) ? readFileSync(path, 'utf8') : (originals.set(path, readFileSync(path, 'utf8')), originals.get(path));
       const count = text.split(edit.find).length - 1;
-      if (count !== 1) { applied = false; console.log(`${mutation.id}: edit does not match exactly once in ${edit.file} (${count})`); break; }
+      if (count !== 1) { applied = false; print(`${mutation.id}: edit does not match exactly once in ${edit.file} (${count})`); break; }
       writeFileSync(path, text.replace(edit.find, () => edit.replace));
     }
     let killed = [];
@@ -200,13 +203,13 @@ try {
     }
     const verdict = !applied ? 'NOT APPLIED' : missed.length === 0 ? 'killed' : 'SURVIVED';
     rows.push({ ...mutation, killed, missed, verdict, restored, detail });
-    console.log(`${mutation.id} test ${mutation.test}: ${verdict} [${killed.join(',')}]${missed.length > 0 ? ` MISSED [${missed.join(',')}]` : ''} restored=${restored} — ${mutation.what}`);
+    print(`${mutation.id} test ${mutation.test}: ${verdict} [${killed.join(',')}]${missed.length > 0 ? ` MISSED [${missed.join(',')}]` : ''} restored=${restored} — ${mutation.what}`);
   }
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }
 
-console.log('\n| Mutation | Test | Disabled | Run | Failing tests (mutated) | Restored |\n|---|---|---|---|---|---|');
-for (const row of rows) console.log(`| ${row.id} | ${row.test} | ${row.what} | ${row.run.name} | ${row.verdict === 'killed' ? row.killed.join(', ') : row.verdict} | ${row.restored} |`);
-console.log(`\n${rows.filter((row) => row.verdict === 'killed').length}/${rows.length} mutations killed`);
+print('\n| Mutation | Test | Disabled | Run | Failing tests (mutated) | Restored |\n|---|---|---|---|---|---|');
+for (const row of rows) print(`| ${row.id} | ${row.test} | ${row.what} | ${row.run.name} | ${row.verdict === 'killed' ? row.killed.join(', ') : row.verdict} | ${row.restored} |`);
+print(`\n${rows.filter((row) => row.verdict === 'killed').length}/${rows.length} mutations killed`);
 process.exit(exitCode);
