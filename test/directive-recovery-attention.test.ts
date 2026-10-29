@@ -70,7 +70,7 @@ async function boot(): Promise<Rig> {
   return { dir, port: (http.address() as AddressInfo).port, api, bus, notifications, worktrees: new InMemoryWorktreePort(join(dir, 'lanes'), api) };
 }
 
-async function call(rig: Rig, method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; body: any }> {
+async function call(rig: Rig, method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; body: unknown }> {
   const res = await fetch(`http://127.0.0.1:${rig.port}${path}`, {
     method,
     headers: { authorization: `Bearer ${TOKEN}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
