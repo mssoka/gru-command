@@ -3045,7 +3045,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:keep"]')!.disabled).toBe(true);
     expect(band.querySelector('.board-notification__submission--submitting')?.textContent).toContain('ecording');
     busy.click(); // duplicate click on the in-flight option: no second request
-    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve', stop.decision));
+    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve', stop.decision, 'gru.owner-escalation'));
     expect(failing.decideNotification).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(band.querySelector('.board-notification__submission--unconfirmed')).not.toBeNull());
     // Ambiguous transport failure → the copy must NOT claim nothing was
@@ -5357,7 +5357,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       )?.textContent,
     ).toBe('Approve the replacement route');
     currentChoice?.click();
-    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve', replacement.decision);
+    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve', replacement.decision, 'test.notice');
   });
 
   it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {

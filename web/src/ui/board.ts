@@ -2888,7 +2888,7 @@ export class BoardView {
     this.decisionSubmissions.set(item.id, submission);
     this.rerenderNotifications();
     void client
-      .decideNotification(item.id, optionId, expectedDecision)
+      .decideNotification(item.id, optionId, expectedDecision, item.kind)
       .then((row) => {
         if (submission.generation !== this.clientGeneration) return; // re-paired: old work is dropped
         this.decisionSubmissions.delete(item.id);

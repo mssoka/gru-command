@@ -456,6 +456,118 @@ now). Each abandonment sees the other control as live and refuses: it is
 an owner-escalation dead end that no route here closes; the owner must bin
 the job.
 
+### Owner approval of abandonment
+
+The owner should not run a terminal script to abandon a request. Gru
+proposes the abandonment; the owner's Approve on one FOR YOU card makes the
+service carry out the native owner abandonment above, with fresh fences, and
+the same card closes with what actually happened. Scope: one action, abandon
+one live directive request as outcome-unknown, card kind
+`owner-approval.directive-abandon`. Re-brief marker abandonment is not part
+of it; it still uses `POST /api/silas/rebriefs/{marker_id}/abandon`.
+
+Two routes, both authenticated with the bearer. Absent a hosted service
+(Silas ops off) both answer `503 owner_approvals_not_hosted`.
+
+```json
+POST /api/owner-approvals
+{
+  "kind": "directive-abandon",
+  "request_id": "<request_id>",
+  "reason": "original producer identity and journal are missing",
+  "by": "gru",
+  "idempotency_key": "abandon-<request_id>-1"
+}
+```
+
+`reason` is 1-500 characters, not blank, with no control character other
+than tab and newline. `idempotency_key` is 1-128 characters of `A-Z a-z 0-9 . _ -`.
+`by` must be `gru`. The service checks that the request exists and is live
+(`dispatching` or `admitted`), reads the four fences the Approve is bound to
+(`job_id`, `state`, `payload_hash` and the recovery-debt generation, or null),
+writes the record, and posts the card. Answers: `201 {approval}` on create;
+`200 {approval}` for a repeat of the same key with the same body (checked
+first); `409 owner_approval_key_conflict` for the same key with a different
+body; `409 owner_approval_pending` when the request already has an approval
+that has not ended; `409 owner_approval_not_live` for an abandoned, retired,
+settled or failed request; `404 owner_approval_unknown_request`; `400` for
+malformed input or any `by` other than `gru`; `401` without the bearer. A
+card that cannot be posted ends the record `refused` with `card-post-failed`.
+
+```
+GET /api/owner-approvals/{id}
+```
+
+returns the approval (`404` for an unknown id): `id`, `kind`, `request_id`,
+`job_id`, `state`, `attempts`, `fences` (`job_id`, `state`, `payload_hash`,
+`debt_generation`), `reason`, `notification_id`, `history` (`state`, `at`,
+`detail` for each `owner-approval.<state>` event) and `outcome`
+(`abandonment_event_seq`, or `refusal` with its `code` and `blockers`). The
+`approval` of a POST is exactly this body.
+
+**States.** `proposed` (the card is posted and unanswered), `approved` (the
+owner said yes; the fences are not yet re-read), `executing` (the
+abandonment is being carried out), then one of four that end it:
+`succeeded`, `denied`, `refused`, `withdrawn`. A request has at most one
+approval that has not ended. Every state change is one ledger transaction
+that appends an `owner-approval.<state>` event (a failed attempt appends
+`owner-approval.attempt-failed`).
+
+**The decision.** The card's Approve and Deny each record one decision on
+the board (`POST /api/notifications/{id}/decision`, with the card's
+`expectedDecision` echoed back). The service acts on it from the
+`notification.decision` event and at every reconcile pass. Only a decision
+whose decider is exactly `owner` is acted on; anything else (`web`, `gru`,
+`Gru`, `silas`, ` owner`, none) is refused as `decider-not-owner` and
+nothing runs. Deny ends the record `denied`. Approve moves it to `approved`;
+the service then reads the fences again, in order: a request already
+abandoned by another route is refused `abandoned-elsewhere`; any other fence
+that changed is refused `stale-fence`, its blockers reading `<field>:
+expected <x>, actual <y>`; otherwise the record becomes `executing` and the
+abandonment above is called as `by: "owner"` with the stored expectations
+and the reason prefixed `[owner-approval <id>] `. The ledger's own rules are
+unchanged: a producer known to be live refuses `live_work`, and a request
+whose cessation the service can verify refuses `retirement_available`
+(retire it instead). A success ends the record `succeeded` with the
+abandonment event's seq. Any other error counts one attempt (the `attempts`
+column is durable) and leaves the record `executing` for the next reconcile;
+the third ends it `refused` as `execution-error`, its message redacted of
+credentials and cut to 300 characters.
+
+**Refusal codes.** The service gives `card-post-failed`, `decider-not-owner`,
+`abandoned-elsewhere`, `stale-fence` and `execution-error`. A ledger refusal
+keeps its own code and the blockers it carries (possibly none): the
+abandonment raises `live_work`, `retirement_available`, `request_mismatch`,
+`directive_not_live` and `terminal_receipt_present`; the retirement-only
+codes `retire_conflict`, `admission_evidence_incomplete`, `stale_head`,
+`stale_generation`, `stale_authority`, `lane_unavailable` and
+`incomplete_context` would pass through the same way. `refusal` is `{code,
+blockers}`.
+
+**The card.** Every ended record resolves its card with the result:
+`Abandoned as outcome-unknown (abandonment event seq <n>).`, `Denied by the
+owner; nothing was run.`, or `Not run: <code>` followed by the blockers, one
+per line (`retirement_available` adds `Ordinary retirement is available;
+Gru retires it instead.`). If the request ends some other way (retired,
+settled, abandoned) before the owner answers, the next reconcile withdraws
+the undecided card and ends the record `withdrawn`; a decision that landed
+first is carried out instead.
+
+**Crash safety.** A restart's reconcile finishes what a crash left: it posts
+a missing card, processes a decided card whose record is still `proposed`,
+re-reads the fences of an `approved` record, and, for an `executing` record,
+settles from an abandonment recorded after its `executing` event (its own,
+by the reason prefix, is `succeeded`; any other is `abandoned-elsewhere`) or
+else re-reads the fences and runs it. It resolves the card of any ended
+record that still has one open. The abandonment never runs twice.
+
+**Attribution.** The same caller-declared model as `/abandon`: one shared
+bearer, no verified identity. Gru never sends `by: "owner"`; it proposes
+with `by: "gru"` and the owner answers on the card, whose `decidedBy` the
+board records from the owner surface. The card's `expectedDecision` echo,
+which the board refuses to record if the displayed decision changed, stands
+in for `confirm_intent`.
+
 ### The shared bearer and owner-only fields
 
 The HTTP bearer token is shared: Gru and the owner authenticate with the

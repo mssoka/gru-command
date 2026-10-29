@@ -1248,4 +1248,42 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_request_closeouts_job ON request_closeouts(job_id);
     `,
   },
+  {
+    // #523: owner approvals. Gru proposes one owner-reserved action on a FOR
+    // YOU card and the owner's Approve makes the server carry it out; this is
+    // the durable record of each proposal and where it stands (`proposed`,
+    // `approved`, `executing`, then `succeeded`, `denied`, `refused` or
+    // `withdrawn`). At most one non-terminal record per request, so a crash
+    // resumes the one operation and never starts a second. Additive: no
+    // existing table changes. LANDING COLLISION (same convention as
+    // migrations 10-33): renumber ONLY this never-applied migration if main
+    // lands id 34 first.
+    id: 34,
+    name: 'owner-approvals',
+    sql: `
+      CREATE TABLE owner_approvals (
+        id                    TEXT PRIMARY KEY,
+        kind                  TEXT NOT NULL CHECK (kind IN ('directive-abandon')),
+        request_id            TEXT NOT NULL REFERENCES pending_directives(request_id),
+        job_id                TEXT NOT NULL REFERENCES jobs(id),
+        fence_state           TEXT NOT NULL CHECK (fence_state IN ('dispatching','admitted')),
+        fence_payload_hash    TEXT NOT NULL,
+        fence_debt_generation INTEGER,
+        reason                TEXT NOT NULL,
+        idempotency_key       TEXT NOT NULL UNIQUE,
+        body_fingerprint      TEXT NOT NULL,
+        notification_id       TEXT NOT NULL UNIQUE,
+        state                 TEXT NOT NULL CHECK (state IN ('proposed','approved','executing','succeeded','denied','refused','withdrawn')),
+        attempts              INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        executing_seq         INTEGER,
+        abandonment_event_seq INTEGER,
+        refusal_code          TEXT,
+        refusal_blockers      TEXT,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_owner_approvals_active ON owner_approvals(request_id) WHERE state IN ('proposed','approved','executing');
+      CREATE INDEX idx_owner_approvals_job ON owner_approvals(job_id);
+    `,
+  },
 ];

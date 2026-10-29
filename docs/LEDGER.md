@@ -724,6 +724,25 @@ Events: `silas.closeout-intent`, `silas.closeout-stopped`,
 `by: "canceled-request-closeout"`). See
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
 
+### Owner approvals of abandonment (#523)
+
+Migration 34 (`owner-approvals`) is additive: no existing table changes.
+`owner_approvals` holds one row per proposal: `id` (`oa-<uuid>`), `kind`
+(`directive-abandon`), `request_id`, `job_id`, the four fences read when Gru
+asked (`fence_state`, `fence_payload_hash`, `fence_debt_generation` and the
+row's `job_id`), `reason`, `idempotency_key` (unique), `body_fingerprint`
+(sha256 of kind, request, reason and `by`), `notification_id`
+(`owner-approval:<id>`, unique), `state` (`proposed`, `approved`,
+`executing`, `succeeded`, `denied`, `refused`, `withdrawn`), `attempts`,
+`executing_seq`, `abandonment_event_seq`, `refusal_code`,
+`refusal_blockers` (JSON) and timestamps. A partial unique index allows at
+most one row per request in `proposed`, `approved` or `executing`. Every
+state change is one transaction that appends an `owner-approval.<state>`
+event (a failed attempt appends `owner-approval.attempt-failed`), so a
+restart's reconcile finishes what a crash left and the native abandonment
+never runs twice. The service is `src/dispatch/owner-approvals.ts`; see
+[DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment).
+
 ### Lane tokens and processes reaped by them (#486)
 
 Migration 31 (`worktree-lane-token`) adds `worktrees.lane_token`: a random

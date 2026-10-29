@@ -79,6 +79,13 @@ describe('gru role definition', () => {
     expect(ROLE_DEFINITIONS.gru.cwd).toBe('workspace_root');
   });
 
+  it('routes directive abandonment through the owner-approval proposal and keeps the re-brief marker ask (#523)', () => {
+    const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
+    expect(gru).toContain('For a directive request, propose abandonment with `POST /api/owner-approvals`; the owner\'s Approve carries it out.');
+    expect(gru).toContain('For a re-brief marker, ask the owner whether to abandon it, quoting the card.');
+    expect(gru).toContain('Never call `/abandon`, record the owner\'s decision, or send owner attribution yourself.');
+  });
+
   it('the persona is generic: no personal paths, no instance or runtime specifics (hygiene ruling)', () => {
     const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
     // Personal paths, instance/tooling specifics, and runtime names never
