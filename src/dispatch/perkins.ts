@@ -5884,6 +5884,7 @@ export class WaveRunner {
         jobId: job.id,
         roundId: round.id,
         prUrl: job.prUrl,
+        signal: setupSignal,
         ...(this.opts.gitlabMrFetch !== undefined ? { deps: { fetch: this.opts.gitlabMrFetch } } : {}),
         log: (level, msg, fields) => this.log(level, msg, fields),
       });

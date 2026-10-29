@@ -73,6 +73,8 @@ export interface GitLabMrReadDeps {
   readonly fetch?: GitLabMrFetch;
   /** Test seam; production reads the process environment. */
   readonly env?: NodeJS.ProcessEnv;
+  /** Cancels the request with the caller's setup (shutdown, supersession). */
+  readonly signal?: AbortSignal;
 }
 
 /** Every spelling of the token a response or an error message could echo. */
@@ -185,7 +187,13 @@ export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrR
     // `redirect: 'manual'`: the credential is never forwarded to a redirect target.
     const response = await fetchImpl(
       `https://${request.host}/api/v4/projects/${encodeURIComponent(request.project)}/merge_requests/${request.iid}`,
-      { headers: { 'PRIVATE-TOKEN': token }, signal: AbortSignal.timeout(PROBE_TIMEOUT_MS), redirect: 'manual' },
+      {
+        headers: { 'PRIVATE-TOKEN': token },
+        signal: deps.signal === undefined
+          ? AbortSignal.timeout(PROBE_TIMEOUT_MS)
+          : AbortSignal.any([AbortSignal.timeout(PROBE_TIMEOUT_MS), deps.signal]),
+        redirect: 'manual',
+      },
     );
     status = response.status;
     ok = response.ok;
@@ -207,7 +215,9 @@ type Log = (level: 'info' | 'warn', msg: string, fields?: Record<string, unknown
  * the job's PR link is a GitLab merge request on an accepted host. Otherwise
  * appends exactly one `gitlab.mr-observed` / `gitlab.mr-read-failed` event
  * to the job (tagged with the round) and returns it with the link identity
- * the binding compares the response against.
+ * the binding compares the response against. When `signal` aborts (the setup
+ * was cancelled while the request was in flight) nothing is recorded and null
+ * is returned: the caller is already unwinding.
  */
 export async function recordGitLabMrRead(input: {
   readonly ledger: Pick<LedgerApi, 'appendCustomEvent'>;
@@ -215,12 +225,14 @@ export async function recordGitLabMrRead(input: {
   readonly roundId: string;
   readonly prUrl: string | null;
   readonly deps?: GitLabMrReadDeps;
+  readonly signal?: AbortSignal;
   readonly log?: Log;
 }): Promise<{ readonly event: EventRecord; readonly link: GitLabMrReadRequest } | null> {
   const parsed = input.prUrl === null ? null : parseGitLabMrLink(input.prUrl);
   if (parsed === null || parsed.kind !== 'supported') return null;
   const link: GitLabMrReadRequest = { host: parsed.host, project: parsed.project, iid: parsed.iid };
-  const outcome = await readGitLabMr(link, input.deps);
+  const outcome = await readGitLabMr(link, input.signal === undefined ? input.deps : { ...input.deps, signal: input.signal });
+  if (input.signal?.aborted === true) return null;
   const event = outcome.ok
     ? input.ledger.appendCustomEvent({
         kind: GITLAB_MR_OBSERVED_EVENT,

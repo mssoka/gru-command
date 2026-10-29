@@ -1874,10 +1874,21 @@ export function proveRecoveredBaseMergeability(review: FrozenReview, priorBaseTi
   }
 }
 
+/** When a CI observation was read, and under which ledger seq, is provenance
+ * of that read (like an attachment's freeze time): a round that reads the same
+ * CI facts again, as a GitLab merge request is read once per round, keeps the
+ * effective inputs, so specialist work stays reusable. The state, the binding,
+ * the checks, the failures and the reason are the effective part. */
+function effectiveCiIdentity(ci: CiEvidenceRecord | null | undefined): unknown {
+  if (ci === null || ci === undefined || typeof ci !== 'object') return ci;
+  const { observedAt: _observedAt, sourceSeq: _sourceSeq, ...effective } = ci;
+  return effective;
+}
+
 function effectiveEvidenceIdentity(evidence: FrozenReviewEvidenceManifest | undefined): unknown {
   if (evidence === undefined) return undefined;
   return {
-    ci: evidence.ci,
+    ci: effectiveCiIdentity(evidence.ci),
     // Each manifest keeps its own freeze time. It is provenance of the copy,
     // not a change to the bytes or owner-authorized purpose/consent.
     attachments: evidence.attachments.map(({ frozenAt: _frozenAt, ...effective }) => effective),

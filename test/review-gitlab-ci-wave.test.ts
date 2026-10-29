@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WaveRunner, type FallbackGateOutcome, type WaveOutcome } from '../src/dispatch/perkins.js';
+import { compatibleReviewIdentity, freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import { appendCiEvidence, renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -77,6 +79,7 @@ interface World {
   readonly wave: WaveRunner;
   readonly calls: Call[];
   readonly logs: string[];
+  readonly escalations: string[];
   /** What the GitLab double answers; replace per case. */
   answer: (call: Call) => Response | Promise<Response>;
   /** The branch tip the next round freezes. */
@@ -124,8 +127,9 @@ async function makeWorld(): Promise<World> {
   });
   const calls: Call[] = [];
   const logs: string[] = [];
+  const escalations: string[] = [];
   const world: World = {
-    repo, ledger, port, artifacts, calls, logs, target, jobs: 0,
+    repo, ledger, port, artifacts, calls, logs, escalations, target, jobs: 0,
     answer: () => json(mrBody(world)),
     wave: new WaveRunner({
       ledger,
@@ -140,6 +144,7 @@ async function makeWorld(): Promise<World> {
         return world.answer(call);
       }) as typeof fetch,
       log: (level, msg, fields) => logs.push(JSON.stringify({ level, msg, fields })),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     }),
   };
   return world;
@@ -164,14 +169,19 @@ interface FrozenCase {
   readonly outcome: WaveOutcome;
 }
 
-/** A fresh job on the world's branch with the given PR link, one round, frozen. */
-async function freezeJob(world: World, prUrl: string | null, jobId = `job-${++world.jobs}`): Promise<FrozenCase> {
+/** A fresh working job on the world's branch with the given PR link. */
+async function prepareJob(world: World, prUrl: string | null, jobId = `job-${++world.jobs}`): Promise<string> {
   const job = world.ledger.addJob({ id: jobId, repo: 'fixture', title: 'gitlab ci evidence', baseBranch: 'main', briefing: 'Goal: ship it.' });
   world.ledger.setJobStatus(job.id, 'working');
   world.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: 'fixture-settled' } });
   if (prUrl !== null) world.ledger.setJobPr(job.id, prUrl);
   await world.port.createJobWorktree({ repoPath: world.repo.path, jobId: job.id });
-  return roundFor(world, job.id);
+  return job.id;
+}
+
+/** A fresh job on the world's branch with the given PR link, one round, frozen. */
+async function freezeJob(world: World, prUrl: string | null, jobId?: string): Promise<FrozenCase> {
+  return roundFor(world, await prepareJob(world, prUrl, jobId));
 }
 
 async function roundFor(world: World, jobId: string): Promise<FrozenCase> {
@@ -197,6 +207,14 @@ async function roundFor(world: World, jobId: string): Promise<FrozenCase> {
       .sort((left, right) => left.seq - right.seq),
     outcome,
   };
+}
+
+async function until(condition: () => boolean, ms = 20_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition not reached in time');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 const reasonLine = (block: string): string | undefined => block.split('\n').find((line) => line.startsWith('reason: '));
@@ -227,7 +245,9 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     expect(stateLine(frozen.block)).toBe('state: GREEN (recorded observation)');
     expect(frozen.block).toContain(`binding: repo=${HOST}/${PROJECT} pr=${IID} sha=${world.target} (matches the frozen review target)`);
     expect(frozen.block).toContain(`  - pipeline #${PIPELINE_ID} (merge_request_event) (${PIPELINE_URL})`);
-    expect(frozen.block).toContain(`source: ledger gitlab.mr-observed seq ${read.seq}`);
+    expect(frozen.block).toContain("source: gitlab.mr-observed (the host's read of this round;");
+    expect(frozen.block).not.toContain(read.ts);
+    expect(frozen.block).not.toContain(`seq ${read.seq}`);
     expect(frozen.spec).not.toContain('no PR URL was resolvable');
     // The frozen manifest passes the admission shape validator: the round
     // was admitted with a passing ci-evidence check, not refused.
@@ -304,35 +324,57 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     await world.wave.shutdown();
   });
 
-  it('A5: every kind of failed read freezes UNAVAILABLE naming the error_kind, and records it', async () => {
+  /** One round whose read fails: UNAVAILABLE naming the kind, one failed-read event. */
+  async function expectFailedRead(kind: string, answer: () => Response | Promise<Response>): Promise<void> {
     const world = await makeWorld();
-    const cases: ReadonlyArray<readonly [string, string, () => Response | Promise<Response>]> = [
-      ['auth', 'auth', () => new Response('{"message":"401 Unauthorized"}', { status: 401 })],
-      ['permission', 'permission', () => new Response('{"message":"403 Forbidden"}', { status: 403 })],
-      ['not-found', 'not-found', () => new Response('{"message":"404 Not found"}', { status: 404 })],
-      ['rate-limit', 'rate-limit', () => new Response('Retry later', { status: 429 })],
-      ['timeout', 'timeout', () => { throw Object.assign(new Error('The operation timed out'), { name: 'TimeoutError' }); }],
-      ['other: HTTP 503', 'other', () => new Response('unavailable', { status: 503 })],
-      ['other: rejection', 'other', () => { throw new TypeError('fetch failed'); }],
-      ['other: malformed body', 'other', () => new Response('<html>not json</html>', { status: 200 })],
-    ];
-    for (const [label, kind, answer] of cases) {
-      world.answer = answer;
-      const frozen = await freezeJob(world, MR_URL);
-      expect(frozen.gitlabEvents, label).toHaveLength(1);
-      expect(frozen.gitlabEvents[0]!.kind, label).toBe('gitlab.mr-read-failed');
-      expect(frozen.gitlabEvents[0]!.payload, label).toMatchObject({
-        host: HOST, project: PROJECT, mr_iid: IID, error_kind: kind, round_id: frozen.roundId,
-      });
-      expect(frozen.ci, label).toMatchObject({
-        state: 'unavailable', repo: null, pr: null, sha: null, sourceKind: 'gitlab.mr-read-failed',
-        sourceSeq: frozen.gitlabEvents[0]!.seq, checks: [], failures: [],
-        reason: expect.stringContaining(`error_kind: ${kind}`),
-      });
-      expect(reasonLine(frozen.block), label).toContain(`error_kind: ${kind}`);
-      expect(stateLine(frozen.block), label).toBe('state: UNAVAILABLE — NO BOUND CI RECEIPT');
-    }
+    world.answer = answer;
+    const frozen = await freezeJob(world, MR_URL);
+    expect(world.calls).toHaveLength(1);
+    expect(frozen.gitlabEvents).toHaveLength(1);
+    expect(frozen.gitlabEvents[0]!.kind).toBe('gitlab.mr-read-failed');
+    expect(frozen.gitlabEvents[0]!.payload).toMatchObject({
+      host: HOST, project: PROJECT, mr_iid: IID, error_kind: kind, round_id: frozen.roundId,
+    });
+    expect(frozen.ci).toMatchObject({
+      state: 'unavailable', repo: null, pr: null, sha: null, sourceKind: 'gitlab.mr-read-failed',
+      sourceSeq: frozen.gitlabEvents[0]!.seq, checks: [], failures: [],
+      reason: expect.stringContaining(`error_kind: ${kind}`),
+    });
+    expect(reasonLine(frozen.block)).toContain(`error_kind: ${kind}`);
+    expect(stateLine(frozen.block)).toBe('state: UNAVAILABLE — NO BOUND CI RECEIPT');
     await world.wave.shutdown();
+  }
+
+  it('A5: a 401 freezes UNAVAILABLE naming error_kind auth', async () => {
+    await expectFailedRead('auth', () => new Response('{"message":"401 Unauthorized"}', { status: 401 }));
+  });
+
+  it('A5: a 403 freezes UNAVAILABLE naming error_kind permission', async () => {
+    await expectFailedRead('permission', () => new Response('{"message":"403 Forbidden"}', { status: 403 }));
+  });
+
+  it('A5: a 404 freezes UNAVAILABLE naming error_kind not-found', async () => {
+    await expectFailedRead('not-found', () => new Response('{"message":"404 Not found"}', { status: 404 }));
+  });
+
+  it('A5: a 429 freezes UNAVAILABLE naming error_kind rate-limit', async () => {
+    await expectFailedRead('rate-limit', () => new Response('Retry later', { status: 429 }));
+  });
+
+  it('A5: a rejection named TimeoutError freezes UNAVAILABLE naming error_kind timeout', async () => {
+    await expectFailedRead('timeout', () => { throw Object.assign(new Error('The operation timed out'), { name: 'TimeoutError' }); });
+  });
+
+  it('A5: a 503 freezes UNAVAILABLE naming error_kind other', async () => {
+    await expectFailedRead('other', () => new Response('unavailable', { status: 503 }));
+  });
+
+  it('A5: a non-timeout rejection freezes UNAVAILABLE naming error_kind other', async () => {
+    await expectFailedRead('other', () => { throw new TypeError('fetch failed'); });
+  });
+
+  it('A5: a malformed body freezes UNAVAILABLE naming error_kind other', async () => {
+    await expectFailedRead('other', () => new Response('<html>not json</html>', { status: 200 }));
   });
 
   it('A5: a missing token freezes UNAVAILABLE (token-missing) and makes no request', async () => {
@@ -394,6 +436,77 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     expect(first.ci).toMatchObject({ state: 'green', sourceSeq: firstEvent!.seq });
     expect(second.ci).toMatchObject({ state: 'failed', sha: secondHead, sourceSeq: secondEvent!.seq });
     await world.wave.shutdown();
+  });
+
+  it('A7: a second job at the same head with an unchanged pipeline freezes the same spec bytes; only the read provenance differs', async () => {
+    const world = await makeWorld();
+    const first = await freezeJob(world, MR_URL, 'job-reread-1');
+    const second = await freezeJob(world, MR_URL, 'job-reread-2');
+    expect(world.calls).toHaveLength(2);
+    expect(first.ci['state']).toBe('green');
+    expect(second.spec).toBe(first.spec);
+    expect(second.ci['sourceSeq']).not.toBe(first.ci['sourceSeq']);
+    expect(second.ci['observedAt']).not.toBeNull();
+    const { observedAt: _firstAt, sourceSeq: _firstSeq, ...firstFacts } = first.ci;
+    const { observedAt: _secondAt, sourceSeq: _secondSeq, ...secondFacts } = second.ci;
+    expect(secondFacts).toEqual(firstFacts);
+    await world.wave.shutdown();
+  });
+
+  it('recovery: specialist work stays reusable across a same-head re-read, and is not reused when the pipeline changed', async () => {
+    const world = await makeWorld();
+    const root = temp('review-gitlab-ci-identity-');
+    const recoveryIdentity = {
+      jobId: 'job-identity', policySha256: 'a'.repeat(64), runtimeId: 'pi', runtimeVersion: 'runtime-fixture-v1',
+      modelRef: 'fixture-model-v1', modelRole: 'perkins', modelSettingsSha256: 'model-settings-fixture-v1',
+    };
+    const freeze = (roundId: string, status: string, seq: number, ts: string) => {
+      const event = {
+        seq, ts, kind: 'gitlab.mr-observed', agentId: null, jobId: 'job-identity', roundId, lens: null,
+        payload: {
+          host: HOST, project: PROJECT, mr_iid: IID, state: 'opened', head_sha: world.target,
+          head_pipeline: { id: PIPELINE_ID, sha: world.target, status, source: 'push', web_url: PIPELINE_URL },
+          round_id: roundId,
+        },
+      };
+      const ci = renderRecordedCiEvidence({
+        events: { branchState: null, ciGreen: null, ciFailed: null },
+        targetSha: world.target, expectedRepo: null, expectedPr: null,
+        gitlabMr: { host: HOST, project: PROJECT, iid: IID, event },
+      });
+      return freezeReviewInputs({
+        roundId, repoPath: world.repo.path, artifactRoot: root, baseRef: 'main', targetRef: world.target,
+        spec: appendCiEvidence({ spec: 'review', block: ci.block, maxBytes: 1_000_000 }),
+        recoveryIdentity, ciEvidence: ci.record,
+      });
+    };
+    const prior = freeze('prior', 'success', 11, '2026-10-29T10:00:00.000Z');
+    const reread = freeze('reread', 'success', 57, '2026-10-29T10:30:00.000Z');
+    expect(reread.manifest.reviewEvidence?.ci).toMatchObject({ sourceSeq: 57, observedAt: '2026-10-29T10:30:00.000Z' });
+    expect(reread.manifest.specSha256).toBe(prior.manifest.specSha256);
+    expect(compatibleReviewIdentity(reread, prior.directory)).toBe(true);
+    const changed = freeze('changed', 'failed', 90, '2026-10-29T11:00:00.000Z');
+    expect(compatibleReviewIdentity(changed, prior.directory)).toBe(false);
+    await world.wave.shutdown();
+  });
+
+  it('a shutdown while the merge request is being read freezes nothing and records no event', async () => {
+    const world = await makeWorld();
+    let entered = false;
+    world.answer = (call) => new Promise<Response>((_resolve, reject) => {
+      entered = true;
+      const signal = call.init?.signal;
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    const jobId = await prepareJob(world, MR_URL);
+    const settled = world.wave.beginRound({ jobId }).then(() => 'started' as const, (error: unknown) => error);
+    await until(() => entered);
+    await world.wave.shutdown();
+    const outcome = await settled;
+    expect(String(outcome)).toMatch(/shut down during review setup|shutting down/u);
+    expect(world.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind.startsWith('gitlab.'))).toEqual([]);
+    expect(world.ledger.latestJobEvent(jobId, 'round.review-inputs-frozen')).toBeNull();
+    expect(world.escalations).toEqual([]);
   });
 
   it('A8: a GitLab merge request job never renders the no-PR-URL reason', async () => {

@@ -115,8 +115,9 @@ below), and needs `GITLAB_TOKEN` (or `GL_TOKEN`) in the service environment.
 
 A job whose PR link is `https://<host>/<group>[/<subgroup>…]/<project>/-/merge_requests/<iid>`
 on a host the service supports for GitLab (`gitlab.com`, or a host whose first
-label is `gitlab`; the same rule that decides where a GitLab token may go)
-binds the **head pipeline of that merge request**. Any other link, or none,
+label is `gitlab` and that GitHub's host rule does not claim first, as in the head
+probe; the same rule that decides where a GitLab token may go) binds the **head
+pipeline of that merge request**. Any other link, or none,
 makes no request and records no `gitlab.*` event.
 
 **One read per round.** After the freeze-time guards and immediately before the
@@ -125,7 +126,9 @@ the freeze head probe makes: `GET https://<host>/api/v4/projects/<url-encoded
 path>/merge_requests/<iid>` with `PRIVATE-TOKEN` from `GITLAB_TOKEN` (falling
 back to `GL_TOKEN`), a 30 s timeout, and no redirect following (the token never
 follows a redirect). There is no timer and no background poll: a second round
-reads again, an earlier round's read is never reused. The token never appears in
+reads again, an earlier round's read is never reused. The request ends with the
+round's setup: a shutdown or supersession during the read cancels it and records
+nothing. The token never appears in
 a recorded event, a log line, the frozen block or the manifest: `detail` is
 credential-redacted and every occurrence of the token value is replaced with
 `[redacted]` first.
@@ -171,7 +174,13 @@ merge commit GitLab creates, so `head_pipeline.sha` is not the MR head and rule 
 renders `NOT-MATCHED`; its reason says so. Only a pipeline that ran on the exact
 reviewed commit certifies it.
 
-**Frozen record.** The manifest record keeps the same keys as for GitHub.
+**Frozen record.** The manifest record keeps the same keys as for GitHub. The
+rendered block names the source (`gitlab.mr-observed` / `gitlab.mr-read-failed`)
+but not when the read happened or its ledger seq; the record carries both, so
+two rounds that read the same facts freeze the same spec bytes, and a replacement
+round at the same head can still reuse the earlier round's specialist work
+(recovery treats `observedAt` and `sourceSeq` as provenance of the read, not as an
+effective input).
 `repo` is `<host>/<project>`, `pr` is the MR iid, `sha` is the pipeline's sha,
 and `observedAt`, `sourceKind` and `sourceSeq` are the recording event's time,
 kind and seq. A bound record's check (or, for `FAILED`, failure, with

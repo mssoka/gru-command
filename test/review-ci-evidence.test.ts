@@ -320,7 +320,7 @@ describe('GitLab merge request CI evidence', () => {
     expect(block).toContain('state: GREEN (recorded observation)');
     expect(block).toContain(`binding: repo=${GL_HOST}/${GL_PROJECT} pr=${GL_IID} sha=${TARGET} (matches the frozen review target)`);
     expect(block).toContain(`  - pipeline #${GL_PIPELINE_ID} (merge_request_event) (${GL_PIPELINE_URL})`);
-    expect(block).toContain(`source: ledger ${GL_OBSERVED} seq ${observed.seq}`);
+    expect(block).toContain(`source: ${GL_OBSERVED} (the host's read of this round; observation time and ledger seq are in the manifest record)`);
   });
 
   it('A2: maps all eleven pipeline statuses, and an unknown one, to the stated state', () => {
@@ -509,7 +509,6 @@ describe('GitLab merge request CI evidence', () => {
       expect(record.state, JSON.stringify(unusable.payload)).toBe('unavailable');
       expect(record.sourceSeq, JSON.stringify(unusable.payload)).toBe(unusable.seq);
       expect(block).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
-      expect(block).toContain(`source: ledger ${unusable.kind} seq ${unusable.seq}`);
     }
   });
 
@@ -534,6 +533,32 @@ describe('GitLab merge request CI evidence', () => {
       expect(line.startsWith('state: GREEN (recorded observation)')).toBe(line === 'state: GREEN (recorded observation)');
     }
     expect(block.split('\n').filter((line) => line === '--- END HOST-RECORDED CI EVIDENCE ---')).toHaveLength(1);
+  });
+
+  it('keeps read time and ledger seq out of every GitLab block: a re-read of the same facts renders the same bytes', () => {
+    const later = (mrEvent: EventRecord): EventRecord => ({ ...mrEvent, seq: mrEvent.seq + 90, ts: '2026-10-29T11:30:00.000Z' });
+    const events: EventRecord[] = [
+      glObserved(),
+      glObserved({}, { status: 'running' }),
+      glObserved({}, { status: 'failed' }),
+      glObserved({ project: 'acme/other' }),
+      glObserved({}, { sha: 'f'.repeat(40) }),
+      glObserved({ state: 'merged' }),
+      glObserved({}, null),
+      glFailed('rate-limit'),
+    ];
+    for (const first of events) {
+      const second = later(first);
+      const a = bindGitLab(first);
+      const b = bindGitLab(second);
+      expect(b.block, JSON.stringify(first.payload)).toBe(a.block);
+      expect(a.block).not.toContain(first.ts);
+      expect(a.block).not.toContain('observed_at');
+      expect(a.block).not.toContain(`seq ${first.seq}`);
+      // The record keeps the provenance, and it is the only difference.
+      expect(a.record).toMatchObject({ observedAt: first.ts, sourceKind: first.kind, sourceSeq: first.seq });
+      expect(b.record).toEqual({ ...a.record, observedAt: second.ts, sourceSeq: second.seq });
+    }
   });
 
   it('A8: an unbound-reason input replaces the default text, and omitting it keeps the default', () => {
