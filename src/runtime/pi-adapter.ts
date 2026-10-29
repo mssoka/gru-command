@@ -59,21 +59,28 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
 type SdkTool = AgentSession['agent']['state']['tools'][number];
 
+/** The most choices `rendersAs` makes before it gives up and answers no. A
+ * prompt Pi renders has a handful of sections and matches in about one choice
+ * per section; only a transcript built to overlap its own sections comes near. */
+const RENDERS_AS_CHOICES = 20_000;
+
 /** Whether `text` is the prompt that `parts` render as, in some order. Pi 1.x
  * renders a transcript's sections in the order they were first written and
  * builds its own prompt in a fixed one, so a section a later patch added sits
  * elsewhere in the replay: the same text, the same sections, another order.
  * The parts come from a transcript, so the search is bounded: the lengths must
- * agree, equal parts are one choice, and a state already refused is not tried
- * again. */
+ * agree, equal parts are one choice, a state already refused is not tried
+ * again, and a search past its budget refuses. */
 export function rendersAs(text: string, parts: readonly string[]): boolean {
   if (parts.length === 0) return text === '';
   if (parts.reduce((length, part) => length + part.length, 2 * (parts.length - 1)) !== text.length) return false;
   const left = new Map<string, number>();
   for (const part of parts) left.set(part, (left.get(part) ?? 0) + 1);
   const refused = new Set<string>();
+  let choices = 0;
   const walk = (offset: number, count: number): boolean => {
     if (count === 0) return offset === text.length + 2;
+    if (++choices > RENDERS_AS_CHOICES) return false;
     const state = `${offset}:${[...left.values()].join(',')}`;
     if (refused.has(state)) return false;
     for (const [part, remaining] of left) {
@@ -93,9 +100,11 @@ export function rendersAs(text: string, parts: readonly string[]): boolean {
  * settings and otherwise warms by default: a paid request on a timer that
  * the directive fence does not see and the yield report does not count.
  * A session keeps the pre-1.x request pattern unless those settings name a
- * mode; nothing is written to them. */
+ * mode the SDK recognizes (it reads any other value as its default, which
+ * warms); nothing is written to them. */
 function withoutImplicitCacheWarming(settings: SettingsManager): SettingsManager {
-  if (settings.getGlobalSettings().cacheWarming === undefined) settings.getCacheWarmingMode = () => 'off';
+  const named = settings.getGlobalSettings().cacheWarming;
+  if (named === undefined || settings.getCacheWarmingMode() !== named) settings.getCacheWarmingMode = () => 'off';
   return settings;
 }
 

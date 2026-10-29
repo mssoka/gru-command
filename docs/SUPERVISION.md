@@ -127,12 +127,14 @@ only in the form it is written in, linked on the chain:
   edit on a resumed session). Walked past before a directive's receipt and
   before a later bound request; one inside a turn is refused as another
   writer's authority change. The authority manifest binds the prompt the run
-  carries (the SDK's effective prompt). At admission, and before a
-  continuation, the transcript's replayed prompt must be that prompt (the
-  same sections, in whatever order the transcript first wrote them): text a
-  persisted system message carries beyond it would reach the model unapproved,
-  so it refuses the directive by name. From admission on, the replay may not
-  change for the rest of the turn;
+  carries (the SDK's effective prompt). Before the receipt and the first
+  request (over the stored messages plus the prompt patch the SDK hands the
+  run), at admission, and before a continuation, the transcript's replayed
+  prompt must be that prompt (the same sections, in whatever order the
+  transcript first wrote them): text a persisted system message carries
+  beyond it would reach the model unapproved, so it refuses the directive by
+  name. From admission on, the replay may not change for the rest of the
+  turn;
 - **omitting context edits:** before Pi retries a failed reply, or compacts
   and retries it, it durably omits that reply from the model's context with a
   `context_edit` entry (null replacement) linked on it. The edit is part of
@@ -140,10 +142,21 @@ only in the form it is written in, linked on the chain:
   or without the recovery compaction, still reads as the failed reply's
   terminal (not ok). An edit that names another row or replaces it is
   refused;
-- **cache-warm usage entries:** with prompt-cache warming on (the SDK
-  default), Pi appends a `usage` entry of kind `cache_warm` on a timer. It
-  joins no conversation, so the turn is read as if it were not there. A usage
-  entry of any other kind is refused as the unknown entry it is.
+- **cache-warm usage entries:** with prompt-cache warming on, Pi appends a
+  `usage` entry of kind `cache_warm` on a timer. It joins no conversation,
+  so the turn is read as if it were not there (a warm entry that is its own
+  parent is a malformed entry). A usage entry of any other kind is refused as
+  the unknown entry it is. Warming is the SDK's default, but a GC session
+  keeps the pre-1.x request pattern: its settings answer `off` unless the
+  user's own Pi settings name a `cacheWarming` mode, because a warm is a paid
+  request the directive fence does not see and the yield report does not
+  count.
+
+Two more 1.x differences are refused by name rather than walked: a Pi
+directive carries text only (1.x re-encodes prompt images, so the receipt
+could never match the accepted prompt), and a continuation of a checkpoint a
+pre-1.x host wrote (its transcript holds no system message, and 1.x adds none
+to a continuation) is not safely resumable.
 
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the

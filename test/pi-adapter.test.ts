@@ -2475,6 +2475,13 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     const started = Date.now();
     expect(rendersAs([...repeated.slice(1), 'other'].join('\n\n'), repeated)).toBe(false);
     expect(rendersAs(repeated.join('\n\n'), repeated)).toBe(true);
+    // Sections that contain one another: each pair is also a section of its own,
+    // so every pair could be matched whole or in halves, and only the last section
+    // fails. Every combination was once a state (1.3 s at 18 pairs, over 25 s at 30).
+    const halves = Array.from({ length: 30 }, (_, index) => [`p${index}A`, `p${index}B`]);
+    const wholes = halves.map(([first, second]) => `${first}\n\n${second}`);
+    const filler = wholes.reduce((length, whole) => length + whole.length, 0) + 1 + 2 * halves.length;
+    expect(rendersAs([...halves.flat(), 'x'.repeat(filler)].join('\n\n'), [...wholes, ...halves.flat(), 'y'])).toBe(false);
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
@@ -2493,6 +2500,11 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     writeFileSync(settings, JSON.stringify({ ...(existsSync(settings) ? JSON.parse(readFileSync(settings, 'utf-8')) as object : {}), cacheWarming: 'streaming' }));
     expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace }))).toBe('streaming');
     expect(JSON.parse(readFileSync(settings, 'utf-8'))).toMatchObject({ cacheWarming: 'streaming' });
+    // A value the SDK does not recognize is read as its warming default: not a choice the user made.
+    for (const unrecognized of ['stream', true, null]) {
+      writeFileSync(settings, JSON.stringify({ ...(JSON.parse(readFileSync(settings, 'utf-8')) as object), cacheWarming: unrecognized }));
+      expect(await mode(() => fx.runtime.spawn('minion', { cwd: fx.workspace })), String(unrecognized)).toBe('off');
+    }
   });
 
   it('a system patch the SDK adds while preparing a directive\'s next turn is refused before that model request (#521)', async () => {
