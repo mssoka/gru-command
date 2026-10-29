@@ -259,9 +259,11 @@ export type ContinuationHarness = Awaited<ReturnType<typeof httpHarness>>;
  * ledger file, the repository and the checkout roots carry over, so a fact the
  * old process held only in memory is gone. */
 export async function restartService(h: RetainedFixture, running: ContinuationHarness, options: HarnessOptions = {}) {
-  await running.stop();
   const dataDir = dbDirs.get(h.db);
-  if (dataDir === undefined) throw new Error('restartService needs a ledger opened through trackedDb(): its data directory is unknown');
+  if (dataDir === undefined || !dbs.includes(h.db)) {
+    throw new Error('restartService needs the fixture whose ledger is still open (opened through trackedDb()): pass the fixture the previous restartService returned for a further restart');
+  }
+  await running.stop();
   dbs.splice(dbs.indexOf(h.db), 1);
   h.db.close();
   const db = trackedDb(dataDir);

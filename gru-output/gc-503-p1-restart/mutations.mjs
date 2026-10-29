@@ -6,7 +6,9 @@
 // (node_modules linked), applies ONE edit set to production source, runs the
 // tests that cover it, and requires every test in `fails` to fail and every
 // test in `holds` to still pass. Edited files are compared byte for byte with
-// HEAD afterwards. Nothing in the working tree is touched.
+// HEAD afterwards. No tracked file in the working tree is touched; the idempotent
+// vitest RPC-timeout patch (the lane scopes' own prerequisite) is applied through
+// the linked node_modules.
 //
 //   node gru-output/gc-503-p1-restart/mutations.mjs [--only R1,A1] [--check]
 //

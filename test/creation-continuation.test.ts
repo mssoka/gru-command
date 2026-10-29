@@ -455,16 +455,22 @@ describe('same-job retained initial-creation continuation', () => {
 
     const controller = new AbortController();
     const aborted = request(api.base, 'POST', body, TOKEN, controller.signal).then(() => 'answered', (error: unknown) => (error as Error).name);
-    await inspecting;
-    expect(continuations()).toEqual([]);
-    controller.abort();
-    expect(await aborted).toBe('AbortError');
-    // The server saw the client leave while the inspection was still held.
-    await vi.waitFor(() => {
-      expect(logs.filter((entry) => entry.msg === 'dispatch request' && entry.fields?.['method'] === 'POST')).toHaveLength(1);
-    }, { timeout: 10_000 });
-    expect(continuations()).toEqual([]);
-    release();
+    try {
+      await inspecting;
+      expect(continuations()).toEqual([]);
+      controller.abort();
+      expect(await aborted).toBe('AbortError');
+      // The server saw the client leave while the inspection was still held.
+      await vi.waitFor(() => {
+        expect(logs.filter((entry) => entry.msg === 'dispatch request' && entry.fields?.['method'] === 'POST')).toHaveLength(1);
+      }, { timeout: 10_000 });
+      expect(continuations()).toEqual([]);
+    } finally {
+      // A failed assertion above must not leave the inspection held and the
+      // client connected: cleanup would wait on that connection and bury the failure.
+      release();
+      controller.abort();
+    }
 
     // The request is recorded after the inspection returns, whoever is still listening.
     await vi.waitFor(() => { expect(api.ledger.getCreationContinuation(api.jobId, body.request_id)).not.toBeNull(); }, { timeout: 10_000 });
