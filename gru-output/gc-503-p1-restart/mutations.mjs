@@ -36,7 +36,7 @@ const API = 'src/ledger/api.ts';
 const SERVICE = 'src/dispatch/service.ts';
 
 // Anchors (each must match exactly once at HEAD; `--check` proves it).
-const APPEND_EVENT = "    const ts = nowIso();\n    const info = this.db\n      .prepare(\n        `INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload)";
+const APPEND_EVENT = "    const info = this.db\n      .prepare(\n        `INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload)";
 const CONTINUATION_READ = ".all(...(requestId === undefined ? [jobId] : [jobId, requestId]) as string[]) as Row[]).map((row) => this.eventFromRow(row));";
 const SERVICE_EARLY_RETURN = "    if (existing !== null) return { created: false, readback: this.creationContinuationReadback(existing) };\n";
 const LEDGER_DEDUPE = "      const prior = byRequest.get(input.requestId);\n      if (prior !== undefined) {";
