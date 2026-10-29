@@ -1,6 +1,7 @@
 import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import { DirectiveProgressService, observeTerminalJobDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { CanceledRequestCloseout } from '../src/dispatch/canceled-request-closeout.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -91,11 +92,13 @@ interface Harness {
   readonly notifications: NotificationCenter;
   readonly spawns: { role: Role; options: SpawnOptions }[];
   readonly server: DispatchServer;
+  /** Present when the harness was booted with `closeout: true` (#523). */
+  readonly closeout?: CanceledRequestCloseout;
   close(): Promise<void>;
 }
 
 async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boolean; lessons?: LessonsReferencePort; wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate;
-  pendingProducerBlockers?: (jobId: string) => readonly string[] } = {}): Promise<Harness> {
+  pendingProducerBlockers?: (jobId: string) => readonly string[]; closeout?: boolean } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-retirement-'));
   cleanupDirs.push(dir);
   writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
@@ -207,6 +210,8 @@ async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boole
     spawn: (role: Role, spawnOptions?: SpawnOptions) => spawner(role, spawnOptions),
     disposeHandle: async (handle: AgentHandle) => { await handle.dispose(); liveHandles.delete(handle.id); },
   };
+  const closeout = opts.closeout !== true ? undefined : new CanceledRequestCloseout({ ledger, worktrees,
+    pendingProducerBlockers: opts.pendingProducerBlockers ?? (() => []), ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}) });
   const server = createDispatchServer({
     config: cfg,
     dispatch,
@@ -214,6 +219,7 @@ async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boole
     ledger,
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     pendingProducerBlockers: opts.pendingProducerBlockers ?? (() => []),
+    ...(closeout !== undefined ? { closeout } : {}),
     ...(opts.lessons !== undefined ? { lessons: opts.lessons } : {}),
     silasOps: {
       registry,
@@ -238,6 +244,7 @@ async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boole
     notifications,
     spawns,
     server,
+    ...(closeout !== undefined ? { closeout } : {}),
     close: async () => {
       server.dispose();
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
@@ -3699,5 +3706,48 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     const claimed = await call(h.port, 'POST', recoverPath(stuck.requestId), body(admitted.requestId), TOKEN);
     expect(claimed.status).toBe(409); expect(field<string>(claimed.json, 'detail')).toMatch(/claimed by request claiming-request/u);
     expect(h.ledger.getObligation(debt.id)?.state).toBe('open');
+  });
+});
+
+describe('canceled-request closeout readback (#523)', () => {
+  it('GET /api/silas/directives/{id} names the closeout path, eligibility, blockers and latest intent through boot()', async () => {
+    const repo = makeFixtureRepo('readback-closeout'); cleanupRepos.push(repo);
+    let supervised: readonly string[] = [];
+    const h = await boot({ closeout: true, pendingProducerBlockers: () => supervised });
+    const readback = async (requestId: string): Promise<{ closeout: Record<string, unknown> }> =>
+      (await call(h.port, 'GET', `/api/silas/directives/${encodeURIComponent(requestId)}`, undefined, TOKEN)).json as { closeout: Record<string, unknown> };
+    // A live request that was never deferred: the plain binning path.
+    await seededLiveRequest(h, repo, 'job-live', 'req-live');
+    expect((await readback('req-live')).closeout).toEqual({ path: 'binning', eligible: false, blockers: [], intent: null });
+    // A deferred request: the closeout path.
+    seedJob(h, 'job-rb');
+    await seedLane(h, repo, 'job-rb');
+    h.ledger.beginRebriefIntent({ jobId: 'job-rb', note: 'redo the work', holder: 'silas-ops', requestId: 'req-rb' });
+    expect(h.ledger.claimDirectiveDispatch('req-rb')).toBe(true);
+    const start = h.ledger.latestJobEventByRequestId('job-rb', 'silas.directive-dispatch-started', 'req-rb')!;
+    h.ledger.recordDirectiveDispatchDeferral(h.ledger.directiveTurnIdentity('req-rb'), start.seq, 'a supervised producer held the lane');
+    expect((await readback('req-rb')).closeout).toEqual({ path: 'closeout', eligible: true, blockers: [], intent: null });
+    supervised = ['restart retry scheduled'];
+    const blocked = (await readback('req-rb')).closeout;
+    expect(blocked).toMatchObject({ path: 'closeout', eligible: false, blockers: [{ code: 'live_work', detail: 'restart retry scheduled' }], intent: null });
+    // The readback and the binning request agree, and the completed intent reads back.
+    const refused = h.closeout!.requestBinning('job-rb', { status: 'binned', by: 'gru' });
+    expect(refused).toMatchObject({ status: 409, body: { error: 'request_closeout_refused', blockers: blocked.blockers } });
+    supervised = [];
+    const done = h.closeout!.requestBinning('job-rb', { status: 'binned', by: 'gru', reason: 'canceled' });
+    expect(done?.status).toBe(200);
+    const after = (await readback('req-rb')).closeout;
+    expect(after).toMatchObject({ path: 'binning', eligible: false, blockers: [],
+      intent: { state: 'complete', generation: 1, requested_by: 'gru', reason: 'canceled', request_id: 'req-rb', job_id: 'job-rb' } });
+    expect(field<string>((await call(h.port, 'GET', '/api/silas/directives/req-rb', undefined, TOKEN)).json, 'state')).toBe('retired');
+  });
+
+  it('the readback omits the closeout member when the service is not passed to createDispatchServer', async () => {
+    const repo = makeFixtureRepo('readback-no-closeout'); cleanupRepos.push(repo);
+    const h = await boot();
+    await seededLiveRequest(h, repo, 'job-none', 'req-none');
+    const body = (await call(h.port, 'GET', '/api/silas/directives/req-none', undefined, TOKEN)).json as Record<string, unknown>;
+    expect(body).toMatchObject({ request_id: 'req-none' });
+    expect(body).not.toHaveProperty('closeout');
   });
 });

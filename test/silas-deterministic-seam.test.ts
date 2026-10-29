@@ -7,6 +7,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { SilasDriver } from '../src/dispatch/silas-driver.js';
 import { createProductionDeterministicPass } from '../src/dispatch/durable-reconcile.js';
+import { CanceledRequestCloseout } from '../src/dispatch/canceled-request-closeout.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { preflightFailure } from '../src/dispatch/review-path.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
@@ -138,4 +139,53 @@ it('P34 real pending original native directive is reconsidered through the produ
     (sweep as (() => void) | null)?.(); await new Promise<void>((resolve) => setImmediate(resolve)); await progress.settled();
     expect(ledger.listJobEventsByKinds(job.id, ['job.delivered'])).toHaveLength(1);
   } finally { driver.stop(); await progress.dispose(); db.close(); }
+});
+
+it('P35 the production pass resumes an open canceled-request closeout and leaves a stopped one with an unchanged blocker fingerprint alone (#523)', async () => {
+  const repo = makeFixtureRepo('seam-closeout'); repos.push(repo);
+  const root = mkdtempSync(join(tmpdir(), 'seam-closeout-port-')); dirs.push(root);
+  const dbDir = mkdtempSync(join(tmpdir(), 'seam-closeout-db-')); dirs.push(dbDir);
+  const db = new LedgerDb(dbDir); const ledger = new LedgerApi(db.handle);
+  const port = new GitReviewPort(root, 'main', repo.head(), ledger);
+  try {
+    const defer = async (jobId: string, requestId: string): Promise<void> => {
+      ledger.addJob({ id: jobId, repo: 'fixture', title: jobId, briefing: `briefing for ${jobId}` });
+      ledger.setJobStatus(jobId, 'working');
+      await port.createJobWorktree({ repoPath: repo.path, jobId });
+      ledger.beginRebriefIntent({ jobId, note: 'redo the work', holder: 'silas-ops', requestId });
+      expect(ledger.claimDirectiveDispatch(requestId)).toBe(true);
+      const start = ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-started', requestId)!;
+      ledger.recordDirectiveDispatchDeferral(ledger.directiveTurnIdentity(requestId), start.seq, 'a supervised producer held the lane');
+    };
+    await defer('job-open', 'req-open'); await defer('job-stopped', 'req-stopped');
+    let release = (): void => {};
+    let hook: ((step: string, jobId: string) => void) | undefined;
+    const closeout = new CanceledRequestCloseout({ ledger, worktrees: port, pendingProducerBlockers: () => [],
+      afterStep: (step, intent) => hook?.(step, intent.jobId) });
+    hook = (step, jobId) => { if (step === 'intent' && jobId === 'job-open') throw new Error('crash after S1'); };
+    expect(() => closeout.requestBinning('job-open', { status: 'binned', by: 'gru' })).toThrow('crash after S1');
+    hook = (step, jobId) => { if (step === 'intent' && jobId === 'job-stopped') release = ledger.beginJobAdmission('job-stopped', 'late admission'); };
+    expect(closeout.requestBinning('job-stopped', { status: 'binned', by: 'gru' })?.status).toBe(409);
+    hook = undefined;
+    expect(ledger.latestCloseoutForJob('job-open')?.state).toBe('open');
+    expect(ledger.latestCloseoutForJob('job-stopped')?.state).toBe('stopped');
+    const order: string[] = [];
+    const pass = createProductionDeterministicPass({ ledger, notifications: { postIncident: () => ({ id: 'seam-notice' }) }, getWave: () => undefined,
+      directiveProgress: { reconsider: () => { order.push('reconsider'); } },
+      closeout: { resumePending: () => { order.push('resume'); return closeout.resumePending(); } } });
+    const stoppedEvents = ledger.listJobEvents('job-stopped').length;
+    pass({ trigger: 'sweep', wakeInFlight: false } as never);
+    // The reconsideration runs first; the open intent completes; the stopped one is untouched.
+    expect(order).toEqual(['reconsider', 'resume']);
+    expect(ledger.latestCloseoutForJob('job-open')).toMatchObject({ state: 'complete', generation: 1 });
+    expect(ledger.getJob('job-open')?.status).toBe('binned');
+    expect(ledger.latestCloseoutForJob('job-stopped')?.state).toBe('stopped');
+    expect(ledger.getJob('job-stopped')?.status).toBe('working');
+    expect(ledger.listJobEvents('job-stopped')).toHaveLength(stoppedEvents);
+    // Its blockers change (the admission is released): the next pass completes it.
+    release();
+    pass({ trigger: 'sweep', wakeInFlight: false } as never);
+    expect(ledger.latestCloseoutForJob('job-stopped')).toMatchObject({ state: 'complete' });
+    expect(ledger.getJob('job-stopped')?.status).toBe('binned');
+  } finally { db.close(); }
 });
