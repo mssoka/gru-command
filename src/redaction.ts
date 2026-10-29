@@ -31,9 +31,10 @@ const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])
  * next flag (`--token --verbose`) is no value. */
 const ARGV_VALUE = `(?!-)${KEYWORD_VALUE}`;
 
-/** The password of `-u user:password`: the keyword rule's unquoted value.
- * It may start with `-`: only the user is a flag's neighbour. */
-const PASSWORD_VALUE = '(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,}';
+/** The password of `-u user:password`: at least 6 characters with a letter
+ * (a uid:gid pair such as `165536:165536` is no credential). It may start
+ * with `-`: only the user is a flag's neighbour. */
+const PASSWORD_VALUE = '(?=[^\\s`\'"]*[A-Za-z])[^\\s`\'"]{6,}';
 
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret

@@ -2690,27 +2690,47 @@ it('redacts argv credentials in every recorded and returned process command', as
   ]);
   expect(written).not.toContain(ARGV_SENTINEL);
   expect(JSON.stringify(h.logs)).not.toContain(ARGV_SENTINEL);
+  // A release nobody answers refuses by name, and the error's processes carry no credential either.
+  const refused = await h.manager.release({ worktreeId: 'job-argv', onLiveProcess: 'refuse' }).then(() => null, (thrown: unknown) => thrown);
+  expect(refused).toBeInstanceOf(LaneLiveProcessError);
+  expectMasked('LaneLiveProcessError.processes', (refused as LaneLiveProcessError).processes.find((proc) => proc.pid === pid)?.command);
+  expect(JSON.stringify([(refused as LaneLiveProcessError).processes, (refused as LaneLiveProcessError).message])).not.toContain(ARGV_SENTINEL);
   // What was masked is only the credential: the executable, the flags and the host stay.
   const recorded = h.ledger.listWorktreeProcesses('job-argv').find((proc) => proc.pid === pid)!.command;
   for (const kept of [process.execPath, '-H', 'Authorization: Bearer', '--', 'host/x']) expect(recorded).toContain(kept);
 });
 
+it('redacts argv credentials: a raw live row from before the redaction is asked about again, not killed, and recorded redacted', async () => {
+  const h = harness(true);
+  const repo = h.make();
+  ledgerJob(h, 'job-argv-old', repo);
+  const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-old' });
+  const child = argvChild(row.path, ARGV_CREDENTIALS);
+  const pid = child.pid!;
+  const raw = (await listedBy(row.path, pid)).command;
+  expect(raw).toContain(ARGV_SENTINEL);
+  // The state an earlier build left: the lane paused, the process's row live with its raw command line.
+  h.ledger.setWorktreeStatus('job-argv-old', 'paused', 'sweep paused: an earlier build recorded the raw line');
+  h.ledgerDb.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+    VALUES ('job-argv-old', ?, ?, 'argv', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(pid, raw);
+  expect(h.ledger.listWorktreeProcesses('job-argv-old').find((proc) => proc.pid === pid)?.command).toBe(raw);
+
+  const again = await h.manager.release({ worktreeId: 'job-argv-old', confirmKill: true, confirmKillPids: [pid] });
+  expect(again.status).toBe('paused');
+  expect(() => process.kill(pid, 0)).not.toThrow();
+  expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.kill-confirmed')).toBe(false);
+  const replaced = h.ledger.listWorktreeProcesses('job-argv-old').find((proc) => proc.pid === pid);
+  expect(replaced).toMatchObject({ state: 'live' });
+  expectMasked('the replaced row', replaced?.command);
+  expect(JSON.stringify(h.ledgerDb.handle.prepare('SELECT * FROM worktree_processes').all())).not.toContain(ARGV_SENTINEL);
+
+  // That ask is the one the owner answers: the recorded, masked pause is confirmed.
+  const answered = await h.manager.release({ worktreeId: 'job-argv-old', confirmKill: true, confirmKillPids: [pid] });
+  expect(answered.status).toBe('swept');
+  expect(child.kill(0)).toBe(false);
+});
+
 describe('#534: raw in memory, masked on the way out', () => {
-  it('a refused release (nobody answers it) throws a LaneLiveProcessError whose processes carry no credential', async () => {
-    const h = harness(true);
-    const repo = h.make();
-    ledgerJob(h, 'job-argv-refuse', repo);
-    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-refuse' });
-    const child = argvChild(row.path, ARGV_CREDENTIALS);
-    await listedBy(row.path, child.pid!);
-
-    const error = await h.manager.release({ worktreeId: 'job-argv-refuse', onLiveProcess: 'refuse' }).then(() => null, (thrown: unknown) => thrown);
-    expect(error).toBeInstanceOf(LaneLiveProcessError);
-    const refused = error as LaneLiveProcessError;
-    expectMasked('LaneLiveProcessError.processes', refused.processes.find((proc) => proc.pid === child.pid)?.command);
-    expect(JSON.stringify([refused.processes, refused.message])).not.toContain(ARGV_SENTINEL);
-  });
-
   it('A5: a recorded pause is still confirmed: the acknowledged pid is killed, though its recorded command is masked', async () => {
     const h = harness(true);
     const repo = h.make();
@@ -2728,36 +2748,6 @@ describe('#534: raw in memory, masked on the way out', () => {
     expect(h.ledger.listWorktreeProcesses('job-argv-ack').find((proc) => proc.pid === pid)).toMatchObject({ state: 'killed' });
     expect(child.kill(0)).toBe(false);
     expect(existsSync(row.path)).toBe(false);
-  });
-
-  it('A6: a live row recorded before the masking, holding a raw credential, is asked about again and replaced by the masked text; the next answer kills', async () => {
-    const h = harness(true);
-    const repo = h.make();
-    ledgerJob(h, 'job-argv-old', repo);
-    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-old' });
-    const child = argvChild(row.path, ARGV_CREDENTIALS);
-    const pid = child.pid!;
-    const raw = (await listedBy(row.path, pid)).command;
-    expect(raw).toContain(ARGV_SENTINEL);
-    // The state an earlier build left: the lane paused, the process's row live with its raw command line.
-    h.ledger.setWorktreeStatus('job-argv-old', 'paused', 'sweep paused: an earlier build recorded the raw line');
-    h.ledgerDb.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
-      VALUES ('job-argv-old', ?, ?, 'argv', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(pid, raw);
-    expect(h.ledger.listWorktreeProcesses('job-argv-old').find((proc) => proc.pid === pid)?.command).toBe(raw);
-
-    const again = await h.manager.release({ worktreeId: 'job-argv-old', confirmKill: true, confirmKillPids: [pid] });
-    expect(again.status).toBe('paused');
-    expect(() => process.kill(pid, 0)).not.toThrow();
-    expect(h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.kill-confirmed')).toBe(false);
-    const replaced = h.ledger.listWorktreeProcesses('job-argv-old').find((proc) => proc.pid === pid);
-    expect(replaced).toMatchObject({ state: 'live' });
-    expectMasked('the replaced row', replaced?.command);
-    expect(JSON.stringify(h.ledgerDb.handle.prepare('SELECT * FROM worktree_processes').all())).not.toContain(ARGV_SENTINEL);
-
-    // That ask is the one the owner answers: the recorded, masked pause is confirmed.
-    const answered = await h.manager.release({ worktreeId: 'job-argv-old', confirmKill: true, confirmKillPids: [pid] });
-    expect(answered.status).toBe('swept');
-    expect(child.kill(0)).toBe(false);
   });
 
   it('A7: a process tied to the tree by a path in its argv that also carries --token is still matched by argv, and a token in its raw argv still names it', async () => {

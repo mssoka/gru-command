@@ -3,15 +3,20 @@
 # run against an isolated git-archive snapshot of the BASE
 # ccd6337fb629f3fc69bea725d06873733b363182, where a worktree process's command
 # line was recorded, returned and handed on as `ps` listed it. Expected result
-# is RED by BEHAVIORAL ASSERTION on the three named cases:
+# is RED by BEHAVIORAL ASSERTION on the named cases:
 #   A1  the real-`ps` sweep: the release() paused result, the
-#       worktree_processes row, the worktree.paused payload and every
-#       onSweepPaused detail carried the credentials;
+#       worktree_processes row, the worktree.paused payload, the
+#       onSweepPaused processes and details and a refused release's error
+#       carried the credentials;
 #   A2  the ledger's registry-evidence write stored them;
 #   A3  redactCredentials did not mask `--token <v>`, `-u <user>:<v>` or
-#       `Authorization: token <v>`.
-# The fast files and the heavy file run under their own Vitest configs; their
-# JSON reports are merged and classified once by
+#       `Authorization: token <v>`;
+#   A6  a live row holding a raw credential (seeded below the ledger API)
+#       was acknowledged and killed instead of asked about again;
+#   A7  a verification scope whose command carries a credential was recorded
+#       in the lane's registry row as listed.
+# The fast files and the heavy files run under their own Vitest configs;
+# their JSON reports are merged and classified once by
 # tools/assert-named-red-baseline.mjs, which exits 2 (FAILS-BEFORE CLAIM
 # BROKEN) on a collection/setup/import failure, a named case that did not fail
 # as an assertion, a missing named case or an unreadable report. A leg that
@@ -40,7 +45,10 @@ cd "$d"
 a1='redacts argv credentials in every recorded and returned process command'
 a2='redacts argv credentials in the verify registry write'
 a3='redacts argv credentials: new token, user and auth-scheme forms'
-for pair in "worktree-manager:$a1" "ledger-api:$a2" "redaction:$a3"; do
+a6='redacts argv credentials: a raw live row from before the redaction is asked about again, not killed, and recorded redacted'
+a7title='records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)'
+a7="POST /api/verify $a7title"
+for pair in "worktree-manager:$a1" "ledger-api:$a2" "redaction:$a3" "worktree-manager:$a6" "verification-server:$a7title"; do
   file=${pair%%:*}
   title=${pair#*:}
   if ! grep -qF "it('$title'" "test/$file.test.ts"; then
@@ -52,7 +60,7 @@ node tools/patch-vitest-rpc-timeout.mjs
 set +e
 npx vitest run --reporter=json --outputFile="$d/fast-results.json" test/redaction.test.ts test/ledger-api.test.ts -t '^redacts argv credentials'
 fast=$?
-npx vitest run --reporter=json --outputFile="$d/heavy-results.json" --config vitest.heavy.config.ts test/worktree-manager.test.ts -t '^redacts argv credentials'
+npx vitest run --reporter=json --outputFile="$d/heavy-results.json" --config vitest.heavy.config.ts test/worktree-manager.test.ts test/verification-server.test.ts -t '^redacts argv credentials|credential-bearing scope command'
 heavy=$?
 set -e
 echo "gc-534-red-baseline vitest exits: fast=$fast heavy=$heavy"
@@ -69,6 +77,6 @@ node -e '
     testResults: reports.flatMap((report) => report.testResults),
   }));
 ' "$d/results.json" "$d/fast-results.json" "$d/heavy-results.json"
-node "$root/tools/assert-named-red-baseline.mjs" gc-534 "$d/results.json" "$a1" "$a2" "$a3" || exit 2
-echo "EXPECTED-NONZERO: the argv-redaction regressions A1-A3 failed behaviorally against the unredacted base"
+node "$root/tools/assert-named-red-baseline.mjs" gc-534 "$d/results.json" "$a1" "$a2" "$a3" "$a6" "$a7" || exit 2
+echo "EXPECTED-NONZERO: the argv-redaction regressions A1, A2, A3, A6 and the verification readback failed behaviorally against the unredacted base"
 exit 1

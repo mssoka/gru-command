@@ -272,12 +272,14 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
   }
 });
 
-it('keeps argv near misses unchanged: a flag with no credential value, a short or symbol-only value, an id pair', () => {
+it('keeps argv near misses unchanged: a flag with no credential value, a short, symbol-only or numeric -u part, an id pair', () => {
   for (const kept of [
     '--token --verbose',
     'node cli.js --token',
     'node cli.js --token --verbose build',
     'docker run -u 1000:1000 image',
+    'docker run -u 165536:165536 image',
+    'curl -u deploy:1234567 https://host/x',
     'docker exec -u alice bash',
     'git push -u origin main',
     'git push -u origin HEAD:refs/heads/main',
