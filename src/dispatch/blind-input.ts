@@ -930,6 +930,62 @@ function excludedGrepPath(candidate: { readonly path: string; readonly byShape: 
   return classifyBlindPath(candidate.path, rule);
 }
 
+/** The numbers `git grep -n` prints between a name and the rest of a line:
+ * `:7:` after a match, `-7-` after a context line. The closing character is
+ * only looked at, so `a-10-29-b.md-7-x` offers `-10-`, `-29-` and `-7-`. */
+const GREP_NUMBER_DELIMITER = /[:-]\d+(?=[:-])/gu;
+/** A line is only searched this far: its first this-many delimiters. */
+const MAX_GREP_DELIMITERS = 64;
+
+/**
+ * What a `git grep -n` line may name beyond the `path:LINE:` form (#520).
+ * Against a revision it prints `<rev>:<path>:7:text` (`<rev>:<path>-7-text`
+ * for context) and against `<rev>:<dir>` it prints `<rev>:<dir>:<file>:7:text`;
+ * in the worktree a context line is `<path>-7-text`. So everything before a
+ * delimiter may be a revision and a path, whatever the revision is spelled —
+ * it is never validated as a ref. Each delimiter offers its head (the line
+ * before it) and, when the head holds a `:`, the head without its first
+ * `:`-separated segment (the revision), as it stands and with its remaining
+ * `:` read as `/` (`<dir>:<file>`), the longest last. Only the first
+ * MAX_GREP_DELIMITERS delimiters of a line count, and a head longer than
+ * MAX_PATH_CHARS is never a path. Judge these by the isolation globs only:
+ * they are guesses at a path, never an absolute one.
+ */
+function revisionGrepCandidates(line: string): readonly string[] {
+  const out: string[] = [];
+  const delimiter = new RegExp(GREP_NUMBER_DELIMITER);
+  let match = delimiter.exec(line);
+  for (let seen = 0; match !== null && seen < MAX_GREP_DELIMITERS && match.index <= MAX_PATH_CHARS; seen += 1) {
+    const head = line.slice(0, match.index);
+    const colon = head.indexOf(':');
+    if (colon >= 0) {
+      const stripped = head.slice(colon + 1);
+      const joined = stripped.replace(/:/gu, '/');
+      if (joined !== '') out.push(joined);
+      if (stripped !== joined) out.push(stripped);
+    }
+    if (head !== '') out.push(head);
+    match = delimiter.exec(line);
+  }
+  return out;
+}
+
+/** The excluded path a result's `git grep` revision and context-line forms
+ * name (see revisionGrepCandidates): the longest, and of equal length the
+ * first in line and delimiter order, so one tool result always records one
+ * path. Null when none is excluded. */
+function revisionGrepHit(lines: readonly string[], rule: BlindIsolationRule): { readonly path: string; readonly detail: string } | undefined {
+  let best: { readonly path: string; readonly detail: string } | undefined;
+  for (const line of lines) {
+    for (const path of revisionGrepCandidates(line)) {
+      if (best !== undefined && path.length <= best.path.length) continue;
+      const detail = excludedGrepPath({ path, byShape: false }, rule);
+      if (detail !== null) best = { path, detail };
+    }
+  }
+  return best;
+}
+
 /**
  * What the reviewer actually SAW: tool results whose grep lines land in an
  * excluded path or whose body is history-bearing text. This is observed
@@ -961,11 +1017,13 @@ export function scanObservedAccess(
       });
       continue;
     }
-    const excluded = result.text
-      .split('\n')
+    const lines = result.text.split('\n');
+    // The `path:LINE:` forms first; only a result they clear is read for
+    // the revision and context-line forms of `git grep` (#520).
+    const excluded = lines
       .flatMap((line) => grepPathCandidates(line))
       .map((candidate) => ({ path: candidate.path, detail: excludedGrepPath(candidate, rule) }))
-      .find((hit) => hit.detail !== null);
+      .find((hit) => hit.detail !== null) ?? revisionGrepHit(lines, rule);
     if (excluded !== undefined) {
       out.push({
         index: result.index,
