@@ -108,7 +108,7 @@ function mrBody(world: World, overrides: Record<string, unknown> = {}, pipeline:
   };
 }
 
-async function makeWorld(): Promise<World> {
+async function makeWorld(options: { readonly productionOrigin?: boolean } = {}): Promise<World> {
   const repo = makeFixtureRepo('review-gitlab-ci-wave');
   repos.push(repo);
   repo.git(['checkout', '-b', BRANCH]);
@@ -142,7 +142,7 @@ async function makeWorld(): Promise<World> {
       reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe(BRANCH),
       reconcileReviewAgent: async () => true,
-      repoOrigin: () => world.origin,
+      ...(options.productionOrigin === true ? {} : { repoOrigin: () => world.origin }),
       gitlabMrFetch: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
         const call = { url: String(input), init };
         calls.push(call);
@@ -301,7 +301,7 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     const cases: ReadonlyArray<readonly [string, Record<string, unknown>, Record<string, unknown>]> = [
       ['another project', { web_url: `https://${HOST}/acme/platform/renamed-app/-/merge_requests/${IID}` },
         { repo: `${HOST}/acme/platform/renamed-app`, pr: IID }],
-      ['another iid', { iid: 8, web_url: `https://${HOST}/${PROJECT}/-/merge_requests/8` }, { repo: `${HOST}/${PROJECT}`, pr: 8 }],
+      ['another iid', { iid: 8 }, { repo: `${HOST}/${PROJECT}`, pr: 8 }],
       ['another head', { sha: 'e'.repeat(40) }, { repo: `${HOST}/${PROJECT}`, pr: IID, sha: 'e'.repeat(40) }],
     ];
     for (const [label, overrides, observed] of cases) {
@@ -589,6 +589,18 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
       reviewEvidence: { ci: { state: string } };
     };
     expect(manifest.reviewEvidence.ci.state).toBe('unavailable');
+    await world.wave.shutdown();
+  });
+
+  it('origin: without the test seam the round asks git for the lane\'s origin, and a local-path origin names no merge request', async () => {
+    const world = await makeWorld({ productionOrigin: true });
+    const frozen = await freezeJob(world, MR_URL);
+    expect(world.calls).toHaveLength(0);
+    expect(frozen.gitlabEvents).toHaveLength(1);
+    expect(frozen.gitlabEvents[0]!.payload).toMatchObject({
+      error_kind: 'other', detail: expect.stringContaining('no resolvable origin remote'),
+    });
+    expect(frozen.ci).toMatchObject({ state: 'unavailable' });
     await world.wave.shutdown();
   });
 

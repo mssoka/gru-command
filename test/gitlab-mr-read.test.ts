@@ -1,10 +1,11 @@
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PROBE_TIMEOUT_MS, defaultPrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 import { readGitLabMr, recordGitLabMrRead } from '../src/dispatch/perkins-review/gitlab-mr-read.js';
-import { parseGitLabMrLink, parseGitLabMrPath } from '../src/dispatch/review-path.js';
+import { parseGitLabMrLink, parseGitLabMrPath, repoRemote } from '../src/dispatch/review-path.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -74,7 +75,7 @@ describe('GitLab merge request link parsing', () => {
       'https://git.example.test/acme/app/-/merge_requests/3',
       'https://evil.gitlab.attacker.test/acme/app/-/merge_requests/3',
       'https://github.com/acme/app/-/merge_requests/3',
-      // GitHub claims this host first, as the head probe's dispatch does, port or not.
+      // GitHub's rule claims these hosts first, as the head probe's dispatch does (here it is asked about the name without its port).
       'https://gitlab.github.com/acme/app/-/merge_requests/3',
       'https://gitlab.github.com:8443/acme/app/-/merge_requests/3',
     ]) expect(parseGitLabMrLink(link), link).toEqual({ kind: 'unsupported-host' });
@@ -187,7 +188,9 @@ describe('readGitLabMr', () => {
       ['a string iid', JSON.stringify(mrBody({ iid: '7' }))],
       ['a web_url that is not an MR url', JSON.stringify(mrBody({ web_url: `https://${HOST}/${PROJECT}` }))],
       ['a web_url that is not a url', JSON.stringify(mrBody({ web_url: 'nonsense' }))],
-      ['a web_url naming another merge request than the iid', JSON.stringify(mrBody({ web_url: `https://${HOST}/${PROJECT}/-/merge_requests/9` }))],
+      ['a state longer than the cap', JSON.stringify(mrBody({ state: 'x'.repeat(3000) }))],
+      ['a pipeline url longer than the cap', JSON.stringify(mrBody({ head_pipeline: { id: 5, sha: TARGET, status: 'running', web_url: `https://${HOST}/${'p'.repeat(3000)}` } }))],
+      ['a pipeline source longer than the cap', JSON.stringify(mrBody({ head_pipeline: { id: 5, sha: TARGET, status: 'running', source: 's'.repeat(3000) } }))],
       ['a head_pipeline without an id', JSON.stringify(mrBody({ head_pipeline: { sha: TARGET, status: 'success' } }))],
       ['a head_pipeline that is a string', JSON.stringify(mrBody({ head_pipeline: 'success' }))],
     ];
@@ -205,6 +208,12 @@ describe('readGitLabMr', () => {
     })));
     const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV });
     expect(outcome).toMatchObject({ ok: true, observed: { host: HOST, project: 'acme/renamed/app', mr_iid: 9 } });
+  });
+
+  it('takes mr_iid from the response iid, even when its web_url names another merge request', async () => {
+    const { fetch: fetchDouble } = double(() => json(mrBody({ iid: 8 })));
+    const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV });
+    expect(outcome).toMatchObject({ ok: true, observed: { host: HOST, project: PROJECT, mr_iid: 8 } });
   });
 
   it('records a missing head pipeline as null, and missing pipeline source and url as null', async () => {
@@ -430,6 +439,55 @@ describe('recordGitLabMrRead', () => {
     expect(calls[0]!.url).toBe(`https://${HOST}:8443/api/v4/projects/acme%2Fplatform%2Fapp/merge_requests/7`);
     expect(recorded?.event.kind).toBe('gitlab.mr-observed');
     expect(recorded?.event.payload).toMatchObject({ host: `${HOST}:8443` });
+  });
+
+  it('matches a port exactly when the origin names one, and ignores it when the origin names none', async () => {
+    const cases: ReadonlyArray<readonly [string, string, string, boolean]> = [
+      ['an https origin and the same port', `${HOST}:8443`, `${HOST}:8443`, true],
+      ['an https origin and another port', `${HOST}:8443`, `${HOST}:9999`, false],
+      ['an https origin with a port and a link without one', `${HOST}:8443`, HOST, false],
+      ['an origin without a port and a link with one', HOST, `${HOST}:8443`, true],
+      ['an origin without a port and a link without one', HOST, HOST, true],
+    ];
+    for (const [label, originHost, linkHost, reads] of cases) {
+      const api = ledger();
+      const { calls, fetch: fetchDouble } = double(() => json(mrBody({ web_url: `https://${linkHost}/${PROJECT}/-/merge_requests/7` })));
+      await recordGitLabMrRead({
+        ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${linkHost}/${PROJECT}/-/merge_requests/7`,
+        deps: { fetch: fetchDouble, env: ENV }, origin: () => ({ host: originHost, owner: 'acme/platform', repo: 'app' }),
+      });
+      expect(calls.length, label).toBe(reads ? 1 : 0);
+      expect(gitlabEvents(api)[0]!.kind, label).toBe(reads ? 'gitlab.mr-observed' : 'gitlab.mr-read-failed');
+    }
+  });
+
+  it('asks the lane\'s real origin remote (the production lookup) over https and ssh, subgroups kept', async () => {
+    const lanes: ReadonlyArray<readonly [string, string, boolean]> = [
+      ['an https origin', `https://${HOST}/${PROJECT}.git`, true],
+      ['an ssh origin', `git@${HOST}:${PROJECT}.git`, true],
+      ['an origin of another project', `https://${HOST}/acme/platform/other.git`, false],
+      ['an origin on another host', `https://gitlab.other.test/${PROJECT}.git`, false],
+      ['an origin that is a local path', '/tmp/not-a-remote.git', false],
+    ];
+    for (const [label, remote, reads] of lanes) {
+      const repo = mkdtempSync(join(tmpdir(), 'gru-gitlab-mr-origin-'));
+      dirs.push(repo);
+      execFileSync('git', ['init', '--quiet', repo], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', remote], { stdio: 'ignore' });
+      const api = ledger();
+      const { calls, fetch: fetchDouble } = double(() => json(mrBody()));
+      await recordGitLabMrRead({
+        ledger: api, jobId: 'job-1', roundId: 'round-1', prUrl: `https://${HOST}/${PROJECT}/-/merge_requests/7`,
+        deps: { fetch: fetchDouble, env: ENV }, origin: () => repoRemote(repo),
+      });
+      expect(calls.length, label).toBe(reads ? 1 : 0);
+      expect(gitlabEvents(api)[0]!.kind, label).toBe(reads ? 'gitlab.mr-observed' : 'gitlab.mr-read-failed');
+    }
+    // A lane with no origin remote at all resolves to none.
+    const bare = mkdtempSync(join(tmpdir(), 'gru-gitlab-mr-origin-'));
+    dirs.push(bare);
+    execFileSync('git', ['init', '--quiet', bare], { stdio: 'ignore' });
+    expect(repoRemote(bare)).toBeNull();
   });
 
   it('reads when the link names the origin, the host and project compared case-insensitively', async () => {

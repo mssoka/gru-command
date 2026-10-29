@@ -30,6 +30,9 @@ import { PROBE_TIMEOUT_MS } from './fresh-head.js';
 
 const MAX_RESPONSE_CHARS = 4 * 1024 * 1024;
 const MAX_DETAIL_CHARS = 300;
+/** No recorded response field is longer: a hostile or broken endpoint cannot
+ * inflate the ledger payload or the frozen manifest. */
+const MAX_FIELD_CHARS = 2048;
 const TOKEN_PLACEHOLDER = '[redacted]';
 
 export type GitLabMrFetch = typeof fetch;
@@ -137,16 +140,15 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
   if (iid === null || state === null || headSha === null || webUrl === null) {
     return { problem: 'the merge request response lacks web_url, iid, state or sha' };
   }
-  let identity: { readonly host: string; readonly project: string; readonly iid: number } | null = null;
+  let identity: { readonly host: string; readonly project: string } | null = null;
   try {
     const url = new URL(webUrl);
     const path = parseGitLabMrPath(url.pathname);
-    if (path !== null) identity = { host: url.host, project: path.project, iid: Number(path.iid) };
+    if (path !== null) identity = { host: url.host, project: path.project };
   } catch {
     // Not a URL: reported below as an unusable web_url.
   }
   if (identity === null) return { problem: 'the merge request response web_url is not a merge request URL' };
-  if (identity.iid !== iid) return { problem: 'the merge request response web_url names another merge request than its iid' };
   const rawPipeline = parsed['head_pipeline'];
   let headPipeline: GitLabMrHeadPipeline | null = null;
   if (rawPipeline !== null && rawPipeline !== undefined) {
@@ -157,6 +159,10 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
       return { problem: 'the merge request response head_pipeline lacks id, sha or status' };
     }
     headPipeline = { id, sha, status, source: nonEmpty(rawPipeline['source']), web_url: nonEmpty(rawPipeline['web_url']) };
+  }
+  const fields = [state, headSha, webUrl, headPipeline?.sha, headPipeline?.status, headPipeline?.source, headPipeline?.web_url];
+  if (fields.some((field) => typeof field === 'string' && field.length > MAX_FIELD_CHARS)) {
+    return { problem: `a merge request response field is longer than ${MAX_FIELD_CHARS} characters` };
   }
   return {
     observed: { host: identity.host, project: identity.project, mr_iid: iid, state, head_sha: headSha, head_pipeline: headPipeline },
@@ -215,20 +221,24 @@ export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrR
 
 type Log = (level: 'info' | 'warn', msg: string, fields?: Record<string, unknown>) => void;
 
-/** The host name without a port, lower-cased: an ssh origin carries no port and
- * a web UI on another port is still the same machine. */
-function hostName(host: string): string {
-  return host.toLowerCase().replace(/:\d+$/u, '');
+/** Whether a link host is the origin's host. An origin that names a port
+ * (an https remote) must be matched exactly; one that names none (an ssh remote
+ * carries no web port) matches the link's host name on any port, since a web UI
+ * on another port is the same machine. */
+function hostMatches(originHost: string, linkHost: string): boolean {
+  const origin = originHost.toLowerCase();
+  const link = linkHost.toLowerCase();
+  return /:\d+$/u.test(origin) ? origin === link : origin === link.replace(/:\d+$/u, '');
 }
 
-/** Why a link does not name the lane's origin, or null when it does. Host name
- * and project path compare case-insensitively, as the verdict poster compares. */
+/** Why a link does not name the lane's origin, or null when it does. Host and
+ * project path compare case-insensitively, as the verdict poster compares. */
 function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): string | null {
   if (origin === null) {
     return `the merge request link names ${link.host}/${link.project}, but this lane has no resolvable origin remote to bind it to; no request was made`;
   }
   const originProject = `${origin.owner}/${origin.repo}`;
-  if (hostName(origin.host) === hostName(link.host) && originProject.toLowerCase() === link.project.toLowerCase()) return null;
+  if (hostMatches(origin.host, link.host) && originProject.toLowerCase() === link.project.toLowerCase()) return null;
   return `the merge request link names ${link.host}/${link.project}, which is not this lane's origin (${origin.host}/${originProject}); no request was made`;
 }
 

@@ -79,7 +79,7 @@ const GITLAB_MR_READ_ERROR_MEANING: Readonly<Record<GitLabMrReadErrorKind, strin
   'not-found': 'GitLab answered 404',
   'rate-limit': 'GitLab answered 429',
   timeout: 'the request timed out',
-  other: 'the request failed or the response was not a usable merge request',
+  other: 'the read failed, was refused before any request (the link does not name the lane\'s origin) or got a response that is not a usable merge request; the gitlab.mr-read-failed event\'s detail says which',
 };
 
 function record(value: unknown): Record<string, unknown> | null {
