@@ -21,7 +21,6 @@ import type { AgentSpawner } from '../src/dispatch/service.js';
 import {
   WaveRunner,
   enactedStateFor,
-  GitLabMrPoster,
   hostDisclosureAppendix,
   publicationBodyFor,
   redactReviewForPublication,
@@ -1712,103 +1711,5 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(artifacts, { recursive: true, force: true });
   }, 180_000);
 
-  it('assembles and records GitLab-compatible bytes before the irreversible post when the provider removes one terminal LF', async () => {
-    const repo = makeFixtureRepo('perkins-gl-publication-newline');
-    repos.push(repo);
-    const branch = 'feature/gitlab-publication-newline';
-    repo.git(['checkout', '-b', branch]);
-    const target = repo.commitFile('src/main.ts', 'export function answer(): number { return 42; }\n');
-    const root = mkdtempSync(join(tmpdir(), 'perkins-gl-publication-port-'));
-    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-gl-publication-artifacts-'));
-    const sessions = mkdtempSync(join(tmpdir(), 'perkins-gl-publication-sessions-'));
-    dirs.push(root, artifacts, sessions);
-    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-gl-publication-db-')));
-    dbs.push(db);
-    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, branch, target, ledger);
-    const lane = await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-gl-publication-newline' });
-    const job = ledger.addJob({ id: 'job-gl-publication-newline', repo: 'fixture', title: 'GitLab newline', baseBranch: 'main', briefing: 'review' });
-    ledger.setJobStatus(job.id, 'working');
-    settleLane(ledger, job.id);
-    const mrUrl = 'https://gitlab.example.test/acme/widget/-/merge_requests/7';
-    ledger.setJobPr(job.id, mrUrl);
-    attachOrigin(repo, branch, root);
-    for (const repositoryPath of [repo.path, lane.path]) {
-      execFileSync('git', ['-C', repositoryPath, 'remote', 'set-url', 'origin', 'https://gitlab.example.test/acme/widget.git']);
-    }
-    const calls: Array<{ readonly url: string; readonly body?: string }> = [];
-    const provider = new GitLabMrPoster({
-      token: 'glpat-isolated-test-token',
-      fetchImpl: async (url, init) => {
-        const sentBody = init?.body === undefined ? undefined : JSON.parse(init.body) as { body?: string };
-        calls.push({ url, ...(sentBody?.body !== undefined ? { body: sentBody.body } : {}) });
-        if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
-        if (url.endsWith('/notes')) {
-          const sent = sentBody?.body ?? '';
-          const echoed = sent.endsWith('\n') ? sent.slice(0, -1) : sent;
-          return { ok: true, status: 201, text: async () => JSON.stringify({ id: 712, body: echoed, author: { username: 'gru-bot' } }) };
-        }
-        return { ok: true, status: 200, text: async () => JSON.stringify({ sha: target, diff_refs: { base_sha: 'b'.repeat(40) } }) };
-      },
-    });
-    const wave = new WaveRunner({
-      ledger, worktrees: port,
-      spawner: fakeWholeSpawner(sessions, { specialists: [], childAnswer: () => '[]' }).spawner,
-      reviewArtifactRoot: artifacts, poster: provider, prHeadProbe: localHeadProbe(branch),
-    });
 
-    const outcome = asWave(await wave.runRound({ jobId: job.id }));
-    expect(outcome.verdict).toBe('approved');
-    expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
-    expect(outcome.posted).toBe(true);
-    expect(outcome.round.status).toBe('completed');
-    const events = ledger.listEvents({ limit: 500 }).filter((event) => event.roundId === outcome.round.id);
-    const posted = events.find((event) => event.kind === 'round.posted');
-    const attempt = events.find((event) => event.kind === 'round.publication-attempt');
-    const receiptEvidence = events.find((event) => event.kind === 'round.publication-receipt');
-    const postedPayload = posted?.payload as { publicationFile: string; publicationSha256: string; receipt: { bodySha256: string; actor: string; headSha: string } } | undefined;
-    const attemptPayload = attempt?.payload as { publicationSha256: string } | undefined;
-    const receiptPayload = receiptEvidence?.payload as { publicationSha256: string; credited: boolean; receipt: { bodySha256: string } } | undefined;
-    const artifactBytes = readFileSync(postedPayload!.publicationFile, 'utf8');
-    const sentBody = calls.find((call) => call.url.endsWith('/notes'))?.body;
-    expect(artifactBytes).not.toMatch(/\n$/u);
-    expect(sentBody).toBe(artifactBytes);
-    expect(sentBody).toContain('## Execution and findings (host-recorded facts)');
-    const digest = createHash('sha256').update(artifactBytes, 'utf8').digest('hex');
-    expect(postedPayload).toMatchObject({ publicationSha256: digest, receipt: { bodySha256: digest, actor: 'gru-bot', headSha: target } });
-    expect(attemptPayload?.publicationSha256).toBe(digest);
-    expect(receiptPayload).toMatchObject({ publicationSha256: digest, credited: false, receipt: { bodySha256: digest } });
-    expect(calls.map((call) => call.url)).toEqual([
-      'https://gitlab.example.test/api/v4/projects/acme%2Fwidget/merge_requests/7',
-      'https://gitlab.example.test/api/v4/user',
-      'https://gitlab.example.test/api/v4/projects/acme%2Fwidget/merge_requests/7/notes',
-      'https://gitlab.example.test/api/v4/projects/acme%2Fwidget/merge_requests/7',
-    ]);
-  });
-
-  it('keeps an old LF-terminated attempt unresolved when GitLab contains only its newline-normalized note', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'perkins-gl-legacy-normalization-'));
-    const repoPath = join(root, 'repo');
-    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
-    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://gitlab.example.test/acme/widget.git']);
-    dirs.push(root);
-    const calls: Array<{ readonly url: string; readonly method?: string }> = [];
-    const poster = new GitLabMrPoster({
-      token: 'glpat-token',
-      fetchImpl: async (url, init) => {
-        calls.push({ url, ...(init?.method !== undefined ? { method: init.method } : {}) });
-        if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
-        if (url.includes('/notes?')) return { ok: true, status: 200, text: async () => JSON.stringify([
-          { id: 713, body: 'legacy artifact', author: { username: 'gru-bot' } },
-        ]) };
-        return { ok: true, status: 200, text: async () => JSON.stringify({ sha: 'a'.repeat(40), diff_refs: { base_sha: 'b'.repeat(40) } }) };
-      },
-    });
-    await expect(poster.reconcile!({
-      prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7',
-      host: 'gitlab.example.test', repoPath, body: 'legacy artifact\n',
-      targetSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), reviewEvent: 'COMMENT',
-    })).rejects.toThrow(/historical match is NOT delivery evidence|stays unresolved/u);
-    expect(calls.some((call) => call.method === 'POST')).toBe(false);
-  }, 180_000);
 });

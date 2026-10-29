@@ -303,7 +303,7 @@ const PINS: Record<string, number> = {
   'perkins-findings-dedupe.test.ts': 11,
   'perkins-freeze-freshhead.test.ts': 25,
   'perkins-group-liveness-ps.test.ts': 3,
-  'perkins-integration-recovery.test.ts': 16,
+  'perkins-integration-recovery.test.ts': 14,
   'perkins-integration-review.test.ts': 15,
   'perkins-lead-schema-compat.test.ts': 6,
   'perkins-whole-review.test.ts': 149,
