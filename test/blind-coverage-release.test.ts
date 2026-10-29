@@ -177,12 +177,19 @@ async function commission(h: Harness, id: string, extra: Record<string, unknown>
   return call(h.port, 'POST', '/api/dispatch', blindReview(id, { repo_path: h.repo.path, input_package: validPackage(), ...extra }));
 }
 
+/** The stub runtime never reports agent state, so a settled turn is marked idle as the real registry does
+ * (binning refuses a job whose agent still reads as spawning). */
+function settleAgents(h: Harness, jobId: string): void {
+  for (const agent of h.ledger.listAgents().filter((candidate) => candidate.jobId === jobId)) h.ledger.setAgentState(agent.id, 'idle');
+}
+
 /** A blind reviewer that delivered a clean report (status `delivered`). */
 async function deliveredReviewer(h: Harness, id: string): Promise<void> {
   const created = await commission(h, id);
   expect(created.status, JSON.stringify(created.json)).toBe(202);
   await waitFor(() => h.ledger.latestJobEvent(id, 'job.delivered') !== null);
   await waitFor(() => h.ledger.getJob(id)?.status === 'delivered');
+  settleAgents(h, id);
 }
 
 async function dismiss(h: Harness, id: string): Promise<void> {
@@ -455,6 +462,7 @@ describe('blind coverage release (issue #513)', () => {
     expect(replacement.status, JSON.stringify(replacement.json)).toBe(202);
     expect(h.ledger.latestJobEvent('rev-2', 'review.blind-input-admitted')?.payload).toMatchObject({ replaces: ['rev-1'] });
     await waitFor(() => h.ledger.getJob('rev-2')?.status === 'delivered');
+    settleAgents(h, 'rev-2');
 
     // It delivers again: a clean settle scan, then the delivered status.
     h.dispatch.observeBlindSession('rev-1', null);
