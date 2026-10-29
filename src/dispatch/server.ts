@@ -21,6 +21,7 @@ import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRun
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
 import { redactCreationTokens } from '../worktrees/creation-intent.js';
 import type { DirectiveRegistry } from './fix-directive.js';
+import { closeoutIntentView, type CanceledRequestCloseout } from './canceled-request-closeout.js';
 import { abandonLiveDirectiveFromRoute, abandonPendingRebriefFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
@@ -89,6 +90,9 @@ export interface DispatchServerOptions {
   readonly workerGate?: PacingGate;
   /** Supervisor's fresh queued/backoff producer ownership for retirement. */
   readonly pendingProducerBlockers: DirectiveProgressDeps['pendingProducerBlockers'];
+  /** Canceled-request closeout (#523): the directive readback names the path
+   * a binning request would take. Absent = the readback omits `closeout`. */
+  readonly closeout?: Pick<CanceledRequestCloseout, 'describe'>;
   /** Provider pacing: bounded settlement of an automatic rate-limit retry
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */
@@ -225,6 +229,14 @@ function retirementReadback(record: DirectiveRequestRecord): Record<string, unkn
     hold_released_by: record.holdReleasedBy,
     hold_released_at: record.holdReleasedAt,
   };
+}
+
+/** The canceled-request closeout member of the directive readback: the path
+ * a binning request takes for this request's job, whether the closeout would
+ * proceed, why not, and the latest intent. */
+function closeoutReadback(closeout: Pick<CanceledRequestCloseout, 'describe'>, requestId: string): Record<string, unknown> {
+  const { path, eligible, blockers, intent } = closeout.describe(requestId);
+  return { path, eligible, blockers, intent: intent === null ? null : closeoutIntentView(intent) };
 }
 
 function abandonmentReadback(record: DirectiveRequestRecord): Record<string, unknown> {
@@ -2342,6 +2354,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         recovery_obligation: options.ledger.recoveryObligation(record.jobId, 'directive', record.requestId),
         ...(record.state === 'retired' ? retirementReadback(record) : {}),
         ...(record.abandonedAt === null ? {} : abandonmentReadback(record)),
+        ...(options.closeout === undefined ? {} : { closeout: closeoutReadback(options.closeout, requestId) }),
         states: {
           dispatching:
             'accepted; a dispatch claim was taken before any side effect — native admission not yet recorded (or unknown after a crash)',

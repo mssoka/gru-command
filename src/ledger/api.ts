@@ -161,6 +161,26 @@ import {
   type DecisionKind,
   type DecisionRecord,
 } from './decision-memory.js';
+import {
+  CLOSEOUT_ACTOR,
+  closeoutBlockerFingerprint,
+  CloseoutPendingError,
+  hasActiveCloseout,
+  insertCloseout,
+  nextCloseoutGeneration,
+  selectActiveCloseoutForJob,
+  selectActiveCloseoutForRequest,
+  selectActiveCloseoutIds,
+  selectCloseout,
+  selectLatestCloseoutForJob,
+  selectLatestCloseoutForRequest,
+  TerminalLiveWorkError,
+  updateCloseoutState,
+  type CloseoutBlocker,
+  type CloseoutIntent,
+  type CloseoutRequester,
+  type CloseoutSupersededReason,
+} from './closeouts.js';
 
 const VERIFICATION_KIND = 'verification.completed';
 const MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS = 4_096;
@@ -171,6 +191,8 @@ const MAX_VERIFICATION_PROCESS_RECEIPT_BYTES = MAX_REBRIEF_RECEIPT_EVIDENCE_BYTE
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirementRefusalCode, DirectiveState } from './directives.js';
 export { DirectiveRetirementError } from './directives.js';
+export type { CloseoutBlocker, CloseoutIntent, CloseoutState, CloseoutSupersededReason } from './closeouts.js';
+export { CloseoutPendingError, TerminalLiveWorkError } from './closeouts.js';
 export type {
   DecisionActor,
   DecisionKind,
@@ -2487,9 +2509,7 @@ export class LedgerApi {
           // atomically until the owner/chief has stopped target-owned work;
           // a bare status write must never conceal a live worker or review.
           const blockers = this.terminalLiveWorkBlockers(id);
-          if (blockers.length > 0) {
-            throw new Error(`job "${id}" has target-owned live work — stop it before binning: ${blockers.join('; ')}`);
-          }
+          if (blockers.length > 0) throw new TerminalLiveWorkError(id, blockers);
         } else if (status === 'done') {
           // `done` is a decision, not an observed fact (`merged` is, and is
           // accepted): it must not close over live directive control.
@@ -9061,6 +9081,7 @@ export class LedgerApi {
 
   assertDirectiveAuthority(identity: DirectiveTurnIdentity): void {
     validateDirectiveIdentity(identity);
+    this.assertNoPendingCloseout(identity.requestId);
     const row = this.getDirective(identity.requestId);
     const job = this.getJob(identity.jobId);
     if (row === null || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || isDirectiveTerminal(row.state) ||
@@ -9096,6 +9117,7 @@ export class LedgerApi {
    * blocker — see directiveCleanupBlockers (#362). */
   claimDirectiveDispatch(requestId: string): boolean {
     return this.transaction(() => {
+      this.assertNoPendingCloseout(requestId);
       const identity = this.directiveTurnIdentity(requestId);
       const cleanupBlockers = this.directiveCleanupBlockers(identity.jobId);
       if (cleanupBlockers.length > 0) throw new DirectiveCheckpointError(`original producer cessation unproven: ${cleanupBlockers.join('; ')}`);
@@ -10508,6 +10530,300 @@ export class LedgerApi {
     return null;
   }
 
+  // ------------------------------------------------------------------
+  // Canceled-request closeout (#523)
+  //
+  // Binning a job whose only live request was deferred before reaching its
+  // worker: S1 `beginCloseout` records the intent, S2 is the guarded
+  // retirement (`retireInterruptedDirective`), S3 `completeCloseout` bins the
+  // job, resolves the request's card and completes the intent. Each step is
+  // one transaction; a crash leaves the intent `open`, which means resume.
+  // ------------------------------------------------------------------
+
+  getCloseout(closeoutId: string): CloseoutIntent | null {
+    return selectCloseout(this.db, closeoutId);
+  }
+
+  /** The newest generation for one request, whatever its state. */
+  latestCloseoutForRequest(requestId: string): CloseoutIntent | null {
+    return selectLatestCloseoutForRequest(this.db, requestId);
+  }
+
+  /** The newest intent of any request on the job. */
+  latestCloseoutForJob(jobId: string): CloseoutIntent | null {
+    return selectLatestCloseoutForJob(this.db, jobId);
+  }
+
+  /** The job's `open` or `stopped` intent, if any. */
+  activeCloseoutForJob(jobId: string): CloseoutIntent | null {
+    return selectActiveCloseoutForJob(this.db, jobId);
+  }
+
+  /** The id of every `open` or `stopped` intent, oldest first. */
+  listActiveCloseoutIds(): readonly string[] {
+    return selectActiveCloseoutIds(this.db);
+  }
+
+  /** True while an `open` or `stopped` intent owes this request its end. */
+  hasPendingCloseout(requestId: string): boolean {
+    return hasActiveCloseout(this.db, requestId);
+  }
+
+  /** The redispatch fence: a request a closeout owes its end is never dispatched. */
+  private assertNoPendingCloseout(requestId: string): void {
+    const pending = selectActiveCloseoutForRequest(this.db, requestId);
+    if (pending !== null) throw new CloseoutPendingError(requestId, pending.closeoutId, pending.state);
+  }
+
+  /** The request a binning request would close out, or null when the job
+   * does not meet the eligibility rule: a non-terminal job (the status
+   * machine admits binned) whose ONLY live request is `dispatching`, carries
+   * a request kind, was claimed for dispatch and then positively deferred
+   * before any native effect, has no recovery decision, and which no pending
+   * re-brief marker accompanies. Equivalently, `doneBlockers(jobId)` names
+   * exactly that one request. */
+  closeoutCandidate(jobId: string): DirectiveRequestRecord | null {
+    const job = this.getJob(jobId);
+    if (job === null || isJobTerminal(job.status)) return null;
+    try { assertJobTransition(job.status, 'binned'); } catch { return null; }
+    const live = this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES });
+    if (live.length !== 1 || this.listPendingRebriefs({ jobId }).length > 0) return null;
+    const request = live[0] as DirectiveRequestRecord;
+    if (request.state !== 'dispatching' || request.requestKind === null || request.dispatchStartedAt === null || request.recoveryDecision !== null) return null;
+    try { if (!this.hasDirectiveDispatchDeferral(request.requestId)) return null; }
+    catch (error) {
+      // Legacy authority that cannot be proven is never a deferral.
+      if (error instanceof DirectiveCheckpointError) return null;
+      throw error;
+    }
+    return request;
+  }
+
+  /** S1: re-run the one evaluation inside the transaction, then record the
+   * intent (`open`) and its `silas.closeout-intent` event. A refusal writes
+   * nothing. */
+  beginCloseout(input: {
+    readonly jobId: string;
+    readonly requestId: string;
+    readonly requestedBy: CloseoutRequester;
+    readonly reason: string | null;
+    readonly evaluate: () => readonly CloseoutBlocker[];
+  }): { readonly kind: 'begun'; readonly intent: CloseoutIntent } | { readonly kind: 'refused'; readonly blockers: readonly CloseoutBlocker[] } {
+    return this.transaction(() => {
+      const candidate = this.closeoutCandidate(input.jobId);
+      if (candidate === null || candidate.requestId !== input.requestId) {
+        return { kind: 'refused' as const, blockers: [{ code: 'closeout_not_eligible',
+          detail: `job "${input.jobId}" no longer meets the closeout eligibility rule for request "${input.requestId}"` }] };
+      }
+      if (selectActiveCloseoutForRequest(this.db, input.requestId) !== null) {
+        throw new Error(`directive request "${input.requestId}" already has an open or stopped closeout — resume it, never start a second`);
+      }
+      const blockers = input.evaluate();
+      if (blockers.length > 0) return { kind: 'refused' as const, blockers };
+      const job = this.getJob(input.jobId) as JobRecord;
+      const generation = nextCloseoutGeneration(this.db, input.requestId);
+      const closeoutId = randomUUID();
+      const event = this.appendEvent({ kind: 'silas.closeout-intent', jobId: input.jobId,
+        payload: { closeout_id: closeoutId, request_id: input.requestId, generation, payload_hash: candidate.payloadHash,
+          job_status: job.status, requested_by: input.requestedBy, reason: input.reason, by: CLOSEOUT_ACTOR } });
+      const ts = nowIso();
+      insertCloseout(this.db, { closeoutId, jobId: input.jobId, requestId: input.requestId, generation, payloadHash: candidate.payloadHash,
+        jobStatus: job.status, intentSeq: event.seq, requestedBy: input.requestedBy, reason: input.reason, createdAt: ts, updatedAt: ts });
+      return { kind: 'begun' as const, intent: selectCloseout(this.db, closeoutId) as CloseoutIntent };
+    });
+  }
+
+  /** The first failing revalidation predicate for an active intent, or null
+   * (plus whether S2 is already satisfied). The intent stores only fixed
+   * identities; the closeout's own writes are recognised by event identity
+   * (its one `silas.directive-retired`), never by comparing epoch values.
+   *  P1 the job status still equals the stored one;
+   *  P2 before S2 the request is still `dispatching` with its deferral and no
+   *     recovery decision, or `retired` by a retire event after the intent;
+   *     before S3 it is `retired` and not abandoned;
+   *  P3 no other request row on the job was accepted after the intent;
+   *  P4 the control events after the intent are at most this request's one
+   *     `silas.directive-retired`. */
+  private closeoutStaleReason(intent: CloseoutIntent, before: 'retire' | 'bin'): { readonly reason: CloseoutSupersededReason | null; readonly retired: boolean } {
+    const job = this.getJob(intent.jobId);
+    const row = this.getDirective(intent.requestId);
+    const retireEvent = this.latestJobEventByRequestId(intent.jobId, 'silas.directive-retired', intent.requestId, { sinceSeq: intent.intentSeq });
+    const retired = row !== null && row.state === 'retired' && row.abandonedAt === null && retireEvent !== null;
+    if (job === null || job.status !== intent.jobStatus) return { reason: 'job-status', retired };
+    if (row === null || row.payloadHash !== intent.payloadHash) return { reason: 'request-state', retired };
+    if (before === 'retire') {
+      const pending = row.state === 'dispatching' && row.recoveryDecision === null && this.hasDirectiveDispatchDeferral(row.requestId);
+      if (!pending && !retired) return { reason: 'request-state', retired };
+    } else if (row.state !== 'retired' || row.abandonedAt !== null) {
+      return { reason: 'request-state', retired };
+    }
+    const later = this.db.prepare('SELECT 1 FROM pending_directives WHERE job_id = ? AND request_id <> ? AND baseline_seq >= ? LIMIT 1')
+      .get(intent.jobId, intent.requestId, intent.intentSeq);
+    if (later !== undefined) return { reason: 'later-work', retired };
+    const control = this.db.prepare(`SELECT seq, kind, payload FROM events WHERE job_id = ? AND seq > ? AND (${DIRECTIVE_CONTROL_SQL}) ORDER BY seq`)
+      .all(intent.jobId, intent.intentSeq) as Row[];
+    const own = control.filter((event) => event.kind === 'silas.directive-retired' &&
+      (JSON.parse(str(event.payload)) as { request_id?: unknown }).request_id === intent.requestId);
+    if (control.length > own.length || own.length > 1) return { reason: 'control-event', retired };
+    return { reason: null, retired };
+  }
+
+  private supersedeCloseout(intent: CloseoutIntent, reason: CloseoutSupersededReason): CloseoutIntent {
+    updateCloseoutState(this.db, intent.closeoutId, { state: 'superseded', supersededReason: reason, updatedAt: nowIso() });
+    this.appendEvent({ kind: 'silas.closeout-superseded', jobId: intent.jobId,
+      payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation, superseded_reason: reason, by: CLOSEOUT_ACTOR } });
+    return selectCloseout(this.db, intent.closeoutId) as CloseoutIntent;
+  }
+
+  private activeCloseoutOrThrow(closeoutId: string): CloseoutIntent {
+    const intent = selectCloseout(this.db, closeoutId);
+    if (intent === null) throw new RecordNotFound(`closeout "${closeoutId}" not found`);
+    if (intent.state !== 'open' && intent.state !== 'stopped') {
+      throw new Error(`closeout "${closeoutId}" is ${intent.state} — only an open or stopped closeout takes a step`);
+    }
+    return intent;
+  }
+
+  /** Revalidate before S2. A stale intent is superseded (fence lifted) and
+   * returned; otherwise `retired` says S2 is already satisfied (a retire of
+   * this request after the intent, by the closeout or by hand). */
+  guardCloseoutRetire(closeoutId: string): { readonly ok: true; readonly retired: boolean; readonly intent: CloseoutIntent } | { readonly ok: false; readonly intent: CloseoutIntent } {
+    return this.transaction(() => {
+      const intent = this.activeCloseoutOrThrow(closeoutId);
+      const stale = this.closeoutStaleReason(intent, 'retire');
+      if (stale.reason !== null) return { ok: false as const, intent: this.supersedeCloseout(intent, stale.reason) };
+      return { ok: true as const, retired: stale.retired, intent };
+    });
+  }
+
+  /** Why an active intent no longer describes the job (the first failing
+   * revalidation predicate), or null while it still does. A read: nothing is
+   * superseded here; the next step does that. */
+  closeoutStaleness(closeoutId: string): CloseoutSupersededReason | null {
+    const intent = this.activeCloseoutOrThrow(closeoutId);
+    const retired = this.getDirective(intent.requestId)?.state === 'retired';
+    return this.closeoutStaleReason(intent, retired ? 'bin' : 'retire').reason;
+  }
+
+  /** The blockers binning would meet right now: the live work `setJobStatus`
+   * refuses (S3). A stopped intent whose request is already retired is
+   * re-evaluated against exactly this. */
+  closeoutBinBlockers(jobId: string): readonly CloseoutBlocker[] {
+    return this.terminalLiveWorkBlockers(jobId).map((detail) => ({ code: 'live_work', detail }));
+  }
+
+  /** S3: revalidate, bin the job (status, `job.status` event, obligations
+   * closed `job-terminal`/`binned`), resolve the request's card — never an
+   * Ack — and complete the intent, in one transaction. Live work that
+   * appeared after S2 makes `setJobStatus` refuse (`TerminalLiveWorkError`);
+   * the whole step rolls back and the caller records the intent stopped. */
+  completeCloseout(closeoutId: string): { readonly kind: 'complete'; readonly intent: CloseoutIntent; readonly job: JobRecord } | { readonly kind: 'superseded'; readonly intent: CloseoutIntent } {
+    return this.transaction(() => {
+      const intent = this.activeCloseoutOrThrow(closeoutId);
+      const stale = this.closeoutStaleReason(intent, 'bin');
+      if (stale.reason !== null) return { kind: 'superseded' as const, intent: this.supersedeCloseout(intent, stale.reason) };
+      const job = this.setJobStatus(intent.jobId, 'binned');
+      const card = this.findNotificationByKind(`silas.directive-unreconciled.${intent.requestId}`, 'active');
+      if (card?.routing === 'action-required') this.resolveNotificationById(card.id, CLOSEOUT_ACTOR);
+      updateCloseoutState(this.db, intent.closeoutId, { state: 'complete', updatedAt: nowIso() });
+      this.appendEvent({ kind: 'silas.closeout-complete', jobId: intent.jobId,
+        payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation, by: CLOSEOUT_ACTOR } });
+      return { kind: 'complete' as const, intent: selectCloseout(this.db, intent.closeoutId) as CloseoutIntent, job };
+    });
+  }
+
+  /** Record a guard that refused AFTER preflight (a race): the intent is
+   * `stopped` with the blockers and their fingerprint. Recording the same
+   * fingerprint again writes nothing. */
+  stopCloseout(closeoutId: string, blockers: readonly CloseoutBlocker[]): CloseoutIntent {
+    return this.transaction(() => {
+      const intent = this.activeCloseoutOrThrow(closeoutId);
+      if (intent.state === 'stopped' && intent.blockerFingerprint === closeoutBlockerFingerprint(blockers)) return intent;
+      updateCloseoutState(this.db, closeoutId, { state: 'stopped', blockers, updatedAt: nowIso() });
+      const stopped = selectCloseout(this.db, closeoutId) as CloseoutIntent;
+      this.appendEvent({ kind: 'silas.closeout-stopped', jobId: intent.jobId,
+        payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation, blockers,
+          blocker_fingerprint: stopped.blockerFingerprint, by: CLOSEOUT_ACTOR } });
+      return stopped;
+    });
+  }
+
+  /** The caller-independent guards of a live retirement, in the order the
+   * retirement evaluates them: live ownership, completed native work, a
+   * correlated terminal receipt, bound admission evidence and unknown
+   * producer custody. Throws the typed refusal; returns the row with its
+   * correlated admission evidence bound (the only write, and only for a
+   * row that has such evidence). `retireInterruptedDirective` and the
+   * canceled-request closeout evaluate exactly this set, so a request is
+   * refused for the same reasons on either path. The caller's expectations
+   * (generation, authority, head) are NOT here: they compare caller input. */
+  retirementPreflight(requestId: string, laneId: string): DirectiveRequestRecord {
+    return this.transaction(() => {
+      const row = this.getDirective(requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
+      if (row.state !== 'dispatching' && row.state !== 'admitted') {
+        throw new DirectiveRetirementError('directive_not_live',
+          `directive request "${requestId}" is ${directiveStateName(row)} — only a live request can be retired`);
+      }
+      const blockers = this.directiveRetirementBlockers(row, laneId);
+      if (blockers.length > 0) {
+        throw new DirectiveRetirementError(
+          'live_work',
+          `job "${row.jobId}" still has live ownership — retirement would conceal or orphan it`,
+          blockers,
+        );
+      }
+      this.assertNoCompletedNativeRetirement(row);
+      // A correlated terminal receipt means normal settlement owns this
+      // request; retirement must never overwrite it.
+      const delivered = this.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
+      if (delivered !== null) {
+        throw new DirectiveRetirementError(
+          'terminal_receipt_present',
+          `directive request "${requestId}" has a correlated job.delivered receipt at seq ${delivered.seq} — ` +
+            'normal settlement (or the reconciler) owns it; do not overwrite a terminal receipt',
+        );
+      }
+      // Preserve prior admission information when present: a correlated
+      // admission event binds FIRST through the existing validated
+      // transition, so the retired row truthfully reads
+      // `admitted-without-terminal` instead of erasing the real turn.
+      let current = row;
+      if (current.state === 'dispatching') {
+        const sent = this.latestJobEventByRequestId(row.jobId, 'silas.directive-sent', row.requestId);
+        if (sent !== null) {
+          const payload = (typeof sent.payload === 'object' && sent.payload !== null ? sent.payload : {}) as Record<string, unknown>;
+          const minionId = typeof payload['minion_id'] === 'string' && payload['minion_id'] !== '' ? payload['minion_id'] : null;
+          if (minionId === null) {
+            throw new DirectiveRetirementError(
+              'admission_evidence_incomplete',
+              `directive request "${requestId}" has correlated admission evidence at seq ${sent.seq} without a minion identity — ` +
+                'reconcile the actual turn before closing control',
+            );
+          }
+          try {
+            current = this.recordDirectiveAdmission({ requestId: row.requestId, minionId, eventSeq: sent.seq });
+          } catch (error) {
+            throw new DirectiveRetirementError(
+              'admission_evidence_incomplete',
+              `directive request "${requestId}" correlated admission evidence is inconsistent: ${String(error)}`,
+            );
+          }
+        }
+      }
+      const admissionGap = this.directiveAdmissionIdentityGap(current);
+      if (admissionGap !== null) throw new DirectiveRetirementError('admission_evidence_incomplete', admissionGap);
+      // Last, unknown custody: no producer identity/journal or no
+      // registered admission minion means no cessation can be verified.
+      const custody = this.directiveCustodyGaps(current);
+      if (custody.length > 0) {
+        throw new DirectiveRetirementError('live_work',
+          `directive request "${requestId}" has unknown producer custody — retirement cannot verify cessation`, custody);
+      }
+      return current;
+    });
+  }
+
   /** Guarded control closure. See the block comment above for the contract. */
   retireInterruptedDirective(input: {
     requestId: string;
@@ -10615,61 +10931,7 @@ export class LedgerApi {
             're-verify the writer ceased at the current head',
         );
       }
-      const blockers = this.directiveRetirementBlockers(row, input.lane.id);
-      if (blockers.length > 0) {
-        throw new DirectiveRetirementError(
-          'live_work',
-          `job "${row.jobId}" still has live ownership — retirement would conceal or orphan it`,
-          blockers,
-        );
-      }
-      this.assertNoCompletedNativeRetirement(row);
-      // A correlated terminal receipt means normal settlement owns this
-      // request; retirement must never overwrite it.
-      const delivered = this.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
-      if (delivered !== null) {
-        throw new DirectiveRetirementError(
-          'terminal_receipt_present',
-          `directive request "${input.requestId}" has a correlated job.delivered receipt at seq ${delivered.seq} — ` +
-            'normal settlement (or the reconciler) owns it; do not overwrite a terminal receipt',
-        );
-      }
-      // Preserve prior admission information when present: a correlated
-      // admission event binds FIRST through the existing validated
-      // transition, so the retired row truthfully reads
-      // `admitted-without-terminal` instead of erasing the real turn.
-      let current = row;
-      if (current.state === 'dispatching') {
-        const sent = this.latestJobEventByRequestId(row.jobId, 'silas.directive-sent', row.requestId);
-        if (sent !== null) {
-          const payload = (typeof sent.payload === 'object' && sent.payload !== null ? sent.payload : {}) as Record<string, unknown>;
-          const minionId = typeof payload['minion_id'] === 'string' && payload['minion_id'] !== '' ? payload['minion_id'] : null;
-          if (minionId === null) {
-            throw new DirectiveRetirementError(
-              'admission_evidence_incomplete',
-              `directive request "${input.requestId}" has correlated admission evidence at seq ${sent.seq} without a minion identity — ` +
-                'reconcile the actual turn before closing control',
-            );
-          }
-          try {
-            current = this.recordDirectiveAdmission({ requestId: row.requestId, minionId, eventSeq: sent.seq });
-          } catch (error) {
-            throw new DirectiveRetirementError(
-              'admission_evidence_incomplete',
-              `directive request "${input.requestId}" correlated admission evidence is inconsistent: ${String(error)}`,
-            );
-          }
-        }
-      }
-      const admissionGap = this.directiveAdmissionIdentityGap(current);
-      if (admissionGap !== null) throw new DirectiveRetirementError('admission_evidence_incomplete', admissionGap);
-      // Last, unknown custody: no producer identity/journal or no
-      // registered admission minion means no cessation can be verified.
-      const custody = this.directiveCustodyGaps(current);
-      if (custody.length > 0) {
-        throw new DirectiveRetirementError('live_work',
-          `directive request "${input.requestId}" has unknown producer custody — retirement cannot verify cessation`, custody);
-      }
+      const current = this.retirementPreflight(row.requestId, input.lane.id);
       const admissionClass = directiveAdmissionClass(current);
       const ts = nowIso();
       this.db

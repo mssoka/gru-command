@@ -42,6 +42,7 @@ import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
+import { binningCloseoutRoute, CanceledRequestCloseout, runBootDirectiveRecovery } from './dispatch/canceled-request-closeout.js';
 import { DirectiveProgressService, executeAcceptedDirective } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, bootProviderRecovery, establishProviderWait, handBackThenStartSupervision } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
@@ -1159,6 +1160,11 @@ async function main(): Promise<number> {
   // boot-time degradation is visible to clients that connect later.
   await decisionRuntime.start();
 
+  // Canceled-request closeout (#523): built once the worktree manager and the
+  // directive progress service exist, after the board — the same late-binding
+  // pattern as `briefingReviewBoardCounts`. Until it is set the board's
+  // binning route answers `null` and today's status write runs.
+  let closeout: CanceledRequestCloseout | undefined = undefined;
   const board = createBoardServer({
     config,
     engine,
@@ -1166,6 +1172,7 @@ async function main(): Promise<number> {
     transcripts: new TranscriptService(store.sessionsDir, { ledger }),
     bus,
     notifications,
+    binningCloseout: binningCloseoutRoute(() => closeout),
     onNotificationAck: (id) => supervisorLive.onNotificationAcked(id),
     onNotificationDisposition: bindSupervisorNotificationDisposition(supervisorLive),
     decisionsStatus: () => decisionRuntime.status(),
@@ -1574,7 +1581,15 @@ async function main(): Promise<number> {
     ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
   });
   state.directiveProgress = directiveProgress;
-  directiveProgress.reconsider();
+  const canceledRequestCloseout = new CanceledRequestCloseout({ ledger, worktrees: worktreeManager,
+    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate,
+    log: (level, msg, fields) => logger.log(level, msg, fields) });
+  closeout = canceledRequestCloseout;
+  const closeoutBoot = runBootDirectiveRecovery({ directiveProgress, closeout: canceledRequestCloseout });
+  if (closeoutBoot.examined > 0) {
+    logger.info('canceled-request closeout recovery', { examined: closeoutBoot.examined, completed: closeoutBoot.completed,
+      stopped: closeoutBoot.stopped, superseded: closeoutBoot.superseded, untouched: closeoutBoot.untouched, failures: closeoutBoot.failures.length });
+  }
   // Explicit phase-handoff restart safety (pr136-chief-handoff): closes
   // crash windows after the correlated delivery commit and before/after
   // the obligation write and the notification publication. Runs AFTER the
@@ -1762,6 +1777,7 @@ async function main(): Promise<number> {
     childWorkers,
     workerGate: pacing.gate,
     pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
+    closeout: canceledRequestCloseout,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     observeBlindTurn,
     ...(pipeline !== null ? { pipeline } : {}),
@@ -2096,6 +2112,7 @@ async function main(): Promise<number> {
       log: (level, msg, fields) => logger.log(level, msg, fields),
       getWave: () => state.wave,
       directiveProgress,
+      closeout: canceledRequestCloseout,
     });
     const silas = new SilasDriver({
       slot: silasSlot,

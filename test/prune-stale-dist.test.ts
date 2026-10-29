@@ -86,17 +86,19 @@ describe('prune-stale-dist', () => {
     // sweep's card and its follow-through (dist/worktrees/lane-provenance.js,
     // dist/worktrees/sweep-card.js, dist/worktrees/sweep-decisions.js); #494
     // the service boot's [env] step (dist/service-environment.js); #505
-    // Nefario's briefing review (dist/briefing-review/*.js); and the
-    // guarded pre-bootstrap dependency patch reader
-    // (dist/worktrees/prebootstrap-patch.js). #521 replaced the installed
+    // Nefario's briefing review (dist/briefing-review/*.js); the guarded
+    // pre-bootstrap dependency patch reader
+    // (dist/worktrees/prebootstrap-patch.js); and #523 the canceled-request
+    // closeout (dist/dispatch/canceled-request-closeout.js and its ledger
+    // persistence, dist/ledger/closeouts.js). #521 replaced the installed
     // part with the pi 1.4 closure (pi-coding-agent and pi-ai 1.4.0 with
     // their pi-agent-core, pi-mcp, pi-codemode, pi-tui and pi-telemetry
     // packages): 151 catalogued names (142 of them ship executable files; the
     // rest are peers, optionals and type-only packages), from which the 0.85.1
     // shrinkwrap's esbuild, clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5298);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5300);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('26a448485928ad8e6b5dea2185a103e30bb78ddec288071c3a9a3f6d21a587c3');
+      .toBe('85510a3ba4cf65e2c0133a89719339e4f971c9060c01ca273d5f54a4c22ec723');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

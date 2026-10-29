@@ -72,6 +72,10 @@ export interface BoardServerOptions {
   /** Transport heartbeat interval (chat parity: 30 s, 0 disables) —
    * half-open connections are terminated after two missed pongs. */
   readonly heartbeatMs?: number;
+  /** Canceled-request closeout (#523): consulted for `{"status":"binned"}`
+   * before the plain status write. A non-null result is written as the
+   * JSON response; `null` falls through to `ledger.setJobStatus`. */
+  readonly binningCloseout?: (jobId: string, body: Record<string, unknown>) => { readonly status: number; readonly body: unknown } | null;
 }
 
 export interface BoardServer {
@@ -527,6 +531,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           if (!isJobStatus(status)) {
             json(res, 400, { error: 'bad_request', detail: `unknown job status "${status}"` });
             return;
+          }
+          if (status === 'binned') {
+            const closeout = options.binningCloseout?.(id, body) ?? null;
+            if (closeout !== null) {
+              json(res, closeout.status, closeout.body);
+              return;
+            }
           }
           json(res, 200, ledger.setJobStatus(id, status));
           return;

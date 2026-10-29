@@ -1214,4 +1214,38 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_rebrief_abandonments_hold ON rebrief_abandonments(job_id, hold_released_by);
     `,
   },
+  {
+    // #523: the durable intent of a canceled-request closeout — binning a job
+    // whose only live request was deferred before reaching its worker. One
+    // row per (request, generation); `open` means the service owes the
+    // remaining steps (a crash resumes it), `stopped` a guard that refused
+    // after preflight, `complete` and `superseded` are terminal. At most one
+    // `open`/`stopped` intent per request. Additive: no existing table
+    // changes. LANDING COLLISION (same convention as migrations 10-32):
+    // renumber ONLY this never-applied migration if main lands id 33 first.
+    id: 33,
+    name: 'request-closeouts',
+    sql: `
+      CREATE TABLE request_closeouts (
+        closeout_id         TEXT PRIMARY KEY,
+        job_id              TEXT NOT NULL REFERENCES jobs(id),
+        request_id          TEXT NOT NULL REFERENCES pending_directives(request_id),
+        generation          INTEGER NOT NULL CHECK (generation >= 1),
+        payload_hash        TEXT NOT NULL,
+        job_status          TEXT NOT NULL,
+        intent_seq          INTEGER NOT NULL,
+        state               TEXT NOT NULL CHECK (state IN ('open','stopped','complete','superseded')),
+        superseded_reason   TEXT CHECK (superseded_reason IS NULL OR superseded_reason IN ('job-status','request-state','later-work','control-event')),
+        requested_by        TEXT NOT NULL CHECK (requested_by IN ('gru','unattributed')),
+        reason              TEXT,
+        blockers            TEXT NOT NULL DEFAULT '[]',
+        blocker_fingerprint TEXT,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL,
+        UNIQUE (request_id, generation)
+      );
+      CREATE UNIQUE INDEX idx_request_closeouts_active ON request_closeouts(request_id) WHERE state IN ('open','stopped');
+      CREATE INDEX idx_request_closeouts_job ON request_closeouts(job_id);
+    `,
+  },
 ];

@@ -301,6 +301,98 @@ Binning records only the terminal administrative discard. It does not
 prove cessation, no effects, completion, delivery, onboarding, or READY,
 and does not clean retained resources.
 
+#### Canceled-request closeout (#523)
+
+One case is executed by the service instead of by hand. When the job's
+**only** live request is `dispatching` with a request kind, was claimed for
+dispatch and then positively deferred before any native effect
+(`silas.directive-dispatch-deferred`, `native_effects: "none"`), has no
+recovery decision, and no re-brief marker accompanies it (equivalently,
+`doneBlockers(jobId)` names exactly that request), the same
+`POST /api/jobs/<id>/status` `{"status":"binned"}` request closes it out.
+Gru's discard judgment or the owner's explicit cancel is still the only
+authority: nothing new is asked of the owner, nothing is ever written
+`by: "owner"`, and every other job (a legacy request with a null
+`request_kind`, an admitted or never-claimed request, a legacy re-brief
+marker, no live request, an already-binned job) takes today's path and gets
+today's response.
+
+The closeout runs the same guards `/retire` runs for that request — the
+route-level lane, supervisor-ownership and pace-queue checks, then the
+ledger's `retirementPreflight` (live ownership, completed native work, a
+correlated terminal receipt, bound admission evidence, unknown custody) —
+and no other job-level check; the live-work check inside the status write
+stays the S3 race refusal. Three durable steps, each one transaction:
+
+1. **S1** records the intent (`request_closeouts`, state `open`) and one
+   `silas.closeout-intent` event, re-running the evaluation inside the
+   transaction. A refusal before S1 writes nothing.
+2. **S2** retires the request with `by: "canceled-request-closeout"`,
+   building the retire input from fresh state (the readback's `expected_*`
+   fields and the lane checkout's actual HEAD). A request already retired by
+   a `silas.directive-retired` after the intent (a manual `/retire`) satisfies
+   S2.
+3. **S3** bins the job (status, `job.status` event, obligations closed
+   `job-terminal`/`binned`), resolves the request's
+   `silas.directive-unreconciled.<request>` card (a resolve, never an Ack),
+   completes the intent and appends `silas.closeout-complete`.
+
+It never claims a dispatch, spawns or prompts. Before S2 and before S3 the
+intent is revalidated against fixed identities: **P1** the job status is the
+stored one; **P2** the request is still deferred (before S2) or retired and
+not abandoned (before S3); **P3** no other request row on the job was
+accepted after the intent; **P4** the control events after the intent are at
+most this request's one `silas.directive-retired`. The first failing
+predicate marks the intent `superseded` with `superseded_reason`
+`job-status`, `request-state`, `later-work` or `control-event`.
+
+While an intent is `open` or `stopped`, `assertDirectiveAuthority` and
+`claimDirectiveDispatch` refuse redispatch of the request with
+`CloseoutPendingError`, `reconsider` skips it, and
+`surfaceDirectiveRecovery` posts no card for it. A crash leaves the intent
+`open`, which means resume: boot (`runBootDirectiveRecovery`: `reconsider()`
+then `resumePending()`) and every deterministic pass finish it; no timer was
+added. A guard that passed preflight but refuses later (a race) records the
+intent `stopped` with its `blockers` and `blocker_fingerprint`; a repeated
+request or `resumePending()` with an unchanged fingerprint writes nothing,
+a changed fingerprint resumes (and revalidates, so an intent whose basis
+changed meanwhile is superseded then). `complete` answers a repeat with the
+original `closeout` member and no event; `superseded` lifts the fence, and a
+new binning request starts the request's next generation if it is still
+eligible. If another writer binned the job while the intent was open, the
+binned retry is the plain idempotent `200`. A closeout superseded after S2
+leaves the request retired with its debt and card open (the state a manual
+`/retire` leaves): judge again. Resumption has three drivers and no timer:
+boot, every deterministic pass (which exists only while Silas is enabled) and
+a repeated binning request; with Silas off, boot and the repeat are the
+drivers.
+
+Responses of the closeout path (body `reason` ≤ 500 characters, optional
+`by`; `gru` is stored as `gru`, any other value as `unattributed`):
+
+- `200` — the job object plus `closeout: {state: "complete", id, generation}`.
+- `400 invalid_reason` — `reason` is longer than 500 characters (counted in
+  characters, not UTF-16 units; checked first, for any binned request) or, when
+  a closeout is started, not a string (`null` reads as absent; a repeat that
+  resumes an existing intent stores nothing and ignores the field).
+- `409 request_closeout_refused` — `{error, blockers}`: a guard refused
+  before S1 (each blocker `{code, detail}` keeps the guard's own code; no
+  intent row, no event).
+- `409 request_closeout_stopped` — `{error, blockers}`: a race stopped the
+  intent after S1.
+- `409 request_closeout_superseded` — `{error, superseded_reason}`.
+
+`GET /api/silas/directives/<request>` carries
+`closeout: {path, eligible, blockers, intent}`: `path` is the job's — `closeout`
+when the job meets the eligibility rule (or an `open`/`stopped` intent keeps it
+on the closeout path, its blockers then being the step it waits on: after S2 the
+live work binning would meet, and `intent_stale` when its basis no longer holds)
+and `binning` otherwise; `eligible` is true when the path is `closeout` and the
+same evaluation finds no blockers, and `intent` is this request's latest intent
+row or null. No
+directive-recovery hold is released on the now-terminal job: a hold on a
+terminal job is already inert.
+
 ### Owner abandonment (unknown custody)
 
 When the service cannot establish a live request's producer custody (no

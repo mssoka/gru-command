@@ -116,6 +116,37 @@ describe('ledger db + migration runner', () => {
     upgraded.close();
   });
 
+  it('upgrades a v32 ledger adding request_closeouts without touching existing rows, and the table keeps one open or stopped intent per request (#523)', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 32) });
+    old.handle.prepare("INSERT INTO jobs (id, repo, title, status, created_at, updated_at) VALUES ('j', 'r', 'closeout job', 'working', 't', 't')").run();
+    old.handle.prepare(`INSERT INTO pending_directives (request_id, job_id, payload, payload_hash, state, baseline_seq, attempts, created_at, updated_at)
+      VALUES ('req', 'j', 'p', 'h', 'dispatching', 0, 0, 't', 't')`).run();
+    expect(old.handle.prepare("SELECT name FROM sqlite_master WHERE name = 'request_closeouts'").get()).toBeUndefined();
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    expect(upgraded.handle.prepare("SELECT request_id, state FROM pending_directives").all()).toEqual([{ request_id: 'req', state: 'dispatching' }]);
+    expect(upgraded.handle.prepare("SELECT id, name FROM schema_migrations WHERE id = 33").get()).toEqual({ id: 33, name: 'request-closeouts' });
+    const columns = upgraded.handle.prepare('PRAGMA table_info(request_closeouts)').all().map((row) => row['name']);
+    expect(columns).toEqual(['closeout_id', 'job_id', 'request_id', 'generation', 'payload_hash', 'job_status', 'intent_seq', 'state',
+      'superseded_reason', 'requested_by', 'reason', 'blockers', 'blocker_fingerprint', 'created_at', 'updated_at']);
+    const insert = upgraded.handle.prepare(`INSERT INTO request_closeouts
+      (closeout_id, job_id, request_id, generation, payload_hash, job_status, intent_seq, state, requested_by, created_at, updated_at)
+      VALUES (?, 'j', 'req', ?, 'h', 'working', 1, ?, 'gru', 't', 't')`);
+    insert.run('c1', 1, 'open');
+    // At most one open or stopped intent per request, and one row per generation.
+    expect(() => insert.run('c2', 2, 'stopped')).toThrow(/UNIQUE constraint/u);
+    expect(() => insert.run('c3', 1, 'superseded')).toThrow(/UNIQUE constraint/u);
+    upgraded.handle.prepare("UPDATE request_closeouts SET state = 'superseded', superseded_reason = 'job-status' WHERE closeout_id = 'c1'").run();
+    insert.run('c2', 2, 'stopped');
+    // The states, reasons and requesters are closed vocabularies.
+    expect(() => insert.run('c4', 3, 'paused')).toThrow(/CHECK constraint/u);
+    expect(() => upgraded.handle.prepare("UPDATE request_closeouts SET superseded_reason = 'whim' WHERE closeout_id = 'c2'").run()).toThrow(/CHECK constraint/u);
+    expect(() => upgraded.handle.prepare("UPDATE request_closeouts SET requested_by = 'owner' WHERE closeout_id = 'c2'").run()).toThrow(/CHECK constraint/u);
+    expect(upgraded.handle.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    upgraded.close();
+  });
+
   it('upgrades a pre-retirement ledger keeping existing directive rows live and readable', () => {
     const dir = tmpDir();
     const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 22) });

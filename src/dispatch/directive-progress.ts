@@ -466,6 +466,8 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
   const row = deps.ledger.getDirective(requestId);
   const job = row === null ? null : deps.ledger.getJob(row.jobId);
   if (row === null || isDirectiveTerminal(row.state) || job === null || isJobTerminal(job.status)) return;
+  // A closeout that owes this request its end resolves the card itself (#523).
+  if (deps.ledger.hasPendingCloseout(requestId)) return;
   if (deps.ledger.recoveryOwnerBasis('directive', requestId).owned) {
     surfaceRecoveryOwnerTransfer(deps, 'directive', requestId);
     return;
@@ -553,6 +555,9 @@ export class DirectiveProgressService {
     for (const row of rows) {
       cursor = this.deps.ledger.directiveRowid(row.requestId) ?? cursor;
       if (this.active.has(row.requestId) || this.deps.ledger.listJobAdmissions(row.jobId).length > 0) continue;
+      // The job's binning is closing this request out (#523): it is never
+      // redispatched, and no recovery card is posted for what the closeout ends.
+      if (this.deps.ledger.hasPendingCloseout(row.requestId)) continue;
       const job = this.deps.ledger.getJob(row.jobId);
       if (job === null) continue;
       if (isJobTerminal(job.status)) {

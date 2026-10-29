@@ -131,7 +131,16 @@ never printing that token: call authenticated `POST /api/jobs/<job-id>/status` w
 Verify the response and `GET /api/board`: the job remains `binned` and the
 prior status is preserved in the ordinary `job.status` history. Binning
 closes applicable debts as `job-terminal` abandonment; it does not prove
-completion, a merged PR, a passing review, or a stopped process. There is
+completion, a merged PR, a passing review, or a stopped process.
+When the heist's only live request is a directive or re-brief request that
+was deferred before it reached its worker, the same binning request closes
+that request out completely: the service retires it, bins the job and
+resolves its recovery card, then resumes after a crash. Do not run
+`/retire` by hand for it, and never write `by: "owner"`: send `by: "gru"`
+and, if useful, a `reason` (up to 500 characters). A `409
+request_closeout_refused` or `request_closeout_stopped` names the guard
+that holds it (`blockers`): release that guard, then repeat the request; a
+`request_closeout_superseded` means the job changed since, so judge again. There is
 no unbin or status-based revival — record a correction rather than forging
 a later transition. Do not create a new endpoint or use the report handback
 disposition as a substitute for the heist status write.
