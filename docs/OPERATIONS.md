@@ -376,6 +376,18 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
   event) — a timed-out retry is safe.
 - `401` missing/bad token · `404` unknown job.
 
+A job whose only live request is a directive request that was deferred
+before reaching its worker is closed out by the service itself (#523): the
+same request retires the request (`by: "canceled-request-closeout"`), bins
+the job, closes the debt, resolves the request's recovery card and completes
+a durable intent, resuming after a crash or restart. Optional body fields:
+`reason` (at most 500 characters, stored and appended to the retire reason)
+and `by` (`gru` is kept, anything else is stored `unattributed`; `owner` is
+never recorded). It adds `409 request_closeout_refused` /
+`request_closeout_stopped` / `request_closeout_superseded` and
+`400 invalid_reason`; every other job is unchanged
+([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523)).
+
 There is no unbin: a mistaken bin is corrected by recording the honest
 next action as a NEW lane/job, never by rewriting the closed record.
 

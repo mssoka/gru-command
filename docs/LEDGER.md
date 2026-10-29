@@ -149,6 +149,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 |---|---|
 | `job.created` | repo, title, display_name |
 | `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref (`binned` uses the ordinary from→to event) |
+| `silas.closeout-intent` / `silas.closeout-stopped` / `silas.closeout-superseded` / `silas.closeout-complete` | the canceled-request closeout (#523): `closeout_id`, `request_id`, `generation`, `by: "canceled-request-closeout"`; intent adds `payload_hash`, `job_status`, `requested_by`, `reason`; stopped adds `blockers` and `blocker_fingerprint`; superseded adds `superseded_reason` |
 | `job.admin-closeout` | disposition (`closed-without-merge`), expected status/url, provider evidence (state/merged/head/closed_at), the cited `github.branch-state` observation (event seq + identity), reason, request sha256 |
 | `job.execution-stop` | `requested` before any effect, then `stopped` only when every live producer has positive cessation evidence; otherwise `unproven` with per-agent/child/review detail and the outstanding residue (unsettled verification, in-flight admission). An unproven stop also opens one `needs-owner` `job-stop-unproven:<jobId>` incident (issue #455), refreshed on later passes and resolved when a pass proves the stop or the owner resumes |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
@@ -705,6 +706,23 @@ on the existing `hold_released_*` columns. `rebrief_abandonments` keeps the
 same facts and hold for an abandoned re-brief marker generation, whose
 markers are deleted. Neither claims anything; see
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-abandonment-unknown-custody).
+
+### Canceled-request closeouts (#523)
+
+Migration 33 (`request-closeouts`) is additive: no existing table changes.
+`request_closeouts` holds one row per (request, generation) —
+`closeout_id` (primary key), `job_id`, `request_id`, `generation`,
+`payload_hash`, the `job_status` at S1, `intent_seq` (the seq of the
+`silas.closeout-intent` event), `state` (`open`, `stopped`, `complete`,
+`superseded`), `superseded_reason` (`job-status`, `request-state`,
+`later-work`, `control-event`), `requested_by` (`gru` or `unattributed`),
+`reason`, `blockers` (JSON) and `blocker_fingerprint` (the sha256 of the sorted
+blocker codes and details), and timestamps. `UNIQUE (request_id, generation)`;
+a partial unique index allows at most one `open` or `stopped` row per request.
+Events: `silas.closeout-intent`, `silas.closeout-stopped`,
+`silas.closeout-superseded` and `silas.closeout-complete` (each carries
+`by: "canceled-request-closeout"`). See
+[DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
 
 ### Lane tokens and processes reaped by them (#486)
 

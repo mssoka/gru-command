@@ -576,6 +576,18 @@ describe('canceled-request closeout — refusal and fall-through (test 8)', () =
     expect(ctx.closeout.requestBinning('no-such-job', { status: 'binned' })).toBeNull();
   });
 
+  it('8o. a pending legacy re-brief marker beside the deferred request falls through', async () => {
+    const ctx = await deferred();
+    ctx.db.handle.prepare(`INSERT INTO pending_rebriefs (id, job_id, kind, payload, payload_hash, baseline_seq, requested_at, updated_at)
+      VALUES ('legacy-marker', ?, 'silas.rebrief', '{"note":"fold","briefing":"b"}', 'legacy-hash', 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(ctx.jobId);
+    expect(ctx.ledger.listPendingRebriefs({ jobId: ctx.jobId })).toHaveLength(1);
+    const seq = ctx.ledger.latestEventSeq();
+    expect(request(ctx)).toBeNull();
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false });
+    expect(() => ctx.ledger.setJobStatus(ctx.jobId, 'binned')).toThrow(/pending re-brief marker/);
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+  });
+
   it('8n. a reason longer than 500 characters is a 400 invalid_reason, whatever the job', async () => {
     const ctx = await deferred();
     const seq = ctx.ledger.latestEventSeq();
