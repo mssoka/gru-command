@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, truncateSync, writeFileSync, writeSync, closeSync } from 'node:fs';
+import { closeSync, copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -372,6 +372,64 @@ describe('transcript service', () => {
       [0, 'tool_result', 'file body', 'Read', false],
       [1, 'tool_result', 'no matches', 'Grep', true],
       [2, 'system', 'turn result: error_max_turns', null, true],
+    ]);
+  });
+
+  it('a session file written by pi 0.85.1 reads back as its captured golden with no torn lines (#521)', () => {
+    const { dir, svc } = tmpStore();
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    copyFileSync(join(import.meta.dirname, 'fixtures', 'pi-0.85-session.jsonl'), join(dir, 'sessions', 'minion', 'd', 'pi-0.85-session.jsonl'));
+    // The golden was captured with the 0.85.1 SDK before the 1.x upgrade.
+    const golden = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', 'pi-0.85-session.golden.json'), 'utf-8')) as {
+      entries: unknown[]; tornLines: number;
+    };
+    expect(golden.entries.map((entry) => (entry as { kind: string }).kind)).toEqual(['user', 'assistant', 'tool_result', 'assistant']);
+    const result = svc.read('minion/d/pi-0.85-session.jsonl');
+    expect(result).toEqual(golden);
+    expect(result.tornLines).toBe(0);
+  });
+
+  it('a pi 1.x session file\'s system message entry is scaffolding: it yields no transcript entry (#521)', () => {
+    const { dir, svc } = tmpStore();
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    const system = {
+      type: 'message', id: 'sys-1', parentId: null, timestamp: T0,
+      message: {
+        role: 'system', content: '', timestamp: 500,
+        sections: { identity: 'You are a minion.' },
+        toolsAdded: [{ name: 'read', description: 'Read a file', parameters: { type: 'object' } }],
+      },
+    };
+    writeFileSync(
+      join(dir, 'sessions', 'minion', 'd', 'pi-1x.jsonl'),
+      sessionFile([header(), system, userEntry('u1', 'sys-1', 'hello'), assistantEntry('a1', 'u1', 'hi there', 'greet back')]),
+    );
+    const result = svc.read('minion/d/pi-1x.jsonl');
+    expect(result.tornLines).toBe(0);
+    expect(result.entries.map((entry) => [entry.index, entry.kind, entry.text, entry.thinking])).toEqual([
+      [0, 'user', 'hello', null],
+      [1, 'assistant', 'hi there', 'greet back'],
+    ]);
+  });
+
+  it('a pi 1.x session file\'s cache-warm usage and context-edit entries are no conversation: they yield no transcript entry and are not torn lines (#521)', () => {
+    const { dir, svc } = tmpStore();
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    const warm = {
+      type: 'usage', id: 'warm-1', parentId: 'a1', timestamp: T0, kind: 'cache_warm', provider: 'anthropic', model: 'fixture-model',
+      usage: { input: 1, output: 1, cacheRead: 9, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    const omit = { type: 'context_edit', id: 'omit-1', parentId: 'warm-1', timestamp: T0, targetId: 'a1', replacement: null };
+    writeFileSync(
+      join(dir, 'sessions', 'minion', 'd', 'pi-1x-entries.jsonl'),
+      sessionFile([header(), userEntry('u1', null, 'hello'), assistantEntry('a1', 'u1', 'hi there', 'greet back'), warm, omit, userEntry('u2', 'omit-1', 'again')]),
+    );
+    const result = svc.read('minion/d/pi-1x-entries.jsonl');
+    expect(result.tornLines).toBe(0);
+    expect(result.entries.map((entry) => [entry.index, entry.kind, entry.text])).toEqual([
+      [0, 'user', 'hello'],
+      [1, 'assistant', 'hi there'],
+      [2, 'user', 'again'],
     ]);
   });
 

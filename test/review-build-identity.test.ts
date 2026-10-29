@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { request } from 'node:http';
 import { dirname, join, sep } from 'node:path';
@@ -272,16 +272,25 @@ describe('installed Perkins runtime identity', () => {
     expect(existsSync(dependency)).toBe(true);
     writeFileSync(dependency, `${readFileSync(dependency, 'utf8')}\n// changed installed provider\n`);
     expect(reviewRuntimeVersion(root)).not.toBe(identity);
-    const changedDependency = reviewRuntimeVersion(root);
-    const binary = join(root, 'node_modules', '@earendil-works', 'pi-coding-agent', 'node_modules',
-      '@esbuild', `${process.platform}-${process.arch}`, 'bin', 'esbuild');
-    if (existsSync(binary)) {
+    let latest = reviewRuntimeVersion(root);
+    // The closure's binary artifacts are hashed too: the WASM module every
+    // host installs, and the host's native pi-tui prebuild when it ships one.
+    const wasm = join(root, 'node_modules', 'quickjs-wasi', 'quickjs.wasm');
+    expect(existsSync(wasm)).toBe(true);
+    writeFileSync(wasm, Buffer.concat([readFileSync(wasm), Buffer.from('changed public wasm executable')]));
+    expect(reviewRuntimeVersion(root)).not.toBe(latest);
+    latest = reviewRuntimeVersion(root);
+    const prebuilds = join(root, 'node_modules', '@earendil-works', 'pi-tui', 'native', process.platform, 'prebuilds', `${process.platform}-${process.arch}`);
+    const native = existsSync(prebuilds) ? readdirSync(prebuilds).find((name) => name.endsWith('.node')) : undefined;
+    if (native !== undefined) {
+      const binary = join(prebuilds, native);
       writeFileSync(binary, Buffer.concat([readFileSync(binary), Buffer.from('changed public platform executable')]));
-      expect(reviewRuntimeVersion(root)).not.toBe(changedDependency);
+      expect(reviewRuntimeVersion(root)).not.toBe(latest);
+      latest = reviewRuntimeVersion(root);
     }
     const helper = join(root, 'dist', 'dispatch', 'perkins-review', 'session-output.js');
     writeFileSync(helper, `${readFileSync(helper, 'utf8')}\n// changed helper\n`);
-    expect(reviewRuntimeVersion(root)).not.toBe(changedDependency);
+    expect(reviewRuntimeVersion(root)).not.toBe(latest);
     const secret = join(root, 'private-credential.txt');
     writeFileSync(secret, 'never hash this credential');
     rmSync(dependency);
@@ -311,40 +320,27 @@ describe('installed Perkins runtime identity', () => {
     }
   }, 180_000);
 
-  it('fails closed on the npm-ci esbuild hard link until the packaged postinstall unshares it', () => {
+  it('fails closed on a hard-linked closure executable until the packaged postinstall unshares it', () => {
     // Owner incident 2026-10-07: esbuild's postinstall hard-links its
-    // platform binary over esbuild/bin/esbuild, and every real npm ci keeps
+    // platform binary over esbuild/bin/esbuild, and every real npm ci kept
     // that link. The copy-built fixture above breaks hard links, which hid
-    // it; reproduce the real install layout here.
+    // it. The pi 1.4 closure (#521) no longer ships esbuild, so the same
+    // layout is reproduced with an executable it does ship: a second hard
+    // link to its WASM module.
     const { root } = packageIdentity();
-    const platformSuffix = join('@esbuild', `${process.platform}-${process.arch}`, 'bin', 'esbuild');
-    const pairs = (readdirSync(root, { recursive: true }) as string[])
-      .filter((path) => path.endsWith(platformSuffix))
-      .map((path) => {
-        const modules = dirname(dirname(dirname(dirname(join(root, path)))));
-        return { platform: join(root, path), bin: join(modules, 'esbuild', 'bin', 'esbuild') };
-      })
-      .filter(({ bin }) => existsSync(bin));
-    expect(pairs.length, 'the installed review closure ships an esbuild platform binary').toBeGreaterThan(0);
-    // Baseline: the same bytes as independent files (what unsharing yields).
-    for (const { bin, platform } of pairs) {
-      rmSync(bin);
-      copyFileSync(platform, bin);
-    }
+    const wasm = join(root, 'node_modules', 'quickjs-wasi', 'quickjs.wasm');
+    const alias = join(root, 'node_modules', 'quickjs-wasi', 'quickjs.wasm.alias');
+    // Baseline: the unlinked closure.
     const unsharedIdentity = reviewRuntimeVersion(root);
-    for (const { bin, platform } of pairs) {
-      rmSync(bin);
-      linkSync(platform, bin);
-    }
+    linkSync(wasm, alias);
+    expect(statSync(wasm).nlink).toBe(2);
     expect(() => reviewRuntimeVersion(root)).toThrow('review runtime file must be bounded, regular and single-linked');
 
     execFileSync(process.execPath, [join(root, 'tools', 'unshare-review-hardlinks.mjs'), root]);
 
-    for (const { bin, platform } of pairs) {
-      expect(statSync(bin).nlink).toBe(1);
-      expect(statSync(platform).nlink).toBe(1);
-      expect(readFileSync(bin).equals(readFileSync(platform))).toBe(true);
-    }
+    expect(statSync(wasm).nlink).toBe(1);
+    expect(statSync(alias).nlink).toBe(1);
+    expect(readFileSync(wasm).equals(readFileSync(alias))).toBe(true);
     // Same bytes, single-linked: the strict check passes, digest unchanged.
     expect(reviewRuntimeVersion(root)).toBe(unsharedIdentity);
   }, 300_000);

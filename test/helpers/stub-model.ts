@@ -1,6 +1,6 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { AssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
-import type { Api, AssistantMessage, Context, Model, Provider, SimpleStreamOptions } from '@earendil-works/pi-ai';
+import type { Api, AssistantMessage, Context, JsonObject, Model, Provider, SimpleStreamOptions } from '@earendil-works/pi-ai';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -254,7 +254,8 @@ export async function makeStubModelRuntime(
             type: 'toolCall',
             id: toolCall.id,
             name: toolCall.name,
-            arguments: toolCall.args,
+            // SDK 1.x types tool-call arguments as JSON; scripted args are literals.
+            arguments: toolCall.args as JsonObject,
           },
           partial: final,
         });

@@ -1,15 +1,16 @@
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import { ModelRuntime, createBashToolDefinition, defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, createBashToolDefinition, defineTool, type AgentSession, type ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { toToolDeclaration } from '@earendil-works/pi-ai';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { afterAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
-import { COMPACTION_END_RECONCILE_MS, PiRuntime, laneBashTool, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
+import { COMPACTION_END_RECONCILE_MS, PiRuntime, laneBashTool, normalizeSessionPath, rendersAs, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import type { DirectiveProducer } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, applyThinkingFallback, ledgerReviewOwnerCessation, serviceRegistryOptions } from '../src/runtime/registry.js';
@@ -37,6 +38,8 @@ const twinGate = vi.hoisted(() => ({
   fail0: null as null | (() => void),
   release1: null as null | (() => void),
   lastOptions: null as unknown,
+  /** The created session's agent state loses its assignable tools accessor. */
+  breakToolsAccessor: false,
 }));
 
 vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
@@ -48,6 +51,11 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
     ...actual,
     createAgentSession: async (opts: unknown) => {
       twinGate.lastOptions = opts;
+      if (twinGate.breakToolsAccessor) {
+        const created = await actual.createAgentSession(opts as never);
+        Object.defineProperty(created.session.agent.state, 'tools', { value: [], writable: true, configurable: true, enumerable: true });
+        return created;
+      }
       if (!twinGate.armed) {
         return actual.createAgentSession(opts as never);
       }
@@ -64,6 +72,20 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
     },
   };
 });
+
+/** A real 1x1 PNG. Pi 1.x decodes prompt images and drops (with a hint in the
+ * prompt text) bytes that are not an image, so transport tests need a real one. */
+const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+
+/** A session written by the real pi 0.85.1 SessionManager (recorded cwd /fixture/project). */
+const PI_085_SESSION = join(import.meta.dirname, 'fixtures', 'pi-0.85-session.jsonl');
+
+/** A compaction summary request. Pi 1.x summarizes the history before the cut
+ * with a `<conversation>` prompt and a split turn's prefix with a
+ * `# Conversation` one; the scripted provider holds or answers either. */
+function isSummaryRequest(prompt: string): boolean {
+  return prompt.startsWith('<conversation>') || prompt.startsWith('# Conversation');
+}
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -216,7 +238,7 @@ async function observeCompactionCancellation(
   });
   let summaryCalls = 0;
   const fx = await fixture((prompt, index) => {
-    if (prompt.startsWith('<conversation>')) {
+    if (isSummaryRequest(prompt)) {
       summaryCalls += 1;
       return summaryCalls === 1
         ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
@@ -408,7 +430,7 @@ async function observeCompactionCancellation(
     // Anchor the abort-settlement marker to the FIRST summary call (the
     // stalled one), not any later summary that the same signal could abort.
     const firstSummary = fx.script.calls.find((call) =>
-      call.prompt.startsWith('<conversation>'),
+      isSummaryRequest(call.prompt),
     );
     // The recovered reply must be observable as a delta AND as a successful
     // assistant message, not only as model admission. The durable check reads
@@ -491,7 +513,7 @@ async function observeCompactionCancellation(
       rawSdkCompactionEnds: rawSdkEvents.filter((type) => type === 'compaction_end').length,
       summarySettledByAbort: firstSummary?.aborted === true,
       stalledSummaryCalls: fx.script.calls.filter((call) =>
-        call.prompt.startsWith('<conversation>'),
+        isSummaryRequest(call.prompt),
       ).length,
       continuationReachedModel: fx.script.calls.some(
         (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
@@ -569,7 +591,7 @@ async function observeNativeFollowUpCancellation(
   });
   let summaryCalls = 0;
   const fx = await fixture((prompt, index) => {
-    if (prompt.startsWith('<conversation>')) {
+    if (isSummaryRequest(prompt)) {
       summaryCalls += 1;
       return summaryCalls === 1
         ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
@@ -749,7 +771,7 @@ async function observeNativeFollowUpCancellation(
         error: event.error ?? null,
       })),
       summarySettledByAbort: fx.script.calls.some(
-        (call) => call.prompt.startsWith('<conversation>') && call.aborted,
+        (call) => isSummaryRequest(call.prompt) && call.aborted,
       ),
       idle: internal.session.isIdle,
       disposed: handle.health().state === 'disposed',
@@ -2014,7 +2036,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         releaseSummary = resolve;
       });
       const fx = await fixture((prompt, index) => {
-        if (prompt.startsWith('<conversation>')) return { deltas: [], hold: summaryHold };
+        if (isSummaryRequest(prompt)) return { deltas: [], hold: summaryHold };
         if (index === 0) return { deltas: ['history '.repeat(12_000)] };
         if (index === 1) {
           return {
@@ -2287,6 +2309,306 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(entriesAfter).toBeGreaterThan(entriesBefore);
     } finally {
       await resumed.dispose();
+    }
+  });
+
+  it('opens and resumes a session file written by pi 0.85.1 (#521)', async () => {
+    const fx = await fixture([{ deltas: ['after the upgrade'] }]);
+    const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+    const sessionDir = join(fx.store.sessionsDir, 'gru', 'pi-0-85-fixture');
+    mkdirSync(sessionDir, { recursive: true });
+    const copyOf = (name: string): string => {
+      const copy = join(sessionDir, name);
+      copyFileSync(PI_085_SESSION, copy);
+      return copy;
+    };
+    // The adapter opens a resumed file with SessionManager.open(file, dir, cwd);
+    // the fixture's own neutral cwd opens cleanly with its four messages.
+    const sdkCopy = copyOf('sdk-open.jsonl');
+    const opened = SessionManager.open(sdkCopy, sessionDir, '/fixture/project');
+    expect(opened.getCwd()).toBe('/fixture/project');
+    expect(opened.buildSessionContext().messages).toHaveLength(4);
+
+    // The adapter's own resume path (a spawn cwd must exist, so the session
+    // runs in the fixture workspace while its recorded cwd stays old).
+    const adapterCopy = copyOf('adapter-resume.jsonl');
+    const resumed = await fx.runtime.spawn('gru', { resumeFile: adapterCopy, model: `${STUB_PROVIDER_ID}/${STUB_MODEL_ID}` });
+    try {
+      expect(resumed.sessionFile).toBe(adapterCopy);
+      // The resumed session holds the old transcript's four messages (whether
+      // resume rewrites the copy is recorded in the PR, not asserted here).
+      const resumedSession = await actualDirectiveSdkSession(resumed);
+      expect(resumedSession.agent.state.messages.map((entry) => entry.role)).toEqual(['user', 'assistant', 'toolResult', 'assistant']);
+      await resumed.prompt('continue', { owner: 'alice' });
+      expect(fx.script.calls.map((c) => c.prompt)).toEqual(['continue']);
+    } finally {
+      await resumed.dispose();
+    }
+  });
+
+  it('the executor fence survives the SDK re-applying the tool loadout, and a session registers no MCP, codemode or tool-search tool (#521)', async () => {
+    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }]);
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    const session = await actualDirectiveSdkSession(handle);
+    // The SDK's own tool registry: what it hands the agent before the adapter's guard.
+    const registry = (session as unknown as { readonly _toolRegistry: ReadonlyMap<string, { readonly execute: unknown }> })._toolRegistry;
+    const guarded = () => session.agent.state.tools.every((tool) => tool.execute !== registry.get(tool.name)!.execute);
+    try {
+      const executors = session.agent.state.tools.map((tool) => tool.execute);
+      expect(guarded()).toBe(true);
+      await handle.prompt('first', { owner: 'alice' });
+      await handle.prompt('second', { owner: 'alice' });
+      // Pi 1.x re-applies the loadout before every prompt: the same guarded executors must still stand.
+      expect(guarded()).toBe(true);
+      expect(session.agent.state.tools.map((tool) => tool.execute)).toEqual(executors);
+      expect(session.getAllTools().map((tool) => tool.name).sort()).toEqual(['bash', 'edit', 'find', 'grep', 'ls', 'read', 'write']);
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a session whose agent state no longer exposes an assignable tools accessor is refused by name before anything is registered (#521)', async () => {
+    const fx = await fixture([]);
+    twinGate.breakToolsAccessor = true;
+    try {
+      await expect(fx.runtime.spawn('minion', { cwd: fx.workspace })).rejects.toThrow(
+        'the pi SDK agent state no longer exposes an assignable tools accessor; refusing to run without the directive executor fence',
+      );
+    } finally { twinGate.breakToolsAccessor = false; }
+    // No lock was taken and no session file is held by the refused spawn.
+    expect((readdirSync(fx.store.sessionsDir, { recursive: true }) as string[]).filter((name) => name.endsWith('.lock'))).toEqual([]);
+    await fx.runtime.dispose();
+    fx.store.dispose();
+  });
+
+  it('a session the installed SDK wrote reads back through the transcript service without its scaffolding entries (#521)', async () => {
+    const { TranscriptService } = await import('../src/transcripts/service.js');
+    const fx = await fixture([{ deltas: [], toolCall: { id: 'call-1', name: 'ls', args: {} } }, { deltas: ['listed'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await handle.prompt('list my files', { owner: 'alice' });
+      expect(readFileSync(handle.sessionFile!, 'utf-8')).toContain('"role":"system"');
+      const result = new TranscriptService(fx.store.sessionsDir).read(relative(fx.store.sessionsDir, handle.sessionFile!));
+      expect(result.tornLines).toBe(0);
+      expect(result.entries.map((entry) => [entry.kind, entry.toolName])).toEqual([['user', null], ['assistant', null], ['tool_result', 'ls'], ['assistant', null]]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a directive on a resumed session whose prompt inputs changed runs its tool: the manifest binds the prompt the run carries (#521)', async () => {
+    const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+    const fx = await fixture([
+      { deltas: ['ordinary reply'] },
+      { deltas: [], toolCall: { id: 'changed-prompt-call', name: 'bash', args: { command: "printf 'ran\\n' > changed-prompt.txt" } } },
+      { deltas: ['done'] },
+    ]);
+    const identity = { requestId: 'changed-prompt', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'changed-prompt-job', workRevision: 0, authorityEpoch: 0 };
+    const first = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'changed-prompt-minion' });
+    await first.prompt('ordinary work', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    // A project rule file changes between the two runs, so the resumed run's
+    // prompt differs from the persisted one and Pi persists a system patch
+    // ahead of the directive's receipt.
+    writeFileSync(join(fx.workspace, 'AGENTS.md'), 'Project rule: changed after the first run.\n');
+    const resumed = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'changed-prompt-minion', resumeFile: file });
+    try {
+      const verdict = await resumed.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      expect(verdict).toMatchObject({ ok: true });
+      expect(readFileSync(join(fx.workspace, 'changed-prompt.txt'), 'utf-8')).toBe('ran\n');
+      const rows = readFileSync(file, 'utf-8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly message?: { readonly role: string } });
+      expect(rows.filter((row) => row.message?.role === 'system')).toHaveLength(2);
+      expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true });
+    } finally {
+      await resumed.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a directive on a resumed session whose persisted prompt carries text the effective prompt does not is refused before its receipt and its first request (#521)', async () => {
+    const fx = await fixture([
+      { deltas: ['ordinary reply'] },
+      { deltas: [], toolCall: { id: 'unbound-prompt-call', name: 'bash', args: { command: "printf 'ran\\n' > unbound-prompt.txt" } } },
+      { deltas: ['unreachable'] },
+    ]);
+    const identity = { requestId: 'unbound-prompt', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'unbound-prompt-job', workRevision: 0, authorityEpoch: 0 };
+    const first = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'unbound-prompt-minion' });
+    await first.prompt('ordinary work', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    // The persisted system message gains text no approved prompt carries. The
+    // SDK diffs prompt sections only, so it would replay that text unchanged.
+    type Row = { message?: { role: string; content?: unknown } };
+    const rows = readFileSync(file, 'utf-8').trimEnd().split('\n').map((line) => JSON.parse(line) as Row);
+    const system = rows.find((row) => row.message?.role === 'system');
+    expect(system).toBeDefined();
+    system!.message!.content = 'unapproved persisted role authority';
+    writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    const resumed = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'unbound-prompt-minion', resumeFile: file });
+    try {
+      await expect(resumed.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow('native directive transcript prompt differs from the prompt its authority manifest bound');
+      // Refused ahead of the receipt: the unapproved text never reaches the model.
+      expect(fx.script.calls.map((call) => call.prompt)).toEqual(['ordinary work']);
+      expect(existsSync(join(fx.workspace, 'unbound-prompt.txt'))).toBe(false);
+      expect(readFileSync(file, 'utf-8')).not.toContain('approved directive');
+    } finally {
+      await resumed.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('the effective prompt is the replay\'s parts in any order, and a mismatch costs no search however many parts repeat (#521)', () => {
+    expect(rendersAs('', [])).toBe(true);
+    expect(rendersAs('one\n\ntwo\n\nthree', ['three', 'one', 'two'])).toBe(true);
+    expect(rendersAs('one\n\ntwo', ['one', 'two', 'two'])).toBe(false);
+    expect(rendersAs('one\n\ntwo', ['one', 'three'])).toBe(false);
+    expect(rendersAs('one two', ['one', 'two'])).toBe(false);
+    expect(rendersAs('one\n\ntwo\n\nextra', ['one', 'two'])).toBe(false);
+    // 60 equal sections that are not the text: every order was once tried.
+    const repeated = Array.from({ length: 60 }, () => 'section');
+    const started = Date.now();
+    expect(rendersAs([...repeated.slice(1), 'other'].join('\n\n'), repeated)).toBe(false);
+    expect(rendersAs(repeated.join('\n\n'), repeated)).toBe(true);
+    // More sections than any prompt has: refused, never a stack overflow or a long search.
+    const thousands = Array.from({ length: 5000 }, () => 'section');
+    expect(rendersAs(thousands.join('\n\n'), thousands)).toBe(false);
+    // An exact match of 3,000 distinct sections: only the cap refuses it.
+    const distinct = Array.from({ length: 3000 }, (_, index) => `section ${index}`);
+    expect(rendersAs(distinct.join('\n\n'), distinct)).toBe(false);
+    // Sections that contain one another: each pair is also a section of its own,
+    // so every pair could be matched whole or in halves, and only the last section
+    // fails. Every combination was once a state (1.3 s at 18 pairs, over 25 s at 30).
+    const halves = Array.from({ length: 30 }, (_, index) => [`p${index}A`, `p${index}B`]);
+    const wholes = halves.map(([first, second]) => `${first}\n\n${second}`);
+    const filler = wholes.reduce((length, whole) => length + whole.length, 0) + 1 + 2 * halves.length;
+    expect(rendersAs([...halves.flat(), 'x'.repeat(filler)].join('\n\n'), [...wholes, ...halves.flat(), 'y'])).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('the adapter leaves the prompt-cache warming mode to the SDK: a session answers what a fresh SettingsManager over the same settings answers (#521, contract revision 5)', async () => {
+    const { SettingsManager } = await import('@earendil-works/pi-coding-agent');
+    const fx = await fixture([{ deltas: ['one'] }]);
+    const settings = join(fx.agentDir, 'settings.json');
+    const base = existsSync(settings) ? JSON.parse(readFileSync(settings, 'utf-8')) as object : {};
+    const modes: string[] = [];
+    // The last setting written differs from the SDK default, so the review session below can tell a file-backed manager from an in-memory one.
+    for (const named of [undefined, 'streaming', 'off', 'idle']) {
+      writeFileSync(settings, JSON.stringify(named === undefined ? base : { ...base, cacheWarming: named }));
+      const before = readFileSync(settings, 'utf-8');
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      try {
+        const mode = (await actualDirectiveSdkSession(handle)).settingsManager.getCacheWarmingMode();
+        expect(mode, String(named)).toBe(SettingsManager.create(fx.workspace, fx.agentDir).getCacheWarmingMode());
+        modes.push(mode);
+      } finally { await handle.dispose(); }
+      // GC reads the user's Pi settings and never writes them.
+      expect(readFileSync(settings, 'utf-8')).toBe(before);
+    }
+    // The setting does reach the session: the cases are not all one mode.
+    expect(new Set(modes).size).toBeGreaterThan(1);
+    // An isolated review session runs on in-memory settings, as the SDK builds them.
+    const review = await fx.runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'isolated policy', tools: [] } });
+    try {
+      const reviewSettings = (twinGate.lastOptions as { settingsManager: { getCacheWarmingMode(): string } }).settingsManager;
+      expect(reviewSettings.getCacheWarmingMode()).toBe(SettingsManager.inMemory({}, { projectTrusted: false }).getCacheWarmingMode());
+      expect(reviewSettings.getCacheWarmingMode()).not.toBe(SettingsManager.create(fx.workspace, fx.agentDir).getCacheWarmingMode());
+    } finally { await review.dispose(); }
+  });
+
+  it('a system patch the SDK adds while preparing a directive\'s next turn is refused before that model request (#521)', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'patched-call', name: 'bash', args: { command: "printf 'ran\\n' > patched-first.txt" } } },
+      { deltas: ['unreachable'] },
+    ]);
+    const identity = { requestId: 'next-turn-patch', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'next-turn-patch-job', workRevision: 0, authorityEpoch: 0 };
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, agentId: 'next-turn-patch-minion' });
+    const session = await actualDirectiveSdkSession(handle);
+    // The SDK computes a prompt patch from the session's options before every
+    // turn; once the first tool result is in, it owes one the approved prompt
+    // never carried.
+    const sdk = session as unknown as { _preparePromptAndToolLoadout: (...args: unknown[]) => unknown };
+    const prepare = sdk._preparePromptAndToolLoadout.bind(session);
+    let patching = false;
+    sdk._preparePromptAndToolLoadout = (...args) => patching
+      ? { role: 'system', content: '', sections: { rules: 'unapproved next-turn section' }, timestamp: Date.now() }
+      : prepare(...args);
+    session.subscribe((event) => { if (event.type === 'message_end' && event.message.role === 'toolResult') patching = true; });
+    try {
+      const verdict = await handle.promptWithVerdict!('approved directive', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+      expect(verdict).toMatchObject({ ok: false, error: expect.stringContaining('effective native model/role/tools authority changed during next-turn preparation') });
+      expect(readFileSync(join(fx.workspace, 'patched-first.txt'), 'utf-8')).toBe('ran\n');
+      expect(fx.script.calls).toHaveLength(1);
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a pi directive refuses prompt images by name: pi 1.x re-encodes them, so the receipt could not match (#521)', async () => {
+    const { readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
+    const fx = await fixture([{ deltas: ['unused'] }], ['text', 'image']);
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    const identity = { requestId: 'directive-image', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'directive-image-job', workRevision: 0, authorityEpoch: 0 };
+    try {
+      await expect(handle.prompt('with an image', {
+        directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} },
+        images: [{ mediaType: 'image/png', data: PNG_1X1_BASE64 }],
+      })).rejects.toThrow('a pi directive carries text only');
+      expect(fx.script.calls).toHaveLength(0);
+      expect(readDirectiveBinding(handle.sessionFile!, identity.requestId)).toBeNull();
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+      fx.store.dispose();
+    }
+  });
+
+  it('a steer an extension input handler consumed is logged, not silently accepted (#521)', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
+    const logs: string[] = [];
+    const fx = await fixture([{ deltas: ['a'], hold }], ['text'], { log: (level, msg) => { logs.push(`${level}:${msg}`); } });
+    const handle = await fx.runtime.spawn('gru');
+    const session = await actualDirectiveSdkSession(handle);
+    vi.spyOn(session, 'steer').mockResolvedValue('handled');
+    try {
+      const turn = handle.prompt('mine', { owner: 'alice' });
+      await waitFor(() => fx.script.calls.length === 1, 'the live turn');
+      await handle.steer('adjust', { owner: 'alice' });
+      expect(logs).toContain('warn:a pi extension input handler consumed the steer; nothing was queued');
+      release();
+      await turn;
+    } finally {
+      release();
+      await handle.dispose();
+    }
+  });
+
+  it('a follow-up an extension input handler consumed is logged, not silently accepted (#521)', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
+    const logs: string[] = [];
+    const fx = await fixture([{ deltas: ['a'], hold }], ['text'], { log: (level, msg) => { logs.push(`${level}:${msg}`); } });
+    const handle = await fx.runtime.spawn('gru');
+    const session = await actualDirectiveSdkSession(handle);
+    vi.spyOn(session, 'followUp').mockResolvedValue('handled');
+    try {
+      const turn = handle.prompt('mine', { owner: 'alice' });
+      await waitFor(() => fx.script.calls.length === 1, 'the live turn');
+      await handle.followUp('and then', { owner: 'alice' });
+      expect(logs).toContain('warn:a pi extension input handler consumed the follow-up; nothing was queued');
+      release();
+      await turn;
+    } finally {
+      release();
+      await handle.dispose();
     }
   });
 
@@ -3131,7 +3453,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(handle.capabilities.images).toBe(true);
       await handle.prompt('look at this', {
         owner: 'alice',
-        images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
+        images: [{ mediaType: 'image/png', data: PNG_1X1_BASE64 }],
       });
       expect(fx.script.calls.length).toBe(1);
       expect(fx.script.calls[0]!.imageCount).toBe(1);
@@ -3318,10 +3640,10 @@ describe('Perkins r1 regressions', () => {
     try {
       await handle.prompt('look', {
         owner: 'alice',
-        images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
+        images: [{ mediaType: 'image/png', data: PNG_1X1_BASE64 }],
       });
       expect(fx.script.calls[0]!.images).toEqual([
-        { data: 'aGVsbG8=', mimeType: 'image/png' },
+        { data: PNG_1X1_BASE64, mimeType: 'image/png' },
       ]);
     } finally {
       await handle.dispose();
@@ -4950,8 +5272,11 @@ it('restart recovery continues a durable SDK user checkpoint without replaying i
       onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
     } })).rejects.toThrow('fixture stops before native acceptance');
     expect(f.script.calls).toHaveLength(0);
+    // Pi 1.x persists the prompt and tool declarations directly ahead of the first prompt.
+    const system = persistedSystemMessage(await actualDirectiveSdkSession(original));
     await original.dispose();
     const manager = SessionManager.open(file);
+    manager.appendMessage(system);
     manager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted SDK request' }], timestamp: Date.now() });
     const proof = inspectDirectiveCheckpoint(file, identity);
     expect(proof.state).toBe('resumable');
@@ -4962,6 +5287,60 @@ it('restart recovery continues a durable SDK user checkpoint without replaying i
     expect(await resumed.resumeDirective!(identity, proof.checkpointId, () => {})).toMatchObject({ ok: true });
     expect(prompt).not.toHaveBeenCalled(); expect(f.script.calls).toHaveLength(1);
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true });
+  } finally { await f.runtime.dispose(); f.store.dispose(); }
+});
+
+it('restart recovery refuses to continue a checkpoint whose transcript predates pi 1.x: no system prompt would reach the model (#521)', async () => {
+  const f = await fixture([{ deltas: ['must not run'] }]);
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const identity = { requestId: 'pre-1x-checkpoint', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'pre-1x-job', workRevision: 0, authorityEpoch: 0 };
+  const original = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'pre-1x-minion' });
+  const file = original.sessionFile!;
+  let preflights = 0;
+  try {
+    await expect(original.prompt('already accepted request', { directive: { identity,
+      beforeAdmission: () => { if (++preflights > 1) throw new Error('fixture stops before native acceptance'); },
+      onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
+    } })).rejects.toThrow('fixture stops before native acceptance');
+    await original.dispose();
+    // What a 0.85.1 host persisted: the user receipt with no system message before it.
+    SessionManager.open(file).appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted request' }], timestamp: Date.now() });
+    const proof = inspectDirectiveCheckpoint(file, identity);
+    if (proof.state !== 'resumable') throw new Error('pre-1.x checkpoint fixture is not resumable');
+    const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
+    await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => {})).rejects.toThrow('this one predates pi 1.x and is not safely resumable');
+    expect(f.script.calls).toHaveLength(0);
+  } finally { await f.runtime.dispose(); f.store.dispose(); }
+});
+
+it('restart recovery refuses to continue a checkpoint whose persisted prompt carries text the effective prompt does not: nothing reaches the model (#521)', async () => {
+  const f = await fixture([{ deltas: ['must not run'] }]);
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const identity = { requestId: 'unbound-checkpoint', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'unbound-checkpoint-job', workRevision: 0, authorityEpoch: 0 };
+  const original = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'unbound-checkpoint-minion' });
+  const file = original.sessionFile!;
+  let preflights = 0;
+  try {
+    // What a 1.x host persists ahead of the receipt, with text its prompt never carried.
+    const system = { ...persistedSystemMessage(await actualDirectiveSdkSession(original)), content: 'unapproved persisted role authority' };
+    await expect(original.prompt('already accepted request', { directive: { identity,
+      beforeAdmission: () => { if (++preflights > 1) throw new Error('fixture stops before native acceptance'); },
+      onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
+    } })).rejects.toThrow('fixture stops before native acceptance');
+    await original.dispose();
+    const manager = SessionManager.open(file);
+    manager.appendMessage(system);
+    manager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted request' }], timestamp: Date.now() });
+    const proof = inspectDirectiveCheckpoint(file, identity);
+    if (proof.state !== 'resumable') throw new Error('checkpoint fixture is not resumable');
+    const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
+    let claims = 0;
+    await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => { claims += 1; })).rejects.toThrow('native directive transcript prompt differs from the prompt its authority manifest bound');
+    // Refused before the continuation is claimed, so the checkpoint stays resumable.
+    expect(claims).toBe(0);
+    expect(f.script.calls).toHaveLength(0);
   } finally { await f.runtime.dispose(); f.store.dispose(); }
 });
 
@@ -5471,12 +5850,12 @@ it('automatic SDK compaction completes before the same admitted native authority
   let runError: unknown = null;
   try {
     const running = executeAcceptedDirective({ ...f.deps, pendingProducerBlockers: supervisor.pendingProducerBlockers.bind(supervisor) }, f.scene.request.requestId);
-    await waitFor(() => rawCompaction.includes('compaction_start') && f.fx.script.calls.some((call) => call.prompt.startsWith('<conversation>')), 'held automatic compaction summary');
+    await waitFor(() => rawCompaction.includes('compaction_start') && f.fx.script.calls.some((call) => isSummaryRequest(call.prompt)), 'held automatic compaction summary');
     const active = sample();
     expect(active).not.toBeNull();
     expect(active).toMatchObject({ openControl: true, openTurn: false, openToolCalls: 0, adapterCompacting: true, ownNative: true });
     expect(active?.exactBlockers.some((blocker) => blocker.includes('open turn/control/tool'))).toBe(true);
-    expect(f.fx.script.calls.filter((call) => !call.prompt.startsWith('<conversation>'))).toHaveLength(1);
+    expect(f.fx.script.calls.filter((call) => !isSummaryRequest(call.prompt))).toHaveLength(1);
     releaseSummary();
     try { await running; } catch (error) { runError = error; }
 
@@ -5572,7 +5951,7 @@ it('Pi post-run compaction after the directive terminal settles the original com
     const [final, compaction] = rows.slice(-2);
     expect(final).toMatchObject({ type: 'message', message: { role: 'assistant', stopReason: 'stop' } });
     expect(compaction).toMatchObject({ type: 'compaction', parentId: final!.id });
-    expect(f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
+    expect(f.fx.script.calls.map((call) => isSummaryRequest(call.prompt))).toEqual([false, true]);
     expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final!.id, binding: row.nativeBinding });
     expect(row.state).toBe('settled');
     const deliveries = f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
@@ -5597,6 +5976,7 @@ async function superviseDirectiveFixture(f: Awaited<ReturnType<typeof sdkDirecti
 /** The native transcript's entries, in file order. */
 function nativeEntries(file: string) {
   return readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { readonly type: string; readonly id: string; readonly parentId?: string | null;
+    readonly targetId?: string; readonly replacement?: unknown;
     readonly message?: { readonly role: string; readonly stopReason?: string; readonly toolCallId?: string; readonly isError?: boolean } });
 }
 
@@ -5626,8 +6006,10 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
     const rows = nativeEntries(row.nativeTarget!.sessionFile);
     const failed = rows.findIndex((entry) => entry.message?.stopReason === 'error');
-    expect(rows[failed + 1]).toMatchObject({ type: 'compaction', parentId: rows[failed]!.id });
-    expect(rows[failed + 2]).toMatchObject({ type: 'message', parentId: rows[failed + 1]!.id, message: { role: 'assistant', stopReason: 'toolUse' } });
+    // Pi 1.x omits the failed reply from context with an edit, then compacts on it.
+    expect(rows[failed + 1]).toMatchObject({ type: 'context_edit', parentId: rows[failed]!.id, targetId: rows[failed]!.id, replacement: null });
+    expect(rows[failed + 2]).toMatchObject({ type: 'compaction', parentId: rows[failed + 1]!.id });
+    expect(rows[failed + 3]).toMatchObject({ type: 'message', parentId: rows[failed + 2]!.id, message: { role: 'assistant', stopReason: 'toolUse' } });
     expect(readFileSync(join(f.scene.lane.path, 'overflow-effect.txt'), 'utf8')).toBe('before\nafter\n');
     // The compaction's terminal is published before the continued reply's tool
     // starts. No next-turn preparation precedes a continued reply's first call:
@@ -5642,7 +6024,7 @@ it('Pi context-overflow compact-and-retry keeps the directive: the failed reply 
     expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])
       .filter((event) => (event.payload as { readonly request_id?: unknown } | undefined)?.request_id === row.requestId)).toHaveLength(1);
     expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
-    expect(f.fx.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, false, true, false, false]);
+    expect(f.fx.script.calls.map((call) => isSummaryRequest(call.prompt))).toEqual([false, false, true, false, false]);
     expect(f.sessions[0]!.prompt).toHaveBeenCalledTimes(1);
   } finally { supervisor.dispose(); await f.cleanup(); }
 });
@@ -5729,7 +6111,7 @@ it('Pi pre-prompt compaction before a directive receipt is admitted and the dire
   // The earlier reply crosses the threshold but its post-run summary fails, so
   // Pi compacts again before the next prompt: after the directive's baseline.
   const f = await fixture((prompt, index) => {
-    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
+    if (isSummaryRequest(prompt)) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
     return index === 0 ? { deltas: ['history '.repeat(100)], usageTokens: 90_000 } : { deltas: ['directive done'] };
   });
   writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
@@ -5757,7 +6139,7 @@ it('Pi pre-prompt compaction before a directive receipt is admitted and the dire
     expect(admission).toMatchObject({ baseline, userEntryId: user!.id });
     expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'admitted', nativeBinding: admission });
     expect(inspectDirectiveCheckpoint(handle.sessionFile!, scene.identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final!.id });
-    expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>') ? 'summary' : call.prompt)).toEqual(['earlier ordinary work', 'summary', 'summary', 'approved directive']);
+    expect(f.script.calls.map((call) => isSummaryRequest(call.prompt) ? 'summary' : call.prompt)).toEqual(['earlier ordinary work', 'summary', 'summary', 'approved directive']);
   } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
 });
 
@@ -5812,7 +6194,7 @@ async function assertCompactionWaitCancelled(by: 'abort' | 'dispose' | 'deadline
     // Abort: the turn settled while the terminal was still withheld. Dispose and the deadline publish it as failed.
     expect(events.filter((event) => event.type === 'compaction_end')).toEqual(by === 'abort' ? [] :
       [{ type: 'compaction_end', success: false, error: by === 'dispose' ? 'agent session disposed during native compaction' : 'native compaction state did not settle after its terminal event' }]);
-    expect(f.script.calls.map((call) => call.prompt.startsWith('<conversation>'))).toEqual([false, true]);
+    expect(f.script.calls.map((call) => isSummaryRequest(call.prompt))).toEqual([false, true]);
     expect(readFileSync(join(scene.lane.path, 'wait-effect.txt'), 'utf8')).toBe('once\n');
     const refusals = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf8').trimEnd().split('\n')
       .map((line) => JSON.parse(line) as { readonly state: string; readonly boundary?: string; readonly reason?: string }).filter((record) => record.state === 'guard-refused');
@@ -5838,7 +6220,7 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed' | 'disposed-at
   const { DirectiveCheckpointError, readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
   let summaries = 0; let replies = 0;
   const f = await fixture((prompt) => {
-    if (prompt.startsWith('<conversation>')) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
+    if (isSummaryRequest(prompt)) return summaries++ === 0 ? { deltas: [], error: 'summary provider failed' } : { deltas: ['pre-prompt summary'] };
     return [{ deltas: ['history '.repeat(100)], usageTokens: 90_000 }][replies++] ?? { deltas: ['directive reply that must never be requested'] };
   });
   writeFileSync(join(f.agentDir, 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 64 } }));
@@ -5864,21 +6246,18 @@ async function assertPreflightRefused(by: 'withheld' | 'disposed' | 'disposed-at
     }
   });
   if (by === 'disposed-at-admission' || by === 'running') {
-    // Act as Pi calls preflightResult: the bound is crossed there, so admission's
-    // own flush is the first re-check past it; or a compaction starts there.
-    const nativePrompt = session.prompt.bind(session);
-    (session as unknown as { prompt: (text: string, options?: Record<string, unknown>) => Promise<void> }).prompt = (text, options) => {
-      const preflight = options?.['preflightResult'] as ((accepted: boolean) => void) | undefined;
-      if (preflight === undefined) return nativePrompt(text, options as never);
-      return nativePrompt(text, { ...options, preflightResult: (accepted: boolean) => {
-        if (accepted && armed && by === 'running') internal.onPiEvent({ type: 'compaction_start' });
-        if (accepted && armed && by === 'disposed-at-admission') {
-          const now = Date.now.bind(Date);
-          clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
-        }
-        preflight(accepted);
-      } } as never);
-    };
+    // Act as Pi hands over to the run (agent.prompt, after its preparation and
+    // compaction): the bound is crossed there, so admission's own flush is the
+    // first re-check past it; or a compaction starts there.
+    const nativePrompt = session.agent.prompt.bind(session.agent);
+    session.agent.prompt = (async (...args: Parameters<typeof nativePrompt>) => {
+      if (armed && by === 'running') internal.onPiEvent({ type: 'compaction_start' });
+      if (armed && by === 'disposed-at-admission') {
+        const now = Date.now.bind(Date);
+        clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + COMPACTION_END_RECONCILE_MS);
+      }
+      return nativePrompt(...args);
+    }) as typeof nativePrompt;
   }
   const events = collect(handle);
   // Once the bound published its failed terminal the gate opens, so disposal can prove quiescence.
@@ -5939,7 +6318,7 @@ async function assertJoinedCompaction(scenario: 'held-preparation' | 'past-deadl
   const joinedSummaryHold = new Promise<void>((resolveHold) => { releaseJoinedSummary = resolveHold; });
   let summaries = 0; let replies = 0; let joinedSummaryStarted = false;
   const f = await fixture((prompt) => {
-    if (prompt.startsWith('<conversation>')) {
+    if (isSummaryRequest(prompt)) {
       if (summaries++ === 1 && scenario === 'past-deadline') { joinedSummaryStarted = true; return { deltas: ['automatic summary'], hold: joinedSummaryHold }; }
       return { deltas: ['automatic summary'] };
     }
@@ -6109,6 +6488,10 @@ async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveEx
     sessionFile: original.sessionFile!, text, authorityManifest: authority });
   // Accountable checkpoint fixture: the SDK's public persistence primitive
   // writes the original user receipt. No model, effects or terminal is forged.
+  // Pi 1.x persists the session's prompt and tool declarations as a system
+  // message directly ahead of the first prompt, so a real host that ceased
+  // after its receipt left that entry before it.
+  session.sessionManager.appendMessage(persistedSystemMessage(session));
   const receipt = session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
   afterReceipt?.(session, receipt);
   const proof = inspectDirectiveCheckpoint(original.sessionFile!, identity);
@@ -6155,7 +6538,7 @@ async function assertGuardedSdkDelivery(resume: boolean) {
 it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver #contract:native-directive-admission:pi', () => assertGuardedSdkDelivery(false));
 it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
 
-async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'branch-model-await' | 'branch-hook' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode') {
+async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'branch-model-await' | 'branch-hook' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode' | 'manifest-effective-prompt') {
   const hook = fault === 'prior-hook-await' || fault.endsWith('-hook');
   const manifest = fault.startsWith('manifest-');
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
@@ -6210,9 +6593,10 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
       expect(foreign.health().state).toBe('streaming');
     } else if (manifest) {
       const session = f.sessions.at(-1)!;
-      if (fault.startsWith('manifest-role')) session.agent.state.systemPrompt = 'unapproved live system authority';
+      if (fault.startsWith('manifest-role')) rewriteSystemPrompt(session, 'unapproved live system authority');
       else if (fault.startsWith('manifest-model')) session.agent.state.model = { ...session.model!, maxTokens: session.model!.maxTokens - 1 };
       else if (fault === 'manifest-execution-mode') session.agent.toolExecution = 'parallel';
+      else if (fault === 'manifest-effective-prompt') rewriteEffectivePrompt(session, 'unapproved effective prompt');
       else session.agent.state.tools = session.agent.state.tools.filter((tool) => tool.name !== 'read');
       expect(f.scene.ledger.directiveTurnIdentity(active.requestId)).toEqual(f.scene.identity);
     } else if (fault.startsWith('branch-')) {
@@ -6229,6 +6613,8 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
     if (manifest) {
       expect(f.fx.script.calls).toHaveLength(1); // last-effect refusal also fences the next model request
       expect(readFileSync(`${active.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('guard-refused');
+      // The transcript is untouched, so only the manifest's prompt term can refuse this one.
+      if (fault === 'manifest-effective-prompt') expect(readFileSync(`${active.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('role/tools/model authority changed before effect or completion');
       const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
       const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
       await service?.dispose(); service = null; f.scene.db.close();
@@ -6291,6 +6677,34 @@ it('refuses directive admission when a custom native tool has no explicit closur
   expect(f.script.calls).toHaveLength(0);
   await handle.dispose();
 });
+
+/** SDK 1.x derives `agent.state.systemPrompt` from the transcript's system
+ * messages (it is read-only): rewrite the leading one, as a live role change. */
+function rewriteSystemPrompt(session: AgentSession, text: string): void {
+  const [leading, ...rest] = session.agent.state.messages;
+  if (leading?.role !== 'system') throw new Error('expected the session transcript to lead with its system message');
+  session.agent.state.messages = [{ ...leading, content: text }, ...rest];
+}
+
+/** The SDK's effective prompt (`session.systemPrompt`) changes without a persisted
+ * patch when the options it is built from change (a reload, a tool change). */
+function rewriteEffectivePrompt(session: AgentSession, text: string): void {
+  const sdk = session as unknown as { _runSystemPromptOptions?: { appendSystemPrompt?: string }; readonly _baseSystemPromptOptions: { appendSystemPrompt?: string } };
+  (sdk._runSystemPromptOptions ?? sdk._baseSystemPromptOptions).appendSystemPrompt = text;
+  if (!session.systemPrompt.includes(text)) throw new Error('the effective prompt does not carry the rewritten option');
+}
+
+/** What a real pi 1.x host persists directly ahead of a session's first
+ * prompt: the SDK's prompt-sections patch carrying the tool declarations. */
+function persistedSystemMessage(session: AgentSession) {
+  const sdk = session as unknown as {
+    readonly _baseSystemPromptOptions: object;
+    _preparePromptAndToolLoadout(options: object): { readonly role: 'system'; readonly content: string; readonly sections: Record<string, string | null>; readonly timestamp: number } | undefined;
+  };
+  const patch = sdk._preparePromptAndToolLoadout(structuredClone(sdk._baseSystemPromptOptions));
+  if (patch === undefined) throw new Error('a session that has not prompted must owe its prompt sections');
+  return { ...patch, toolsAdded: session.agent.state.tools.map(toToolDeclaration) };
+}
 
 async function actualDirectiveSdkSession(handle: AgentHandle) {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
@@ -6530,7 +6944,7 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
     await waitFor(() => f.fx.script.calls.length === 1, 'actual guarded SDK model await');
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!; const file = row.nativeTarget!.sessionFile;
     const handle = f.registry.getHandle(row.nativeTarget!.agentId)!;
-    f.sessions[0]!.agent.state.systemPrompt = 'unapproved current role authority'; release(); await run;
+    rewriteSystemPrompt(f.sessions[0]!, 'unapproved current role authority'); release(); await run;
     expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(1);
     // While its tool refusals' receipts are owed, the refusal at the next model request is durable: never ordinary work.
     expect(checkpoint.inspectDirectiveCheckpoint(file, f.scene.identity)).toEqual({ state: 'unknown', reason: 'native directive execution/authority boundary refused; exact turn remains incomplete' });
@@ -6560,6 +6974,7 @@ it('actual SDK post-commit refusal journal failure fsync-retries exact receipts 
 
 it('real SDK system mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-role'));
 it('real SDK tools mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-tools'));
+it('real SDK effective-prompt change with the transcript untouched is refused by the authority manifest before native effects and the next model request', () => assertProductionSdkFence(false, 'manifest-effective-prompt'));
 it('real SDK system mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-role-hook'));
 it('real SDK model mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-model-hook'));
 
@@ -6744,6 +7159,7 @@ async function registerSyntheticResponses(modelRuntime: ModelRuntime, providerId
   return () => requests;
 }
 interface NativeRow {
+  readonly type?: string; readonly targetId?: string; readonly replacement?: unknown;
   readonly id: string; readonly parentId: string | null;
   readonly message?: { readonly role?: string; readonly stopReason?: string; readonly errorMessage?: string; readonly toolCallId?: string; readonly isError?: boolean; readonly content?: readonly unknown[] };
 }
@@ -6754,6 +7170,13 @@ function producerJournal(file: string): readonly Readonly<Record<string, unknown
   return readFileSync(`${file}.producers.jsonl`, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 const toolResultsOf = (rows: readonly NativeRow[]) => rows.filter((row) => row.message?.role === 'toolResult').map((row) => [row.message?.toolCallId, row.message?.isError]);
+/** Pi 1.x omits a failed reply from context with an edit linked on it; the
+ * SDK's retried replies hang off that edit, read here by stop reason. */
+function retriedReplies(rows: readonly NativeRow[], error: NativeRow) {
+  const edits = rows.filter((entry) => entry.parentId === error.id);
+  expect(edits).toEqual([expect.objectContaining({ type: 'context_edit', targetId: error.id, replacement: null })]);
+  return rows.filter((entry) => entry.parentId === edits[0]!.id).map((entry) => entry.message?.stopReason);
+}
 
 it('a real SDK retry after a truncated Responses stream settles the directive once, and its checkpoint outlives the turn and the minion (#483)', async () => {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
@@ -6773,7 +7196,7 @@ it('a real SDK retry after a truncated Responses stream settles the directive on
     const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
     const answer = rows.filter((entry) => entry.message?.role === 'assistant' && entry.message.stopReason === 'stop').at(-1)!;
     expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
-    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(retriedReplies(rows, error)).toEqual(['toolUse']);
     expect(toolResultsOf(rows)).toEqual([['failing-call|item-1', true], ['following-call|item-3', false]]);
     expect(requests()).toBe(4);
     expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
@@ -6790,14 +7213,17 @@ it('a real SDK retry after a truncated Responses stream settles the directive on
   } finally { await f.cleanup(); }
 });
 
-it('a real SDK retry of the directive\'s first request, after a fractional backoff, lets its next tool call run once and the directive settles (#483)', async () => {
+it('a real SDK retry of the directive\'s first request, after a short backoff, lets its next tool call run once and the directive settles (#483)', async () => {
   const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
   const retryStarts: unknown[] = [];
   const f = await sdkDirectiveExecutionFixture([], (session) => {
     session.subscribe((event) => { if (event.type === 'auto_retry_start') retryStarts.push(event); });
   });
-  // SDK delayMs is baseDelayMs·2^(attempt-1): a fractional base stays fractional.
-  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 0.5 } }));
+  // SDK delayMs is baseDelayMs·2^(attempt-1). Pi 1.x treats a non-integer as
+  // unsafe and sleeps its 60 s cap instead, so a fractional delay can no longer
+  // reach the adapter from the SDK; the validator's acceptance of one stays
+  // pinned in directive-retry-history.test.ts.
+  writeFileSync(join(f.fx.agentDir, 'settings.json'), JSON.stringify({ retry: { baseDelayMs: 1 } }));
   const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
   const effect = join(effects, 'ran.log');
   const requests = await registerSyntheticResponses(f.fx.modelRuntime, 'gru-stub', 'stub-model', [
@@ -6812,8 +7238,8 @@ it('a real SDK retry of the directive\'s first request, after a fractional backo
     const user = rows.find((entry) => entry.message?.role === 'user')!;
     const error = rows.find((entry) => entry.message?.stopReason === 'error')!;
     expect(error.parentId).toBe(user.id);
-    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 0.5, errorMessage: error.message?.errorMessage })]);
-    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1, errorMessage: error.message?.errorMessage })]);
+    expect(retriedReplies(rows, error)).toEqual(['toolUse']);
     expect(toolResultsOf(rows)).toEqual([['once-call|item-2', false]]);
     expect(readFileSync(effect, 'utf8')).toBe('ran');
     expect(requests()).toBe(3);
@@ -6868,7 +7294,7 @@ it('a real SDK retry of a truncated stream holding a partial tool call continues
     expect(error.message?.errorMessage).toContain('stream ended before a terminal response event');
     expect(error.message?.content).toContainEqual(expect.objectContaining({ type: 'toolCall', name: 'bash' }));
     expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1, delayMs: 1, errorMessage: error.message?.errorMessage })]);
-    expect(rows.filter((entry) => entry.parentId === error.id).map((entry) => entry.message?.stopReason)).toEqual(['toolUse']);
+    expect(retriedReplies(rows, error)).toEqual(['toolUse']);
     expect(toolResultsOf(rows)).toEqual([['retried-call|item-2', false]]);
     expect(readFileSync(effect, 'utf8')).toBe('ran');
     expect(requests()).toBe(3);
@@ -6983,6 +7409,36 @@ async function retryMinion(bodies: readonly (readonly ResponsesEvent[])[]) {
   const dispose = async () => { await handle.dispose(); await fx.runtime.dispose(); fx.store.dispose(); };
   return { logs, requests, handle, session, retryStarts, directive, dispose };
 }
+
+it('a real SDK retry whose failed reply the cache warmer followed still records its retry-start receipt, and the retried tool runs (#521)', async () => {
+  const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);
+  const effect = join(effects, 'ran.log');
+  const m = await retryMinion([responsesTruncated, responsesFunctionCall(2, 'bash', 'after-warm-leaf', { command: `printf ran >> ${JSON.stringify(effect)}` }), responsesAnswer('done after the warm entry')]);
+  const request = m.directive('warm-leaf-retry');
+  // Pi's cache warmer appends a usage entry on a timer: here it becomes the
+  // branch's leaf between the failed reply and the retry's start.
+  let warmed = false;
+  m.session.subscribe((event) => {
+    if (event.type === 'agent_end' && !warmed) {
+      warmed = true;
+      m.session.sessionManager.appendUsage('cache_warm', 'gru-synthetic-responses', 'synthetic-model',
+        { input: 1, output: 1, cacheRead: 9, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+    }
+  });
+  try {
+    const verdict = await m.handle.promptWithVerdict!('synthetic native retry investigation', { directive: request });
+    const file = m.handle.sessionFile!;
+    expect(warmed).toBe(true);
+    expect(nativeRows(file).some((row) => row.type === 'usage')).toBe(true);
+    const error = nativeRows(file).find((entry) => entry.message?.stopReason === 'error')!;
+    expect(producerJournal(file).filter((receipt) => receipt['state'] === 'retry-start')).toEqual([expect.objectContaining({ entryId: error.id })]);
+    expect(m.logs.filter((entry) => entry.msg === UNRECORDED_RETRY)).toEqual([]);
+    expect(readFileSync(effect, 'utf-8')).toBe('ran');
+    expect(verdict).toMatchObject({ ok: true });
+  } finally {
+    await m.dispose();
+  }
+});
 
 it('a real SDK retry of an error row holding an unknown block records no evidence, says why, and refuses the next tool by the error row\'s own reason (#483)', async () => {
   const effects = mkdtempSync(join(tmpdir(), 'gru-retry-effect-')); cleanupDirs.push(effects);

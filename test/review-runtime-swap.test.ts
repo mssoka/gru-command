@@ -144,7 +144,7 @@ it.skipIf(process.platform !== 'linux')('keeps the identity when a sibling appea
   // A missing optional dependency is looked up in every ancestor's
   // node_modules, so the walk climbs `..` through the shared tmpdir.
   writeFileSync(join(installed, 'package.json'), JSON.stringify({
-    name: 'tslib', version: '1.0.0', optionalDependencies: { '@esbuild/linux-x64': '1.0.0' },
+    name: 'tslib', version: '1.0.0', optionalDependencies: { bufferutil: '1.0.0' },
   }));
   writeFileSync(join(installed, 'tslib.js'), 'export const checked = true;');
   const original = reviewRuntimeVersion(root);
@@ -170,7 +170,7 @@ it.skipIf(process.platform !== 'linux')('still refuses when an ancestor is repla
   const installed = join(root, 'node_modules', 'tslib');
   mkdirSync(installed, { recursive: true });
   writeFileSync(join(installed, 'package.json'), JSON.stringify({
-    name: 'tslib', version: '1.0.0', optionalDependencies: { '@esbuild/linux-x64': '1.0.0' },
+    name: 'tslib', version: '1.0.0', optionalDependencies: { bufferutil: '1.0.0' },
   }));
   writeFileSync(join(installed, 'tslib.js'), 'export const checked = true;');
   expect(reviewRuntimeVersion(root)).toMatch(/^[a-f0-9]{64}$/u);

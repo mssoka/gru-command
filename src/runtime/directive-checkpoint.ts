@@ -196,6 +196,9 @@ interface NativeEntry {
   readonly tokensBefore?: unknown;
   readonly fromHook?: unknown;
   readonly timestamp?: unknown;
+  readonly targetId?: unknown;
+  readonly replacement?: unknown;
+  readonly kind?: unknown;
 }
 /*
  * Native transcripts grow for a session's whole life (#469), so inspection
@@ -214,7 +217,10 @@ function withNativeTranscript<T>(file: string, inspect: (fd: number) => T): T {
   try { return inspect(fd); } finally { closeSync(fd); }
 }
 /** Complete lines read on demand from `start`, each bounded and fatally
- * decoded. A torn final line is never decoded: it only sets `partial`. */
+ * decoded. A torn final line is never decoded: it only sets `partial`.
+ * `tolerateWarmGrowth` (a pi session) reads on when the file grew by nothing
+ * but complete cache-warm usage entries between the read that found its end
+ * and the check of its size; any other growth still refuses. */
 class NativeLines {
   private readonly decoder = utf8Decoder();
   private readonly buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
@@ -224,7 +230,26 @@ class NativeLines {
   /** The offset after the last complete line read. */
   end: number;
   partial = false;
-  constructor(private readonly fd: number, start: number) { this.position = start; this.end = start; }
+  constructor(private readonly fd: number, start: number, private readonly tolerateWarmGrowth = false) { this.position = start; this.end = start; }
+  /** Pi 1.x's cache warmer appends a `usage` entry on a timer, so the file may
+   * grow between the read that returned nothing and the check of its size.
+   * That growth is harmless only when it is whole lines, each a cache-warm
+   * usage entry: the turn is read through them as it is everywhere else. */
+  private grewByWarmEntriesOnly(size: number): boolean {
+    const grown = size - this.position;
+    if (grown <= 0 || grown > READ_CHUNK_BYTES) return false;
+    const appended = Buffer.allocUnsafe(grown);
+    if (readSync(this.fd, appended, 0, grown, this.position) !== grown || appended[grown - 1] !== 10) return false;
+    const decoder = utf8Decoder();
+    for (let at = 0; at < grown;) {
+      const newline = appended.indexOf(10, at);
+      let entry: unknown;
+      try { entry = JSON.parse(decodeEvidence(appended.subarray(at, newline), 'native transcript', decoder)); } catch { return false; }
+      if (typeof entry !== 'object' || entry === null || !isCacheWarm(entry as { readonly type: string; readonly kind?: unknown })) return false;
+      at = newline + 1;
+    }
+    return true;
+  }
   /** The next complete line, or null at the end; one longer than `limit` bytes refuses. */
   next(limit: number, oversized: string): string | null {
     const pieces: Buffer[] = [];
@@ -233,7 +258,11 @@ class NativeLines {
       if (this.chunk.length === 0) {
         const count = readSync(this.fd, this.buffer, 0, this.buffer.length, this.position);
         if (count === 0) {
-          if (fstatSync(this.fd).size !== this.position) throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+          const size = fstatSync(this.fd).size;
+          if (size !== this.position) {
+            if (this.tolerateWarmGrowth && bytes === 0 && this.grewByWarmEntriesOnly(size)) continue;
+            throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+          }
           if (bytes > 0) this.partial = true;
           return null;
         }
@@ -274,7 +303,7 @@ class NativeTurn {
   private count = 0;
   private scope = 'native directive turn';
   private ended: { readonly start: number; readonly count: number } | null = null;
-  constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
+  constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted', tolerateWarmGrowth = false) { this.lines = new NativeLines(fd, start, tolerateWarmGrowth); }
   /** The turn ended at the last line read. What is read after it only looks
    * ahead, under its own bound and its own name: it is never charged to,
    * nor refused as, this turn. Idempotent until resume(): a chained retry
@@ -308,6 +337,16 @@ class NativeTurn {
 /** The pi turn's entry at `index`: `malformed` without a unique, non-empty
  * id; undefined past the turn's end. */
 type PiTurn = (index: number) => NativeEntry | 'malformed' | undefined;
+/** Pi 1.x's cache warmer appends these on a timer; they are no conversation. */
+function isCacheWarm(entry: { readonly type: string; readonly kind?: unknown }): boolean {
+  return entry.type === 'usage' && entry.kind === 'cache_warm';
+}
+/** A branch's last entry that is part of the conversation: a cache-warm usage
+ * entry may be the leaf when Pi emits an event about the entry before it. */
+export function conversationTail<T extends { readonly type: string; readonly kind?: unknown }>(branch: readonly T[]): T | undefined {
+  for (let at = branch.length - 1; at >= 0; at -= 1) if (!isCacheWarm(branch[at]!)) return branch[at];
+  return undefined;
+}
 /** A pi transcript split after its `baseline` entry (after the header when
  * null). Entries through the split are kept only as their ids and parent ids. */
 interface PiTranscript {
@@ -322,10 +361,13 @@ interface PiTranscript {
   readonly endTurn: () => void;
   /** Takes back endTurn (see NativeTurn.resume). */
   readonly resumeTurn: () => void;
+  /** The cache-warm usage entries read so far in the turn, by id, to the id of
+   * the entry they hang off. The turn is read as if they were not there. */
+  readonly warmed: ReadonlyMap<string, string | null>;
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
-    const lines = new NativeLines(fd, 0);
+    const lines = new NativeLines(fd, 0, true);
     const first = lines.nextEntry();
     const header = first === null ? null : JSON.parse(first) as NativeEntry | null;
     const parentIds = new Map<string, string | null>();
@@ -344,21 +386,37 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {} });
+      return inspect({ header, parentIds, malformed, turn: null, endTurn: () => {}, resumeTurn: () => {}, warmed: new Map() });
     }
-    const after = new NativeTurn(fd, lines.end, tail);
+    const after = new NativeTurn(fd, lines.end, tail, true);
     const seen = new Set<string>();
     const entries: (NativeEntry | 'malformed')[] = [];
+    // Pi 1.x's cache warmer appends a `usage` entry (kind cache_warm) as a child
+    // of the current leaf on a timer. It joins no conversation and runs no tool,
+    // so the turn is read as if it were not there: a child's parent is the usage
+    // entry's own parent. Any other usage kind is read as the unknown entry it is.
+    const warmed = new Map<string, string | null>();
     const turn: PiTurn = (index) => {
       while (entries.length <= index) {
         const line = after.next();
         if (line === undefined) return undefined;
         const entry = JSON.parse(line) as NativeEntry | null;
-        if (fresh(entry, seen)) { seen.add(entry.id); entries.push(entry); } else entries.push('malformed');
+        if (!fresh(entry, seen)) { entries.push('malformed'); continue; }
+        seen.add(entry.id);
+        let parentId = entry.parentId ?? null;
+        while (parentId !== null && warmed.has(parentId)) parentId = warmed.get(parentId)!;
+        if (isCacheWarm(entry)) {
+          // A warm entry resolving to itself closes a parent cycle the walk above
+          // would never leave: it is evidence of another writer, not a warm entry.
+          if (parentId === entry.id) { entries.push('malformed'); continue; }
+          warmed.set(entry.id, parentId);
+          continue;
+        }
+        entries.push(parentId === (entry.parentId ?? null) ? entry : { ...entry, parentId });
       }
       return entries[index];
     };
-    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume() });
+    return inspect({ header, parentIds, malformed, turn, endTurn: () => after.end(), resumeTurn: () => after.resume(), warmed });
   });
 }
 /** One inspection's parent links: the turn entries it has walked, over the
@@ -404,7 +462,7 @@ class PiAncestry {
  */
 function linkedCompactionRefusal(entry: NativeEntry, parentId: string | null, ancestry: PiAncestry): string | null {
   if (parentId === null || entry.parentId !== parentId) return 'native compaction is not linked to the active checkpoint';
-  // The SDK GC ships (^0.85.1) always writes fromHook; without it, refused.
+  // The SDK GC ships (^1.4.0) always writes fromHook; without it, refused.
   if (entry.fromHook === true) return 'native compaction summary was authored by an extension hook';
   if (entry.fromHook !== false) return 'native compaction hook marker is malformed';
   if (typeof entry.timestamp !== 'string' || entry.timestamp.trim() === '') return 'native compaction lacks a timestamp';
@@ -433,17 +491,36 @@ function turnCompactionRefusal(entry: NativeEntry, previous: NativeEntry, openTo
  * for such a reply. Returns that compaction; the named refusal when the
  * compaction on such a reply is not Pi's, or the error reply it continued
  * holds content that is not history; null when nothing continued `reply`. */
-function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
+function compactAndRetryCompaction(reply: NativeEntry, after: (offset: 1 | 2 | 3) => NativeEntry | 'malformed' | undefined, ancestry: PiAncestry): NativeEntry | string | null {
   const stop = reply.message?.stopReason;
   if (reply.message?.role !== 'assistant' || !(stop === 'error' || stop === 'length' && !holdsToolCalls(reply.message))) return null;
-  const compaction = after(1);
+  // Pi 1.x omits a failed reply from the model's context with a context edit
+  // before it compacts and retries; the compaction then hangs off that edit.
+  const first = after(1);
+  const edit = typeof first === 'object' && omitsErrorRow(first, reply) ? first : null;
+  const compaction = edit === null ? first : after(2);
   if (typeof compaction !== 'object' || compaction.type !== 'compaction') return null;
-  const refusal = linkedCompactionRefusal(compaction, reply.id, ancestry);
+  // The compaction hangs off the edit, so its chain is checked through it; the
+  // callers link the compaction and skip the edit with it (see compactionSpan).
+  if (edit !== null) ancestry.link(edit);
+  const refusal = linkedCompactionRefusal(compaction, (edit ?? reply).id, ancestry);
   if (refusal !== null) return refusal;
-  const retried = after(2);
+  const retried = edit === null ? after(2) : after(3);
   if (typeof retried !== 'object' || retried.type !== 'message' || retried.message?.role !== 'assistant' || retried.parentId !== compaction.id) return null;
   if (stop === 'error' && !validRetryErrorContent(reply.message.content)) return 'native compaction retries an error row holding content that is not history';
   return compaction;
+}
+/** How many entries a compact-and-retry spans after the failed reply: the compaction, and Pi 1.x's omitting context edit it hangs off when there is one. */
+const compactionSpan = (reply: NativeEntry, compaction: NativeEntry): 1 | 2 => compaction.parentId === reply.id ? 1 : 2;
+/** Pi 1.x keeps a failed reply in the transcript and durably omits it from
+ * the model's context with a `context_edit` entry linked on it (`replacement`
+ * null) when it retries the reply or compacts and retries it. A failed reply
+ * is an error row, or a call-less length row, the same two compactAndRetryCompaction
+ * reads. The edit runs no tool and sends no message. */
+function omitsErrorRow(edit: NativeEntry, row: NativeEntry): boolean {
+  const stop = row.message?.stopReason;
+  return edit.type === 'context_edit' && edit.parentId === row.id && edit.targetId === row.id && edit.replacement === null &&
+    row.type === 'message' && row.message?.role === 'assistant' && (stop === 'error' || stop === 'length' && !holdsToolCalls(row.message));
 }
 /** The level Pi's session records in a thinking_level_change: what
  * setThinkingLevel was given, or clamped to (through Pi's own nested copies). */
@@ -463,22 +540,43 @@ const PI_THINKING_CONTROL_LEVELS: [Exclude<ModelThinkingLevel | PiRecordedThinki
 function controlRefusal(control: NativeEntry, tip: NativeEntry, ancestry: PiAncestry): string | null {
   if (control.type === 'compaction') return tip.type === 'compaction' ? 'native compaction follows another compaction' : linkedCompactionRefusal(control, tip.id, ancestry);
   if (control.parentId !== tip.id) return 'native control is not linked to the completed checkpoint';
+  if (control.type === 'context_edit' && !omitsErrorRow(control, tip)) return 'native context edit does not omit the completed checkpoint';
   if (control.type === 'model_change' &&
       (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim())) return 'native model control is malformed';
   if (control.type === 'thinking_level_change' &&
       (typeof control.thinkingLevel !== 'string' || !PI_THINKING_CONTROL_LEVELS.includes(control.thinkingLevel))) return 'native thinking-level control is malformed';
   return null;
 }
+/** Pi 1.x persists the prompt and tool declarations as `system` message
+ * entries: the session's leading one, and a patch whenever the SDK finds its
+ * sections or tools changed. They sit directly ahead of the prompt that
+ * carries them, run no tool and send no message, so one linked on the chain
+ * is walked past. An authority change in them is refused by the live
+ * authority manifest (it hashes the effective prompt and tools), not here. */
+function linkedSystemMessage(entry: NativeEntry | 'malformed' | undefined, parentId: string | null): entry is NativeEntry {
+  return typeof entry === 'object' && entry.type === 'message' && entry.message?.role === 'system' && entry.parentId === parentId;
+}
 /** Where a directive's user receipt is: directly after its baseline, or after
- * Pi's pre-prompt compaction linked on the baseline. A compaction there that
- * is not that evidence is refused by its reason. */
+ * Pi's pre-prompt compaction linked on the baseline, then after the system
+ * messages Pi 1.x writes ahead of the prompt (linkedSystemMessage). A
+ * compaction there that is not that evidence is refused by its reason. */
 function piReceiptAt(turn: PiTurn, baseline: string | null, ancestry: PiAncestry): { readonly index: number; readonly parentId: string | null } | string {
+  let index = 0;
+  let parentId = baseline;
   const first = turn(0);
-  if (typeof first !== 'object' || first.type !== 'compaction') return { index: 0, parentId: baseline };
-  const refusal = linkedCompactionRefusal(first, baseline, ancestry);
-  if (refusal !== null) return refusal;
-  ancestry.link(first);
-  return { index: 1, parentId: first.id };
+  if (typeof first === 'object' && first.type === 'compaction') {
+    const refusal = linkedCompactionRefusal(first, baseline, ancestry);
+    if (refusal !== null) return refusal;
+    ancestry.link(first);
+    index = 1;
+    parentId = first.id;
+  }
+  for (let entry = turn(index); linkedSystemMessage(entry, parentId); entry = turn(index)) {
+    ancestry.link(entry);
+    index += 1;
+    parentId = entry.id;
+  }
+  return { index, parentId };
 }
 /** Header facts come from the first line alone. They identify a session/cwd,
  * never admission, completion or work authority. */
@@ -508,7 +606,7 @@ export function prepareDirectiveBinding(input: {
   if (prior !== null) throw new DirectiveCheckpointError(`request ${input.identity.requestId} already has native association — inspect it; never replay`);
   // The baseline is the last entry: the whole session streams past, one line at a time.
   const baseline = withNativeTranscript(input.sessionFile, (fd) => {
-    const lines = new NativeLines(fd, 0);
+    const lines = new NativeLines(fd, 0, true);
     let last: string | null = null;
     for (let line = lines.nextEntry(); line !== null; line = lines.nextEntry()) {
       const entry = JSON.parse(line) as NativeEntry;
@@ -562,7 +660,7 @@ const UNBOUND_TAIL = 'native entries follow the correlated terminal checkpoint w
  * durably bound admission, or null when they are. Reads only the few entries
  * after the checkpoint (#469); a read refusal propagates, a binding that does
  * not read back is no later request. */
-function laterBoundRequestRefusal(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): string | null {
+function laterBoundRequestRefusal(file: string, native: PiTurn, warmed: ReadonlyMap<string, string | null>, identity: DirectiveTurnIdentity, checkpointIndex: number, ancestry: PiAncestry): string | null {
   const checkpoint = native(checkpointIndex);
   if (typeof checkpoint !== 'object') return UNBOUND_TAIL;
   let tip = checkpoint;
@@ -570,18 +668,29 @@ function laterBoundRequestRefusal(file: string, native: PiTurn, identity: Direct
   // These controls change the NEXT request's model, or compact the model's
   // context (Pi's post-run and pre-prompt compaction), not the completed
   // request's ancestry. No branch or unbound effect is skipped.
-  for (let control = native(nextIndex); typeof control === 'object' && ['model_change', 'thinking_level_change', 'compaction'].includes(control.type); control = native(nextIndex)) {
+  for (let control = native(nextIndex); typeof control === 'object' && ['model_change', 'thinking_level_change', 'compaction', 'context_edit'].includes(control.type); control = native(nextIndex)) {
     const refusal = controlRefusal(control, tip, ancestry);
     if (refusal !== null) return refusal;
     ancestry.link(control);
     tip = control;
     nextIndex += 1;
   }
+  // Pi 1.x writes its system messages ahead of the later prompt (see
+  // linkedSystemMessage); the later binding's baseline is still `tip`.
+  let promptParent: NativeEntry = tip;
+  for (let entry = native(nextIndex); linkedSystemMessage(entry, promptParent.id); entry = native(nextIndex)) {
+    ancestry.link(entry);
+    promptParent = entry;
+    nextIndex += 1;
+  }
   const immediate = native(nextIndex);
-  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== tip.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
+  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== promptParent.id || !Array.isArray(immediate.message.content)) return UNBOUND_TAIL;
   // The later binding's baseline is the receipt's parent, or the entry Pi
   // compacted on before that prompt (see piReceiptAt).
-  const baselines = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];
+  // A cache-warm usage entry the later binding was prepared on is read through
+  // (see withPiTranscript), so it names the entry it hangs off as its baseline too.
+  const anchors = tip.type === 'compaction' ? [tip.id, tip.parentId] : [tip.id];
+  const baselines = anchors.flatMap((anchor) => [anchor, ...[...warmed].filter(([, parent]) => parent === anchor).map(([usage]) => usage)]);
   try {
     const hash = contentHash(immediate.message.content);
     const matching = readDirectiveBindings(file).filter((candidate) => candidate.identity.requestId !== identity.requestId &&
@@ -683,15 +792,34 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
   // a grep with no match). One it never answered may be an interrupted effect,
   // unless it is the SDK's own "not executed" result for a length row's call.
   let unanswered = false;
+  // Where a compaction may follow the terminal: directly, or after the context
+  // edit Pi 1.x writes first when it omits a failed terminal reply.
+  let terminalSpan = 1;
   const notExecuted = new Set<string>();
   for (let index = at.index + 1; ; index += 1) {
     const entry = native(index);
     if (entry === undefined) break;
     if (entry === 'malformed') return unknown(MALFORMED);
     if (terminal !== null) {
+      // Pi 1.x has omitted a failed terminal reply from context before the
+      // retry it cancelled during its backoff, or before the recovery
+      // compaction a lost host never followed: either way the reply stays the
+      // turn's terminal. An edit followed by something else is one of a later
+      // request's controls, judged below.
+      if (index === terminal.index + 1 && entry.type === 'context_edit') {
+        if (!omitsErrorRow(entry, previous)) return unknown('native branch/control/partial checkpoint');
+        const following = native(index + 1);
+        if (following === undefined) return completed(terminal);
+        if (typeof following === 'object' && following.type === 'compaction') {
+          ancestry.link(entry);
+          previous = entry;
+          terminalSpan = 2;
+          continue;
+        }
+      }
       // Pi's post-run compaction follows the final assistant directly. It is
       // lookahead: the terminal it follows stays this turn's checkpoint.
-      if (index === terminal.index + 1 && entry.type === 'compaction') {
+      if (index === terminal.index + terminalSpan && entry.type === 'compaction') {
         const refusal = linkedCompactionRefusal(entry, previous.id, ancestry);
         if (refusal !== null) return unknown(refusal);
         ancestry.link(entry);
@@ -702,12 +830,20 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       // distinct, durably read-back admission binds it. Keep the earlier
       // checkpoint readable without treating an unbound/replayed user tail
       // as proof that the old request completed.
-      const refusal = laterBoundRequestRefusal(file, native, identity, terminal.index, ancestry);
+      const refusal = laterBoundRequestRefusal(file, native, transcript.warmed, identity, terminal.index, ancestry);
       return refusal === null ? completed(terminal) : unknown(refusal);
     }
     if (entry.type === 'compaction') {
       const refusal = turnCompactionRefusal(entry, previous, pending.size, ancestry);
       if (refusal !== null) return unknown(refusal);
+      ancestry.link(entry);
+      previous = entry;
+      continue;
+    }
+    if (entry.type === 'context_edit') {
+      // Only the omission of the failed reply just walked, which the retry
+      // checks above read ahead and accepted.
+      if (!omitsErrorRow(entry, previous)) return unknown('native branch/control/partial checkpoint');
       ancestry.link(entry);
       previous = entry;
       continue;
@@ -726,7 +862,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
       // one lookahead; each entry is read, and charged, once.
       const lookahead = (offset: number) => { endTurn(); return native(index + offset); };
       // A receipted error row is history when the SDK's retried answer follows it (#483).
-      if (isRetryHistoryRow(entry, () => lookahead(1), retries)) {
+      if (isRetryHistoryRow(entry, lookahead, retries)) {
         resumeTurn();
         lastMessage = message;
         continue;
@@ -740,7 +876,7 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, tr
         // The failed reply is history; the turn continues on the compaction.
         ancestry.link(retry);
         previous = retry;
-        index += 1;
+        index += compactionSpan(entry, retry);
         lastMessage = message;
         continue;
       }
@@ -1213,9 +1349,14 @@ function isReceiptedErrorRow(entryId: string, message: Record<string, unknown>, 
  * never enter the pending set, so a result naming one is unmatched. Without
  * that answer (a retry cancelled during backoff) the row is the turn's
  * terminal. `successor` is read only for a receipted row. */
-function isRetryHistoryRow(entry: NativeEntry, successor: () => NativeEntry | 'malformed' | undefined, evidence: ReadonlyMap<string, string>): boolean {
+function isRetryHistoryRow(entry: NativeEntry, successor: (offset: 1 | 2) => NativeEntry | 'malformed' | undefined, evidence: ReadonlyMap<string, string>): boolean {
   if (entry.message === undefined || !isReceiptedErrorRow(entry.id, entry.message, evidence)) return false;
-  const next = successor();
+  const next = successor(1);
+  if (typeof next === 'object' && omitsErrorRow(next, entry)) {
+    // Pi 1.x: the retried answer follows the context edit that omits the row.
+    const retried = successor(2);
+    return typeof retried === 'object' && retried.type === 'message' && retried.parentId === next.id && retried.message?.role === 'assistant';
+  }
   return typeof next === 'object' && next.type === 'message' && next.parentId === entry.id && next.message?.role === 'assistant';
 }
 /** The SDK auto-retries an error reply or compacts and retries it, never
@@ -1379,13 +1520,19 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
       previous = entry;
       continue;
     }
+    if (entry.type === 'context_edit') {
+      if (!omitsErrorRow(entry, previous)) refuse();
+      ancestry.link(entry);
+      previous = entry;
+      continue;
+    }
     if (entry.type !== 'message' || entry.parentId !== previous.id || !message) refuse();
     ancestry.link(entry);
     previous = entry;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || !Array.isArray(message!.content)) refuse();
       // An error row the live SDK retried past is history, not a tool invocation (#483).
-      if (isRetryHistoryRow(entry, () => native[at + 1], retries)) continue;
+      if (isRetryHistoryRow(entry, (offset) => native[at + offset], retries)) continue;
       // Nor is a failed reply Pi compacted on and continued (#481).
       const retry = compactAndRetryCompaction(entry, (offset) => native[at + offset], ancestry);
       if (typeof retry === 'string') refuse(retry);
@@ -1393,7 +1540,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
         if (retries.has(entry.id)) refuse(RETRIED_TWICE);
         ancestry.link(retry);
         previous = retry;
-        at += 1;
+        at += compactionSpan(entry, retry);
         continue;
       }
       if (message!.stopReason === 'error') {

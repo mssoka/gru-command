@@ -94,7 +94,7 @@ when it is a Pi-authored summary, with a timestamp, a summary and a token
 count, linked directly on the active chain, with its kept entry on that
 chain. `fromHook: false` marks a Pi-authored summary: an automatic one, or
 a manual compact, which GC runs only on an idle session and so never inside
-a live turn. The SDK GC ships (^0.85.1) always writes `fromHook`; a
+a live turn. The SDK GC ships (^1.4.0) always writes `fromHook`; a
 compaction without it is refused. Such a compaction is walked past in one
 of four places:
 
@@ -117,6 +117,56 @@ of four places:
   Pi's compaction ran after it. An error reply that also carries a
   `retry-start` receipt is refused by name: Pi auto-retries a reply or
   compacts and retries it, never both.
+
+Pi 1.x adds three entry shapes to a directive's transcript, each walked past
+only in the form it is written in, linked on the chain:
+
+- **system messages:** the prompt sections and tool declarations Pi persists
+  directly ahead of the prompt that carries them (the session's first, and a
+  patch when the sections or tools changed, for example after an `AGENTS.md`
+  edit on a resumed session). Walked past before a directive's receipt and
+  before a later bound request; one inside a turn is refused as another
+  writer's authority change. The authority manifest binds the prompt the run
+  carries (the SDK's effective prompt). Before the receipt and the first
+  request (over the stored messages plus the prompt patch the SDK hands the
+  run), at admission, and before a continuation, the prompt the transcript
+  replays (the net of all its system messages) must be that prompt (the same
+  sections, in whatever order the transcript first wrote them): text that
+  survives the replay beyond it, such as a persisted `content` the SDK never
+  corrects, would reach the model unapproved, so it refuses the directive by
+  name. The check bounds the net replay, not each persisted message: an
+  earlier system message is history, like an earlier turn, and the SDK
+  rewrites a stale section or tool declaration with a corrective patch (the
+  agent loop reconciles the transcript's tools with the live ones before
+  every request). From admission on, the replay may not change for the rest
+  of the turn;
+- **omitting context edits:** before Pi retries a failed reply, or compacts
+  and retries it, it durably omits that reply from the model's context with a
+  `context_edit` entry (null replacement) linked on it. The edit is part of
+  the retry history and of the compact-and-retry; a turn lost after it, with
+  or without the recovery compaction, still reads as the failed reply's
+  terminal (not ok). An edit that names another row or replaces it is
+  refused;
+- **cache-warm usage entries:** with prompt-cache warming on, Pi appends a
+  `usage` entry of kind `cache_warm` on a timer. It joins no conversation,
+  so the turn is read as if it were not there (a warm entry that is its own
+  parent is a malformed entry). A usage entry of any other kind is refused as
+  the unknown entry it is. The timer can also append between the read that
+  finds the end of the transcript and the check of its size, so that growth is
+  read on when it is whole cache-warm lines and nothing else; any other
+  growth, a torn warm line included, still refuses by name. Warming follows
+  the SDK's default and the user's own Pi settings (`cacheWarming` in the
+  agent directory's `settings.json`): GC does not override the mode and
+  never writes those settings. Isolated review sessions run on in-memory
+  settings that never read that file, so they take the SDK default whatever
+  the user has set. A warm is a paid provider request that the directive
+  fence does not see and the yield report does not count.
+
+Two more 1.x differences are refused by name rather than walked: a Pi
+directive carries text only (1.x re-encodes prompt images, so the receipt
+could never match the accepted prompt), and a continuation of a checkpoint a
+pre-1.x host wrote (its transcript holds no system message, and 1.x adds none
+to a continuation) is not safely resumable.
 
 Anything else is refused by name and the request stays UNKNOWN: a
 hook-authored or malformed summary, a wrong parent, a kept entry off the
