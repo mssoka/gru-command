@@ -1710,6 +1710,4 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   }, 180_000);
-
-
 });

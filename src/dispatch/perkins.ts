@@ -418,11 +418,20 @@ export function hostDisclosureAppendix(
  * evidence instead (R8). */
 export const PUBLICATION_BODY_MAX_BYTES = 60_000;
 
-/** GitLab stores MR note bodies without one terminal LF. New publication
- * intent is canonicalized once before artifact/digest/attempt/POST creation;
- * historical artifacts and receipts are never rewritten through this helper. */
+/** Ruby `String#rstrip` whitespace: GitLab's stored-note normalization. */
+const GITLAB_TRAILING_WHITESPACE = ' \t\n\v\f\0';
+
+/** GitLab normalizes every MR note body before storing it: its quick-action
+ * extractor deletes each CR and strips trailing whitespace (`rstrip`). New
+ * publication intent is canonicalized to those stored bytes before
+ * artifact/digest/attempt/POST creation; the helper is idempotent, and
+ * historical artifacts and receipts are never rewritten through it.
+ * Quick-action lines themselves are not modeled here (#526). */
 export function canonicalGitLabPublicationBody(body: string): string {
-  return body.endsWith('\n') ? body.slice(0, -1) : body;
+  const withoutCr = body.replaceAll('\r', '');
+  let end = withoutCr.length;
+  while (end > 0 && GITLAB_TRAILING_WHITESPACE.includes(withoutCr[end - 1]!)) end -= 1;
+  return withoutCr.slice(0, end);
 }
 
 /** Assemble the exact publication body (report + host appendix) and refuse
@@ -439,9 +448,11 @@ export function publicationBodyFor(
 ): string {
   const assembledBody = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals, reviewEvent)}\n`;
   // Enforce the early assembly bound on the provider-canonical bytes too:
-  // GitLab removes one terminal LF, so a body exactly one byte over the
-  // threshold can still fit after that known transformation. Redaction and
-  // its possible expansion are checked again on the final body at delivery.
+  // GitLab deletes CRs and the terminal LF, so a body just over the
+  // threshold can still fit after that known transformation. Canonicalizing
+  // before redaction also lets redaction see the bytes GitLab will store.
+  // Redaction and its possible expansion are checked again on the final
+  // body at delivery.
   const body = provider === 'gitlab' ? canonicalGitLabPublicationBody(assembledBody) : assembledBody;
   if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
     throw new Error(
@@ -6945,9 +6956,10 @@ export class WaveRunner {
           throw overflow;
         }
         const redactedBody = redactReviewForPublication(publicationBody);
-        // The GitLab note API removes one terminal LF from stored notes. Make
-        // the canonical bytes explicit before the durable artifact, digest,
-        // attempt, or irreversible POST; GitHub bytes remain unchanged.
+        // The GitLab note API stores normalized bodies (CRs deleted, trailing
+        // whitespace stripped). Make the canonical bytes explicit before the
+        // durable artifact, digest, attempt, or irreversible POST; GitHub
+        // bytes remain unchanged.
         const finalBody = providerKind === 'gitlab'
           ? canonicalGitLabPublicationBody(redactedBody)
           : redactedBody;
