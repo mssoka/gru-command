@@ -282,11 +282,22 @@ describe('pi 1.x context edits around a retried reply (#521)', () => {
     message(file, 'answer', 'omit-truncated', answer);
     // Refused as an edit that omits no failed reply, not later as unanswered calls.
     expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'native branch/control/partial checkpoint' });
+    // The tool fence: Pi answers the cut-off call itself and the model goes on. Without the edit the
+    // scene is accepted, so the edit is the only thing the flush can refuse.
+    const notExecuted = { role: 'toolResult', toolCallId: call.id, toolName: 'bash', isError: true, content: [{ type: 'text', text: 'Tool call was not executed' }] };
+    const next = { ...call, id: 'call-next' };
+    const nextInvocation = { ...invocation, content: [next] };
+    const control = scene(['system-1']);
+    message(control.file, 'truncated', 'receipt', cutOff);
+    message(control.file, 'result', 'truncated', notExecuted);
+    message(control.file, 'invocation', 'result', nextInvocation);
+    expect(() => flushDirectiveToolIntent(control.file, nextInvocation, next, identity)).not.toThrow();
     const second = scene(['system-1']);
     message(second.file, 'truncated', 'receipt', cutOff);
     contextEdit(second.file, 'omit-truncated', 'truncated');
-    message(second.file, 'invocation', 'omit-truncated', invocation);
-    expect(() => flushDirectiveToolIntent(second.file, invocation, call, identity)).toThrow(DirectiveCheckpointError);
+    message(second.file, 'result', 'omit-truncated', notExecuted);
+    message(second.file, 'invocation', 'result', nextInvocation);
+    expect(() => flushDirectiveToolIntent(second.file, nextInvocation, next, identity)).toThrow(DirectiveCheckpointError);
   });
 
   it('a compaction that skips the omitting edit is not linked on the failed reply: refused', () => {

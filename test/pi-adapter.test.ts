@@ -2478,8 +2478,9 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     // More sections than any prompt has: refused, never a stack overflow or a long search.
     const thousands = Array.from({ length: 5000 }, () => 'section');
     expect(rendersAs(thousands.join('\n\n'), thousands)).toBe(false);
+    // An exact match of 3,000 distinct sections: only the cap refuses it.
     const distinct = Array.from({ length: 3000 }, (_, index) => `section ${index}`);
-    expect(rendersAs([...distinct.slice(1), 'other'].join('\n\n'), distinct)).toBe(false);
+    expect(rendersAs(distinct.join('\n\n'), distinct)).toBe(false);
     // Sections that contain one another: each pair is also a section of its own,
     // so every pair could be matched whole or in halves, and only the last section
     // fails. Every combination was once a state (1.3 s at 18 pairs, over 25 s at 30).
@@ -2496,7 +2497,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     const settings = join(fx.agentDir, 'settings.json');
     const base = existsSync(settings) ? JSON.parse(readFileSync(settings, 'utf-8')) as object : {};
     const modes: string[] = [];
-    for (const named of [undefined, 'off', 'idle', 'streaming']) {
+    // The last setting written differs from the SDK default, so the review session below can tell a file-backed manager from an in-memory one.
+    for (const named of [undefined, 'streaming', 'off', 'idle']) {
       writeFileSync(settings, JSON.stringify(named === undefined ? base : { ...base, cacheWarming: named }));
       const before = readFileSync(settings, 'utf-8');
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
@@ -2515,6 +2517,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     try {
       const reviewSettings = (twinGate.lastOptions as { settingsManager: { getCacheWarmingMode(): string } }).settingsManager;
       expect(reviewSettings.getCacheWarmingMode()).toBe(SettingsManager.inMemory({}, { projectTrusted: false }).getCacheWarmingMode());
+      expect(reviewSettings.getCacheWarmingMode()).not.toBe(SettingsManager.create(fx.workspace, fx.agentDir).getCacheWarmingMode());
     } finally { await review.dispose(); }
   });
 

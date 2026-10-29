@@ -2092,7 +2092,7 @@ export class PiAgentHandle implements AgentHandle {
     // A real AgentSession is guarded in agent.prompt (see the constructor); any
     // other session still reports its acceptance through the pre-1.x hook.
     if (directive !== undefined && !(this.session instanceof AgentSession)) {
-      promptOptions['preflightResult'] = (accepted?: unknown) => { if (accepted !== false) this.assertDirectivePreflight(directive); };
+      promptOptions['preflightResult'] = (accepted?: unknown) => { if (accepted) this.assertDirectivePreflight(directive); };
     }
     let captured: PromptTurnVerdict = { ok: true, error: null };
     const turn = (continuation === undefined ? this.session.prompt(text, promptOptions) : continuation())
