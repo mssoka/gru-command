@@ -6337,7 +6337,8 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     expect(canonicalGitLabPublicationBody('report')).toBe('report');
     const minimalReview = { findings: [], specialistRuns: [], priorDispositions: [] };
     const emptyBody = publicationBodyFor('', minimalReview, 'gitlab', []);
-    const limitReport = 'x'.repeat(PUBLICATION_BODY_MAX_BYTES + 1 - Buffer.byteLength(emptyBody, 'utf8'));
+    const preCanonicalEmptyBodyBytes = Buffer.byteLength(emptyBody, 'utf8') + 1;
+    const limitReport = 'x'.repeat(PUBLICATION_BODY_MAX_BYTES + 1 - preCanonicalEmptyBodyBytes);
     const boundaryBody = publicationBodyFor(limitReport, minimalReview, 'gitlab', []);
     expect(Buffer.byteLength(boundaryBody, 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES);
     expect(boundaryBody.endsWith('\n')).toBe(false);
