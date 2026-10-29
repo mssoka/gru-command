@@ -79,7 +79,7 @@ const GITLAB_MR_READ_ERROR_MEANING: Readonly<Record<GitLabMrReadErrorKind, strin
   'not-found': 'GitLab answered 404',
   'rate-limit': 'GitLab answered 429',
   timeout: 'the request timed out',
-  other: 'no usable merge request (the request failed, was refused before any request, or the response was unusable); the event at sourceSeq says which',
+  other: 'no usable merge request: request failed, refused before any request, or unusable response; see the round\'s gitlab.mr-read-failed event',
 };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -580,7 +580,7 @@ function renderGitLabMrEvidence(
   const observed = event.kind === GITLAB_MR_OBSERVED_EVENT ? gitlabObservationFromPayload(payload) : null;
   if (observed === null) {
     return unavailableEvidence(
-      `the recorded GitLab event (${inline(event.kind)} seq ${event.seq}) is not a usable merge request observation`,
+      `the recorded GitLab event (${inline(event.kind)}) is not a usable merge request observation`,
       from,
     );
   }

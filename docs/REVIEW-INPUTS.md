@@ -166,7 +166,7 @@ round. The event's `host` and `project` come from the response's `web_url` and
   or has a `head_pipeline` without a numeric `id`, a `sha` or a `status`; or the
   read was refused before any request because the link does not name the lane's
   origin, or was cancelled with the round's setup).
-  `detail` is at most 300 characters. It stays in the event: the frozen reason is fixed text per kind, and for `other` (which joins several causes) it points at the event the record's `sourceSeq` names, and all of it fits the 200-character line of the published appendix.
+  `detail` is at most 300 characters. It stays in the event: the frozen reason is fixed text per kind, and for `other` (which joins several causes) it points at the round's `gitlab.mr-read-failed` ledger event; every reason fits the 200-character line of the published appendix whole.
 
 **Binding order.** Only the event this round's read recorded governs; earlier
 `gitlab.*` events are never used, and no `github.*` event is consulted. The first

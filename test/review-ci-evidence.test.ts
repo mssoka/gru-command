@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { EventRecord } from '../src/ledger/api.js';
+import { hostDisclosureAppendix } from '../src/dispatch/perkins.js';
 import {
+  GITLAB_MR_READ_ERROR_KINDS,
   appendCiEvidence,
   renderRecordedCiEvidence,
   CI_GREEN_EVENT,
@@ -501,7 +503,6 @@ describe('GitLab merge request CI evidence', () => {
         reason: expect.stringContaining(`error_kind: ${kind}`),
       });
       expect(reasonLine(block), kind).toContain(`error_kind: ${kind}`);
-      // `other` joins several causes, so its recorded detail rides in the reason; the rest say it themselves.
       // Fixed text per kind: the recorded detail is remote text and stays in the ledger event.
       expect(reasonLine(block), kind).not.toContain('whatever GitLab said');
       // Short enough that the 200-character appendix line keeps the whole reason.
@@ -509,6 +510,18 @@ describe('GitLab merge request CI evidence', () => {
       expect(block, kind).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
       expect(block, kind).toContain(`source: ${GL_FAILED} (the host's read of this round;`);
       expect(block, kind).not.toContain('GREEN');
+    }
+  });
+
+  it('A5: the closed set of error kinds is the seven the design names, and every reason reaches the published appendix whole', () => {
+    expect([...GITLAB_MR_READ_ERROR_KINDS]).toEqual(GL_ERROR_KINDS);
+    for (const kind of GITLAB_MR_READ_ERROR_KINDS) {
+      const { record } = bindGitLab(glFailed(kind));
+      const appendix = hostDisclosureAppendix({ findings: [], specialistRuns: [], priorDispositions: [] }, 'gitlab', ['blind', 'edge'], record);
+      const line = appendix.split('\n').find((candidate) => candidate.startsWith('- CI evidence at freeze: UNAVAILABLE'));
+      expect(line, kind).toBeDefined();
+      expect(line, kind).toContain(record.reason!);
+      expect(line, kind).not.toContain('[truncated]');
     }
   });
 
