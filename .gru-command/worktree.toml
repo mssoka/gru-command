@@ -1186,3 +1186,13 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
+
+# #519 GitLab merge-request CI evidence. `gc-519-focused` runs the new freeze-path
+# suite (heavy: real git lanes), the binding and reader suites, and the edited
+# registry pins; `gc-519-static` is the lint + typecheck + build gate;
+# `gc-519-red` runs the fail-before tests against a scratch extract of the base
+# commit (the heavy-test list is overlaid so the new heavy file is included) and
+# exits non-zero by design: the verbose reporter lists which cases failed there.
+gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts && npx vitest run test/review-ci-evidence.test.ts test/gitlab-mr-read.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-519-static = "npm run lint && npm run typecheck && npm run build"
+gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
