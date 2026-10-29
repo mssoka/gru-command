@@ -446,17 +446,17 @@ export function publicationBodyFor(
   startTotals?: AppendixStartTotals,
   reviewEvent: VerdictReviewEvent = 'COMMENT',
 ): string {
-  const assembledBody = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals, reviewEvent)}\n`;
-  // Enforce the early assembly bound on the provider-canonical bytes too:
+  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals, reviewEvent)}\n`;
+  // Enforce the early assembly bound on the provider-canonical bytes:
   // GitLab deletes CRs and the terminal LF, so a body just over the
-  // threshold can still fit after that known transformation. Canonicalizing
-  // before redaction also lets redaction see the bytes GitLab will store.
-  // Redaction and its possible expansion are checked again on the final
-  // body at delivery.
-  const body = provider === 'gitlab' ? canonicalGitLabPublicationBody(assembledBody) : assembledBody;
-  if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
+  // threshold can still fit after that known transformation. The body
+  // itself stays raw: redaction must see the authored bytes (a CR can be
+  // the boundary that exposes a token), and delivery canonicalizes after
+  // redaction, then checks the bound again on the final bytes.
+  const boundedBytes = Buffer.byteLength(provider === 'gitlab' ? canonicalGitLabPublicationBody(body) : body, 'utf8');
+  if (boundedBytes > PUBLICATION_BODY_MAX_BYTES) {
     throw new Error(
-      `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
+      `publication body (${boundedBytes} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
       'complete retained-finding evidence is preserved locally — refusing to publish a partial disclosure',
     );
   }
@@ -1514,10 +1514,11 @@ export class GitLabMrPoster implements VerdictPoster {
         }
         const exactBodyMatch = receiptDigest(note.body) === receiptDigest(input.body);
         // Historical attempts can predate the GitLab canonical publication
-        // bytes. A note differing by exactly the one provider-stripped final
-        // LF is a match for ambiguity purposes, never a receipt or absence.
-        const legacyTerminalLfMatch = input.body.endsWith('\n') && note.body === input.body.slice(0, -1);
-        if (!exactBodyMatch && !legacyTerminalLfMatch) continue;
+        // bytes. A note equal to the attempt body after GitLab's own
+        // normalization is a match for ambiguity purposes, never a receipt
+        // or absence.
+        const legacyCanonicalMatch = note.body === canonicalGitLabPublicationBody(input.body);
+        if (!exactBodyMatch && !legacyCanonicalMatch) continue;
         const noteAuthor = typeof note.author?.username === 'string' ? note.author.username.trim() : '';
         if (noteAuthor !== '' && noteAuthor.toLowerCase() === author.toLowerCase()) {
           authoredMatches.push(note);
@@ -6957,9 +6958,9 @@ export class WaveRunner {
         }
         const redactedBody = redactReviewForPublication(publicationBody);
         // The GitLab note API stores normalized bodies (CRs deleted, trailing
-        // whitespace stripped). Make the canonical bytes explicit before the
-        // durable artifact, digest, attempt, or irreversible POST; GitHub
-        // bytes remain unchanged.
+        // whitespace stripped). Make the canonical bytes explicit after
+        // redaction and before the durable artifact, digest, attempt, or
+        // irreversible POST; GitHub bytes remain unchanged.
         const finalBody = providerKind === 'gitlab'
           ? canonicalGitLabPublicationBody(redactedBody)
           : redactedBody;

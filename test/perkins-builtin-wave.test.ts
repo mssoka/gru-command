@@ -6341,13 +6341,21 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     expect(canonicalGitLabPublicationBody('  report')).toBe('  report');
     expect(canonicalGitLabPublicationBody('report')).toBe('report');
     const minimalReview = { findings: [], specialistRuns: [], priorDispositions: [] };
-    expect(publicationBodyFor('line one\r\nline two', minimalReview, 'gitlab', [])).not.toContain('\r');
+    // Assembly stays raw so redaction sees the authored bytes: the CR is the
+    // boundary that exposes this token, and deleting it first would join the
+    // token to the preceding word and publish it.
+    const crSeparatedToken = `ghp_${'A'.repeat(36)}`;
+    const crSeparated = publicationBodyFor(`Fetching\r${crSeparatedToken} done`, minimalReview, 'gitlab', []);
+    expect(crSeparated).toContain('\r');
+    expect(canonicalGitLabPublicationBody(redactReviewForPublication(crSeparated))).toContain('Fetching[REDACTED] done');
     const emptyBody = publicationBodyFor('', minimalReview, 'gitlab', []);
-    const preCanonicalEmptyBodyBytes = Buffer.byteLength(emptyBody, 'utf8') + 1;
-    const limitReport = 'x'.repeat(PUBLICATION_BODY_MAX_BYTES + 1 - preCanonicalEmptyBodyBytes);
+    const canonicalEmptyBodyBytes = Buffer.byteLength(canonicalGitLabPublicationBody(emptyBody), 'utf8');
+    const limitReport = 'x'.repeat(PUBLICATION_BODY_MAX_BYTES - canonicalEmptyBodyBytes);
     const boundaryBody = publicationBodyFor(limitReport, minimalReview, 'gitlab', []);
-    expect(Buffer.byteLength(boundaryBody, 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES);
-    expect(boundaryBody.endsWith('\n')).toBe(false);
+    // The raw bytes are one over the bound; the canonical bytes GitLab
+    // stores fit exactly, so the bound is measured on the canonical bytes.
+    expect(Buffer.byteLength(boundaryBody, 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES + 1);
+    expect(Buffer.byteLength(canonicalGitLabPublicationBody(boundaryBody), 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES);
     expect(boundaryBody).toContain(limitReport);
     // One byte more is one canonical byte over the bound: still refused.
     expect(() => publicationBodyFor(`${limitReport}x`, minimalReview, 'gitlab', []))
@@ -6405,7 +6413,13 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     });
     const wave = new WaveRunner({
       ledger, worktrees: port,
-      spawner: fakeWholeSpawner(sessions, { specialists: [], childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, {
+        specialists: [],
+        childAnswer: () => '[]',
+        // A line quoted from a CRLF file, with a token whose only boundary
+        // is a bare CR: GitLab deletes every CR from the stored note.
+        transformReport: (report) => `${report}\r\nQuoted from a CRLF file: Fetching\r${crSeparatedToken} done\r\n`,
+      }).spawner,
       reviewArtifactRoot: artifacts, poster: provider, prHeadProbe: localHeadProbe(branch),
     });
 
@@ -6424,6 +6438,9 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     const artifactBytes = readFileSync(postedPayload!.publicationFile, 'utf8');
     const sentBody = calls.find((call) => call.url.endsWith('/notes'))?.body;
     expect(artifactBytes).not.toMatch(/\n$/u);
+    expect(artifactBytes).not.toContain('\r');
+    expect(artifactBytes).toContain('Quoted from a CRLF file: Fetching[REDACTED] done');
+    expect(artifactBytes).not.toContain(crSeparatedToken);
     expect(sentBody).toBe(artifactBytes);
     expect(sentBody).toContain('## Execution and findings (host-recorded facts)');
     const digest = createHash('sha256').update(artifactBytes, 'utf8').digest('hex');
@@ -6494,12 +6511,18 @@ describe('GitLab SHA-bound merge-request delivery', () => {
           if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
           if (url.includes('/notes?')) return { ok: true, status: 200, text: async () => JSON.stringify([
             { id: 713, body: 'legacy artifact', author: { username: 'gru-bot' } },
+            { id: 714, body: 'legacy\nquoted CRLF artifact', author: { username: 'gru-bot' } },
           ]) };
           return { ok: true, status: 200, text: async () => JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) };
         },
       });
       await expect(poster.reconcile!({
         prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'legacy artifact\n',
+        targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
+      })).rejects.toThrow(/historical match is NOT delivery evidence/u);
+      // GitLab also deleted every CR of a legacy body: still a match, never absence.
+      await expect(poster.reconcile!({
+        prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'legacy\r\nquoted CRLF artifact\n',
         targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
       })).rejects.toThrow(/historical match is NOT delivery evidence/u);
       expect(calls.map((call) => call.url)).toContain('https://gitlab.example.test/api/v4/projects/acme%2Fwidget/merge_requests/7/notes?per_page=100&page=1');
