@@ -220,6 +220,18 @@ scheduler records every run it spawns for a lane (pid + argv, evidence
 `registry`) and reconciles it on exit. A service the orchestrator started
 for a lane is the lane's to tear down — not a stranger's.
 
+A row's `command` line is recorded with its credentials masked (#534),
+whoever writes it: `redactCredentials` runs inside the ledger write, so a
+pause, a reap and the verification scheduler's `registry` rows all record
+the masked line, and every process record that leaves GC — the release's
+paused result, the `worktree.paused` payload, the `onSweepPaused`
+processes and details — carries it. The raw `ps` line stays in memory for
+the checks that need it (tree matching, token naming, `ps -E`
+provenance). An acknowledged pid is compared against its recorded row
+masked, so the answer to a recorded pause is still honored; a row written
+before the masking that still holds a credential never matches, so its
+process is asked about again and the fresh row replaces it.
+
 Each row also carries the lane's **token** (`lane_token`, #486): random per
 lane incarnation, minted when the row is registered (lanes not yet swept
 when the column arrived got one then). Every session GC spawns in the lane
@@ -419,9 +431,10 @@ carries it, and so does everything that session starts
    RECORDED ask: it kills exactly the acknowledged pids (never a fresh
    enumeration — later arrivals were never acknowledged), and only while
    the fresh enumeration still finds each rooted in the tree running the
-   command it was recorded with (#486: an answer given late never reaches a
-   pid that now runs another command), with a SIGTERM grace before
-   SIGKILL. Survivors re-pause; newcomers get their own ask;
+   command it was recorded with (its credentials masked, #534; #486: an
+   answer given late never reaches a pid that now runs another command),
+   with a SIGTERM grace before SIGKILL. Survivors re-pause; newcomers get
+   their own ask;
    `confirm_kill` without a recorded pause is not honored. Silent kills
    do not exist for processes nothing ties to the lane. The owner's card
    ([§3a](#3a-lane-provenance-486)) names what runs and offers that answer
