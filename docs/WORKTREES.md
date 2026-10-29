@@ -755,7 +755,10 @@ names the bound used), and the ten-minute watch above applies unchanged. Before
 the confirmation, on any failure or abort, the first wait stays 1 000 ms, and
 the SIGTERM and SIGKILL waits that follow a missed close are 1 000 ms each in
 every case; `committedRefCloseMs` touches none of them, nor `creationCloseWindowMs`
-(the ten-minute pipe watch).
+(the ten-minute pipe watch). The same bounds apply to the ref-delete transaction
+of a rollback. The wait runs inside the repository lock of the call that owns
+the child, so a child that never closes holds the other lane operations on that
+repository for up to `committedRefCloseMs` plus the two 1 000 ms signal waits.
 
 A continuation waits at the ordinary disk floor (the owner may bin or park the
 job meanwhile), then takes the job admission, refuses a live directive or

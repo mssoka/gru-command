@@ -82,13 +82,20 @@ try {
   execFileSync(process.execPath, ['tools/patch-vitest-rpc-timeout.mjs'], { cwd: dir, stdio: 'ignore' });
   print(`mutation record at ${head}`);
 
+  // A mutant cannot be told apart from a broken scratch tree: with a bad
+  // baseline no mutation is run.
+  let baselineOk = true;
   for (const suite of [CUSTODY, GIT_ENV]) {
     const baseline = runSuite(dir, suite);
     print(`baseline ${suite.name}: ${baseline.passed} passed, ${baseline.failed.length} failed`);
-    if (baseline.crashed || baseline.failed.length > 0 || baseline.passed === 0) { exitCode = 1; print('  BASELINE FAILED', baseline.failed, baseline.stderr ?? ''); }
+    if (baseline.crashed || baseline.failed.length > 0 || baseline.passed === 0) {
+      baselineOk = false;
+      exitCode = 1;
+      print(`  BASELINE FAILED: ${baseline.failed.join('; ') || 'no failed test'}${baseline.stderr ? ` | stderr tail: ${baseline.stderr}` : ''}`);
+    }
   }
 
-  for (const mutation of MUTATIONS) {
+  for (const mutation of baselineOk ? MUTATIONS : []) {
     const originals = new Map();
     let applied = true;
     for (const edit of mutation.edits) {
@@ -120,7 +127,7 @@ try {
   }
 
   // Restored: the covering tests pass again.
-  for (const suite of [CUSTODY, GIT_ENV]) {
+  for (const suite of baselineOk ? [CUSTODY, GIT_ENV] : []) {
     const again = runSuite(dir, suite);
     const ok = !again.crashed && again.failed.length === 0 && again.passed > 0;
     print(`restored ${suite.name}: ${ok ? 'pass' : 'FAIL'}`);
