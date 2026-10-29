@@ -147,11 +147,11 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
   const pendingProducerBlockers = options.pendingProducerBlockers ?? (() => []);
 
   const makeService = (overrides: BootOptions = {}): OwnerApprovalService => {
-    const crashAt = overrides.crashAt ?? [];
+    const crashAt = overrides.crashAt ?? options.crashAt ?? [];
     const gate = overrides.workerGate ?? workerGate;
     return createOwnerApprovalService({
       ledger,
-      notifications: overrides.notifications ?? notifications,
+      notifications: overrides.notifications ?? options.notifications ?? notifications,
       bus,
       worktrees,
       ...(gate === undefined ? {} : { workerGate: gate }),
@@ -418,9 +418,10 @@ describe('owner approval of abandonment — the owner’s Approve carries the na
     expect(abandoned).toHaveLength(1);
     expect(abandoned[0]!.payload['claims']).toBe('none: no completion, no no-effect, no cessation');
     expect((abandoned[0]!.payload['retirement_refused'] as string[]).join('\n')).toContain('no live lane worktree');
-    for (const kind of ['silas.directive-retired', 'silas.directive-sent']) {
-      expect(countEvents(h, kind), kind).toBe(0);
-    }
+    // The fixture's own admission evidence stands; the approval replays nothing.
+    expect(countEvents(h, 'silas.directive-sent')).toBe(1);
+    expect(countEvents(h, 'silas.directive-retired')).toBe(0);
+    expect(countEvents(h, 'job.delivered')).toBe(0);
     expect(h.ledger.findNotificationByKind('silas.directive-unreconciled.req-bound', 'active')).toBeNull();
   });
 
@@ -743,7 +744,7 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     const repo = makeFixtureRepo('oa-crash-withdrawn');
     cleanupRepos.push(repo);
     const h = await boot({ crashAt: ['card-withdrawn'] });
-    await historicalLiveRequest(h, repo, 'job-c8', 'req-c8');
+    await seededLiveRequest(h, repo, 'job-c8', 'req-c8');
     const proposal = await propose(h, 'req-c8');
     const approval = createdApproval(proposal);
     const card = approvalCard(h, field<string>(approval, 'notification_id'));
@@ -816,7 +817,7 @@ describe('owner approval — proposal answers and readback', () => {
     const repo = makeFixtureRepo('oa-answers');
     cleanupRepos.push(repo);
     const h = await boot();
-    await historicalLiveRequest(h, repo, 'job-a1', 'req-a1');
+    await seededLiveRequest(h, repo, 'job-a1', 'req-a1');
     const created = await propose(h, 'req-a1');
     expect(created.status).toBe(201);
     expect(createdApproval(created)).toMatchObject({ kind: 'directive-abandon', request_id: 'req-a1', job_id: 'job-a1',
@@ -1083,6 +1084,7 @@ describe('owner approval — registration and wiring', () => {
       const read = await call(port, 'GET', `/api/owner-approvals/${field<string>(approval, 'id')}`);
       expect(read.status).toBe(200);
       expect(read.json).toEqual(approval);
+      h.service.current.start();
       await decide(h, field<string>(approval, 'notification_id'), 'approve', 'owner');
       expect(requestState(h, 'req-s1')).toBe('abandoned');
       expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('succeeded');
@@ -1114,10 +1116,16 @@ describe('owner approval — the text that sends Gru and the owner to the new ro
     await historicalLiveRequest(h, repo, 'job-x1', 'req-x1');
     surfaceDirectiveRecovery({ ledger: h.ledger, notifications: h.notifications }, 'req-x1', 'restart interrupted the writer');
     const debtCard = h.ledger.findNotificationByKind('silas.directive-unreconciled.req-x1', 'active')!;
-    h.ledger.setJobStatus('job-x1', 'in-review');
-    h.ledger.setJobStatus('job-x1', 'merged');
-    observeTerminalJobDirective({ ledger: h.ledger, notifications: h.notifications } as unknown as Parameters<typeof observeTerminalJobDirective>[0], 'req-x1');
-    const terminalCard = h.ledger.findNotificationByKind('silas.directive-unreconciled.req-x1', 'active')!;
+    // The terminal-job card is a different request's card: same kind, its own row.
+    await historicalLiveRequest(h, repo, 'job-x2', 'req-x2');
+    h.ledger.registerAgent({ id: 'minion-x2', role: 'minion', jobId: 'job-x2', sessionFile: join(h.dir, 'none-x2.jsonl') });
+    h.ledger.setAgentState('minion-x2', 'idle');
+    const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-x2', payload: { request_id: 'req-x2', minion_id: 'minion-x2' } });
+    h.ledger.recordDirectiveAdmission({ requestId: 'req-x2', minionId: 'minion-x2', eventSeq: sent.seq });
+    h.ledger.setJobStatus('job-x2', 'in-review');
+    h.ledger.setJobStatus('job-x2', 'merged');
+    observeTerminalJobDirective({ ledger: h.ledger, notifications: h.notifications } as unknown as Parameters<typeof observeTerminalJobDirective>[0], 'req-x2');
+    const terminalCard = h.ledger.findNotificationByKind('silas.directive-unreconciled.req-x2', 'active')!;
     expect(terminalCard.id).not.toBe(debtCard.id);
     const cases = [
       ['debt', debtCard.detail ?? '', 'It needs the owner: '],
