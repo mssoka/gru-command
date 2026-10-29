@@ -557,7 +557,7 @@ describe('GitLab merge request CI evidence', () => {
       expect(lines.filter((line) => line.startsWith('state: ')), label).toHaveLength(1);
       for (const text of [record.reason, record.repo, record.sha, ...record.checks.flatMap((check) => [check.name, check.url]),
         ...record.failures.flatMap((failure) => [failure.name, failure.conclusion, failure.url])]) {
-        expect(text === null || !/[\n\r\t\u0000]/u.test(text), label).toBe(true);
+        expect(text === null || [...text].every((character) => (character.codePointAt(0) ?? 0) >= 32), label).toBe(true);
       }
     }
   });
