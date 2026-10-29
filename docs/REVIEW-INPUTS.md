@@ -595,10 +595,11 @@ and a release adds the reason `coverage released by gru: <reason>`. A release is
 permanent: a released job that is later re-opened by a directive and delivers
 again is still released, and a later prohibited read still moves `state` to
 `invalidated` while `released` stays. With the release in place the reuse check
-no longer refuses on that sibling and lists it in `replaces`; a live, unreleased
-`qualifying` sibling still refuses, so there is never a duplicate live reviewer,
-and the replacement owns the coverage from its own admission on, however its
-handback is later dispositioned. A release record that cannot be read fails loud
+no longer refuses on that sibling and lists it in `replaces` (a `blocked`,
+`parked` or `binned` sibling is skipped before its coverage is read, released or
+not, and is never listed); a live, unreleased `qualifying` sibling still refuses,
+so such a reviewer is never duplicated, and the replacement owns the coverage from
+its own admission on, however its handback is later dispositioned. A release record that cannot be read fails loud
 by name (the job's readback errors, and a commission with it as a sibling is
 answered `409 blind_coverage_unreadable` whose correction names the
 `review.blind-coverage-released` event to repair) instead of reading as not

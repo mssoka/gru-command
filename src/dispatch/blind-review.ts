@@ -762,7 +762,7 @@ export function releaseBlindCoverage(
       `job "${jobId}" is ${job.status} — only a delivered or done blind report can have its coverage released`,
       skipped
         ? `A ${job.status} reviewer is already skipped by the reuse check: a corrected same-target commission is admitted without a release.`
-        : `A reviewer that is ${job.status} has not settled a report, so it keeps its coverage; release applies only to a report that was delivered or dismissed. Park or bin a failed reviewer that is still working: the reuse check then skips it.`,
+        : `Release applies only to a report that was delivered or dismissed (job delivered or done), and a reviewer that is ${job.status} is neither. It keeps its coverage; park or bin a failed reviewer that is still working, which the reuse check then skips.`,
       { job_status: job.status },
     );
   }

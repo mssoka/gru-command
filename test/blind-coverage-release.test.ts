@@ -186,8 +186,8 @@ function settleAgents(h: Harness, jobId: string): void {
 }
 
 /** A blind reviewer that delivered a clean report (status `delivered`). */
-async function deliveredReviewer(h: Harness, id: string): Promise<void> {
-  const created = await commission(h, id);
+async function deliveredReviewer(h: Harness, id: string, extra: Record<string, unknown> = {}): Promise<void> {
+  const created = await commission(h, id, extra);
   expect(created.status, JSON.stringify(created.json)).toBe(202);
   await waitFor(() => h.ledger.latestJobEvent(id, 'job.delivered') !== null);
   await waitFor(() => h.ledger.getJob(id)?.status === 'delivered');
@@ -250,6 +250,22 @@ describe('blind coverage release (issue #513)', () => {
     expect(afterDismissal.json).toMatchObject({ error: 'blind_coverage_owned', coverage_job_id: 'rev-1' });
     expect(h.ledger.getJob('rev-2')).toBeNull();
     expect(h.ledger.getJob('rev-3')).toBeNull();
+
+    // However the handback is dispositioned, the report keeps owning its coverage (each on its own target).
+    for (const [outcome, sha, body] of [
+      ['acted', 'd'.repeat(40), { outcome: 'acted', directive_job_id: 'parent', by: 'parent' }],
+      ['superseded', 'e'.repeat(40), { outcome: 'superseded', note: 'a newer head replaced it', by: 'parent' }],
+    ] as const) {
+      const id = `rev-${outcome}`;
+      const target = { target_sha: sha, input_package: validPackage({ target_sha: sha }) };
+      await deliveredReviewer(h, id, target);
+      const settled = await call(h.port, 'POST', `/api/jobs/${id}/disposition`, body);
+      expect(settled.status, `${outcome}: ${JSON.stringify(settled.json)}`).toBe(200);
+      const refused = await commission(h, `${id}-again`, target);
+      expect(refused.status, outcome).toBe(409);
+      expect(refused.json, outcome).toMatchObject({ error: 'blind_coverage_owned', coverage_job_id: id });
+      expect(h.ledger.getJob(`${id}-again`), outcome).toBeNull();
+    }
   });
 
   it('A3: a live sibling cannot be released and still owns the coverage', async () => {
@@ -305,7 +321,7 @@ describe('blind coverage release (issue #513)', () => {
       expect(refused.json, status).toMatchObject({ error: 'blind_coverage_live', job_status: status });
       // A blocked, parked or binned reviewer is already skipped by the reuse check: the answer says so.
       const correction = String(refused.json['correction']);
-      if (status === 'in-review') expect(correction, status).toMatch(/has not settled a report/u);
+      if (status === 'in-review') expect(correction, status).toMatch(/is neither/u);
       else expect(correction, status).toMatch(/already skipped by the reuse check/u);
       expect(h.rows('rev-1'), status).toEqual(before);
     }
@@ -409,9 +425,24 @@ describe('blind coverage release (issue #513)', () => {
     const unreleased = (await call(h.port, 'GET', coveragePath('rev-1'))).json;
     expect(unreleased).toMatchObject({ state: 'qualifying', qualifying: true, released: null, reasons: [] });
 
-    expect((await release(h, 'rev-1')).status).toBe(200);
+    const answered = await release(h, 'rev-1');
+    expect(answered.status).toBe(200);
     const event = h.ledger.latestJobEvent('rev-1', RELEASE_KIND)!;
+    // The release answer itself reads back the event it appended and the coverage as it now stands.
+    expect(answered.json).toMatchObject({
+      job_id: 'rev-1',
+      idempotent: false,
+      event: { seq: event.seq, ts: event.ts, kind: RELEASE_KIND, payload: { reason: REASON, by: 'gru', target_sha: TARGET } },
+      coverage: {
+        jobId: 'rev-1',
+        state: 'qualifying',
+        qualifying: false,
+        released: { by: 'gru', reason: REASON, at: event.ts, event_seq: event.seq },
+        reasons: [`coverage released by gru: ${REASON}`],
+      },
+    });
     const released = (await call(h.port, 'GET', coveragePath('rev-1'))).json;
+    expect(answered.json['coverage']).toEqual(released);
     expect(released).toMatchObject({
       jobId: 'rev-1',
       state: 'qualifying',
@@ -453,6 +484,8 @@ describe('blind coverage release (issue #513)', () => {
     expect(again.status).toBe(200);
     expect(again.json).toMatchObject({ idempotent: true });
     expect(again.json['event']).toEqual(first.json['event']);
+    expect(again.json['coverage']).toEqual(first.json['coverage']);
+    expect(again.json['coverage']).toMatchObject({ state: 'qualifying', qualifying: false, released: { reason: REASON } });
     expect(h.rows('rev-1').filter((row) => (JSON.parse(row) as { kind: string }).kind === RELEASE_KIND)).toHaveLength(1);
 
     const different = await release(h, 'rev-1', { reason: 'something else entirely', by: 'gru' });
@@ -505,6 +538,25 @@ describe('blind coverage release (issue #513)', () => {
     expect(h.ledger.latestJobEvent('rev-3', 'review.blind-input-admitted')?.payload).toMatchObject({ replaces: ['rev-1'] });
   });
 
+  it('a blocked, parked or binned reviewer is skipped by the reuse check, released or not, and is not named in replaces', async () => {
+    const h = await boot();
+    await dispatchParent(h);
+    const cases = [['blocked', false], ['parked', false], ['binned', false], ['parked', true]] as const;
+    for (const [index, [status, released]] of cases.entries()) {
+      const sha = String(index + 1).repeat(40);
+      const target = { target_sha: sha, input_package: validPackage({ target_sha: sha }) };
+      const id = `rev-${status}-${released ? 'released' : 'plain'}`;
+      await deliveredReviewer(h, id, target);
+      if (released) expect((await release(h, id)).status).toBe(200);
+      else expect((await commission(h, `${id}-early`, target)).status, id).toBe(409);
+      h.ledger.setJobStatus(id, status);
+      // No release is needed once the lane is blocked, parked or binned; the replacement is admitted without naming it.
+      const replacement = await commission(h, `${id}-2`, target);
+      expect(replacement.status, `${id}: ${JSON.stringify(replacement.json)}`).toBe(202);
+      expect(h.ledger.latestJobEvent(`${id}-2`, 'review.blind-input-admitted')?.payload, id).toMatchObject({ replaces: [] });
+    }
+  });
+
   it('a release frees only the released report: its replacement owns the coverage', async () => {
     const h = await boot();
     await dispatchParent(h);
@@ -525,8 +577,11 @@ describe('blind coverage release (issue #513)', () => {
     const h = await boot();
     await dispatchParent(h);
     await deliveredReviewer(h, 'rev-1');
-    h.ledger.appendCustomEvent({ kind: BLIND_RELEASED_EVENT, jobId: 'rev-1', payload: { reason: '', by: 'owner' } });
-    expect(() => blindCoverageOf(h.ledger, 'rev-1')).toThrow(/review\.blind-coverage-released record \(event \d+\) is malformed/u);
+    // Each record breaks exactly one clause of a well-formed release (a reason, and "gru" as the actor).
+    for (const payload of [{ reason: 'x', by: 'owner' }, { reason: '  ', by: 'gru' }, { reason: 7, by: 'gru' }, { by: 'gru' }, null, 'text']) {
+      h.ledger.appendCustomEvent({ kind: BLIND_RELEASED_EVENT, jobId: 'rev-1', payload });
+      expect(() => blindCoverageOf(h.ledger, 'rev-1'), JSON.stringify(payload)).toThrow(/review\.blind-coverage-released record \(event \d+\) is malformed/u);
+    }
     const replacement = await commission(h, 'rev-2');
     expect(replacement.status).toBe(409);
     expect(replacement.json).toMatchObject({ error: 'blind_coverage_unreadable', coverage_job_id: 'rev-1' });
