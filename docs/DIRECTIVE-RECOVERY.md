@@ -192,10 +192,12 @@ incident per request and recovery-debt generation, not one per pass:
   that names another generation, which now names the current one; a new card
   is posted when none is active and the newest has another identity or no
   identity line.
-- **Generations.** A visited request's generation changes with its debt's
-  lifecycle (a settled or superseded debt starts a new one). A retired
-  predecessor's reopened debt (`reopenStrandedRecoveryDebts`) resolves its
-  own card, and `surfaceDirectiveRecovery` never visits a retired request.
+- **Generations.** A request's debt keeps its generation while the request
+  stays live: a debt that was only settled or cancelled is returned as is, and
+  a new generation starts only when the debt is superseded or is observed
+  again after a changed owner transfer. A retired predecessor's reopened debt
+  (`reopenStrandedRecoveryDebts`) resolves its own card, and
+  `surfaceDirectiveRecovery` never visits a retired request.
 - **Mailbox basis.** For a `silas.directive-unreconciled.*` row whose detail
   starts with the identity line of the request its kind names, the item
   basis hashes the row's identity, kind, identity line and severity instead of
@@ -220,8 +222,9 @@ incident per request and recovery-debt generation, not one per pass:
   closeout (#523)* below). Both card writers can act on the same legacy
   request: the boot card posted over an open card replaces its detail, so the
   card loses its identity line (and its mailbox basis falls back to the
-  detail) until the next pass writes the line again, and a boot card posted
-  after Gru resolved the pass's card is a new card, as before.
+  detail) until the next pass writes the line again, so a card Gru resolves
+  in that gap leaves the next pass one more card to post; and a boot card
+  posted after Gru resolved the pass's card is a new card, as before.
 - **Upgrade effects.** An existing card without the line counts as another
   identity, so one more card may be posted once per request after the upgrade
   (when the old one was resolved). The signal is part of a mailbox item's
