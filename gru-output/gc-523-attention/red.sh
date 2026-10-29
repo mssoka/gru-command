@@ -12,10 +12,11 @@ root=$PWD
 base=ccd6337fb629f3fc69bea725d06873733b363182
 
 d=$(mktemp -d "${TMPDIR:-/tmp}/gru-523-attention-red.XXXXXX") || exit 2
-d=$(cd "$d" && pwd -P) || exit 2
 cleanup() { cd "$root" && rm -rf -- "$d"; }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP
+abs=$(cd "$d" && pwd -P) || exit 2
+d=$abs
 
 {
   git archive "$base" | tar -x -C "$d" &&
@@ -30,7 +31,10 @@ trap 'exit 143' TERM INT HUP
 
 printf 'gc-523-attention RED base=%s candidate=%s snapshot=%s\n' "$base" "$(git rev-parse HEAD)" "$d"
 cd "$d" || exit 2
-node tools/patch-vitest-rpc-timeout.mjs || exit 2
+node tools/patch-vitest-rpc-timeout.mjs || {
+  echo "gc-523-attention RED setup failed (vitest patch): this is not the expected red" >&2
+  exit 2
+}
 npx vitest run test/directive-recovery-attention.test.ts -t 'A[1-6]\. ' --reporter=verbose
 code=$?
 exit "$code"
