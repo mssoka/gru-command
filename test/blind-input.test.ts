@@ -522,11 +522,24 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
       expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited('docs/issues/x.md'));
       expect(JSON.stringify(hits), text).not.toContain(text);
     }
-    // A context line has no colon-closed number: its path region ends where the
-    // text starts, so a later head that holds whitespace is not a candidate.
-    const hits = scan(context('docs/issues/x.md', 7, 'Prior review: finding 2 closed 2026-10-29-x'));
-    expect(hits.map((hit) => `${hit.code}:${hit.path}`)).toEqual(prohibited('docs/issues/x.md'));
-    expect(JSON.stringify(hits)).not.toContain('finding 2 closed');
+    // A context line has no colon-closed number: a later head is a path only when
+    // it has reached a file name, so the text that follows `-7-` is never one —
+    // with a space (`Prior review: …`) or without one (`DATE=2026-10-29`).
+    for (const text of ['Prior review: finding 2 closed 2026-10-29-x', 'DATE=2026-10-29', '2026-10-29-notes-x']) {
+      const hits = scan(context('docs/issues/x.md', 7, text));
+      expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited('docs/issues/x.md'));
+      expect(JSON.stringify(hits), text).not.toContain(text);
+    }
+  });
+
+  it('reads a spaced path whose name carries a date-like segment, match and context, under a prefix and a non-prefix rule', () => {
+    const spaced = 'vendor/spec 2026-10-29 review.md';
+    const prefixRule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude vendor/**', amendments: [] });
+    const mdRule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude **/*.md', amendments: [] });
+    for (const rule of [prefixRule, mdRule]) {
+      expect(recorded(match(named('HEAD', spaced), 7, 'x'), rule), 'match').toEqual(prohibited(spaced));
+      expect(recorded(context(named('HEAD', spaced), 7, 'x'), rule), 'context').toEqual(prohibited(spaced));
+    }
   });
 
   it('records no revision under a non-prefix exclusion rule, and no text behind the line number', () => {

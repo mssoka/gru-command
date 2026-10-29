@@ -937,6 +937,14 @@ const GREP_NUMBER_DELIMITER = /[:-]\d+(?=[:-])/gu;
 /** A line is only searched this far: its first this-many delimiters. */
 const MAX_GREP_DELIMITERS = 64;
 
+/** A head has reached a repository file name when its last component ends in
+ * a dotted extension (`…/deferred-work.md`, `<rev>:…/a.md`). A head that only
+ * reaches a date-like part of a name (`…/2026`, `…/2026-10`) has not: the
+ * rest of the name may still follow. */
+function endsAtFileName(head: string): boolean {
+  return /\.[A-Za-z][A-Za-z0-9]{0,15}$/u.test(head.trimEnd());
+}
+
 /**
  * What a `git grep -n` line may name beyond the `path:LINE:` form (#520).
  * Against a revision it prints `<rev>:<path>:7:text` (`<rev>:<path>-7-text`
@@ -945,28 +953,30 @@ const MAX_GREP_DELIMITERS = 64;
  * delimiter may be a revision and a path, whatever the revision is spelled —
  * it is never validated as a ref.
  *
- * A head is only a candidate while it is still the path region, because the
- * matched line's TEXT carries delimiters of its own (`...:7:Updated on
- * 2026-10-29`) and `ProhibitedAccess.excerptSha256` is digest only: the
- * private text never rides the ledger, and a recorded `path` is a repository
- * path (the review of #528 found the text reaching both). Three rules keep a
- * head to the path region:
+ * The matched line's TEXT carries delimiters of its own (`...:7:Updated on
+ * 2026-10-29`, `...-7-DATE=2026-10-29`), and `ProhibitedAccess.excerptSha256`
+ * is digest only: the private text never rides the ledger, and a recorded
+ * `path` is a repository path (the review of #528 found the text reaching
+ * both). So a head is a candidate only while it is the path region:
  *
- * - a match line's line number closes with `:` (`<rev>:<path>:7:`), so the
- *   first colon-closed number is the last delimiter a line offers — every
- *   later head has crossed the line number into the text;
- * - a head holding whitespace after the first delimiter has left the path
- *   (a real path is space-free; only the first delimiter may have one, for a
- *   spaced path: `HEAD:docs/issues/prior review.md:1:`);
- * - a head holding a `:` names `<segment>:<…>` — a revision, or a
- *   `<dir>:<file>` — never a repository path itself: its revision-stripped
- *   form is, and its remaining `:` read as `/` is (`<dir>:<file>`); a
- *   `<rev>:` (the tree root) leaves a leading `:` that is dropped too.
+ * - the first delimiter's head is always one — it is the path itself, or its
+ *   first segment when the path has a date-like segment (`.../2026-10-29-
+ *   notes.md-7-`), and a spaced path carries its space there (#357);
+ * - a later head is one only when it has reached a file name (see
+ *   endsAtFileName): `.../2026-10-29-notes.md` and a spaced
+ *   `HEAD:vendor/spec 2026-10-29 review.md` do, a date segment inside the
+ *   text (`...-7-DATE=2026`) or the name (`.../2026-10`) does not;
+ * - a match line's line number closes with `:` (`<rev>:<path>:7:`), so it is
+ *   the last delimiter the line offers — nothing beyond it is a path.
  *
- * A colon-free head is the path itself (a worktree context line). Only the
- * first MAX_GREP_DELIMITERS delimiters of a line count, and a head longer
- * than MAX_PATH_CHARS is never a path. Judge these by the isolation globs
- * only: they are guesses at a path, never an absolute one.
+ * A head holding a `:` names `<segment>:<…>` — a revision, or a
+ * `<dir>:<file>` — never a repository path itself: its revision-stripped form
+ * is, and its remaining `:` read as `/` is (`<dir>:<file>`); a `<rev>:` (the
+ * tree root) leaves a leading `:` that is dropped too. A colon-free head is a
+ * path itself (a worktree line). Only the first MAX_GREP_DELIMITERS delimiters
+ * of a line count, and a head longer than MAX_PATH_CHARS is never a path.
+ * Judge these by the isolation globs only: they are guesses at a path, never
+ * an absolute one.
  */
 function revisionGrepCandidates(line: string): readonly string[] {
   const out: string[] = [];
@@ -974,25 +984,24 @@ function revisionGrepCandidates(line: string): readonly string[] {
   let match = delimiter.exec(line);
   for (let seen = 0; match !== null && seen < MAX_GREP_DELIMITERS && match.index <= MAX_PATH_CHARS; seen += 1) {
     const head = line.slice(0, match.index);
-    // The line number closes with `:`; the text after it can hold a date or a
-    // clock time (`...:7:Updated on 2026-10-29`), so nothing beyond it is a path.
+    // The line number of a match line closes with `:`; the text after it can
+    // hold a date or a clock time, so nothing beyond it is a path.
     const lineNumber = line[match.index + match[0].length] === ':';
-    // Past the first delimiter, whitespace means the head has run into the
-    // matched text (`...:7:Updated on 2026`): later heads only grow.
-    if (seen > 0 && /\s/u.test(head)) break;
-    const colon = head.indexOf(':');
-    if (colon >= 0) {
-      const stripped = head.slice(colon + 1);
-      const joined = stripped.replace(/:/gu, '/');
-      if (joined !== '') out.push(joined);
-      if (stripped !== joined) {
-        out.push(stripped);
-        // `<rev>:` (the tree root, `git grep -n needle HEAD:`) prints
-        // `<rev>::<path>`, so the revision strip leaves a leading `:`.
-        if (stripped.startsWith(':')) out.push(stripped.slice(1));
+    if (seen === 0 || endsAtFileName(head)) {
+      const colon = head.indexOf(':');
+      if (colon >= 0) {
+        const stripped = head.slice(colon + 1);
+        const joined = stripped.replace(/:/gu, '/');
+        if (joined !== '') out.push(joined);
+        if (stripped !== joined) {
+          out.push(stripped);
+          // `<rev>:` (the tree root, `git grep -n needle HEAD:`) prints
+          // `<rev>::<path>`, so the revision strip leaves a leading `:`.
+          if (stripped.startsWith(':')) out.push(stripped.slice(1));
+        }
+      } else if (head !== '') {
+        out.push(head);
       }
-    } else if (head !== '') {
-      out.push(head);
     }
     if (lineNumber) break;
     match = delimiter.exec(line);
