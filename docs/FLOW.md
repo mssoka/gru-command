@@ -393,10 +393,11 @@ than gating, since a pinned base is expected to trail a moving main), and
 the GitLab probe and poster resolve their token
 identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitLab runs every
 note body through its quick-action extractor and executes a line such as
-`/merge`, `/approve`, `/close` or `/label …` as the posting account, so the
-report part of a GitLab publication (written by the review lead after it reads
-code the MR author controls) is made canonical before anything is hashed,
-recorded or sent: after redaction, every CR is deleted, one `\` is inserted
+`/merge`, `/approve`, `/close` or `/label …` as the posting account. The
+report part of a publication is written by the review lead after it reads
+code the MR author controls, so the whole GitLab publication body (the report
+and the host appendix) is made canonical before anything is hashed, recorded
+or sent: after redaction, every CR is deleted, one `\` is inserted
 before the `/` of every line whose first non-whitespace character is `/`
 (everywhere in the body — code, quote and HTML blocks included; GitLab's
 extractor and command table are deliberately not modeled, and inside a code

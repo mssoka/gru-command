@@ -6746,6 +6746,12 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       ['CRLF line ends', '\r\n/merge\r\n/close\r\n', '\n\\/merge\n\\/close'],
       ['trailing whitespace after a final quick action', '/merge  \n\n', '\\/merge'],
       ['a mixed whitespace lead', '\t /merge', '\t \\/merge'],
+      // Whitespace is JavaScript `\s`, a superset of ASCII: a Unicode-space
+      // lead is escaped too, never left as a possible command.
+      ['a no-break-space lead', '\u00a0/merge', '\u00a0\\/merge'],
+      // GitLab's extractor deletes only CRs and needs the slash at the very
+      // start of the line, so a NUL before it is not a command position.
+      ['a NUL before the slash', 'text\n\0/merge', 'text\n\0/merge'],
       // The rule is model-free: a path-like line is escaped like a command.
       ['a path-like slash line', 'See\r\n/path/to/x\r\n', 'See\n\\/path/to/x'],
       ['a CR that joins a slash onto a line', 'a\r/merge', 'a/merge'],
