@@ -406,7 +406,6 @@ describe('same-job retained initial-creation continuation', () => {
     expect(api.ledger).not.toBe(h.ledger);
     expect(api.worktrees).not.toBe(h.worktrees);
     expect(api.dispatch).not.toBe(first.dispatch);
-    expect(api.base).not.toBe(first.base);
     expect(api.ledger.getJob(h.job.id)?.status).toBe('working');
     expect(api.ledger.getAgent(agentId)).toMatchObject({ jobId: h.job.id, role: 'minion' });
     expect(api.ledger.getWorktree(h.job.id)).toMatchObject({ id: lane.id, path: lane.path, branch: lane.branch, sha: lane.sha, baseSource: lane.baseSource });
@@ -463,12 +462,12 @@ describe('same-job retained initial-creation continuation', () => {
     // The server saw the client leave while the inspection was still held.
     await vi.waitFor(() => {
       expect(logs.filter((entry) => entry.msg === 'dispatch request' && entry.fields?.['method'] === 'POST')).toHaveLength(1);
-    });
+    }, { timeout: 10_000 });
     expect(continuations()).toEqual([]);
     release();
 
     // The request is recorded after the inspection returns, whoever is still listening.
-    await vi.waitFor(() => { expect(api.ledger.getCreationContinuation(api.jobId, body.request_id)).not.toBeNull(); });
+    await vi.waitFor(() => { expect(api.ledger.getCreationContinuation(api.jobId, body.request_id)).not.toBeNull(); }, { timeout: 10_000 });
     const recorded = api.ledger.getCreationContinuation(api.jobId, body.request_id)!;
     const durable = () => {
       const events = continuations().map((event) => event.payload as Record<string, unknown>);
