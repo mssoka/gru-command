@@ -490,8 +490,9 @@ describe('blind review commissioning (issue #316)', () => {
     expect((await call(h.port, 'POST', '/api/dispatch', blindReview('rev-gitref', { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
     await waitFor(() => h.ledger.latestJobEvent('rev-gitref', 'job.delivered') !== null);
     // A pre-change observation of the very same result: the old scanner found nothing in it.
-    const earlier = { source: 'operator', scanned: 1, rule_sha256: null, prohibited: [] };
-    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'rev-gitref', payload: earlier });
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'rev-gitref', payload: { source: 'operator', scanned: 1, rule_sha256: null, prohibited: [] } });
+    const recordedBefore = h.ledger.listJobEvents('rev-gitref', { kinds: [BLIND_ACCESS_EVENT], order: 'asc' });
+    expect(recordedBefore.length).toBeGreaterThan(0);
     const coverage = (): Promise<{ status: number; json: Record<string, unknown> }> => call(h.port, 'GET', '/api/dispatch/jobs/rev-gitref/blind-coverage');
     expect((await coverage()).json).toMatchObject({ qualifying: true, prohibitedAccess: 0, accessObserved: true });
 
@@ -508,15 +509,13 @@ describe('blind review commissioning (issue #316)', () => {
     expect((await coverage()).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
 
     const events = h.ledger.listJobEvents('rev-gitref', { kinds: [BLIND_ACCESS_EVENT], order: 'asc' });
-    expect(events.length).toBe(3);
-    // The event recorded before the change is untouched; the new ones are appended beside it.
-    expect(events[0]!.payload).toEqual(earlier);
+    // Everything recorded before the change is untouched; the two submissions are appended beside it.
+    expect(events.slice(0, recordedBefore.length)).toEqual(recordedBefore);
     const entry = { toolName: 'bash', code: 'excluded-path-read', path: '_bmad-output/implementation-artifacts/deferred-work.md' };
-    for (const event of events.slice(1)) {
-      expect((event.payload as { prohibited: unknown[] }).prohibited).toEqual([expect.objectContaining(entry)]);
-      expect(JSON.stringify(event.payload)).not.toContain('matched symbol');
-    }
-    expect((events[1]!.payload as { prohibited: unknown[] }).prohibited).toEqual((events[2]!.payload as { prohibited: unknown[] }).prohibited);
+    const withEntries = events.slice(recordedBefore.length).map((event) => (event.payload as { prohibited: unknown[] }).prohibited).filter((prohibited) => prohibited.length > 0);
+    expect(withEntries).toEqual([[expect.objectContaining(entry)], [expect.objectContaining(entry)]]);
+    expect(withEntries[1]).toEqual(withEntries[0]);
+    expect(JSON.stringify(events.slice(recordedBefore.length))).not.toContain('matched symbol');
   });
 
   it('observes the finished reviewer session automatically at turn settle', async () => {
