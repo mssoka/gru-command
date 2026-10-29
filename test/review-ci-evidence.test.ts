@@ -497,7 +497,7 @@ describe('GitLab merge request CI evidence', () => {
       glObserved({ mr_iid: '7' }),
       glObserved({}, { id: 'forty-two' }),
       event('gitlab.something-else', 41, {}),
-      event(GL_OBSERVED, 42, null),
+      { ...event(GL_OBSERVED, 42, {}), payload: null },
     ]) {
       const { record, block } = bindGitLab(unusable);
       expect(record.state, JSON.stringify(unusable.payload)).toBe('unavailable');
