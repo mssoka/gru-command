@@ -437,7 +437,12 @@ export function publicationBodyFor(
   startTotals?: AppendixStartTotals,
   reviewEvent: VerdictReviewEvent = 'COMMENT',
 ): string {
-  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals, reviewEvent)}\n`;
+  const assembledBody = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals, reviewEvent)}\n`;
+  // Enforce the early assembly bound on the provider-canonical bytes too:
+  // GitLab removes one terminal LF, so a body exactly one byte over the
+  // threshold can still fit after that known transformation. Redaction and
+  // its possible expansion are checked again on the final body at delivery.
+  const body = provider === 'gitlab' ? canonicalGitLabPublicationBody(assembledBody) : assembledBody;
   if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
     throw new Error(
       `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
