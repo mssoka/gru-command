@@ -6349,12 +6349,16 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       const gitLabUrl = 'https://gitlab.example.test/acme/widget/-/merge_requests/7';
       ledger.setJobPr(job.id, gitLabUrl);
       attachOrigin(repo, branch, root);
-      for (const repositoryPath of [repo.path, lane.path]) {
-        execFileSync('git', ['-C', repositoryPath, 'remote', 'set-url', 'origin', 'https://gitlab.example.test/acme/widget.git']);
-      }
+      // GitLab identity is represented at the poster's repoRemote seam, while
+      // source freezing keeps the isolated local bare origin and performs no
+      // provider/network access.
+      const gitWrapper = join(root, 'git-identity-wrapper.sh');
+      writeFileSync(gitWrapper, `#!/bin/sh\nif [ "$3" = "remote" ] && [ "$4" = "get-url" ] && [ "$5" = "origin" ]; then\n  printf '%s\\n' 'https://gitlab.example.test/acme/widget.git'\n  exit 0\nfi\nexec git "$@"\n`, 'utf8');
+      chmodSync(gitWrapper, 0o755);
       const calls: Array<{ readonly url: string; readonly body?: string }> = [];
       const provider = new GitLabMrPoster({
         token: 'glpat-isolated-test-token',
+        gitBinary: gitWrapper,
         fetchImpl: async (url, init) => {
           const sentBody = init?.body === undefined ? undefined : JSON.parse(init.body) as { body?: string };
           calls.push({ url, ...(sentBody?.body !== undefined ? { body: sentBody.body } : {}) });
