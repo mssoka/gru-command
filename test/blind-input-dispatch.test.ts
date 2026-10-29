@@ -484,6 +484,41 @@ describe('blind review commissioning (issue #316)', () => {
     });
   });
 
+  it('A6: a revision-prefixed grep hit from an excluded path invalidates coverage, and resubmitting the same result stays one prohibited read (#520)', async () => {
+    const h = await boot();
+    await dispatchParent(h);
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview('rev-gitref', { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-gitref', 'job.delivered') !== null);
+    // A pre-change observation of the very same result: the old scanner found nothing in it.
+    const earlier = { source: 'operator', scanned: 1, rule_sha256: null, prohibited: [] };
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'rev-gitref', payload: earlier });
+    const coverage = (): Promise<{ status: number; json: Record<string, unknown> }> => call(h.port, 'GET', '/api/dispatch/jobs/rev-gitref/blind-coverage');
+    expect((await coverage()).json).toMatchObject({ qualifying: true, prohibitedAccess: 0, accessObserved: true });
+
+    const text = `${'a'.repeat(40)}:_bmad-output/implementation-artifacts/deferred-work.md:7: matched symbol`;
+    const submit = (): Promise<{ status: number; json: Record<string, unknown> }> =>
+      call(h.port, 'POST', '/api/dispatch/blind-access', { job_id: 'rev-gitref', tool_results: [{ tool_name: 'bash', text }] });
+    const first = await submit();
+    expect(first.status).toBe(200);
+    expect(first.json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+    expect((await coverage()).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+
+    // The identical text again is the same read: one prohibited access, not two.
+    expect((await submit()).status).toBe(200);
+    expect((await coverage()).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+
+    const events = h.ledger.listJobEvents('rev-gitref', { kinds: [BLIND_ACCESS_EVENT], order: 'asc' });
+    expect(events.length).toBe(3);
+    // The event recorded before the change is untouched; the new ones are appended beside it.
+    expect(events[0]!.payload).toEqual(earlier);
+    const entry = { toolName: 'bash', code: 'excluded-path-read', path: '_bmad-output/implementation-artifacts/deferred-work.md' };
+    for (const event of events.slice(1)) {
+      expect((event.payload as { prohibited: unknown[] }).prohibited).toEqual([expect.objectContaining(entry)]);
+      expect(JSON.stringify(event.payload)).not.toContain('matched symbol');
+    }
+    expect((events[1]!.payload as { prohibited: unknown[] }).prohibited).toEqual((events[2]!.payload as { prohibited: unknown[] }).prohibited);
+  });
+
   it('observes the finished reviewer session automatically at turn settle', async () => {
     const h = await boot({
       sessionToolResults: () => [

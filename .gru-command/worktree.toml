@@ -1186,3 +1186,12 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # against the installed pi 1.4 tree, the packed tarball fingerprint and the
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
+
+# #520 blind access: `git grep` revision and context-line forms. `-focused` runs
+# the edited unit and dispatch suites, the unchanged blind-review suite and the
+# registry pins; `-static` is the lint + typecheck + build gate; `-red` runs the
+# edited suites against a scratch extract of the base commit (it exits nonzero by
+# design: the fail-before tests are the only failures).
+gc-520-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/blind-input.test.ts test/blind-input-dispatch.test.ts test/blind-review.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-520-static = "npm run lint && npm run typecheck && npm run build"
+gc-520-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts test/blind-input-dispatch.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/blind-input.test.ts test/blind-input-dispatch.test.ts'
