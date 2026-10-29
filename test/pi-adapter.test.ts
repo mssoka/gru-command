@@ -5310,7 +5310,10 @@ it('restart recovery refuses to continue a checkpoint whose persisted prompt car
     const proof = inspectDirectiveCheckpoint(file, identity);
     if (proof.state !== 'resumable') throw new Error('checkpoint fixture is not resumable');
     const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
-    await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => {})).rejects.toThrow('native directive transcript prompt differs from the prompt its authority manifest bound');
+    let claims = 0;
+    await expect(resumed.resumeDirective!(identity, proof.checkpointId, () => { claims += 1; })).rejects.toThrow('native directive transcript prompt differs from the prompt its authority manifest bound');
+    // Refused before the continuation is claimed, so the checkpoint stays resumable.
+    expect(claims).toBe(0);
     expect(f.script.calls).toHaveLength(0);
   } finally { await f.runtime.dispose(); f.store.dispose(); }
 });
