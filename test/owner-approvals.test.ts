@@ -353,7 +353,7 @@ async function jobLane(h: Harness, jobId: string): Promise<WorktreeLane> {
   return lane;
 }
 
-describe('owner approval of abandonment — the owner’s Approve carries the native abandonment out', () => {
+describe('owner approval of abandonment', () => {
   it('abandons an unknown-custody request as outcome-unknown and closes the card with what happened', async () => {
     const repo = makeFixtureRepo('oa-unknown-custody');
     cleanupRepos.push(repo);
