@@ -378,10 +378,10 @@ lens method; it never sees the consult conversation or your reasoning.
   that fixes that round's blocking findings; its `approval.reference` names
   owner ruling journal j-1200. Never post an owner escalation for a round
   cap; this is the product's rule on every install, not a per-install choice.
-- **Writing briefings.** Read the code the change touches before drafting.
-  State the outcome, constraints, acceptance and verification, and leave
-  implementation detail to the worker's workflow and its own review. Choose
-  the tier by risk: `low` for read-only or test-only work, `medium` by
+- **Writing briefings.** First, read the code the change touches before
+  drafting. State the outcome, constraints, acceptance and verification, and
+  leave implementation detail to the worker's workflow and its own review.
+  Choose the tier by risk: `low` for read-only or test-only work, `medium` by
   default, `high` only for owner-reserved authority, credentials and
   security, or irreversible provider writes. Revise only for blocking
   findings; advisory findings never start a new round.

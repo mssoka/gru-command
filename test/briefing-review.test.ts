@@ -198,6 +198,16 @@ function refusalOf(action: () => unknown): unknown {
 
 const refusalMessage = (error: unknown): string => normalise((error as Error).message);
 
+/** The async form for service calls that reject instead of throwing. */
+async function asyncRefusalOf(action: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await action();
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected a refusal');
+}
+
 describe('Nefario briefing review — commission and identity', () => {
   it('arms one review and dispatches one read-only lens job per lens, carrying the verbatim briefing, its own helper section and the result contract', async () => {
     const h = harness();
@@ -546,7 +556,7 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
       h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
     }
     const capped = commission(h, { briefing: revision(7) });
-    const capRefusal = refusalOf(() => h.service.commission(capped));
+    const capRefusal = await asyncRefusalOf(() => h.service.commission(capped));
     expect(capRefusal).toMatchObject({ code: 'briefing_review_round_cap', status: 409 });
     const cappedMessage = refusalMessage(capRefusal);
     expect(cappedMessage).toContain('push-back');
