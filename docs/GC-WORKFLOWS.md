@@ -67,6 +67,11 @@ this is routing compatibility, not an external BMAD dependency.
   all four; a risk raised during review adds its lenses on the same head),
   reasoned fixes, verification and ordinary PR handoff.
 - Planning and review helper entrypoints are also independently resolvable.
+- Since `gru-command-workflows@5`, `skills/gc-build/review.md` sends a failed
+  blind report that was delivered or dismissed to the coverage release
+  (`POST /api/dispatch/jobs/<job>/blind-coverage/release`, #513, documented in
+  [REVIEW-INPUTS.md](REVIEW-INPUTS.md)) instead of waiting for it to be parked
+  or binned, and names the readback field a worker reads (`qualifying: true`).
 - Intake helpers, read by intake rather than rendered into a lane:
   `skills/gc-build/intake.md` (the planning contract) and, since
   `gru-command-workflows@3`, `skills/gc-build/slice.md` (#429).

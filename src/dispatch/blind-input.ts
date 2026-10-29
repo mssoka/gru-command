@@ -80,7 +80,14 @@ export type BlindRefusalCode =
   | 'blind_input_refused'
   | 'stale_parent_contract'
   | 'blind_coverage_owned'
-  | 'blind_coverage_unreadable';
+  | 'blind_coverage_unreadable'
+  /** The coverage release control (#513): a malformed request, then each way
+   * a job's coverage is not releasable. None of them is audited as an event. */
+  | 'invalid_request'
+  | 'blind_coverage_not_blind'
+  | 'blind_coverage_live'
+  | 'blind_coverage_not_owned'
+  | 'blind_coverage_already_released';
 
 /** A named refusal at the commissioning boundary. `correction` is the path a
  * stranger can act on; `violations` never carry the private text itself. */
