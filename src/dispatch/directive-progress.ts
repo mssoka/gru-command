@@ -509,7 +509,9 @@ function deadTurnLine(ledger: Pick<LedgerApi, 'deadTurnEvidence'>, requestId: st
     // The owner's ask closes the card (a successor is refused while the verdict is unbounded).
     return { unbounded: true, line: ` Dead turn (its host is gone), read from its own evidence — ${describeDeadTurn(dead)}. Only a human can judge that: "this turn may have run ${ran}; continue?"` };
   } catch (error) {
-    return { unbounded: false, line: ` The dead turn's evidence could not be read (${shownText(String(error), 200)}).` };
+    // Unreadable evidence is unbounded, as it is at every other custody surface:
+    // the card must ask the owner, never point at a successor call the preflight refuses.
+    return { unbounded: true, line: ` The dead turn's evidence could not be read (${shownText(String(error), 200)}).` };
   }
 }
 

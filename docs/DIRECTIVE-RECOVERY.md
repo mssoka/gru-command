@@ -698,8 +698,9 @@ precedence over any completion the CLI's denial produced. An assistant row the
 SDK never runs (pi `error`, `aborted`, `length` stops) holds no intent. A
 host authority-boundary refusal (no tool id) is counted and told in the line.
 Tool names and ids are model-controlled text, and a successor's prompt carries
-them: a plain token is shown as is, anything else as a quoted, line-safe literal,
-never longer than 80 code points, on every surface.
+them: a plain token is shown as is, anything else is cut to 80 code points and
+shown as a quoted, line-safe literal (a backslash escape can make the rendered
+form longer, never unbounded), on every surface.
 
 `none` and `bounded` stay recorded facts: the `silas.directive-recovery-decided`
 event carries `dead_turn` (verdict, runtime, effects, refusals, the host-absent
@@ -712,6 +713,11 @@ unproven cleanup; the restart pass does the same when it first meets the request
 and repairs the stale `streaming` agent row. Gru's routine `/recover` decision
 then succeeds with no owner decision: the card is an `action-required` card for
 Gru, never an owner stop, and the owner's abandon exit answers "can be retired".
+
+`bounded` rests on completions the transcript records: a completed tool can
+still have left a detached child running, and the transcript records that the
+tool returned, not that its children exited. That residue is covered by the
+existing live-lane-process fence, not by this verdict.
 
 `unbounded` is the only residue a human can still judge, and the card asks the
 question they can answer ("this turn may have run `<tools>`; continue?"). The

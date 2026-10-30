@@ -3949,6 +3949,13 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     await withDeadScene('pi', 'quiet', async (s) => {
       appendFileSync(`${s.file}.producers.jsonl`, '{"torn":');
       expect(s.ledger.directiveProgressBlockers(s.requestId, s.lane.id)).toContainEqual(expect.stringMatching(/^original native physical ownership unreadable \(unbounded: .*partial write/u));
+      // The card matches the blocker: evidence the service could not read is unbounded,
+      // so it asks the owner instead of pointing Gru at a successor the preflight refuses.
+      surfaceDirectiveRecovery(s.deps, s.requestId, 'the dead turn is unreadable');
+      const card = activeCard(s);
+      expect(card?.detail).toContain('The dead turn\'s evidence could not be read');
+      expect(card?.detail).toContain('It needs the owner'); expect(card?.detail).toContain('ask the owner');
+      expect(card?.detail).not.toContain('recover with a fresh named successor');
     });
   });
 

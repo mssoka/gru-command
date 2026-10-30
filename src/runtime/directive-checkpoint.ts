@@ -1620,8 +1620,12 @@ const DEAD_TURN_TEXT_POINTS = 80;
 const PLAIN_TOOL_TEXT = /^[\w.:/@+-]{1,80}$/u;
 function shownDeadTurnText(value: string): string {
   if (PLAIN_TOOL_TEXT.test(value)) return value;
-  const points = [...value];
-  return points.length > DEAD_TURN_TEXT_POINTS ? `${lineSafeLiteral(points.slice(0, DEAD_TURN_TEXT_POINTS).join(''))}…` : lineSafeLiteral(value);
+  // Slice before spreading: the transcript allows a 32 MiB entry, and spreading it
+  // whole would allocate a multi-million-entry array on every surface that shows it.
+  const points = [...value.slice(0, DEAD_TURN_TEXT_POINTS * 2 + 1)];
+  // Whole when no more than twice the bound in units: then `points` is all of it.
+  if (value.length <= DEAD_TURN_TEXT_POINTS * 2 && points.length <= DEAD_TURN_TEXT_POINTS) return lineSafeLiteral(value);
+  return `${lineSafeLiteral(points.slice(0, DEAD_TURN_TEXT_POINTS).join(''))}…`;
 }
 export function shownDeadTurnTool<T extends DeadTurnTool>(tool: T): T {
   return { ...tool, id: shownDeadTurnText(tool.id), name: shownDeadTurnText(tool.name) };
