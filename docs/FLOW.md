@@ -355,7 +355,9 @@ route:
    claude-code runtime this is a CLI-availability probe; on pi it checks
    model resolution plus provider auth.
 3. **Code-host integration** — a GitHub (`gh`) or GitLab (`GITLAB_TOKEN`)
-   token valid for the exact repository remote: the preflight leg. Verdict
+   token valid for the exact repository remote: the preflight leg. (A GitLab
+   token is also what reads a merge request's head pipeline for the round's CI
+   evidence.) Verdict
    delivery rides the `gh` token only when no Perkins App bundle is
    installed; with a bundle, github.com publication is App-authored (see
    [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)). Only GitHub
@@ -390,8 +392,13 @@ and recorded on the job as
 delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
-the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitLab runs every
+the GitLab probe, the poster and the freeze's CI-evidence read resolve their
+token identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). For a job whose
+PR link is a GitLab merge request, the round's frozen CI evidence is the merge
+request's own head pipeline, read once by the host just before the freeze
+(`gitlab.mr-observed` / `gitlab.mr-read-failed`, bound to the exact reviewed SHA;
+a merged-results pipeline never binds; see
+[REVIEW-INPUTS.md](./REVIEW-INPUTS.md#gitlab-merge-requests)). GitLab runs every
 note body through its quick-action extractor and executes a line such as
 `/merge`, `/approve`, `/close` or `/label …` as the posting account. The
 report part of a publication is written by the review lead after it reads
