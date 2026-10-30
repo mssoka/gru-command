@@ -1217,11 +1217,15 @@ function nowIso(): string {
 
 /** What a request's dead turn can have left behind, for its host-absent
  * `producers`: null when the checkpoint is not an unfinished or failed turn
- * (a completed turn is settled, not judged here). The evidence reads throw
- * what they throw; classifying never does. */
+ * (a completed turn is settled, not judged here). A checkpoint that cannot be
+ * read is `unbounded`, by name: it is no evidence either way. */
 function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]):
   { readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] } | null {
-  const checkpoint = inspectDirectiveCheckpoint(sessionFile, identity);
+  let checkpoint: ReturnType<typeof inspectDirectiveCheckpoint>;
+  try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity); }
+  catch (error) {
+    return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${String(error).slice(0, 200)}`, pending: [] }, producers };
+  }
   if (checkpoint.state !== 'unknown' && !(checkpoint.state === 'terminal' && !checkpoint.ok)) return null;
   return { dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
 }
