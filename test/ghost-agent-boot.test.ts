@@ -74,22 +74,23 @@ async function binJob(baseUrl: string, token: string, jobId: string): Promise<{ 
   return { status: response.status, body: await response.json() };
 }
 
+/** A `working` job a previous service process left two open turns on, and a closed neighbour. */
+function seedRestartedMidTurn(ledger: LedgerApi, jobId: string): void {
+  ledger.addJob({ id: jobId, repo: 'fixture', title: 'restarted mid-turn', baseBranch: 'main', briefing: 'work' });
+  ledger.setJobStatus(jobId, 'working');
+  ledger.registerAgent({ id: 'ghost-streaming', role: 'minion', jobId });
+  ledger.setAgentState('ghost-streaming', 'streaming');
+  ledger.registerAgent({ id: 'ghost-spawning', role: 'minion', jobId });
+  // A closed neighbour on the same job: not an open turn, never touched.
+  ledger.registerAgent({ id: 'closed-idle', role: 'minion', jobId });
+  ledger.setAgentState('closed-idle', 'idle');
+}
+
 describe('compiled service: boot settles the agent rows a previous process left open (#547)', () => {
-  it('moves a streaming and a spawning row of a working job to error, names the reason, orphans each turn, and unblocks binning', async () => {
+  it('moves a streaming and a spawning row of a working job to error, names the reason and orphans each turn', async () => {
     const jobId = 'job-ghost-boot';
-    const { home, workspace } = seedHome('gru-ghost-boot', (ledger) => {
-      ledger.addJob({ id: jobId, repo: 'fixture', title: 'restarted mid-turn', baseBranch: 'main', briefing: 'work' });
-      ledger.setJobStatus(jobId, 'working');
-      ledger.registerAgent({ id: 'ghost-streaming', role: 'minion', jobId });
-      ledger.setAgentState('ghost-streaming', 'streaming');
-      ledger.registerAgent({ id: 'ghost-spawning', role: 'minion', jobId });
-      // A closed neighbour on the same job: not an open turn, never touched.
-      ledger.registerAgent({ id: 'closed-idle', role: 'minion', jobId });
-      ledger.setAgentState('closed-idle', 'idle');
-    });
-    // The refusal the issue reports, on the seeded ledger itself.
-    const seeded = agentRows(home, jobId);
-    expect(seeded).toEqual([
+    const { home, workspace } = seedHome('gru-ghost-boot', (ledger) => seedRestartedMidTurn(ledger, jobId));
+    expect(agentRows(home, jobId)).toEqual([
       { id: 'closed-idle', state: 'idle' },
       { id: 'ghost-spawning', state: 'spawning' },
       { id: 'ghost-streaming', state: 'streaming' },
@@ -119,8 +120,18 @@ describe('compiled service: boot settles the agent rows a previous process left 
         try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
       }).find((line) => line['msg'] === 'host-absent agent turns settled at boot');
       expect(summary).toMatchObject({ examined: 2, live: 0, settled: 2, failed: 0 });
+    } finally {
+      await service.stop();
+    }
+  }, 90_000);
 
-      // Binning is no longer refused for "open worker turn(s)".
+  it('no longer refuses to bin the job for open worker turns', async () => {
+    const jobId = 'job-ghost-bin';
+    const { home, workspace } = seedHome('gru-ghost-bin', (ledger) => seedRestartedMidTurn(ledger, jobId));
+    const service = await startRealService({
+      port: await pickFreePort(), token: 'ghost-bin-token', home, workspace, keepHome: true, requireWebDist: false,
+    });
+    try {
       const binned = await binJob(service.baseUrl, service.token, jobId);
       expect(binned, JSON.stringify(binned.body)).toMatchObject({ status: 200, body: { id: jobId, status: 'binned' } });
     } finally {

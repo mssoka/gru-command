@@ -250,7 +250,7 @@ const PINS: Record<string, number> = {
   'directive-retry-history.test.ts': 41,
   'directive-transcript-bounds.test.ts': 35,
   'fix-directive.test.ts': 60,
-  'ghost-agent-boot.test.ts': 2,
+  'ghost-agent-boot.test.ts': 3,
   'github-poll.test.ts': 45,
   'gitlab-mr-read.test.ts': 27,
   'gru-cli.test.ts': 12,
