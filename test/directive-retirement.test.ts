@@ -581,8 +581,10 @@ describe('directive retirement — evidence-fenced control closure', () => {
     // streaming, and nothing in this process holds a handle for it.
     h.ledger.setAgentState('ghost-agent', 'streaming');
     const OPEN_TURN = 'open worker turn(s): ghost-agent (streaming)';
+    // The ghost agent's own rows: its state move, the orphan record and the
+    // notices derived from them. Nothing else may change.
     const settlementOwned = (event: { readonly agentId: string | null; readonly kind: string }): boolean =>
-      event.agentId === 'ghost-agent' && (event.kind === 'agent.state' || event.kind === 'supervision.turn-recovery');
+      event.agentId === 'ghost-agent' && ['agent.state', 'supervision.turn-recovery', 'notification.created'].includes(event.kind);
     const evidence = () => ({
       request: h.ledger.getDirective(row.requestId),
       events: h.ledger.listEvents({ limit: 500 }).filter((event) => !settlementOwned(event)),

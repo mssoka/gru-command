@@ -7452,8 +7452,9 @@ describe('supervisor — host-absent turns settled at boot (#547)', () => {
       expect(result.failed).toEqual([]);
       for (const [agentId, from] of [['ghost-streaming', 'streaming'], ['ghost-spawning', 'spawning']] as const) {
         expect(h.api.getAgent(agentId)?.state, agentId).toBe('error');
-        const events = agentEventsAfter(h, agentId, before);
-        // Agent row only: the state move and the orphan record, nothing else.
+        // Agent row only: the state move and the orphan record, nothing else
+        // (each notice the center derives from them is its own event row).
+        const events = agentEventsAfter(h, agentId, before).filter((event) => event.kind !== 'notification.created');
         expect(events.map((event) => event.kind), agentId).toEqual(['agent.state', 'supervision.turn-recovery']);
         expect(events[0]?.payload, agentId).toEqual({ from, to: 'error', error: 'host-absent at boot' });
         expect(events[1]?.payload, agentId).toMatchObject({ disposition: 'orphaned', reason: 'host-absent at boot' });
@@ -7462,6 +7463,10 @@ describe('supervisor — host-absent turns settled at boot (#547)', () => {
         expect(notices[0]).toMatchObject({ routing: 'action-required', severity: 'error', agentId, resolvedAt: null });
         expect(notices[0]?.detail, agentId).toContain('host-absent at boot');
         expect(notices[0]?.detail, agentId).toContain('job job-ghost');
+        // The ordinary FYI every agent reaching `error` gets, carrying the reason.
+        const errored = h.api.listNotifications({ limit: 100 }).filter((notice) => notice.title === `Agent ${agentId} errored`);
+        expect(errored, agentId).toHaveLength(1);
+        expect(errored[0], agentId).toMatchObject({ routing: 'fyi', detail: 'host-absent at boot' });
       }
       expect(h.api.getAgent('quiet-idle')?.state).toBe('idle');
       expect(h.api.getAgent('quiet-disposed')?.state).toBe('disposed');
