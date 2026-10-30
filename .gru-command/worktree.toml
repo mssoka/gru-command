@@ -1199,28 +1199,30 @@ gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182
 
 # Lane-fence stale registry row: a `live` `registry` row names a service this
 # orchestrator spawned (the verify scheduler records it at spawn and its
-# onSettled settles it), so a dead pid there is stale bookkeeping a restart
-# left behind and must not fence directive retirement. Rows with cwd/argv/
-# lane-token evidence keep fencing exactly as before. Focused = the
-# retirement suite plus the suite/budget pins; the approved RPC patch runs
-# first because the scheduler invokes the command directly and does not run
-# npm's pretest hook.
-stale-row-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+# onSettled settles it), so a dead pid/group there is stale bookkeeping a
+# restart left behind and must not fence directive retirement. Rows with
+# cwd/argv/lane-token evidence keep fencing exactly as before. Focused = the
+# retirement suite, the suite/budget pins and the red classifier's own
+# accept/refuse contract; the approved RPC patch runs first because the
+# scheduler invokes the command directly and does not run npm's pretest hook.
+stale-row-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/assert-stale-row-red.test.ts"
 
 # Static product checks for the same change: lint, compiler and full build
 # (including the pinned Perkins resource verifier).
 stale-row-static = "npm run lint && npm run typecheck && npm run build"
 
 # Fails-before evidence: the FINAL directive-retirement test bytes (which
-# carry A1) are overlaid onto an isolated git-archive snapshot of the
-# pre-change base ccd6337f, so the stale-registry retirement assertion REDs
-# by behavior there. A bare base archive has no A1 test and would be green
-# for nothing. Dependencies are linked by symlink (no download/install), the
-# approved RPC patch prerequisite runs first, and the Vitest JSON report is
-# classified by tools/assert-stale-row-red.mjs: collection/setup/import
-# failures, a missing/green A1 case, or a failure without the named
-# 409-vs-200 AssertionError exits 2. The expected failure exits 1 so the
-# evidence stays visible. The snapshot directory and the ignored pointer
-# file are preserved for inspection; nothing is deleted or checked out and
-# no branch/worktree holds the sha.
+# carry A1) are overlaid onto an isolated git-archive snapshot of the task's
+# referenced pre-change base ccd6337f (its fence source and this test file
+# are byte-identical to the branch base 191fff12 at review time), so the
+# stale-registry retirement assertion REDs by behavior there. A bare base
+# archive has no A1 test and would be green for nothing. Dependencies are
+# linked by symlink (no download/install), the approved RPC patch
+# prerequisite runs first, and the Vitest JSON report is classified by
+# tools/assert-stale-row-red.mjs: collection/setup/import failures, a
+# missing/green A1 case, or a failure without the named 409-vs-200
+# AssertionError exits 2. The expected failure exits 1 so the evidence stays
+# visible. The snapshot directory and the ignored pointer file are preserved
+# for inspection; nothing is deleted or checked out and no branch/worktree
+# holds the sha.
 stale-row-red = 'set -e; base=ccd6337fb629f3fc69bea725d06873733b363182; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-stale-row-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/directive-retirement.test.ts "$d/test/directive-retirement.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "stale-row-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/stale-row-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/directive-retirement.test.ts -t "retires past a live registry row whose spawned pid is gone"; a=$?; set -e; echo "stale-row-red vitest exit=$a EXPECTED-NONZERO: pre-change base fences on the stale registry row"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-stale-row-red.mjs" "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the stale-row retirement REDs by assertion against the pre-change base"; exit 1'

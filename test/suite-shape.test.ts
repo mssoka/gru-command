@@ -153,6 +153,7 @@ const PINS: Record<string, number> = {
   'assert-binned-baseline.test.ts': 3,
   'classify-baseline.test.ts': 32,
   'assert-merge-authority-baseline.test.ts': 8,
+  'assert-stale-row-red.test.ts': 8,
   'assert-notification-card-baseline.test.ts': 8,
   'assert-perkins-integration-review-baseline.test.ts': 11,
   'assert-repo-overview-baseline.test.ts': 4,

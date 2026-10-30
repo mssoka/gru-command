@@ -2,18 +2,21 @@
 /**
  * Fail-before classifier for the gc-lane-fence stale registry-row baseline.
  *
- * The pre-change base (ccd6337f) has no liveness predicate in the lane-process
- * fence, so the A1 regression must fail there BY ASSERTION: retirement is
- * refused (409) where the test expects 200. A nonzero vitest exit from an
- * import, collection, setup or fixture failure is not fail-before evidence,
- * and a green A1 case breaks the claim. This tool exits 0 only when the named
- * case was collected, failed as an AssertionError, and its message carries the
- * expected 409-vs-200 assertion; it exits 2 otherwise.
+ * The task's referenced pre-change base (ccd6337f; its `src/ledger/api.ts`,
+ * `src/verify/scheduler.ts` and `test/directive-retirement.test.ts` are
+ * byte-identical to the branch base 191fff12 at review time) has no liveness
+ * predicate in the lane-process fence, so the A1 regression must fail there
+ * BY ASSERTION: retirement is refused (409) where the test expects 200. A
+ * nonzero vitest exit from an import, collection, setup or fixture failure is
+ * not fail-before evidence, and a green A1 case breaks the claim. This tool
+ * exits 0 only when the named case was collected, failed as an AssertionError,
+ * and its message carries the expected 409-vs-200 assertion; it exits 2
+ * otherwise.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 export const EXPECTED_TEST_TITLE =
   'retires past a live registry row whose spawned pid is gone and leaves that row live';
@@ -53,7 +56,20 @@ export function assertStaleRowRed(report) {
   return `stale-row red proven — "${EXPECTED_TEST_TITLE}" failed by assertion at the pre-change base (${EXPECTED_ASSERTION})`;
 }
 
-if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+/** True only when this module IS the CLI entry point. Canonical paths are
+ * compared (realpath on both sides), so invoking the tool through a
+ * symlinked path still runs the classifier instead of silently exiting 0
+ * without classifying anything. */
+function invokedDirectly() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
   try {
     const path = process.argv[2];
     if (path === undefined) throw new Error('usage: assert-stale-row-red.mjs RESULTS_JSON');
