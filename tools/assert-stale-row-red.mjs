@@ -20,7 +20,7 @@ export const EXPECTED_TEST_TITLE =
 export const EXPECTED_ASSERTION = 'expected 409 to be 200';
 
 function nameOf(result) {
-  return typeof result.fullName === 'string' && result.fullName !== '' ? result.fullName : result.title;
+  return typeof result.title === 'string' && result.title !== '' ? result.title : result.fullName;
 }
 
 /** Classify a Vitest JSON report from the stale-row baseline. Returns the
