@@ -262,10 +262,14 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     // curl accepts an empty user; the part after the colon is the credential.
     [`curl -u :${ARGV_SECRET} https://host/x`, `curl -u :${REDACTION_PLACEHOLDER} https://host/x`],
     [`curl -u ":${ARGV_SECRET}" https://host/x`, `curl -u ":${REDACTION_PLACEHOLDER}" https://host/x`],
-    // A whole-quoted value may hold the other quote character in its password.
+    // A whole-quoted value may hold the other quote character in its password,
+    // and a quoted password may start with a digit or symbol.
     [`curl -u "deploy:it's-${ARGV_SECRET}" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
     [`curl -u 'deploy:say"hi-${ARGV_SECRET}' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     [`curl -u deploy:"it's-${ARGV_SECRET}" https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u 'deploy:1234 5678${ARGV_SECRET}' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl -u 'deploy:$ecret pass phrase' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl -u 'a b:1234 ${ARGV_SECRET}' https://host/x`, `curl -u 'a b:${REDACTION_PLACEHOLDER}' https://host/x`],
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
     ['docker run -u postgres:postgres image', `docker run -u postgres:${REDACTION_PLACEHOLDER} image`],

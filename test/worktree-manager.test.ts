@@ -2820,10 +2820,22 @@ it('masks argv credentials in a later paused result (survivors and newcomers)', 
     kill.mockRestore();
   }
 
-  // The acknowledged pid leaves (the real signal now fails, which is "gone"),
-  // and a credential-bearing newcomer is asked about on its own.
+  // The acknowledged pid leaves (an ESRCH for the fabricated pid: no real
+  // process is ever signalled by this fixture), and a credential-bearing
+  // newcomer is asked about on its own.
   h.enumerator.mockReturnValue([attested, newcomer]);
-  const later = await h.manager.release({ worktreeId: 'job-argv-later', confirmKill: true });
+  const later = await (async () => {
+    const gone = vi.spyOn(process, 'kill').mockImplementation((() => {
+      const error = new Error('kill ESRCH') as NodeJS.ErrnoException;
+      error.code = 'ESRCH';
+      throw error;
+    }) as typeof process.kill);
+    try {
+      return await h.manager.release({ worktreeId: 'job-argv-later', confirmKill: true });
+    } finally {
+      gone.mockRestore();
+    }
+  })();
   expect(later.status).toBe('paused');
   if (later.status !== 'paused') return;
   expect(later.note).toMatch(/the acknowledged kill did not cover/);

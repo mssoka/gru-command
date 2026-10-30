@@ -142,7 +142,7 @@ const REDACTIONS: readonly Redaction[] = [
   // them. The user may be empty (`-u ":secret"`).
   replacing(/(?<![A-Za-z0-9-])(-u\s+"[^":]{0,64}:)(?=[^"]*[A-Za-z])[^"]{6,}"/gu,
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
-  replacing(/(?<![A-Za-z0-9-])(-u\s+'[^':]{0,64}:)(?=['^']*[A-Za-z])[^']{6,}'/gu,
+  replacing(/(?<![A-Za-z0-9-])(-u\s+'[^':]{0,64}:)(?=[^']*[A-Za-z])[^']{6,}'/gu,
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
   // A bare user (an empty one too: `-u :secret`) with a bare or quoted
   // password. The lookbehind keeps `cli -u:value` and `--tokenize` alone.

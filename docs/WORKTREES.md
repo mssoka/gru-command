@@ -225,8 +225,11 @@ whoever writes it: `redactCredentials` runs inside the ledger write, so a
 pause, a reap and the verification scheduler's `registry` rows all record
 the masked line, and every process record that leaves GC — the release's
 paused result, the `worktree.paused` payload, the `onSweepPaused`
-processes and details, and the refusal error's processes — carries it.
-The raw `ps` line stays in memory for
+processes and details, and the refusal error's processes — carries it for
+the credential forms `redactCredentials` recognizes (the pairing token's
+`Authorization: Bearer`, the keyword assignments, and the `--token`,
+`-u user:value` and `Authorization: token` argv forms; the inventory in
+#534's PR names the boundary). The raw `ps` line stays in memory for
 the checks that need it (tree matching, token naming, `ps -E`
 provenance). An acknowledged pid is compared against its recorded row
 masked, so the answer to a recorded pause is still honored; a row written
