@@ -1,5 +1,7 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   BlindInputRefusal,
@@ -67,6 +69,25 @@ function amendment(version: number, body: string, extra: Partial<JobAmendmentRec
     ...extra,
   };
 }
+
+/** The commit messages this branch adds to `origin/main` (`git log --format=%B`),
+ * or null where this tree has no clone to ask: a `git archive` extract, or a
+ * clone that never fetched `origin/main`. A skipped case is reported as skipped,
+ * never as passed. */
+function readBranchMessages(): string | null {
+  const root = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
+  const git = (...args: readonly string[]): string =>
+    execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+  try {
+    // An extract placed inside some other checkout must not read that one's log.
+    if (realpathSync(git('rev-parse', '--show-toplevel').trim()) !== root) return null;
+    git('rev-parse', '--verify', '--quiet', 'origin/main');
+    return git('log', '--format=%B', 'origin/main..HEAD');
+  } catch {
+    return null;
+  }
+}
+const branchMessages = readBranchMessages();
 
 describe('review role (claims-needed reviewers stay a separate contract)', () => {
   it('classifies explicit roles, infers blind from the lane name, and rejects unknown roles', () => {
@@ -421,7 +442,9 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   });
 
   it('A2: any revision spelling, as a match line or a context line, is stripped from the recorded path', () => {
-    for (const rev of ['abc1234', 'HEAD', 'HEAD~1', 'origin/main', 'refs/heads/feature/x', 'v1.0.1']) {
+    // The last three end in `-<digits>`: a ref spelled `pr-528` or
+    // `release-2026-10-29` offers delimiters of its own before the path.
+    for (const rev of ['abc1234', 'HEAD', 'HEAD~1', 'origin/main', 'refs/heads/feature/x', 'v1.0.1', 'pr-528', 'v1-2-0', 'release-2026-10-29']) {
       expect(recorded(match(named(rev, ARTIFACT), 7, ' matched symbol')), `${rev} match`).toEqual(prohibited(ARTIFACT));
       expect(recorded(context(named(rev, ARTIFACT), 7, ' matched symbol')), `${rev} context`).toEqual(prohibited(ARTIFACT));
     }
@@ -468,8 +491,8 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(line!.detail).not.toMatch(/\u202e/u);
   });
 
-  it('judges the new candidates by the isolation globs only: an absolute, `..` or drive-letter head is no hit through them', () => {
-    for (const path of ['/etc/hosts', '../docs/issues/a.md', 'C:/Data/a.md', 'C:\\Data\\a.md']) {
+  it('judges the new candidates by the isolation globs only: an absolute or drive-letter head is no hit through them', () => {
+    for (const path of ['/etc/hosts', 'C:/Data/a.md', 'C:\\Data\\a.md']) {
       expect(recorded(match(named('HEAD', path), 1)), path).toEqual([]);
     }
     expect(recorded(match(named('v1', '/srv/x'), 3, 'y'))).toEqual([]);
@@ -557,6 +580,125 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(match(named('HEAD', ':docs/issues/notes.md'), 1, 'needle'))).toEqual(prohibited('docs/issues/notes.md'));
     // `--column` adds a column number after the line number.
     expect(recorded(match(named('HEAD', 'docs/issues/notes.md'), 2, '1:needle one'))).toEqual(prohibited('docs/issues/notes.md'));
+  });
+
+  it('R1: the text behind a context line number is never part of the recorded path or detail', () => {
+    // A context line's text may quote another `name:N:` of its own; the path
+    // ended at the first file name, so what follows `-7-` is the file's text.
+    const quoted = ['See ', ['docs/issues/520-notes.md', '12', ' for details'].join(':')].join('');
+    for (const rev of ['HEAD', 'origin/main', 'abc1234']) {
+      for (const path of ['docs/issues/deferred-work.md', 'docs/issues/prior review.md']) {
+        const hits = scan(context(named(rev, path), 7, quoted));
+        expect(hits.map((hit) => `${hit.code}:${hit.path}`), `${rev} ${path}`).toEqual(prohibited(path));
+        expect(JSON.stringify(hits), `${rev} ${path}`).not.toMatch(/See|520-notes|details/u);
+      }
+    }
+    // A match line ends its path at its own line number, whatever its text quotes.
+    expect(recorded(match(named('HEAD', 'docs/issues/deferred-work.md'), 7, quoted))).toEqual(prohibited('docs/issues/deferred-work.md'));
+  });
+
+  it('R1: a clean file\'s context line that quotes an excluded name is no hit under a non-prefix rule', () => {
+    const rule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude **/*.md', amendments: [] });
+    const quoted = ['see ', ['notes.md', '12', ' for details'].join(':')].join('');
+    for (const rev of ['HEAD', 'origin/main']) {
+      expect(recorded(context(named(rev, 'src/clean.ts'), 7, quoted), rule), rev).toEqual([]);
+    }
+    // ...while the file's own name still counts, and is all that is recorded.
+    expect(recorded(context(named('HEAD', 'src/clean.md'), 7, quoted), rule)).toEqual(prohibited('src/clean.md'));
+  });
+
+  it('R1: an extensionless name with date-like segments is read whole, whatever glob excludes it', () => {
+    const rule = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude **/notes', amendments: [] });
+    const path = 'vendor/2026-10-29-run/notes';
+    expect(recorded(context(path, 7), rule), 'worktree context').toEqual(prohibited(path));
+    expect(recorded(context(named('HEAD', path), 7), rule), 'revision context').toEqual(prohibited(path));
+    expect(recorded(match(named('HEAD', path), 7), rule), 'revision match').toEqual(prohibited(path));
+    // An extensionless private file keeps the prose behind its line number out of the record too.
+    const privatePath = 'docs/issues/NOTES';
+    for (const text of ['see 2026-10-29 and 10-30-15', 'finished 12-30-45 ok']) {
+      const hits = scan(context(named('HEAD', privatePath), 7, text));
+      expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited(privatePath));
+      expect(JSON.stringify(hits), text).not.toMatch(/see|finished/u);
+    }
+  });
+
+  it('R3: a parent-relative path behind a revision is outside the package, as `path:N:` is', () => {
+    // `cd src && git grep -n needle HEAD -- ..` prints `HEAD:../vendor/notes.md:1:needle`.
+    const outside = (path: string): string => `invalid package path "${path}" (must be a relative path inside the repository)`;
+    for (const line of [
+      match(named('HEAD', '../vendor/notes.md'), 1, 'needle'),
+      context(named('origin/main', '../vendor/notes.md'), 1, 'needle'),
+      match(named('HEAD', '../vendor:notes.md'), 1, 'needle'),
+      match(named('release-2026-10-29', '../vendor/notes.md'), 1, 'needle'),
+    ]) {
+      const hits = scan(line);
+      expect(hits.map((hit) => `${hit.code}:${hit.path}`), line).toEqual(prohibited('../vendor/notes.md'));
+      expect(hits[0]!.detail, line).toBe(outside('../vendor/notes.md'));
+    }
+    // A spaced parent path is judged as `path:N:` judges one (file-like, behind `../`).
+    expect(recorded(match(named('HEAD', '../other repo/notes.md'), 1))).toEqual(prohibited('../other repo/notes.md'));
+    // The worktree context form of the same path.
+    expect(recorded(context('../vendor/notes.md', 3, 'needle'))).toEqual(prohibited('../vendor/notes.md'));
+  });
+
+  it('R3: URL-shaped and absolute frames stay no hit: only a parent-relative path is judged by shape', () => {
+    for (const text of [
+      match(['webpack:', '', '', '../node_modules/x/index.js'].join('/'), 12, '34'),
+      match('TypeError at file:///srv/app/a.js', 12, '34'),
+      match('    at fn (file:///srv/app/a.js', 12, '34)'),
+      match(named('HEAD', '/srv/app/a.js'), 12, '34'),
+      match(named('HEAD', 'see ../x.md'), 12, '34'),
+    ]) {
+      expect(scan(text), text).toEqual([]);
+    }
+  });
+
+  it('R5: `git grep --heading` names the file once and prints `N:text` under it; the lines belong to that file', () => {
+    const body = (n: number, text = 'needle'): string => `${n}:${text}`;
+    const ctx = (n: number, text = 'needle'): string => `${n}-${text}`;
+    const lines = (...rows: readonly string[]): string => rows.join('\n');
+    // Worktree form, with a context group separator.
+    expect(recorded(lines(ARTIFACT, ctx(6, 'before'), body(7), '--', body(12)))).toEqual(prohibited(ARTIFACT));
+    // `<rev>:<path>`, `<rev>:<dir>:<file>` and the tree root `<rev>::<path>`.
+    expect(recorded(lines(named('HEAD', ARTIFACT), body(7)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(lines(named('HEAD', `${ARTIFACT_DIR}:deferred-work.md`), body(7)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(lines(named('HEAD', `:${ARTIFACT}`), body(7)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(lines(named('HEAD', 'docs/issues/prior review.md'), ctx(2)))).toEqual(prohibited('docs/issues/prior review.md'));
+    // `--column` adds a column behind the line number.
+    expect(recorded(lines(named('HEAD', ARTIFACT), '7:3:needle'))).toEqual(prohibited(ARTIFACT));
+    // Several files: a later heading is judged too, and a clean file's lines are not its neighbour's.
+    expect(recorded(lines('src/a.ts', body(3), '--', ARTIFACT, body(9)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(lines(ARTIFACT, body(1), '', 'src/a.ts', body(3), body(4)))).toEqual(prohibited(ARTIFACT));
+    // The record holds the heading's path, never a line of text.
+    const hits = scan(lines(named('HEAD', ARTIFACT), body(7, 'private words 2026-10-29'), ctx(8, 'more')));
+    expect(JSON.stringify(hits)).not.toMatch(/private|more/u);
+    expect(hits).toHaveLength(1);
+  });
+
+  it('R5: a heading judges nothing without lines under it, and clean files stay clean', () => {
+    const lines = (...rows: readonly string[]): string => rows.join('\n');
+    // A bare listing of an excluded name is no heading: no numbered line follows it.
+    expect(scan(lines(ARTIFACT, 'docs/issues/other.md'))).toEqual([]);
+    expect(scan(lines('src/a.ts', '3:needle', 'src/b.ts', '4-ctx'))).toEqual([]);
+    // Lines under a clean heading may mention an excluded name without reading it.
+    expect(scan(lines('src/config.ts', `12:  const glob = '_bmad-output/**'`, '--', `15-see ${ARTIFACT}`))).toEqual([]);
+    // A blank line closes a file's group (`--break`): numbered lines after it have no heading.
+    expect(scan(lines(ARTIFACT, '', '7:needle'))).toEqual([]);
+    // An indented line is no heading, and prose before a numbered list names no file.
+    expect(scan(lines(`  ${ARTIFACT}`, '7:needle'))).toEqual([]);
+    expect(scan(lines('Results', '1: first', '2: second'))).toEqual([]);
+    // `-n` was not given: nothing numbers the lines, so nothing attributes them (out of scope).
+    expect(scan(lines(ARTIFACT, 'needle one', 'needle two'))).toEqual([]);
+  });
+
+  it.skipIf(branchMessages === null)('R4: this branch\'s own commit messages are no excluded read, as written or as a log shows them', () => {
+    // Commit messages are output a blind reviewer reads: no message of this
+    // branch may spell an excluded path in a form a grep prints.
+    const messages = branchMessages!;
+    expect(scan(messages)).toEqual([]);
+    const logged = messages.split('\n').map((line) => `    ${line}`).join('\n');
+    expect(scan(logged)).toEqual([]);
+    expect(messages.split('\n').flatMap((line) => scan(line))).toEqual([]);
   });
 
   it('reading these tests is no excluded read: no line of this file, as written or as a read gutter or diff shows it, reads as a grep hit', () => {
