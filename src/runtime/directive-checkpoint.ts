@@ -1750,6 +1750,21 @@ export function classifyDeadDirectiveTurn(file: string, identity: DirectiveTurnI
   }
 }
 
+/** The settled custody fact contract revision 1 names, as recorded on the
+ * `silas.directive-recovery-decided` event: `{ verdict, effects?, reason? }`.
+ * It is computed by the service when `/recover` consumes the decision, never
+ * supplied by the caller, and is not part of the decision fingerprint. */
+export interface DirectiveCustodyVerdict {
+  readonly verdict: 'none' | 'bounded' | 'unbounded';
+  readonly effects?: readonly { readonly tool_use_id: string; readonly name: string }[];
+  readonly reason?: string;
+}
+export function custodyVerdictOf(dead: DeadTurnVerdict): DirectiveCustodyVerdict {
+  if (dead.verdict === 'none') return { verdict: 'none' };
+  if (dead.verdict === 'unbounded') return { verdict: 'unbounded', reason: dead.reason };
+  return { verdict: 'bounded', effects: dead.effects.map(({ id, name }) => { const shown = shownDeadTurnTool({ id, name }); return { tool_use_id: shown.id, name: shown.name }; }) };
+}
+
 /** One line a card, blocker or successor note can carry. Tool names and ids
  * are shown as plain tokens or quoted, line-safe and bounded. */
 export function describeDeadTurn(dead: DeadTurnVerdict): string {

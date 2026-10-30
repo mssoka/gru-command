@@ -22,7 +22,7 @@ import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
 import { shownText } from '../dispatch/line-safe.js';
-import { DirectiveCheckpointError, classifyDeadDirectiveTurn, describeDeadTurn, shownDeadTurnTool, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, classifyDeadDirectiveTurn, custodyVerdictOf, describeDeadTurn, shownDeadTurnTool, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveCustodyVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -1217,18 +1217,23 @@ function nowIso(): string {
 }
 
 /** What a request's dead turn can have left behind, for its host-absent
- * `producers`: null when the checkpoint is not an unfinished or failed turn
- * (a completed turn is settled, not judged here). A checkpoint that cannot be
- * read is `unbounded`, by name: it is no evidence either way. */
-function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]):
-  { readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] } | null {
+ * `producers`. Only the unfinished (`unknown`) checkpoint is classified; a
+ * completed turn is settled elsewhere and a terminal checkpoint — ok or not —
+ * keeps today's settlement path untouched. A checkpoint that cannot be read is
+ * `unbounded`, by name: it is no evidence either way. */
+type DeadTurnReading =
+  | { readonly kind: 'settled' }
+  | { readonly kind: 'terminal'; readonly ok: boolean }
+  | { readonly kind: 'verdict'; readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] };
+function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]): DeadTurnReading {
   let checkpoint: ReturnType<typeof inspectDirectiveCheckpoint>;
   try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity); }
   catch (error) {
-    return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
+    return { kind: 'verdict', dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
   }
-  if (checkpoint.state !== 'unknown' && !(checkpoint.state === 'terminal' && !checkpoint.ok)) return null;
-  return { dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
+  if (checkpoint.state === 'terminal') return { kind: 'terminal', ok: checkpoint.ok };
+  if (checkpoint.state !== 'unknown') return { kind: 'settled' };
+  return { kind: 'verdict', dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
 }
 
 /** The recovery decision's record of a dead turn's verdict (bounded in size). */
@@ -9921,7 +9926,7 @@ export class LedgerApi {
       // Non-executing (#470): an already-retired request's debt settles on a
       // later request's actual native admission on the same lane.
       { readonly kind: 'reconcile-admitted'; readonly admittedRequestId: string };
-  }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
+  }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean; readonly custody_verdict: DirectiveCustodyVerdict | null } {
     const facts = [input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision];
     // Canonical, like the rebrief decision's (#363 S02-0-02): the same
     // decision with its properties in another order is the same decision.
@@ -9935,7 +9940,10 @@ export class LedgerApi {
       const prior = this.recoveryDecisionHistory('directive', row.requestId).find((decision) => decision.generation === input.generation);
       if (prior !== undefined) {
         if (prior.fingerprint !== fingerprint && prior.fingerprint !== legacyFingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
-        return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
+        // The stored custody verdict replays as itself; a decision recorded before
+        // contract revision 1 (no `custody_verdict`) replays unchanged, as null.
+        const stored = (this.getEvent(prior.eventSeq)?.payload as { custody_verdict?: DirectiveCustodyVerdict } | undefined)?.custody_verdict ?? null;
+        return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true, custody_verdict: stored };
       }
       const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
       const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind === 'owner-decision' && currentDebt.state === 'suspended') ? currentDebt : null;
@@ -9992,7 +10000,7 @@ export class LedgerApi {
         payload: { request_id: row.requestId, generation: input.generation, payload_hash: row.payloadHash, expected_head: input.expectedHead,
           authority_epoch: input.expectedEpoch, expected_work_revision: input.expectedWorkRevision, expected_contract_sha256: input.expectedContractSha256,
           fingerprint, owner_transfer: ownerTransfer, owner_resolution_event_seq: ownerBasis.resolutionEventSeq, decision: input.decision, reason: input.reason,
-          ...(found === null ? {} : { dead_turn: deadTurnRecord(found.dead, found.producers) }),
+          ...(found === null ? {} : { dead_turn: deadTurnRecord(found.dead, found.producers), custody_verdict: custodyVerdictOf(found.dead) }),
           ...(admission === null ? {} : { admission: { request_id: admission.requestId, admission_seq: admission.admissionSeq, admission_minion: admission.admissionMinion,
             work_revision: admission.workRevision, retired_work_revision: admission.retiredWorkRevision, retirement_seq: admission.retirementSeq, lane_id: admission.laneId } }) } });
       this.db.prepare('UPDATE pending_directives SET recovery_decision = ? WHERE request_id = ?').run(JSON.stringify({ fingerprint, successorId: successor?.requestId ?? null, eventSeq: event.seq }), row.requestId);
@@ -10008,7 +10016,7 @@ export class LedgerApi {
         const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
         if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-evidence');
       }
-      return { successor, idempotent: false };
+      return { successor, idempotent: false, custody_verdict: found === null ? null : custodyVerdictOf(found.dead) };
     });
   }
 
@@ -10475,9 +10483,13 @@ export class LedgerApi {
         else if (original.some(({ evidence }) => evidence === 'host-absent')) {
           // Host absence proves the producer gone, not what it did: the turn's
           // own durable evidence decides.
-          const found = deadTurnOf(target.sessionFile, identity, original.filter(({ evidence }) => evidence === 'host-absent').map(({ producer }) => producer));
-          if (found?.dead.verdict === 'unbounded') native.push({ text: `original host absent but native effects/checkpoint remain UNKNOWN (${describeDeadTurn(found.dead)})`, custody: 'unknown' });
-          else if (found !== null) bounded.push(...found.producers);
+          const reading = deadTurnOf(target.sessionFile, identity, original.filter(({ evidence }) => evidence === 'host-absent').map(({ producer }) => producer));
+          // A terminal checkpoint (ok or not) keeps today's path: only the failed one is UNKNOWN.
+          if (reading.kind === 'terminal' && !reading.ok) native.push({ text: 'original host absent but native effects/checkpoint remain UNKNOWN', custody: 'unknown' });
+          else if (reading.kind === 'verdict') {
+            if (reading.dead.verdict === 'unbounded') native.push({ text: `original host absent but native effects/checkpoint remain UNKNOWN (${describeDeadTurn(reading.dead)})`, custody: 'unknown' });
+            else bounded.push(...reading.producers);
+          }
         }
       } catch (error) { native.push({ text: `original native physical ownership unreadable (unbounded: ${shownText(String(error), 200)})`, custody: 'unknown' }); }
     }
@@ -10551,7 +10563,8 @@ export class LedgerApi {
     const owners = inspectDirectiveProducers(target.sessionFile);
     const absent = owners.filter(({ producer, evidence }) => evidence === 'host-absent' && isDeepStrictEqual(producer.identity, identity));
     if (absent.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) return null;
-    return deadTurnOf(target.sessionFile, identity, absent.map(({ producer }) => producer));
+    const reading = deadTurnOf(target.sessionFile, identity, absent.map(({ producer }) => producer));
+    return reading.kind === 'verdict' ? { dead: reading.dead, producers: reading.producers } : null;
   }
 
   /** The host-absent producers of a dead turn whose own evidence bounds its

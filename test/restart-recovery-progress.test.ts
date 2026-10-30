@@ -3736,6 +3736,13 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       // The verdict is a recorded fact of the decision, and the successor's note names it.
       const decided = s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-recovery-decided', s.requestId)!;
       expect(decided.payload).toMatchObject({ decision: { kind: 'rebrief-successor' }, dead_turn: { verdict, runtime, host_absent_incarnations: [expect.any(String)] } });
+      // Contract revision 1's field: the service-computed verdict, never the caller's.
+      const custody = (decided.payload as { custody_verdict: { verdict: string; effects?: { tool_use_id: string; name: string }[]; reason?: string } }).custody_verdict;
+      expect(custody).toMatchObject({ verdict });
+      if (verdict === 'bounded') {
+        expect(custody.effects).toHaveLength(2);
+        expect(custody.effects?.every((effect) => typeof effect.tool_use_id === 'string' && typeof effect.name === 'string')).toBe(true);
+      } else expect(custody.effects).toBeUndefined();
       const note = storedText(s, 'dead-turn-successor');
       expect(note).toContain('finish the approved work'); expect(note).toContain(`${verdict}:`);
       for (const effect of effects) expect(note).toContain(effect);
@@ -3746,7 +3753,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expect(s.prompts().join('\n')).toContain(`${verdict}:`);
       expect(s.ledger.getObligation(debt.id)).toMatchObject({ state: 'settled' });
       // The exact decision replays as itself: no second successor, no second turn.
-      expect(recoverInterruptedDirectiveFromRoute(input)).toMatchObject({ idempotent: true, successor: { requestId: 'dead-turn-successor' } });
+      expect(recoverInterruptedDirectiveFromRoute(input)).toMatchObject({ idempotent: true, custody_verdict: { verdict }, successor: { requestId: 'dead-turn-successor' } });
     });
   }
   it('A1 pi: a dead turn with no tool intent is resumed by a rebrief-successor without any owner decision, verdict none', () => assertDeadTurnSettled('pi', 'quiet', 'none', []));
@@ -3757,6 +3764,25 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     assertDeadTurnSettled('pi', 'bounded', 'bounded', ['bash (call-1) completed', 'edit (call-2) failed', 'a failed tool can have left partial effects']));
   it('A2 claude-code: completed intents are verdict bounded, name their effects and still admit the successor', () =>
     assertDeadTurnSettled('claude-code', 'bounded', 'bounded', ['Read (toolu_1) completed', 'Edit (toolu_2) failed', 'a failed tool can have left partial effects']));
+
+  it('A5: a replay returns the stored custody verdict; a decision recorded before the field existed still replays', async () => {
+    await withDeadScene('pi', 'bounded', async (s) => {
+      const debt = await restartPass(s);
+      const decision = { kind: 'rebrief-successor' as const, requestId: 'replay-successor', note: 'finish the approved work' };
+      const input = recoveryInput(s, debt, decision);
+      expect(recoverInterruptedDirectiveFromRoute(input)).toMatchObject({ idempotent: false, custody_verdict: { verdict: 'bounded' } });
+      const decisions = (): number => (s.db.handle.prepare("SELECT COUNT(*) AS n FROM events WHERE kind = 'silas.directive-recovery-decided' AND job_id = ?")
+        .get(s.jobId) as { n: number }).n;
+      const before = decisions();
+      // Same generation, same decision: the stored verdict comes back and no second decision is written.
+      expect(recoverInterruptedDirectiveFromRoute(input)).toMatchObject({ idempotent: true, custody_verdict: { verdict: 'bounded', effects: expect.any(Array) } });
+      expect(decisions()).toBe(before);
+      // A decision recorded before contract revision 1 (no custody_verdict) replays unchanged, as null.
+      s.db.handle.prepare("UPDATE events SET payload = json_remove(payload, '$.custody_verdict') WHERE kind = 'silas.directive-recovery-decided' AND job_id = ?").run(s.jobId);
+      expect(recoverInterruptedDirectiveFromRoute(input)).toMatchObject({ idempotent: true, custody_verdict: null, successor: { requestId: 'replay-successor' } });
+      expect(decisions()).toBe(before);
+    });
+  });
 
   /** Tool names and ids are model-controlled text: no surface carries one raw. */
   async function assertHostileNamesContained(runtime: 'pi' | 'claude-code') {
@@ -4122,14 +4148,16 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       const debt = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the dead turn owes a recovery decision');
       decideRecovery(s, debt, { kind: 'owner-decision', obligationId: ownerStop(s).id });
       expect(s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-recovery-decided', s.requestId)?.payload).toMatchObject({
-        dead_turn: { verdict: 'unbounded', runtime: 'pi', reason: expect.stringMatching(/bash \(call-1\) has neither a completion/u), pending: [{ id: 'call-1', name: 'bash' }] } });
+        dead_turn: { verdict: 'unbounded', runtime: 'pi', reason: expect.stringMatching(/bash \(call-1\) has neither a completion/u), pending: [{ id: 'call-1', name: 'bash' }] },
+        custody_verdict: { verdict: 'unbounded', reason: expect.stringMatching(/bash \(call-1\) has neither a completion/u) } });
     });
     await withDeadScene('pi', 'quiet', async (s) => {
       const debt = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the dead turn owes a recovery decision');
       appendFileSync(`${s.file}.producers.jsonl`, '{"torn":');
       decideRecovery(s, debt, { kind: 'owner-decision', obligationId: ownerStop(s).id });
       expect(s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-recovery-decided', s.requestId)?.payload).toMatchObject({
-        dead_turn: { verdict: 'unbounded', reason: expect.stringMatching(/native evidence is unreadable: .*partial write/u), pending: [] } });
+        dead_turn: { verdict: 'unbounded', reason: expect.stringMatching(/native evidence is unreadable: .*partial write/u), pending: [] },
+        custody_verdict: { verdict: 'unbounded', reason: expect.stringMatching(/native evidence is unreadable: .*partial write/u) } });
     });
   });
 

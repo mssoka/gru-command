@@ -684,7 +684,9 @@ The verdict is derived *from* the checkpoint walk, never beside it: the walk (ru
 without its refusal-receipt early return, which the verdict counts itself) must
 find the turn structurally sound and merely unfinished or failed, or the verdict
 is `unbounded` and names the walk's own reason. Only then are the turn's intents,
-completions and refusals read.
+completions and refusals read. Only an unfinished (`unknown`) checkpoint is
+classified: a completed turn is settled elsewhere, and a terminal checkpoint —
+`ok` or not — keeps today's settlement path untouched.
 
 The evidence is the runtime's own. A tool intent is durable before the host
 allows any tool: Claude's `tool_use` frame is in the transcript before the
@@ -703,10 +705,13 @@ shown as a quoted, line-safe literal (a backslash escape can make the rendered
 form longer, never unbounded), on every surface.
 
 `none` and `bounded` stay recorded facts: the `silas.directive-recovery-decided`
-event carries `dead_turn` (verdict, runtime, effects, refusals, the host-absent
-incarnations; an owner-decision records its verdict too, an unbounded one with the
-intents it may have run) and the successor's directive or note ends with the
-service-read evidence line. The retirement itself (whichever route retires the
+event carries `custody_verdict` (`{ verdict, effects?, reason? }`, computed by the
+service when `/recover` consumes the decision, never supplied by the caller and
+not part of the decision fingerprint; a replay returns the stored verdict and a
+decision recorded before the field replays unchanged) and `dead_turn` (verdict,
+runtime, effects, refusals, the host-absent incarnations; an owner-decision
+records its verdict too, an unbounded one with the intents it may have run), and
+the successor's directive or note ends with the service-read evidence line. The retirement itself (whichever route retires the
 request) records the dead producer's missing cessation receipt, as a completed
 host-absent turn gets, so the next request's own dispatch is not refused as
 unproven cleanup; the restart pass does the same when it first meets the request
