@@ -1196,3 +1196,16 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts && npx vitest run test/review-ci-evidence.test.ts test/gitlab-mr-read.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-519-static = "npm run lint && npm run typecheck && npm run build"
 gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
+
+# Admission remote-probe budget: the bound that starved the probe's local
+# ref-name check on process-spawn latency is 30 s (matching the movement
+# probe's own per-remote lookup), not 5 s. `-fast` covers the A1 constant
+# pin and the suite-shape/test-budget registries; `-heavy` is the classified
+# admission suite; `-static` is lint + compiler + build. `-red` overlays the
+# final A1 test file onto an isolated archive of the pre-change base
+# ccd6337f (node_modules symlinked, approved RPC patch first) and exits
+# non-zero by design: the pin REDs there because the base's bound is 5_000.
+admission-fast = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/config.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+admission-heavy = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-admission-preflight.test.ts"
+admission-static = "npm run lint && npm run typecheck && npm run build"
+admission-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-admission-budget-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/config.test.ts "$d/test/config.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "admission-budget RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --reporter=verbose test/config.test.ts -t "pins the admission remote-probe budget at 30 seconds"'
