@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -134,6 +134,35 @@ describe('compiled service: boot settles the agent rows a previous process left 
     try {
       const binned = await binJob(service.baseUrl, service.token, jobId);
       expect(binned, JSON.stringify(binned.body)).toMatchObject({ status: 200, body: { id: jobId, status: 'binned' } });
+    } finally {
+      await service.stop();
+    }
+  }, 90_000);
+
+  it('re-proves a parked job\'s interrupted stop against the settled rows: a ghost turn no longer leaves it unproven', async () => {
+    const jobId = 'job-ghost-parked';
+    const { home, workspace } = seedHome('gru-ghost-parked', (ledger) => {
+      ledger.addJob({ id: jobId, repo: 'fixture', title: 'parked mid-turn', baseBranch: 'main', briefing: 'work' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.registerAgent({ id: 'ghost-parked', role: 'minion', jobId });
+      ledger.setAgentState('ghost-parked', 'streaming');
+      ledger.setJobStatus(jobId, 'parked');
+      // The service stopped between the park's stop request and its verdict.
+      ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId, payload: { state: 'requested', by: 'crash', reason: 'interrupted' } });
+    });
+    const service = await startRealService({
+      port: await pickFreePort(), token: 'ghost-parked-token', home, workspace, keepHome: true, requireWebDist: false,
+    });
+    try {
+      await vi.waitFor(() => {
+        const verdicts = readLedger(home, (db) => (db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind = 'job.execution-stop' ORDER BY seq")
+          .all(jobId) as unknown as { payload: string }[]).map((event) => JSON.parse(event.payload) as Record<string, unknown>));
+        // The seeded request, then the boot re-proof's verdict: the ghost is
+        // a settled `error` row, not an open turn the runtime fails to hold.
+        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'stopped']);
+        expect(verdicts[1]).toMatchObject({ physical_state: 'stopped', agents: [], outstanding: [] });
+      }, { timeout: 30_000, interval: 250 });
+      expect(agentRows(home, jobId)).toEqual([{ id: 'ghost-parked', state: 'error' }]);
     } finally {
       await service.stop();
     }

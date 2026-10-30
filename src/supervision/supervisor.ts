@@ -71,6 +71,11 @@ export interface SupervisorRegistry {
   quarantineHandle(handle: AgentHandle): void;
   spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle>;
   disposeHandle(handle: AgentHandle): Promise<void>;
+  /** Every handle this process holds — unpublished and quarantined ones
+   * included, which `getHandle` hides. Only the one-shot boot settlement of a
+   * previous process's open turns reads it (issue #547); a registry without it
+   * makes that settlement refuse by name rather than guess. */
+  listHandles?(): readonly AgentHandle[];
 }
 
 /**
@@ -602,29 +607,47 @@ export class Supervisor {
    * Issue #547: an agent row a previous service process left `spawning` or
    * `streaming` has no process, no registry handle and no further events, yet
    * every live-work fence counts it as an open worker turn, so nothing ever
-   * clears it. Call this ONCE per boot, after hydration (`start`), with the
-   * handles this process holds: a row no handle and no supervised record
-   * owns belonged to a previous process. Each such row leaves the live
-   * states through the same `error` move a dead turn takes (an `agent.state`
-   * event naming {@link HOST_ABSENT_AT_BOOT}) and is surfaced by the orphan
-   * notice. Agent rows only: the turn is not resumed, and no producer
-   * cessation, retirement, abandonment, completion or delivery is recorded.
-   * A second call, and any turn this process spawns, is left alone.
+   * clears it. Call this ONCE per boot, after hydration (`start`) and after
+   * the boot recoveries that re-run work under an existing agent id: a row
+   * that no registry handle (published or not), no supervised record and no
+   * unfinished tracked child worker owns belonged to a previous process. Each
+   * such row leaves the live states through the same `error` move a dead turn
+   * takes (an `agent.state` event naming {@link HOST_ABSENT_AT_BOOT}) and is
+   * surfaced by the orphan notice. Agent rows only: the turn is not resumed,
+   * and no producer cessation, retirement, abandonment, completion or
+   * delivery is recorded. A second call, and any turn this process runs, is
+   * left alone.
+   *
+   * A row whose ownership cannot be read, or whose move fails, stays open and
+   * is reported `failed` (the next boot retries it). A registry that cannot
+   * list its handles, or an agent listing that fails, throws: the supervisor
+   * must not guess which turns are another process's.
    */
-  settleHostAbsentTurns(live: readonly Pick<AgentHandle, 'id'>[]): HostAbsentTurnSettlement {
+  settleHostAbsentTurns(): HostAbsentTurnSettlement {
     if (this.disposed || this.hostAbsentSettled) return { examined: 0, live: 0, settled: [], failed: [] };
+    if (typeof this.registry.listHandles !== 'function') {
+      throw new Error(
+        'the supervisor registry cannot list its handles, so a previous process\'s open turns cannot be told from this ' +
+          'process\'s — no agent row is settled; give the registry a listHandles() that includes unpublished handles',
+      );
+    }
+    // One synchronous snapshot: no spawn or disposal can interleave between
+    // the rows and the handles that are compared against them.
     const open = this.ledger.listAgents().filter((row) => row.state === 'spawning' || row.state === 'streaming');
+    const held = new Set(this.registry.listHandles().map((handle) => handle.id));
     this.hostAbsentSettled = true;
-    const held = new Set(live.map((handle) => handle.id));
     const settled: string[] = [];
     const failed: string[] = [];
     let owned = 0;
     for (const row of open) {
-      if (held.has(row.id) || this.agents.has(row.id)) {
-        owned += 1;
-        continue;
-      }
       try {
+        // A tracked child admitted but not finished is re-run by the child
+        // service's own boot reconciliation under this same agent id; its row
+        // reads `spawning` until the spawn returns a handle.
+        if (held.has(row.id) || this.agents.has(row.id) || this.ledger.childWorkerByAgent(row.id)?.resultState === null) {
+          owned += 1;
+          continue;
+        }
         this.ledger.setAgentState(row.id, 'error', HOST_ABSENT_AT_BOOT);
       } catch (error) {
         failed.push(row.id);
@@ -639,8 +662,8 @@ export class Supervisor {
       this.postOrphanedTurn(
         row.id,
         HOST_ABSENT_AT_BOOT,
-        `the previous service process ended while the turn was ${row.state}; this process holds no handle for it, ` +
-          'so nothing is running and nothing was re-delivered',
+        `its row was still ${row.state} when this service process booted and this process holds no handle for it — ` +
+          'the host that ran it is gone, and nothing was re-delivered',
       );
     }
     return { examined: open.length, live: owned, settled, failed };

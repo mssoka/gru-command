@@ -602,9 +602,9 @@ describe('directive retirement — evidence-fenced control closure', () => {
 
     const supervisor = new Supervisor({ ledger: h.ledger, notifications: h.notifications,
       config: { enabled: false, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
-      registry: { getHandle: () => null, quarantineHandle: () => {}, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
+      registry: { getHandle: () => null, listHandles: () => [], quarantineHandle: () => {}, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
     try {
-      expect(supervisor.settleHostAbsentTurns([]).settled).toEqual(['ghost-agent']);
+      expect(supervisor.settleHostAbsentTurns().settled).toEqual(['ghost-agent']);
     } finally { supervisor.dispose(); }
 
     expect(h.ledger.getAgent('ghost-agent')?.state).toBe('error');
