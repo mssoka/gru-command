@@ -794,7 +794,9 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(requestId.length).toBeGreaterThan(600);
     const h = await boot({ crashAt: ['record-written'] });
     await historicalLiveRequest(h, repo, 'job-c9', requestId);
-    expect((await propose(h, requestId)).status).toBe(400);
+    // The idempotency key is bounded to 128 characters, the request id is not.
+    const keyed = { idempotency_key: 'key-long-request-id' };
+    expect((await propose(h, requestId, keyed)).status).toBe(400);
     const [id] = h.ledger.listActiveOwnerApprovalIds();
     expect(h.ledger.getOwnerApproval(id!)).toMatchObject({ state: 'proposed' });
     expect(h.ledger.getNotification(h.ledger.getOwnerApproval(id!)!.notificationId)).toBeNull();
@@ -809,7 +811,7 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(h.ledger.listActiveOwnerApprovalIds()).toEqual([]);
     expect(approvalCards(h)).toEqual([]);
     // Not wedged: a new proposal is not answered owner_approval_pending.
-    const again = await propose(h, requestId, { idempotency_key: 'second-try' });
+    const again = await propose(h, requestId, { idempotency_key: 'key-long-second-try' });
     expect(again.status).toBe(201);
     expect(createdApproval(again)).toMatchObject({ state: 'refused', outcome: { refusal: { code: 'card-post-failed' } } });
     expect(abandonmentEvents(h)).toEqual([]);
@@ -945,6 +947,7 @@ describe('owner approval — the stored failure message is redacted, then cut to
   it('drops a credential that begins after position 300 along with the rest of the cut', async () => {
     const message = `${'x'.repeat(320)} ${BEARER}${SENTINEL}`;
     expect(message.indexOf(SENTINEL)).toBeGreaterThan(300);
+    expect(redactCredentials(message)).not.toContain(SENTINEL);
     const { h, record, cardId } = await failThrice('after', message);
     const stored = record.refusal?.blockers[0] ?? '';
     expect(record.refusal?.code).toBe('execution-error');
@@ -955,10 +958,12 @@ describe('owner approval — the stored failure message is redacted, then cut to
   });
 
   it('leaves no fragment of a credential that straddles position 300', async () => {
-    const head = 'y'.repeat(300 - BEARER.length - 6);
-    const message = `${head}${BEARER}${SENTINEL} and some trailing detail`;
+    const head = 'y'.repeat(300 - 6 - 1 - BEARER.length);
+    const message = `${head} ${BEARER}${SENTINEL} and some trailing detail`;
     expect(message.indexOf(SENTINEL)).toBeLessThan(300);
     expect(message.indexOf(SENTINEL) + SENTINEL.length).toBeGreaterThan(300);
+    // The fixture really carries a credential the redactor recognises.
+    expect(redactCredentials(message)).not.toContain(SENTINEL);
     const { h, record, cardId } = await failThrice('straddle', message);
     const stored = record.refusal?.blockers[0] ?? '';
     // Redaction first, then the cut: cutting first would keep six characters of the credential.
