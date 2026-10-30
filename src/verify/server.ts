@@ -12,6 +12,7 @@ import {
   VerificationRequestConflictError,
   VerificationScheduler,
   isValidVerificationRequestId,
+  maskedEventPayload,
   readGitState,
   type VerificationAttemptStatus,
   type VerificationLease,
