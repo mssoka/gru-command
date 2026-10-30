@@ -284,6 +284,10 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     ['curl -u a:"abc12"', `curl -u a:${REDACTION_PLACEHOLDER}`],
     ['cli --token abc123', `cli --token ${REDACTION_PLACEHOLDER}`],
     ['curl -u a:abc123', `curl -u a:${REDACTION_PLACEHOLDER}`],
+    // A value beginning with the placeholder is a credential too; only the
+    // exact placeholder is left alone (A4).
+    [`curl -u deploy:[REDACTED]${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u a:"[REDACTED]${ARGV_SECRET}" https://host/x`, `curl -u a:${REDACTION_PLACEHOLDER} https://host/x`],
     ['curl -H Authorization: token abc123', `curl -H Authorization: token ${REDACTION_PLACEHOLDER}`],
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
@@ -328,6 +332,7 @@ it('keeps argv near misses unchanged: a flag with no credential value, a short, 
     'git push -u origin main',
     'git push -u origin HEAD:refs/heads/main',
     'cli --token abc12',
+    'curl -u deploy:[REDACTED]',
     'cli --token "abc"',
     'curl -u a:"abc"',
     "curl -u a:'12345'",

@@ -41,11 +41,12 @@ const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{4,}"|\'(?=[^\']*[A-Za-z0-9
  * masked however it looks, so a `scheme://` tail is masked too: the mask is
  * also the recorded-command identity the acknowledged kill compares, and
  * masking no credential there would be worse than collapsing two
- * non-credential `-u` arguments. A value the shell already split on
+ * non-credential `-u` arguments. Only a value that is exactly the placeholder
+ * is left alone (idempotence). A value the shell already split on
  * whitespace (a child spawned with a space inside its `-u` value) is not
  * recoverable from the argv; its quoted shell source is handled by the
  * whole-quoted passes below. */
-const ARGV_TOKEN = '(?!["\']?\\[REDACTED\\]["\']?)(?:"(?=[^"]*[A-Za-z])[^"]{4,}"|\'(?=[^\']*[A-Za-z])[^\']{4,}\'|(?=[^\\s]*[A-Za-z])[^\\s]{5,}[^\\s"\'])';
+const ARGV_TOKEN = '(?!["\']?\\[REDACTED\\]["\']?(?=$|[\\s"\']))(?:"(?=[^"]*[A-Za-z])[^"]{4,}"|\'(?=[^\']*[A-Za-z])[^\']{4,}\'|(?=[^\\s]*[A-Za-z])[^\\s]{5,}[^\\s"\'])';
 
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret

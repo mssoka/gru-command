@@ -1757,9 +1757,9 @@ export class LedgerApi {
         for (const row of this.listWorktreeProcesses(input.worktreeId)) {
           // A row written since #534 already holds the masked text, so compare it
           // directly; a legacy row still holds the raw line, so compare it after
-          // one mask. (The mask is not idempotent in general, so a stored masked
-          // row is never re-masked for the comparison.) The audit carries the
-          // masked text, never a legacy row's credential.
+          // one mask. The fallback re-mask is for that legacy raw row; a stored
+          // masked row that fails the direct comparison is never rewritten. The
+          // audit carries the masked text, never a legacy row's credential.
           if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry'
             || (row.command !== maskedIdentity && redactCredentials(row.command) !== maskedIdentity)
             || !absent(row.pid) || !absent(-row.pid)) continue;
