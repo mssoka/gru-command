@@ -31,7 +31,7 @@ const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])
  * is no value. A bare token runs to whitespace and may carry quote or
  * backtick characters: `ps` shows a child's argv (or a shell-spliced word)
  * without the shell's quotation, so `--token it's-secret` is one value. */
-const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s]*[A-Za-z0-9])[^\\s]{5,}[^\\s"\'])';
+const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{4,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{4,}\'|(?=[^\\s]*[A-Za-z0-9])[^\\s]{5,}[^\\s"\'])';
 
 /** The value of a bare `-u user:password` (or `-u :password`): at least 6
  * characters with a letter (a uid:gid pair such as `165536:165536` is no
@@ -45,7 +45,7 @@ const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9
  * whitespace (a child spawned with a space inside its `-u` value) is not
  * recoverable from the argv; its quoted shell source is handled by the
  * whole-quoted passes below. */
-const ARGV_TOKEN = '(?!["\']?\\[REDACTED\\]["\']?)(?:"(?=[^"]*[A-Za-z])[^"]{6,}"|\'(?=[^\']*[A-Za-z])[^\']{6,}\'|(?=[^\\s]*[A-Za-z])[^\\s]{5,}[^\\s"\'])';
+const ARGV_TOKEN = '(?!["\']?\\[REDACTED\\]["\']?)(?:"(?=[^"]*[A-Za-z])[^"]{4,}"|\'(?=[^\']*[A-Za-z])[^\']{4,}\'|(?=[^\\s]*[A-Za-z])[^\\s]{5,}[^\\s"\'])';
 
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret

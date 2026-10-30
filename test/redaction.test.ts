@@ -277,6 +277,14 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     [`curl -u deploy:pa\`ss-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
     [`/bin/sh -c curl -u 'deploy:it'\\''s-${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     [`curl --token it's-${ARGV_SECRET}`, `curl --token ${REDACTION_PLACEHOLDER}`],
+    // A quoted token of six or more characters masks whole, even when its
+    // inner value is shorter; the exact six-character minimum masks.
+    ['cli --token "abc12"', `cli --token ${REDACTION_PLACEHOLDER}`],
+    ["cli --token '12345'", `cli --token ${REDACTION_PLACEHOLDER}`],
+    ['curl -u a:"abc12"', `curl -u a:${REDACTION_PLACEHOLDER}`],
+    ['cli --token abc123', `cli --token ${REDACTION_PLACEHOLDER}`],
+    ['curl -u a:abc123', `curl -u a:${REDACTION_PLACEHOLDER}`],
+    ['curl -H Authorization: token abc123', `curl -H Authorization: token ${REDACTION_PLACEHOLDER}`],
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
     ['docker run -u postgres:postgres image', `docker run -u postgres:${REDACTION_PLACEHOLDER} image`],
@@ -320,6 +328,9 @@ it('keeps argv near misses unchanged: a flag with no credential value, a short, 
     'git push -u origin main',
     'git push -u origin HEAD:refs/heads/main',
     'cli --token abc12',
+    'cli --token "abc"',
+    'curl -u a:"abc"',
+    "curl -u a:'12345'",
     'cli --token ******',
     'cli --tokenize abcdefgh',
     'cli --token-file /tmp/token-file',
