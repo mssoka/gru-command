@@ -480,7 +480,7 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
     detail: `Request ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
       `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}. Inspect GET /api/silas/directives/${requestId}, ` +
       (custody.length > 0
-        ? `but its producer custody is unknown (${custody.join('; ')}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`
+        ? `but its producer custody is unknown (${custody.join('; ')}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk()}`
         : `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
           'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
           'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.'),
@@ -489,9 +489,9 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
 
 /** The card text that hands an unknown-custody request to the owner: Gru
  * asks, it never abandons. */
-function ownerAbandonmentAsk(requestId: string): string {
-  return `ask the owner whether to abandon it (POST /api/silas/directives/${requestId}/abandon with by "owner" and confirm_intent true; ` +
-    'it records the outcome as unknown and holds the lane). Never call /abandon yourself.';
+function ownerAbandonmentAsk(): string {
+  return 'ask the owner whether to abandon it by proposing it with POST /api/owner-approvals, so the owner\'s Approve carries it out. ' +
+    'Never call /abandon yourself.';
 }
 
 /** A live request on a terminal job never runs again: the job merged, or
@@ -519,7 +519,7 @@ export function observeTerminalJobDirective(deps: DirectiveProgressDeps, request
     title: `Directive ${requestId} is still ${current.state} on ${job.status} job ${row.jobId}`,
     detail: `Request ${requestId} (payload_hash ${row.payloadHash}) has no terminal receipt, but job ${row.jobId} is ${job.status}: it never runs again ` +
       `and its outcome stays UNKNOWN (${evidence}). Inspect GET /api/silas/directives/${requestId}. Retire it with POST /api/silas/directives/${requestId}/retire ` +
-      `when the service can verify cessation; if its producer custody is unknown, ${ownerAbandonmentAsk(requestId)} Neither claims completion or no effect.`,
+      `when the service can verify cessation; if its producer custody is unknown, ${ownerAbandonmentAsk()} Neither claims completion or no effect.`,
     dedupe: 'active' });
 }
 

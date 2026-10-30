@@ -102,6 +102,10 @@ export interface DispatchServerOptions {
   readonly childWorkers?: ChildWorkerService;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
+  /** Owner approvals (#523): the service behind /api/owner-approvals*, hosted
+   * where Silas ops are. The server authenticates; the service owns the rest.
+   * Absent = /api/owner-approvals* answers 503. */
+  readonly ownerApprovals?: { handle(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> };
   /** Durable pipeline queue surface (approved j-239/j-1064); absent =
    * /api/pipeline/* answers 503 (queue not hosted in this build). */
   readonly pipeline?: PipelineService;
@@ -550,6 +554,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
+    if (path === '/api/owner-approvals' || path.startsWith('/api/owner-approvals/')) {
+      if (!authed(req, res)) return true;
+      const approvals = options.ownerApprovals;
+      if (approvals === undefined) {
+        json(res, 503, { error: 'owner_approvals_not_hosted', detail: 'owner approvals are not hosted on this service' });
+        return true;
+      }
+      return approvals.handle(req, res, path);
+    }
     const property = /^\/api\/jobs\/([^/]+)\/property-campaigns(?:\/([^/]+)(?:\/(execute|repair|retain))?)?$/u.exec(path);
     if (property !== null) {
       if (!authed(req, res)) return true;
@@ -2603,7 +2616,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
       const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
-      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && path !== '/api/briefing-review' && !path.startsWith('/api/briefing-review/') && !isDisposition) {
+      const isOwnerApprovals = path === '/api/owner-approvals' || path.startsWith('/api/owner-approvals/');
+      if (!isProperty && !isOwnerApprovals && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && path !== '/api/briefing-review' && !path.startsWith('/api/briefing-review/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
