@@ -564,7 +564,10 @@ export class BriefingReviewService {
    * the notification names the cap's push-back/dispatch/amendment path instead
    * of pointing at an action the service will reject. */
   private changesNeededGuidance(armed: ArmedReview): string {
-    if (trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
+    const newest = [...new Set(armedChain(this.ledger, armed.chainKey).map((record) => record.reviewId))].at(-1);
+    // A late result on an older review must not borrow the newest text's cap
+    // guidance: its notification names its own round and lens jobs.
+    if (newest === armed.reviewId && trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
       return (
         'This is the round cap: record a push-back on the last reviewed text, dispatch that exact text, then immediately append ' +
         'one material corrective amendment with POST /api/dispatch/amendment (its approval.reference names owner ruling journal j-1200) ' +

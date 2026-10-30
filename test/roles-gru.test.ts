@@ -65,6 +65,7 @@ describe('gru role definition', () => {
     expect(gru).toContain('POST /api/dispatch/amendment');
     expect(gru).toContain('journal j-1200');
     expect(gru).toContain('cannot be met as stated');
+    expect(gru).toContain('The round-cap rule governs the cap condition');
     expect(gru).not.toContain('when the lenses disagree with the intent');
     expect(gru).toContain('read the code the change touches');
     expect(gru).toContain('choose the tier by risk');
