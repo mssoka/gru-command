@@ -181,13 +181,17 @@ function retryCleanup(deps: DirectiveProgressDeps, owner: CleanupOwner): Promise
   return owner.retry;
 }
 
-function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity, handle?: AgentHandle, producerStartSeq?: number, producer?: DirectiveProducer, historicalReceipt = false): void {
+/** `exemptOwnRuns` is for the checks that run inside the admitted turn (the
+ * runtime's tool fence): the request's own verification runs, requested since
+ * its native admission, do not fence its own further tools (#542). It exempts
+ * nothing before the request has that admission, and no other caller sets it. */
+function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity, handle?: AgentHandle, producerStartSeq?: number, producer?: DirectiveProducer, historicalReceipt = false, exemptOwnRuns = false): void {
   if (!historicalReceipt) check(deps, identity);
   const lane = deps.worktrees.listWorktrees({ jobId: identity.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
   const target = deps.ledger.getDirective(identity.requestId)?.nativeTarget;
   const ownSpawningAgentId = handle?.health().state === 'idle' && (target == null || (target.agentId === handle.id && target.sessionFile === handle.sessionFile)) ? handle.id : undefined;
   const ownNativeProducer = handle?.id === producer?.agentId && handle?.sessionFile === producer?.sessionFile ? producer : undefined;
-  const durable = deps.ledger.directiveProgressBlockers(identity.requestId, lane?.id ?? '', ownSpawningAgentId, producerStartSeq, ownNativeProducer)
+  const durable = deps.ledger.directiveProgressBlockers(identity.requestId, lane?.id ?? '', ownSpawningAgentId, producerStartSeq, ownNativeProducer, exemptOwnRuns)
     .filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
   const own = new Set([`directive ${identity.requestId}`, `directive recovery ${identity.requestId}`, `rebrief ${identity.requestId}`, ...(deps.ownAdmissionKinds ?? [])]);
   const reservations = deps.ledger.listJobAdmissions(identity.jobId).filter((kind) => !own.has(kind));
@@ -224,7 +228,10 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
     if (prepared !== undefined && readDirectiveSessionHeader(prepared.sessionFile).cwd !== originalLane.path) {
       throw new DirectiveCheckpointError('original native cwd differs from its registered lane; fresh directive effects are forbidden');
     }
-    checkAdmissionFences(deps, identity, prepared, producerStartSeq, preparedProducer);
+    // The runtime calls this before every side effect and, once the turn is
+    // admitted, before every tool request. Until the request has its native
+    // admission the exemption has nothing to pass, so admission is never eased.
+    checkAdmissionFences(deps, identity, prepared, producerStartSeq, preparedProducer, false, true);
   };
   try {
     if (!deps.ledger.claimDirectiveDispatch(requestId)) return;

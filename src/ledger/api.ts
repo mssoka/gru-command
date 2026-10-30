@@ -216,6 +216,14 @@ export type {
 
 type Row = Record<string, unknown>;
 
+/** The verification runs of one admitted directive request that the in-turn
+ * tool fence does not count as blockers (#542); see `ownVerificationRuns`. */
+interface OwnVerificationRuns {
+  readonly laneId: string;
+  readonly runIds: ReadonlySet<string>;
+  readonly pids: ReadonlySet<number>;
+}
+
 /**
  * The API of record (EPICS E6 story 1): every mutation updates its row AND
  * appends an events row in ONE transaction, then publishes the event on
@@ -1652,9 +1660,15 @@ export class LedgerApi {
    * can never hide an open run. `verification.attached` settles nothing
    * (issue #159). */
   hasUnsettledVerificationRun(jobId: string): boolean {
-    const row = this.db
+    return this.unsettledVerificationRunIds(jobId, 1).length > 0;
+  }
+
+  /** The run ids {@link hasUnsettledVerificationRun} counts (a run recorded
+   * without an id is one `null` entry), at most `limit` of them. */
+  private unsettledVerificationRunIds(jobId: string, limit = -1): readonly (string | null)[] {
+    const rows = this.db
       .prepare(
-        `SELECT 1 AS unsettled FROM (
+        `SELECT run_id FROM (
            SELECT json_extract(payload, '$.run_id') AS run_id,
                   MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
                   MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start') THEN seq ELSE 0 END) AS settled_seq
@@ -1664,10 +1678,10 @@ export class LedgerApi {
              'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start'
            )
            GROUP BY run_id
-         ) WHERE open_seq > settled_seq LIMIT 1`,
+         ) WHERE open_seq > settled_seq LIMIT ?`,
       )
-      .get(jobId) as Row | undefined;
-    return row !== undefined;
+      .all(jobId, limit) as Row[];
+    return rows.map((row) => (typeof row.run_id === 'string' ? row.run_id : null));
   }
 
   /** Authoritative terminal readback may close only absent matching physical
@@ -9296,7 +9310,12 @@ export class LedgerApi {
     })];
   }
 
-  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
+  /** `exemptOwnRuns` is the in-turn tool fence's (#542): it lets the request's
+   * own verification runs (see {@link ownVerificationRuns}) pass. It applies
+   * only with the validated live producer below, and only once the request
+   * has its native admission, so admission itself, `/recover`, closeout and
+   * every other caller never pass it. */
+  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer, exemptOwnRuns = false): readonly string[] {
     const row = this.getDirective(requestId);
     if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
     if (ownProducerStartSeq !== undefined && this.directiveProducerStart(this.directiveTurnIdentity(requestId)) !== ownProducerStartSeq) {
@@ -9320,7 +9339,35 @@ export class LedgerApi {
         throw new DirectiveCheckpointError('active native producer is ceased/unbound or another physical incarnation remains UNKNOWN');
       }
     }
-    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer);
+    const ownRuns = exemptOwnRuns && ownNativeProducer !== undefined ? this.ownVerificationRuns(row, laneId) : undefined;
+    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer, ownRuns);
+  }
+
+  /** The verification runs an admitted request's live producer requested
+   * itself: the scheduler accepted each (`verification.requested`, once per
+   * run id) for this job's lane after the request's correlated native
+   * admission. A run requested earlier, for another working directory, or
+   * never requested on the job is not the request's. `pids` are the processes
+   * the scheduler recorded for those runs (`verification.process-started`).
+   * Undefined for a request without native admission, and for a lane that is
+   * not the job's. */
+  private ownVerificationRuns(row: DirectiveRequestRecord, laneId: string): OwnVerificationRuns | undefined {
+    const admissionSeq = row.nativeBinding === null ? null : row.admissionSeq;
+    const lane = this.getWorktree(laneId);
+    if (admissionSeq === null || lane === null || lane.jobId !== row.jobId || lane.status === 'swept') return undefined;
+    const requests = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.cwd') AS cwd
+      FROM events WHERE job_id = ? AND kind = 'verification.requested' AND seq > ?`).all(row.jobId, admissionSeq) as Row[];
+    const runIds = new Set<string>();
+    for (const request of requests) {
+      if (typeof request.run_id === 'string' && request.cwd === lane.path) runIds.add(request.run_id);
+    }
+    const pids = new Set<number>();
+    const starts = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.pid') AS pid, json_extract(payload, '$.cwd') AS cwd
+      FROM events WHERE job_id = ? AND kind = 'verification.process-started' AND seq > ?`).all(row.jobId, admissionSeq) as Row[];
+    for (const start of starts) {
+      if (typeof start.run_id === 'string' && runIds.has(start.run_id) && start.cwd === lane.path && Number.isSafeInteger(start.pid)) pids.add(Number(start.pid));
+    }
+    return { laneId: lane.id, runIds, pids };
   }
 
   claimDirectiveCheckpoint(identity: DirectiveTurnIdentity, checkpointId: string): void {
@@ -10400,8 +10447,9 @@ export class LedgerApi {
    * read is durable state or the process-local admission registry (the
    * same boundary every producer must reserve before its first await), so
    * a synchronous check inside the state transaction is authoritative. */
-  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
-    return this.directiveOwnership(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer).map(({ text }) => text);
+  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer,
+    ownRuns?: OwnVerificationRuns): readonly string[] {
+    return this.directiveOwnership(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer, ownRuns).map(({ text }) => text);
   }
 
   /** The same ownership, each entry tagged: `unknown` when it records only
@@ -10411,7 +10459,7 @@ export class LedgerApi {
    * re-brief or another request owning the lane, a provider continuation, a
    * verification run, a review round, a lane process). */
   private directiveOwnership(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number,
-    ownNativeProducer?: DirectiveProducer): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
+    ownNativeProducer?: DirectiveProducer, ownRuns?: OwnVerificationRuns): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
     const blockers: { text: string; custody: 'unknown' | 'live' }[] = this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)
       .map((text) => ({ text, custody: 'unknown' }));
     const unknown = (text: string) => blockers.push({ text, custody: 'unknown' });
@@ -10460,22 +10508,25 @@ export class LedgerApi {
     if (waits.length > 0) {
       live(`open provider continuation(s): ${waits.map((wait) => `${wait.id} (${wait.status})`).join(', ')}`);
     }
-    if (this.hasUnsettledVerificationRun(row.jobId)) live('unsettled verification run(s) hold the lane');
+    // #542: the in-turn tool fence passes the runs the admitted request itself requested.
+    if (this.unsettledVerificationRunIds(row.jobId).some((runId) => runId === null || ownRuns?.runIds.has(runId) !== true)) live('unsettled verification run(s) hold the lane');
     const rounds = this.listRounds(row.jobId).filter((round) => round.status === 'pending' || round.status === 'live');
     if (rounds.length > 0) {
       live(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
     }
     // #464: a swept lane runs nothing; a row it left `live` (recorded
     // before sweeps moved them to `exited`) never fences a writer.
-    const liveProcesses = this.db
+    const liveProcesses = (this.db
       .prepare(
-        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
+        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid, p.evidence AS evidence
            FROM worktree_processes p
            JOIN worktrees w ON w.id = p.worktree_id
           WHERE p.state = 'live' AND w.status <> 'swept' AND (w.job_id = ? OR p.worktree_id = ?)
           ORDER BY p.worktree_id, p.pid`,
       )
-      .all(row.jobId, laneId) as Row[];
+      .all(row.jobId, laneId) as Row[])
+      // #542: the scheduler's own registry row for a pid an own run's process-started named.
+      .filter((proc) => !(ownRuns !== undefined && str(proc.worktree_id) === ownRuns.laneId && str(proc.evidence) === 'registry' && ownRuns.pids.has(Number(proc.pid))));
     if (liveProcesses.length > 0) {
       live(
         `live lane process(es): ${liveProcesses
