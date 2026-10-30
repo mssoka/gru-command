@@ -85,6 +85,11 @@ describe('gru role definition', () => {
     expect(capBullet).not.toContain('escalate to the owner');
     const precedence = bullet('**Precedence.**', '**Three routing paths.**');
     expect(precedence).toContain('escalate that finding and hold only the step it gates');
+    const routing = bullet('**Three routing paths.**', '**Round cap.**');
+    expect(routing).toContain("only for a finding whose content shows the owner's requested outcome cannot be met as stated");
+    expect(routing).toContain('Lenses disagreeing with the briefing, or a briefing that keeps drawing findings, is not that case');
+    const provenance = bullet('**Provenance.**', '## Onboarding heists');
+    expect(provenance).toContain('a push-back dispatch omits the block');
   });
 
   it('the chief owns a red default branch: fix heist from the current head, the repository hold is a restriction (#446)', () => {

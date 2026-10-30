@@ -135,11 +135,13 @@ decisive when every armed lens holds READY for the review (inherited results
 count). One decisive verdict exists per `(reviewId, generation)`; later lens
 results are recorded but never re-decide it. A decisive verdict posts one
 `action-required` notification, `briefing-review:<reviewId>:<generation>`,
-naming the verdict, round, tier, review, sha and the lens jobs, with the routing
-path: fix the briefing and re-commission, or record a push-back — and, at the
-round cap, push-back plus dispatch the exact reviewed text plus one material
-corrective amendment. It never presents an owner escalation as a routing path. A
-decisive READY carries `caught`: the blocking findings of the immediately
+naming the verdict, round, tier, review, sha and the lens jobs. A
+CHANGES-NEEDED notice carries the routing path: fix the briefing and
+re-commission, or record a push-back — and, at the round cap, push-back plus
+dispatch the exact reviewed text plus one material corrective amendment. A READY
+notice carries its provenance route: dispatch the reviewed text with its
+`briefing_review` block. Neither presents an owner escalation as a routing path.
+A decisive READY carries `caught`: the blocking findings of the immediately
 preceding CHANGES-NEEDED round of the same chain that this revision superseded (0
 when nothing was superseded).
 
@@ -265,7 +267,7 @@ spelling.
 | `briefing_review_lens_unknown` | 400 | a lens outside the armed set |
 | `briefing_review_result_conflict` | 409 | a different result for the same review and lens |
 | `briefing_review_decided` | 409 | a tier raise on a decided review |
-| `briefing_review_round_cap` | 409 | a fourth revision after three trailing CHANGES-NEEDED rounds |
+| `briefing_review_round_cap` | 409 | a further revision after three trailing CHANGES-NEEDED rounds |
 | `briefing_review_already_ready` | 409 | a push-back on a READY review |
 | `briefing_review_pushback_conflict` | 409 | a different push-back reason for the same review and generation |
 | `briefing_review_mismatch` | 409 | provenance sha or `rounds` differs from the record |

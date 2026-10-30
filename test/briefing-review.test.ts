@@ -616,6 +616,21 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
       status: 200,
       body: { reviewId: sixth.reviewId, round: 6 },
     });
+    // The advertised route works: push back the tail, then dispatch the exact
+    // text without the provenance block.
+    expect(h.service.pushback({
+      repoPath: h.repo.path,
+      briefingSha256: sixth.briefingSha256,
+      reason: 'owner ruling j-1200 cap path',
+      by: 'gru',
+    })).toMatchObject({ generation: 1, by: 'gru' });
+    expect(h.service.admitDispatch({
+      jobId: 'job-cap-pushback',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revision(6),
+      requested: undefined,
+    })).toMatchObject({ verdict: 'PUSHED-BACK', round: 6 });
   });
 
   it('announces the cap when an out-of-order older result completes the trailing run', async () => {
@@ -635,9 +650,8 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     const finalNotice = normalise(String([...h.notices.values()].at(-1)!['detail']));
     expectCapGuidance(finalNotice);
     // The cap belongs to the chain's newest text, not to the late round-1 row.
-    expect(finalNotice).toContain(`review ${newest.reviewId}`);
-    expect(finalNotice).toContain(newest.briefingSha256);
-    expect(finalNotice).toContain('Last reviewed text:');
+    expect(finalNotice).toContain(`last reviewed text is round 3 (review ${newest.reviewId}, briefing sha256 ${newest.briefingSha256})`);
+    expect(finalNotice).not.toContain('Last reviewed text:');
   });
 
   it('does not call a still-pending newest review the last reviewed text', async () => {
@@ -647,7 +661,20 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
     const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
     expect(notice).not.toContain('Last reviewed text:');
+    expect(notice).not.toContain('is READY');
     expect(notice).toContain('re-commission at this tier');
+  });
+
+  it('a late older CHANGES-NEEDED result dispatches the READY chain tail', async () => {
+    const h = harness();
+    await h.service.commission(commission(h));
+    await h.service.commission(commission(h, { briefing: `${BRIEFING}\n- The revision the owner approved.` }));
+    h.service.submitResult(resultFor(h, armedByRound(h, 2), { lens: 'stranger' }));
+    h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
+    const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expect(notice).toContain('is READY');
+    expect(notice).toContain('dispatch that reviewed text with its briefing_review provenance');
+    expect(notice).not.toContain('re-commission at this tier');
   });
 });
 

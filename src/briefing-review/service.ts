@@ -573,6 +573,15 @@ export class BriefingReviewService {
 
   private changesNeededGuidance(armed: ArmedReview): string {
     const newest = this.chainTail(armed.chainKey);
+    const newestVerdict = newest === undefined ? null : decisiveVerdict(reviewVerdicts(this.ledger, newest.reviewId), newest.generation);
+    // A late older CHANGES-NEEDED result must not send the caller to fix a
+    // chain whose newest review already decided READY.
+    if (newest !== undefined && newestVerdict?.aggregate === 'READY') {
+      return (
+        `The chain's newest review ${newest.reviewId} (round ${String(newest.round)}) is READY: ` +
+        'dispatch that reviewed text with its briefing_review provenance; this older CHANGES-NEEDED result is recorded but does not gate it.'
+      );
+    }
     // The cap is a chain condition, not a property of the triggering row: a
     // late decisive result on an older round can be the one that crosses it.
     if (trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
@@ -593,11 +602,6 @@ export class BriefingReviewService {
    * converged retry silent because the center returns the existing row. */
   private announce(armed: ArmedReview, input: { readonly verdict: BriefingReviewVerdict; readonly caught: number }): void {
     const jobs = armed.lenses.map((lens) => `${lens} (${lensJobId(armed.reviewId, lens)})`).join(', ');
-    const tail = this.chainTail(armed.chainKey);
-    const tailVerdict = tail === undefined ? null : decisiveVerdict(reviewVerdicts(this.ledger, tail.reviewId), tail.generation);
-    const tailLine = tail !== undefined && tail.reviewId !== armed.reviewId && tailVerdict !== null
-      ? [`Last reviewed text: review ${tail.reviewId} (round ${String(tail.round)}), briefing sha256 ${tail.briefingSha256}.`]
-      : [];
     this.options.notifications.post({
       id: `briefing-review:${armed.reviewId}:${String(armed.generation)}`,
       kind: BRIEFING_REVIEW_NOTIFICATION_KIND,
@@ -609,7 +613,6 @@ export class BriefingReviewService {
       detail: [
         `${input.verdict} for review ${armed.reviewId} (round ${String(armed.round)}, generation ${String(armed.generation)}, ${armed.tier} tier).`,
         `Briefing sha256 ${armed.briefingSha256}; heist "${armed.title}" in ${armed.repoPath}.`,
-        ...tailLine,
         `Lens jobs: ${jobs}.`,
         input.verdict === 'READY'
           ? `This revision caught ${String(input.caught)} blocking finding(s) the previous round would have sent to a lane.`
