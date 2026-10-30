@@ -219,7 +219,6 @@ type Row = Record<string, unknown>;
 /** The verification runs of one admitted directive request that the in-turn
  * tool fence does not count as blockers (#542); see `ownVerificationRuns`. */
 interface OwnVerificationRuns {
-  readonly laneId: string;
   readonly runIds: ReadonlySet<string>;
   readonly pids: ReadonlySet<number>;
 }
@@ -9310,11 +9309,11 @@ export class LedgerApi {
     })];
   }
 
-  /** `exemptOwnRuns` is the in-turn tool fence's (#542): it lets the request's
-   * own verification runs (see {@link ownVerificationRuns}) pass. It applies
-   * only with the validated live producer below, and only once the request
-   * has its native admission, so admission itself, `/recover`, closeout and
-   * every other caller never pass it. */
+  /** `exemptOwnRuns` is the in-turn tool fence's (#542): the request's
+   * post-admission verification runs (see {@link ownVerificationRuns}) do not
+   * count as blockers. It exempts nothing while the request has no correlated
+   * admission, and no caller but the runtimes' shared tool-time check passes
+   * it: admission, `/recover`, closeout and the rest keep every blocker. */
   directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer, exemptOwnRuns = false): readonly string[] {
     const row = this.getDirective(requestId);
     if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
@@ -9339,35 +9338,34 @@ export class LedgerApi {
         throw new DirectiveCheckpointError('active native producer is ceased/unbound or another physical incarnation remains UNKNOWN');
       }
     }
-    const ownRuns = exemptOwnRuns && ownNativeProducer !== undefined ? this.ownVerificationRuns(row, laneId) : undefined;
+    const ownRuns = exemptOwnRuns ? this.ownVerificationRuns(row, laneId) : undefined;
     return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer, ownRuns);
   }
 
-  /** The verification runs an admitted request's live producer requested
-   * itself: the scheduler accepted each (`verification.requested`, once per
-   * run id) for this job's lane after the request's correlated native
-   * admission. A run requested earlier, for another working directory, or
-   * never requested on the job is not the request's. `pids` are the processes
-   * the scheduler recorded for those runs (`verification.process-started`).
-   * Undefined for a request without native admission, and for a lane that is
-   * not the job's. */
+  /** The request's post-admission verification runs: each one's
+   * `verification.requested` (once per run id) is for the request's job, has
+   * the job's registered lane path as its `cwd`, and follows the request's
+   * correlated admission (`silas.directive-sent`). The events carry no
+   * requester, so "own" is time and place only. A run requested at or before
+   * the admission is never one. `pids` are the pids of those runs'
+   * `verification.process-started`; the lane's `worktree_processes` rows are
+   * keyed by that pid alone. Undefined while the request has no admission. */
   private ownVerificationRuns(row: DirectiveRequestRecord, laneId: string): OwnVerificationRuns | undefined {
-    const admissionSeq = row.nativeBinding === null ? null : row.admissionSeq;
     const lane = this.getWorktree(laneId);
-    if (admissionSeq === null || lane === null || lane.jobId !== row.jobId || lane.status === 'swept') return undefined;
+    if (row.admissionSeq === null || lane === null || lane.jobId !== row.jobId) return undefined;
     const requests = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.cwd') AS cwd
-      FROM events WHERE job_id = ? AND kind = 'verification.requested' AND seq > ?`).all(row.jobId, admissionSeq) as Row[];
+      FROM events WHERE job_id = ? AND kind = 'verification.requested' AND seq > ?`).all(row.jobId, row.admissionSeq) as Row[];
     const runIds = new Set<string>();
     for (const request of requests) {
       if (typeof request.run_id === 'string' && request.cwd === lane.path) runIds.add(request.run_id);
     }
+    const starts = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.pid') AS pid
+      FROM events WHERE job_id = ? AND kind = 'verification.process-started' AND seq > ?`).all(row.jobId, row.admissionSeq) as Row[];
     const pids = new Set<number>();
-    const starts = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.pid') AS pid, json_extract(payload, '$.cwd') AS cwd
-      FROM events WHERE job_id = ? AND kind = 'verification.process-started' AND seq > ?`).all(row.jobId, admissionSeq) as Row[];
     for (const start of starts) {
-      if (typeof start.run_id === 'string' && runIds.has(start.run_id) && start.cwd === lane.path && Number.isSafeInteger(start.pid)) pids.add(Number(start.pid));
+      if (typeof start.run_id === 'string' && runIds.has(start.run_id) && Number.isSafeInteger(start.pid)) pids.add(Number(start.pid));
     }
-    return { laneId: lane.id, runIds, pids };
+    return { runIds, pids };
   }
 
   claimDirectiveCheckpoint(identity: DirectiveTurnIdentity, checkpointId: string): void {
@@ -10518,15 +10516,15 @@ export class LedgerApi {
     // before sweeps moved them to `exited`) never fences a writer.
     const liveProcesses = (this.db
       .prepare(
-        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid, p.evidence AS evidence
+        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
            FROM worktree_processes p
            JOIN worktrees w ON w.id = p.worktree_id
           WHERE p.state = 'live' AND w.status <> 'swept' AND (w.job_id = ? OR p.worktree_id = ?)
           ORDER BY p.worktree_id, p.pid`,
       )
       .all(row.jobId, laneId) as Row[])
-      // #542: the scheduler's own registry row for a pid an own run's process-started named.
-      .filter((proc) => !(ownRuns !== undefined && str(proc.worktree_id) === ownRuns.laneId && str(proc.evidence) === 'registry' && ownRuns.pids.has(Number(proc.pid))));
+      // #542: a row whose pid a post-admission run's process-started named.
+      .filter((proc) => ownRuns?.pids.has(Number(proc.pid)) !== true);
     if (liveProcesses.length > 0) {
       live(
         `live lane process(es): ${liveProcesses

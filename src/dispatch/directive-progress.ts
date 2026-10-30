@@ -182,9 +182,10 @@ function retryCleanup(deps: DirectiveProgressDeps, owner: CleanupOwner): Promise
 }
 
 /** `exemptOwnRuns` is for the checks that run inside the admitted turn (the
- * runtime's tool fence): the request's own verification runs, requested since
- * its native admission, do not fence its own further tools (#542). It exempts
- * nothing before the request has that admission, and no other caller sets it. */
+ * runtimes' tool fence): the request's post-admission verification runs (see
+ * `LedgerApi.directiveProgressBlockers`) do not fence its further tools
+ * (#542). It exempts nothing before the request has its native admission, and
+ * no other caller sets it. */
 function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity, handle?: AgentHandle, producerStartSeq?: number, producer?: DirectiveProducer, historicalReceipt = false, exemptOwnRuns = false): void {
   if (!historicalReceipt) check(deps, identity);
   const lane = deps.worktrees.listWorktrees({ jobId: identity.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
