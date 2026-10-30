@@ -893,6 +893,29 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(requestState(h, 'req-c11')).toBe('abandoned');
   });
 
+  it('keeps a record proposed when the post threw after the card was committed: the card exists and is decidable', async () => {
+    const repo = makeFixtureRepo('oa-post-threw-after-commit');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    // The real center commits the row, then something after the write (the bell hook) throws.
+    h.restart({ notifications: { post: (input) => { h.notifications.post(input); throw new Error('owner bell hook failed'); } } });
+    await historicalLiveRequest(h, repo, 'job-c12', 'req-c12');
+    const created = await propose(h, 'req-c12');
+    expect(created.status).toBe(201);
+    const id = field<string>(createdApproval(created), 'id');
+    // Not refused: the card exists, so the proposal stands and a second proposal is still "pending".
+    expect(createdApproval(created)).toMatchObject({ state: 'proposed', outcome: { refusal: null } });
+    expect(approvalCards(h)).toHaveLength(1);
+    expect((await propose(h, 'req-c12', { idempotency_key: 'another-key' })).status).toBe(409);
+    expect(requestState(h, 'req-c12')).toBe('dispatching');
+    // ...and the owner's Approve on that card is carried out, not recorded and ignored.
+    h.service.current.start();
+    await decide(h, `owner-approval:${id}`, 'approve', 'owner');
+    expect(requestState(h, 'req-c12')).toBe('abandoned');
+    expect(h.ledger.getOwnerApproval(id)?.state).toBe('succeeded');
+    expect(approvalCards(h)).toHaveLength(1);
+  });
+
   it('succeeds once with a real card close, and a second reconcile appends nothing', async () => {
     const repo = makeFixtureRepo('oa-once');
     cleanupRepos.push(repo);
@@ -1228,6 +1251,36 @@ describe('owner approval — proposal answers and readback', () => {
       .toEqual(['proposed', 'approved', 'executing', 'succeeded']);
     expect(field<Record<string, unknown>>(settled.json, 'outcome')).toMatchObject({
       abandonment_event_seq: abandonmentEvents(h)[0]!.seq, refusal: null });
+  });
+});
+
+describe('owner approval — the result stays on the board after the card resolves', () => {
+  it('keeps a just-resolved approval card in the snapshot however many notifications arrived since it was posted', async () => {
+    const repo = makeFixtureRepo('oa-busy-board');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    await historicalLiveRequest(h, repo, 'job-busy', 'req-busy');
+    await historicalLiveRequest(h, repo, 'job-old', 'req-old');
+    const busy = createdApproval(await propose(h, 'req-busy'));
+    const old = createdApproval(await propose(h, 'req-old'));
+    // The owner answers hours later: far more than a snapshot's newest 30 notifications were posted since.
+    for (let index = 0; index < 45; index += 1) {
+      h.notifications.post({ kind: 'test.feed', routing: 'fyi', severity: 'info', title: `feed row ${String(index)}`, detail: null });
+    }
+    await decide(h, field<string>(busy, 'notification_id'), 'approve', 'owner');
+    await decide(h, field<string>(old, 'notification_id'), 'deny', 'owner');
+
+    expect(requestState(h, 'req-busy')).toBe('abandoned');
+    expect(requestState(h, 'req-old')).toBe('dispatching');
+    const seq = abandonmentEvents(h)[0]!.seq;
+    expect(await boardCard(h, field<string>(busy, 'notification_id'))).toMatchObject({
+      resolvedBy: 'gru', resolutionDetail: `Abandoned as outcome-unknown (abandonment event seq ${String(seq)}).` });
+    expect(await boardCard(h, field<string>(old, 'notification_id'))).toMatchObject({
+      resolvedBy: 'gru', resolutionDetail: 'Denied by the owner; nothing was run.' });
+    // The window is bounded: a card resolved long ago is not carried in every snapshot.
+    (h.db.handle).prepare('UPDATE notifications SET resolved_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', field<string>(old, 'notification_id'));
+    await expect(boardCard(h, field<string>(old, 'notification_id'))).rejects.toThrow(/does not show card/u);
+    expect(await boardCard(h, field<string>(busy, 'notification_id'))).toMatchObject({ resolvedBy: 'gru' });
   });
 });
 
