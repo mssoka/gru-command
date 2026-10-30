@@ -65,6 +65,12 @@ and blocks the job with a note. A consumed pre-bootstrap patch is different:
 any failure before its worker is admitted keeps the lane, its creation receipt
 and the readback evidence; see [WORKTREES.md §1a](./WORKTREES.md#1a-guarded-pre-bootstrap-dependency-patch).
 
+A heist that is approved but not dispatched yet is not held in conversation: it
+is enqueued in the durable pipeline (`POST /api/pipeline/enqueue`) with its full
+briefing, and the service dispatches it through this same path when its
+prerequisites are met and a resident worker slot is free. Endpoints, states and
+the admission rules are in [PIPELINE.md](./PIPELINE.md).
+
 ## 3. Lifecycle on the board
 
 The ledger's event stream drives the board: `job.handoff`,
