@@ -749,7 +749,9 @@ Migration 35 (`notification-resolution-detail`) adds the nullable
 (`resolveOwnerDecision`) or a producer's withdrawal (`withdrawOwnerProposal`)
 closed the card with, kept on the row so the board shows it on the card and
 not only in the `notification.resolved` event. A row resolved before the
-migration, or by a path that gives no detail, reads null.
+migration, or by a path that gives no detail, reads null. The migration also
+adds the partial index `idx_notifications_resolved_at`, which the board's
+read of owner cards resolved in the last 24 hours (newest 20) uses.
 
 ### Lane tokens and processes reaped by them (#486)
 

@@ -524,13 +524,22 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
    * when that fails for good: a record whose card can never exist must not
    * stay `proposed`, or every new proposal for its request is answered
    * pending. A transient failure (the store busy or locked) leaves the record
-   * `proposed` for the next reconcile to post again. The proposal and the
+   * `proposed` for the next reconcile to post again, and so does a failure
+   * after the card itself was committed. The proposal and the
    * reconcile's repost both go through here, so they classify alike. */
   const postCardOrRefuse = (record: OwnerApprovalRecord): void => {
     try {
       postCard(record);
     } catch (error) {
       const message = errorMessage(error);
+      // The write is what matters: a post commits the card and then runs hooks
+      // (the owner bell), and one of them can throw. A card that is there is
+      // posted - refusing the record would leave an open, decidable card whose
+      // Approve is recorded and ignored.
+      if (ledger.getNotification(record.notificationId) !== null) {
+        log('warn', 'owner approval: something after the card was posted failed; the card stands', { id: record.id, error: message });
+        return;
+      }
       if (isTransientCardPostFailure(error)) {
         log('warn', 'owner approval: the card could not be posted yet; the next reconcile retries it', { id: record.id, error: message });
         return;

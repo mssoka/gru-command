@@ -39,6 +39,12 @@ import type { EventRecord } from '../ledger/api.js';
  * served by the paged `GET /api/notifications/receipts` route. */
 const RECEIPT_WINDOW = 30;
 
+/** An owner card stays in the snapshot this long after it resolves, at most
+ * RESOLVED_OWNER_LIMIT of them, so the result its follow-through closed it
+ * with can be read even when the card is older than the newest rows (#523). */
+const RESOLVED_OWNER_WINDOW_MS = 24 * 60 * 60 * 1000;
+const RESOLVED_OWNER_LIMIT = 20;
+
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
@@ -1345,6 +1351,8 @@ export class BoardEngine {
         if (page.length < 50) break;
       }
     }
+    const resolvedSince = new Date(this.now() - RESOLVED_OWNER_WINDOW_MS).toISOString();
+    for (const row of this.ledger.listRecentlyResolvedOwnerNotifications(resolvedSince, RESOLVED_OWNER_LIMIT)) byId.set(row.id, row);
     return [...byId.values()]
       .sort((a, b) => b.ts.localeCompare(a.ts) || a.id.localeCompare(b.id))
       .map((row) => ({

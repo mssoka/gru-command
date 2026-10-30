@@ -5958,6 +5958,17 @@ export class LedgerApi {
       .map((row) => this.notificationFromRow(row));
   }
 
+  /** Owner cards resolved at or after `since`, newest resolution first. A card
+   * leaves the snapshot's newest-rows window and the unresolved scans the moment
+   * it resolves; the board reads these so the result a follow-through closed it
+   * with stays readable for a while, however many notifications arrived since
+   * the card was posted (#523). */
+  listRecentlyResolvedOwnerNotifications(since: string, limit: number): readonly NotificationRecord[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('recently resolved notification limit must be positive');
+    return (this.db.prepare("SELECT * FROM notifications WHERE routing = 'needs-owner' AND resolved_at IS NOT NULL AND resolved_at >= ? ORDER BY resolved_at DESC, id LIMIT ?")
+      .all(since, limit) as Row[]).map((row) => this.notificationFromRow(row));
+  }
+
   /** Count action-required notifications still awaiting a machine
    * disposition, INCLUDING terminal-bound closed receipts. Read straight
    * from the TABLE — not the bounded feed window. Receipts belong to the

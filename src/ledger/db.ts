@@ -1296,10 +1296,15 @@ export const MIGRATIONS: readonly Migration[] = [
     // before this migration (or by a path that gives no detail) keeps null.
     // LANDING COLLISION: renumber ONLY this never-applied migration if main
     // lands id 35 first.
+    //
+    // The board keeps an owner card in its snapshot for a while after it
+    // resolves (so its result can be read however many notifications arrived
+    // since it was posted); the partial index makes that range read cheap.
     id: 35,
     name: 'notification-resolution-detail',
     sql: `
       ALTER TABLE notifications ADD COLUMN resolution_detail TEXT;
+      CREATE INDEX idx_notifications_resolved_at ON notifications(resolved_at) WHERE resolved_at IS NOT NULL;
     `,
   },
 ];

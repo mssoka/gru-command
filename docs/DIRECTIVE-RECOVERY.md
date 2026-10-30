@@ -554,7 +554,11 @@ per line (`retirement_available` adds `Ordinary retirement is available;
 Gru retires it instead.`). The result is stored on the card's own row
 (`notifications.resolution_detail`, migration 35) and the board renders it on
 the card as `Result: …`, one line per blocker, not only in the
-`notification.resolved` audit event. If the request ends some other way (retired,
+`notification.resolved` audit event. A resolved card leaves the FOR YOU band
+(as every producer's does) and is read in the bell's feed; the board keeps an
+owner card in its snapshot for 24 hours after it resolves (the newest 20), so
+its result stays readable however many notifications arrived since it was
+posted. If the request ends some other way (retired,
 settled, abandoned) before the owner answers, the next reconcile withdraws
 the undecided card and ends the record `withdrawn`; a decision that landed
 first is carried out instead.
