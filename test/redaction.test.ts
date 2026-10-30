@@ -275,7 +275,7 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     // shell already split on whitespace is not recoverable from argv.)
     [`curl -u deploy:it's-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
     [`curl -u deploy:pa\`ss-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
-    [`/bin/sh -c curl -u 'deploy:it'\\''s-${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`/bin/sh -c curl -u 'deploy:it'\\''s-${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     [`curl --token it's-${ARGV_SECRET}`, `curl --token ${REDACTION_PLACEHOLDER}`],
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
