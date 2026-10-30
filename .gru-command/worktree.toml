@@ -1203,7 +1203,7 @@ gc-523-approval-focused = "npm run build && npx vitest run test/owner-approvals.
 gc-523-approval-static = "npm run lint && npm run typecheck && npm run build"
 # The fast loop over the files a review fix touches (also the red run of the
 # tests committed ahead of their fix).
-gc-523-approval-quick = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/notification-decisions.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts src/lib/board-protocol.test.ts"
+gc-523-approval-quick = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/notification-decisions.test.ts test/service-shutdown.test.ts test/ledger-db.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts src/lib/board-protocol.test.ts"
 # A14 against the ORIGINAL base `ccd6337f`: the text file imports only modules
 # that exist there and inlines its fixtures, so every case fails by assertion
 # (the old confirm_intent recipe, no new section, no pointer, no reason rule),
