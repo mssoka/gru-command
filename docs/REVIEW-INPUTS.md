@@ -142,7 +142,8 @@ Authorization: Bearer <pairing token>
 **Round-cap corrective amendment (owner ruling journal j-1200).** When a
 heist reaches the briefing-review round cap (three trailing CHANGES-NEEDED
 rounds), Gru records a push-back on the last reviewed text, dispatches that
-exact text, and appends one `effect: "material"` amendment through
+exact text without the `briefing_review` block, and appends one
+`effect: "material"` amendment through
 `POST /api/dispatch/amendment` that fixes that round's blocking findings. That
 amendment's `approval.reference` cites owner ruling journal j-1200. A round cap
 never escalates to the owner, except for a finding whose content says the

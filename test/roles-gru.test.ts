@@ -70,6 +70,11 @@ describe('gru role definition', () => {
     expect(gru).toContain('read the code the change touches');
     expect(gru).toContain('choose the tier by risk');
     expect(gru).toContain('advisory findings never start a new round');
+    const capBullet = gru.match(/\*\*Round cap\.\*\*[\s\S]*?(?=\n- \*\*|$)/u)?.[0] ?? '';
+    expect(capBullet).toContain('Never post an owner escalation for a round cap');
+    expect(capBullet).not.toContain('escalate to the owner');
+    const precedence = gru.match(/\*\*Precedence\.\*\*[\s\S]*?(?=\n- \*\*|$)/u)?.[0] ?? '';
+    expect(precedence).toContain('escalate that finding and hold only the step it gates');
   });
 
   it('the chief owns a red default branch: fix heist from the current head, the repository hold is a restriction (#446)', () => {

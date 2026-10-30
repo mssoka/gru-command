@@ -24,7 +24,8 @@ Source: GH-505. Internal identifier: `briefing-review`.
 4. **Gru routes** the result: fix the briefing and re-commission; or record a
    push-back with a reason when you judged the finding and are shipping as
    written. At the round cap, record a push-back on the last reviewed text,
-   dispatch that exact text, and immediately append one material corrective
+   dispatch that exact text without the `briefing_review` block, and immediately
+   append one material corrective
    amendment (`POST /api/dispatch/amendment`) that fixes that round's blocking
    findings; its `approval.reference` names owner ruling journal j-1200. A plain
    disagreement never escalates. The one exception is a finding whose content
@@ -91,8 +92,9 @@ higher tier and never removes a lens. A **decided** review refuses a raise with
 **Round cap.** `round` starts at 1 per chain. Three trailing CHANGES-NEEDED
 rounds mean the briefing is not converging, not that it needs another polish:
 the next revision is refused 409 `briefing_review_round_cap`. At the cap,
-record a push-back on the last reviewed text, dispatch that exact text, then
-immediately append one material corrective amendment
+record a push-back on the last reviewed text, dispatch that exact text without
+the `briefing_review` block, then immediately append one material corrective
+amendment
 (`POST /api/dispatch/amendment`) that fixes that round's blocking findings; its
 `approval.reference` names owner ruling journal j-1200. A plain disagreement
 never escalates. A finding whose content says the owner's requested outcome

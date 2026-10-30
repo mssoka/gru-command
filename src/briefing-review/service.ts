@@ -411,10 +411,15 @@ export class BriefingReviewService {
     }
     const trailing = trailingChangesNeeded(this.ledger, identity.chainKey);
     if (trailing >= BRIEFING_REVIEW_ROUND_CAP) {
+      const tail = this.chainTail(identity.chainKey);
+      const label = tail === undefined
+        ? 'the last reviewed text'
+        : `round ${String(tail.round)} (review ${tail.reviewId}, briefing sha256 ${tail.briefingSha256})`;
       throw new BriefingReviewError(
         'briefing_review_round_cap',
-        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; record a push-back on the last reviewed text, dispatch that exact text ` +
-          'without a briefing_review block, then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
+        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; the last reviewed text is ${label}: ` +
+          'record a push-back with POST /api/briefing-review/pushback on that text, dispatch it without a briefing_review block, ' +
+          'then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
           "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings",
         409,
       );
@@ -563,16 +568,23 @@ export class BriefingReviewService {
   /** The proactive routing text. At the cap a re-commission is refused, so
    * the notification names the cap's push-back/dispatch/amendment path instead
    * of pointing at an action the service will reject. */
+  private chainTail(chainKey: string): ArmedReview | undefined {
+    const chain = armedChain(this.ledger, chainKey);
+    return [...new Map(chain.map((record) => [record.reviewId, record])).values()].at(-1);
+  }
+
   private changesNeededGuidance(armed: ArmedReview): string {
-    const chain = armedChain(this.ledger, armed.chainKey);
-    const newest = [...new Map(chain.map((record) => [record.reviewId, record])).values()].at(-1);
+    const newest = this.chainTail(armed.chainKey);
     // The cap is a chain condition, not a property of the triggering row: a
     // late decisive result on an older round can be the one that crosses it.
     if (trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
-      const label = newest === undefined ? `round ${String(armed.round)}` : `round ${String(newest.round)} (review ${newest.reviewId})`;
+      const label = newest === undefined
+        ? 'the last reviewed text'
+        : `round ${String(newest.round)} (review ${newest.reviewId}, briefing sha256 ${newest.briefingSha256})`;
       return (
-        `The heist is at the briefing-review round cap for ${label}: record a push-back on the last reviewed text, dispatch that exact text ` +
-        'without a briefing_review block, then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
+        `The heist is at the briefing-review round cap; the last reviewed text is ${label}: ` +
+        'record a push-back with POST /api/briefing-review/pushback on that text, dispatch it without a briefing_review block, ' +
+        'then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
         "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings."
       );
     }
@@ -583,6 +595,10 @@ export class BriefingReviewService {
    * converged retry silent because the center returns the existing row. */
   private announce(armed: ArmedReview, input: { readonly verdict: BriefingReviewVerdict; readonly caught: number }): void {
     const jobs = armed.lenses.map((lens) => `${lens} (${lensJobId(armed.reviewId, lens)})`).join(', ');
+    const tail = this.chainTail(armed.chainKey);
+    const tailLine = tail !== undefined && tail.reviewId !== armed.reviewId
+      ? [`Last reviewed text: review ${tail.reviewId} (round ${String(tail.round)}), briefing sha256 ${tail.briefingSha256}.`]
+      : [];
     this.options.notifications.post({
       id: `briefing-review:${armed.reviewId}:${String(armed.generation)}`,
       kind: BRIEFING_REVIEW_NOTIFICATION_KIND,
@@ -594,6 +610,7 @@ export class BriefingReviewService {
       detail: [
         `${input.verdict} for review ${armed.reviewId} (round ${String(armed.round)}, generation ${String(armed.generation)}, ${armed.tier} tier).`,
         `Briefing sha256 ${armed.briefingSha256}; heist "${armed.title}" in ${armed.repoPath}.`,
+        ...tailLine,
         `Lens jobs: ${jobs}.`,
         input.verdict === 'READY'
           ? `This revision caught ${String(input.caught)} blocking finding(s) the previous round would have sent to a lane.`
@@ -766,7 +783,7 @@ export class BriefingReviewService {
       const armed = this.latest(reviewId);
       if (armed === null) return [];
       const verdict = decisiveVerdict(reviewVerdicts(this.ledger, reviewId), armed.generation);
-      return [{ reviewId, tier: armed.tier, round: armed.round, verdict: verdict?.aggregate ?? null }];
+      return [{ reviewId, tier: armed.tier, round: armed.round, verdict: verdict?.aggregate ?? null, briefingSha256: armed.briefingSha256 }];
     });
   }
 

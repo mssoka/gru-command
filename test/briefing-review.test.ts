@@ -22,6 +22,7 @@ import {
   type BriefingReviewStage,
   type BriefingReviewTier,
 } from '../src/briefing-review/types.js';
+import { briefingReviewGate } from '../src/briefing-review/gate.js';
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -209,14 +210,18 @@ function expectOrdinaryPushbackGuidance(message: string): void {
 /** The cap route names the exact push-back / dispatch / amendment sequence. */
 function expectCapGuidance(message: string): void {
   expect(message).toContain('push-back');
+  expect(message).toContain('POST /api/briefing-review/pushback');
   expect(message).toContain('dispatch that exact text');
   expect(message).toContain('without a briefing_review block');
   expect(message).toContain('POST /api/dispatch/amendment');
   expect(message).toContain('journal j-1200');
   expect(message).not.toContain('re-commission at this tier');
-  expect(message).not.toContain('POST /api/briefing-review');
+  expect(message).not.toMatch(/POST \/api\/briefing-review(?!\/pushback)/u);
   expect(message).not.toMatch(/escalat/iu);
   expect(message).not.toMatch(/needs-owner/iu);
+  // Order matters: push back, dispatch the exact text, then amend it.
+  expect(message.indexOf('push-back')).toBeLessThan(message.indexOf('dispatch that exact text'));
+  expect(message.indexOf('dispatch that exact text')).toBeLessThan(message.indexOf('POST /api/dispatch/amendment'));
 }
 
 /** Capture a refusal (a passing call breaks the test rather than reading as
@@ -621,11 +626,14 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
       h.service.submitResult(resultFor(h, armedByRound(h, round), { lens: 'stranger', findings: [blocking()] }));
       expect(normalise(String([...h.notices.values()].at(-1)!['detail']))).not.toContain('round cap');
     }
+    const newest = armedByRound(h, 3);
     h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
     const finalNotice = normalise(String([...h.notices.values()].at(-1)!['detail']));
     expectCapGuidance(finalNotice);
     // The cap belongs to the chain's newest text, not to the late round-1 row.
-    expect(finalNotice).toContain('round 3');
+    expect(finalNotice).toContain(`review ${newest.reviewId}`);
+    expect(finalNotice).toContain(newest.briefingSha256);
+    expect(finalNotice).toContain('Last reviewed text:');
   });
 });
 
@@ -832,6 +840,47 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     }));
     expect(unknown).toMatchObject({ code: 'briefing_review_unknown', status: 409 });
     expectCapGuidance(refusalMessage(unknown));
+  });
+
+  it('a mixed-tier capped chain names the chain tail, never an older enforced READY review', () => {
+    const sha = (char: string): string => char.repeat(64);
+    const chain = [
+      { reviewId: 'review-r1', tier: 'medium', round: 1, verdict: 'READY', briefingSha256: sha('a') },
+      { reviewId: 'review-r2', tier: 'low', round: 2, verdict: 'CHANGES-NEEDED', briefingSha256: sha('b') },
+      { reviewId: 'review-r3', tier: 'low', round: 3, verdict: 'CHANGES-NEEDED', briefingSha256: sha('c') },
+      { reviewId: 'review-r4', tier: 'low', round: 4, verdict: 'CHANGES-NEEDED', briefingSha256: sha('d') },
+    ] as const;
+    const briefing = 'A revised briefing has no review of its own.';
+    const base = {
+      stage: 3 as const,
+      briefing,
+      repoPath: '/repo',
+      title: 'Refunds endpoint',
+      jobId: 'job-mixed-cap',
+      exact: null,
+      exactVerdict: null,
+      exactPushback: null,
+      chain,
+    };
+    const required = briefingReviewGate({ ...base, requested: undefined });
+    expect(required.admitted).toBe(false);
+    if (required.admitted) throw new Error('expected a refusal');
+    const requiredMessage = normalise(required.error.message);
+    expect(requiredMessage).toContain('review review-r4');
+    expect(requiredMessage).toContain(sha('d'));
+    expect(requiredMessage).not.toContain('review-r1');
+    expectCapGuidance(requiredMessage);
+
+    const unknown = briefingReviewGate({
+      ...base,
+      requested: { rounds: 4, verdict: 'CHANGES-NEEDED', briefingSha256: briefingSha256Of(briefing) },
+    });
+    expect(unknown.admitted).toBe(false);
+    if (unknown.admitted) throw new Error('expected a refusal');
+    const unknownMessage = normalise(unknown.error.message);
+    expect(unknownMessage).toContain('review review-r4');
+    expect(unknownMessage).toContain(sha('d'));
+    expectCapGuidance(unknownMessage);
   });
 
   it('stage 3 enforces medium as well as high; low stays advisory, and stage 2 leaves medium advisory', async () => {

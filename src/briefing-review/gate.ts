@@ -48,6 +48,7 @@ export interface BriefingReviewChainReview {
   readonly tier: BriefingReviewTier;
   readonly round: number;
   readonly verdict: BriefingReviewVerdict | null;
+  readonly briefingSha256: string;
 }
 
 export interface BriefingReviewGateRefusal {
@@ -111,12 +112,23 @@ function chainAtCap(chain: readonly BriefingReviewChainReview[]): boolean {
   return trailing >= BRIEFING_REVIEW_ROUND_CAP;
 }
 
+/** The chain's newest review is the cap's last reviewed text. */
+function chainTail(chain: readonly BriefingReviewChainReview[]): BriefingReviewChainReview | undefined {
+  return chain[chain.length - 1];
+}
+
 /** The cap routes to push-back + dispatch + one material amendment, never to a
- * re-commission the service will refuse. */
-function capRouting(): string {
+ * re-commission the service will refuse. It names the chain tail so a caller
+ * never pushes back an older or READY review. */
+function capRouting(chain: readonly BriefingReviewChainReview[]): string {
+  const tail = chainTail(chain);
+  const label = tail === undefined
+    ? 'the last reviewed text'
+    : `round ${String(tail.round)} (review ${tail.reviewId}, briefing sha256 ${tail.briefingSha256})`;
   return (
-    'this heist is at the briefing-review round cap: record a push-back on the last reviewed text, dispatch that exact text ' +
-    'without a briefing_review block, then append one material corrective amendment with POST /api/dispatch/amendment ' +
+    `this heist is at the briefing-review round cap; the last reviewed text is ${label}: ` +
+    'record a push-back with POST /api/briefing-review/pushback on that text, dispatch it without a briefing_review block, ' +
+    'then append one material corrective amendment with POST /api/dispatch/amendment ' +
     "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings"
   );
 }
@@ -177,7 +189,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
         'briefing_review_unknown',
         409,
         chainAtCap(input.chain)
-          ? `no briefing review is armed for briefing ${dispatchedSha} in ${input.repoPath}; ${capRouting()}`
+          ? `no briefing review is armed for briefing ${dispatchedSha} in ${input.repoPath}; ${capRouting(input.chain)}`
           : `no briefing review is armed for briefing ${dispatchedSha} in ${input.repoPath}; commission one with POST /api/briefing-review before claiming its provenance`,
         null,
       );
@@ -207,7 +219,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
         'briefing_review_not_ready',
         409,
         chainAtCap(input.chain)
-          ? `review ${exact.reviewId} holds CHANGES-NEEDED and ${stageLabel(stage)} enforces ${exact.tier}-tier readiness; ${capRouting()}`
+          ? `review ${exact.reviewId} holds CHANGES-NEEDED and ${stageLabel(stage)} enforces ${exact.tier}-tier readiness; ${capRouting(input.chain)}`
           : `review ${exact.reviewId} holds CHANGES-NEEDED and ${stageLabel(stage)} enforces ${exact.tier}-tier readiness: fix the briefing and re-commission at this tier, ` +
             'or record a push-back with POST /api/briefing-review/pushback and dispatch without the block',
         'changes-needed',
@@ -233,7 +245,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
       'briefing_review_not_ready',
       409,
       chainAtCap(input.chain)
-        ? `${stageLabel(stage)} review ${exact.reviewId} holds CHANGES-NEEDED; ${capRouting()}`
+        ? `${stageLabel(stage)} review ${exact.reviewId} holds CHANGES-NEEDED; ${capRouting(input.chain)}`
         : `${stageLabel(stage)} review ${exact.reviewId} holds CHANGES-NEEDED: fix the briefing and re-commission at this tier, ` +
           'or record a push-back with POST /api/briefing-review/pushback',
       'changes-needed',
@@ -256,8 +268,7 @@ export function briefingReviewGate(input: BriefingReviewGateInput): BriefingRevi
       'briefing_review_required',
       409,
       chainAtCap(input.chain)
-        ? `this ${stageLabel(stage)} install reviewed this heist's chain (newest: ${newest.reviewId}, round ${String(newest.round)}) but this exact briefing ` +
-          `has no review; ${capRouting()}`
+        ? `this ${stageLabel(stage)} install reviewed this heist's chain but this exact briefing has no review; ${capRouting(input.chain)}`
         : `this ${stageLabel(stage)} install reviewed this heist's chain (newest: ${newest.reviewId}, round ${String(newest.round)}) but this exact briefing ` +
           'has no review; commission POST /api/briefing-review for the revised briefing before dispatching it',
       'missing',
