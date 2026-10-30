@@ -323,6 +323,32 @@ describe('recordNotificationDecision — the side-effect boundary', () => {
   });
 });
 
+describe('the result a follow-through closes an owner card with is kept on the card (#523)', () => {
+  it('stores the resolution detail of a follow-through and of a producer withdrawal on the row itself', () => {
+    const rig = boot();
+    const followed = rig.center.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Approve?', detail: 'evidence', decision: decision() }).id;
+    // An open card has no result yet.
+    expect(rig.api.getNotification(followed)).toMatchObject({ resolutionDetail: null });
+    rig.center.decide(followed, 'approve', 'web');
+    expect(rig.api.getNotification(followed)).toMatchObject({ resolutionDetail: null });
+    rig.api.resolveOwnerDecision(followed, 'Not run: live_work\nlive lane process(es): lane-1 pid 4242', INTERNAL);
+    expect(rig.api.getNotification(followed)).toMatchObject({
+      resolvedBy: 'gru', detail: 'evidence', resolutionDetail: 'Not run: live_work\nlive lane process(es): lane-1 pid 4242' });
+    // A repeated follow-through keeps the first result, as it keeps the first resolution.
+    rig.api.resolveOwnerDecision(followed, 'a later claim', INTERNAL);
+    expect(rig.api.getNotification(followed)?.resolutionDetail).toBe('Not run: live_work\nlive lane process(es): lane-1 pid 4242');
+
+    const withdrawn = rig.center.post({ kind: 'disk.reclaim-proposal', routing: 'needs-owner', severity: 'error', title: 'Reclaim?', detail: 'proposal', decision: decision() }).id;
+    rig.api.withdrawOwnerProposal(withdrawn, 'The disk is under budget again; nothing from this card is run.');
+    expect(rig.api.getNotification(withdrawn)).toMatchObject({
+      resolvedBy: 'producer-withdrawn', resolutionDetail: 'The disk is under budget again; nothing from this card is run.' });
+    // The ordinary machine resolution keeps its null: no result text was given.
+    const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
+    rig.api.disposeMachineNotification(machine.id, 'cleared');
+    expect(rig.api.getNotification(machine.id)?.resolutionDetail).toBeNull();
+  });
+});
+
 describe('side-effect permissions across the notification routes', () => {
   it('an owner escalation cannot be deduped past the typed-decision requirement', () => {
     const rig = boot();

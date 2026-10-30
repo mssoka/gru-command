@@ -3130,6 +3130,42 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.ackNotification).not.toHaveBeenCalled();
   });
 
+  it('shows the result a follow-through closed an owner card with, on the card itself (#523)', () => {
+    const view = new BoardView(() => {});
+    const closed = notification('approval-closed', {
+      routing: 'needs-owner',
+      kind: 'owner-approval.directive-abandon',
+      severity: 'error',
+      title: 'Abandon directive request req-1?',
+      detail: 'Gru proposes abandoning directive request req-1 as outcome-unknown.',
+      decision: ownerDecision({ question: 'Abandon directive request req-1 as outcome-unknown?', options: [
+        { id: 'approve', label: 'Approve', consequence: 'Closes the request as outcome-unknown.' },
+        { id: 'deny', label: 'Deny', consequence: 'Nothing runs.' },
+      ] }),
+      decidedAt: '2026-01-01T00:09:00.000Z',
+      decidedBy: 'owner',
+      decidedOption: 'approve',
+      resolvedAt: '2026-01-01T00:10:00.000Z',
+      resolvedBy: 'gru',
+      resolutionDetail: 'Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1',
+    });
+    view.render(snapshot({ notifications: [closed] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const card = document.getElementById('notification-list')!.querySelector<HTMLElement>('[data-notification-id="approval-closed"]')!;
+    const result = card.querySelector<HTMLElement>('.board-notification__result')!;
+    // The card says what happened: the code first, then each blocker on its own line.
+    expect(result.textContent).toBe('Result: Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1');
+    expect(card.textContent).toContain('follow-through resolved');
+    // A card without a recorded result renders no result line.
+    view.render(snapshot({ notifications: [{ ...closed, resolutionDetail: null }] }));
+    expect(document.querySelector('.board-notification__result')).toBeNull();
+    view.render(snapshot({ notifications: [{ ...closed, resolutionDetail: undefined }] }));
+    expect(document.querySelector('.board-notification__result')).toBeNull();
+    // An open card never shows a result, even from a stale field.
+    view.render(snapshot({ notifications: [{ ...closed, resolvedAt: null, resolvedBy: null, decidedAt: null, decidedBy: null, decidedOption: null }] }));
+    expect(document.querySelector('.board-notification__result')).toBeNull();
+  });
+
   it('board band and bell render the SAME decision question, recommendation and options', () => {
     const view = new BoardView(() => {});
     view.render(
