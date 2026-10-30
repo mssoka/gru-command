@@ -21,8 +21,17 @@ Source: GH-505. Internal identifier: `briefing-review`.
    finding and submits one verdict (READY or CHANGES-NEEDED).
 3. **The review aggregates.** Any CHANGES-NEEDED is decisive at once; READY
    needs every armed lens to be READY.
-4. **Gru routes** the result: fix the briefing and re-commission, escalate to
-   the owner, or record a push-back with a reason.
+4. **Gru routes** the result: fix the briefing and re-commission; or record a
+   push-back with a reason when you judged the finding and are shipping as
+   written. At the round cap, record a push-back on the last reviewed text,
+   dispatch that exact text without the `briefing_review` block, and
+   immediately append one material corrective amendment
+   (`POST /api/dispatch/amendment`) that fixes that round's blocking findings;
+   its `approval.reference` names owner ruling journal j-1200. A plain
+   disagreement never escalates. The one exception is a finding whose content
+   says the owner's requested outcome cannot be met as stated: it cannot be
+   repaired by an amendment without changing the owner's scope, so escalate that
+   finding and hold only the step it gates.
 5. **Dispatch carries provenance**: the exact reviewed text, its sha and the
    round/verdict, recorded on the job.
 
@@ -81,10 +90,16 @@ higher tier and never removes a lens. A **decided** review refuses a raise with
 (READY).
 
 **Round cap.** `round` starts at 1 per chain. Three trailing CHANGES-NEEDED
-rounds mean the lenses disagree with the briefing's intent, not that it needs
-another polish: the next revision is refused 409 `briefing_review_round_cap`
-with an instruction to escalate through `POST /api/notifications/needs-owner`
-(reserved class `scope-design`). A READY verdict ends the streak. An exact
+rounds mean the briefing is not converging, not that it needs another polish:
+the next revision is refused 409 `briefing_review_round_cap`. At the cap,
+record a push-back on the last reviewed text, dispatch that exact text without
+the `briefing_review` block, then immediately append one material corrective
+amendment (`POST /api/dispatch/amendment`) that fixes that round's blocking
+findings; its `approval.reference` names owner ruling journal j-1200. A plain disagreement
+never escalates. A finding whose content says the owner's requested outcome
+cannot be met as stated cannot be repaired by an amendment without changing the
+owner's scope, so it takes the owner-escalation path; escalate that finding and
+hold only the step it gates. A READY verdict ends the streak. An exact
 re-commission of a decided review still converges.
 
 ### `POST /api/briefing-review/result` — one lens result
@@ -119,10 +134,15 @@ decisive when every armed lens holds READY for the review (inherited results
 count). One decisive verdict exists per `(reviewId, generation)`; later lens
 results are recorded but never re-decide it. A decisive verdict posts one
 `action-required` notification, `briefing-review:<reviewId>:<generation>`,
-naming the verdict, round, tier, review, sha, the lens jobs and the three
-routing paths. A decisive READY carries `caught`: the blocking findings of the
-immediately preceding CHANGES-NEEDED round of the same chain that this revision
-superseded (0 when nothing was superseded).
+naming the verdict, round, tier, review, sha and the lens jobs. A
+CHANGES-NEEDED notice carries the routing path: fix the briefing and
+re-commission, or record a push-back — and, at the round cap, push-back plus
+dispatch the exact reviewed text plus one material corrective amendment. A READY
+notice carries its provenance route: dispatch the reviewed text with its
+`briefing_review` block. Neither presents an owner escalation as a routing path.
+A decisive READY carries `caught`: the blocking findings of the immediately
+preceding CHANGES-NEEDED round of the same chain that this revision superseded (0
+when nothing was superseded).
 
 ### `POST /api/briefing-review/pushback` — Gru's recorded override
 
@@ -130,11 +150,11 @@ superseded (0 when nothing was superseded).
 { "repoPath": "/code/shop", "briefingSha256": "…", "reason": "Owner ruled this shape.", "by": "gru" }
 ```
 
-The third path. It records one durable reason (1–2000 characters), is
+The recorded-override path. It records one durable reason (1–2000 characters), is
 idempotent by reason, refuses a READY review (409
 `briefing_review_already_ready`), conflicts on a different reason for the same
-review and generation (409 `briefing_review_pushback_conflict`), and lets a
-an enforced-stage dispatch of the exact sha proceed. It never changes the review's
+review and generation (409 `briefing_review_pushback_conflict`), and lets an
+enforced-stage dispatch of the exact sha proceed. It never changes the review's
 findings or the scope.
 
 ## Staged dispatch gate
@@ -246,7 +266,7 @@ spelling.
 | `briefing_review_lens_unknown` | 400 | a lens outside the armed set |
 | `briefing_review_result_conflict` | 409 | a different result for the same review and lens |
 | `briefing_review_decided` | 409 | a tier raise on a decided review |
-| `briefing_review_round_cap` | 409 | a fourth revision after three trailing CHANGES-NEEDED rounds |
+| `briefing_review_round_cap` | 409 | a further revision after three trailing CHANGES-NEEDED rounds |
 | `briefing_review_already_ready` | 409 | a push-back on a READY review |
 | `briefing_review_pushback_conflict` | 409 | a different push-back reason for the same review and generation |
 | `briefing_review_mismatch` | 409 | provenance sha or `rounds` differs from the record |
