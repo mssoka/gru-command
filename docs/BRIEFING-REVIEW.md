@@ -24,10 +24,10 @@ Source: GH-505. Internal identifier: `briefing-review`.
 4. **Gru routes** the result: fix the briefing and re-commission; or record a
    push-back with a reason when you judged the finding and are shipping as
    written. At the round cap, record a push-back on the last reviewed text,
-   dispatch that exact text without the `briefing_review` block, and immediately
-   append one material corrective
-   amendment (`POST /api/dispatch/amendment`) that fixes that round's blocking
-   findings; its `approval.reference` names owner ruling journal j-1200. A plain
+   dispatch that exact text without the `briefing_review` block, and
+   immediately append one material corrective amendment
+   (`POST /api/dispatch/amendment`) that fixes that round's blocking findings;
+   its `approval.reference` names owner ruling journal j-1200. A plain
    disagreement never escalates. The one exception is a finding whose content
    says the owner's requested outcome cannot be met as stated: it cannot be
    repaired by an amendment without changing the owner's scope, so escalate that
@@ -94,9 +94,8 @@ rounds mean the briefing is not converging, not that it needs another polish:
 the next revision is refused 409 `briefing_review_round_cap`. At the cap,
 record a push-back on the last reviewed text, dispatch that exact text without
 the `briefing_review` block, then immediately append one material corrective
-amendment
-(`POST /api/dispatch/amendment`) that fixes that round's blocking findings; its
-`approval.reference` names owner ruling journal j-1200. A plain disagreement
+amendment (`POST /api/dispatch/amendment`) that fixes that round's blocking
+findings; its `approval.reference` names owner ruling journal j-1200. A plain disagreement
 never escalates. A finding whose content says the owner's requested outcome
 cannot be met as stated cannot be repaired by an amendment without changing the
 owner's scope, so it takes the owner-escalation path; escalate that finding and
@@ -154,8 +153,8 @@ when nothing was superseded).
 The recorded-override path. It records one durable reason (1–2000 characters), is
 idempotent by reason, refuses a READY review (409
 `briefing_review_already_ready`), conflicts on a different reason for the same
-review and generation (409 `briefing_review_pushback_conflict`), and lets a
-an enforced-stage dispatch of the exact sha proceed. It never changes the review's
+review and generation (409 `briefing_review_pushback_conflict`), and lets an
+enforced-stage dispatch of the exact sha proceed. It never changes the review's
 findings or the scope.
 
 ## Staged dispatch gate
