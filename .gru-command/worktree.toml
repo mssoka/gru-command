@@ -1203,10 +1203,11 @@ gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182
 # the retirement suite, the registry pins and the #485 refusal-text scan (whose
 # resolved-constant pin carries the three named checkpoint reasons); `custody-static`
 # is the lint + typecheck + build gate; `custody-red` runs the fail-before cases
-# (A1-A3) against a scratch extract of ccd6337f (the briefing's named base; no
-# directive, ledger or runtime code differs from the PR base) with only the final
-# test file copied in, and exits non-zero by design: the verbose reporter lists
-# which cases failed there.
+# A1 and A2 by test name (contract revision 1; A3 is not in the red run because the
+# base already refuses) against a scratch extract of ccd6337f (the briefing's named
+# base; no directive, ledger or runtime code differs from the PR base) with only the
+# final test file copied in, and exits non-zero by design: the verbose reporter
+# lists which cases failed there.
 custody-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts && npx vitest run test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/decisions.test.ts"
 custody-static = "npm run lint && npm run typecheck && npm run build"
-custody-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-custody-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/restart-recovery-progress.test.ts "$d/test/restart-recovery-progress.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "custody baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/restart-recovery-progress.test.ts --testNamePattern "A[123] (pi|claude-code):"'
+custody-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-custody-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/restart-recovery-progress.test.ts "$d/test/restart-recovery-progress.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "custody baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/restart-recovery-progress.test.ts --testNamePattern "A[12] (pi|claude-code):"'
