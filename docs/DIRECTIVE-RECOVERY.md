@@ -666,6 +666,89 @@ verification fences. Its native lock reclaim names only that absent original
 PID; no heartbeat age or missing registry is permission. The ledger closes
 only that exact start token, never a later same-logical-minion incarnation.
 
+#### A dead turn is settled from its own evidence (restart custody)
+
+Host absence proves the producer gone, not what its turn did. When a request's
+original producer is `host-absent` (no live lock, process, open turn or queued
+work) and its checkpoint is not a completed turn, the service reads the
+evidence GC itself wrote for that turn identity and returns one verdict. It
+never asks a human to certify what a dead process did.
+
+| Verdict | Evidence it rests on | Custody blocker? |
+|---|---|---|
+| `none` | The turn recorded no tool intent after admission, or every intent has a recorded guard refusal (a refused tool never ran). | No |
+| `bounded` | Tool intents exist and each has a completion or a recorded guard refusal; the effects are known and listed (a failed tool is listed as failed, and the note warns it can have left partial effects). | No |
+| `unbounded` | An intent has neither a completion nor a refusal, **or** the evidence cannot be trusted: the transcript, producer journal, association journal or checkpoint is unreadable or missing, the final line is torn, a tool id repeats, or the checkpoint walk itself refuses the turn for a structural reason (a branch, a control entry, an unbound tail, a result or permission request no intent explains, a prompt that entered the unfinished turn, an unlinked compaction). | Yes — today's refusal, now naming which |
+
+The verdict is derived *from* the checkpoint walk, never beside it: the walk (run
+without its refusal-receipt early return, which the verdict counts itself) must
+find the turn structurally sound and merely unfinished or failed, or the verdict
+is `unbounded` and names the walk's own reason. Only then are the turn's intents,
+completions and refusals read. A *successful* terminal checkpoint keeps today's
+settlement path untouched (it is settled, not judged here). A failed terminal
+**is** a dead turn and is classified: the pi transcript records a provider
+failure as its own terminal row, so treating every terminal as untouched would
+leave the very turn the provider killed on the owner's desk (contract revision
+1's A1 pi fixture).
+
+The evidence is the runtime's own. A tool intent is durable before the host
+allows any tool: Claude's `tool_use` frame is in the transcript before the
+permission answer (`assertClaudeDirectiveToolIntent`), and pi's assistant
+`toolCall` row is flushed by the SDK hook before the tool runs
+(`flushDirectiveToolIntent`; pi's `<session>.directives.jsonl` holds only the
+request bindings). A completion is the matching `tool_result` (Claude) or
+`toolResult` (pi). A guard refusal is a `guard-refused` receipt for that tool
+id in `<session>.producers.jsonl`, written for either runtime; it takes
+precedence over any completion the CLI's denial produced. An assistant row the
+SDK never runs (pi `error`, `aborted`, `length` stops) holds no intent. A
+host authority-boundary refusal (no tool id) is counted and told in the line.
+Tool names and ids are model-controlled text, and a successor's prompt carries
+them: a plain token is shown as is, anything else is cut to 80 code points and
+shown as a quoted, line-safe literal (a backslash escape can make the rendered
+form longer, never unbounded), on every surface.
+
+`none` and `bounded` stay recorded facts: the `silas.directive-recovery-decided`
+event carries `custody_verdict` (`{ verdict, effects?, reason? }`, computed by the
+service when `/recover` consumes the decision, never supplied by the caller and
+not part of the decision fingerprint; a replay returns the stored verdict and a
+decision recorded before the field replays unchanged) and `dead_turn` (verdict,
+runtime, effects, refusals, the host-absent incarnations; an owner-decision
+records its verdict too, an unbounded one with the intents it may have run), and
+the successor's directive or note ends with the service-read evidence line. The retirement itself (whichever route retires the
+request) records the dead producer's missing cessation receipt, as a completed
+host-absent turn gets, so the next request's own dispatch is not refused as
+unproven cleanup; the restart pass does the same when it first meets the request
+and repairs the stale `streaming` agent row. Gru's routine `/recover` decision
+then succeeds with no owner decision: the card is an `action-required` card for
+Gru, never an owner stop, and the owner's abandon exit answers "can be retired".
+
+`bounded` rests on completions the transcript records: a completed tool can
+still have left a detached child running, and the transcript records that the
+tool returned, not that its children exited. That residue is covered by the
+existing live-lane-process fence, not by this verdict.
+
+`unbounded` is the only residue a human can still judge, and the card asks the
+question they can answer ("this turn may have run `<tools>`; continue?"). The
+owner's exit is unchanged (abandonment records the outcome as unknown); a
+"continue" answer has no mechanism yet (the owner-decision authorisation path is
+a separate change).
+
+Legacy `pending_rebriefs` markers (not requests) keep their old rule, and so does a
+request whose association is missing or unreadable (it is `unbounded`: absence of
+evidence is not evidence of no effect).
+
+**Scope: only a proven `host-absent` producer is reclassified.** Producers whose
+evidence is `unknown` (a live pid, a foreign host, an independent controller) are
+not. A Claude directive turn records an `independent` controller receipt before
+the CLI is spawned and only the CLI child's observed close proves it gone, so a
+service killed after the spawn leaves that Claude producer `unknown`, not
+`host-absent`: it keeps its owner-gated refusal (pinned by a test). The
+reclassification reaches Claude only for a producer proven host-absent (prepared,
+not independent), and pi (whose bash controller is recorded only for a
+user-initiated command). Extending it to a killed Claude CLI child needs a proof
+the child is gone (its pid is not recorded) or an owner ruling that a dead host
+cannot answer a permission request; neither is part of this change.
+
 Verification recovery also preserves original identities. Same-request terminal
 replay may reconcile matching registry process rows only after both the exact
 PID and its detached process group are absent. It records

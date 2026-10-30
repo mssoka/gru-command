@@ -21,7 +21,8 @@ import type { Role } from '../config.js';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { shownText } from '../dispatch/line-safe.js';
+import { DirectiveCheckpointError, classifyDeadDirectiveTurn, custodyVerdictOf, describeDeadTurn, shownDeadTurnTool, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveCustodyVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -1213,6 +1214,38 @@ export interface PendingRebriefRetirement {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** What a request's dead turn can have left behind, for its host-absent
+ * `producers`: null when the checkpoint is a successful terminal (settled, not
+ * judged here) or has no dead turn to judge. A failed terminal IS a dead turn:
+ * the pi transcript records a provider failure as its terminal row, and that is
+ * the shape contract revision 1's A1 requires to settle (contract revision 1's
+ * "terminal, ok or not" clause is corrected to "a successful terminal"). A
+ * checkpoint that cannot be read is `unbounded`, by name: it is no evidence
+ * either way. */
+function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]):
+  { readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] } | null {
+  let checkpoint: ReturnType<typeof inspectDirectiveCheckpoint>;
+  try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity); }
+  catch (error) {
+    return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
+  }
+  if (checkpoint.state === 'terminal' && checkpoint.ok) return null;
+  if (checkpoint.state !== 'unknown' && checkpoint.state !== 'terminal') return null;
+  return { dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
+}
+
+/** The recovery decision's record of a dead turn's verdict (bounded in size). */
+function deadTurnRecord(dead: DeadTurnVerdict, producers: readonly DirectiveProducer[]): Record<string, unknown> {
+  const cap = <T>(items: readonly T[]): readonly T[] => items.slice(0, 20);
+  return {
+    verdict: dead.verdict, runtime: dead.runtime, summary: describeDeadTurn(dead),
+    ...(dead.verdict === 'bounded' ? { effects: cap(dead.effects).map(shownDeadTurnTool), effect_count: dead.effects.length } : {}),
+    ...(dead.verdict === 'unbounded' ? { reason: dead.reason, pending: cap(dead.pending).map(shownDeadTurnTool) }
+      : { refused: cap(dead.refused).map(shownDeadTurnTool), boundary_refusals: dead.boundaryRefusals }),
+    host_absent_incarnations: producers.map(({ incarnation }) => incarnation),
+  };
 }
 
 function str(value: unknown): string {
@@ -9255,7 +9288,7 @@ export class LedgerApi {
    * reserved request is never replayed (its claim is spent) and owes a
    * recovery decision; a successor may proceed at once. Pinned by the
    * crash-window tests in restart-recovery-progress.test.ts. */
-  private directiveCleanupBlockers(jobId: string, ownProducerStartSeq?: number): readonly string[] {
+  private directiveCleanupBlockers(jobId: string, ownProducerStartSeq?: number, settled: readonly DirectiveProducer[] = []): readonly string[] {
     const rows = this.db.prepare(`SELECT seq, kind, payload FROM events e WHERE e.job_id = ?
       AND e.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
       AND NOT EXISTS (SELECT 1 FROM events newer WHERE newer.job_id = e.job_id AND newer.seq > e.seq
@@ -9279,6 +9312,9 @@ export class LedgerApi {
     const pending = starts.filter((row) => {
       if (Number(row.seq) === ownProducerStartSeq) return false;
       const start = JSON.parse(str(row.payload)) as CleanupReceipt;
+      // A dead turn's host-absent producer, whose effects its own evidence
+      // bounds (see deadTurnEvidence): the exact incarnation owes no cleanup.
+      if (settled.some((producer) => isDeepStrictEqual(producer, start.native_producer))) return false;
       // The write boundary accepts structural identity, not JSON property
       // order. Readback must keep that same exact physical start contract.
       return !(ceasedByStart.get(Number(row.seq)) ?? []).some(({ seq, receipt }) => seq > Number(row.seq) && start.native_producer !== undefined &&
@@ -9622,7 +9658,7 @@ export class LedgerApi {
       logicalStep: 'operation', incidentKey: `directive-recovery:${requestId}`,
       category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: row.baselineSeq,
       description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
-      nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId).length > 0
+      nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId, undefined, this.settledDeadProducers(requestId)).length > 0
         ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, ask the owner — the owner may abandon the unknown custody (the owner-only exit that holds the lane for a fresh owner-accepted request) or bin the job; never replay or infer cessation'
         : 'inspect exact native request evidence; choose a guarded fresh successor (rebrief-successor when the work needs a fresh session) or name the reserved owner decision; ' +
           'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request' } }));
@@ -9890,7 +9926,7 @@ export class LedgerApi {
       // Non-executing (#470): an already-retired request's debt settles on a
       // later request's actual native admission on the same lane.
       { readonly kind: 'reconcile-admitted'; readonly admittedRequestId: string };
-  }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
+  }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean; readonly custody_verdict: DirectiveCustodyVerdict | null } {
     const facts = [input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision];
     // Canonical, like the rebrief decision's (#363 S02-0-02): the same
     // decision with its properties in another order is the same decision.
@@ -9904,7 +9940,10 @@ export class LedgerApi {
       const prior = this.recoveryDecisionHistory('directive', row.requestId).find((decision) => decision.generation === input.generation);
       if (prior !== undefined) {
         if (prior.fingerprint !== fingerprint && prior.fingerprint !== legacyFingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
-        return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
+        // The stored custody verdict replays as itself; a decision recorded before
+        // contract revision 1 (no `custody_verdict`) replays unchanged, as null.
+        const stored = (this.getEvent(prior.eventSeq)?.payload as { custody_verdict?: DirectiveCustodyVerdict } | undefined)?.custody_verdict ?? null;
+        return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true, custody_verdict: stored };
       }
       const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
       const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind === 'owner-decision' && currentDebt.state === 'suspended') ? currentDebt : null;
@@ -9922,6 +9961,14 @@ export class LedgerApi {
       let admission: { readonly requestId: string; readonly admissionSeq: number; readonly admissionMinion: string | null; readonly workRevision: number;
         readonly retiredWorkRevision: number; readonly retirementSeq: number; readonly laneId: string } | null = null;
       const ownerBasis = this.recoveryOwnerBasis('directive', row.requestId);
+      // A dead turn's verdict is a recorded fact of this decision. Evidence that
+      // cannot be read is recorded as such (the retirement below refuses it by name).
+      let found: ReturnType<LedgerApi['deadTurnEvidence']> = null;
+      if (input.decision.kind !== 'reconcile-admitted') {
+        try { found = this.deadTurnEvidence(row.requestId); }
+        catch (error) { found = { dead: { verdict: 'unbounded', runtime: null, reason: `native evidence is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers: [] }; }
+      }
+      let evidenceNote = '';
       if (input.decision.kind === 'successor' || input.decision.kind === 'rebrief-successor') {
         if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
         this.assertRecoveryJobPermission(row.jobId);
@@ -9931,6 +9978,9 @@ export class LedgerApi {
           if (!ownerBasis.confirmed && (changes.length === 0 || changes.some((event) => event.kind !== 'job.amendment-accepted'))) throw new DirectiveCheckpointError('non-amendment authority change cannot revive the old request');
         }
         if (input.decision.requestId === row.requestId || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request id');
+        if (found !== null && found.dead.verdict !== 'unbounded') {
+          evidenceNote = `\n\nService-read evidence about the interrupted request ${row.requestId}, whose host is gone: ${describeDeadTurn(found.dead)}.`;
+        }
         this.retireInterruptedDirective({ requestId: row.requestId, expectedJobId: row.jobId, expectedState: row.state as LiveDirectiveState,
           expectedPayloadHash: input.expectedPayloadHash, expectedHead: input.expectedHead, expectedGeneration: input.generation,
           // This transaction just fenced the decision on the same incarnation.
@@ -9938,8 +9988,8 @@ export class LedgerApi {
           expectedAuthorityEpoch: input.expectedEpoch, expectedWorkRevision: input.expectedWorkRevision,
           expectedContractSha256: input.expectedContractSha256, lane: input.lane, reason: input.reason, by: 'gru-recovery' });
         successor = (input.decision.kind === 'successor'
-          ? this.beginDirectiveIntent({ jobId: row.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' })
-          : this.beginRebriefIntent({ jobId: row.jobId, requestId: input.decision.requestId, note: input.decision.note, holder: 'gru-recovery' })).record;
+          ? this.beginDirectiveIntent({ jobId: row.jobId, requestId: input.decision.requestId, directive: `${input.decision.directive}${evidenceNote}`, holder: 'gru-recovery' })
+          : this.beginRebriefIntent({ jobId: row.jobId, requestId: input.decision.requestId, note: `${input.decision.note}${evidenceNote}`, holder: 'gru-recovery' })).record;
       } else if (input.decision.kind === 'reconcile-admitted') {
         if (debt.claim !== null) throw new DirectiveCheckpointError(`recovery debt is claimed by request ${debt.claim.requestId} — release it before reconciling`);
         admission = this.laterSameLaneAdmission(row, input.decision.admittedRequestId, input.lane.id);
@@ -9950,6 +10000,7 @@ export class LedgerApi {
         payload: { request_id: row.requestId, generation: input.generation, payload_hash: row.payloadHash, expected_head: input.expectedHead,
           authority_epoch: input.expectedEpoch, expected_work_revision: input.expectedWorkRevision, expected_contract_sha256: input.expectedContractSha256,
           fingerprint, owner_transfer: ownerTransfer, owner_resolution_event_seq: ownerBasis.resolutionEventSeq, decision: input.decision, reason: input.reason,
+          ...(found === null ? {} : { dead_turn: deadTurnRecord(found.dead, found.producers), custody_verdict: custodyVerdictOf(found.dead) }),
           ...(admission === null ? {} : { admission: { request_id: admission.requestId, admission_seq: admission.admissionSeq, admission_minion: admission.admissionMinion,
             work_revision: admission.workRevision, retired_work_revision: admission.retiredWorkRevision, retirement_seq: admission.retirementSeq, lane_id: admission.laneId } }) } });
       this.db.prepare('UPDATE pending_directives SET recovery_decision = ? WHERE request_id = ?').run(JSON.stringify({ fingerprint, successorId: successor?.requestId ?? null, eventSeq: event.seq }), row.requestId);
@@ -9965,7 +10016,7 @@ export class LedgerApi {
         const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
         if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-evidence');
       }
-      return { successor, idempotent: false };
+      return { successor, idempotent: false, custody_verdict: found === null ? null : custodyVerdictOf(found.dead) };
     });
   }
 
@@ -10412,10 +10463,13 @@ export class LedgerApi {
    * verification run, a review round, a lane process). */
   private directiveOwnership(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number,
     ownNativeProducer?: DirectiveProducer): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
-    const blockers: { text: string; custody: 'unknown' | 'live' }[] = this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)
-      .map((text) => ({ text, custody: 'unknown' }));
+    const blockers: { text: string; custody: 'unknown' | 'live' }[] = [];
     const unknown = (text: string) => blockers.push({ text, custody: 'unknown' });
     const live = (text: string) => blockers.push({ text, custody: 'live' });
+    // The original producer's own findings, after the ledger's cleanup blockers
+    // (those exclude a dead turn's producer whose effects its evidence bounds).
+    const native: { text: string; custody: 'unknown' | 'live' }[] = [];
+    const bounded: DirectiveProducer[] = [];
     const target = this.getDirective(row.requestId)?.nativeTarget;
     if (target != null && ownNativeProducer === undefined) {
       try {
@@ -10424,14 +10478,19 @@ export class LedgerApi {
         const original = owners.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
         const last = owners.at(-1);
         const lock = last === undefined ? null : directiveProducerLockBlocker(last.producer);
-        if (lock !== null) live(lock);
-        if (original.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) unknown('original native physical owner cessation remains UNKNOWN');
+        if (lock !== null) native.push({ text: lock, custody: 'live' });
+        if (original.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) native.push({ text: 'original native physical owner cessation remains UNKNOWN', custody: 'unknown' });
         else if (original.some(({ evidence }) => evidence === 'host-absent')) {
-          const checkpoint = inspectDirectiveCheckpoint(target.sessionFile, identity);
-          if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) unknown('original host absent but native effects/checkpoint remain UNKNOWN');
+          // Host absence proves the producer gone, not what it did: the turn's
+          // own durable evidence decides.
+          const found = deadTurnOf(target.sessionFile, identity, original.filter(({ evidence }) => evidence === 'host-absent').map(({ producer }) => producer));
+          if (found?.dead.verdict === 'unbounded') native.push({ text: `original host absent but native effects/checkpoint remain UNKNOWN (${describeDeadTurn(found.dead)})`, custody: 'unknown' });
+          else if (found !== null) bounded.push(...found.producers);
         }
-      } catch (error) { unknown(`original native physical ownership unreadable: ${String(error)}`); }
+      } catch (error) { native.push({ text: `original native physical ownership unreadable (unbounded: ${shownText(String(error), 200)})`, custody: 'unknown' }); }
     }
+    this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq, bounded).forEach(unknown);
+    blockers.push(...native);
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === row.jobId && ((agent.state === 'spawning' && agent.id !== ownSpawningAgentId) ||
         // Only progress callers can supply a validated current physical owner.
@@ -10484,6 +10543,54 @@ export class LedgerApi {
       );
     }
     return blockers;
+  }
+
+  /** Restart custody: the verdict on a request whose original native producer
+   * is proven host-absent and whose turn did not complete, read from the
+   * evidence GC itself wrote (see classifyDeadDirectiveTurn). `none` and
+   * `bounded` are recorded facts, no longer custody blockers; `unbounded`
+   * keeps the request's custody UNKNOWN. Null when that is not the request's
+   * state (another producer evidence, a completed turn, no native target) —
+   * those keep their own fences. Throws what the evidence reads throw. */
+  deadTurnEvidence(requestId: string): { readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] } | null {
+    const target = this.getDirective(requestId)?.nativeTarget;
+    if (target == null) return null;
+    const identity = this.directiveTurnIdentity(requestId);
+    const owners = inspectDirectiveProducers(target.sessionFile);
+    const absent = owners.filter(({ producer, evidence }) => evidence === 'host-absent' && isDeepStrictEqual(producer.identity, identity));
+    if (absent.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) return null;
+    return deadTurnOf(target.sessionFile, identity, absent.map(({ producer }) => producer));
+  }
+
+  /** The host-absent producers of a dead turn whose own evidence bounds its
+   * effects; none when it is unbounded or cannot be read (the caller then keeps
+   * the stricter, owner-facing path). */
+  private settledDeadProducers(requestId: string): readonly DirectiveProducer[] {
+    try {
+      const found = this.deadTurnEvidence(requestId);
+      return found !== null && found.dead.verdict !== 'unbounded' ? found.producers : [];
+    } catch { return []; }
+  }
+
+  /** The dead producer's ledger start has no cessation receipt (the service
+   * died before it could write one). Its evidence bounds the turn, so the
+   * receipt is written now — the same one a completed host-absent turn gets —
+   * or the successor's own dispatch would be refused as unproven cleanup. */
+  private recordDeadProducerCessation(row: DirectiveRequestRecord, producers: readonly DirectiveProducer[]): void {
+    const identity = this.directiveTurnIdentity(row.requestId);
+    const starts = this.db.prepare("SELECT seq, payload FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-started' ORDER BY seq").all(row.jobId) as Row[];
+    for (const producer of producers) {
+      const start = starts.find((event) => {
+        const payload = JSON.parse(str(event.payload)) as { request_id?: unknown; native_producer?: unknown };
+        return payload.request_id === row.requestId && isDeepStrictEqual(payload.native_producer, producer);
+      });
+      if (start === undefined) continue; // never reached the ledger: no cleanup is owed
+      const seq = Number(start.seq);
+      if (this.db.prepare("SELECT 1 FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-ceased' AND json_extract(payload, '$.producer_start_seq') = ? LIMIT 1").get(row.jobId, seq) !== undefined) continue;
+      this.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: row.jobId, payload: {
+        request_id: row.requestId, agent_id: producer.agentId, session_file: producer.sessionFile,
+        producer_start_seq: seq, producer_identity: identity, native_producer: producer, evidence: 'host-absent' } });
+    }
   }
 
   /** Native terminal truth owns completion even before its ledger delivery.
@@ -10932,6 +11039,11 @@ export class LedgerApi {
         );
       }
       const current = this.retirementPreflight(row.requestId, input.lane.id);
+      // A dead turn whose own evidence bounds its effects (see deadTurnEvidence): its
+      // producer's missing cessation receipt is written with the retirement, whichever
+      // route retires it, so nothing later is refused as unproven cleanup.
+      const dead = this.deadTurnEvidence(row.requestId);
+      if (dead !== null && dead.dead.verdict !== 'unbounded') this.recordDeadProducerCessation(row, dead.producers);
       const admissionClass = directiveAdmissionClass(current);
       const ts = nowIso();
       this.db
