@@ -10271,9 +10271,12 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     const wave = new WaveRunner({
       ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, prHeadProbe: localHeadProbe(f.branch),
     });
-    /** The retry timer armed since `from`: its callback and delay. */
+    /** The retry timer armed since `from`: its callback and delay. The
+     * retry's own delays are one and five minutes; admission's guarded git
+     * steps arm shorter timers (the probe bound plus its guard slack), so the
+     * filter starts at the retry's first delay. */
     const armed = (from: number): { readonly fire: () => void; readonly ms: number } => {
-      const calls = timers.mock.calls.slice(from).filter(([, ms]) => typeof ms === 'number' && ms > 30_000);
+      const calls = timers.mock.calls.slice(from).filter(([, ms]) => typeof ms === 'number' && ms >= 60_000);
       expect(calls).toHaveLength(1);
       return { fire: calls[0]![0] as () => void, ms: calls[0]![1] as number };
     };
@@ -10297,7 +10300,7 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       refusedAt = Date.now();
       first.fire();
       await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled').length === 2);
-      await until(() => timers.mock.calls.slice(mark).some(([, ms]) => typeof ms === 'number' && ms > 30_000));
+      await until(() => timers.mock.calls.slice(mark).some(([, ms]) => typeof ms === 'number' && ms >= 60_000));
       const second = armed(mark);
       expect(second.ms).toBe(300_000);
       const due2 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[1] as { dueAt: string }).dueAt);
@@ -10315,12 +10318,14 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     const f = await transientFixture('controlled-clock');
     const realSetTimeout = globalThis.setTimeout;
     const realClearTimeout = globalThis.clearTimeout;
-    /** The controlled clock's scheduler: long (retry-sized) timers are held
-     * here with the delay they were armed with and fire only when the test
-     * advances the clock; everything else runs on real timers. */
+    /** The controlled clock's scheduler: retry-sized timers (at least the
+     * retry's one-minute first delay) are held here with the delay they were
+     * armed with and fire only when the test advances the clock; everything
+     * else — including admission's shorter guarded-git timers — runs on real
+     * timers. */
     const held: Array<{ readonly handle: object; readonly dueAt: number; readonly delay: number; readonly fn: () => void }> = [];
     const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
-      if (typeof ms !== 'number' || ms <= 30_000) return (realSetTimeout as (...all: unknown[]) => NodeJS.Timeout)(fn, ms, ...args);
+      if (typeof ms !== 'number' || ms < 60_000) return (realSetTimeout as (...all: unknown[]) => NodeJS.Timeout)(fn, ms, ...args);
       const handle = { unref: () => handle, ref: () => handle, hasRef: () => false, refresh: () => handle };
       held.push({ handle, dueAt: Date.now() + ms, delay: ms, fn });
       return handle as unknown as NodeJS.Timeout;
