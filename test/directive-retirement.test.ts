@@ -5,7 +5,7 @@ import { CanceledRequestCloseout } from '../src/dispatch/canceled-request-closeo
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,7 +24,7 @@ import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/f
 import { originHeadProbe } from './helpers/pr-head-probe.js';
 import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof, directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { BoardEngine } from '../src/board/engine.js';
-import { VerificationScheduler } from '../src/verify/scheduler.js';
+import { VerificationScheduler, groupAlive, pidAlive } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { reconcilePendingDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
@@ -1147,6 +1147,33 @@ describe('directive retirement — live ownership fails closed', () => {
     // pid 0 signals this process group, so this proves `pidAlive`'s
     // non-positive guard is wired in rather than reimplemented here.
     expect((await retire(h, 'req-p-zero', laneHead(lane))).status).toBe(200);
+  });
+
+  it('keeps fencing a registry row whose detached process group outlives its leader', async () => {
+    const repo = makeFixtureRepo('retire-registry-group');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-group', 'req-p-group');
+    // Every verification shell is spawned detached, so the recorded pid is a
+    // process-group leader and a descendant can outlive it. The surviving
+    // group is the spawned service still running in the lane.
+    const leader = spawn('/bin/sh', ['-c', 'sleep 60 &'], { detached: true, stdio: 'ignore' });
+    const leaderPid = leader.pid as number;
+    try {
+      await new Promise<void>((resolve) => leader.once('exit', () => resolve()));
+      await waitFor(() => groupAlive(leaderPid), 'the detached process-group member to start');
+      expect(pidAlive(leaderPid)).toBe(false);
+      h.ledger.recordWorktreeProcesses({
+        worktreeId: lane.id,
+        processes: [{ pid: leaderPid, command: 'npm test', evidence: 'registry' }],
+        state: 'live',
+      });
+      const refused = await retire(h, 'req-p-group', laneHead(lane));
+      expect(refused.status).toBe(409);
+      expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('live lane process(es)');
+    } finally {
+      try { process.kill(-leaderPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
   });
 
   it('refuses when the job has no resolvable lane and never guesses', async () => {
