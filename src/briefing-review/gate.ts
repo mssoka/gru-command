@@ -115,8 +115,8 @@ function chainAtCap(chain: readonly BriefingReviewChainReview[]): boolean {
  * re-commission the service will refuse. */
 function capRouting(): string {
   return (
-    'this heist is at the briefing-review round cap: record a push-back on the last reviewed text, dispatch that exact text, ' +
-    'then append one material corrective amendment with POST /api/dispatch/amendment ' +
+    'this heist is at the briefing-review round cap: record a push-back on the last reviewed text, dispatch that exact text ' +
+    'without a briefing_review block, then append one material corrective amendment with POST /api/dispatch/amendment ' +
     "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings"
   );
 }

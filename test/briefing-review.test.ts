@@ -132,12 +132,11 @@ function armedOf(h: Harness): { reviewId: string; briefingSha256: string; lenses
 
 /** What a lens submits: its own job id, the review's sha and evidence quoted
  * from the marked briefing. */
-function result(h: Harness, input: {
+function resultFor(h: Harness, armed: { readonly reviewId: string; readonly briefingSha256: string }, input: {
   readonly lens: string;
   readonly findings?: readonly BriefingReviewFinding[];
   readonly verdict?: 'READY' | 'CHANGES-NEEDED';
 }) {
-  const armed = armedOf(h);
   // The wire carries snake_case finding fields; the service reads them into
   // the internal camelCase shape.
   const findings = (input.findings ?? []).map((finding) => ({
@@ -154,6 +153,24 @@ function result(h: Harness, input: {
     verdict: input.verdict ?? (findings.some((finding) => finding.severity === 'blocking') ? 'CHANGES-NEEDED' : 'READY'),
     findings,
   };
+}
+
+function result(h: Harness, input: {
+  readonly lens: string;
+  readonly findings?: readonly BriefingReviewFinding[];
+  readonly verdict?: 'READY' | 'CHANGES-NEEDED';
+}) {
+  return resultFor(h, armedOf(h), input);
+}
+
+function armedByRound(h: Harness, round: number): { readonly reviewId: string; readonly briefingSha256: string } {
+  const armed = h.ledger
+    .listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] })
+    .map((event) => readArmed(event))
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+    .find((entry) => entry.round === round);
+  if (armed === undefined) throw new Error(`no armed review for round ${String(round)}`);
+  return armed;
 }
 
 /** A finding as the wire carries it (snake_case, exactly four fields). */
@@ -193,8 +210,11 @@ function expectOrdinaryPushbackGuidance(message: string): void {
 function expectCapGuidance(message: string): void {
   expect(message).toContain('push-back');
   expect(message).toContain('dispatch that exact text');
+  expect(message).toContain('without a briefing_review block');
   expect(message).toContain('POST /api/dispatch/amendment');
   expect(message).toContain('journal j-1200');
+  expect(message).not.toContain('re-commission at this tier');
+  expect(message).not.toContain('POST /api/briefing-review');
   expect(message).not.toMatch(/escalat/iu);
   expect(message).not.toMatch(/needs-owner/iu);
 }
@@ -588,6 +608,25 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
       body: { reviewId: sixth.reviewId, round: 6 },
     });
   });
+
+  it('announces the cap when an out-of-order older result completes the trailing run', async () => {
+    const h = harness();
+    const revision = (n: number): string => `${BRIEFING}\n- Revision ${String(n)} settles the empty-history case.`;
+    // Arm three revisions while every head is still pending, then decide them
+    // newest-first: the oldest result is the one that crosses the cap.
+    for (const round of [1, 2, 3]) {
+      await h.service.commission(commission(h, { briefing: round === 1 ? BRIEFING : revision(round) }));
+    }
+    for (const round of [3, 2]) {
+      h.service.submitResult(resultFor(h, armedByRound(h, round), { lens: 'stranger', findings: [blocking()] }));
+      expect(normalise(String([...h.notices.values()].at(-1)!['detail']))).not.toContain('round cap');
+    }
+    h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
+    const finalNotice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expectCapGuidance(finalNotice);
+    // The cap belongs to the chain's newest text, not to the late round-1 row.
+    expect(finalNotice).toContain('round 3');
+  });
 });
 
 describe('Nefario briefing review — the staged dispatch gate', () => {
@@ -738,6 +777,18 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     for (const round of [1, 2, 3]) {
       await h.service.commission(commission(h, { tier: 'medium', briefing: round === 1 ? BRIEFING : revision(round) }));
       h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
+      if (round === 2) {
+        // One below the cap the gate still gives the ordinary route.
+        const below = refusalOf(() => h.service.admitDispatch({
+          jobId: 'job-below-cap',
+          repoPath: h.repo.path,
+          title: 'Refunds endpoint',
+          briefing: revision(2),
+          requested: undefined,
+        }));
+        expect(below).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+        expectOrdinaryPushbackGuidance(refusalMessage(below));
+      }
     }
     const last = armedOf(h);
     const lastText = revision(3);

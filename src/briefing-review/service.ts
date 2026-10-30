@@ -413,9 +413,9 @@ export class BriefingReviewService {
     if (trailing >= BRIEFING_REVIEW_ROUND_CAP) {
       throw new BriefingReviewError(
         'briefing_review_round_cap',
-        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; record a push-back on the last reviewed text, dispatch that exact text, ` +
-          'then immediately append one material corrective amendment with POST /api/dispatch/amendment (its approval.reference names owner ruling journal j-1200) ' +
-          "that fixes that round's blocking findings",
+        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; record a push-back on the last reviewed text, dispatch that exact text ` +
+          'without a briefing_review block, then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
+          "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings",
         409,
       );
     }
@@ -564,14 +564,16 @@ export class BriefingReviewService {
    * the notification names the cap's push-back/dispatch/amendment path instead
    * of pointing at an action the service will reject. */
   private changesNeededGuidance(armed: ArmedReview): string {
-    const newest = [...new Set(armedChain(this.ledger, armed.chainKey).map((record) => record.reviewId))].at(-1);
-    // A late result on an older review must not borrow the newest text's cap
-    // guidance: its notification names its own round and lens jobs.
-    if (newest === armed.reviewId && trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
+    const chain = armedChain(this.ledger, armed.chainKey);
+    const newest = [...new Map(chain.map((record) => [record.reviewId, record])).values()].at(-1);
+    // The cap is a chain condition, not a property of the triggering row: a
+    // late decisive result on an older round can be the one that crosses it.
+    if (trailingChangesNeeded(this.ledger, armed.chainKey) >= BRIEFING_REVIEW_ROUND_CAP) {
+      const label = newest === undefined ? `round ${String(armed.round)}` : `round ${String(newest.round)} (review ${newest.reviewId})`;
       return (
-        'This is the round cap: record a push-back on the last reviewed text, dispatch that exact text, then immediately append ' +
-        'one material corrective amendment with POST /api/dispatch/amendment (its approval.reference names owner ruling journal j-1200) ' +
-        "that fixes this round's blocking findings."
+        `The heist is at the briefing-review round cap for ${label}: record a push-back on the last reviewed text, dispatch that exact text ` +
+        'without a briefing_review block, then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
+        "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings."
       );
     }
     return 'Fix the briefing and re-commission at this tier, or record a push-back with POST /api/briefing-review/pushback.';
