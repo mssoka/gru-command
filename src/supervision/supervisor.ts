@@ -475,7 +475,7 @@ export const HOST_ABSENT_AT_BOOT = 'host-absent at boot';
 export interface HostAbsentTurnSettlement {
   /** Agent rows found open (`spawning` or `streaming`). */
   readonly examined: number;
-  /** Open rows this process owns (a registry handle or a supervised record): untouched. */
+  /** Open rows this process owns (a registry handle, a supervised record or an unfinished tracked child worker): untouched. */
   readonly live: number;
   /** Agent ids moved to `error` and surfaced through the orphan notice. */
   readonly settled: readonly string[];
