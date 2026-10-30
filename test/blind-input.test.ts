@@ -602,6 +602,13 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     }
     // A match line ends its path at its own line number, whatever its text quotes.
     expect(recorded(match(named('HEAD', 'docs/issues/deferred-work.md'), 7, quoted))).toEqual(prohibited('docs/issues/deferred-work.md'));
+    // So does a name that ends in an extension: compiler-style text right behind the number (`file.ts:5:`,
+    // `key:12:val`, a clock time) is the file's text, not a longer name or the line number.
+    for (const text of [['x.ts', '5', ' err'].join(':'), ['key', '12', 'val'].join(':'), ['12', '30', '45 started'].join(':'), 'foo.md-9-bar']) {
+      const hits = scan(context(named('HEAD', 'docs/issues/v1.2/deferred-work.md'), 7, text));
+      expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited('docs/issues/v1.2/deferred-work.md'));
+      expect(JSON.stringify(hits), text).not.toMatch(/err|key|started|foo/u);
+    }
   });
 
   it('R1: a clean file\'s context line that quotes an excluded name is no hit under a non-prefix rule', () => {
@@ -623,10 +630,10 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     // An extensionless private file keeps what follows its line number out of the record too: prose, a
     // date with no space before it, a number between dashes.
     const privatePath = 'docs/issues/NOTES';
-    for (const text of ['see 2026-10-29 and 10-30-15', 'finished 12-30-45 ok', 'DATE=2026-10-29', 'x-1-y']) {
+    for (const text of ['see 2026-10-29 and 10-30-15', 'finished 12-30-45 ok', 'DATE=2026-10-29', 'x-1-y', ['meeting at 12', '30', '45 today'].join(':')]) {
       const hits = scan(context(named('HEAD', privatePath), 7, text));
       expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited(privatePath));
-      expect(JSON.stringify(hits), text).not.toMatch(/see|finished|DATE|x-1-y/u);
+      expect(JSON.stringify(hits), text).not.toMatch(/see|finished|DATE|x-1-y|meeting/u);
     }
     for (const text of ['DATE-2026-10-29-x', 'meeting at 12:30:45']) {
       expect(recorded(match(named('HEAD', privatePath), 7, text)), `match ${text}`).toEqual(prohibited(privatePath));

@@ -942,6 +942,9 @@ const MAX_GREP_DELIMITERS = 64;
 const GREP_BODY_LINE = /^\d{1,6}[:-]/u;
 /** A name with no whitespace that ends in a dotted extension. */
 const UNSPACED_FILE_NAME = /^\S*\.[A-Za-z][A-Za-z0-9]{0,15}$/u;
+/** What a name goes on with after a dotted part of its own, up to its real
+ * extension: dash-separated numbers (`report.final` + `-2026-10-29.md`). */
+const DATED_NAME_TAIL = /^(?:-\d+)+\.[A-Za-z][A-Za-z0-9]{0,15}$/u;
 
 /** A name a grep result may offer, with whether its SHAPE alone may classify
  * it (see gitGrepCandidate). */
@@ -1034,11 +1037,14 @@ function gitGrepHeadPaths(head: string): readonly GrepCandidate[] {
  * heads of the PATH REGION are guesses at a path — the line up to the first
  * delimiter that ends the path:
  *
- * - a match line's line number, `:7:` (opened and closed by a colon);
- * - a head that has reached a file name (see endsAtFileName), unless the next
- *   name end follows with no whitespace between (`report.final-2026-10-29.md`
- *   holds a dotted part of its own): `.../2026-10-29-notes.md-7-` ends at
- *   `.md`, not at the `-10-` or `-29-` before it, and what follows is text.
+ * - a match line's line number, `:7:` (opened and closed by a colon) — unless
+ *   whitespace follows an earlier delimiter and the head has not reached a file
+ *   name, when it is more likely text (`NOTES-7-meeting at 12:30:45`);
+ * - a head that has reached a file name (see endsAtFileName), unless the name
+ *   goes on with dash-separated numbers to a later extension
+ *   (`report.final-2026-10-29.md` holds a dotted part of its own, see
+ *   DATED_NAME_TAIL): `.../2026-10-29-notes.md-7-` ends at `.md`, not at the
+ *   `-10-` or `-29-` before it, and what follows is text.
  *
  * Every head up to there is a guess (a date-like part of a name is a prefix
  * of the whole name). A path that no delimiter settled (no extension) offers
@@ -1065,10 +1071,14 @@ function gitGrepLineNames(line: string): GrepNames | null {
   const fileName = found.map((d) => endsAtFileName(line.slice(Math.max(0, d.index - 32), d.index)));
   let stop = -1;
   for (let k = 0; k < found.length; k += 1) {
-    if (lineNumber[k]) { stop = k; break; }
+    if (lineNumber[k]) {
+      // After a first delimiter and whitespace, `:7:` is more likely text (`… at 12:30:45`) than the line number.
+      if (k === 0 || fileName[k] || !/\s/u.test(line.slice(found[0]!.index, found[k]!.index))) { stop = k; break; }
+      continue;
+    }
     if (!fileName[k]) continue;
-    const next = found.findIndex((_, j) => j > k && (lineNumber[j] || fileName[j]));
-    if (next < 0 || /\s/u.test(line.slice(found[k]!.index, found[next]!.index))) { stop = k; break; }
+    const next = found.findIndex((_, j) => j > k && fileName[j]);
+    if (next < 0 || !DATED_NAME_TAIL.test(line.slice(found[k]!.index, found[next]!.index))) { stop = k; break; }
   }
   const last = stop >= 0 ? stop : found.length - 1;
   if (!(stop >= 0 && lineNumber[stop])) {
