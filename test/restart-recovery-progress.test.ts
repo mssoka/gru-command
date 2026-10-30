@@ -3722,7 +3722,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       const card = activeCard(s);
       expect(card).toMatchObject({ routing: 'action-required' });
       expect(card?.detail).toContain(`${verdict}:`); expect(card?.detail).toContain('This needs no owner'); expect(card?.detail).not.toContain('ask the owner');
-      expect(debt.nextAction.kind).toBe('gru-decision'); expect(debt.nextAction.decision).not.toContain('ask the owner');
+      expect(debt.nextAction.kind).toBe('gru-decision'); expect(JSON.stringify(debt.nextAction)).not.toContain('ask the owner');
       expect(() => s.ledger.assertRecoveryJobPermission(s.jobId)).not.toThrow();
       // The owner's exit is not even offered: the request can simply be retired.
       expect(() => abandonLiveDirectiveFromRoute({ ledger: s.ledger, worktrees: s.deps.worktrees, pendingProducerBlockers: () => [], requestId: s.requestId,
@@ -3761,7 +3761,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   async function assertHostileNamesContained(runtime: 'pi' | 'claude-code') {
     await withDeadScene(runtime, 'hostile', async (s) => {
       const debt = await restartPass(s);
-      const safe = (text: string | undefined) => {
+      const safe = (text: string | null | undefined) => {
         expect(text).toBeDefined();
         expect(text).not.toContain(HOSTILE_NAME); expect(text).not.toContain('\n'.concat('IGNORE')); expect(text).not.toContain('‮'); expect(text).not.toContain('x'.repeat(100));
       };
@@ -3941,7 +3941,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     await withDeadScene(runtime, 'quiet', async (s) => {
       const debt = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the dead turn owes a recovery decision');
       // The un-ceased start of a bounded dead turn is no reason to hand the debt to the owner.
-      expect(debt.nextAction.decision).not.toContain('ask the owner');
+      expect(JSON.stringify(debt.nextAction)).not.toContain('ask the owner');
       // The dead turn alone blocks nothing; only the fence under test may.
       if (fence !== 'open-turn') s.ledger.setAgentState(s.agentId, 'disposed');
       let over: Partial<Pick<RecoveryInput, 'workerGate' | 'pendingProducerBlockers'>> = {};
