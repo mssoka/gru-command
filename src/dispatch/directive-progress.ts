@@ -339,8 +339,6 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
   const sessionOwners = inspectDirectiveProducers(row.nativeTarget.sessionFile);
   if (owners.length === 0 || sessionOwners.some(({ evidence }) => evidence === 'unknown')) throw new DirectiveCheckpointError(`exact original physical native producer cessation unproven; start ${deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId)?.seq ?? 'unbound'}`);
   if (owners.some(({ evidence }) => evidence === 'host-absent') && (proof.state === 'unknown' || (proof.state === 'terminal' && !proof.ok))) {
-    // A terminal checkpoint, ok or not, keeps today's settlement path untouched.
-    if (proof.state === 'terminal') throw new DirectiveCheckpointError('original host absent but native effects/checkpoint remain incomplete');
     // Host absence proves the producer gone, not what it did. The turn's own
     // durable evidence bounds its effects (`none`, `bounded`), and then the
     // cessation is accounted for like a completed turn's; otherwise it cannot be.

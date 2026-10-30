@@ -2078,7 +2078,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           expectedHead: strField(body, 'expected_head'), expectedEpoch: epoch,
           ...(authorityBound ? { expectedWorkRevision: revision as number, expectedContractSha256: strField(body, 'expected_contract_sha256') } : {}), reason: strField(body, 'reason'),
         } as const;
-        let outcome: ReturnType<typeof recoverInterruptedDirectiveFromRoute>;
+        let outcome: ReturnType<typeof recoverInterruptedDirectiveFromRoute> | ReturnType<typeof recoverInterruptedRebriefFromRoute>;
         if (choice['kind'] === 'reconcile-completed') {
           outcome = recoverInterruptedRebriefFromRoute({ ...recoveryInput, markerId: requestId,
             decision: { kind: 'reconcile-completed', inspectionRequestId: strField(choice, 'inspection_request_id') },

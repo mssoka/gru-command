@@ -1217,23 +1217,23 @@ function nowIso(): string {
 }
 
 /** What a request's dead turn can have left behind, for its host-absent
- * `producers`. Only the unfinished (`unknown`) checkpoint is classified; a
- * completed turn is settled elsewhere and a terminal checkpoint — ok or not —
- * keeps today's settlement path untouched. A checkpoint that cannot be read is
- * `unbounded`, by name: it is no evidence either way. */
-type DeadTurnReading =
-  | { readonly kind: 'settled' }
-  | { readonly kind: 'terminal'; readonly ok: boolean }
-  | { readonly kind: 'verdict'; readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] };
-function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]): DeadTurnReading {
+ * `producers`: null when the checkpoint is a successful terminal (settled, not
+ * judged here) or has no dead turn to judge. A failed terminal IS a dead turn:
+ * the pi transcript records a provider failure as its terminal row, and that is
+ * the shape contract revision 1's A1 requires to settle (contract revision 1's
+ * "terminal, ok or not" clause is corrected to "a successful terminal"). A
+ * checkpoint that cannot be read is `unbounded`, by name: it is no evidence
+ * either way. */
+function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]):
+  { readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] } | null {
   let checkpoint: ReturnType<typeof inspectDirectiveCheckpoint>;
   try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity); }
   catch (error) {
-    return { kind: 'verdict', dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
+    return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
   }
-  if (checkpoint.state === 'terminal') return { kind: 'terminal', ok: checkpoint.ok };
-  if (checkpoint.state !== 'unknown') return { kind: 'settled' };
-  return { kind: 'verdict', dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
+  if (checkpoint.state === 'terminal' && checkpoint.ok) return null;
+  if (checkpoint.state !== 'unknown' && checkpoint.state !== 'terminal') return null;
+  return { dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
 }
 
 /** The recovery decision's record of a dead turn's verdict (bounded in size). */
@@ -10483,13 +10483,9 @@ export class LedgerApi {
         else if (original.some(({ evidence }) => evidence === 'host-absent')) {
           // Host absence proves the producer gone, not what it did: the turn's
           // own durable evidence decides.
-          const reading = deadTurnOf(target.sessionFile, identity, original.filter(({ evidence }) => evidence === 'host-absent').map(({ producer }) => producer));
-          // A terminal checkpoint (ok or not) keeps today's path: only the failed one is UNKNOWN.
-          if (reading.kind === 'terminal' && !reading.ok) native.push({ text: 'original host absent but native effects/checkpoint remain UNKNOWN', custody: 'unknown' });
-          else if (reading.kind === 'verdict') {
-            if (reading.dead.verdict === 'unbounded') native.push({ text: `original host absent but native effects/checkpoint remain UNKNOWN (${describeDeadTurn(reading.dead)})`, custody: 'unknown' });
-            else bounded.push(...reading.producers);
-          }
+          const found = deadTurnOf(target.sessionFile, identity, original.filter(({ evidence }) => evidence === 'host-absent').map(({ producer }) => producer));
+          if (found?.dead.verdict === 'unbounded') native.push({ text: `original host absent but native effects/checkpoint remain UNKNOWN (${describeDeadTurn(found.dead)})`, custody: 'unknown' });
+          else if (found !== null) bounded.push(...found.producers);
         }
       } catch (error) { native.push({ text: `original native physical ownership unreadable (unbounded: ${shownText(String(error), 200)})`, custody: 'unknown' }); }
     }
@@ -10563,8 +10559,7 @@ export class LedgerApi {
     const owners = inspectDirectiveProducers(target.sessionFile);
     const absent = owners.filter(({ producer, evidence }) => evidence === 'host-absent' && isDeepStrictEqual(producer.identity, identity));
     if (absent.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) return null;
-    const reading = deadTurnOf(target.sessionFile, identity, absent.map(({ producer }) => producer));
-    return reading.kind === 'verdict' ? { dead: reading.dead, producers: reading.producers } : null;
+    return deadTurnOf(target.sessionFile, identity, absent.map(({ producer }) => producer));
   }
 
   /** The host-absent producers of a dead turn whose own evidence bounds its

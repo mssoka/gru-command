@@ -684,9 +684,12 @@ The verdict is derived *from* the checkpoint walk, never beside it: the walk (ru
 without its refusal-receipt early return, which the verdict counts itself) must
 find the turn structurally sound and merely unfinished or failed, or the verdict
 is `unbounded` and names the walk's own reason. Only then are the turn's intents,
-completions and refusals read. Only an unfinished (`unknown`) checkpoint is
-classified: a completed turn is settled elsewhere, and a terminal checkpoint —
-`ok` or not — keeps today's settlement path untouched.
+completions and refusals read. A *successful* terminal checkpoint keeps today's
+settlement path untouched (it is settled, not judged here). A failed terminal
+**is** a dead turn and is classified: the pi transcript records a provider
+failure as its own terminal row, so treating every terminal as untouched would
+leave the very turn the provider killed on the owner's desk (contract revision
+1's A1 pi fixture).
 
 The evidence is the runtime's own. A tool intent is durable before the host
 allows any tool: Claude's `tool_use` frame is in the transcript before the
