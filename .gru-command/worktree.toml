@@ -1197,15 +1197,19 @@ gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --co
 gc-519-static = "npm run lint && npm run typecheck && npm run build"
 gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
 
-# #520 blind access: `git grep` revision, context-line and `--heading` forms.
-# `-focused` runs the edited unit and dispatch suites, the unchanged blind-review
-# suite and the registry pins; `-static` is the lint + typecheck + build gate;
-# `-red` runs the edited suites against a scratch extract of main as this lane
-# started (it exits nonzero by design: the fail-before tests are the only
-# failures); `-red-prior` runs them against the earlier lane's scanner (commit
-# ed1dab43, byte-identical to that lane's tip in src/dispatch/blind-input.ts),
-# where only the R1-R5 cases of its last review fail.
+# #520 blind access: the forms `git grep` prints for revisions and context
+# lines (contract revision 1). `-focused` runs the edited unit and dispatch
+# suites, the unchanged blind-review suite and the registry pins; `-static` is
+# the lint + typecheck + build gate; `-msg-check` applies the scanner's own rule
+# to this branch's commit messages and to the PR text kept in
+# gru-output/gc-520/pr-body.md (reviewer-visible text) and requires 0 hits;
+# `-red` runs the contract's fail-before cases against a scratch extract of the
+# base the contract names, and `-red-4a269d13` the cases the contract revision
+# names against the earlier lane's head. Both red scopes classify their report
+# (every named case must fail BY ASSERTION, never by import) and then exit
+# non-zero by design.
 gc-520-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/blind-input.test.ts test/blind-input-dispatch.test.ts test/blind-review.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-520-static = "npm run lint && npm run typecheck && npm run build"
-gc-520-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts test/blind-input-dispatch.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/blind-input.test.ts test/blind-input-dispatch.test.ts'
-gc-520-red-prior = 'set -e; root="$PWD"; base=ed1dab43dd248438740611b9376c28adc6ec0cfc; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-prior.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts test/blind-input-dispatch.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 prior source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/blind-input.test.ts test/blind-input-dispatch.test.ts'
+gc-520-msg-check = "node gru-output/gc-520/msg-check.mjs"
+gc-520-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts test/blind-input-dispatch.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 red base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" -t "A1: |A2: |A3: |A4: |A5: |A6: " test/blind-input.test.ts test/blind-input-dispatch.test.ts; status=$?; set -e; printf "GC520 red vitest exit=%s (nonzero expected)\n" "$status"; test "$status" -ne 0; node "$root/gru-output/gc-520/red-classify.mjs" "$d/results.json" a1a6; printf "EXPECTED-NONZERO: the contract fail-before cases fail by assertion on %s\n" "$base"; exit 1'
+gc-520-red-4a269d13 = 'set -e; root="$PWD"; base=4a269d13f492688570ac0b1c8af737cc0d8bc8b5; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-red-prior.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 red-4a269d13 base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" -t "A2: any revision spelling|worktree context line records the path itself|clean file.s worktree context line|extensionless name with date-like segments|R1.R2:|parent-relative path behind a revision" test/blind-input.test.ts; status=$?; set -e; printf "GC520 red-4a269d13 vitest exit=%s (nonzero expected)\n" "$status"; test "$status" -ne 0; node "$root/gru-output/gc-520/red-classify.mjs" "$d/results.json" 4a269d13; printf "EXPECTED-NONZERO: the named cases of contract revision 1 fail by assertion on %s\n" "$base"; exit 1'

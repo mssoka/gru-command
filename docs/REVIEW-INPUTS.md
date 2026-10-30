@@ -625,10 +625,11 @@ answers `qualifying | invalidated | unattested | unobserved | not-blind | unclas
 derived only from the admission, `review.blind-access-observed` and
 `job.blind-access-unobservable` facts. The reviewer's session tool results are
 scanned at turn settle (grep lines landing in excluded paths — also in the forms
-`git grep` prints against a revision, for context lines and under `--heading`,
-where the recorded path is the repository path, never the revision or a line's
-text; a worktree context line whose text quotes another `name:N:` is still read
-by the spaced-path rule, which records its whole capture — paged reads returning
+`git grep` prints against a revision and for context lines, where the recorded
+path is the repository path, never the revision or a line's text; the
+`git grep --heading` form is not observed; a worktree context line whose text
+quotes another `name:N:` is still read by the spaced-path rule, which records
+its whole capture — paged reads returning
 history-bearing text, and any file-content tool call — pi `read`/`edit`,
 Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit`, and a content
 search (pi `grep`, Claude `Grep`) — whose result returned, even empty or binary,
