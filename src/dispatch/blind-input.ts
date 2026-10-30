@@ -955,17 +955,17 @@ function endsAtFileName(head: string): boolean {
   return /\.[A-Za-z][A-Za-z0-9]{0,15}$/u.test(head.trimEnd());
 }
 
-/** One guess at a repository path. Only a parent-relative guess (`../x`) is
- * judged by its shape, the way `path:N:` judges one: a ref can hold no `..`,
- * so whatever follows `<rev>:` that does is a path outside the checkout
+/** One guess at a repository path. Only a parent-relative guess (`../x`) may
+ * be judged by its shape, the way `path:N:` judges one: a ref can hold no
+ * `..`, so whatever follows `<rev>:` that does is a path outside the checkout
  * (`git grep -n x HEAD -- ..` run from a subdirectory prints it). An absolute
  * or drive-letter guess is not: git prints no such name after a revision, and
  * a stack frame or URL (`file:///srv/a.js:12:3`) reads as one. A spaced guess
  * needs a file-like end (see fileLikeOutside), so prose never counts. */
-function gitGrepCandidate(path: string): GrepCandidate {
+function gitGrepCandidate(path: string, shapeAllowed: boolean): GrepCandidate {
   const slashed = path.replace(/\\/gu, '/');
   const parentRelative = /(^|\/)\.\.(\/|$)/u.test(slashed) && !slashed.startsWith('/') && !/^[A-Za-z]:\//u.test(slashed);
-  return { path, byShape: parentRelative && (!/\s/u.test(slashed) || fileLikeOutside(slashed)) };
+  return { path, byShape: shapeAllowed && parentRelative && (!/\s/u.test(slashed) || fileLikeOutside(slashed)) };
 }
 
 /** What a head — the line up to a delimiter, or a `--heading` file line —
@@ -979,14 +979,17 @@ function gitGrepCandidate(path: string): GrepCandidate {
 function gitGrepHeadPaths(head: string): readonly GrepCandidate[] {
   const name = head.trimEnd();
   const colon = name.indexOf(':');
-  if (colon < 0) return name === '' ? [] : [gitGrepCandidate(name)];
+  if (colon < 0) return name === '' ? [] : [gitGrepCandidate(name, true)];
+  // A ref holds no whitespace: prose before the colon names no revision, so
+  // what follows it is judged by the globs alone, never by its shape.
+  const shape = !/\s/u.test(name.slice(0, colon));
   const stripped = name.slice(colon + 1);
   const joined = stripped.replace(/:/gu, '/');
   const out: GrepCandidate[] = [];
-  if (joined !== '') out.push(gitGrepCandidate(joined));
+  if (joined !== '') out.push(gitGrepCandidate(joined, shape));
   if (stripped !== joined) {
-    out.push(gitGrepCandidate(stripped));
-    if (stripped.startsWith(':')) out.push(gitGrepCandidate(stripped.slice(1)));
+    out.push(gitGrepCandidate(stripped, shape));
+    if (stripped.startsWith(':')) out.push(gitGrepCandidate(stripped.slice(1), shape));
   }
   return out;
 }

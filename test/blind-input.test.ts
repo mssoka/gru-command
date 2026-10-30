@@ -623,7 +623,8 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   });
 
   it('R3: a parent-relative path behind a revision is outside the package, as `path:N:` is', () => {
-    // `cd src && git grep -n needle HEAD -- ..` prints `HEAD:../vendor/notes.md:1:needle`.
+    // Run from a subdirectory, a search of the parent against a revision prints
+    // the parent-relative name behind the revision.
     const outside = (path: string): string => `invalid package path "${path}" (must be a relative path inside the repository)`;
     for (const line of [
       match(named('HEAD', '../vendor/notes.md'), 1, 'needle'),
@@ -648,6 +649,9 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
       match('    at fn (file:///srv/app/a.js', 12, '34)'),
       match(named('HEAD', '/srv/app/a.js'), 12, '34'),
       match(named('HEAD', 'see ../x.md'), 12, '34'),
+      // Prose before the colon is no revision (a ref holds no whitespace), so the
+      // parent-relative name after it is not read by its shape.
+      match(named('see this', '../vendor/notes.md'), 1, 'needle'),
     ]) {
       expect(scan(text), text).toEqual([]);
     }
@@ -670,8 +674,8 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(lines('src/a.ts', body(3), '--', ARTIFACT, body(9)))).toEqual(prohibited(ARTIFACT));
     expect(recorded(lines(ARTIFACT, body(1), '', 'src/a.ts', body(3), body(4)))).toEqual(prohibited(ARTIFACT));
     // The record holds the heading's path, never a line of text.
-    const hits = scan(lines(named('HEAD', ARTIFACT), body(7, 'private words 2026-10-29'), ctx(8, 'more')));
-    expect(JSON.stringify(hits)).not.toMatch(/private|more/u);
+    const hits = scan(lines(named('HEAD', ARTIFACT), body(7, 'sensitive words 2026-10-29'), ctx(8, 'afterwards')));
+    expect(JSON.stringify(hits)).not.toMatch(/sensitive|afterwards/u);
     expect(hits).toHaveLength(1);
   });
 
