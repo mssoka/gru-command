@@ -229,16 +229,30 @@ processes and details, and the refusal error's processes — carries it for
 the credential forms `redactCredentials` recognizes (the pairing token's
 `Authorization: Bearer`, the keyword assignments, and the `--token`,
 `-u user:value` and `Authorization: token` argv forms; the inventory in
-#534's PR names the boundary). The raw `ps` line stays in memory for
-the checks that need it (tree matching, token naming, `ps -E`
-provenance). An acknowledged pid is compared against its recorded row
-masked, so the answer to a recorded pause is still honored; a row written
-before the masking that still holds a credential never matches, so its
-process is asked about again and the fresh row replaces it. A registry row
-written before the masking is closed by its terminal readback (the stored
-text is masked before the comparison, and the reconcile audit carries the
-masked text). A row whose process exits without being paused again keeps
-its recorded text: there is no backfill of existing rows.
+#534's PR names the boundary). The verification scheduler's events carry
+their command lines masked too: the `command`, `process_command` and
+`step_command` of `verification.started`, `verification.process-started`,
+`verification.requested`, `verification.completed` and the other
+verification events, each per-step check's `command`, and the request's
+`dedupe_key` (and the `verification.refused` event of a held job). The
+raw `ps` line stays in memory for the checks that need it (tree matching,
+token naming, `ps -E` provenance).
+
+The masked text is for display and audit, never an identity: two commands
+whose credentials differ mask to the same line. Each row therefore also
+records `command_sha256`, the SHA-256 hex of the **raw** command line, on
+every write, and every decision that a live process is the one a row
+describes compares that digest. An acknowledged pid is killed only while
+the fresh enumeration's raw command digests to the row's; the terminal
+readback of a verification run closes a `registry` row only when its digest
+equals that of the raw process command the reconcile derives from the run's
+own command (the events it reads hold the masked text, so they bind
+receipts to the run but never identify a process). A row with no digest (one
+written before the digest existed) has no identity: it never matches by its
+masked text, so its process is asked about again and the fresh row replaces
+it, and a registry row of that kind is left to the sweep's reap. A row
+whose process exits without being paused again keeps its recorded text:
+there is no backfill of existing rows.
 
 Each row also carries the lane's **token** (`lane_token`, #486): random per
 lane incarnation, minted when the row is registered (lanes not yet swept
@@ -439,9 +453,12 @@ carries it, and so does everything that session starts
    RECORDED ask: it kills exactly the acknowledged pids (never a fresh
    enumeration — later arrivals were never acknowledged), and only while
    the fresh enumeration still finds each rooted in the tree running the
-   command it was recorded with (its credentials masked, #534; #486: an
-   answer given late never reaches a pid that now runs another command),
-   with a SIGTERM grace before SIGKILL. Survivors re-pause; newcomers get
+   command it was recorded with (#486: an answer given late never reaches a
+   pid that now runs another command). "The command it was recorded with" is
+   the SHA-256 of the raw command line stored beside the row (#534), not the
+   row's masked `command`, which two commands with different credentials
+   share; a row without that digest never matches and is asked about again.
+   A SIGTERM grace precedes SIGKILL. Survivors re-pause; newcomers get
    their own ask;
    `confirm_kill` without a recorded pause is not honored. Silent kills
    do not exist for processes nothing ties to the lane. The owner's card

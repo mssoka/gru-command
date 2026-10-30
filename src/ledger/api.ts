@@ -6,7 +6,7 @@ import { realpathSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
-import { newLaneToken } from '../worktrees/lane-provenance.js';
+import { newLaneToken, processCommandSha256 } from '../worktrees/lane-provenance.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
@@ -1216,6 +1216,15 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** Whether a verification event's recorded command field is the command `raw`.
+ * An event is recorded with its command masked (#534); one recorded before the
+ * masking holds the command as listed. Either is the event of that command. This
+ * binds an event to a run; whether a live process is the one a registry row
+ * describes is the row's raw-command digest, never this comparison. */
+function recordsCommand(recorded: unknown, raw: string): boolean {
+  return recorded === raw || recorded === redactCredentials(raw);
+}
+
 function str(value: unknown): string {
   if (typeof value !== 'string') throw new Error(`ledger row field is not a string: ${String(value)}`);
   return value;
@@ -1688,8 +1697,8 @@ export class LedgerApi {
         AND json_extract(payload, '$.run_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.jobId, input.runId) as Row | undefined;
       const conflictingTerminal = this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
         AND json_extract(payload, '$.run_id') = ? AND
-        (json_extract(payload, '$.command') IS NOT ? OR json_extract(payload, '$.cwd') IS NOT ?) LIMIT 1`)
-        .get(input.jobId, input.runId, input.command, input.cwd);
+        ((json_extract(payload, '$.command') IS NOT ? AND json_extract(payload, '$.command') IS NOT ?) OR json_extract(payload, '$.cwd') IS NOT ?) LIMIT 1`)
+        .get(input.jobId, input.runId, input.command, redactCredentials(input.command), input.cwd);
       if (conflictingTerminal !== undefined) return;
       if (terminal === undefined || !this.hasJobEventWithPayloadValues(input.jobId, ['verification.requested', 'verification.attached'],
         [{ key: 'run_id', value: input.runId }, { key: 'request_id', value: input.requestId }], 0)) return;
@@ -1713,10 +1722,13 @@ export class LedgerApi {
       const started = starts[0];
       if (started === undefined || Number(started.seq) >= Number(terminal.seq)) return;
       const physical = JSON.parse(str(started.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown; sha?: unknown };
-      if (!Number.isSafeInteger(physical.pid) || Number(physical.pid) <= 0 || physical.command !== input.command || physical.cwd !== input.cwd ||
+      if (!Number.isSafeInteger(physical.pid) || Number(physical.pid) <= 0 || !recordsCommand(physical.command, input.command) || physical.cwd !== input.cwd ||
           starts.some((event) => { const facts = JSON.parse(str(event.payload)) as typeof physical;
-            return Number(event.seq) >= Number(terminal.seq) || facts.pid !== physical.pid || facts.command !== input.command || facts.cwd !== input.cwd; })) return;
+            return Number(event.seq) >= Number(terminal.seq) || facts.pid !== physical.pid || !recordsCommand(facts.command, input.command) || facts.cwd !== input.cwd; })) return;
       const nativeStarts = receipts.filter((row) => row.kind === 'verification.process-started');
+      // `command` is the RAW process command line the reconcile derives from the
+      // caller's raw `input.command`, never read back from an event (events hold
+      // it masked): the registry row is matched by its digest.
       const identities: Array<{ readonly seq: number; readonly pid: number; readonly command: string }> = [];
       if (nativeStarts.length === 0) {
         // Prior whole-command receipts stay valid exactly as recorded. A null
@@ -1734,16 +1746,17 @@ export class LedgerApi {
           const index = Number(facts.step_index);
           const count = Number(facts.step_count);
           const pid = Number(facts.pid);
-          const monolithic = count === 1 && index === 0 && facts.step_command === input.command;
+          const monolithic = count === 1 && index === 0 && recordsCommand(facts.step_command, input.command);
+          // The raw step this receipt claims, as the reconcile itself derives it.
+          const step = monolithic ? input.command : count === steps.length ? steps[index] : undefined;
           if (!Number.isSafeInteger(facts.pid) || pid <= 0 || !Number.isSafeInteger(facts.step_index) || !Number.isSafeInteger(facts.step_count) ||
               index < 0 || count <= 0 || index >= count || indices.has(index) || pids.has(pid) ||
-              Number(event.seq) >= Number(terminal.seq) || facts.command !== input.command || facts.cwd !== input.cwd || facts.sha !== physical.sha ||
-              facts.process_command !== `/bin/sh -c ${String(facts.step_command)}` ||
-              (!monolithic && (count !== steps.length || facts.step_command !== steps[index])) ||
+              Number(event.seq) >= Number(terminal.seq) || !recordsCommand(facts.command, input.command) || facts.cwd !== input.cwd || facts.sha !== physical.sha ||
+              step === undefined || !recordsCommand(facts.step_command, step) || !recordsCommand(facts.process_command, `/bin/sh -c ${step}`) ||
               (stepCount !== null && count !== stepCount)) return;
           stepCount = count;
           indices.add(index); pids.add(pid);
-          identities.push({ seq: Number(event.seq), pid, command: String(facts.process_command) });
+          identities.push({ seq: Number(event.seq), pid, command: `/bin/sh -c ${step}` });
         }
         if (identities[0]?.pid !== physical.pid) return;
       }
@@ -1753,15 +1766,15 @@ export class LedgerApi {
           AND json_extract(payload, '$.pid') = ? AND (job_id IS NOT ? OR json_extract(payload, '$.run_id') IS NOT ?) LIMIT 1`)
           .get(identity.pid, input.jobId, input.runId);
         if (conflicting !== undefined) continue;
-        const maskedIdentity = redactCredentials(identity.command);
+        const digest = processCommandSha256(identity.command);
         for (const row of this.listWorktreeProcesses(input.worktreeId)) {
-          // A row written since #534 already holds the masked text, so compare it
-          // directly; a legacy row still holds the raw line, so compare it after
-          // one mask. The fallback re-mask is for that legacy raw row; a stored
-          // masked row that fails the direct comparison is never rewritten. The
-          // audit carries the masked text, never a legacy row's credential.
+          // The row is this run's process only by the digest of its raw command
+          // line (#534): the stored `command` is masked, so two commands whose
+          // credentials differ read the same. A row recorded before the digest
+          // existed (`null`) has no identity to match and is left to the sweep's
+          // reap. The audit carries the masked text.
           if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry'
-            || (row.command !== maskedIdentity && redactCredentials(row.command) !== maskedIdentity)
+            || row.commandSha256 === null || row.commandSha256 !== digest
             || !absent(row.pid) || !absent(-row.pid)) continue;
           this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
           this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
@@ -3615,12 +3628,14 @@ export class LedgerApi {
    * every pid a pause or confirmed kill is grounded on lands here — the
    * registry is the authoritative map job → worktree → branch →
    * processes, so the ask can always name what was live. A command line is
-   * recorded with its credentials masked (#534), whoever the writer is: a
-   * caller keeps the raw line to match against and compares it as
-   * `redactCredentials(raw)`. */
+   * recorded with its credentials masked (#534), whoever the writer is, and
+   * with the SHA-256 of the raw line beside it: the masked text is for display,
+   * the digest is what a later decision that a live process is this one
+   * compares. A caller that holds a row it read back (not a raw line) passes
+   * that row's `commandSha256` through, `null` when the row has none. */
   recordWorktreeProcesses(input: {
     worktreeId: string;
-    processes: readonly { pid: number; command: string; evidence: string }[];
+    processes: readonly { pid: number; command: string; evidence: string; commandSha256?: string | null }[];
     state: 'live' | 'killed';
   }): void {
     if (input.processes.length === 0) return;
@@ -3636,11 +3651,12 @@ export class LedgerApi {
       const revived = input.state === 'live'
         ? input.processes.map((proc) => proc.pid).filter((pid) => exited.get(input.worktreeId, pid) !== undefined) : [];
       const upsert = this.db.prepare(
-        `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO worktree_processes (worktree_id, pid, command, command_sha256, evidence, state, first_seen, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (worktree_id, pid) DO UPDATE SET
            state = excluded.state,
            command = excluded.command,
+           command_sha256 = excluded.command_sha256,
            last_seen = excluded.last_seen,
            -- #486: a reap by the lane's token is the row's proof, whatever
            -- first tied the pid to the tree; and a row that had left 'live'
@@ -3651,7 +3667,8 @@ export class LedgerApi {
            evidence = CASE WHEN excluded.evidence = 'lane-token' OR (state <> 'live' AND excluded.state = 'live') THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
-        upsert.run(input.worktreeId, proc.pid, redactCredentials(proc.command), proc.evidence, input.state, ts, ts);
+        const digest = proc.commandSha256 === undefined ? processCommandSha256(proc.command) : proc.commandSha256;
+        upsert.run(input.worktreeId, proc.pid, redactCredentials(proc.command), digest, proc.evidence, input.state, ts, ts);
       }
       this.appendEvent({
         kind: 'worktree.processes',
@@ -3701,18 +3718,23 @@ export class LedgerApi {
 
   listWorktreeProcesses(worktreeId: string): readonly {
     readonly pid: number;
+    /** Masked (#534): for display and audit, never an identity. */
     readonly command: string;
+    /** SHA-256 hex of the raw command line; `null` for a row written before
+     * the digest existed (its identity is unknown). */
+    readonly commandSha256: string | null;
     readonly evidence: string;
     readonly state: string;
     readonly lastSeen: string;
   }[] {
     return (
       this.db
-        .prepare('SELECT pid, command, evidence, state, last_seen FROM worktree_processes WHERE worktree_id = ? ORDER BY first_seen, pid')
+        .prepare('SELECT pid, command, command_sha256, evidence, state, last_seen FROM worktree_processes WHERE worktree_id = ? ORDER BY first_seen, pid')
         .all(worktreeId) as Row[]
     ).map((row) => ({
       pid: Number(row.pid),
       command: str(row.command),
+      commandSha256: row.command_sha256 === null ? null : str(row.command_sha256),
       evidence: str(row.evidence),
       state: str(row.state),
       lastSeen: str(row.last_seen),

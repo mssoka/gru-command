@@ -1404,3 +1404,38 @@ describe('verification scheduler — global budget', () => {
     expect(existsSync(join(storageDir, 'scheduler.json'))).toBe(true);
   });
 });
+
+it('records every verification event with its command lines masked while the run keeps and spawns the raw command (#534 R2)', async () => {
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const repo = makeRepo();
+  const { scheduler, records } = makeScheduler();
+  scheduler.start();
+  const command = `node -e "process.exit(0)" -- --token ${secret}`;
+  const masked = 'node -e "process.exit(0)" -- --token [REDACTED]';
+  try {
+    const outcome = await scheduler.submit(repoSpec(repo, 'job-mask', { command, requestId: 'mask-request' }));
+    // The run is the raw command: it ran, and its outcome (the caller's own) names it.
+    expect(outcome).toMatchObject({ ok: true, exitCode: 0, command });
+    const byKind = (kind: string) => records.filter((record) => record.kind === kind);
+    for (const kind of ['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']) {
+      expect(byKind(kind), kind).toHaveLength(1);
+    }
+    expect(byKind('verification.requested')[0]!.payload['command']).toBe(masked);
+    expect(byKind('verification.started')[0]!.payload['command']).toBe(masked);
+    expect(byKind('verification.process-started')[0]!.payload).toMatchObject({
+      command: masked, process_command: `/bin/sh -c ${masked}`, step_command: masked,
+    });
+    expect(byKind('verification.completed')[0]!.payload['command']).toBe(masked);
+    // Nothing the run published carries the credential, the dedupe key and the per-step checks included.
+    for (const record of records) {
+      expect(JSON.stringify(record), record.kind).not.toContain(secret);
+      for (const field of ['command', 'process_command', 'step_command', 'dedupe_key']) {
+        if (record.payload[field] !== undefined) expect(String(record.payload[field]), `${record.kind}.${field}`).toContain('[REDACTED]');
+      }
+    }
+    // The shape is unchanged for a command that carries nothing to mask.
+    const clean = await scheduler.submit(repoSpec(repo, 'job-clean', { requestId: 'clean-request' }));
+    expect(clean).toMatchObject({ ok: true });
+    expect(records.filter((record) => record.kind === 'verification.started' && record.jobId === 'job-clean')[0]!.payload['command']).toBe('node -e "process.exit(0)"');
+  } finally { await scheduler.dispose(); }
+});

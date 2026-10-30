@@ -47,7 +47,7 @@ import { redactedText } from '../decisions/questions.js';
 import { boundedTail, recordedTail, redactCredentials, redactCredentialWindow } from '../redaction.js';
 import { oneLineErrorText } from '../property/error-text.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
-import { readLaneTokens, readProcessFacts, type LaneTokenRead, type LaneTokenReader, type ProcessFacts } from './lane-provenance.js';
+import { processCommandSha256, readLaneTokens, readProcessFacts, type LaneTokenRead, type LaneTokenReader, type ProcessFacts } from './lane-provenance.js';
 import type { ManagedRepoPath } from '../repos/managed-names.js';
 import { assertSafeRequirementsPatch, originIdentitySha256, readPreBootstrapDependencyPatchPackage, PreBootstrapPatchError, type LoadedPreBootstrapPatch } from './prebootstrap-patch.js';
 
@@ -3275,17 +3275,20 @@ export class WorktreeManager {
       // and an acknowledged pid is killed only while this enumeration still
       // finds it rooted here running the command it was recorded with (an
       // answer given late, or carried out after a restart, never reaches a
-      // recycled pid). The record holds the masked command line (#534), so the
-      // live one is compared masked: a row from before the masking, which
-      // still holds a credential, never matches and is asked about again.
+      // recycled pid). The record holds the command line masked (#534), and two
+      // commands whose credentials differ mask alike, so "the command it was
+      // recorded with" is the digest of the RAW line: a row without one (written
+      // before the digest existed) has no identity, never matches, and is asked
+      // about again.
       const named = input.confirmKillPids === undefined ? null : new Set(input.confirmKillPids);
-      const running = new Map(processes.map((proc) => [proc.pid, redactCredentials(proc.command)]));
+      const running = new Map(processes.map((proc) => [proc.pid, processCommandSha256(proc.command)]));
       const acknowledged =
         input.confirmKill === true && row.status === 'paused'
           ? this.opts.ledger
               .listWorktreeProcesses(row.id)
-              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid)) && running.get(proc.pid) === proc.command)
-              .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
+              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid))
+                && proc.commandSha256 !== null && running.get(proc.pid) === proc.commandSha256)
+              .map((proc) => ({ pid: proc.pid, command: proc.command, commandSha256: proc.commandSha256, evidence: proc.evidence }))
           : [];
       if (input.confirmKill === true && acknowledged.length > 0) {
         return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch, assertCleanup, attempt);
@@ -3347,6 +3350,7 @@ export class WorktreeManager {
         processes: stranded.map((proc) => ({
           pid: proc.pid,
           command: proc.command,
+          commandSha256: proc.commandSha256,
           evidence: proc.evidence,
         })),
         state: 'killed',
@@ -3373,7 +3377,7 @@ export class WorktreeManager {
         worktreeId: row.id,
         processes: targets
           .filter((proc) => killedSet.has(proc.pid))
-          .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence })),
+          .map((proc) => ({ pid: proc.pid, command: proc.command, commandSha256: proc.commandSha256, evidence: proc.evidence })),
         state: 'killed',
       });
     }
@@ -4386,7 +4390,7 @@ export class WorktreeManager {
    */
   private async killAcknowledgedAndContinue(
     row: WorktreeRecord,
-    acknowledged: readonly { pid: number; command: string; evidence: string }[],
+    acknowledged: readonly { pid: number; command: string; commandSha256: string | null; evidence: string }[],
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
     assertCleanup: () => void,

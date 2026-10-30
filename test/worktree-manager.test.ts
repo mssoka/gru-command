@@ -7,7 +7,8 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { commandReferencesTree, LaneLiveProcessError, processTableAsync, psEnumerator, WorktreeManager, type PausedProcess, type TreeProcess, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
-import { REDACTION_PLACEHOLDER } from '../src/redaction.js';
+import { redactCredentials, REDACTION_PLACEHOLDER } from '../src/redaction.js';
+import { createHash } from 'node:crypto';
 import { laneProvenanceFromLedger } from '../src/worktrees/lane-provenance.js';
 import { loadConfig, type RuntimeId } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
@@ -2860,4 +2861,66 @@ it('masks argv credentials in a later paused result (survivors and newcomers)', 
   }
   expectMasked('the newcomer row', h.ledger.listWorktreeProcesses('job-argv-later').find((proc) => proc.pid === newcomer.pid)?.command);
   expect(JSON.stringify([h.pauses.slice(1), events, h.ledger.listWorktreeProcesses('job-argv-later')])).not.toContain(ARGV_SENTINEL);
+});
+
+describe('#534 R1: a process is the recorded one by the digest of its raw command line, never its masked text', () => {
+  const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+  const ANOTHER_SECRET = 'Zx5Hn2Bv8Qd4Wm7Lt3Pc';
+
+  it('an answer recorded for another credential under the same masked command asks again and kills nothing', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-swap', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-swap' });
+    const pid = argvChild(row.path, ARGV_CREDENTIALS).pid!;
+    const raw = (await listedBy(row.path, pid)).command;
+    expect((await h.manager.release({ worktreeId: 'job-argv-swap' })).status).toBe('paused');
+    const asked = h.ledger.listWorktreeProcesses('job-argv-swap').find((proc) => proc.pid === pid)!;
+    expect(asked.commandSha256).toBe(sha256(raw));
+
+    // The pid as the answer's owner saw it: the same command with another
+    // credential, which masks to exactly the text the live process masks to.
+    const other = raw.split(ARGV_SENTINEL).join(ANOTHER_SECRET);
+    expect(other).not.toBe(raw);
+    expect(redactCredentials(other)).toBe(asked.command);
+    h.ledger.recordWorktreeProcesses({ worktreeId: 'job-argv-swap', state: 'live', processes: [{ pid, command: other, evidence: 'argv' }] });
+    const stale = h.ledger.listWorktreeProcesses('job-argv-swap').find((proc) => proc.pid === pid)!;
+    expect(stale.command).toBe(asked.command);
+    expect(stale.commandSha256).toBe(sha256(other));
+
+    const again = await h.manager.release({ worktreeId: 'job-argv-swap', confirmKill: true, confirmKillPids: [pid] });
+    expect(again.status).toBe('paused');
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(h.ledger.listEvents({ limit: 300 }).some((event) => event.kind === 'worktree.kill-confirmed')).toBe(false);
+    // The fresh pause replaced the row with the live process's own digest, and that ask is the one an answer confirms.
+    expect(h.ledger.listWorktreeProcesses('job-argv-swap').find((proc) => proc.pid === pid)).toMatchObject({ state: 'live', commandSha256: sha256(raw) });
+    const answered = await h.manager.release({ worktreeId: 'job-argv-swap', confirmKill: true, confirmKillPids: [pid] });
+    expect(answered.status).toBe('swept');
+    expect(h.ledger.listWorktreeProcesses('job-argv-swap').find((proc) => proc.pid === pid)).toMatchObject({ state: 'killed', commandSha256: sha256(raw) });
+  });
+
+  it('a live row recorded without a digest is asked about again even when its masked text matches', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-nodigest', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-nodigest' });
+    const pid = argvChild(row.path, ARGV_CREDENTIALS).pid!;
+    const raw = (await listedBy(row.path, pid)).command;
+    // A row written before the digest existed: paused, live, the masked line, no identity.
+    h.ledger.setWorktreeStatus('job-argv-nodigest', 'paused', 'sweep paused: a row from before the digest');
+    h.ledgerDb.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('job-argv-nodigest', ?, ?, 'argv', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(pid, redactCredentials(raw));
+    expect(h.ledger.listWorktreeProcesses('job-argv-nodigest').find((proc) => proc.pid === pid)?.commandSha256).toBeNull();
+
+    const again = await h.manager.release({ worktreeId: 'job-argv-nodigest', confirmKill: true, confirmKillPids: [pid] });
+    expect(again.status).toBe('paused');
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(h.ledger.listEvents({ limit: 300 }).some((event) => event.kind === 'worktree.kill-confirmed')).toBe(false);
+    expect(h.ledger.listWorktreeProcesses('job-argv-nodigest').find((proc) => proc.pid === pid)).toMatchObject({ state: 'live', commandSha256: sha256(raw) });
+
+    // The happy path: the same raw command, recorded by the pause, is confirmed.
+    const answered = await h.manager.release({ worktreeId: 'job-argv-nodigest', confirmKill: true, confirmKillPids: [pid] });
+    expect(answered.status).toBe('swept');
+    expect(h.ledger.listEvents({ limit: 300 }).find((event) => event.kind === 'worktree.kill-confirmed')?.payload).toMatchObject({ pids: [pid] });
+  });
 });
