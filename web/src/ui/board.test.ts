@@ -3154,9 +3154,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelector('[data-notification-id="approval-closed"]')).toBeNull();
     (document.getElementById('notification-bell') as HTMLButtonElement).click();
     const card = document.getElementById('notification-list')!.querySelector<HTMLElement>('[data-notification-id="approval-closed"]')!;
-    const result = card.querySelector<HTMLElement>('.board-notification__result')!;
     // The card says what happened: the code first, then each blocker on its own line.
-    expect(result.textContent).toBe('Result: Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1');
+    expect(card.querySelector<HTMLElement>('.board-notification__result')?.textContent).toBe('Result: Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1');
     expect(card.textContent).toContain('follow-through resolved');
     // A card without a recorded result renders no result line.
     view.render(snapshot({ notifications: [{ ...closed, resolutionDetail: null }] }));
