@@ -13,7 +13,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
-import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareClaudeDirectiveBinding, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, recordDirectiveToolRefusal, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveProducer, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, classifyDeadDirectiveTurn, describeDeadTurn, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareClaudeDirectiveBinding, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, recordDirectiveToolRefusal, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveProducer, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery, type DirectiveProgressDeps } from '../src/dispatch/directive-progress.js';
@@ -3578,6 +3578,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     readonly agentId: string;
     readonly identity: DirectiveTurnIdentity;
     readonly prompts: () => readonly string[];
+    /** One more entry of the dead turn: a pi message, or a Claude stream frame. */
+    readonly append: (entry: Record<string, unknown>) => void;
     readonly cleanup: () => Promise<void>;
   }
 
@@ -3621,7 +3623,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     if (shape === 'torn-transcript') appendFileSync(f.file, `${JSON.stringify({ type: 'message', id: receiptId, parentId: null, message: { role: 'assistant', stopReason: 'stop', content: [] } })}\n`);
     if (shape === 'torn-bindings') { fail(); appendFileSync(`${f.file}.directives.jsonl`, '{"torn":'); }
     return { ledger: f.ledger, deps: f.deps, requestId: f.intent.requestId, jobId: f.intent.jobId, lane: f.lane, file: f.file, agentId: FIXTURE_MINION,
-      identity: f.identity, prompts: () => f.native.prompts, cleanup: async () => {} };
+      identity: f.identity, prompts: () => f.native.prompts, append: (entry) => { f.native.append(entry); }, cleanup: async () => {} };
   }
 
   async function claudeDeadScene(shape: DeadShape): Promise<DeadScene> {
@@ -3659,7 +3661,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
         return log === undefined || !existsSync(log) ? []
           : readFileSync(log, 'utf8').trim().split('\n').filter((line) => line !== '').map((line) => String((JSON.parse(line) as { prompt?: unknown }).prompt ?? ''));
       };
-      return { ledger, deps: scene.deps, requestId: intent.requestId, jobId: 'claude-job', lane: scene.lane, file: sessionFile, agentId: 'claude-minion', identity, prompts, cleanup: scene.cleanup };
+      return { ledger, deps: scene.deps, requestId: intent.requestId, jobId: 'claude-job', lane: scene.lane, file: sessionFile, agentId: 'claude-minion', identity, prompts,
+        append: (entry) => frame(entry), cleanup: scene.cleanup };
     } catch (error) { await scene.cleanup(); throw error; }
   }
 
@@ -3745,9 +3748,12 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   async function assertDeadTurnRefused(runtime: 'pi' | 'claude-code', shape: DeadShape, reason: RegExp, pass: boolean) {
     await withDeadScene(runtime, shape, async (s) => {
       const debt = pass ? await restartPass(s) : s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the dead turn owes a recovery decision');
+      // Today's refusal, unchanged: the un-ceased start and the open turn still block beside the named one.
       const blockers = s.ledger.directiveProgressBlockers(s.requestId, s.lane.id);
-      expect(blockers).toEqual([expect.stringMatching(/^original host absent but native effects\/checkpoint remain UNKNOWN \(unbounded: /u)]);
-      expect(blockers[0]).toMatch(reason);
+      const named = blockers.filter((blocker) => blocker.includes('unbounded'));
+      expect(named).toEqual([expect.stringMatching(/^original host absent but native effects\/checkpoint remain UNKNOWN \(unbounded: /u)]);
+      expect(named[0]).toMatch(reason);
+      expect(blockers.length).toBeGreaterThan(1);
       if (pass) {
         // Today's behaviour: the owner is the only exit, and the card asks a question a human can answer.
         const card = s.ledger.findNotificationByKind(`silas.directive-unreconciled.${s.requestId}`, 'active');
@@ -3758,7 +3764,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       const before = s.ledger.latestEventSeq();
       let refusal: unknown;
       try { decideRecovery(s, debt, { kind: 'rebrief-successor', requestId: 'refused-successor', note: 'must never start' }); } catch (error) { refusal = error; }
-      expect(refusal).toMatchObject({ code: 'live_work', blockers: [expect.stringMatching(/unbounded/u)] });
+      expect(refusal).toMatchObject({ code: 'live_work', blockers: expect.arrayContaining([expect.stringMatching(/unbounded/u)]) });
       expect(s.ledger.getDirective('refused-successor')).toBeNull(); expect(s.ledger.getDirective(s.requestId)?.state).toBe('admitted');
       expect(s.ledger.latestEventSeq()).toBe(before);
     });
@@ -3775,6 +3781,66 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     assertDeadTurnRefused('pi', 'torn-bindings', /native checkpoint is unreadable: .*partial write/u, false));
   it('A3 claude-code: an unreadable association journal is unbounded and says so', () =>
     assertDeadTurnRefused('claude-code', 'torn-bindings', /native checkpoint is unreadable: .*partial write/u, false));
+
+  /** The classifier's boundaries, one entry at a time (what counts as an intent, a completion, a refusal, the turn's end). */
+  const verdictOf = (s: DeadScene) => classifyDeadDirectiveTurn(s.file, s.identity);
+  it('classifier pi: only a row the SDK runs holds an intent; a later request is not this turn; a long list is capped', async () => {
+    await withDeadScene('pi', 'quiet', async (s) => {
+      const text = (value: string) => [{ type: 'text', text: value }];
+      const toolCall = (id: string, name = 'bash') => ({ type: 'toolCall', id, name, arguments: { command: 'ls' } });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'none', runtime: 'pi', refused: [] });
+      // The SDK runs none of an aborted row's calls, and answers a length row's with its own failure.
+      s.append({ role: 'assistant', stopReason: 'aborted', content: [toolCall('call-aborted')] });
+      s.append({ role: 'assistant', stopReason: 'length', content: [toolCall('call-length')] });
+      s.append({ role: 'toolResult', toolCallId: 'call-length', toolName: 'bash', isError: true, content: text('not executed') });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'none' });
+      // A row the SDK runs holds an intent; with neither completion nor refusal the turn is unbounded.
+      s.append({ role: 'assistant', stopReason: 'stop', content: [toolCall('call-1', 'edit')] });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', reason: 'tool intent edit (call-1) has neither a completion nor a recorded refusal', pending: [{ id: 'call-1', name: 'edit' }] });
+      s.append({ role: 'toolResult', toolCallId: 'call-1', toolName: 'edit', isError: false, content: text('ok') });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded', effects: [{ id: 'call-1', name: 'edit', outcome: 'completed' }] });
+      // Seven more completed effects: the line names six and counts the rest.
+      for (let n = 2; n <= 8; n += 1) {
+        s.append({ role: 'assistant', stopReason: 'toolUse', content: [toolCall(`call-${String(n)}`)] });
+        s.append({ role: 'toolResult', toolCallId: `call-${String(n)}`, toolName: 'bash', isError: false, content: text('ok') });
+      }
+      const eight = verdictOf(s);
+      expect(eight).toMatchObject({ verdict: 'bounded' }); expect(describeDeadTurn(eight)).toMatch(/^bounded: 8 tool effect\(s\), .* and 2 more$/u);
+      // A later user message starts another request: what follows it is not this turn's.
+      s.append({ role: 'user', content: text('a later request') });
+      s.append({ role: 'assistant', stopReason: 'toolUse', content: [toolCall('call-later')] });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded' });
+    });
+    // A stop reason the SDK does not define never counts as proof either way.
+    await withDeadScene('pi', 'quiet', async (s) => {
+      s.append({ role: 'assistant', stopReason: 'deferred', content: [{ type: 'toolCall', id: 'call-1', name: 'bash', arguments: {} }] });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', reason: expect.stringMatching(/unsupported stop reason deferred/u) });
+    });
+  });
+  it('classifier claude-code: a result or a new turn ends the turn; a background notice is no prompt; a repeated tool_use id is unbounded', async () => {
+    await withDeadScene('claude-code', 'quiet', async (s) => {
+      const sessionId = String(readDirectiveSessionHeader(s.file).id);
+      const use = (id: string, name: string) => s.append({ type: 'assistant', session_id: sessionId, message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input: {} }] } });
+      const result = (id: string) => s.append({ type: 'user', session_id: sessionId, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'none', runtime: 'claude-code', refused: [] });
+      // A background task's notice is the CLI's event, not another prompt.
+      s.append({ type: 'user', isReplay: true, session_id: sessionId, parent_tool_use_id: null, origin: { kind: 'task-notification' },
+        message: { role: 'user', content: '<task-notification>done</task-notification>' } });
+      use('toolu_1', 'Read'); result('toolu_1');
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded', effects: [{ id: 'toolu_1', name: 'Read', outcome: 'completed' }] });
+      // The turn's own result ends it; a later init and its tools belong to the next turn.
+      s.append({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, uuid: 'result-1' });
+      s.append({ type: 'system', subtype: 'init', session_id: sessionId });
+      use('toolu_next', 'Bash');
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded', effects: [{ id: 'toolu_1' }] });
+    });
+    await withDeadScene('claude-code', 'pending', async (s) => {
+      expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', pending: [{ id: 'toolu_1', name: 'Bash' }] });
+      s.append({ type: 'assistant', session_id: String(readDirectiveSessionHeader(s.file).id),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }] } });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', reason: 'a native tool intent is malformed or repeats its tool_use id' });
+    });
+  });
 
   /** A4: a dead turn settled by its evidence never relaxes a live fence. */
   async function assertLiveFenceHolds(runtime: 'pi' | 'claude-code', fence: 'open-turn' | 'held-lock' | 'lane-process' | 'queued-turn' | 'supervised') {

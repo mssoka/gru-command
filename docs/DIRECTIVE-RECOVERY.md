@@ -666,6 +666,48 @@ verification fences. Its native lock reclaim names only that absent original
 PID; no heartbeat age or missing registry is permission. The ledger closes
 only that exact start token, never a later same-logical-minion incarnation.
 
+#### A dead turn is settled from its own evidence (restart custody)
+
+Host absence proves the producer gone, not what its turn did. When a request's
+original producer is `host-absent` (no live lock, process, open turn or queued
+work) and its checkpoint is not a completed turn, the service reads the
+evidence GC itself wrote for that turn identity and returns one verdict. It
+never asks a human to certify what a dead process did.
+
+| Verdict | Evidence it rests on | Custody blocker? |
+|---|---|---|
+| `none` | The turn recorded no tool intent after admission, or every intent has a recorded guard refusal (a refused tool never ran). | No |
+| `bounded` | Tool intents exist and each has a completion or a recorded guard refusal; the effects are known and listed. | No |
+| `unbounded` | An intent has neither a completion nor a refusal, or the transcript, producer journal, association journal or checkpoint cannot be read. | Yes — today's refusal, now naming which |
+
+The evidence is the runtime's own. A tool intent is durable before the host
+allows any tool: Claude's `tool_use` frame is in the transcript before the
+permission answer (`assertClaudeDirectiveToolIntent`), and pi's assistant
+`toolCall` row is flushed by the SDK hook before the tool runs
+(`flushDirectiveToolIntent`; pi's `<session>.directives.jsonl` holds only the
+request bindings). A completion is the matching `tool_result` (Claude) or
+`toolResult` (pi). A guard refusal is a `guard-refused` receipt for that tool
+id in `<session>.producers.jsonl`, written for either runtime; it takes
+precedence over any completion the CLI's denial produced. An assistant row the
+SDK never runs (pi `error`, `aborted`, `length` stops) holds no intent.
+
+`none` and `bounded` stay recorded facts: the `silas.directive-recovery-decided`
+event carries `dead_turn` (verdict, runtime, effects, refusals, the host-absent
+incarnations) and the successor's directive or note ends with the service-read
+evidence line. The decision also records the dead producer's missing cessation
+receipt, as a completed host-absent turn gets, so the successor's own dispatch
+is not refused as unproven cleanup; the restart pass does the same when it first
+meets the request, and repairs the stale `streaming` agent row. No owner call is
+involved: the request is retired by the service, the successor admitted, the
+lane continues.
+
+`unbounded` is the only residue a human can still judge, and the card asks the
+question they can answer ("this turn may have run `<tools>`; continue?"). The
+owner's exit is unchanged (abandonment records the outcome as unknown).
+Producers whose evidence is `unknown` (a live pid, an independent controller such
+as Claude's CLI child that was never observed to close, a foreign host) are not
+reclassified: only the proven host-absent state is.
+
 Verification recovery also preserves original identities. Same-request terminal
 replay may reconcile matching registry process rows only after both the exact
 PID and its detached process group are absent. It records
