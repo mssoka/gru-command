@@ -53,8 +53,8 @@ const LEGS = [
       'ledger db + migration runner adds the nullable notification resolution detail and leaves a row resolved before it null (#523)',
       // F2: a card the reconcile cannot post
       `${CRASH} a card the reconcile cannot post ends the record refused card-post-failed, so the request can be proposed again`,
+      // (the busy-store reconcile test pins what the stranded head already did - retry - and is not a defect test)
       `${CRASH} keeps retrying a card the store could not take yet: a busy store is not a card that can never exist`,
-      `${CRASH} a reconcile repost that meets a busy store leaves the record proposed and tries again`,
       // F3: nothing carries out a decision on an unhosted boot
       `${WITHDRAW} withdraws each open undecided card when the service is not hosted, and leaves decided and executing records for a hosting boot`,
       `${WITHDRAW} leaves an approval that was already being carried out for the boot that hosts the service again`,

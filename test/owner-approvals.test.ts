@@ -578,8 +578,8 @@ describe('owner approval — the Approve is bound to the fences read when Gru as
     expect(record.state).toBe('refused');
     expect(record.refusal?.code).toBe('live_work');
     expect(record.refusal?.blockers).toContain(`live lane process(es): ${lane.id} pid 4242`);
-    expect(((await boardCard(h, card.id))['resolutionDetail'] as string).split('\n'))
-      .toEqual(['Not run: live_work', ...record.refusal!.blockers]);
+    expect((await boardCard(h, card.id))['resolutionDetail'])
+      .toBe(['Not run: live_work', ...record.refusal!.blockers].join('\n'));
     const cards = approvalCards(h).length;
     const ids = h.ledger.listActiveOwnerApprovalIds();
     const events = h.ledger.listEvents({ limit: 1_000 }).map((event) => event.seq);
@@ -966,8 +966,8 @@ describe('owner approval — the route evidence reaches the abandonment', () => 
     expect(record.refusal?.code).toBe('live_work');
     expect(record.refusal?.blockers.join(' ')).toContain('queued worker turn');
     expect(abandonmentEvents(h)).toEqual([]);
-    const text = (await boardCard(h, card.id))['resolutionDetail'] as string;
-    expect(text.split('\n')[0]).toBe('Not run: live_work');
+    const text = (await boardCard(h, card.id))['resolutionDetail'];
+    expect(text).toBe(['Not run: live_work', ...record.refusal!.blockers].join('\n'));
     expect(text).toContain('queued worker turn');
     held.release();
     (await queued).release();
@@ -990,8 +990,8 @@ describe('owner approval — the route evidence reaches the abandonment', () => 
     expect(record.refusal?.code).toBe('live_work');
     expect(record.refusal?.blockers).toContain('job admission in flight: probe producer');
     expect(abandonmentEvents(h)).toEqual([]);
-    expect(((await boardCard(h, card.id))['resolutionDetail'] as string).split('\n'))
-      .toEqual(['Not run: live_work', ...record.refusal!.blockers]);
+    expect((await boardCard(h, card.id))['resolutionDetail'])
+      .toBe(['Not run: live_work', ...record.refusal!.blockers].join('\n'));
   });
 });
 
