@@ -49,8 +49,10 @@ export function assertStaleRowRed(report) {
     throw new Error(`the A1 case was ${String(assertion.status)} at the pre-change base; fail-before claim broken`);
   }
   const messages = Array.isArray(assertion.failureMessages) ? assertion.failureMessages : [];
-  if (messages.length === 0 || messages.some((message) => typeof message !== 'string' || !message.startsWith('AssertionError:')) ||
-    !messages.some((message) => message.includes(EXPECTED_ASSERTION))) {
+  if (messages.length === 0 || messages.some((message) => typeof message !== 'string' || !message.startsWith('AssertionError:'))) {
+    throw new Error('the A1 case did not fail as an AssertionError — not behavioral RED');
+  }
+  if (!messages.some((message) => message.includes(EXPECTED_ASSERTION))) {
     throw new Error(`the A1 case failed without the expected "${EXPECTED_ASSERTION}" AssertionError — not behavioral RED`);
   }
   return `stale-row red proven — "${EXPECTED_TEST_TITLE}" failed by assertion at the pre-change base (${EXPECTED_ASSERTION})`;
