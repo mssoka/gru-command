@@ -418,7 +418,7 @@ export class BriefingReviewService {
       throw new BriefingReviewError(
         'briefing_review_round_cap',
         `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; the last reviewed text is ${label}: ` +
-          'record a push-back with POST /api/briefing-review/pushback on that text, dispatch it without a briefing_review block, ' +
+          'record a push-back with POST /api/briefing-review/pushback on that text, dispatch that exact text without a briefing_review block, ' +
           'then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
           "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings",
         409,
@@ -583,7 +583,7 @@ export class BriefingReviewService {
         : `round ${String(newest.round)} (review ${newest.reviewId}, briefing sha256 ${newest.briefingSha256})`;
       return (
         `The heist is at the briefing-review round cap; the last reviewed text is ${label}: ` +
-        'record a push-back with POST /api/briefing-review/pushback on that text, dispatch it without a briefing_review block, ' +
+        'record a push-back with POST /api/briefing-review/pushback on that text, dispatch that exact text without a briefing_review block, ' +
         'then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
         "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings."
       );
