@@ -14,6 +14,7 @@ import {
 } from '../src/config.js';
 
 import { GruAwareness } from '../src/chat/awareness.js';
+import { ADMISSION_REMOTE_PROBE_TIMEOUT_MS } from '../src/dispatch/perkins-review/admission.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 
@@ -56,6 +57,15 @@ default = "provider/model-a"
 [models.roles]
 gru = "provider/model-b"
 `;
+
+describe('Perkins admission remote-probe budget', () => {
+  // The budget covers the probe's local ref-name check, a process spawn whose
+  // latency — not the remote lookup — exhausted the old five-second bound on a
+  // loaded host and aborted every review round at admission.
+  it('pins the admission remote-probe budget at 30 seconds', () => {
+    expect(ADMISSION_REMOTE_PROBE_TIMEOUT_MS).toBe(30_000);
+  });
+});
 
 describe('config defaults', () => {
   it('boots on pure defaults when no config file exists', () => {
