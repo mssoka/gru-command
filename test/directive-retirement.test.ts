@@ -3348,7 +3348,10 @@ describe('legacy proven completion without fabricated historical delivery', () =
     } finally { await scheduler.dispose(); }
   });
 
-  it('P37 requires both full verification and whole review after a later current candidate delivery', async () => {
+  // Real lanes, git pushes and three review rounds: 10.3 s on an idle host, and
+  // the fast phase's 30 s ceiling was exceeded under the full suite's contended
+  // workers (full run 4fb228b9 at d41f3977). The allowance changes no assertion.
+  it('P37 requires both full verification and whole review after a later current candidate delivery', { timeout: 120_000 }, async () => {
     const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture(true);
     try {
       const accepted = await call(h.port, 'POST', '/api/silas/rebrief',

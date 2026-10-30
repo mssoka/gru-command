@@ -1195,7 +1195,10 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # base's unredacted source and requires A1, A2, A3, A6 and the registry
 # readback to fail behaviorally (it exits nonzero by design once the
 # classifier accepts the red run).
-gc-534-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/redaction.test.ts test/ledger-api.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/verification-scheduler.test.ts test/child-workers.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run test/directive-retirement.test.ts -t '#534' && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts test/verification-server.test.ts"
+# test/decisions.test.ts is the full-suite repair of 2026-10-30: its systemone
+# status-mapping fixture stopped racing a 20 ms deadline for a response it
+# already produces (the hang case keeps the tight deadline it tests).
+gc-534-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/redaction.test.ts test/ledger-api.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/verification-scheduler.test.ts test/child-workers.test.ts test/decisions.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run test/directive-retirement.test.ts -t '#534' && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts test/verification-server.test.ts"
 gc-534-static = "npm run lint && npm run typecheck && npm run build"
 gc-534-red = "sh tools/gc-534-red-baseline.sh"
 # The continuation of #534 (review r6b: R1, a process row is identified by the
