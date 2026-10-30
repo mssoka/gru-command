@@ -801,7 +801,8 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(h.ledger.getOwnerApproval(id!)).toMatchObject({ state: 'proposed' });
     expect(h.ledger.getNotification(h.ledger.getOwnerApproval(id!)!.notificationId)).toBeNull();
 
-    h.restart().reconcile();
+    // The restarted service has no crash seam: its reconcile reaches the repost.
+    h.restart({ crashAt: [] }).reconcile();
 
     expect(requestState(h, requestId)).toBe('dispatching');
     const record = h.ledger.getOwnerApproval(id!)!;
