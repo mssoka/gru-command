@@ -1753,11 +1753,16 @@ export class LedgerApi {
           AND json_extract(payload, '$.pid') = ? AND (job_id IS NOT ? OR json_extract(payload, '$.run_id') IS NOT ?) LIMIT 1`)
           .get(identity.pid, input.jobId, input.runId);
         if (conflicting !== undefined) continue;
+        const maskedIdentity = redactCredentials(identity.command);
         for (const row of this.listWorktreeProcesses(input.worktreeId)) {
-          // Compare the stored text masked: a row written before #534 still holds
-          // the raw line, and the mask is idempotent for rows written since. The
-          // audit carries the masked text, never a legacy row's credential.
-          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || redactCredentials(row.command) !== redactCredentials(identity.command) || !absent(row.pid) || !absent(-row.pid)) continue;
+          // A row written since #534 already holds the masked text, so compare it
+          // directly; a legacy row still holds the raw line, so compare it after
+          // one mask. (The mask is not idempotent in general, so a stored masked
+          // row is never re-masked for the comparison.) The audit carries the
+          // masked text, never a legacy row's credential.
+          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry'
+            || (row.command !== maskedIdentity && redactCredentials(row.command) !== maskedIdentity)
+            || !absent(row.pid) || !absent(-row.pid)) continue;
           this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
           this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
             request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,

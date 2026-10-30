@@ -270,6 +270,13 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     [`curl -u 'deploy:1234 5678${ARGV_SECRET}' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     [`curl -u 'deploy:$ecret pass phrase' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     [`curl -u 'a b:1234 ${ARGV_SECRET}' https://host/x`, `curl -u 'a b:${REDACTION_PLACEHOLDER}' https://host/x`],
+    // A child's argv has no shell quotes: a quote, backtick or shell-spliced
+    // word in the value still runs to whitespace and masks whole. (A value the
+    // shell already split on whitespace is not recoverable from argv.)
+    [`curl -u deploy:it's-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy:pa\`ss-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`/bin/sh -c curl -u 'deploy:it'\\''s-${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl --token it's-${ARGV_SECRET}`, `curl --token ${REDACTION_PLACEHOLDER}`],
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
     ['docker run -u postgres:postgres image', `docker run -u postgres:${REDACTION_PLACEHOLDER} image`],

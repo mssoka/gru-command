@@ -27,20 +27,25 @@ const keepPrefix = (_match: string, prefix: string): string => `${prefix}${REDAC
 const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,})';
 
 /** The value a command line gives a credential flag or auth scheme (#534):
- * the keyword rule's value, and one that does not start with `-`, so the
- * next flag (`--token --verbose`) is no value. */
-const ARGV_VALUE = `(?!-)${KEYWORD_VALUE}`;
+ * one that does not start with `-`, so the next flag (`--token --verbose`)
+ * is no value. A bare token runs to whitespace and may carry quote or
+ * backtick characters: `ps` shows a child's argv (or a shell-spliced word)
+ * without the shell's quotation, so `--token it's-secret` is one value. */
+const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s]*[A-Za-z0-9])[^\\s]{6,})';
 
-/** The password of `-u user:password`: at least 6 characters with a letter
- * (a uid:gid pair such as `165536:165536` is no credential), bare or a
- * quoted shell word (`-u deploy:'…'`), whose quotes are part of the value
- * a `ps` line shows. A bare one may start with `-`: only the user is a
- * flag's neighbour. The user may be empty (`-u :password`); the value after
- * the colon is masked however it looks, so a `scheme://` tail is masked
- * too — the mask is also the recorded-command identity the acknowledged
- * kill compares, and masking no credential there would be worse than
- * collapsing two non-credential `-u` arguments. */
-const PASSWORD_VALUE = '(?:"(?=[^"]*[A-Za-z])[^"]{6,}"|\'(?=[^\']*[A-Za-z])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z])[^\\s`\'"]{6,})';
+/** The value of a bare `-u user:password` (or `-u :password`): at least 6
+ * characters with a letter (a uid:gid pair such as `165536:165536` is no
+ * credential), running to whitespace. A bare token may hold quote or
+ * backtick characters — a child's argv and a shell-spliced word shed the
+ * shell's quotation — and may start with `-`. The value after the colon is
+ * masked however it looks, so a `scheme://` tail is masked too: the mask is
+ * also the recorded-command identity the acknowledged kill compares, and
+ * masking no credential there would be worse than collapsing two
+ * non-credential `-u` arguments. A value the shell already split on
+ * whitespace (a child spawned with a space inside its `-u` value) is not
+ * recoverable from the argv; its quoted shell source is handled by the
+ * whole-quoted passes below. */
+const ARGV_TOKEN = '(?!["\']?\\[REDACTED\\]["\']?)(?=[^\\s]*[A-Za-z])[^\\s]{6,}';
 
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret
@@ -144,9 +149,9 @@ const REDACTIONS: readonly Redaction[] = [
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
   replacing(/(?<![A-Za-z0-9-])(-u\s+'[^':]{0,64}:)(?=[^']*[A-Za-z])[^']{6,}'/gu,
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
-  // A bare user (an empty one too: `-u :secret`) with a bare or quoted
-  // password. The lookbehind keeps `cli -u:value` and `--tokenize` alone.
-  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-]?[^\\s:'"\`]*["']?:)${PASSWORD_VALUE}`, 'gu'), keepPrefix),
+  // A bare user (an empty one too: `-u :secret`) with a bare value. The
+  // lookbehind keeps `cli -u:value` and `--tokenize` alone.
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-]?[^\\s:'"\`]*["']?:)${ARGV_TOKEN}`, 'gu'), keepPrefix),
   redactNpmrcAuth,
   // A key, then an optional closing quote (JSON's `"password": "…"`), then
   // `:` or `=`. One whose identifier starts right after a `/` is part of a

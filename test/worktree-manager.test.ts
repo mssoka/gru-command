@@ -2614,6 +2614,8 @@ const ARGV_CREDENTIALS: readonly string[] = [
   `--token=${ARGV_SENTINEL}`,
   '--token', ARGV_SENTINEL,
   '-u', `user:${ARGV_SENTINEL}`,
+  // A child's argv keeps the quote; the bare `-u` value runs to whitespace.
+  '-u', `deploy:it's-${ARGV_SENTINEL}`,
   '-H', `Authorization: token ${ARGV_SENTINEL}`,
   `https://user:${ARGV_SENTINEL}@host/x`,
 ];
