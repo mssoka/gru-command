@@ -408,8 +408,9 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
     expect(grepPathCandidates(`${'a '.repeat(5000)}x.md:1:x`).length).toBeLessThanOrEqual(2049);
     expect(grepPathCandidates(`a b${'/a'.repeat(5000)}:1:x`).length).toBeLessThanOrEqual(2049);
     // The second slash of `//` starts nothing: no `/host/…` candidate.
-    expect(grepPathCandidates('foo //host/share/f.md:1:x').map((candidate) => candidate.path))
-      .toEqual(['foo //host/share/f.md', '//host/share/f.md', 'host/share/f.md', 'share/f.md', 'f.md']);
+    const share = ['', '', 'host', 'share', 'f.md'].join('/');
+    expect(grepPathCandidates(`foo ${share}:1:x`).map((candidate) => candidate.path))
+      .toEqual([`foo ${share}`, share, 'host/share/f.md', 'share/f.md', 'f.md']);
     // Prose padding with no excluded suffix stays no hit.
     expect(scanObservedAccess([{ index: 2, toolName: 'bash', text: `${'word '.repeat(20_000)}done at 10:30:15` }], DEFAULT_BLIND_ISOLATION_RULE)).toEqual([]);
   });
@@ -431,6 +432,11 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   const recorded = (text: string, rule = DEFAULT_BLIND_ISOLATION_RULE): readonly string[] =>
     scan(text, rule).map((hit) => `${hit.code}:${hit.path ?? ''}`);
   const prohibited = (path: string): readonly string[] => [`excluded-path-read:${path}`];
+  const ruleOf = (directive: string) => deriveBlindIsolationRule({ briefing: `blind-isolation: ${directive}`, amendments: [] });
+  /** Numbered lines under a `git grep --heading` file name. */
+  const numbered = (n: number, text = 'needle'): string => `${n}:${text}`;
+  const numberedContext = (n: number, text = 'needle'): string => `${n}-${text}`;
+  const rows = (...parts: readonly string[]): string => parts.join('\n');
 
   it('A1: a hit prefixed by a 40-hex revision is a read of the excluded repository path', () => {
     const text = match(named('a'.repeat(40), ARTIFACT), 7, ' matched symbol');
@@ -444,7 +450,8 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   it('A2: any revision spelling, as a match line or a context line, is stripped from the recorded path', () => {
     // The last three end in `-<digits>`: a ref spelled `pr-528` or
     // `release-2026-10-29` offers delimiters of its own before the path.
-    for (const rev of ['abc1234', 'HEAD', 'HEAD~1', 'origin/main', 'refs/heads/feature/x', 'v1.0.1', 'pr-528', 'v1-2-0', 'release-2026-10-29']) {
+    // Refs with a dotted part before a number (`feat/node.js-18-lts`, a `git describe` name) end the path no earlier.
+    for (const rev of ['abc1234', 'HEAD', 'HEAD~1', 'origin/main', 'refs/heads/feature/x', 'v1.0.1', 'pr-528', 'v1-2-0', 'release-2026-10-29', 'feat/node.js-18-lts', 'release/2.x-1-rc', 'v2.beta-5-gabc1234', 'gru/gc-520-continue']) {
       expect(recorded(match(named(rev, ARTIFACT), 7, ' matched symbol')), `${rev} match`).toEqual(prohibited(ARTIFACT));
       expect(recorded(context(named(rev, ARTIFACT), 7, ' matched symbol')), `${rev} context`).toEqual(prohibited(ARTIFACT));
     }
@@ -613,13 +620,66 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(context(path, 7), rule), 'worktree context').toEqual(prohibited(path));
     expect(recorded(context(named('HEAD', path), 7), rule), 'revision context').toEqual(prohibited(path));
     expect(recorded(match(named('HEAD', path), 7), rule), 'revision match').toEqual(prohibited(path));
-    // An extensionless private file keeps the prose behind its line number out of the record too.
+    // An extensionless private file keeps what follows its line number out of the record too: prose, a
+    // date with no space before it, a number between dashes.
     const privatePath = 'docs/issues/NOTES';
-    for (const text of ['see 2026-10-29 and 10-30-15', 'finished 12-30-45 ok']) {
+    for (const text of ['see 2026-10-29 and 10-30-15', 'finished 12-30-45 ok', 'DATE=2026-10-29', 'x-1-y']) {
       const hits = scan(context(named('HEAD', privatePath), 7, text));
       expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited(privatePath));
-      expect(JSON.stringify(hits), text).not.toMatch(/see|finished/u);
+      expect(JSON.stringify(hits), text).not.toMatch(/see|finished|DATE|x-1-y/u);
     }
+    for (const text of ['DATE-2026-10-29-x', 'meeting at 12:30:45']) {
+      expect(recorded(match(named('HEAD', privatePath), 7, text)), `match ${text}`).toEqual(prohibited(privatePath));
+    }
+    expect(recorded(context('vendor/Makefile', 7, '3-x'), ruleOf('exclude vendor/**'))).toEqual(prohibited('vendor/Makefile'));
+  });
+
+  it('R1: a listing, indented prose and a date after a name are no grep lines, whatever numbers a name holds', () => {
+    const vendor = ruleOf('exclude vendor/**');
+    const suffix = ruleOf('exclude **/*.md');
+    // `git ls-files`, `find` and `git grep -l` print names with no line number: a number between dashes
+    // inside a dated or issue-numbered name is no delimiter, and the name ends in an extension.
+    for (const [text, rule] of [
+      ['vendor/gc-520-notes.md', vendor],
+      ['vendor/2026-10-29-notes.md', vendor],
+      [named('HEAD', 'vendor/gc-520-notes.md'), vendor],
+      ['docs/issues/gc-520-notes.md', DEFAULT_BLIND_ISOLATION_RULE],
+      [`${ARTIFACT_DIR}/1-1-account-management.md`, DEFAULT_BLIND_ISOLATION_RULE],
+      ['docs/issues/report.final-2026-10-29.md', DEFAULT_BLIND_ISOLATION_RULE],
+      // `find -printf`: a name, then a date.
+      ['vendor/x.md 2026-10-29', vendor],
+      // An indented comment or frame is no grep result, as for `path:N:`.
+      ['  // see notes.md:12: for details', suffix],
+      ['Updated on 2026-10-29', DEFAULT_BLIND_ISOLATION_RULE],
+    ] as const) {
+      expect(recorded(text, rule), text).toEqual([]);
+    }
+  });
+
+  it('R2: a dotted part, a number or a space inside a name does not end the path early', () => {
+    const suffix = ruleOf('exclude **/*.md');
+    // A name with a dotted part of its own before a dated part: the whole name, not `report.final`.
+    const dotted = 'docs/issues/report.final-2026-10-29.md';
+    for (const rule of [DEFAULT_BLIND_ISOLATION_RULE, suffix]) {
+      expect(recorded(match(named('HEAD', dotted), 7), rule), 'match').toEqual(prohibited(dotted));
+      expect(recorded(context(named('HEAD', dotted), 7), rule), 'context').toEqual(prohibited(dotted));
+    }
+    expect(recorded(context(dotted, 7))).toEqual(prohibited(dotted));
+    // ...also when the dotted part is a version (`.1`) behind a letter-led word.
+    expect(recorded(context(named('HEAD', 'notes/story-2.1-3-x.md'), 7), suffix)).toEqual(prohibited('notes/story-2.1-3-x.md'));
+    // A delimiter opened by a colon and closed by a hyphen ends nothing: `<rev>:<dir>` with a BMAD-style file name.
+    expect(recorded(match(named('HEAD', 'docs/issues:1-1-story.md'), 7))).toEqual(prohibited('docs/issues/1-1-story.md'));
+    expect(recorded(context(named('HEAD', 'docs/issues:1-1-story.md'), 7))).toEqual(prohibited('docs/issues/1-1-story.md'));
+    // A date before the first space of a spaced name.
+    for (const [rule, path] of [[DEFAULT_BLIND_ISOLATION_RULE, 'docs/issues/2026-10-29 retro notes.md'], [suffix, 'docs/issues/2026-10-29 retro notes.md'], [suffix, 'vendor/2026-10-29 spec/notes.md']] as const) {
+      expect(recorded(match(named('HEAD', path), 7), rule), `${path} match`).toEqual(prohibited(path));
+      expect(recorded(context(named('HEAD', path), 7), rule), `${path} context`).toEqual(prohibited(path));
+    }
+    // The tree root prints `<rev>::<path>`: the path is the repository's, with no colon in front of it.
+    expect(recorded(match(named('HEAD', ':notes.md'), 7), suffix)).toEqual(prohibited('notes.md'));
+    expect(recorded(context(named('HEAD', ':notes.md'), 7), suffix)).toEqual(prohibited('notes.md'));
+    expect(recorded(match(named('HEAD', ':sub/notes.md'), 7), suffix)).toEqual(prohibited('sub/notes.md'));
+    expect(recorded(rows(named('HEAD', ':notes.md'), numbered(7)), suffix)).toEqual(prohibited('notes.md'));
   });
 
   it('R3: a parent-relative path behind a revision is outside the package, as `path:N:` is', () => {
@@ -652,47 +712,67 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
       // Prose before the colon is no revision (a ref holds no whitespace), so the
       // parent-relative name after it is not read by its shape.
       match(named('see this', '../vendor/notes.md'), 1, 'needle'),
+      // A drive-letter name with `..` is absolute, and a spaced parent path needs a file-like end.
+      match(named('HEAD', 'C:/../vendor/a.md'), 1),
+      match(named('HEAD', '../see this text'), 1),
     ]) {
       expect(scan(text), text).toEqual([]);
     }
   });
 
   it('R5: `git grep --heading` names the file once and prints `N:text` under it; the lines belong to that file', () => {
-    const body = (n: number, text = 'needle'): string => `${n}:${text}`;
-    const ctx = (n: number, text = 'needle'): string => `${n}-${text}`;
-    const lines = (...rows: readonly string[]): string => rows.join('\n');
     // Worktree form, with a context group separator.
-    expect(recorded(lines(ARTIFACT, ctx(6, 'before'), body(7), '--', body(12)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(ARTIFACT, numberedContext(6, 'before'), numbered(7), '--', numbered(12)))).toEqual(prohibited(ARTIFACT));
     // `<rev>:<path>`, `<rev>:<dir>:<file>` and the tree root `<rev>::<path>`.
-    expect(recorded(lines(named('HEAD', ARTIFACT), body(7)))).toEqual(prohibited(ARTIFACT));
-    expect(recorded(lines(named('HEAD', `${ARTIFACT_DIR}:deferred-work.md`), body(7)))).toEqual(prohibited(ARTIFACT));
-    expect(recorded(lines(named('HEAD', `:${ARTIFACT}`), body(7)))).toEqual(prohibited(ARTIFACT));
-    expect(recorded(lines(named('HEAD', 'docs/issues/prior review.md'), ctx(2)))).toEqual(prohibited('docs/issues/prior review.md'));
-    // `--column` adds a column behind the line number.
-    expect(recorded(lines(named('HEAD', ARTIFACT), '7:3:needle'))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(named('HEAD', ARTIFACT), numbered(7)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(named('HEAD', `${ARTIFACT_DIR}:deferred-work.md`), numbered(7)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(named('HEAD', `:${ARTIFACT}`), numbered(7)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(named('HEAD', 'docs/issues/prior review.md'), numberedContext(2)))).toEqual(prohibited('docs/issues/prior review.md'));
+    // `--column` adds a column behind the line number; CRLF output carries a carriage return on every line.
+    expect(recorded(rows(named('HEAD', ARTIFACT), '7:3:needle'))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(ARTIFACT, numberedContext(6, 'before'), numbered(7), '--', numbered(12)).replace(/\n/gu, '\r\n'))).toEqual(prohibited(ARTIFACT));
     // Several files: a later heading is judged too, and a clean file's lines are not its neighbour's.
-    expect(recorded(lines('src/a.ts', body(3), '--', ARTIFACT, body(9)))).toEqual(prohibited(ARTIFACT));
-    expect(recorded(lines(ARTIFACT, body(1), '', 'src/a.ts', body(3), body(4)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows('src/a.ts', numbered(3), '--', ARTIFACT, numbered(9)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(ARTIFACT, numbered(1), '', 'src/a.ts', numbered(3), numbered(4)))).toEqual(prohibited(ARTIFACT));
     // The record holds the heading's path, never a line of text.
-    const hits = scan(lines(named('HEAD', ARTIFACT), body(7, 'sensitive words 2026-10-29'), ctx(8, 'afterwards')));
+    const hits = scan(rows(named('HEAD', ARTIFACT), numbered(7, 'sensitive words 2026-10-29'), numberedContext(8, 'afterwards')));
     expect(JSON.stringify(hits)).not.toMatch(/sensitive|afterwards/u);
     expect(hits).toHaveLength(1);
   });
 
   it('R5: a heading judges nothing without lines under it, and clean files stay clean', () => {
-    const lines = (...rows: readonly string[]): string => rows.join('\n');
     // A bare listing of an excluded name is no heading: no numbered line follows it.
-    expect(scan(lines(ARTIFACT, 'docs/issues/other.md'))).toEqual([]);
-    expect(scan(lines('src/a.ts', '3:needle', 'src/b.ts', '4-ctx'))).toEqual([]);
+    expect(scan(rows(ARTIFACT, 'docs/issues/other.md'))).toEqual([]);
+    expect(scan(rows('src/a.ts', numbered(3), 'src/b.ts', numberedContext(4)))).toEqual([]);
     // Lines under a clean heading may mention an excluded name without reading it.
-    expect(scan(lines('src/config.ts', `12:  const glob = '_bmad-output/**'`, '--', `15-see ${ARTIFACT}`))).toEqual([]);
+    expect(scan(rows('src/config.ts', numbered(12, `  const glob = '_bmad-output/**'`), '--', numberedContext(15, `see ${ARTIFACT}`)))).toEqual([]);
     // A blank line closes a file's group (`--break`): numbered lines after it have no heading.
-    expect(scan(lines(ARTIFACT, '', '7:needle'))).toEqual([]);
+    expect(scan(rows(ARTIFACT, '', numbered(7)))).toEqual([]);
     // An indented line is no heading, and prose before a numbered list names no file.
-    expect(scan(lines(`  ${ARTIFACT}`, '7:needle'))).toEqual([]);
-    expect(scan(lines('Results', '1: first', '2: second'))).toEqual([]);
+    expect(scan(rows(`  ${ARTIFACT}`, numbered(7)))).toEqual([]);
+    expect(scan(rows('Results', '1: first', '2: second'))).toEqual([]);
     // `-n` was not given: nothing numbers the lines, so nothing attributes them (out of scope).
-    expect(scan(lines(ARTIFACT, 'needle one', 'needle two'))).toEqual([]);
+    expect(scan(rows(ARTIFACT, 'needle one', 'needle two'))).toEqual([]);
+  });
+
+  it('R5: a name that opens with digits, an absolute name, and a numbered line that quotes a path', () => {
+    const vendor = ruleOf('exclude vendor/**');
+    // A commit id of digits only is a name, not a line number (a line number has up to six digits).
+    expect(recorded(rows('1234567:vendor/lib/a.ts', numbered(7)), vendor)).toEqual(prohibited('vendor/lib/a.ts'));
+    expect(recorded(rows('src/a.ts', numbered(3), '1234567:vendor/lib/a.ts', numbered(7)), vendor)).toEqual(prohibited('vendor/lib/a.ts'));
+    // So is the first name of an output, or the first after a blank line, whatever it opens with.
+    expect(recorded(rows('01-plan/part.md', numbered(7)), ruleOf('exclude 01-plan/**'))).toEqual(prohibited('01-plan/part.md'));
+    expect(recorded(rows('src/a.ts', numbered(3), '', '01-plan/part.md', numbered(7)), ruleOf('exclude 01-plan/**'))).toEqual(prohibited('01-plan/part.md'));
+    // A name on a line of its own is judged by an outside shape too, as `path:N:` is.
+    expect(recorded(rows('/abs/repo/vendor/x.md', numbered(7)))).toEqual(prohibited('/abs/repo/vendor/x.md'));
+    expect(recorded(rows('C:\\repo\\x.md', numbered(7)))).toEqual(prohibited('C:/repo/x.md'));
+    expect(recorded(rows('/abs/repo/vendor/x.md'))).toEqual([]);
+    // The text of a numbered line is text: it names no file, with a heading above it or none.
+    expect(recorded(rows('build.log', numbered(3, 'vendor/a.js:12:5: error foo')), vendor)).toEqual([]);
+    expect(recorded(numbered(3, 'vendor/a.js:12:5: error foo'), vendor)).toEqual([]);
+    // A name in the middle of a listing, or a prose line, opens no group.
+    expect(recorded(rows('a.md', 'vendor/x.md', '2026-10-29 build ok'), vendor)).toEqual([]);
+    expect(recorded(rows('vendor/ some text', '1: x'), vendor)).toEqual([]);
   });
 
   it.skipIf(branchMessages === null)('R4: this branch\'s own commit messages are no excluded read, as written or as a log shows them', () => {
@@ -705,33 +785,35 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(messages.split('\n').flatMap((line) => scan(line))).toEqual([]);
   });
 
-  it('reading these tests is no excluded read: no line of this file, as written or as a read gutter, a diff or any grep output shows it, reads as a grep hit', () => {
-    const file = 'test/blind-input.test.ts';
-    const own = readFileSync(new URL(import.meta.url), 'utf8').split('\n');
-    // Lines a reviewer sees: the file itself, a numbered read, a diff line, a
-    // `grep -n` match or context line, with and without a revision. The two
-    // older fixtures that name an outside path by shape are the only lines of
-    // this file that were already recorded before the revision forms were read.
-    const shapes = (line: string, index: number): readonly string[] => {
-      const n = index + 1;
-      return [
-        line, `${String(n).padStart(6)}→${line}`, `+${line}`,
-        [file, String(n), line].join(':'), [file, String(n), line].join('-'),
-        ['HEAD', file, String(n), line].join(':'), ['HEAD', file, String(n), line].join('-'),
-      ];
-    };
-    const older = /\/\/host\/share\/f\.md/u;
-    const flagged = own.flatMap((line, index) => shapes(line, index).flatMap((shown) => scan(shown).map((hit) => `${index + 1}: ${hit.path ?? ''}`)));
-    expect([...new Set(flagged)].filter((entry) => !older.test(entry))).toEqual([]);
-    // ...and the file as one result, where a numbered line can follow a name
-    // line: a whole read, and `--heading` output over it, with and without a revision.
-    const lines = own.filter((line) => !older.test(line));
-    const whole = [
-      lines.join('\n'),
-      [file, ...lines.map((line, index) => `${index + 1}:${line}`)].join('\n'),
-      [`HEAD:${file}`, ...lines.map((line, index) => `${index + 1}-${line}`)].join('\n'),
+  it('reading the files of this change is no excluded read: no line, as written or as a read gutter, a diff or any grep output shows it, reads as a grep hit', () => {
+    // A blind reviewer reads these files, and what its tools print is observed. So no line of any
+    // file this change touches may read as a grep hit — plain, behind a numbered gutter, as a diff
+    // line, as `grep -n` match or context output with and without a revision — nor may the file
+    // as one result, plain or as `--heading` output.
+    const files = [
+      'src/dispatch/blind-input.ts', 'test/blind-input.test.ts', 'test/blind-input-dispatch.test.ts',
+      'test/suite-shape.test.ts', 'docs/REVIEW-INPUTS.md', '.gru-command/worktree.toml',
     ];
-    expect(whole.flatMap((text) => scan(text))).toEqual([]);
+    const flagged: string[] = [];
+    for (const file of files) {
+      const own = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').split('\n');
+      own.forEach((line, index) => {
+        const n = String(index + 1);
+        const shown = [
+          line, `${n}\t${line}`, `${n.padStart(6)}\t${line}`, `${n.padStart(6)}→${line}`, `+${line}`, `-${line}`, ` ${line}`,
+          [file, n, line].join(':'), [file, n, line].join('-'), ['HEAD', file, n, line].join(':'), ['HEAD', file, n, line].join('-'),
+        ];
+        for (const text of shown) flagged.push(...scan(text).map((hit) => `${file}:${n}: ${hit.path ?? ''}`));
+      });
+      const whole = [
+        own.join('\n'),
+        own.map((line, index) => `${index + 1}\t${line}`).join('\n'),
+        [file, ...own.map((line, index) => `${index + 1}:${line}`)].join('\n'),
+        [`HEAD:${file}`, ...own.map((line, index) => `${index + 1}-${line}`)].join('\n'),
+      ];
+      flagged.push(...whole.flatMap((text) => scan(text)).map((hit) => `${file} as one result: ${hit.path ?? ''}`));
+    }
+    expect([...new Set(flagged)]).toEqual([]);
   });
 });
 
