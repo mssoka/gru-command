@@ -219,6 +219,7 @@ type Row = Record<string, unknown>;
 /** The verification runs of one admitted directive request that the in-turn
  * tool fence does not count as blockers (#542); see `ownVerificationRuns`. */
 interface OwnVerificationRuns {
+  readonly laneId: string;
   readonly runIds: ReadonlySet<string>;
   readonly pids: ReadonlySet<number>;
 }
@@ -9347,9 +9348,10 @@ export class LedgerApi {
    * the job's registered lane path as its `cwd`, and follows the request's
    * correlated admission (`silas.directive-sent`). The events carry no
    * requester, so "own" is time and place only. A run requested at or before
-   * the admission is never one. `pids` are the pids of those runs'
-   * `verification.process-started`; the lane's `worktree_processes` rows are
-   * keyed by that pid alone. Undefined while the request has no admission. */
+   * the admission is never one, whenever its frames or processes arrive.
+   * `pids` are the pids of those runs' `verification.process-started`; the
+   * verify server records each against the lane whose path is the run's cwd.
+   * Undefined while the request has no admission. */
   private ownVerificationRuns(row: DirectiveRequestRecord, laneId: string): OwnVerificationRuns | undefined {
     const lane = this.getWorktree(laneId);
     if (row.admissionSeq === null || lane === null || lane.jobId !== row.jobId) return undefined;
@@ -9365,7 +9367,7 @@ export class LedgerApi {
     for (const start of starts) {
       if (typeof start.run_id === 'string' && runIds.has(start.run_id) && Number.isSafeInteger(start.pid)) pids.add(Number(start.pid));
     }
-    return { runIds, pids };
+    return { laneId: lane.id, runIds, pids };
   }
 
   claimDirectiveCheckpoint(identity: DirectiveTurnIdentity, checkpointId: string): void {
@@ -10523,8 +10525,8 @@ export class LedgerApi {
           ORDER BY p.worktree_id, p.pid`,
       )
       .all(row.jobId, laneId) as Row[])
-      // #542: a row whose pid a post-admission run's process-started named.
-      .filter((proc) => ownRuns?.pids.has(Number(proc.pid)) !== true);
+      // #542: the lane's row for a pid a post-admission run's process-started named.
+      .filter((proc) => !(ownRuns !== undefined && str(proc.worktree_id) === ownRuns.laneId && ownRuns.pids.has(Number(proc.pid))));
     if (liveProcesses.length > 0) {
       live(
         `live lane process(es): ${liveProcesses
