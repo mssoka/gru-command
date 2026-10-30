@@ -15,7 +15,7 @@ import {
 import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
-import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
+import { publishSpawnRegistration, stageSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import { notifyDisposalSettlement } from '../src/runtime/disposal-observation.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
@@ -204,6 +204,11 @@ class FakeRegistry implements SupervisorRegistry {
 
   getHandle(agentId: string): AgentHandle | null {
     return [...this.liveHandles].find((handle) => handle.id === agentId && !this.unpublished.has(handle) && !this.quarantined.has(handle)) ?? null;
+  }
+
+  /** Like the real registry: every handle held, unpublished and quarantined included. */
+  listHandles(): readonly AgentHandle[] {
+    return [...this.liveHandles];
   }
 
   quarantineHandle(handle: AgentHandle): void {
@@ -7409,5 +7414,292 @@ describe('restart cleanup journal conservative replay (GH-280)', () => {
       expect(debt.generation).toBe(token.generation);
       expect(h.journal.claim(handle, 'custody-job', 'origin').generation).toBe(token.generation);
     } finally { h.db.close(); }
+  });
+});
+
+describe('supervisor — host-absent turns settled at boot (#547)', () => {
+  /** A `working` job and the agent rows a previous service process left open on it. */
+  function seedOpenTurn(h: Harness, jobId: string, agentId: string, state: 'spawning' | 'streaming'): void {
+    if (h.api.getJob(jobId) === null) {
+      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+      h.api.setJobStatus(jobId, 'working');
+    }
+    h.api.registerAgent({ id: agentId, role: 'minion', jobId });
+    if (state === 'streaming') h.api.setAgentState(agentId, 'streaming');
+  }
+
+  /** Events of one agent after `afterSeq`, oldest first. */
+  function agentEventsAfter(h: Harness, agentId: string, afterSeq: number) {
+    return h.api.listEvents({ limit: 1_000 }).filter((event) => event.agentId === agentId && event.seq > afterSeq).reverse();
+  }
+
+  function lastSeq(h: Harness): number {
+    return h.api.listEvents({ limit: 1 })[0]?.seq ?? 0;
+  }
+
+  it('moves a previous process\'s spawning and streaming rows to error, naming the reason, with one orphan notice each', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-ghost', 'ghost-streaming', 'streaming');
+      seedOpenTurn(h, 'job-ghost', 'ghost-spawning', 'spawning');
+      // Rows that are not open turns, and a job that never had one.
+      seedOpenTurn(h, 'job-quiet', 'quiet-idle', 'streaming');
+      h.api.setAgentState('quiet-idle', 'idle');
+      seedOpenTurn(h, 'job-quiet', 'quiet-disposed', 'streaming');
+      h.api.setAgentState('quiet-disposed', 'disposed');
+      const before = lastSeq(h);
+
+      const result = h.supervisor.settleHostAbsentTurns();
+
+      expect(result.examined).toBe(2);
+      expect(result.live).toBe(0);
+      expect([...result.settled].sort()).toEqual(['ghost-spawning', 'ghost-streaming']);
+      expect(result.failed).toEqual([]);
+      for (const [agentId, from] of [['ghost-streaming', 'streaming'], ['ghost-spawning', 'spawning']] as const) {
+        expect(h.api.getAgent(agentId)?.state, agentId).toBe('error');
+        // Agent row only: the state move and the orphan record, nothing else
+        // (each notice the center derives from them is its own event row).
+        const events = agentEventsAfter(h, agentId, before).filter((event) => event.kind !== 'notification.created');
+        expect(events.map((event) => event.kind), agentId).toEqual(['agent.state', 'supervision.turn-recovery']);
+        expect(events[0]?.payload, agentId).toEqual({ from, to: 'error', error: 'host-absent at boot' });
+        expect(events[1]?.payload, agentId).toMatchObject({ disposition: 'orphaned', reason: 'host-absent at boot' });
+        const notices = h.notificationsOfKind(`supervision.turn-orphaned.${agentId}`);
+        expect(notices, agentId).toHaveLength(1);
+        expect(notices[0]).toMatchObject({ routing: 'action-required', severity: 'error', agentId, resolvedAt: null });
+        expect(notices[0]?.detail, agentId).toContain('host-absent at boot');
+        expect(notices[0]?.detail, agentId).toContain('job job-ghost');
+        // The ordinary FYI every agent reaching `error` gets, carrying the reason.
+        const errored = h.api.listNotifications({ limit: 100 }).filter((notice) => notice.title === `Agent ${agentId} errored`);
+        expect(errored, agentId).toHaveLength(1);
+        expect(errored[0], agentId).toMatchObject({ routing: 'fyi', detail: 'host-absent at boot' });
+      }
+      expect(h.api.getAgent('quiet-idle')?.state).toBe('idle');
+      expect(h.api.getAgent('quiet-disposed')?.state).toBe('disposed');
+      expect(h.notificationsOfKind('supervision.turn-orphaned.quiet-idle')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.quiet-disposed')).toEqual([]);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('frees the job: binning is refused for the open turns before the settlement and allowed after it', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-ghost', 'ghost-streaming', 'streaming');
+      seedOpenTurn(h, 'job-ghost', 'ghost-spawning', 'spawning');
+      expect(() => h.api.setJobStatus('job-ghost', 'binned')).toThrow(/open worker turn\(s\): .*ghost-streaming \(streaming\)/u);
+      expect(() => h.api.setJobStatus('job-ghost', 'binned')).toThrow(/ghost-spawning \(spawning\)/u);
+      expect(h.api.getJob('job-ghost')?.status).toBe('working');
+
+      h.supervisor.settleHostAbsentTurns();
+
+      expect(h.api.setJobStatus('job-ghost', 'binned').status).toBe('binned');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('leaves a turn this process runs alone — a published handle — and a second call changes nothing', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-mixed', 'ghost-streaming', 'streaming');
+      // The boot settlement ran: the ghost moved, nothing else existed yet.
+      expect(h.supervisor.settleHostAbsentTurns().settled).toEqual(['ghost-streaming']);
+
+      // A turn spawned AFTER boot in this process: a live handle, adopted by
+      // supervision, with its ledger row streaming.
+      const live = new FakeHandle('minion', 'live-streaming', null);
+      h.registry.adopt(live);
+      seedOpenTurn(h, 'job-mixed', 'live-streaming', 'streaming');
+      live.setState('streaming');
+      expect(h.supervisor.viewFor('live-streaming')).not.toBeNull();
+      // And a row that appeared after boot with no handle at all (never a
+      // previous process's: the settlement already ran once).
+      seedOpenTurn(h, 'job-mixed', 'late-streaming', 'streaming');
+      const before = lastSeq(h);
+      const listed = h.api.listAgents();
+
+      const again = h.supervisor.settleHostAbsentTurns();
+
+      expect(again).toEqual({ examined: 0, live: 0, settled: [], failed: [] });
+      expect(h.api.getAgent('live-streaming')?.state).toBe('streaming');
+      expect(h.api.getAgent('late-streaming')?.state).toBe('streaming');
+      expect(h.api.listAgents()).toEqual(listed);
+      expect(lastSeq(h)).toBe(before);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.live-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.late-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.ghost-streaming')).toHaveLength(1);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('reads the registry\'s own handle list: an unpublished handle, a supervised record and a published handle are all this process\'s', () => {
+    const h = boot();
+    try {
+      for (const id of ['held-unpublished', 'held-by-supervision', 'held-published', 'ghost']) seedOpenTurn(h, 'job-owned', id, 'streaming');
+      // Held by the registry only: the owner has not published it, so the
+      // supervisor never adopted it and `getHandle` answers null.
+      const unpublished = new FakeHandle('minion', 'held-unpublished', null);
+      h.registry.adopt(unpublished, stageSpawnRegistration({}, () => {}));
+      expect(h.registry.getHandle('held-unpublished')).toBeNull();
+      expect(h.supervisor.viewFor('held-unpublished')).toBeNull();
+      // Held by supervision only: a record with no handle in the registry.
+      (h.supervisor as unknown as { agents: Map<string, unknown> }).agents.set(
+        'held-by-supervision',
+        staleOpenSlotRecord(null, 0, { agentId: 'held-by-supervision' }),
+      );
+      // Held by both: published and adopted.
+      h.registry.adopt(new FakeHandle('minion', 'held-published', null));
+
+      const result = h.supervisor.settleHostAbsentTurns();
+
+      expect(result).toEqual({ examined: 4, live: 3, settled: ['ghost'], failed: [] });
+      for (const id of ['held-unpublished', 'held-by-supervision', 'held-published']) {
+        expect(h.api.getAgent(id)?.state, id).toBe('streaming');
+        expect(h.notificationsOfKind(`supervision.turn-orphaned.${id}`), id).toEqual([]);
+      }
+      expect(h.api.getAgent('ghost')?.state).toBe('error');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('leaves an unfinished tracked child worker the boot re-runs alone, and settles a finished child\'s ghost row', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-children', 'parent-ghost', 'streaming');
+      const admit = (id: string) => h.api.admitChildWorker({
+        id, parentAgentId: 'parent-ghost', jobId: 'job-children', purpose: 'bounded task', authority: 'read-only', task: 'inspect',
+        idempotencyKey: `${id}-key`,
+      });
+      // Queued, no session yet: the child service re-runs it under this id,
+      // and its row reads `spawning` until the spawn returns a handle.
+      admit('child-queued');
+      // Finished by the boot reconciliation (its session died with the host).
+      admit('child-finished');
+      h.api.recordChildResult('child-finished', { state: 'error', summary: 'service restarted while the child was running', ref: null });
+      expect(h.api.getAgent('child-queued')?.state).toBe('spawning');
+      expect(h.api.getAgent('child-finished')?.state).toBe('spawning');
+
+      const result = h.supervisor.settleHostAbsentTurns();
+
+      expect(result.examined).toBe(3);
+      expect(result.live).toBe(1);
+      expect([...result.settled].sort()).toEqual(['child-finished', 'parent-ghost']);
+      expect(h.api.getAgent('child-queued')?.state).toBe('spawning');
+      expect(h.notificationsOfKind('supervision.turn-orphaned.child-queued')).toEqual([]);
+      expect(h.api.listEvents({ limit: 1_000 }).filter((event) => event.agentId === 'child-queued' && event.kind === 'agent.state')).toEqual([]);
+      expect(h.api.getAgent('child-finished')?.state).toBe('error');
+      expect(h.notificationsOfKind('supervision.turn-orphaned.child-finished')).toHaveLength(1);
+      expect(h.api.getAgent('parent-ghost')?.state).toBe('error');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('moves a turn with no lane left to recover — a finished job, or no job — and records it, without the action-required note', () => {
+    const h = boot();
+    try {
+      // A turn whose job is already finished: bin the job while its agent is
+      // idle, then leave the agent open the way a restart does.
+      h.api.addJob({ id: 'job-binned', repo: 'fixture', title: 'job-binned' });
+      h.api.setJobStatus('job-binned', 'working');
+      h.api.registerAgent({ id: 'binned-streaming', role: 'minion', jobId: 'job-binned' });
+      h.api.setAgentState('binned-streaming', 'idle');
+      h.api.setJobStatus('job-binned', 'binned');
+      h.api.setAgentState('binned-streaming', 'streaming');
+      // A resident session that belongs to no job (Gru, Bob, Silas, the vector session).
+      h.api.registerAgent({ id: 'gru-streaming', role: 'gru' });
+      h.api.setAgentState('gru-streaming', 'streaming');
+      // And one with a lane to recover, for contrast.
+      seedOpenTurn(h, 'job-live', 'live-lane-streaming', 'streaming');
+      const before = lastSeq(h);
+
+      const result = h.supervisor.settleHostAbsentTurns();
+
+      expect([...result.settled].sort()).toEqual(['binned-streaming', 'gru-streaming', 'live-lane-streaming']);
+      for (const agentId of ['binned-streaming', 'gru-streaming', 'live-lane-streaming']) {
+        expect(h.api.getAgent(agentId)?.state, agentId).toBe('error');
+        const events = agentEventsAfter(h, agentId, before).filter((event) => event.kind !== 'notification.created');
+        expect(events.map((event) => event.kind), agentId).toEqual(['agent.state', 'supervision.turn-recovery']);
+        expect(events[0]?.payload, agentId).toMatchObject({ to: 'error', error: 'host-absent at boot' });
+        expect(events[1]?.payload, agentId).toMatchObject({ disposition: 'orphaned', reason: 'host-absent at boot' });
+      }
+      expect(h.notificationsOfKind('supervision.turn-orphaned.binned-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.gru-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.live-lane-streaming')).toHaveLength(1);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('reports a row it cannot move as failed — still open, no orphan notice — and still settles the others', () => {
+    const logged: { level: string; msg: string; fields: Record<string, unknown> | undefined }[] = [];
+    const h = boot(undefined, { log: (level, msg, fields) => logged.push({ level, msg, fields }) });
+    try {
+      seedOpenTurn(h, 'job-fault', 'stuck-streaming', 'streaming');
+      seedOpenTurn(h, 'job-fault', 'moves-streaming', 'streaming');
+      const setState = h.api.setAgentState.bind(h.api);
+      const fault = vi.spyOn(h.api, 'setAgentState').mockImplementation((id, state, error) => {
+        if (id === 'stuck-streaming') throw new Error('ledger write refused');
+        return setState(id, state, error);
+      });
+
+      const result = h.supervisor.settleHostAbsentTurns();
+      fault.mockRestore();
+
+      expect(result).toEqual({ examined: 2, live: 0, settled: ['moves-streaming'], failed: ['stuck-streaming'] });
+      expect(h.api.getAgent('stuck-streaming')?.state).toBe('streaming');
+      expect(h.api.getAgent('moves-streaming')?.state).toBe('error');
+      expect(h.notificationsOfKind('supervision.turn-orphaned.stuck-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.moves-streaming')).toHaveLength(1);
+      const failure = logged.find((entry) => entry.msg.startsWith('host-absent agent turn could not be settled at boot'));
+      expect(failure).toMatchObject({ level: 'error', fields: { agent_id: 'stuck-streaming', state: 'streaming' } });
+      expect(String(failure?.fields?.['error'])).toContain('ledger write refused');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('refuses boot by name when the agent listing fails, and still settles on a retry — it never guesses', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-listing', 'ghost-streaming', 'streaming');
+      const listing = vi.spyOn(h.api, 'listAgents').mockImplementation(() => {
+        throw new Error('agents table unreadable');
+      });
+      expect(() => h.supervisor.settleHostAbsentTurns()).toThrow('agents table unreadable');
+      listing.mockRestore();
+      expect(h.api.getAgent('ghost-streaming')?.state).toBe('streaming');
+      expect(h.supervisor.settleHostAbsentTurns().settled).toEqual(['ghost-streaming']);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('refuses by name, settling nothing, when the registry cannot list its handles', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-unlisted', 'ghost-streaming', 'streaming');
+      (h.registry as unknown as { listHandles?: unknown }).listHandles = undefined;
+      expect(() => h.supervisor.settleHostAbsentTurns()).toThrow(/cannot list its handles/u);
+      expect(h.api.getAgent('ghost-streaming')?.state).toBe('streaming');
+      expect(h.notificationsOfKind('supervision.turn-orphaned.ghost-streaming')).toEqual([]);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('settles nothing once the supervisor is disposed', () => {
+    const h = boot();
+    try {
+      seedOpenTurn(h, 'job-disposed', 'ghost-streaming', 'streaming');
+      h.supervisor.dispose();
+      expect(h.supervisor.settleHostAbsentTurns()).toEqual({ examined: 0, live: 0, settled: [], failed: [] });
+      expect(h.api.getAgent('ghost-streaming')?.state).toBe('streaming');
+    } finally {
+      h.dispose();
+    }
   });
 });

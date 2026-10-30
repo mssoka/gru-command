@@ -193,6 +193,43 @@ name the prompt (or the re-delivery fails), the supervision posts an
 lane (job, branch, worktree, job phase), so recovery is a lane action,
 not archaeology.
 
+**A turn the previous service process left open is settled at boot (#547).**
+An agent row still `spawning` or `streaming` when the service stopped has no
+process and no registry handle in the new one, yet every live-work fence
+counts it as an open worker turn: binning, retirement, abandonment and
+recovery of its job would be refused for good. Once per boot, after
+supervision hydration, the boot recoveries (re-brief, child worker,
+directive) and before the listener serves, each such row moves to `error`
+unless this process owns it: a registry handle (published or not), a
+supervised record, or an unfinished tracked child worker that the boot just
+re-ran under the same agent id. The move is an `agent.state` event whose
+payload names `host-absent at boot`, and the turn is recorded as orphaned
+(`supervision.turn-recovery`). When its job is still unfinished it also
+surfaces through the same **action-required** `supervision.turn-orphaned.<agent>`
+note; a turn of a finished job, or of no job (Gru, Bob, Silas), has no lane
+left to recover and gets the record without the note. Every settled row also
+gets the ordinary "Agent … errored" FYI. Agent rows only: the turn is not resumed, and no producer cessation, directive
+retirement, abandonment, completion or delivery is recorded. A directive
+request whose agent was such a ghost keeps its state and its recovery
+evidence; only the "open worker turn" blocker the ghost row caused goes
+away, and every other blocker (a native session lock, an unproven producer,
+a live lane process, a queued turn) is still reported. A turn this process
+spawns is never touched. A row whose move fails stays open for the next
+boot; an agent listing that fails refuses boot.
+
+The parked-job stop re-proof (`job.execution-stop`) starts after the
+settlement, so it reads a ghost turn as the settled row it is instead of
+reporting an open turn "unproven" for as long as the service runs. The
+evidence behind that is the same host-absent inference the settlement
+makes (this process holds no handle for the row), not an observed process
+exit; a stop pass at any later time reads the settled row the same way. A child
+worker the boot re-runs for a parent that was itself a ghost follows the
+child-worker rule that an errored parent has no authority to delegate: it
+may end with a terminal `error` naming the parent, as it did not before. A
+child that ends before any session exists (that, a lane or spawn failure, a
+cancel while queued) now also moves its own agent row out of `spawning`, so
+it never becomes an open worker turn that nothing clears.
+
 **Restart ladder.** A hang or a *fatal* runtime error triggers one
 restart rung: dispose the wedged handle (its pending prompts reject),
 respawn with `resumeFile` (crash = resume — the conversation survives),

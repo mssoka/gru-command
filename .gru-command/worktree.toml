@@ -1196,3 +1196,14 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts && npx vitest run test/review-ci-evidence.test.ts test/gitlab-mr-read.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-519-static = "npm run lint && npm run typecheck && npm run build"
 gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
+
+# #547 agent rows a previous service process left spawning/streaming. `gc-547-focused`
+# builds, runs the booted-service suite (heavy: compiled dist/main.js) and the
+# supervisor, directive-retirement and registry-pin suites; `gc-547-static` is the
+# lint + typecheck + build gate; `gc-547-red` extracts the base commit, overlays
+# the new booted-service test (and the heavy list that includes it), builds that
+# base and runs the test by name: it must fail there by assertion, so it exits
+# non-zero by design.
+gc-547-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/ghost-agent-boot.test.ts && npx vitest run test/supervisor.test.ts test/directive-retirement.test.ts test/child-workers.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-547-static = "npm run lint && npm run typecheck && npm run build"
+gc-547-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc547-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/ghost-agent-boot.test.ts "$d/test/ghost-agent-boot.test.ts"; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC547 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npm run build; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/ghost-agent-boot.test.ts'

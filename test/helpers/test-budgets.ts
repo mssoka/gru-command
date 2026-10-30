@@ -173,6 +173,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'canceled-request-closeout.test.ts', workload: 'canceled-request closeout steps and resume over real git lanes (retire HEAD binding against fixture repositories)' },
   { file: 'bob-state-service.test.ts', workload: 'real compiled service booted twice against a real data home: the due Bob beat persists bob-state.json and the restart inherits the remainder' },
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
+  { file: 'ghost-agent-boot.test.ts', workload: 'real compiled service booted against a seeded data home: agent rows a previous process left open are settled before the listener' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands and recreated persisted-server original-PID/no-start reconciliation' },
   { file: 'wake-e2e.test.ts', workload: 'real service wake-on-alert flow' },
   { file: 'workflow-runtime-packaged.test.ts', workload: 'extracts the actual npm archive and drives compiled workflow CLIs over a real git lane' },
