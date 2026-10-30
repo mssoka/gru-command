@@ -570,6 +570,53 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(eventKinds(h)).toEqual(activeEvents);
   });
 
+  it('settling the ghost agent behind an admitted request drops only its open-turn blocker: the request, journal and evidence stay (#547)', async () => {
+    const repo = makeFixtureRepo('retire-ghost-agent');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane, row } = await seededLiveRequest(h, repo, 'job-ghost-agent', 'req-ghost-agent');
+    const file = join(h.dir, 'ghost-agent.jsonl');
+    admitNativeDirectiveFixture(h.ledger, row.requestId, 'ghost-agent', file);
+    // The previous service process ended mid-turn: the row still says
+    // streaming, and nothing in this process holds a handle for it.
+    h.ledger.setAgentState('ghost-agent', 'streaming');
+    const OPEN_TURN = 'open worker turn(s): ghost-agent (streaming)';
+    const settlementOwned = (event: { readonly agentId: string | null; readonly kind: string }): boolean =>
+      event.agentId === 'ghost-agent' && (event.kind === 'agent.state' || event.kind === 'supervision.turn-recovery');
+    const evidence = () => ({
+      request: h.ledger.getDirective(row.requestId),
+      events: h.ledger.listEvents({ limit: 500 }).filter((event) => !settlementOwned(event)),
+      producers: inspectDirectiveProducers(file),
+    });
+
+    const refused = await retire(h, row.requestId, laneHead(lane));
+    expect(refused.status).toBe(409);
+    const blockersBefore = field<string[]>(refused.json, 'blockers');
+    expect(blockersBefore).toContain(OPEN_TURN);
+    const others = blockersBefore.filter((blocker) => blocker !== OPEN_TURN);
+    expect(others.length).toBeGreaterThan(0);
+    const before = evidence();
+    expect(before.request?.state).toBe('admitted');
+
+    const supervisor = new Supervisor({ ledger: h.ledger, notifications: h.notifications,
+      config: { enabled: false, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+      registry: { getHandle: () => null, quarantineHandle: () => {}, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
+    try {
+      expect(supervisor.settleHostAbsentTurns([]).settled).toEqual(['ghost-agent']);
+    } finally { supervisor.dispose(); }
+
+    expect(h.ledger.getAgent('ghost-agent')?.state).toBe('error');
+    expect(evidence()).toEqual(before);
+    expect(h.ledger.getDirective(row.requestId)?.state).toBe('admitted');
+    const stillRefused = await retire(h, row.requestId, laneHead(lane));
+    expect(stillRefused.status).toBe(409);
+    expect(field<string>(stillRefused.json, 'error')).toBe('live_work');
+    // Every other blocker is still reported, in the same order; only the
+    // ghost's open-turn blocker went away.
+    expect(field<string[]>(stillRefused.json, 'blockers')).toEqual(others);
+    expect(evidence()).toEqual(before);
+  });
+
   it('retires only after exact original producer cessation, then bins through the existing job-status path', async () => {
     const repo = makeFixtureRepo('retire-positive-native-closeout');
     cleanupRepos.push(repo);

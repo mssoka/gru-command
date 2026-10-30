@@ -1986,6 +1986,20 @@ async function main(): Promise<number> {
   // whose provider-wall row the hand-back resolves hydrates with a fresh
   // re-arm control rather than one bound to a resolved row.
   handBackThenStartSupervision(providerRecoverySensor, supervisorLive, (level, msg, fields) => logger.log(level, msg, fields));
+  // Issue #547: a turn a previous process left spawning/streaming has no
+  // handle here and no further events, yet every live-work fence counts it as
+  // an open worker turn. Once per boot, after the registry and supervision are
+  // up and the boot recoveries above have read the ledger as they found it,
+  // move each such row out of the live states and surface it as orphaned.
+  const hostAbsentTurns = supervisorLive.settleHostAbsentTurns(registry.listHandles());
+  if (hostAbsentTurns.examined > 0) {
+    logger.info('host-absent agent turns settled at boot', {
+      examined: hostAbsentTurns.examined,
+      live: hostAbsentTurns.live,
+      settled: hostAbsentTurns.settled.length,
+      failed: hostAbsentTurns.failed.length,
+    });
+  }
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);

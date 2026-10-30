@@ -460,6 +460,24 @@ export type SupervisorRestartPolicy =
   | { readonly options: SpawnOptions }
   | { readonly refuse: string };
 
+/** The reason a boot settlement records on a previous process's open turn:
+ * the `error` carried by its `agent.state` event and the orphan notice's
+ * reason (issue #547). */
+export const HOST_ABSENT_AT_BOOT = 'host-absent at boot';
+
+/** What one boot settlement did to the agent rows a previous service process
+ * left in `spawning` or `streaming` (issue #547). */
+export interface HostAbsentTurnSettlement {
+  /** Agent rows found open (`spawning` or `streaming`). */
+  readonly examined: number;
+  /** Open rows this process owns (a registry handle or a supervised record): untouched. */
+  readonly live: number;
+  /** Agent ids moved to `error` and surfaced through the orphan notice. */
+  readonly settled: readonly string[];
+  /** Agent ids whose move failed: still open, so the next boot retries them. */
+  readonly failed: readonly string[];
+}
+
 export class Supervisor {
   private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
@@ -512,6 +530,8 @@ export class Supervisor {
   /** Wall-clock of the previous watchdog tick (sleep/wake detection). */
   private lastTickWallAt: number | null = null;
   private disposed = false;
+  /** The boot settlement of a previous process's open turns ran (once per process). */
+  private hostAbsentSettled = false;
 
   constructor(opts: SupervisorOptions) {
     this.cfg = opts.config;
@@ -576,6 +596,54 @@ export class Supervisor {
       }
     }, this.tickMs);
     this.ticker.unref?.();
+  }
+
+  /**
+   * Issue #547: an agent row a previous service process left `spawning` or
+   * `streaming` has no process, no registry handle and no further events, yet
+   * every live-work fence counts it as an open worker turn, so nothing ever
+   * clears it. Call this ONCE per boot, after hydration (`start`), with the
+   * handles this process holds: a row no handle and no supervised record
+   * owns belonged to a previous process. Each such row leaves the live
+   * states through the same `error` move a dead turn takes (an `agent.state`
+   * event naming {@link HOST_ABSENT_AT_BOOT}) and is surfaced by the orphan
+   * notice. Agent rows only: the turn is not resumed, and no producer
+   * cessation, retirement, abandonment, completion or delivery is recorded.
+   * A second call, and any turn this process spawns, is left alone.
+   */
+  settleHostAbsentTurns(live: readonly Pick<AgentHandle, 'id'>[]): HostAbsentTurnSettlement {
+    if (this.disposed || this.hostAbsentSettled) return { examined: 0, live: 0, settled: [], failed: [] };
+    const open = this.ledger.listAgents().filter((row) => row.state === 'spawning' || row.state === 'streaming');
+    this.hostAbsentSettled = true;
+    const held = new Set(live.map((handle) => handle.id));
+    const settled: string[] = [];
+    const failed: string[] = [];
+    let owned = 0;
+    for (const row of open) {
+      if (held.has(row.id) || this.agents.has(row.id)) {
+        owned += 1;
+        continue;
+      }
+      try {
+        this.ledger.setAgentState(row.id, 'error', HOST_ABSENT_AT_BOOT);
+      } catch (error) {
+        failed.push(row.id);
+        this.log('error', 'host-absent agent turn could not be settled at boot — it stays open until the next boot', {
+          agent_id: row.id,
+          state: row.state,
+          error: failureText(error),
+        });
+        continue;
+      }
+      settled.push(row.id);
+      this.postOrphanedTurn(
+        row.id,
+        HOST_ABSENT_AT_BOOT,
+        `the previous service process ended while the turn was ${row.state}; this process holds no handle for it, ` +
+          'so nothing is running and nothing was re-delivered',
+      );
+    }
+    return { examined: open.length, live: owned, settled, failed };
   }
 
   /** Declare a supervision slot (stable identity across restarts). */
