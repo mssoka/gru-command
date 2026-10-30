@@ -41,7 +41,7 @@ the instance has no token). A build that does not host the queue answers
 | Field | Required | Meaning |
 |---|---|---|
 | `id` | yes | The entry id. It becomes the job id (and the branch `gru/<id>`) on admission. A safe record id: 1 to 128 characters of `A-Z a-z 0-9 . _ -`, starting with a letter or digit. |
-| `repo_path` | yes | Absolute path of the repository the lane is created from. |
+| `repo_path` | yes | Path of the repository the lane is created from. Enqueue checks only that it is not blank; a path the dispatch service refuses surfaces at admission. |
 | `title` | yes | The heist title. |
 | `briefing` | yes | The complete briefing, stored verbatim. |
 | `request_id` | no | Idempotency identity. Defaults to `id`. |
@@ -54,8 +54,9 @@ the instance has no token). A build that does not host the queue answers
 Other fields are ignored. Admission dispatches `job_id`, `repo_path`, `title`
 and `briefing` and nothing else, so an admitted job is dispatched as
 `POST /api/dispatch` would with only those four fields. The pipeline carries
-none of that route's optional fields (display name, deliverable, review target, parent job, completion
-handoff, pre-bootstrap patch, briefing-review provenance).
+none of that route's optional fields (display name, deliverable, review target,
+parent job, completion handoff, pre-bootstrap patch, briefing-review
+provenance).
 
 The receipt, `201` for a new entry and `200` for an exact replay:
 
@@ -73,8 +74,8 @@ it returns the acceptance receipt with `duplicate: true` and creates nothing.
 
 - the `request_id` was accepted with different content: **an accepted briefing
   is immutable**, and changed work needs a new entry;
-- the `id` already names an entry in any state, cancelled and failed ones
-  included, or an existing job;
+- a new `request_id` reuses the `id` of an entry in any state, cancelled and
+  failed ones included, or the `id` of an existing job;
 - the prerequisites would form a dependency cycle.
 
 An entry that lists itself as a prerequisite is a `400`. While an entry exists,
@@ -229,8 +230,8 @@ dispatched directly holds none.
 
 The service reconsiders the queue when something that can change eligibility
 happens: an enqueue, a cleared hold, any job transition, a resident worker slot
-freeing up or being taken, and once at boot. There is no polling timer.
-In that pass it takes the first eligible entry in the order above and admits it
+freeing up or being taken, and once at boot. There is no polling timer. In that
+pass it takes the first eligible entry in the order above and admits it
 only when the shared resident worker budget has a free slot and no older
 resident admission is queued ahead of it. The budget stays the one capacity
 authority; the pipeline keeps no counter of its own. When eligible work waits
@@ -239,15 +240,16 @@ budget's own idle-minion reclaim can serve it.
 
 Admission writes the claim (`admitting`) before it dispatches, dispatches the
 entry through the existing dispatch service with the entry id as the job id,
-then marks the entry `admitted`. A rejected dispatch is never retried blind:
+then marks the entry `admitted`. A failed dispatch never duplicates work:
 
 - a dispatch that fails before any job exists puts the entry back to `waiting`
   with the failure noted, and one retry pass is armed 5 seconds later (the next
-  trigger runs it sooner). The third such failure makes the entry `failed` and posts one `pipeline.admission-failed` card to the owner's
-  attention list;
+  trigger runs it sooner). The third such failure makes the entry `failed` and
+  posts one `pipeline.admission-failed` notification (`action-required`: it wakes
+  Gru, not the owner's bell);
 - a dispatch that created the job before failing is adopted, not repeated. If
   no worker ever started, the job is blocked with a note and one
-  `pipeline.adopted-without-worker` card is posted;
+  `pipeline.adopted-without-worker` notification (`action-required`) is posted;
 - a claim left over from a crash is reconciled at boot: a committed job is
   adopted, otherwise the entry returns to `waiting` with its briefing intact.
 
@@ -265,8 +267,9 @@ briefing before the first release, then clear the hold (see the role).
 
 ## Immutability and correction
 
-An entry's briefing, title, repository, priority, prerequisites, scopes and hold
-reason are fixed at enqueue; no route edits them. To change an entry before it
+An entry's briefing, title, repository, priority, prerequisites and scopes are
+fixed at enqueue; no route edits them. Only its hold can change, through `hold`
+and `clear-hold`. To change an entry before it
 is admitted, cancel it and enqueue the corrected briefing under a **new** `id`
 (a cancelled entry's id stays reserved). Entries that listed the cancelled one as
 a prerequisite stay `waiting` on it, so they are cancelled and re-enqueued
