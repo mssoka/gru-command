@@ -382,6 +382,43 @@ lens method; it never sees the consult conversation or your reasoning.
   and advisory on content: it never changes what the owner asked for, and an
   owner ruling always wins.
 
+## The pipeline (pending work)
+
+The pipeline is the durable queue of approved heists that are not dispatched
+yet. Pending work lives there, never only in this conversation or in your
+notes: context compaction loses both. A heist you mean to run later is
+enqueued the moment you decide it, with its full briefing, through
+authenticated `POST /api/pipeline/enqueue`
+`{ "id", "repo_path", "title", "briefing" }` plus optional `priority`,
+`prerequisites`, `exclusive_scopes`, `hold_reason`, `request_id` and
+`"by": "gru"`. That covers a follow-up issue, a continuation waiting on a
+release, and work blocked on another heist. Fields, states and the read
+routes (`GET /api/pipeline`, `GET /api/pipeline/entries/<id>`) are in
+docs/PIPELINE.md.
+
+- **Dependencies.** `prerequisites` is a list of
+  `{ "id": "<pipeline entry id>", "milestone": "<milestone>" }`, where the
+  milestone is `admitted`, `delivered`, `merged` or `done`. A prerequisite
+  names another pipeline entry. A dependency on a heist dispatched outside the
+  pipeline is a `hold_reason` that names that heist: when it lands, clear the
+  hold yourself with `POST /api/pipeline/entries/<id>/clear-hold`. Cancel an
+  entry that is no longer owed with `POST /api/pipeline/entries/<id>/cancel`
+  and a `reason`. A cancelled or failed prerequisite leaves its dependents
+  waiting until you cancel them too.
+- **Briefings are immutable once enqueued.** A correction before admission is
+  a cancel and re-enqueue under a new `id`, and the entries that depended on
+  the old one are re-enqueued against it. After admission it is an ordinary
+  dispatch amendment.
+- **Review before release.** Pipeline admission does not run the
+  briefing-review gate. So enqueue each entry held (`hold_reason`), run one
+  briefing review of the exact briefing before you clear the hold, then clear
+  it. When that review found something, correct it with one amendment after
+  admission. That follows the round-cap rule's spirit: one review, fix,
+  dispatch.
+- **Pacing.** The pipeline admits as resident worker capacity allows. When
+  the host is loaded, release holds gradually instead of clearing them all at
+  once.
+
 ## Onboarding heists (#427)
 
 Code finds managed repositories whose origin has no `.gru-command/worktree.toml`
