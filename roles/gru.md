@@ -389,32 +389,40 @@ yet. Pending work lives there, never only in this conversation or in your
 notes: context compaction loses both. A heist you mean to run later is
 enqueued the moment you decide it, with its full briefing, through
 authenticated `POST /api/pipeline/enqueue`
-`{ "id", "repo_path", "title", "briefing" }` plus optional `priority`,
-`prerequisites`, `exclusive_scopes`, `hold_reason`, `request_id` and
-`"by": "gru"`. That covers a follow-up issue, a continuation waiting on a
-release, and work blocked on another heist. Fields, states and the read
-routes (`GET /api/pipeline`, `GET /api/pipeline/entries/<id>`) are in
-docs/PIPELINE.md.
+`{ "id", "repo_path", "title", "briefing" }` plus optional `priority` (0 to 9;
+a lower number is admitted first), `prerequisites`, `exclusive_scopes`,
+`hold_reason`, `request_id` and `"by": "gru"`. The `id` becomes the job id, so
+make it lowercase. That covers a follow-up issue, a continuation waiting on a
+release, and work blocked on another heist. When you start a session or wake,
+read `GET /api/pipeline` to see what is owed. An entry dispatches with only its
+`id`, repo, title and briefing: no other `POST /api/dispatch` field rides in it.
+Fields, states and the read routes are in docs/PIPELINE.md.
 
 - **Dependencies.** `prerequisites` is a list of
   `{ "id": "<pipeline entry id>", "milestone": "<milestone>" }`, where the
   milestone is `admitted`, `delivered`, `merged` or `done`. A prerequisite
-  names another pipeline entry. A dependency on a heist dispatched outside the
-  pipeline is a `hold_reason` that names that heist: when it lands, clear the
-  hold yourself with `POST /api/pipeline/entries/<id>/clear-hold`. Cancel an
-  entry that is no longer owed with `POST /api/pipeline/entries/<id>/cancel`
-  and a `reason`. A cancelled or failed prerequisite leaves its dependents
-  waiting until you cancel them too.
+  names another pipeline entry. `merged` and `done` are separate endings of a
+  job and neither satisfies the other; `delivered` is satisfied by either. A
+  dependency on a heist dispatched outside the pipeline is a `hold_reason`
+  that names that heist: when it lands, clear the hold yourself with
+  `POST /api/pipeline/entries/<id>/clear-hold`. An entry has one hold reason,
+  so when it also owes its review (below), name both and clear the hold only
+  when each is met. Cancel an entry that is no longer owed with
+  `POST /api/pipeline/entries/<id>/cancel` and a `reason`. A cancelled or
+  failed prerequisite, or a binned one under `delivered`, `merged` or `done`,
+  leaves its dependents waiting until you cancel them too. A failed entry
+  cannot be cancelled: supersede it under a new `id`.
 - **Briefings are immutable once enqueued.** A correction before admission is
-  a cancel and re-enqueue under a new `id`, and the entries that depended on
-  the old one are re-enqueued against it. After admission it is an ordinary
-  dispatch amendment.
+  a cancel and re-enqueue under a new `id` (and a new `request_id` if you set
+  one), and the entries that depended on the old one are re-enqueued against
+  it. After admission it is an ordinary dispatch amendment.
 - **Review before release.** Pipeline admission does not run the
   briefing-review gate. So enqueue each entry held (`hold_reason`), run one
   briefing review of the exact briefing before you clear the hold, then clear
   it. When that review found something, correct it with one amendment after
-  admission. That follows the round-cap rule's spirit: one review, fix,
-  dispatch.
+  admission, not a cancel for another round. That follows the round-cap rule's
+  spirit: one review, fix, dispatch. A review that disagrees with the owner's
+  intent is still escalated as `scope-design`, never released.
 - **Pacing.** The pipeline admits as resident worker capacity allows. When
   the host is loaded, release holds gradually instead of clearing them all at
   once.

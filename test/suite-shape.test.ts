@@ -313,7 +313,7 @@ const PINS: Record<string, number> = {
   'perkins-review-convergence.test.ts': 59,
   'perkins-review-symlinks.test.ts': 16,
   'phase-handoffs.test.ts': 14,
-  'pipeline-server.test.ts': 12,
+  'pipeline-server.test.ts': 14,
   'report-jobs-backfill.test.ts': 17,
   'pipeline-service.test.ts': 31,
   'pi-adapter.test.ts': 299,

@@ -84,41 +84,73 @@ describe('gru role definition', () => {
 
   it('the chief keeps pending work in the pipeline: enqueue now, dependencies, immutable briefings, review before release, pacing', () => {
     const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
-    const gru = prompt.replace(/\s+/gu, ' ');
-    // The section sits after Nefario's stress-test and before onboarding.
+    // The section sits after Nefario's stress-test and before onboarding; every
+    // assertion below reads the section alone, so words the rest of the role
+    // already uses (`merged`, `done`) cannot satisfy it.
     const nefario = prompt.indexOf("## Nefario's briefing stress-test");
     const pipeline = prompt.indexOf('## The pipeline (pending work)');
     const onboarding = prompt.indexOf('## Onboarding heists');
     expect(nefario).toBeGreaterThan(-1);
     expect(pipeline).toBeGreaterThan(nefario);
     expect(onboarding).toBeGreaterThan(pipeline);
+    const section = prompt.slice(pipeline, onboarding).replace(/\s+/gu, ' ');
     // What it is for: pending work is enqueued at once, never kept in conversation or notes.
-    expect(gru).toContain('The pipeline is the durable queue of approved heists that are not dispatched yet');
-    expect(gru).toContain('Pending work lives there, never only in this conversation or in your notes');
-    expect(gru).toContain('enqueued the moment you decide it, with its full briefing, through authenticated `POST /api/pipeline/enqueue`');
-    expect(gru).toContain('a follow-up issue, a continuation waiting on a release, and work blocked on another heist');
-    expect(gru).toContain('docs/PIPELINE.md');
-    // Dependencies: pipeline entries with a closed milestone set; outside heists are holds.
-    for (const milestone of PIPELINE_MILESTONES) expect(gru).toContain(`\`${milestone}\``);
-    expect(gru).toContain('A prerequisite names another pipeline entry');
-    expect(gru).toContain('A dependency on a heist dispatched outside the pipeline is a `hold_reason` that names that heist');
-    expect(gru).toContain('`POST /api/pipeline/entries/<id>/clear-hold`');
-    expect(gru).toContain('`POST /api/pipeline/entries/<id>/cancel`');
+    expect(section).toContain('The pipeline is the durable queue of approved heists that are not dispatched yet');
+    expect(section).toContain('Pending work lives there, never only in this conversation or in your notes');
+    expect(section).toContain('enqueued the moment you decide it, with its full briefing, through authenticated `POST /api/pipeline/enqueue`');
+    expect(section).toContain('a follow-up issue, a continuation waiting on a release, and work blocked on another heist');
+    expect(section).toContain('read `GET /api/pipeline` to see what is owed');
+    expect(section).toContain('no other `POST /api/dispatch` field rides in it');
+    expect(section).toContain('docs/PIPELINE.md');
+    // The enqueue body the route reads (the route-contract test posts exactly these fields).
+    expect(section).toContain('`{ "id", "repo_path", "title", "briefing" }`');
+    for (const optional of ['`priority`', '`prerequisites`', '`exclusive_scopes`', '`hold_reason`', '`request_id`', '`"by": "gru"`']) {
+      expect(section, `role section missing ${optional}`).toContain(optional);
+    }
+    expect(section).toContain('a lower number is admitted first');
+    expect(section).toContain('The `id` becomes the job id, so make it lowercase');
+    // Dependencies: pipeline entries with the closed milestone set; outside heists are holds.
+    const milestones = PIPELINE_MILESTONES.map((milestone) => `\`${milestone}\``);
+    expect(section).toContain(`the milestone is ${milestones.slice(0, -1).join(', ')} or ${milestones.at(-1)}`);
+    expect(section).toContain('A prerequisite names another pipeline entry');
+    expect(section).toContain('`merged` and `done` are separate endings of a job and neither satisfies the other; `delivered` is satisfied by either');
+    expect(section).toContain('A dependency on a heist dispatched outside the pipeline is a `hold_reason` that names that heist');
+    expect(section).toContain('`POST /api/pipeline/entries/<id>/clear-hold`');
+    expect(section).toContain('`POST /api/pipeline/entries/<id>/cancel`');
+    expect(section).toContain('An entry has one hold reason, so when it also owes its review (below), name both and clear the hold only when each is met');
+    expect(section).toContain('A failed entry cannot be cancelled: supersede it under a new `id`');
     // Immutability, review before release, pacing.
-    expect(gru).toContain('Briefings are immutable once enqueued');
-    expect(gru).toContain('A correction before admission is a cancel and re-enqueue');
-    expect(gru).toContain('After admission it is an ordinary dispatch amendment');
-    expect(gru).toContain('Pipeline admission does not run the briefing-review gate');
-    expect(gru).toContain('enqueue each entry held');
-    expect(gru).toContain('run one briefing review of the exact briefing before you clear the hold');
-    expect(gru).toContain('correct it with one amendment after admission');
-    expect(gru).toContain("the round-cap rule's spirit: one review, fix, dispatch");
-    expect(gru).toContain('The pipeline admits as resident worker capacity allows');
-    expect(gru).toContain('release holds gradually');
+    expect(section).toContain('Briefings are immutable once enqueued');
+    expect(section).toContain('A correction before admission is a cancel and re-enqueue under a new `id` (and a new `request_id` if you set one)');
+    expect(section).toContain('After admission it is an ordinary dispatch amendment');
+    expect(section).toContain('Pipeline admission does not run the briefing-review gate');
+    expect(section).toContain('enqueue each entry held');
+    expect(section).toContain('run one briefing review of the exact briefing before you clear the hold');
+    expect(section).toContain('correct it with one amendment after admission, not a cancel for another round');
+    expect(section).toContain("the round-cap rule's spirit: one review, fix, dispatch");
+    expect(section).toContain('is still escalated as `scope-design`, never released');
+    expect(section).toContain('The pipeline admits as resident worker capacity allows');
+    expect(section).toContain('release holds gradually');
   });
 
-  it('docs/PIPELINE.md documents the routes, states, milestones, bounds and gate gap the code defines, and is linked from the role and FLOW', () => {
+  it('docs/PIPELINE.md documents the routes, states, milestones, bounds and gate gap the code defines, and is linked from the role, FLOW and BRIEFING-REVIEW', () => {
     const doc = readFileSync(join(REPO_ROOT, 'docs', 'PIPELINE.md'), 'utf-8').replace(/\s+/gu, ' ');
+    // Each assertion reads the section or table that must hold the copy: a state
+    // and a milestone share the name `admitted`, and a page-wide match would let
+    // either table lose its row.
+    const between = (from: string, to: string): string => {
+      const start = doc.indexOf(from);
+      const stop = doc.indexOf(to, start + from.length);
+      expect(start, `docs/PIPELINE.md missing "${from}"`).toBeGreaterThan(-1);
+      expect(stop, `docs/PIPELINE.md missing "${to}" after "${from}"`).toBeGreaterThan(start);
+      return doc.slice(start, stop);
+    };
+    const endpoints = between('## Endpoints', '### Enqueue');
+    const enqueue = between('### Enqueue', '### Reading');
+    const states = between('## States', '## Prerequisites and milestones');
+    const milestones = between('## Prerequisites and milestones', '## Priority');
+    const priority = between('## Priority', '## Exclusive scopes');
+    const scopes = between('## Exclusive scopes', '## Admission');
     // Routes the dispatch server mounts.
     for (const route of [
       'POST /api/pipeline/enqueue',
@@ -128,30 +160,45 @@ describe('gru role definition', () => {
       'POST /api/pipeline/entries/<id>/clear-hold',
       'POST /api/pipeline/entries/<id>/cancel',
     ]) {
-      expect(doc, `docs/PIPELINE.md missing ${route}`).toContain(route);
+      expect(endpoints, `docs/PIPELINE.md missing ${route}`).toContain(`| \`${route}\` |`);
     }
-    // Every enqueue body field the route handler reads.
+    // Every enqueue body field the route handler reads (the route-contract test
+    // in pipeline-server.test.ts posts exactly this documented set).
     for (const field of ['id', 'repo_path', 'title', 'briefing', 'request_id', 'priority', 'prerequisites', 'exclusive_scopes', 'hold_reason', 'by']) {
-      expect(doc, `docs/PIPELINE.md missing enqueue field ${field}`).toContain(`| \`${field}\` |`);
+      expect(enqueue, `docs/PIPELINE.md missing enqueue field ${field}`).toContain(`| \`${field}\` |`);
     }
     // The closed state and milestone vocabularies, straight from the code.
     for (const state of PIPELINE_STATES) {
-      expect(doc, `docs/PIPELINE.md missing state ${state}`).toContain(`| \`${state}\` |`);
+      expect(states, `docs/PIPELINE.md missing state ${state}`).toContain(`| \`${state}\` |`);
     }
     for (const milestone of PIPELINE_MILESTONES) {
-      expect(doc, `docs/PIPELINE.md missing milestone ${milestone}`).toContain(`| \`${milestone}\` |`);
+      expect(milestones, `docs/PIPELINE.md missing milestone ${milestone}`).toContain(`| \`${milestone}\` |`);
     }
-    // Priority bounds, default and direction.
-    expect(doc).toContain(`an integer from ${PIPELINE_PRIORITY_MIN} to ${PIPELINE_PRIORITY_MAX}, default ${PIPELINE_PRIORITY_DEFAULT}`);
-    expect(doc).toContain('A **lower number is admitted first**');
-    // The sharp edges the role depends on.
-    expect(doc).toContain('A binned dependency does not release a `delivered` dependent');
+    // merged and done are separate endings; the role relies on that.
+    expect(milestones).toContain('| `merged` | has a job whose status is exactly `merged`. |');
+    expect(milestones).toContain('| `done` | has a job whose status is exactly `done`. |');
+    expect(milestones).toContain('`delivered` is the milestone both endings satisfy');
+    expect(milestones).toContain('A binned dependency does not release a `delivered` dependent');
+    // Priority bounds, default and direction, at every site that states them.
+    const bounds = `${PIPELINE_PRIORITY_MIN} to ${PIPELINE_PRIORITY_MAX}`;
+    expect(enqueue).toContain(`| \`priority\` | no | A JSON number, an integer from ${bounds}. Default ${PIPELINE_PRIORITY_DEFAULT}.`);
+    expect(priority).toContain(`an integer from ${bounds}, default ${PIPELINE_PRIORITY_DEFAULT}`);
+    expect(priority).toContain(`${PIPELINE_PRIORITY_MIN} is the highest priority and ${PIPELINE_PRIORITY_MAX} the lowest`);
+    expect(priority).toContain(`A value outside ${bounds}`);
+    expect(priority).toContain('A **lower number is admitted first**');
+    expect(scopes).toContain('`exclusive_scopes`');
+    // The gate gap and the sharp edges the role depends on.
     expect(doc).toContain('## The briefing-review gate is not run on admission');
     expect(doc).toContain('Making admission honour the gate is a separate change');
-    expect(doc).toContain('`exclusive_scopes`');
-    // Linked from the role section and from the dispatch flow.
+    expect(enqueue).toContain('admission refuses them');
+    // Linked from the role section and from the dispatch flow, where dispatch is described.
     expect(readFileSync(GRU_MD, 'utf-8')).toContain('docs/PIPELINE.md');
-    expect(readFileSync(join(REPO_ROOT, 'docs', 'FLOW.md'), 'utf-8')).toContain('(./PIPELINE.md)');
+    const flow = readFileSync(join(REPO_ROOT, 'docs', 'FLOW.md'), 'utf-8');
+    const dispatchSection = flow.slice(flow.indexOf('## 2. Ops handoff (dispatch)'), flow.indexOf('## 3. Lifecycle on the board'));
+    expect(dispatchSection).toContain('(./PIPELINE.md)');
+    expect(readFileSync(join(REPO_ROOT, 'docs', 'BRIEFING-REVIEW.md'), 'utf-8')).toContain(
+      '(./PIPELINE.md#the-briefing-review-gate-is-not-run-on-admission)',
+    );
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {

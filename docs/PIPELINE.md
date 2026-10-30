@@ -40,7 +40,7 @@ the instance has no token). A build that does not host the queue answers
 
 | Field | Required | Meaning |
 |---|---|---|
-| `id` | yes | The entry id. It becomes the job id (and the branch `gru/<id>`) on admission. A safe record id: 1 to 128 characters of `A-Z a-z 0-9 . _ -`, starting with a letter or digit. |
+| `id` | yes | The entry id. It becomes the job id (and the branch `gru/<id>`) on admission, so use 1 to 128 lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit, that make a valid branch name (no `..`, no trailing `.`, no `.lock` ending). Enqueue itself also accepts uppercase letters, but admission refuses them: such an entry answers `201` and then fails at admission, and its id stays burned (see [Admission](#admission)). |
 | `repo_path` | yes | Path of the repository the lane is created from. Enqueue checks only that it is not blank; a path the dispatch service refuses surfaces at admission. |
 | `title` | yes | The heist title. |
 | `briefing` | yes | The complete briefing, stored verbatim. |
@@ -51,7 +51,9 @@ the instance has no token). A build that does not host the queue answers
 | `hold_reason` | no | A string. A non-blank value enqueues the entry already held. Trimmed and cut to 500 characters. A blank string is no hold; a non-string is a 400. |
 | `by` | no | Who enqueued. Recorded on the `pipeline.enqueued` event; attribution only. |
 
-Other fields are ignored. Admission dispatches `job_id`, `repo_path`, `title`
+The request body is capped at 512 KiB; a larger one is rejected and the
+connection is closed, so the client sees a reset rather than a `400`. Other
+fields are ignored. Admission dispatches `job_id`, `repo_path`, `title`
 and `briefing` and nothing else, so an admitted job is dispatched as
 `POST /api/dispatch` would with only those four fields. The pipeline carries
 none of that route's optional fields (display name, deliverable, review target,
@@ -135,7 +137,8 @@ Refused with a `400`: any of the three on an `admitting` entry (a live
 admission claim is never raced) and on an `admitted` one (its job lifecycle owns
 it now; stop the job through its own controls). `hold` and `clear-hold` are also
 refused on a `failed` or `cancelled` entry. `cancel` is refused on a `failed`
-entry, whose failure record is kept as history. Any authenticated caller can
+entry, whose failure record is kept as history: supersede it by enqueueing the
+work again under a new `id` and `request_id`, and re-enqueue its dependents. Any authenticated caller can
 hold or clear a hold: the service does not tell one caller's hold from
 another's, and the entry's reason reads `owner hold: <reason>` whoever placed it.
 
@@ -179,7 +182,7 @@ job and clear the hold when the job lands.
 | Milestone | Reached when the prerequisite entry |
 |---|---|
 | `admitted` | is `admitted` and its job has a recorded worker start (a registered minion, or a `job.minion-spawned` event). A job that was committed but never started a worker does not release dependents. Nothing here reads the job's later status. |
-| `delivered` | has a job with a recorded successful delivery and a status of `delivered`, `in-review`, `merged` or `done`. |
+| `delivered` | has a job with a proven candidate delivery on record (a `job.delivered` event; one recorded as unproven does not count) and a status of `delivered`, `in-review`, `merged` or `done`. |
 | `merged` | has a job whose status is exactly `merged`. |
 | `done` | has a job whose status is exactly `done`. |
 
@@ -188,7 +191,9 @@ job and clear the hold when the job lands.
   releasing approved work off it would claim progress the record never made. The
   dependent stays `waiting` with the job's status in its reason (`waiting for
   <id> to be delivered (now binned)`) until it is cancelled. Re-enqueue the work
-  that is still owed with prerequisites that name live entries.
+  that is still owed with prerequisites that name live entries. The same holds
+  under `merged` and `done`, which a binned job never reaches. Only `admitted`,
+  which looks at the start and never at the later status, still counts it.
 - `merged` and `done` are separate terminal statuses and neither implies the
   other. A job that ends `done` never satisfies `merged`, and one that ends
   `merged` never satisfies `done`. `delivered` is the milestone both endings
@@ -242,8 +247,8 @@ Admission writes the claim (`admitting`) before it dispatches, dispatches the
 entry through the existing dispatch service with the entry id as the job id,
 then marks the entry `admitted`. A failed dispatch never duplicates work:
 
-- a dispatch that fails before any job exists puts the entry back to `waiting`
-  with the failure noted, and one retry pass is armed 5 seconds later (the next
+- a dispatch that fails before any job exists (for example one refused for an
+  uppercase `id`) puts the entry back to `waiting` with the failure noted, and one retry pass is armed 5 seconds later (the next
   trigger runs it sooner). The third such failure makes the entry `failed` and
   posts one `pipeline.admission-failed` notification (`action-required`: it wakes
   Gru, not the owner's bell);
@@ -261,6 +266,9 @@ Pipeline admission calls the dispatch service directly and never passes through
 the handler. Today, then, an admitted entry is never held for a READY review at
 any `stage`, is never refused for a missing review, and carries no review
 provenance on its job. Making admission honour the gate is a separate change.
+A material amendment made after admission reaches the worker with the next
+directive or re-brief ([REVIEW-INPUTS.md](./REVIEW-INPUTS.md)), so the worker's
+first turn runs on the text as enqueued.
 
 Until then, the discipline is Gru's: enqueue the entry held, review the exact
 briefing before the first release, then clear the hold (see the role).
@@ -270,8 +278,9 @@ briefing before the first release, then clear the hold (see the role).
 An entry's briefing, title, repository, priority, prerequisites and scopes are
 fixed at enqueue; no route edits them. Only its hold can change, through `hold`
 and `clear-hold`. To change an entry before it
-is admitted, cancel it and enqueue the corrected briefing under a **new** `id`
-(a cancelled entry's id stays reserved). Entries that listed the cancelled one as
+is admitted, cancel it and enqueue the corrected briefing under a **new** `id` (a cancelled
+entry's id stays reserved), with a new `request_id` too if you set one: a new
+`id` under the old `request_id` is a `409`. Entries that listed the cancelled one as
 a prerequisite stay `waiting` on it, so they are cancelled and re-enqueued
 against the new id as well. After admission the briefing is the job's, and a
 correction is an ordinary dispatch amendment
