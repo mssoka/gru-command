@@ -698,6 +698,11 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     // A delimiter opened by a colon and closed by a hyphen ends nothing: `<rev>:<dir>` with a BMAD-style file name.
     expect(recorded(match(named('HEAD', 'docs/issues:1-1-story.md'), 7))).toEqual(prohibited('docs/issues/1-1-story.md'));
     expect(recorded(context(named('HEAD', 'docs/issues:1-1-story.md'), 7))).toEqual(prohibited('docs/issues/1-1-story.md'));
+    // A whitespace-free capture stays the path the older rule reads, so a name
+    // whose dotted part is followed by a written-out part is the whole file, not `report.final`.
+    for (const rule of [DEFAULT_BLIND_ISOLATION_RULE, suffix]) {
+      expect(recorded(match('vendor/report.final-2-of-3.md', 7), rule), 'written-out name').toEqual(prohibited('vendor/report.final-2-of-3.md'));
+    }
     // A date before the first space of a spaced name.
     for (const [rule, path] of [[DEFAULT_BLIND_ISOLATION_RULE, 'docs/issues/2026-10-29 retro notes.md'], [suffix, 'docs/issues/2026-10-29 retro notes.md'], [suffix, 'vendor/2026-10-29 spec/notes.md']] as const) {
       expect(recorded(match(named('HEAD', path), 7), rule), `${path} match`).toEqual(prohibited(path));

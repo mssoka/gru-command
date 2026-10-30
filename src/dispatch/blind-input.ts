@@ -1189,8 +1189,12 @@ export function scanObservedAccess(
     // context-line number inside the capture means the rest is the line's text,
     // which never rides the record. That line is judged by its path region.
     const grammarDecides = ({ line, names }: { readonly line: string; readonly names: readonly GrepNames[] }): boolean => {
-      const captureEnd = GREP_LINE.exec(line)?.[1]?.length ?? -1;
-      return captureEnd >= 0 && names.some((reading) => reading.closed && reading.regionEnd < captureEnd);
+      const capture = GREP_LINE.exec(line)?.[1];
+      // Only a spaced capture is ambiguous enough for the line's grammar to
+      // override it (prose or a clock time reaches a `:digits:` too); a
+      // whitespace-free capture is the path the older rule has always read.
+      if (capture === undefined || !/\s/u.test(capture)) return false;
+      return names.some((reading) => reading.closed && reading.regionEnd < capture.length);
     };
     const excluded = readings
       .filter((reading) => !grammarDecides(reading))
