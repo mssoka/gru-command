@@ -13,6 +13,7 @@
 //
 //   node gru-output/gc-520/red-classify.mjs <results.json> <a1a6|4a269d13>
 import { readFileSync } from 'node:fs';
+import process from 'node:process';
 
 const EXPECTED = {
   // The original contract's fail-before cases, against the base they were

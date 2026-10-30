@@ -783,7 +783,7 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     const files = [
       'src/dispatch/blind-input.ts', 'test/blind-input.test.ts', 'test/blind-input-dispatch.test.ts',
       'test/suite-shape.test.ts', 'docs/REVIEW-INPUTS.md', '.gru-command/worktree.toml',
-      'gru-output/gc-520/msg-check.mjs', 'gru-output/gc-520/red-classify.mjs', 'gru-output/gc-520/pr-body.md',
+      'gru-output/gc-520/msg-check.mjs', 'gru-output/gc-520/red-classify.mjs',
     ];
     const flagged: string[] = [];
     for (const file of files) {

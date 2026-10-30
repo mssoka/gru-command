@@ -18,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
 const print = (line) => process.stdout.write(`${line}\n`);
