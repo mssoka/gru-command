@@ -21,7 +21,8 @@ import type { Role } from '../config.js';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, classifyDeadDirectiveTurn, describeDeadTurn, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { shownText } from '../dispatch/line-safe.js';
+import { DirectiveCheckpointError, classifyDeadDirectiveTurn, describeDeadTurn, shownDeadTurnTool, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -1235,8 +1236,9 @@ function deadTurnRecord(dead: DeadTurnVerdict, producers: readonly DirectiveProd
   const cap = <T>(items: readonly T[]): readonly T[] => items.slice(0, 20);
   return {
     verdict: dead.verdict, runtime: dead.runtime, summary: describeDeadTurn(dead),
-    ...(dead.verdict === 'bounded' ? { effects: cap(dead.effects), effect_count: dead.effects.length } : {}),
-    ...(dead.verdict === 'unbounded' ? { reason: dead.reason, pending: cap(dead.pending) } : { refused: cap(dead.refused) }),
+    ...(dead.verdict === 'bounded' ? { effects: cap(dead.effects).map(shownDeadTurnTool), effect_count: dead.effects.length } : {}),
+    ...(dead.verdict === 'unbounded' ? { reason: dead.reason, pending: cap(dead.pending).map(shownDeadTurnTool) }
+      : { refused: cap(dead.refused).map(shownDeadTurnTool), boundary_refusals: dead.boundaryRefusals }),
     host_absent_incarnations: producers.map(({ incarnation }) => incarnation),
   };
 }
@@ -9651,7 +9653,7 @@ export class LedgerApi {
       logicalStep: 'operation', incidentKey: `directive-recovery:${requestId}`,
       category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: row.baselineSeq,
       description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
-      nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId).length > 0
+      nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId, undefined, this.settledDeadProducers(requestId)).length > 0
         ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, ask the owner — the owner may abandon the unknown custody (the owner-only exit that holds the lane for a fresh owner-accepted request) or bin the job; never replay or infer cessation'
         : 'inspect exact native request evidence; choose a guarded fresh successor (rebrief-successor when the work needs a fresh session) or name the reserved owner decision; ' +
           'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request' } }));
@@ -9952,9 +9954,12 @@ export class LedgerApi {
         readonly retiredWorkRevision: number; readonly retirementSeq: number; readonly laneId: string } | null = null;
       const ownerBasis = this.recoveryOwnerBasis('directive', row.requestId);
       // A dead turn's verdict is a recorded fact of this decision. Evidence that
-      // cannot be read is no verdict: the retirement below refuses it by name.
+      // cannot be read is recorded as such (the retirement below refuses it by name).
       let found: ReturnType<LedgerApi['deadTurnEvidence']> = null;
-      if (input.decision.kind !== 'reconcile-admitted') { try { found = this.deadTurnEvidence(row.requestId); } catch { found = null; } }
+      if (input.decision.kind !== 'reconcile-admitted') {
+        try { found = this.deadTurnEvidence(row.requestId); }
+        catch (error) { found = { dead: { verdict: 'unbounded', runtime: null, reason: `native evidence is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers: [] }; }
+      }
       let evidenceNote = '';
       if (input.decision.kind === 'successor' || input.decision.kind === 'rebrief-successor') {
         if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
@@ -9966,7 +9971,6 @@ export class LedgerApi {
         }
         if (input.decision.requestId === row.requestId || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request id');
         if (found !== null && found.dead.verdict !== 'unbounded') {
-          this.recordDeadProducerCessation(row, found.producers);
           evidenceNote = `\n\nService-read evidence about the interrupted request ${row.requestId}, whose host is gone: ${describeDeadTurn(found.dead)}.`;
         }
         this.retireInterruptedDirective({ requestId: row.requestId, expectedJobId: row.jobId, expectedState: row.state as LiveDirectiveState,
@@ -10550,6 +10554,16 @@ export class LedgerApi {
     return deadTurnOf(target.sessionFile, identity, absent.map(({ producer }) => producer));
   }
 
+  /** The host-absent producers of a dead turn whose own evidence bounds its
+   * effects; none when it is unbounded or cannot be read (the caller then keeps
+   * the stricter, owner-facing path). */
+  private settledDeadProducers(requestId: string): readonly DirectiveProducer[] {
+    try {
+      const found = this.deadTurnEvidence(requestId);
+      return found !== null && found.dead.verdict !== 'unbounded' ? found.producers : [];
+    } catch { return []; }
+  }
+
   /** The dead producer's ledger start has no cessation receipt (the service
    * died before it could write one). Its evidence bounds the turn, so the
    * receipt is written now — the same one a completed host-absent turn gets —
@@ -11017,6 +11031,11 @@ export class LedgerApi {
         );
       }
       const current = this.retirementPreflight(row.requestId, input.lane.id);
+      // A dead turn whose own evidence bounds its effects (see deadTurnEvidence): its
+      // producer's missing cessation receipt is written with the retirement, whichever
+      // route retires it, so nothing later is refused as unproven cleanup.
+      const dead = this.deadTurnEvidence(row.requestId);
+      if (dead !== null && dead.dead.verdict !== 'unbounded') this.recordDeadProducerCessation(row, dead.producers);
       const admissionClass = directiveAdmissionClass(current);
       const ts = nowIso();
       this.db
