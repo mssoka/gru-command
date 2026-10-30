@@ -417,7 +417,7 @@ export class BriefingReviewService {
         : `round ${String(tail.round)} (review ${tail.reviewId}, briefing sha256 ${tail.briefingSha256})`;
       throw new BriefingReviewError(
         'briefing_review_round_cap',
-        `this heist's last ${String(trailing)} rounds all reached CHANGES-NEEDED; the last reviewed text is ${label}: ` +
+        `this heist is at the briefing-review round cap; its last ${String(trailing)} rounds all reached CHANGES-NEEDED, and the last reviewed text is ${label}: ` +
           'record a push-back with POST /api/briefing-review/pushback on that text, dispatch that exact text without a briefing_review block, ' +
           'then immediately append one material corrective amendment with POST /api/dispatch/amendment ' +
           "(its approval.reference names owner ruling journal j-1200) that fixes that round's blocking findings",
@@ -578,7 +578,7 @@ export class BriefingReviewService {
     // chain whose newest review already decided READY.
     if (newest !== undefined && newestVerdict?.aggregate === 'READY') {
       return (
-        `The chain's newest review ${newest.reviewId} (round ${String(newest.round)}) is READY: ` +
+        `The chain's newest review ${newest.reviewId} (round ${String(newest.round)}, briefing sha256 ${newest.briefingSha256}) is READY: ` +
         'dispatch that reviewed text with its briefing_review provenance; this older CHANGES-NEEDED result is recorded but does not gate it.'
       );
     }
@@ -615,7 +615,8 @@ export class BriefingReviewService {
         `Briefing sha256 ${armed.briefingSha256}; heist "${armed.title}" in ${armed.repoPath}.`,
         `Lens jobs: ${jobs}.`,
         input.verdict === 'READY'
-          ? `This revision caught ${String(input.caught)} blocking finding(s) the previous round would have sent to a lane.`
+          ? `This revision caught ${String(input.caught)} blocking finding(s) the previous round would have sent to a lane. ` +
+            'Dispatch the reviewed text with its briefing_review block.'
           : this.changesNeededGuidance(armed),
         'The review is binding on readiness and advisory on content; it never changes scope or overrides an owner ruling.',
       ].join('\n'),

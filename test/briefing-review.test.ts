@@ -210,6 +210,7 @@ function expectOrdinaryPushbackGuidance(message: string): void {
 
 /** The cap route names the exact push-back / dispatch / amendment sequence. */
 function expectCapGuidance(message: string): void {
+  expect(message).toContain('round cap');
   expect(message).toContain('push-back');
   expect(message).toContain('POST /api/briefing-review/pushback');
   expect(message).toContain('dispatch that exact text');
@@ -527,6 +528,8 @@ describe('Nefario briefing review — evidence-bound results', () => {
     expect(ready).toMatchObject({ decisive: true, aggregate: 'READY' });
     // Three lenses of the superseded round each reported one blocking finding.
     expect(ready.caught).toBe(3);
+    const readyNotice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expect(readyNotice).toContain('Dispatch the reviewed text with its briefing_review block');
     const decisive = h.ledger
       .listEventsAfter(0, { kinds: [BRIEFING_REVIEW_VERDICT] })
       .map((event) => event.payload as { readonly decisive?: boolean; readonly caught?: number; readonly chain_key?: string })
@@ -660,21 +663,33 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     await h.service.commission(commission(h, { briefing: `${BRIEFING}\n- A later revision is still under review.` }));
     h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
     const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
-    expect(notice).not.toContain('Last reviewed text:');
+    expect(notice).not.toMatch(/last reviewed text/iu);
     expect(notice).not.toContain('is READY');
     expect(notice).toContain('re-commission at this tier');
   });
 
-  it('a late older CHANGES-NEEDED result dispatches the READY chain tail', async () => {
+  it('a late older CHANGES-NEEDED result routes to the READY chain tail', async () => {
     const h = harness();
+    const readyText = `${BRIEFING}\n- The revision the owner approved.`;
     await h.service.commission(commission(h));
-    await h.service.commission(commission(h, { briefing: `${BRIEFING}\n- The revision the owner approved.` }));
-    h.service.submitResult(resultFor(h, armedByRound(h, 2), { lens: 'stranger' }));
+    await h.service.commission(commission(h, { briefing: readyText }));
+    const readyReview = armedByRound(h, 2);
+    h.service.submitResult(resultFor(h, readyReview, { lens: 'stranger' }));
     h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
     const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
     expect(notice).toContain('is READY');
+    expect(notice).toContain(`review ${readyReview.reviewId}`);
+    expect(notice).toContain(readyReview.briefingSha256);
     expect(notice).toContain('dispatch that reviewed text with its briefing_review provenance');
     expect(notice).not.toContain('re-commission at this tier');
+    // The advertised route itself admits the READY text with its block.
+    expect(h.service.admitDispatch({
+      jobId: 'job-late-ready',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: readyText,
+      requested: { rounds: 2, verdict: 'READY', briefingSha256: readyReview.briefingSha256 },
+    })).toMatchObject({ verdict: 'READY', round: 2 });
   });
 });
 
