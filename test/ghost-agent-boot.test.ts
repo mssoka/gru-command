@@ -157,10 +157,11 @@ describe('compiled service: boot settles the agent rows a previous process left 
       await vi.waitFor(() => {
         const verdicts = readLedger(home, (db) => (db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind = 'job.execution-stop' ORDER BY seq")
           .all(jobId) as unknown as { payload: string }[]).map((event) => JSON.parse(event.payload) as Record<string, unknown>));
-        // The seeded request, then the boot re-proof's verdict: the ghost is
-        // a settled `error` row, not an open turn the runtime fails to hold.
-        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'stopped']);
-        expect(verdicts[1]).toMatchObject({ physical_state: 'stopped', agents: [], outstanding: [] });
+        // The seeded request, the boot re-proof's own intent (a stop pass
+        // records `requested` before any effect), then its verdict: the ghost
+        // is a settled `error` row, not an open turn the runtime fails to hold.
+        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'requested', 'stopped']);
+        expect(verdicts[2]).toMatchObject({ physical_state: 'stopped', agents: [], outstanding: [] });
       }, { timeout: 30_000, interval: 250 });
       expect(agentRows(home, jobId)).toEqual([{ id: 'ghost-parked', state: 'error' }]);
     } finally {
