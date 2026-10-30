@@ -604,10 +604,10 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(match(named('HEAD', 'docs/issues/deferred-work.md'), 7, quoted))).toEqual(prohibited('docs/issues/deferred-work.md'));
     // So does a name that ends in an extension: compiler-style text right behind the number (`file.ts:5:`,
     // `key:12:val`, a clock time) is the file's text, not a longer name or the line number.
-    for (const text of [['x.ts', '5', ' err'].join(':'), ['key', '12', 'val'].join(':'), ['12', '30', '45 started'].join(':'), 'foo.md-9-bar']) {
+    for (const text of [['x.ts', '5', ' fault'].join(':'), ['key', '12', 'val'].join(':'), ['12', '30', '45 started'].join(':'), 'foo.md-9-bar']) {
       const hits = scan(context(named('HEAD', 'docs/issues/v1.2/deferred-work.md'), 7, text));
       expect(hits.map((hit) => `${hit.code}:${hit.path}`), text).toEqual(prohibited('docs/issues/v1.2/deferred-work.md'));
-      expect(JSON.stringify(hits), text).not.toMatch(/err|key|started|foo/u);
+      expect(JSON.stringify(hits), text).not.toMatch(/fault|key|started|foo/u);
     }
   });
 
