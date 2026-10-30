@@ -52,7 +52,6 @@ export const OWNER_APPROVAL_REFUSAL_CODES = [
   'abandoned-elsewhere',
   'stale-fence',
   'execution-error',
-  'service-not-hosted',
 ] as const;
 export type OwnerApprovalRefusalCode = (typeof OWNER_APPROVAL_REFUSAL_CODES)[number];
 
@@ -130,6 +129,14 @@ export const ownerApprovalEventKind = (state: OwnerApprovalState | 'attempt-fail
 export function ownerApprovalFingerprint(kind: OwnerApprovalKind, requestId: string, reason: string): string {
   return createHash('sha256').update(JSON.stringify([kind, requestId, reason, 'gru'])).digest('hex');
 }
+
+/** The `owner-approval.*` events of one record, in order. A range over the kind
+ * index, not `LIKE`: SQLite's `LIKE` is case-insensitive, cannot use the
+ * binary-collation index and would scan the whole events table on every
+ * readback. `/` is the character after `.`, so the range is the `owner-approval.`
+ * prefix exactly. */
+export const OWNER_APPROVAL_HISTORY_SQL =
+  "SELECT ts, kind, payload FROM events WHERE kind >= 'owner-approval.' AND kind < 'owner-approval/' AND json_extract(payload, '$.id') = ? ORDER BY seq";
 
 type Row = Record<string, unknown>;
 

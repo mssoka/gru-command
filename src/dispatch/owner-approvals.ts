@@ -173,14 +173,20 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
-/** Every control character but tab and LF: C0, DEL and C1 (no raw control
- * range literal). The card validation rejects C0 and DEL; a C1 control (NEL
- * and the like) is refused here too, so "no control character other than tab
- * and newline" is the whole rule the docs state. */
+/** A character a reason may not carry: every control character (`\p{Cc}`: C0,
+ * DEL and C1) but tab and LF, the line and paragraph separators (U+2028,
+ * U+2029) and the bidi embedding, override and isolate controls (U+202A-U+202E,
+ * U+2066-U+2069), which reorder what the owner reads on the card. No raw
+ * control range literal. */
+function isRefusedReasonCharacter(code: number): boolean {
+  if (code === 0x09 || code === 0x0a) return false;
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029 ||
+    (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069);
+}
+
 function hasControlChars(value: string): boolean {
   for (const char of value) {
-    const code = char.codePointAt(0) ?? 0;
-    if (code === 0x7f || (code >= 0x80 && code <= 0x9f) || (code < 0x20 && code !== 0x09 && code !== 0x0a)) return true;
+    if (isRefusedReasonCharacter(char.codePointAt(0) ?? 0)) return true;
   }
   return false;
 }
@@ -198,7 +204,7 @@ function parseProposal(body: Record<string, unknown>): { readonly kind: OwnerApp
   if (typeof reason !== 'string') throw new Error('reason must be a string');
   if (reason.trim() === '') throw new Error('reason must not be blank');
   if ([...reason].length > OWNER_APPROVAL_REASON_MAX_CHARS) throw new Error(`reason must be at most ${String(OWNER_APPROVAL_REASON_MAX_CHARS)} characters`);
-  if (hasControlChars(reason)) throw new Error('reason must not contain control characters other than tab and newline');
+  if (hasControlChars(reason)) throw new Error('reason must not contain control characters other than tab and newline, line or paragraph separators, or bidi override and isolate characters');
   const idempotencyKey = body['idempotency_key'];
   if (typeof idempotencyKey !== 'string' || !IDEMPOTENCY_KEY.test(idempotencyKey)) {
     throw new Error('idempotency_key must be 1-128 characters of A-Z, a-z, 0-9, ".", "_" or "-"');
@@ -210,6 +216,17 @@ function parseProposal(body: Record<string, unknown>): { readonly kind: OwnerApp
  * ledger, a card and a response. */
 function errorMessage(error: unknown): string {
   return redactCredentials(error instanceof Error ? error.message : String(error)).slice(0, ERROR_MESSAGE_CHARS);
+}
+
+/** A card post that failed only because the store was busy or locked (SQLITE_BUSY,
+ * SQLITE_LOCKED): the card is fine and the same post can succeed later. Every
+ * other failure (a decision outside its bounds, a constraint, a store that is
+ * gone) cannot be cured by asking again. */
+export function isTransientCardPostFailure(error: unknown): boolean {
+  const failed = error as { errcode?: unknown; message?: unknown } | null;
+  const code = typeof failed?.errcode === 'number' ? failed.errcode % 256 : null;
+  return code === 5 || code === 6 ||
+    (typeof failed?.message === 'string' && /database (?:table )?is (?:locked|busy)/iu.test(failed.message));
 }
 
 /** The card's decision for a record, built from its stored facts alone. */
@@ -278,40 +295,36 @@ function view(ledger: ServiceLedger, record: OwnerApprovalRecord): OwnerApproval
 export interface UnhostedOwnerApprovalOutcome {
   /** Undecided cards withdrawn and their records ended `withdrawn`. */
   readonly withdrawn: readonly string[];
-  /** Records whose recorded decision nothing will carry out, ended `refused`. */
-  readonly refused: readonly string[];
-  /** Records left for the boot that hosts the service again (see below). */
+  /** Records left alone for the boot that hosts the service again. */
   readonly kept: readonly string[];
 }
 
-const UNHOSTED_WITHDRAWN_DETAIL = 'Owner approvals are not hosted on this service (Silas ops are off), so nothing from this card is run. Ask Gru to propose it again once they are on.';
-const UNHOSTED_REFUSAL: OwnerApprovalRefusal = {
-  code: 'service-not-hosted',
-  blockers: ['Silas ops are off on this service, so owner approvals are not hosted and nothing carried out the decision'],
-};
+/** Why a record ended `withdrawn` on an unhosted boot (the history detail starts with it). */
+export const OWNER_APPROVAL_UNHOSTED_REASON = 'service-unhosted';
+const UNHOSTED_WITHDRAWN_DETAIL = `${OWNER_APPROVAL_UNHOSTED_REASON}: owner approvals need the service hosted ([silas] enabled = true), ` +
+  'so nothing from this card is run. Ask Gru to propose it again once they are on.';
 
 /**
- * The service is hosted only where Silas ops are. A boot that does not host it
- * must not leave an approval card open: the owner's Approve would be recorded
- * and nothing would carry it out. So every `proposed` record of an earlier
- * boot ends here, and its card with it: an undecided card is withdrawn
- * (`withdrawn`); a card whose decision was recorded but not yet followed is
- * closed with the truth (`refused`, `service-not-hosted`, nothing ran).
+ * Approval cards need the service hosted (`[silas] enabled = true`). A boot
+ * that does not host it must not leave an undecided approval card open: the
+ * owner's Approve would be recorded and nothing would carry it out. So every
+ * open, undecided card of an earlier boot is withdrawn and its record ends
+ * `withdrawn` with the reason `service-unhosted`.
  *
- * An `approved` or `executing` record is left alone: it may already have run,
- * and it cannot be told from here. It is finished by the next boot that hosts
- * the service (its reconcile reads the abandonment audit), never run twice.
- * Each record is handled on its own; one that cannot be ended is logged and
- * kept, and never stops the boot.
+ * A decided, `approved` or `executing` record is left alone: the owner already
+ * answered (or the operation is under way and may already have run), and the
+ * next boot that hosts the service processes it as it always does (its
+ * reconcile reads the decision and the abandonment audit; it never runs
+ * twice). Each record is handled on its own; one that cannot be ended is
+ * logged and kept, and never stops the boot.
  */
 export function withdrawUnhostedOwnerApprovals(deps: {
-  readonly ledger: Pick<ServiceLedger, 'listActiveOwnerApprovalIds' | 'getOwnerApproval' | 'getNotification' | 'withdrawOwnerProposal' | 'resolveOwnerDecision' | 'endOwnerApproval'>;
+  readonly ledger: Pick<ServiceLedger, 'listActiveOwnerApprovalIds' | 'getOwnerApproval' | 'getNotification' | 'withdrawOwnerProposal' | 'endOwnerApproval'>;
   readonly log?: Log;
 }): UnhostedOwnerApprovalOutcome {
   const { ledger } = deps;
   const log: Log = deps.log ?? (() => {});
   const withdrawn: string[] = [];
-  const refused: string[] = [];
   const kept: string[] = [];
   for (const id of ledger.listActiveOwnerApprovalIds()) {
     try {
@@ -319,12 +332,7 @@ export function withdrawUnhostedOwnerApprovals(deps: {
       if (record === null) continue;
       if (record.state !== 'proposed') { kept.push(id); continue; }
       const card = ledger.getNotification(record.notificationId);
-      if (card !== null && card.decidedAt !== null) {
-        ledger.endOwnerApproval(id, { state: 'refused', refusal: UNHOSTED_REFUSAL, detail: refusalDetail(UNHOSTED_REFUSAL) });
-        if (card.resolvedAt === null) ledger.resolveOwnerDecision(card.id, refusalDetail(UNHOSTED_REFUSAL), OWNER_PROVENANCE);
-        refused.push(id);
-        continue;
-      }
+      if (card !== null && card.decidedAt !== null) { kept.push(id); continue; }
       if (card !== null && card.resolvedAt === null) {
         try {
           ledger.withdrawOwnerProposal(card.id, UNHOSTED_WITHDRAWN_DETAIL);
@@ -341,10 +349,10 @@ export function withdrawUnhostedOwnerApprovals(deps: {
       log('error', 'owner approval: could not end a record while the service is not hosted', { id, error: String(error) });
     }
   }
-  if (withdrawn.length + refused.length + kept.length > 0) {
-    log('info', 'owner approvals are not hosted: open approvals were ended', { withdrawn, refused, kept });
+  if (withdrawn.length + kept.length > 0) {
+    log('info', 'owner approvals are not hosted: open undecided approvals were withdrawn', { withdrawn, kept });
   }
-  return { withdrawn, refused, kept };
+  return { withdrawn, kept };
 }
 
 export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): OwnerApprovalService {
@@ -513,14 +521,20 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
   };
 
   /** Post the record's card, or end the record `refused` (`card-post-failed`)
-   * when that throws: a record whose card can never exist must not stay
-   * `proposed`, or every new proposal for its request is answered pending.
-   * The proposal and the reconcile's repost both go through here. */
+   * when that fails for good: a record whose card can never exist must not
+   * stay `proposed`, or every new proposal for its request is answered
+   * pending. A transient failure (the store busy or locked) leaves the record
+   * `proposed` for the next reconcile to post again. The proposal and the
+   * reconcile's repost both go through here, so they classify alike. */
   const postCardOrRefuse = (record: OwnerApprovalRecord): void => {
     try {
       postCard(record);
     } catch (error) {
       const message = errorMessage(error);
+      if (isTransientCardPostFailure(error)) {
+        log('warn', 'owner approval: the card could not be posted yet; the next reconcile retries it', { id: record.id, error: message });
+        return;
+      }
       log('error', 'owner approval: the card could not be posted', { id: record.id, error: message });
       ledger.endOwnerApproval(record.id, { state: 'refused', refusal: { code: 'card-post-failed', blockers: [message] }, detail: `Not run: card-post-failed\n${message}` });
     }

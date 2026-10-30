@@ -112,13 +112,25 @@ describe('owner approval - the text that sends Gru and the owner to the new rout
     for (const state of ['proposed', 'approved', 'executing', 'succeeded', 'denied', 'refused', 'withdrawn']) {
       expect(doc, state).toContain(state);
     }
-    for (const code of ['card-post-failed', 'decider-not-owner', 'abandoned-elsewhere', 'stale-fence', 'execution-error', 'service-not-hosted',
+    for (const code of ['card-post-failed', 'decider-not-owner', 'abandoned-elsewhere', 'stale-fence', 'execution-error',
       'retirement_available', 'live_work', 'directive_not_live', 'request_mismatch', 'terminal_receipt_present']) {
       expect(doc, code).toContain(code);
     }
     expect(doc).toContain('expectedDecision');
     expect(doc).toContain('confirm_intent');
-    expect(doc).toContain('C1');
+  });
+
+  it('docs/DIRECTIVE-RECOVERY.md states the reason rule and that approval cards need the service hosted', () => {
+    const doc = read('docs', 'DIRECTIVE-RECOVERY.md').replace(/\s+/gu, ' ');
+    // The sentence the doc has always carried stays, and the code enforces all of it.
+    expect(doc).toContain('with no control character other than tab and newline');
+    for (const named of ['no C0 control', 'no DEL', 'no C1 control such as U+0085', 'U+2028, U+2029', 'U+202A-U+202E, U+2066-U+2069']) {
+      expect(doc, named).toContain(named);
+    }
+    expect(doc).toContain('Approval cards need the service hosted');
+    expect(doc).toContain('`[silas] enabled = true`');
+    expect(doc).toContain('`service-unhosted`');
+    expect(doc).toContain('owner_approvals_not_hosted');
   });
 
   it('docs/OPERATIONS.md points the unknown-custody sentence at the owner-approval section', () => {

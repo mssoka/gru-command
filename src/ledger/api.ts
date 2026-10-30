@@ -185,6 +185,7 @@ import {
   insertOwnerApproval,
   OWNER_APPROVAL_CARD_KIND,
   OWNER_APPROVAL_ENDINGS,
+  OWNER_APPROVAL_HISTORY_SQL,
   OWNER_APPROVAL_MAX_ATTEMPTS,
   ownerApprovalEventKind,
   ownerApprovalFingerprint,
@@ -10600,9 +10601,7 @@ export class LedgerApi {
 
   /** The record's state changes in order, from its `owner-approval.*` events. */
   ownerApprovalHistory(id: string): readonly OwnerApprovalHistoryEntry[] {
-    const rows = this.db
-      .prepare("SELECT ts, kind, payload FROM events WHERE kind LIKE 'owner-approval.%' AND json_extract(payload, '$.id') = ? ORDER BY seq")
-      .all(id) as Row[];
+    const rows = this.db.prepare(OWNER_APPROVAL_HISTORY_SQL).all(id) as Row[];
     return rows.map((row) => {
       const detail = (JSON.parse(str(row.payload)) as { detail?: unknown }).detail;
       return { state: str(row.kind).slice('owner-approval.'.length), at: str(row.ts), detail: typeof detail === 'string' ? detail : null };

@@ -13,7 +13,9 @@ import { observeTerminalJobDirective, surfaceDirectiveRecovery } from '../src/di
 import {
   createOwnerApprovalService,
   DIRECTIVE_ABANDON_CARD_KIND,
+  isTransientCardPostFailure,
   OWNER_APPROVAL_RECONCILE_INTERVAL_MS,
+  OWNER_APPROVAL_UNHOSTED_REASON,
   ownerApprovalReasonPrefix,
   withdrawUnhostedOwnerApprovals,
   type OwnerApprovalService,
@@ -30,6 +32,7 @@ import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { producerWithdrawable } from '../src/ledger/notification-decision.js';
 import {
+  OWNER_APPROVAL_HISTORY_SQL,
   OWNER_APPROVAL_MAX_ATTEMPTS,
   OWNER_APPROVAL_REASON_MAX_CHARS,
   OWNER_APPROVAL_STATES,
@@ -763,6 +766,9 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     h.restart().reconcile();
     expect(approvalCard(h, card.id).resolvedAt).not.toBeNull();
     expect(resolutionDetail(h, card.id)).toBe(`Abandoned as outcome-unknown (abandonment event seq ${String(record.abandonmentEventSeq)}).`);
+    // The reconcile closure shows the same result on the card the board renders.
+    expect(await boardCard(h, card.id)).toMatchObject({ resolvedBy: 'gru',
+      resolutionDetail: `Abandoned as outcome-unknown (abandonment event seq ${String(record.abandonmentEventSeq)}).` });
   });
 
   it('card withdrawn, record still proposed: reconcile (g) ends it withdrawn', async () => {
@@ -816,6 +822,73 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(again.status).toBe(201);
     expect(createdApproval(again)).toMatchObject({ state: 'refused', outcome: { refusal: { code: 'card-post-failed' } } });
     expect(abandonmentEvents(h)).toEqual([]);
+  });
+
+  it('keeps retrying a card the store could not take yet: a busy store is not a card that can never exist', async () => {
+    const repo = makeFixtureRepo('oa-repost-busy');
+    cleanupRepos.push(repo);
+    const busy = (): Error => Object.assign(new Error('database is locked'), { errcode: 5 });
+    expect(isTransientCardPostFailure(busy())).toBe(true);
+    expect(isTransientCardPostFailure(Object.assign(new Error('x'), { errcode: 261 }))).toBe(true);
+    expect(isTransientCardPostFailure(Object.assign(new Error('x'), { errcode: 6 }))).toBe(true);
+    expect(isTransientCardPostFailure(new Error('decision.question must be at most 300 characters'))).toBe(false);
+    expect(isTransientCardPostFailure(Object.assign(new Error('constraint failed'), { errcode: 19 }))).toBe(false);
+    expect(isTransientCardPostFailure('database is locked')).toBe(false);
+
+    // The proposal itself: the first post meets a busy store.
+    let posts = 0;
+    const h = await boot();
+    const flaky: Pick<NotificationCenter, 'post'> = {
+      post: (input) => { posts += 1; if (posts === 1) throw busy(); return h.notifications.post(input); },
+    };
+    h.restart({ notifications: flaky });
+    await historicalLiveRequest(h, repo, 'job-c10', 'req-c10');
+    const created = await propose(h, 'req-c10');
+    expect(created.status).toBe(201);
+    // Not refused: the record waits for its card, the request is still live, and Gru is not told "pending" twice.
+    expect(createdApproval(created)).toMatchObject({ state: 'proposed', outcome: { refusal: null } });
+    expect(requestState(h, 'req-c10')).toBe('dispatching');
+    expect(approvalCards(h)).toEqual([]);
+    expect((await propose(h, 'req-c10', { idempotency_key: 'another-key' })).status).toBe(409);
+    // The next reconcile posts the card once, and the card still carries the owner's Approve.
+    h.service.current.reconcile();
+    h.service.current.reconcile();
+    expect(approvalCards(h)).toHaveLength(1);
+    expect(posts).toBe(2);
+    h.service.current.start();
+    const id = field<string>(createdApproval(created), 'id');
+    await decide(h, `owner-approval:${id}`, 'approve', 'owner');
+    expect(requestState(h, 'req-c10')).toBe('abandoned');
+    expect(h.ledger.getOwnerApproval(id)?.state).toBe('succeeded');
+  });
+
+  it('a reconcile repost that meets a busy store leaves the record proposed and tries again', async () => {
+    const repo = makeFixtureRepo('oa-repost-busy-reconcile');
+    cleanupRepos.push(repo);
+    const h = await boot({ crashAt: ['record-written'] });
+    await historicalLiveRequest(h, repo, 'job-c11', 'req-c11');
+    expect((await propose(h, 'req-c11')).status).toBe(400);
+    const [id] = h.ledger.listActiveOwnerApprovalIds();
+    let posts = 0;
+    h.restart({ crashAt: [], notifications: { post: (input) => {
+      posts += 1;
+      if (posts < 3) throw Object.assign(new Error('database is locked'), { errcode: 5 });
+      return h.notifications.post(input);
+    } } });
+    h.service.current.reconcile();
+    h.service.current.reconcile();
+    // Two busy answers later: still proposed, nothing refused, no card, one record.
+    expect(requestState(h, 'req-c11')).toBe('dispatching');
+    expect(h.ledger.getOwnerApproval(id!)).toMatchObject({ state: 'proposed', refusal: null });
+    expect(h.ledger.listActiveOwnerApprovalIds()).toEqual([id]);
+    expect(approvalCards(h)).toEqual([]);
+    h.service.current.reconcile();
+    expect(posts).toBe(3);
+    expect(approvalCards(h)).toHaveLength(1);
+    expect(h.ledger.getOwnerApproval(id!)?.state).toBe('proposed');
+    h.service.current.start();
+    await decide(h, h.ledger.getOwnerApproval(id!)!.notificationId, 'approve', 'owner');
+    expect(requestState(h, 'req-c11')).toBe('abandoned');
   });
 
   it('succeeds once with a real card close, and a second reconcile appends nothing', async () => {
@@ -1068,6 +1141,12 @@ describe('owner approval — proposal answers and readback', () => {
       ['DEL', { reason: `bad${String.fromCodePoint(0x7f)}byte` }],
       ['C1 control (NEL)', { reason: `bad${String.fromCodePoint(0x85)}byte` }],
       ['C1 control (last)', { reason: `bad${String.fromCodePoint(0x9f)}byte` }],
+      ['line separator', { reason: `bad${String.fromCodePoint(0x2028)}line` }],
+      ['paragraph separator', { reason: `bad${String.fromCodePoint(0x2029)}paragraph` }],
+      ['bidi embedding', { reason: `bad${String.fromCodePoint(0x202a)}embed` }],
+      ['bidi override', { reason: `bad${String.fromCodePoint(0x202e)}override` }],
+      ['bidi isolate', { reason: `bad${String.fromCodePoint(0x2066)}isolate` }],
+      ['bidi isolate end', { reason: `bad${String.fromCodePoint(0x2069)}pop` }],
       ['too long', { reason: 'x'.repeat(OWNER_APPROVAL_REASON_MAX_CHARS + 1) }],
       ['bad key', { idempotency_key: 'has spaces' }],
       ['empty key', { idempotency_key: '' }],
@@ -1082,8 +1161,8 @@ describe('owner approval — proposal answers and readback', () => {
     }
     expect(approvalCards(h)).toEqual([]);
     expect(h.ledger.listActiveOwnerApprovalIds()).toEqual([]);
-    // Tab and LF are allowed reason characters.
-    const allowed = await propose(h, 'req-i1', { reason: 'custody\tunknown\nrestart' });
+    // Tab and LF are allowed reason characters, and so is ordinary non-ASCII text.
+    const allowed = await propose(h, 'req-i1', { reason: 'custody\tunknown\nrestart: caf\u00e9 \u2014 \u200bok' });
     expect(allowed.status).toBe(201);
   });
 
@@ -1147,6 +1226,16 @@ describe('owner approval — proposal answers and readback', () => {
       .toEqual(['proposed', 'approved', 'executing', 'succeeded']);
     expect(field<Record<string, unknown>>(settled.json, 'outcome')).toMatchObject({
       abandonment_event_seq: abandonmentEvents(h)[0]!.seq, refusal: null });
+  });
+});
+
+describe('owner approval — the readback does not scan the event log', () => {
+  it('reads a record\u2019s history through the kind index, not a scan of every event', async () => {
+    const h = await boot({ startService: false });
+    const plan = h.db.handle.prepare(`EXPLAIN QUERY PLAN ${OWNER_APPROVAL_HISTORY_SQL}`).all('oa-any') as { readonly detail: string }[];
+    const details = plan.map((row) => row.detail).join('\n');
+    expect(details).toContain('SEARCH events USING INDEX idx_events_kind');
+    expect(details).not.toMatch(/SCAN events/u);
   });
 });
 
@@ -1240,7 +1329,7 @@ describe('owner approval — reconcile, withdrawal and shutdown', () => {
     expect(abandonmentEvents(h)).toEqual([]);
   });
 
-  it('withdraws what is open when the service is not hosted, so no decision is recorded that nothing carries out', async () => {
+  it('withdraws each open undecided card when the service is not hosted, and leaves decided and executing records for a hosting boot', async () => {
     const repo = makeFixtureRepo('oa-unhosted');
     cleanupRepos.push(repo);
     const h = await boot({ startService: false });
@@ -1259,23 +1348,32 @@ describe('owner approval — reconcile, withdrawal and shutdown', () => {
 
     expect(requestState(h, 'req-u-open')).toBe('dispatching');
     expect(requestState(h, 'req-u-decided')).toBe('dispatching');
-    expect(outcome).toEqual({ withdrawn: [field<string>(open, 'id')], refused: [field<string>(decided, 'id')], kept: [] });
+    expect(outcome).toEqual({ withdrawn: [field<string>(open, 'id')], kept: [field<string>(decided, 'id')] });
+    // The undecided card is withdrawn and its record ended with the named reason.
     expect(h.ledger.getOwnerApproval(field<string>(open, 'id'))?.state).toBe('withdrawn');
+    expect(h.ledger.ownerApprovalHistory(field<string>(open, 'id')).at(-1)).toMatchObject({ state: 'withdrawn' });
+    expect(h.ledger.ownerApprovalHistory(field<string>(open, 'id')).at(-1)?.detail?.startsWith(OWNER_APPROVAL_UNHOSTED_REASON)).toBe(true);
+    expect(OWNER_APPROVAL_UNHOSTED_REASON).toBe('service-unhosted');
     expect(h.ledger.getNotification(openCard.id)).toMatchObject({ resolvedBy: 'producer-withdrawn', decidedAt: null });
-    expect((await boardCard(h, openCard.id))['resolutionDetail']).toContain('not hosted');
-    // The card is closed, so the owner cannot record a decision nobody carries out.
+    expect((await boardCard(h, openCard.id))['resolutionDetail']).toContain('service-unhosted');
+    // The closed card takes no decision that nothing would carry out.
     expect((await decide(h, openCard.id, 'approve', 'owner')).status).toBeGreaterThanOrEqual(400);
     expect(h.ledger.getNotification(openCard.id)?.decidedAt).toBeNull();
-    // The decision that was already recorded is answered truthfully, never left waiting.
-    expect(h.ledger.getOwnerApproval(field<string>(decided, 'id'))).toMatchObject({ state: 'refused', refusal: { code: 'service-not-hosted' } });
-    expect(((await boardCard(h, decidedCard.id))['resolutionDetail'] as string).split('\n')[0]).toBe('Not run: service-not-hosted');
-    expect(h.ledger.listActiveOwnerApprovalIds()).toEqual([]);
+    // The decided record is untouched: its card stays decided and open.
+    expect(h.ledger.getOwnerApproval(field<string>(decided, 'id'))?.state).toBe('proposed');
+    expect(h.ledger.getNotification(decidedCard.id)).toMatchObject({ decidedOption: 'approve', resolvedAt: null });
     expect(abandonmentEvents(h)).toEqual([]);
-    // Idempotent: a second boot finds nothing to do.
-    expect(withdrawUnhostedOwnerApprovals({ ledger: h.ledger })).toEqual({ withdrawn: [], refused: [], kept: [] });
+    // Idempotent: a second unhosted boot ends nothing more.
+    expect(withdrawUnhostedOwnerApprovals({ ledger: h.ledger })).toEqual({ withdrawn: [], kept: [field<string>(decided, 'id')] });
+
+    // The next boot that hosts the service processes the decision, as today.
+    h.service.current.start();
+    expect(requestState(h, 'req-u-decided')).toBe('abandoned');
+    expect(h.ledger.getOwnerApproval(field<string>(decided, 'id'))?.state).toBe('succeeded');
+    expect(abandonmentEvents(h)).toHaveLength(1);
   });
 
-  it('keeps an approval that was already being carried out for the boot that hosts the service again', async () => {
+  it('leaves an approval that was already being carried out for the boot that hosts the service again', async () => {
     const repo = makeFixtureRepo('oa-unhosted-inflight');
     cleanupRepos.push(repo);
     const h = await boot({ crashAt: ['executing-written'] });
@@ -1285,7 +1383,7 @@ describe('owner approval — reconcile, withdrawal and shutdown', () => {
     expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('executing');
 
     // It may already have run: it is neither withdrawn nor refused.
-    expect(withdrawUnhostedOwnerApprovals({ ledger: h.ledger })).toEqual({ withdrawn: [], refused: [], kept: [field<string>(approval, 'id')] });
+    expect(withdrawUnhostedOwnerApprovals({ ledger: h.ledger })).toEqual({ withdrawn: [], kept: [field<string>(approval, 'id')] });
     expect(requestState(h, 'req-u-fly')).toBe('dispatching');
     expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('executing');
     // Hosted again, reconcile finishes it exactly once.
@@ -1374,8 +1472,7 @@ describe('owner approval — registration and wiring', () => {
     expect(source).toContain('config.silas.enabled && silasSlot !== null');
     // Not hosted: what is open is withdrawn at boot, before any route can take a decision (F3).
     expect(source).toContain('if (ownerApprovals === undefined) withdrawUnhostedOwnerApprovals({');
-    const shutdown = readFileSync(join(import.meta.dirname, '..', 'src', 'service-shutdown.ts'), 'utf-8');
-    expect(shutdown).toContain('state.ownerApprovals.stop()');
+    // The stop() ordering and its failure isolation are exercised in test/service-shutdown.test.ts.
   });
 });
 

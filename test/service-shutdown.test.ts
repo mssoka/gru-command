@@ -311,6 +311,21 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['onboarding stop failed']);
   });
 
+  it('stops the owner-approval service after onboarding; a failing stop never skips what follows (#523)', async () => {
+    const order: string[] = [];
+    const state: ServiceShutdownState = {
+      onboarding: { stop: () => { order.push('onboarding.stop'); } },
+      ownerApprovals: { stop: () => { order.push('ownerApprovals.stop'); throw new Error('timer already cleared'); } },
+      laneSlimmer: { stop: async () => { order.push('laneSlimmer.stop'); } },
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['onboarding.stop', 'ownerApprovals.stop', 'laneSlimmer.stop', 'handle.stop']);
+    expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['owner approvals stop failed']);
+  });
+
   it('stops lane slimming after onboarding and waits for the slim pass that is running; a failing stop never skips what follows (#427)', async () => {
     const order: string[] = [];
     let finishPass!: () => void;

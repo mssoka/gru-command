@@ -481,8 +481,10 @@ POST /api/owner-approvals
 ```
 
 `reason` is 1-500 characters, not blank, with no control character other
-than tab and newline (no C0 control, no DEL and no C1 control such as
-U+0085). `idempotency_key` is 1-128 characters of `A-Z a-z 0-9 . _ -`.
+than tab and newline: no C0 control, no DEL, no C1 control such as U+0085,
+and also no line or paragraph separator (U+2028, U+2029) and no bidi
+embedding, override or isolate character (U+202A-U+202E, U+2066-U+2069),
+which would reorder what the owner reads on the card. `idempotency_key` is 1-128 characters of `A-Z a-z 0-9 . _ -`.
 `by` must be `gru`. The service checks that the request exists and is live
 (`dispatching` or `admitted`), reads the four fences the Approve is bound to
 (`job_id`, `state`, `payload_hash` and the recovery-debt generation, or null),
@@ -536,8 +538,7 @@ the third ends it `refused` as `execution-error`, its message redacted of
 credentials and cut to 300 characters.
 
 **Refusal codes.** The service gives `card-post-failed`, `decider-not-owner`,
-`abandoned-elsewhere`, `stale-fence`, `execution-error` and
-`service-not-hosted`. A ledger refusal
+`abandoned-elsewhere`, `stale-fence` and `execution-error`. A ledger refusal
 keeps its own code and the blockers it carries (possibly none): the
 abandonment raises `live_work`, `retirement_available`, `request_mismatch`,
 `directive_not_live` and `terminal_receipt_present`; the retirement-only
@@ -564,20 +565,26 @@ re-reads the fences of an `approved` record, and, for an `executing` record,
 settles from an abandonment recorded after its `executing` event (its own,
 by the reason prefix, is `succeeded`; any other is `abandoned-elsewhere`) or
 else re-reads the fences and runs it. It resolves the card of any ended
-record that still has one open. A card the reconcile cannot post (for
+record that still has one open. A card the reconcile cannot post for good (for
 example a request id long enough to break the card's own length bounds) ends
-the record `refused` as `card-post-failed`, exactly as at proposal time, so
-the request is never left with a record that waits for a card that cannot
-exist. The abandonment never runs twice.
+the record `refused` as `card-post-failed`, as at proposal time, so the
+request is never left with a record that waits for a card that cannot exist;
+a card the store could not take only because it was busy or locked keeps the
+record `proposed` and is posted again on the next reconcile (the proposal
+classifies the same way and answers `201` with the record still `proposed`).
+The abandonment never runs twice.
 
-**When the service is not hosted.** The service runs only where Silas ops are
-on. A boot without it ends what an earlier boot left: an undecided card is
-withdrawn and its record ends `withdrawn`, and a card whose decision was
-recorded but never followed is closed with `Not run: service-not-hosted` (the
-record ends `refused`), so no Approve is ever recorded that nothing carries
-out. An `approved` or `executing` record is left alone, because it may
-already have run; the next boot that hosts the service finishes it from the
-abandonment audit, never twice.
+**When the service is not hosted.** Approval cards need the service hosted:
+it runs only where Silas ops are on (`[silas] enabled = true`); with them off
+`POST` and `GET /api/owner-approvals` answer `503 owner_approvals_not_hosted`.
+A boot that does not host it withdraws each open, undecided approval card and
+ends its record `withdrawn` with the reason `service-unhosted` (the history
+detail starts with it), so no Approve is ever recorded on a card that nothing
+would carry out. A decided, `approved` or `executing` record is left alone: the
+owner already answered, or the operation is under way and may already have
+run, and the next boot that hosts the service processes it as it always does
+(its reconcile reads the decision and the abandonment audit; the abandonment
+never runs twice).
 
 **Attribution.** The same caller-declared model as `/abandon`: one shared
 bearer, no verified identity. Gru never sends `by: "owner"`; it proposes
