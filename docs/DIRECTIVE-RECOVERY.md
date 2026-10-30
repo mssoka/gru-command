@@ -678,7 +678,13 @@ never asks a human to certify what a dead process did.
 |---|---|---|
 | `none` | The turn recorded no tool intent after admission, or every intent has a recorded guard refusal (a refused tool never ran). | No |
 | `bounded` | Tool intents exist and each has a completion or a recorded guard refusal; the effects are known and listed (a failed tool is listed as failed, and the note warns it can have left partial effects). | No |
-| `unbounded` | An intent has neither a completion nor a refusal, **or** the evidence cannot be trusted: the transcript, producer journal, association journal or checkpoint is unreadable, the final line is torn, a result or permission request names no recorded intent, a prompt entered the unfinished turn, or a tool id repeats. | Yes — today's refusal, now naming which |
+| `unbounded` | An intent has neither a completion nor a refusal, **or** the evidence cannot be trusted: the transcript, producer journal, association journal or checkpoint is unreadable or missing, the final line is torn, a tool id repeats, or the checkpoint walk itself refuses the turn for a structural reason (a branch, a control entry, an unbound tail, a result or permission request no intent explains, a prompt that entered the unfinished turn, an unlinked compaction). | Yes — today's refusal, now naming which |
+
+The verdict is derived *from* the checkpoint walk, never beside it: the walk (run
+without its refusal-receipt early return, which the verdict counts itself) must
+find the turn structurally sound and merely unfinished or failed, or the verdict
+is `unbounded` and names the walk's own reason. Only then are the turn's intents,
+completions and refusals read.
 
 The evidence is the runtime's own. A tool intent is durable before the host
 allows any tool: Claude's `tool_use` frame is in the transcript before the
@@ -691,8 +697,9 @@ id in `<session>.producers.jsonl`, written for either runtime; it takes
 precedence over any completion the CLI's denial produced. An assistant row the
 SDK never runs (pi `error`, `aborted`, `length` stops) holds no intent. A
 host authority-boundary refusal (no tool id) is counted and told in the line.
-Tool names and ids are model-controlled text: every surface shows them
-line-safe and bounded.
+Tool names and ids are model-controlled text, and a successor's prompt carries
+them: a plain token is shown as is, anything else as a quoted, line-safe literal,
+never longer than 80 code points, on every surface.
 
 `none` and `bounded` stay recorded facts: the `silas.directive-recovery-decided`
 event carries `dead_turn` (verdict, runtime, effects, refusals, the host-absent
@@ -711,6 +718,10 @@ question they can answer ("this turn may have run `<tools>`; continue?"). The
 owner's exit is unchanged (abandonment records the outcome as unknown); a
 "continue" answer has no mechanism yet (the owner-decision authorisation path is
 a separate change).
+
+Legacy `pending_rebriefs` markers (not requests) keep their old rule, and so does a
+request whose association is missing or unreadable (it is `unbounded`: absence of
+evidence is not evidence of no effect).
 
 **Scope: only a proven `host-absent` producer is reclassified.** Producers whose
 evidence is `unknown` (a live pid, a foreign host, an independent controller) are

@@ -1225,7 +1225,7 @@ function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, produc
   let checkpoint: ReturnType<typeof inspectDirectiveCheckpoint>;
   try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity); }
   catch (error) {
-    return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${String(error).slice(0, 200)}`, pending: [] }, producers };
+    return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
   }
   if (checkpoint.state !== 'unknown' && !(checkpoint.state === 'terminal' && !checkpoint.ok)) return null;
   return { dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
@@ -10479,7 +10479,7 @@ export class LedgerApi {
           if (found?.dead.verdict === 'unbounded') native.push({ text: `original host absent but native effects/checkpoint remain UNKNOWN (${describeDeadTurn(found.dead)})`, custody: 'unknown' });
           else if (found !== null) bounded.push(...found.producers);
         }
-      } catch (error) { native.push({ text: `original native physical ownership unreadable: ${String(error)}`, custody: 'unknown' }); }
+      } catch (error) { native.push({ text: `original native physical ownership unreadable (unbounded: ${shownText(String(error), 200)})`, custody: 'unknown' }); }
     }
     this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq, bounded).forEach(unknown);
     blockers.push(...native);
