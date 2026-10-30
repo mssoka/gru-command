@@ -934,8 +934,8 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     expect(notReady.admitted).toBe(false);
     if (notReady.admitted) throw new Error('expected a refusal');
     const notReadyMessage = normalise(notReady.error.message);
-    expect(notReadyMessage).toContain('review review-r4');
-    expect(notReadyMessage).not.toContain('review-r1');
+    expect(notReadyMessage).toContain('last reviewed text is round 4 (review review-r4');
+    expect(notReadyMessage).not.toContain('last reviewed text is round 1');
     expectCapGuidance(notReadyMessage);
   });
 
