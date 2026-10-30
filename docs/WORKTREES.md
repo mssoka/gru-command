@@ -236,7 +236,10 @@ their command lines masked too: the `command`, `process_command` and
 verification events, each per-step check's `command`, and the request's
 `dedupe_key` (and the `verification.refused` event of a held job). The
 raw `ps` line stays in memory for the checks that need it (tree matching,
-token naming, `ps -E` provenance).
+token naming, `ps -E` provenance). The scheduler's own state file (mode 0600,
+in the data directory) keeps the raw line too: a restarted scheduler compares
+a holder's recorded argv with the live process to recognise it as its own, so
+it is an identity input, not an event, a row or a response.
 
 The masked text is for display and audit, never an identity: two commands
 whose credentials differ mask to the same line. Each row therefore also

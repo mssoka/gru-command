@@ -274,11 +274,13 @@ describe('POST /api/verify', () => {
         .toMatchObject({ command: 'node verify.mjs pass --token [REDACTED]', process_command: '/bin/sh -c node verify.mjs pass --token [REDACTED]', step_command: 'node verify.mjs pass --token [REDACTED]' });
       expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
       // The run's process is gone; its row, live again, is closed by the readback of the original receipts. The
-      // readback's command is the raw one the scheduler kept: the events hold it masked.
+      // readback's command is the raw one the scheduler kept: the events hold it masked. The row is the one the
+      // server's own spawn write recorded: its digest is that of the raw argv, which is the identity the reconcile derives.
       const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string };
       const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
       const reconcile = () => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
-      h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${command}`, evidence: 'registry' }] });
+      expect(liveRow()?.commandSha256).toBe(createHash('sha256').update(`/bin/sh -c ${command}`).digest('hex'));
+      h.db.handle.prepare("UPDATE worktree_processes SET state = 'live' WHERE worktree_id = ? AND pid = ?").run(lane.id, facts.pid);
       expect(liveRow()).toMatchObject({ state: 'live' });
       reconcile();
       expect(liveRow()).toMatchObject({ state: 'killed' });
@@ -388,6 +390,24 @@ describe('POST /api/verify', () => {
         status: 'parked',
       });
       expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.started')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('records the held-job refusal with the scope command masked (#534 R2)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+    const harness = await boot({ manifest: `[verify]\nfull = "node verify.mjs pass --token ${secret}"\n` });
+    harness.ledger.setJobStatus(harness.jobId, 'parked');
+    try {
+      const result = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
+      expect(result.status).toBe(409);
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.refused')?.payload).toMatchObject({
+        scope: 'full',
+        code: 'job_held',
+        command: 'node verify.mjs pass --token [REDACTED]',
+      });
+      expect(JSON.stringify(harness.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
     } finally {
       await harness.close();
     }

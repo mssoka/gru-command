@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
+import { LedgerApi, DEFAULT_LENSES, recordsCommand, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
@@ -2629,4 +2629,21 @@ it('records the SHA-256 of the raw command beside the masked command on every pr
     expect(db.handle.prepare('SELECT command_sha256 FROM worktree_processes WHERE pid = 7001').get()).toEqual({ command_sha256: sha256(rival) });
     expect(JSON.stringify(api.listEvents({ limit: 100 }))).not.toContain(sha256(rival));
   } finally { db.close(); }
+});
+
+it('binds a verification event to its command by the raw line or its masked form, and no other (#534 R2)', () => {
+  const raw = 'node verify.mjs pass --token Kq7ZmW3xP9tR2vLd8Nc4';
+  const masked = 'node verify.mjs pass --token [REDACTED]';
+  // An event recorded since the masking holds the masked line; one recorded before holds the line as listed.
+  expect(recordsCommand(masked, raw)).toBe(true);
+  expect(recordsCommand(raw, raw)).toBe(true);
+  // Another command, another credential-bearing command, a different masked line and a non-string are none of them this command.
+  expect(recordsCommand('node verify.mjs fail --token [REDACTED]', raw)).toBe(false);
+  expect(recordsCommand('node verify.mjs pass --token Zx5Hn2Bv8Qd4Wm7Lt3Pc', raw)).toBe(false);
+  expect(recordsCommand(undefined, raw)).toBe(false);
+  expect(recordsCommand(null, raw)).toBe(false);
+  expect(recordsCommand(7, raw)).toBe(false);
+  // A command with nothing to mask is its own masked form.
+  expect(recordsCommand('npm test', 'npm test')).toBe(true);
+  expect(recordsCommand('npm run build', 'npm test')).toBe(false);
 });

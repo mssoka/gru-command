@@ -1221,7 +1221,7 @@ function nowIso(): string {
  * masking holds the command as listed. Either is the event of that command. This
  * binds an event to a run; whether a live process is the one a registry row
  * describes is the row's raw-command digest, never this comparison. */
-function recordsCommand(recorded: unknown, raw: string): boolean {
+export function recordsCommand(recorded: unknown, raw: string): boolean {
   return recorded === raw || recorded === redactCredentials(raw);
 }
 
