@@ -244,6 +244,7 @@ const PINS: Record<string, number> = {
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 80,
   'docs-contracts.test.ts': 6,
+  'directive-own-run-fence.test.ts': 10,
   'directive-producer-inspection.test.ts': 2,
   'directive-retirement.test.ts': 110,
   'directive-pi-1x-entries.test.ts': 32,
