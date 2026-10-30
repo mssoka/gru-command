@@ -7598,6 +7598,42 @@ describe('supervisor — host-absent turns settled at boot (#547)', () => {
     }
   });
 
+  it('moves a turn with no lane left to recover — a finished job, or no job — and records it, without the action-required note', () => {
+    const h = boot();
+    try {
+      // A turn whose job is already finished: bin the job while its agent is
+      // idle, then leave the agent open the way a restart does.
+      h.api.addJob({ id: 'job-binned', repo: 'fixture', title: 'job-binned' });
+      h.api.setJobStatus('job-binned', 'working');
+      h.api.registerAgent({ id: 'binned-streaming', role: 'minion', jobId: 'job-binned' });
+      h.api.setAgentState('binned-streaming', 'idle');
+      h.api.setJobStatus('job-binned', 'binned');
+      h.api.setAgentState('binned-streaming', 'streaming');
+      // A resident session that belongs to no job (Gru, Bob, Silas, the vector session).
+      h.api.registerAgent({ id: 'gru-streaming', role: 'gru' });
+      h.api.setAgentState('gru-streaming', 'streaming');
+      // And one with a lane to recover, for contrast.
+      seedOpenTurn(h, 'job-live', 'live-lane-streaming', 'streaming');
+      const before = lastSeq(h);
+
+      const result = h.supervisor.settleHostAbsentTurns();
+
+      expect([...result.settled].sort()).toEqual(['binned-streaming', 'gru-streaming', 'live-lane-streaming']);
+      for (const agentId of ['binned-streaming', 'gru-streaming', 'live-lane-streaming']) {
+        expect(h.api.getAgent(agentId)?.state, agentId).toBe('error');
+        const events = agentEventsAfter(h, agentId, before).filter((event) => event.kind !== 'notification.created');
+        expect(events.map((event) => event.kind), agentId).toEqual(['agent.state', 'supervision.turn-recovery']);
+        expect(events[0]?.payload, agentId).toMatchObject({ to: 'error', error: 'host-absent at boot' });
+        expect(events[1]?.payload, agentId).toMatchObject({ disposition: 'orphaned', reason: 'host-absent at boot' });
+      }
+      expect(h.notificationsOfKind('supervision.turn-orphaned.binned-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.gru-streaming')).toEqual([]);
+      expect(h.notificationsOfKind('supervision.turn-orphaned.live-lane-streaming')).toHaveLength(1);
+    } finally {
+      h.dispose();
+    }
+  });
+
   it('reports a row it cannot move as failed — still open, no orphan notice — and still settles the others', () => {
     const logged: { level: string; msg: string; fields: Record<string, unknown> | undefined }[] = [];
     const h = boot(undefined, { log: (level, msg, fields) => logged.push({ level, msg, fields }) });

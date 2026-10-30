@@ -169,6 +169,36 @@ describe('compiled service: boot settles the agent rows a previous process left 
     }
   }, 90_000);
 
+  it('settles a session-bound child worker after the child service has failed it: result and agent row both leave their open states', async () => {
+    const jobId = 'job-ghost-child';
+    const { home, workspace } = seedHome('gru-ghost-child', (ledger, dir) => {
+      ledger.addJob({ id: jobId, repo: 'fixture', title: 'child mid-turn', baseBranch: 'main', briefing: 'work' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.registerAgent({ id: 'parent-minion', role: 'minion', jobId, parentage: 'top-level' });
+      ledger.setAgentState('parent-minion', 'idle');
+      // A child whose session had bound when the service died: the child
+      // service fails it at boot, and only then is its row a previous
+      // process's open turn. Settling first would own it as unfinished.
+      ledger.admitChildWorker({ id: 'child-bound-ghost', parentAgentId: 'parent-minion', jobId, purpose: 'bounded task', authority: 'writer', task: 'inspect', idempotencyKey: 'ghost-child-key' });
+      ledger.markChildAdmitted('child-bound-ghost', { worktreeId: 'wt-child-bound-ghost', branch: null });
+      ledger.markChildStarted('child-bound-ghost', { sessionFile: join(dir, 'child-bound-ghost.jsonl') });
+      ledger.setAgentState('child-bound-ghost', 'streaming');
+    });
+    const service = await startRealService({
+      port: await pickFreePort(), token: 'ghost-child-token', home, workspace, keepHome: true, requireWebDist: false,
+    });
+    try {
+      const child = readLedger(home, (db) => db.prepare('SELECT result_state, result_summary FROM child_workers WHERE id = ?').get('child-bound-ghost')) as
+        { result_state: string | null; result_summary: string | null };
+      expect(child.result_state).toBe('error');
+      expect(child.result_summary).toContain('service restarted while the child was running');
+      expect(agentRows(home, jobId)).toEqual([{ id: 'child-bound-ghost', state: 'error' }, { id: 'parent-minion', state: 'idle' }]);
+      expect(orphanNotices(home, 'child-bound-ghost')).toHaveLength(1);
+    } finally {
+      await service.stop();
+    }
+  }, 90_000);
+
   it('keeps an admitted directive request admitted while its ghost agent leaves streaming', async () => {
     const jobId = 'job-ghost-directive';
     const requestId = 'req-ghost-directive';

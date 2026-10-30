@@ -664,9 +664,26 @@ export class Supervisor {
         HOST_ABSENT_AT_BOOT,
         `its row was still ${row.state} when this service process booted and this process holds no handle for it — ` +
           'the host that ran it is gone, and nothing was re-delivered',
+        this.hasRecoverableLane(row.jobId),
       );
     }
     return { examined: open.length, live: owned, settled, failed };
+  }
+
+  /** Whether a turn's job still exists and is not finished: only then is there
+   * a lane for an action-required orphan note to recover. A turn of a
+   * finished job, or of no job (Gru, Bob, Silas, the vector session), is
+   * still moved out of the open states and recorded, without the note. A
+   * lookup that fails reads as recoverable: noise is the safer error. */
+  private hasRecoverableLane(jobId: string | null): boolean {
+    if (jobId === null) return false;
+    try {
+      const job = this.ledger.getJob(jobId);
+      return job !== null && !isJobTerminal(job.status);
+    } catch (error) {
+      this.log('warn', 'job lookup for the orphan note failed — raising the note', { job: jobId, error: String(error) });
+      return true;
+    }
   }
 
   /** Declare a supervision slot (stable identity across restarts). */
@@ -3237,13 +3254,17 @@ export class Supervisor {
     }
   }
 
-  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string): void {
+  /** Record an orphaned turn and, unless `notify` is false, raise the lane's
+   * action-required note. `notify: false` keeps the durable record for a turn
+   * with no lane left to recover (#547). */
+  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string, notify = true): void {
     const lane = this.laneContext(laneAgentId);
     this.recordEvent('supervision.turn-recovery', laneAgentId, {
       disposition: 'orphaned',
       reason,
       note: detail,
     });
+    if (!notify) return;
     try {
       this.notifications.postIncident({
         kind: `supervision.turn-orphaned.${laneAgentId}`,
