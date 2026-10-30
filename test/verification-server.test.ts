@@ -244,6 +244,45 @@ describe('POST /api/verify', () => {
     await h.close();
   });
 
+  it('records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-readback';
+    const h = await boot({ manifest: `[verify]\nfull = "node verify.mjs pass --token ${secret}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      // The port may be ledger-backed (the row exists) or a test double (it does not).
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      // What the server recorded at the run's spawn and settlement.
+      const recorded = h.ledger.listWorktreeProcesses(lane.id);
+      expect(recorded.length).toBeGreaterThan(0);
+      for (const row of recorded) { expect(row.command).not.toContain(secret); expect(row.command).toContain('[REDACTED]'); }
+      // The run's process is gone; its row, live again, is closed by the readback of the original receipts.
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; command: string; cwd: string };
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command: facts.command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      const audit = h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled');
+      expect(audit?.payload).toMatchObject({ pid: facts.pid, request_id: requestId });
+      expect(String((audit?.payload as { command: string }).command)).not.toContain(secret);
+      // A row written before #534 still holds the raw line; the same readback
+      // closes it, its audit carries the masked text, and the stored row keeps
+      // its recorded text (no backfill).
+      const legacy = `/bin/sh -c ${facts.command}`;
+      h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: legacy, evidence: 'registry' }] });
+      h.db.handle.prepare('UPDATE worktree_processes SET command = ? WHERE worktree_id = ? AND pid = ?').run(legacy, lane.id, facts.pid);
+      expect(liveRow()?.command).toBe(legacy);
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command: facts.command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      expect(liveRow()?.command).toBe(legacy);
+      const audits = h.ledger.listEvents({ limit: 500 }).filter((event) => event.kind === 'verification.process-reconciled');
+      expect(audits.length).toBeGreaterThanOrEqual(2);
+      expect(JSON.stringify(audits)).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
   it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     expect(manifest).not.toBeNull();
