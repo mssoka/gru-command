@@ -150,6 +150,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'review-supersession.test.ts', workload: 'real git lane lifecycle and held resident review cancellation/cessation gates over HTTP' },
   { file: 'review-owner-cessation.test.ts', workload: 'real Claude CLI double disposal, live straggler processes and the OS process table behind the review endpoint over real git lanes' },
   { file: 'restart-recovery-progress.test.ts', workload: 'persisted native/ledger recovery and pre-native deferral transactions over real git lanes, including physical child-host exit and frozen-owner proofs' },
+  { file: 'directive-own-run-fence.test.ts', workload: 'real Claude CLI double turns through the production directive executor over real git lanes, moving the ledger between the CLI echo and its first tool request' },
   { file: 'rehearsal.test.ts', workload: 'package/build/install rehearsal with real npm' },
   {
     file: 'review-inputs-wave.test.ts',

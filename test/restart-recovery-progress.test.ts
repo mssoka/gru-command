@@ -21,7 +21,7 @@ import { admitBlindReview, recordBlindAdmission } from '../src/dispatch/blind-re
 import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
-import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentHandle, PromptOptions, SpawnOptions } from '../src/runtime/types.js';
 import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import { rememberManagedLane } from '../src/worktrees/handoff.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -3968,5 +3968,62 @@ describe('directive routing to a claude-code minion whose session cannot attest 
     expect(f.ledger.listObligations({ jobId: f.intent.jobId }).some((item) =>
       item.incidentKey === `directive-recovery:${f.intent.requestId}` && item.state === 'open')).toBe(true);
     await live.dispose();
+  });
+});
+
+describe('#542 a pi directive turn and its own verification run', () => {
+  type Pi = Awaited<ReturnType<typeof fixture>>;
+  const registerLane = (f: Pi): void => { if (f.ledger.getWorktree(f.lane.id) === null) f.ledger.registerWorktree(f.lane); };
+  /** What the scheduler and the verify server record for one run. */
+  const requestRun = (f: Pi, runId: string, pid: number): void => {
+    const base = { run_id: runId, scope: 'full', command: 'npm test', cwd: f.lane.path };
+    f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: f.intent.jobId, payload: { ...base, request_id: `${runId}-request`, head: 'a'.repeat(40), dedupe_key: runId } });
+    f.ledger.appendCustomEvent({ kind: 'verification.process-started', jobId: f.intent.jobId, payload: { ...base, pid, process_command: '/bin/sh -c npm test', step_command: 'npm test', step_index: 0, step_count: 1, sha: 'a'.repeat(40) } });
+    f.ledger.recordWorktreeProcesses({ worktreeId: f.lane.id, processes: [{ pid, command: '/bin/sh -c npm test', evidence: 'registry' }], state: 'live' });
+  };
+  const settleRun = (f: Pi, runId: string, pid: number): void => {
+    f.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: f.intent.jobId, payload: { run_id: runId } });
+    f.ledger.recordWorktreeProcesses({ worktreeId: f.lane.id, processes: [{ pid, command: '/bin/sh -c npm test', evidence: 'registry' }], state: 'killed' });
+  };
+  /** The pi handle the executor spawns gets the directive through `wrap`. */
+  const throughDirective = (f: Pi, wrap: (directive: NonNullable<PromptOptions['directive']>) => NonNullable<PromptOptions['directive']>): void => {
+    const spawn = f.registry.spawn.bind(f.registry);
+    vi.spyOn(f.registry, 'spawn').mockImplementation(async (role, options) => {
+      const handle = await spawn(role, options);
+      const promptWithVerdict = handle.promptWithVerdict!.bind(handle);
+      handle.promptWithVerdict = (text, promptOptions) => promptWithVerdict(text,
+        promptOptions?.directive === undefined ? promptOptions : { ...promptOptions, directive: wrap(promptOptions.directive) });
+      return handle;
+    });
+  };
+
+  it('pi\'s tool-time check passes the turn\'s post-admission run and its pid row; the request then settles', async () => {
+    const f = await fixture(); registerLane(f);
+    let toolTime = 'not asked';
+    throughDirective(f, (directive) => ({ ...directive, onAdmitted: (binding) => {
+      directive.onAdmitted(binding);
+      // What pi's tool hook and next-turn preparation do once the turn is admitted: the run lands, the shared check is asked.
+      requestRun(f, 'own-run', 51001);
+      try { directive.beforeAdmission(); toolTime = 'allowed'; } catch (error) { toolTime = String(error); }
+      settleRun(f, 'own-run', 51001);
+    } }));
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    expect(toolTime).toBe('allowed');
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'settled', failReason: null });
+  });
+
+  it('pi\'s admission-time check refuses an unsettled run that is in place before the admission', async () => {
+    const f = await fixture(); registerLane(f);
+    let seeded = false;
+    throughDirective(f, (directive) => ({ ...directive, beforeAdmission: () => {
+      if (!seeded) { seeded = true; requestRun(f, 'earlier-run', 51002); }
+      directive.beforeAdmission();
+    } }));
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    const row = f.ledger.getDirective(f.intent.requestId)!;
+    expect(f.native.prompts).toEqual([]);
+    expect(row.nativeBinding).toBeNull();
+    expect(row.failReason).toContain('unsettled verification run(s) hold the lane');
+    expect(row.failReason).toContain(`live lane process(es): ${f.lane.id} pid 51002`);
   });
 });
