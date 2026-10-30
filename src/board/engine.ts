@@ -207,6 +207,10 @@ export interface NotificationView {
   readonly ackedAt: string | null;
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** The result the card was closed with (a follow-through's outcome or a
+   * producer's withdrawal): shown on the card itself, not only in the audit
+   * event (#523). Null while open or when the resolution gave none. */
+  readonly resolutionDetail: string | null;
   /** Typed owner-decision metadata (owner release 2026-10-11; null on
    * legacy/machine rows). */
   readonly decision: NotificationDecision | null;
@@ -1356,6 +1360,7 @@ export class BoardEngine {
         ackedAt: row.ackedAt,
         resolvedAt: row.resolvedAt,
         resolvedBy: row.resolvedBy,
+        resolutionDetail: row.resolutionDetail,
         decision: row.decision,
         decidedAt: row.decidedAt,
         decidedBy: row.decidedBy,

@@ -481,7 +481,8 @@ POST /api/owner-approvals
 ```
 
 `reason` is 1-500 characters, not blank, with no control character other
-than tab and newline. `idempotency_key` is 1-128 characters of `A-Z a-z 0-9 . _ -`.
+than tab and newline (no C0 control, no DEL and no C1 control such as
+U+0085). `idempotency_key` is 1-128 characters of `A-Z a-z 0-9 . _ -`.
 `by` must be `gru`. The service checks that the request exists and is live
 (`dispatching` or `admitted`), reads the four fences the Approve is bound to
 (`job_id`, `state`, `payload_hash` and the recovery-debt generation, or null),
@@ -535,7 +536,8 @@ the third ends it `refused` as `execution-error`, its message redacted of
 credentials and cut to 300 characters.
 
 **Refusal codes.** The service gives `card-post-failed`, `decider-not-owner`,
-`abandoned-elsewhere`, `stale-fence` and `execution-error`. A ledger refusal
+`abandoned-elsewhere`, `stale-fence`, `execution-error` and
+`service-not-hosted`. A ledger refusal
 keeps its own code and the blockers it carries (possibly none): the
 abandonment raises `live_work`, `retirement_available`, `request_mismatch`,
 `directive_not_live` and `terminal_receipt_present`; the retirement-only
@@ -548,7 +550,10 @@ blockers}`.
 `Abandoned as outcome-unknown (abandonment event seq <n>).`, `Denied by the
 owner; nothing was run.`, or `Not run: <code>` followed by the blockers, one
 per line (`retirement_available` adds `Ordinary retirement is available;
-Gru retires it instead.`). If the request ends some other way (retired,
+Gru retires it instead.`). The result is stored on the card's own row
+(`notifications.resolution_detail`, migration 35) and the board renders it on
+the card as `Result: …`, one line per blocker, not only in the
+`notification.resolved` audit event. If the request ends some other way (retired,
 settled, abandoned) before the owner answers, the next reconcile withdraws
 the undecided card and ends the record `withdrawn`; a decision that landed
 first is carried out instead.
@@ -559,7 +564,20 @@ re-reads the fences of an `approved` record, and, for an `executing` record,
 settles from an abandonment recorded after its `executing` event (its own,
 by the reason prefix, is `succeeded`; any other is `abandoned-elsewhere`) or
 else re-reads the fences and runs it. It resolves the card of any ended
-record that still has one open. The abandonment never runs twice.
+record that still has one open. A card the reconcile cannot post (for
+example a request id long enough to break the card's own length bounds) ends
+the record `refused` as `card-post-failed`, exactly as at proposal time, so
+the request is never left with a record that waits for a card that cannot
+exist. The abandonment never runs twice.
+
+**When the service is not hosted.** The service runs only where Silas ops are
+on. A boot without it ends what an earlier boot left: an undecided card is
+withdrawn and its record ends `withdrawn`, and a card whose decision was
+recorded but never followed is closed with `Not run: service-not-hosted` (the
+record ends `refused`), so no Approve is ever recorded that nothing carries
+out. An `approved` or `executing` record is left alone, because it may
+already have run; the next boot that hosts the service finishes it from the
+abandonment audit, never twice.
 
 **Attribution.** The same caller-declared model as `/abandon`: one shared
 bearer, no verified identity. Gru never sends `by: "owner"`; it proposes

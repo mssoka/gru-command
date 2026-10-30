@@ -105,7 +105,7 @@ import type { VectorBoardView } from './vector/board.js';
 import { BriefingReviewService } from './briefing-review/service.js';
 import type { BriefingReviewBoardCounts } from './briefing-review/board.js';
 import { createVectorServer } from './vector/server.js';
-import { createOwnerApprovalService, type OwnerApprovalService } from './dispatch/owner-approvals.js';
+import { createOwnerApprovalService, withdrawUnhostedOwnerApprovals, type OwnerApprovalService } from './dispatch/owner-approvals.js';
 import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
 import { onboardingProbesDir } from './onboarding/proof.js';
 import { createOnboardingServer } from './onboarding/server.js';
@@ -1771,6 +1771,10 @@ async function main(): Promise<number> {
         log: (level, msg, fields) => logger.log(level, msg, fields),
       })
     : undefined;
+  // Not hosted (Silas ops off): an approval card an earlier boot left open
+  // would take the owner's Approve and nothing would carry it out. End what
+  // is open now, before any route can record a decision on it.
+  if (ownerApprovals === undefined) withdrawUnhostedOwnerApprovals({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) });
   const dispatchServer = createDispatchServer({
     config,
     intake,

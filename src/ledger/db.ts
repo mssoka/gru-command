@@ -1286,4 +1286,20 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_owner_approvals_job ON owner_approvals(job_id);
     `,
   },
+  {
+    // #523: the result a producer closes an owner card with. The follow-through
+    // that carried out (or refused) the owner's choice, and the withdrawal of a
+    // proposal that went stale, each give a detail; until now it lived only in
+    // the `notification.resolved` event, so the card the owner looks at showed
+    // its original text and a "resolved" chip. Kept on the row, the board can
+    // render it on the card itself. Additive and nullable: a row resolved
+    // before this migration (or by a path that gives no detail) keeps null.
+    // LANDING COLLISION: renumber ONLY this never-applied migration if main
+    // lands id 35 first.
+    id: 35,
+    name: 'notification-resolution-detail',
+    sql: `
+      ALTER TABLE notifications ADD COLUMN resolution_detail TEXT;
+    `,
+  },
 ];

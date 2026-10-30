@@ -744,6 +744,13 @@ restart's reconcile finishes what a crash left and the native abandonment
 never runs twice. The service is `src/dispatch/owner-approvals.ts`; see
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment).
 
+Migration 35 (`notification-resolution-detail`) adds the nullable
+`notifications.resolution_detail`: the result a follow-through
+(`resolveOwnerDecision`) or a producer's withdrawal (`withdrawOwnerProposal`)
+closed the card with, kept on the row so the board shows it on the card and
+not only in the `notification.resolved` event. A row resolved before the
+migration, or by a path that gives no detail, reads null.
+
 ### Lane tokens and processes reaped by them (#486)
 
 Migration 31 (`worktree-lane-token`) adds `worktrees.lane_token`: a random

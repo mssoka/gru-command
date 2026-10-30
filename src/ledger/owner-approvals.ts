@@ -52,6 +52,7 @@ export const OWNER_APPROVAL_REFUSAL_CODES = [
   'abandoned-elsewhere',
   'stale-fence',
   'execution-error',
+  'service-not-hosted',
 ] as const;
 export type OwnerApprovalRefusalCode = (typeof OWNER_APPROVAL_REFUSAL_CODES)[number];
 

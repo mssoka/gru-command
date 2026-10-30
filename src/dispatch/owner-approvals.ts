@@ -173,11 +173,14 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
-/** C0 controls other than tab and LF, and DEL (no raw control range literal). */
+/** Every control character but tab and LF: C0, DEL and C1 (no raw control
+ * range literal). The card validation rejects C0 and DEL; a C1 control (NEL
+ * and the like) is refused here too, so "no control character other than tab
+ * and newline" is the whole rule the docs state. */
 function hasControlChars(value: string): boolean {
   for (const char of value) {
     const code = char.codePointAt(0) ?? 0;
-    if (code === 0x7f || (code < 0x20 && code !== 0x09 && code !== 0x0a)) return true;
+    if (code === 0x7f || (code >= 0x80 && code <= 0x9f) || (code < 0x20 && code !== 0x09 && code !== 0x0a)) return true;
   }
   return false;
 }
@@ -269,6 +272,79 @@ function view(ledger: ServiceLedger, record: OwnerApprovalRecord): OwnerApproval
       refusal: record.refusal === null ? null : { code: record.refusal.code, blockers: [...record.refusal.blockers] },
     },
   };
+}
+
+/** What a boot without the service did to the records an earlier boot left. */
+export interface UnhostedOwnerApprovalOutcome {
+  /** Undecided cards withdrawn and their records ended `withdrawn`. */
+  readonly withdrawn: readonly string[];
+  /** Records whose recorded decision nothing will carry out, ended `refused`. */
+  readonly refused: readonly string[];
+  /** Records left for the boot that hosts the service again (see below). */
+  readonly kept: readonly string[];
+}
+
+const UNHOSTED_WITHDRAWN_DETAIL = 'Owner approvals are not hosted on this service (Silas ops are off), so nothing from this card is run. Ask Gru to propose it again once they are on.';
+const UNHOSTED_REFUSAL: OwnerApprovalRefusal = {
+  code: 'service-not-hosted',
+  blockers: ['Silas ops are off on this service, so owner approvals are not hosted and nothing carried out the decision'],
+};
+
+/**
+ * The service is hosted only where Silas ops are. A boot that does not host it
+ * must not leave an approval card open: the owner's Approve would be recorded
+ * and nothing would carry it out. So every `proposed` record of an earlier
+ * boot ends here, and its card with it: an undecided card is withdrawn
+ * (`withdrawn`); a card whose decision was recorded but not yet followed is
+ * closed with the truth (`refused`, `service-not-hosted`, nothing ran).
+ *
+ * An `approved` or `executing` record is left alone: it may already have run,
+ * and it cannot be told from here. It is finished by the next boot that hosts
+ * the service (its reconcile reads the abandonment audit), never run twice.
+ * Each record is handled on its own; one that cannot be ended is logged and
+ * kept, and never stops the boot.
+ */
+export function withdrawUnhostedOwnerApprovals(deps: {
+  readonly ledger: Pick<ServiceLedger, 'listActiveOwnerApprovalIds' | 'getOwnerApproval' | 'getNotification' | 'withdrawOwnerProposal' | 'resolveOwnerDecision' | 'endOwnerApproval'>;
+  readonly log?: Log;
+}): UnhostedOwnerApprovalOutcome {
+  const { ledger } = deps;
+  const log: Log = deps.log ?? (() => {});
+  const withdrawn: string[] = [];
+  const refused: string[] = [];
+  const kept: string[] = [];
+  for (const id of ledger.listActiveOwnerApprovalIds()) {
+    try {
+      const record = ledger.getOwnerApproval(id);
+      if (record === null) continue;
+      if (record.state !== 'proposed') { kept.push(id); continue; }
+      const card = ledger.getNotification(record.notificationId);
+      if (card !== null && card.decidedAt !== null) {
+        ledger.endOwnerApproval(id, { state: 'refused', refusal: UNHOSTED_REFUSAL, detail: refusalDetail(UNHOSTED_REFUSAL) });
+        if (card.resolvedAt === null) ledger.resolveOwnerDecision(card.id, refusalDetail(UNHOSTED_REFUSAL), OWNER_PROVENANCE);
+        refused.push(id);
+        continue;
+      }
+      if (card !== null && card.resolvedAt === null) {
+        try {
+          ledger.withdrawOwnerProposal(card.id, UNHOSTED_WITHDRAWN_DETAIL);
+        } catch (error) {
+          // A decision landed between the read and the withdrawal: it stands.
+          if (error instanceof NotificationDecisionRefusal && error.code === 'decision_recorded') { kept.push(id); continue; }
+          throw error;
+        }
+      }
+      ledger.endOwnerApproval(id, { state: 'withdrawn', detail: UNHOSTED_WITHDRAWN_DETAIL });
+      withdrawn.push(id);
+    } catch (error) {
+      kept.push(id);
+      log('error', 'owner approval: could not end a record while the service is not hosted', { id, error: String(error) });
+    }
+  }
+  if (withdrawn.length + refused.length + kept.length > 0) {
+    log('info', 'owner approvals are not hosted: open approvals were ended', { withdrawn, refused, kept });
+  }
+  return { withdrawn, refused, kept };
 }
 
 export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): OwnerApprovalService {
@@ -436,6 +512,20 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
     });
   };
 
+  /** Post the record's card, or end the record `refused` (`card-post-failed`)
+   * when that throws: a record whose card can never exist must not stay
+   * `proposed`, or every new proposal for its request is answered pending.
+   * The proposal and the reconcile's repost both go through here. */
+  const postCardOrRefuse = (record: OwnerApprovalRecord): void => {
+    try {
+      postCard(record);
+    } catch (error) {
+      const message = errorMessage(error);
+      log('error', 'owner approval: the card could not be posted', { id: record.id, error: message });
+      ledger.endOwnerApproval(record.id, { state: 'refused', refusal: { code: 'card-post-failed', blockers: [message] }, detail: `Not run: card-post-failed\n${message}` });
+    }
+  };
+
   /** The request ended some other way before the owner answered: the card is
    * withdrawn, then the record. A decision that landed first is carried out. */
   const withdraw = (record: OwnerApprovalRecord, card: NotificationRecord): void => {
@@ -462,7 +552,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
         ledger.endOwnerApproval(record.id, { state: 'withdrawn', detail: `Request ${record.requestId} is no longer live; no card was posted.` });
         return;
       }
-      postCard(record);
+      postCardOrRefuse(record);
       return;
     }
     if (card.decidedAt !== null) { processDecision(record, card); return; }
@@ -530,13 +620,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
         return;
       case 'created': {
         step('record-written');
-        try {
-          postCard(result.approval);
-        } catch (error) {
-          const message = errorMessage(error);
-          log('error', 'owner approval: the card could not be posted', { id: result.approval.id, error: message });
-          ledger.endOwnerApproval(result.approval.id, { state: 'refused', refusal: { code: 'card-post-failed', blockers: [message] }, detail: `Not run: card-post-failed\n${message}` });
-        }
+        postCardOrRefuse(result.approval);
         json(res, 201, { approval: view(ledger, requireRecord(result.approval.id)) });
         return;
       }

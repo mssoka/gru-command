@@ -708,6 +708,10 @@ export interface NotificationRecord {
   /** System resolution is distinct from a human acknowledgement. */
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** What a follow-through (or a producer's withdrawal of a stale proposal)
+   * closed the card with: the result the owner reads on the card itself
+   * (#523). Null while the card is open, and on a resolution that gave none. */
+  readonly resolutionDetail: string | null;
   /** Typed owner-decision metadata (null on legacy/machine rows). */
   readonly decision: NotificationDecision | null;
   /** The recorded owner decision — DISTINCT from ack and resolution: it
@@ -6243,7 +6247,7 @@ export class LedgerApi {
       if (current.decidedAt !== null) {
         throw new NotificationDecisionRefusal('decision_recorded', `notification "${id}" already records decision "${current.decidedOption}"; it is carried out, never withdrawn`);
       }
-      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?').run(nowIso(), 'producer-withdrawn', id);
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ?, resolution_detail = ? WHERE id = ?').run(nowIso(), 'producer-withdrawn', detail, id);
       this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'producer-withdrawn', detail, withdrawn: true } });
       return this.getNotification(id);
     });
@@ -6315,8 +6319,8 @@ export class LedgerApi {
         );
       }
       if (current.resolvedAt !== null) return current; // idempotent
-      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
-        .run(nowIso(), 'gru', id);
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ?, resolution_detail = ? WHERE id = ?')
+        .run(nowIso(), 'gru', detail, id);
       this.appendEvent({
         kind: 'notification.resolved',
         agentId: current.agentId,
@@ -12708,6 +12712,7 @@ export class LedgerApi {
       ackedBy: nstr(row.acked_by),
       resolvedAt: nstr(row.resolved_at),
       resolvedBy: nstr(row.resolved_by),
+      resolutionDetail: nstr(row.resolution_detail),
       decision: parseStoredNotificationDecision(nstr(row.decision_json)),
       decidedAt: nstr(row.decided_at),
       decidedBy: nstr(row.decided_by),
