@@ -1094,7 +1094,9 @@ function gitGrepHit(lines: readonly string[], rule: BlindIsolationRule): GrepHit
   let best: GrepHit | undefined;
   let heading: string | null = null;
   let judged = false;
-  for (const line of lines) {
+  for (const raw of lines) {
+    // CRLF output: the separators are git's own, the carriage return is not part of them.
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
     const named: (GrepHit | undefined)[] = [excludedHeadsPath(gitGrepHeads(line), rule)];
     if (line === '') {
       heading = null;

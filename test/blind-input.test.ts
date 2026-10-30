@@ -705,14 +705,33 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(messages.split('\n').flatMap((line) => scan(line))).toEqual([]);
   });
 
-  it('reading these tests is no excluded read: no line of this file, as written or as a read gutter or diff shows it, reads as a grep hit', () => {
+  it('reading these tests is no excluded read: no line of this file, as written or as a read gutter, a diff or any grep output shows it, reads as a grep hit', () => {
+    const file = 'test/blind-input.test.ts';
     const own = readFileSync(new URL(import.meta.url), 'utf8').split('\n');
-    // Lines a reviewer sees: the file itself, a numbered read, a diff line. The two
-    // older fixtures that name an outside path by shape are the only lines of this
-    // file that were already recorded before the revision forms were read.
-    const shapes = (line: string, index: number): readonly string[] => [line, `${String(index + 1).padStart(6)}→${line}`, `+${line}`];
+    // Lines a reviewer sees: the file itself, a numbered read, a diff line, a
+    // `grep -n` match or context line, with and without a revision. The two
+    // older fixtures that name an outside path by shape are the only lines of
+    // this file that were already recorded before the revision forms were read.
+    const shapes = (line: string, index: number): readonly string[] => {
+      const n = index + 1;
+      return [
+        line, `${String(n).padStart(6)}→${line}`, `+${line}`,
+        [file, String(n), line].join(':'), [file, String(n), line].join('-'),
+        ['HEAD', file, String(n), line].join(':'), ['HEAD', file, String(n), line].join('-'),
+      ];
+    };
+    const older = /\/\/host\/share\/f\.md/u;
     const flagged = own.flatMap((line, index) => shapes(line, index).flatMap((shown) => scan(shown).map((hit) => `${index + 1}: ${hit.path ?? ''}`)));
-    expect([...new Set(flagged)].filter((entry) => !/\/\/host\/share\/f\.md$/u.test(entry))).toEqual([]);
+    expect([...new Set(flagged)].filter((entry) => !older.test(entry))).toEqual([]);
+    // ...and the file as one result, where a numbered line can follow a name
+    // line: a whole read, and `--heading` output over it, with and without a revision.
+    const lines = own.filter((line) => !older.test(line));
+    const whole = [
+      lines.join('\n'),
+      [file, ...lines.map((line, index) => `${index + 1}:${line}`)].join('\n'),
+      [`HEAD:${file}`, ...lines.map((line, index) => `${index + 1}-${line}`)].join('\n'),
+    ];
+    expect(whole.flatMap((text) => scan(text))).toEqual([]);
   });
 });
 
