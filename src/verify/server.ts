@@ -252,8 +252,11 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         }
         if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
           [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
-        // The scheduler hands the event over with its command lines masked
-        // (#534): the ledger never holds a credential in a command line it records.
+        // The scheduler hands the event over with its command lines masked once
+        // (#534), at its record boundary: the ledger never holds a credential in a
+        // command line it records. They are not masked again here, because masking
+        // is not idempotent for every shape and a second pass would corrupt the
+        // line the readback binds to.
         ledger.appendCustomEvent({
           kind: event.kind,
           jobId: event.jobId,

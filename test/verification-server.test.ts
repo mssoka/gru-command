@@ -291,6 +291,28 @@ describe('POST /api/verify', () => {
     } finally { await h.close(); }
   });
 
+  it('closes a registry row at the terminal readback for a command whose masked line masking again would change (#534 R2)', async () => {
+    // A quoted credential followed directly by `;` is masked once to `--token [REDACTED];echo done`; a second pass would
+    // take `[REDACTED];echo` for a value. The events hold the line as it was written, and the readback binds to it.
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-glued';
+    const command = `node verify.mjs pass --token "${secret}";echo done`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command.replaceAll('"', '\\"')}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string; command: string };
+      expect(facts.command).toBe('node verify.mjs pass --token [REDACTED];echo done');
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      expect(liveRow()?.commandSha256).toBe(createHash('sha256').update(`/bin/sh -c ${command}`).digest('hex'));
+      h.db.handle.prepare("UPDATE worktree_processes SET state = 'live' WHERE worktree_id = ? AND pid = ?").run(lane.id, facts.pid);
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
   it('closes a registry row at the terminal readback only by the digest of its raw command: another credential under the same masked text, and a row without a digest, stay live (#534 R1)', async () => {
     const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const other = 'Zx5Hn2Bv8Qd4Wm7Lt3Pc'; const requestId = 'argv-redaction-identity';
     const command = `node verify.mjs pass --token ${secret}`;

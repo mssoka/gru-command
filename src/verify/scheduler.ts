@@ -184,7 +184,8 @@ const EVENT_COMMAND_FIELDS = ['command', 'process_command', 'step_command', 'ded
  * and each per-step check's, with its credentials masked. The scheduler keeps
  * the raw command in memory (it is the run's identity, and what the process
  * registry digests at spawn); a ledger event, which the board, a review and an
- * audit read, holds it masked. Idempotent: a masked line masks to itself. */
+ * audit read, holds it masked. Apply it once, at the record boundary: masking a
+ * masked line again is not a no-op for every shape. */
 export function maskedEventPayload(payload: Record<string, unknown>): Record<string, unknown> {
   const masked: Record<string, unknown> = { ...payload };
   for (const field of EVENT_COMMAND_FIELDS) {

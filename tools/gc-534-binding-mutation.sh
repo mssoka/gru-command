@@ -32,15 +32,17 @@ rm -f "$d/head.tar"
 ln -s "$root/node_modules" "$d/node_modules"
 printf '%s head=%s\n' "$d" "$headrev" > "$prep/gc-534-binding-mutation.last-snapshot.txt"
 cd "$d"
-node -e '
-  const { readFileSync, writeFileSync } = require("node:fs");
-  const file = "src/ledger/api.ts";
-  const anchor = "return typeof recorded === 'string' && (recorded === raw || redactCredentials(recorded) === redactCredentials(raw));";
-  const text = readFileSync(file, "utf8");
-  const count = text.split(anchor).length - 1;
-  if (count !== 1) { process.stderr.write("mutation anchor matched " + count + " times in " + file + " (need exactly 1)\n"); process.exit(2); }
-  writeFileSync(file, text.replace(anchor, "return recorded === raw;"));
-' || { echo "gc-534 mutation anchor guard failed" >&2; exit 2; }
+# The edit program rides a quoted heredoc: an inner single quote in a `node -e '...'`
+# string would end the shell quote and strip the anchor's own quotes.
+node - <<'JS' || { echo "gc-534 mutation anchor guard failed" >&2; exit 2; }
+const { readFileSync, writeFileSync } = require("node:fs");
+const file = "src/ledger/api.ts";
+const anchor = "return typeof recorded === 'string'\n    && (recorded === raw || recorded === redactCredentials(raw) || redactCredentials(recorded) === redactCredentials(raw));";
+const text = readFileSync(file, "utf8");
+const count = text.split(anchor).length - 1;
+if (count !== 1) { process.stderr.write("mutation anchor matched " + count + " times in " + file + " (need exactly 1)\n"); process.exit(2); }
+writeFileSync(file, text.replace(anchor, "return recorded === raw;"));
+JS
 helper='binds a verification event to its command by the raw line or its masked form, and no other (#534 R2)'
 readback='records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)'
 gate='P37 a declared full command carrying a credential still settles the gate: its masked verification events bind to it (#534 R2)'

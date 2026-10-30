@@ -1217,14 +1217,17 @@ function nowIso(): string {
 }
 
 /** Whether a verification event's recorded command field is the command `raw`.
- * An event is recorded with its command masked (#534); one recorded before the
- * masking holds the command as listed. Both sides are masked with today's rules
- * before they are compared, so an event recorded under an earlier set of
- * redaction rules still binds, and a line recorded as listed is itself. This
+ * An event is recorded with its command masked once (#534); one recorded before
+ * the masking holds the command as listed. The masked line is compared as it was
+ * written, never masked again: masking is not idempotent for every shape (a
+ * quoted credential followed directly by `;` or `)` leaves a placeholder that a
+ * second pass would take for a value). Masking both sides is the last resort, so
+ * an event recorded under an earlier set of redaction rules still binds. This
  * binds an event to a run; whether a live process is the one a registry row
  * describes is the row's raw-command digest, never this comparison. */
 export function recordsCommand(recorded: unknown, raw: string): boolean {
-  return typeof recorded === 'string' && (recorded === raw || redactCredentials(recorded) === redactCredentials(raw));
+  return typeof recorded === 'string'
+    && (recorded === raw || recorded === redactCredentials(raw) || redactCredentials(recorded) === redactCredentials(raw));
 }
 
 function str(value: unknown): string {
@@ -1781,7 +1784,7 @@ export class LedgerApi {
           this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
           this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
             request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
-            pid: row.pid, command: redactCredentials(row.command), evidence: 'original-pid-and-process-group-absent',
+            pid: row.pid, command: row.command, evidence: 'original-pid-and-process-group-absent',
           } });
         }
       }
@@ -3634,7 +3637,8 @@ export class LedgerApi {
    * with the SHA-256 of the raw line beside it: the masked text is for display,
    * the digest is what a later decision that a live process is this one
    * compares. A caller that holds a row it read back (not a raw line) passes
-   * that row's `commandSha256` through, `null` when the row has none. */
+   * that row's `commandSha256` through, `null` when the row has none (a row
+   * from before the digest may hold the line as listed, so it is masked). */
   recordWorktreeProcesses(input: {
     worktreeId: string;
     processes: readonly { pid: number; command: string; evidence: string; commandSha256?: string | null }[];
@@ -3670,7 +3674,10 @@ export class LedgerApi {
       );
       for (const proc of input.processes) {
         const digest = proc.commandSha256 === undefined ? processCommandSha256(proc.command) : proc.commandSha256;
-        upsert.run(input.worktreeId, proc.pid, redactCredentials(proc.command), digest, proc.evidence, input.state, ts, ts);
+        // A row read back with its digest holds its masked text already (a row is only given a digest by this write),
+        // and masking is not idempotent for every shape, so that text is kept as it is.
+        const command = typeof proc.commandSha256 === 'string' ? proc.command : redactCredentials(proc.command);
+        upsert.run(input.worktreeId, proc.pid, command, digest, proc.evidence, input.state, ts, ts);
       }
       this.appendEvent({
         kind: 'worktree.processes',
@@ -3720,7 +3727,8 @@ export class LedgerApi {
 
   listWorktreeProcesses(worktreeId: string): readonly {
     readonly pid: number;
-    /** Masked (#534): for display and audit, never an identity. */
+    /** Masked since #534 (a row written before keeps the line as listed; there is no
+     * backfill): for display and audit, never an identity. */
     readonly command: string;
     /** SHA-256 hex of the raw command line; `null` for a row written before
      * the digest existed (its identity is unknown). */

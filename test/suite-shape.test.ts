@@ -403,7 +403,7 @@ const PINS: Record<string, number> = {
   'verification-build-reuse.test.ts': 32,
   'verification-evidence.test.ts': 13,
   'verification-scheduler.test.ts': 59,
-  'verification-server.test.ts': 53,
+  'verification-server.test.ts': 54,
   'verify-perkins-resource.test.ts': 3,
   'wake-e2e.test.ts': 4,
   'wake-policy.test.ts': 24,

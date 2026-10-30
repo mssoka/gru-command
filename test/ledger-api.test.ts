@@ -9,6 +9,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
+import { redactCredentials } from '../src/redaction.js';
 import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -2625,6 +2626,16 @@ it('records the SHA-256 of the raw command beside the masked command on every pr
     expect(row(7001)).toMatchObject({ state: 'killed', commandSha256: sha256(rival) });
     api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7003, command: 'legacy line', commandSha256: null, evidence: 'argv' }] });
     expect(row(7003)?.commandSha256).toBeNull();
+    // A row read back with its digest holds its masked text already and keeps it as it is, even for a shape that masking
+    // again would change; a row without a digest may hold the line as listed and is masked.
+    const glued = `cli --token "${secret}";echo done`;
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'live', processes: [{ pid: 7004, command: glued, evidence: 'argv' }] });
+    const writtenOnce = row(7004)!;
+    expect(writtenOnce.command).toBe('cli --token [REDACTED];echo done');
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7004, command: writtenOnce.command, commandSha256: writtenOnce.commandSha256, evidence: 'argv' }] });
+    expect(row(7004)).toMatchObject({ state: 'killed', command: 'cli --token [REDACTED];echo done', commandSha256: sha256(glued) });
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7005, command: `curl -u deploy:${secret}`, commandSha256: null, evidence: 'argv' }] });
+    expect(row(7005)).toMatchObject({ command: 'curl -u deploy:[REDACTED]', commandSha256: null });
     // The digest is a column of the table and never leaves the ledger on the event stream.
     expect(db.handle.prepare('SELECT command_sha256 FROM worktree_processes WHERE pid = 7001').get()).toEqual({ command_sha256: sha256(rival) });
     expect(JSON.stringify(api.listEvents({ limit: 100 }))).not.toContain(sha256(rival));
@@ -2637,15 +2648,22 @@ it('binds a verification event to its command by the raw line or its masked form
   // An event recorded since the masking holds the masked line; one recorded before holds the line as listed.
   expect(recordsCommand(masked, raw)).toBe(true);
   expect(recordsCommand(raw, raw)).toBe(true);
-  // Another command, another credential-bearing command, a different masked line and a non-string are none of them this command.
+  // Another command, a different masked line and a non-string are none of them this command.
   expect(recordsCommand('node verify.mjs fail --token [REDACTED]', raw)).toBe(false);
-  expect(recordsCommand('node verify.mjs pass --token Zx5Hn2Bv8Qd4Wm7Lt3Pc', raw)).toBe(false);
   expect(recordsCommand(undefined, raw)).toBe(false);
   expect(recordsCommand(null, raw)).toBe(false);
   expect(recordsCommand(7, raw)).toBe(false);
   // An event recorded under an earlier, narrower set of redaction rules (it knew `--token` only) still binds: both
   // sides are masked with today's rules before they are compared.
   expect(recordsCommand('curl --token [REDACTED] -u deploy:Zx5Hn2Bv8Qd4', 'curl --token Kq7ZmW3xP9tR2vLd8Nc4 -u deploy:Zx5Hn2Bv8Qd4')).toBe(true);
+  // The event is bound to its run by the line it was written with: a line differing from `raw` only in a masked
+  // credential is the same line. (The registry row, not an event, is what identifies a process: its raw-command digest.)
+  expect(recordsCommand(masked, raw.replace('Kq7ZmW3xP9tR2vLd8Nc4', 'Zx5Hn2Bv8Qd4Wm7Lt3Pc'))).toBe(true);
+  // The masked line binds as it was written, whether or not masking it again would change it: a quoted credential
+  // followed directly by `;`, `)` or `|` leaves a placeholder a second pass takes for a value.
+  for (const glued of ['cli --token "$NPM_TOKEN";echo done', '(cli --token "$NPM_TOKEN")', 'curl -u deploy:"$PASS";echo', 'cli --token "$NPM_TOKEN"|tee out.log']) {
+    expect(recordsCommand(redactCredentials(glued), glued), glued).toBe(true);
+  }
   // A command with nothing to mask is its own masked form.
   expect(recordsCommand('npm test', 'npm test')).toBe(true);
   expect(recordsCommand('npm run build', 'npm test')).toBe(false);
