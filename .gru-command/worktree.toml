@@ -1200,12 +1200,13 @@ gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182
 # #542 an admitted directive/re-brief turn's own verification run no longer
 # fences its later tools. `own-run-fence` runs the new suite (heavy: the real
 # Claude adapter over the CLI double) and the edited registry pins;
-# `own-run-fence-a4` runs the existing fence suites unchanged; `-static` is the
+# `own-run-fence-a4` builds first (claude-adapter reads dist/) and runs the
+# existing fence suites unchanged; `-static` is the
 # lint + typecheck + build gate; `-red` runs the new suite against a scratch
 # extract of the base commit (the heavy-test list is overlaid so the new heavy
 # file is included) and exits non-zero by design: the verbose reporter lists
 # which cases failed there.
 own-run-fence = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/directive-own-run-fence.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
-own-run-fence-a4 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts test/canceled-request-closeout.test.ts && npx vitest run test/directive-retirement.test.ts test/job-stop.test.ts test/ledger-api.test.ts"
+own-run-fence-a4 = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts test/canceled-request-closeout.test.ts && npx vitest run test/directive-retirement.test.ts test/job-stop.test.ts test/ledger-api.test.ts"
 own-run-fence-static = "npm run lint && npm run typecheck && npm run build"
 own-run-fence-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc542-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/directive-own-run-fence.test.ts "$d/test/directive-own-run-fence.test.ts"; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC542 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/directive-own-run-fence.test.ts'
