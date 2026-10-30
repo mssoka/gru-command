@@ -17,8 +17,8 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
  * This file imports only modules that exist on the base commit, and seeds its
  * requests without any helper the change adds, so on the base it runs and
  * fails by assertion (the old `confirm_intent` recipe, no new section), never
- * by an import or collection error. The `gc-523-approval-before` scope runs it
- * against a `git archive` of the base.
+ * by an import or collection error. The `gc-523-approval-red-a14` scope runs it
+ * against a `git archive` of the original base `ccd6337f`, by test name.
  */
 
 const cleanupDirs: string[] = [];

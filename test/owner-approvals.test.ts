@@ -544,6 +544,8 @@ describe('owner approval — the Approve is bound to the fences read when Gru as
     const approval = createdApproval(proposal);
     const card = approvalCard(h, field<string>(approval, 'notification_id'));
     await decide(h, card.id, 'approve', 'owner');
+    // The request first: the Approve is recorded but nothing has run yet.
+    expect(requestState(h, 'req-elsewhere')).toBe('dispatching');
     expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('approved');
     // The owner's terminal route, not this service, closes the request.
     const row = h.ledger.getDirective('req-elsewhere')!;

@@ -3150,6 +3150,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       resolutionDetail: 'Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1',
     });
     view.render(snapshot({ notifications: [closed] }));
+    // A resolved card leaves the FOR YOU band (for every producer) and is read in the bell's feed.
+    expect(document.getElementById('board-owner')!.querySelector('[data-notification-id="approval-closed"]')).toBeNull();
     (document.getElementById('notification-bell') as HTMLButtonElement).click();
     const card = document.getElementById('notification-list')!.querySelector<HTMLElement>('[data-notification-id="approval-closed"]')!;
     const result = card.querySelector<HTMLElement>('.board-notification__result')!;
