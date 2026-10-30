@@ -253,7 +253,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
           [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
         // The scheduler hands the event over with its command lines masked
-        // (#534): the ledger never holds a credential a scope's command carries.
+        // (#534): the ledger never holds a credential in a command line it records.
         ledger.appendCustomEvent({
           kind: event.kind,
           jobId: event.jobId,

@@ -1068,7 +1068,6 @@ describe('tracked child workers: migration and storage', () => {
     // registered lane AND its process evidence (the FK child table the
     // worktrees rebuild must keep satisfying at commit).
     const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 14) });
-    const before = new LedgerApi(legacy.handle, {});
     // Seed through the FIXTURE's own schema: the merged build's addJob also
     // writes jobs.display_name (migration 17), which a pre-#161 fixture
     // (migrations <= 14 / <= 15) does not carry. The raw insert matches the
@@ -1088,11 +1087,15 @@ legacy.handle
          VALUES ('job-1', 'job', '/tmp/r', 'r', '/tmp/r/wt', NULL, 'abc', 'job-1', NULL, 'active', NULL, ?, ?)`,
       )
       .run(seededAt, seededAt);
-    before.recordWorktreeProcesses({
-      worktreeId: 'job-1',
-      processes: [{ pid: 123, command: 'sleep 1', evidence: 'argv' }],
-      state: 'live',
-    });
+    // The process evidence too, in the legacy columns: the merged build's
+    // recordWorktreeProcesses also writes worktree_processes.command_sha256
+    // (migration 34), which this fixture's schema does not carry.
+    legacy.handle
+      .prepare(
+        `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+         VALUES ('job-1', 123, 'sleep 1', 'argv', 'live', ?, ?)`,
+      )
+      .run(seededAt, seededAt);
     legacy.close();
     // The shipped build runs every migration: the worktrees table is
     // rebuilt for kind 'child' and the FK evidence survives.

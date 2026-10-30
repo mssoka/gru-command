@@ -2643,6 +2643,9 @@ it('binds a verification event to its command by the raw line or its masked form
   expect(recordsCommand(undefined, raw)).toBe(false);
   expect(recordsCommand(null, raw)).toBe(false);
   expect(recordsCommand(7, raw)).toBe(false);
+  // An event recorded under an earlier, narrower set of redaction rules (it knew `--token` only) still binds: both
+  // sides are masked with today's rules before they are compared.
+  expect(recordsCommand('curl --token [REDACTED] -u deploy:Zx5Hn2Bv8Qd4', 'curl --token Kq7ZmW3xP9tR2vLd8Nc4 -u deploy:Zx5Hn2Bv8Qd4')).toBe(true);
   // A command with nothing to mask is its own masked form.
   expect(recordsCommand('npm test', 'npm test')).toBe(true);
   expect(recordsCommand('npm run build', 'npm test')).toBe(false);

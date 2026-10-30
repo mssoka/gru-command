@@ -3085,14 +3085,15 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
 });
 
 describe('legacy proven completion without fabricated historical delivery', () => {
-  async function completedFixture(full = false, noDirectiveChanges = false, pendingProducerBlockers?: (jobId: string) => readonly string[]) {
+  const P37_FULL_COMMAND = 'test ! -f .P37-fail && printf verified';
+  async function completedFixture(full = false, noDirectiveChanges = false, pendingProducerBlockers?: (jobId: string) => readonly string[], fullCommand = P37_FULL_COMMAND) {
     const h = await boot({ completeReview: full, noDirectiveChanges, pendingProducerBlockers }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
     if (full) { attachBareOrigin(repo); repo.git(['push', 'origin', 'main']); }
     const jobId = 'completed-control-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
     if (full) {
       h.ledger.setJobPr(jobId, 'https://github.com/example/fixture/pull/1');
       mkdirSync(join(lane.path, '.gru-command'), { recursive: true });
-      writeFileSync(join(lane.path, '.gru-command', 'worktree.toml'), '[verify]\nfull = "test ! -f .P37-fail && printf verified"\n');
+      writeFileSync(join(lane.path, '.gru-command', 'worktree.toml'), `[verify]\nfull = "${fullCommand}"\n`);
       execFileSync('git', ['-C', lane.path, 'add', '.gru-command/worktree.toml']);
       execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'declare genuine full fixture gate'], { stdio: 'ignore' });
     }
@@ -3193,8 +3194,8 @@ describe('legacy proven completion without fabricated historical delivery', () =
   it('PR334 recovery directive GET and owner decision reach the exact generation beyond default pagination', () => assertCurrentRecoveryReadback('directive', true));
   it('PR334 recovery legacy GET and owner decision reach the exact generation beyond default pagination', () => assertCurrentRecoveryReadback('rebrief', true));
 
-  async function verifiedCurrentGateFixture(noDirectiveChanges = false) {
-    const f = await completedFixture(true, noDirectiveChanges); const { h } = f;
+  async function verifiedCurrentGateFixture(noDirectiveChanges = false, fullCommand = P37_FULL_COMMAND) {
+    const f = await completedFixture(true, noDirectiveChanges, undefined, fullCommand); const { h } = f;
     expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
     const closure = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
     expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: (closure.payload as { inspection_directive: string }).inspection_directive }, TOKEN)).status).toBe(202);
@@ -3204,7 +3205,7 @@ describe('legacy proven completion without fabricated historical delivery', () =
     execFileSync('git', ['-C', f.lane.path, 'push', 'origin', f.lane.branch!], { stdio: 'ignore' });
     const scheduler = new VerificationScheduler({ storageDir: join(h.dir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, record: (event) => { h.ledger.appendCustomEvent(event); } });
     try {
-      const outcome = await scheduler.submit({ jobId: f.jobId, scope: 'full', command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path, requestId: 'P37-original-full' }, () => {});
+      const outcome = await scheduler.submit({ jobId: f.jobId, scope: 'full', command: fullCommand, cwd: f.lane.path, requestId: 'P37-original-full' }, () => {});
       expect(outcome.ok).toBe(true); expect(outcome.trackedDirty).toBe(false);
       const begun = await h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! }); const result = await begun.run;
       expect(result, JSON.stringify(h.ledger.listJobEventsByKinds(f.jobId, ['round.error', 'round.status', 'round.perkins-review']))).toMatchObject({ verdict: 'approved' });
@@ -3223,6 +3224,23 @@ describe('legacy proven completion without fabricated historical delivery', () =
       expect(h.ledger.latestJobEvent(f.jobId, 'verification.reconciled')?.payload).toMatchObject({ state: 'completed', run_id: replay.runId });
       expect(h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence',
         gate: 'original successful full and whole review remain valid after read-only replay', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq } }).state).toBe('settled');
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('P37 a declared full command carrying a credential still settles the gate: its masked verification events bind to it (#534 R2)', { timeout: 120_000 }, async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+    const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture(false, `${P37_FULL_COMMAND} --token ${secret}`);
+    try {
+      // The events the actual declared full run left hold the command masked ...
+      const lifecycle = h.ledger.listJobEventsByKinds(f.jobId, ['verification.requested', 'verification.started', 'verification.completed']);
+      expect(lifecycle.length).toBeGreaterThanOrEqual(3);
+      for (const event of lifecycle) expect((event.payload as { command: string }).command, event.kind).toBe(`${P37_FULL_COMMAND} --token [REDACTED]`);
+      expect(JSON.stringify(h.ledger.listJobEventsByKinds(f.jobId, ['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']))).not.toContain(secret);
+      // ... and the gate, which reads them against the manifest's raw declared command, still settles on them.
+      const settle = () => h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence',
+        gate: 'a credential in the declared full command does not unbind its masked events', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq } });
+      expect(settle).not.toThrow();
+      expect(h.ledger.getObligation(duty.id)?.state).toBe('settled');
     } finally { await scheduler.dispose(); }
   });
 

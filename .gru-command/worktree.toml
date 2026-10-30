@@ -1195,7 +1195,7 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # base's unredacted source and requires A1, A2, A3, A6 and the registry
 # readback to fail behaviorally (it exits nonzero by design once the
 # classifier accepts the red run).
-gc-534-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/redaction.test.ts test/ledger-api.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/verification-scheduler.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts test/verification-server.test.ts"
+gc-534-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/redaction.test.ts test/ledger-api.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/verification-scheduler.test.ts test/child-workers.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run test/directive-retirement.test.ts -t '#534' && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts test/verification-server.test.ts"
 gc-534-static = "npm run lint && npm run typecheck && npm run build"
 gc-534-red = "sh tools/gc-534-red-baseline.sh"
 # The continuation of #534 (review r6b: R1, a process row is identified by the
@@ -1203,6 +1203,10 @@ gc-534-red = "sh tools/gc-534-red-baseline.sh"
 # carry their commands masked): the changed tests run over the stranded lane's
 # last head 0e7d5f95 and must fail behaviorally (nonzero by design, as above).
 gc-534-r1r2-red = "sh tools/gc-534-r1r2-red-baseline.sh"
+# One string edit to the candidate head reduces the event-to-run binding helper
+# (`recordsCommand`) to strict equality; the helper pin, the terminal readback and
+# the retirement-gate guard must fail by assertion (nonzero by design).
+gc-534-mutation = "sh tools/gc-534-binding-mutation.sh"
 
 # #519 GitLab merge-request CI evidence. `gc-519-focused` runs the new freeze-path
 # suite (heavy: real git lanes), the binding and reader suites, and the edited

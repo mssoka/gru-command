@@ -2758,17 +2758,20 @@ describe('#534: raw in memory, masked on the way out', () => {
     ledgerJob(h, 'job-argv-match', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-match' });
     const session = 'session-9b1d4c7e-argv-534';
+    // Unique to this test: `naming` reads the whole system listing, and heavy files run in parallel workers whose
+    // children carry the shared sentinel.
+    const secret = `A7x${process.pid}y${Date.now().toString(36)}z`;
     // Its cwd is outside the tree: only the path in argv ties it to the lane.
-    const child = argvChild(undefined, [row.path, `--token=${ARGV_SENTINEL}`, session]);
+    const child = argvChild(undefined, [row.path, `--token=${secret}`, session]);
     const pid = child.pid!;
     const matched = await listedBy(row.path, pid);
     expect(matched.evidence).toBe('argv');
-    expect(matched.command).toContain(ARGV_SENTINEL);
+    expect(matched.command).toContain(secret);
 
     const table = await processTableAsync({ onCwdError: (error) => { throw error; }, listCwds: async () => new Map([[pid, tmpdir()]]) });
-    expect(table.naming(session)).toEqual([expect.objectContaining({ pid, evidence: 'argv', command: expect.stringContaining(ARGV_SENTINEL) })]);
-    expect(table.naming(ARGV_SENTINEL).map((proc) => proc.pid)).toEqual([pid]);
-    expect(table.rootedIn(row.path).find((proc) => proc.pid === pid)).toMatchObject({ evidence: 'argv', command: expect.stringContaining(ARGV_SENTINEL) });
+    expect(table.naming(session)).toEqual([expect.objectContaining({ pid, evidence: 'argv', command: expect.stringContaining(secret) })]);
+    expect(table.naming(secret).map((proc) => proc.pid)).toEqual([pid]);
+    expect(table.rootedIn(row.path).find((proc) => proc.pid === pid)).toMatchObject({ evidence: 'argv', command: expect.stringContaining(secret) });
   });
 
   it('A8: the real lane-token read still reads the credential-bearing process, so its provenance is its credential-free twin\'s', async () => {

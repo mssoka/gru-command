@@ -239,7 +239,8 @@ raw `ps` line stays in memory for the checks that need it (tree matching,
 token naming, `ps -E` provenance). The scheduler's own state file (mode 0600,
 in the data directory) keeps the raw line too: a restarted scheduler compares
 a holder's recorded argv with the live process to recognise it as its own, so
-it is an identity input, not an event, a row or a response.
+it is an identity input, not an event or a row. A verification run's own
+response frames and status name the command to the client that submitted it.
 
 The masked text is for display and audit, never an identity: two commands
 whose credentials differ mask to the same line. Each row therefore also
@@ -253,9 +254,12 @@ own command (the events it reads hold the masked text, so they bind
 receipts to the run but never identify a process). A row with no digest (one
 written before the digest existed) has no identity: it never matches by its
 masked text, so its process is asked about again and the fresh row replaces
-it, and a registry row of that kind is left to the sweep's reap. A row
-whose process exits without being paused again keeps its recorded text:
-there is no backfill of existing rows.
+it, and a registry row of that kind is left to the sweep's reap: a
+verification run in flight when the digest first shipped leaves such a row
+`live` until its lane's sweep, and until then the lane stays fenced against
+retirement and its turn-settled lane-token reap is skipped. A row whose
+process exits without being paused again keeps its recorded text: there is
+no backfill of existing rows.
 
 Each row also carries the lane's **token** (`lane_token`, #486): random per
 lane incarnation, minted when the row is registered (lanes not yet swept

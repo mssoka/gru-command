@@ -1218,11 +1218,13 @@ function nowIso(): string {
 
 /** Whether a verification event's recorded command field is the command `raw`.
  * An event is recorded with its command masked (#534); one recorded before the
- * masking holds the command as listed. Either is the event of that command. This
+ * masking holds the command as listed. Both sides are masked with today's rules
+ * before they are compared, so an event recorded under an earlier set of
+ * redaction rules still binds, and a line recorded as listed is itself. This
  * binds an event to a run; whether a live process is the one a registry row
  * describes is the row's raw-command digest, never this comparison. */
 export function recordsCommand(recorded: unknown, raw: string): boolean {
-  return recorded === raw || recorded === redactCredentials(raw);
+  return typeof recorded === 'string' && (recorded === raw || redactCredentials(recorded) === redactCredentials(raw));
 }
 
 function str(value: unknown): string {
@@ -1695,11 +1697,11 @@ export class LedgerApi {
       const terminal = this.db.prepare(`SELECT seq FROM events WHERE job_id = ?
         AND (kind = 'verification.completed' OR kind = 'verification.reconciled' AND json_extract(payload, '$.state') = 'completed')
         AND json_extract(payload, '$.run_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.jobId, input.runId) as Row | undefined;
-      const conflictingTerminal = this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-        AND json_extract(payload, '$.run_id') = ? AND
-        ((json_extract(payload, '$.command') IS NOT ? AND json_extract(payload, '$.command') IS NOT ?) OR json_extract(payload, '$.cwd') IS NOT ?) LIMIT 1`)
-        .get(input.jobId, input.runId, input.command, redactCredentials(input.command), input.cwd);
-      if (conflictingTerminal !== undefined) return;
+      // A completed event for this run that names another command or directory fences the readback.
+      const completions = this.db.prepare(`SELECT json_extract(payload, '$.command') AS command, json_extract(payload, '$.cwd') AS cwd
+        FROM events WHERE job_id = ? AND kind = 'verification.completed' AND json_extract(payload, '$.run_id') = ?`)
+        .all(input.jobId, input.runId) as Row[];
+      if (completions.some((completion) => !recordsCommand(completion.command, input.command) || completion.cwd !== input.cwd)) return;
       if (terminal === undefined || !this.hasJobEventWithPayloadValues(input.jobId, ['verification.requested', 'verification.attached'],
         [{ key: 'run_id', value: input.runId }, { key: 'request_id', value: input.requestId }], 0)) return;
       const evidence = this.db.prepare(`SELECT seq, kind,
