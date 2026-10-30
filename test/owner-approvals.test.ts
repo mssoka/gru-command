@@ -339,12 +339,16 @@ function resolutionDetail(h: Harness, cardId: string): unknown {
 
 /** The card as the owner's board renders it: the board snapshot's own
  * notification view, not the ledger row and not the resolution event. */
-async function boardCard(h: Harness, cardId: string): Promise<Record<string, unknown>> {
+async function boardCardOrNull(h: Harness, cardId: string): Promise<Record<string, unknown> | null> {
   const snapshot = await call(h.port, 'GET', '/api/board');
   expect(snapshot.status).toBe(200);
-  const card = field<Record<string, unknown>[]>(snapshot.json, 'notifications').find((row) => row['id'] === cardId);
-  if (card === undefined) throw new Error(`the board does not show card ${cardId}`);
-  return card;
+  return field<Record<string, unknown>[]>(snapshot.json, 'notifications').find((row) => row['id'] === cardId) ?? null;
+}
+
+async function boardCard(h: Harness, cardId: string): Promise<Record<string, unknown>> {
+  const card = await boardCardOrNull(h, cardId);
+  expect(card, `the board shows card ${cardId}`).not.toBeNull();
+  return card!;
 }
 
 /** Retire a live request the ordinary way (a fixture that only needs "no longer live"). */
@@ -1279,7 +1283,7 @@ describe('owner approval — the result stays on the board after the card resolv
       resolvedBy: 'gru', resolutionDetail: 'Denied by the owner; nothing was run.' });
     // The window is bounded: a card resolved long ago is not carried in every snapshot.
     (h.db.handle).prepare('UPDATE notifications SET resolved_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', field<string>(old, 'notification_id'));
-    await expect(boardCard(h, field<string>(old, 'notification_id'))).rejects.toThrow(/does not show card/u);
+    expect(await boardCardOrNull(h, field<string>(old, 'notification_id'))).toBeNull();
     expect(await boardCard(h, field<string>(busy, 'notification_id'))).toMatchObject({ resolvedBy: 'gru' });
   });
 });

@@ -31,6 +31,7 @@ const A = 'owner approval of abandonment';
 const FENCES = 'owner approval — the Approve is bound to the fences read when Gru asked';
 const CRASH = 'owner approval — crash windows finish on reconcile, never twice';
 const WITHDRAW = 'owner approval — reconcile, withdrawal and shutdown';
+const STAYS = 'owner approval — the result stays on the board after the card resolves';
 const ANSWERS = 'owner approval — proposal answers and readback';
 const TEXT = 'owner approval - the text that sends Gru and the owner to the new route';
 
@@ -51,10 +52,13 @@ const LEGS = [
       `${WITHDRAW} withdraws a proposed card once its request is retired, leaving no non-terminal record`,
       'the result a follow-through closes an owner card with is kept on the card (#523) stores the resolution detail of a follow-through and of a producer withdrawal on the row itself',
       'ledger db + migration runner adds the nullable notification resolution detail and leaves a row resolved before it null (#523)',
+      // F1 on a busy board: the resolved card is still in the snapshot
+      `${STAYS} keeps a just-resolved approval card in the snapshot however many notifications arrived since it was posted`,
       // F2: a card the reconcile cannot post
       `${CRASH} a card the reconcile cannot post ends the record refused card-post-failed, so the request can be proposed again`,
       // (the busy-store reconcile test pins what the stranded head already did - retry - and is not a defect test)
       `${CRASH} keeps retrying a card the store could not take yet: a busy store is not a card that can never exist`,
+      `${CRASH} keeps a record proposed when the post threw after the card was committed: the card exists and is decidable`,
       // F3: nothing carries out a decision on an unhosted boot
       `${WITHDRAW} withdraws each open undecided card when the service is not hosted, and leaves decided and executing records for a hosting boot`,
       `${WITHDRAW} leaves an approval that was already being carried out for the boot that hosts the service again`,
