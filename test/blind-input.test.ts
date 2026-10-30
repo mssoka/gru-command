@@ -473,6 +473,13 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     // `-10-` and `-29-` are delimiters too: the longest excluded head is the file, not `docs/issues/2026`.
     expect(recorded(context('docs/issues/2026-10-29-notes.md', 7))).toEqual(prohibited('docs/issues/2026-10-29-notes.md'));
     expect(recorded(context('./docs/issues/prior review.md', 4, 'context line'))).toEqual(prohibited('./docs/issues/prior review.md'));
+    // Text that opens with `word:` (YAML front matter, a URL) is the file's text, not a revision: the
+    // number before it is still the line number, with or without a revision of the search.
+    for (const text of ['Status: done', 'title: x', 'https://example.com/a', 'key:value', '**Note:** x']) {
+      expect(recorded(context('docs/issues/a.md', 7, text)), `worktree ${text}`).toEqual(prohibited('docs/issues/a.md'));
+      expect(recorded(context(named('HEAD', 'docs/issues/a.md'), 7, text)), `HEAD ${text}`).toEqual(prohibited('docs/issues/a.md'));
+      expect(recorded(context(named('release-2026-10-29', 'docs/issues/a.md'), 7, text)), `dated ${text}`).toEqual(prohibited('docs/issues/a.md'));
+    }
   });
 
   it('records the longest excluded candidate, the earliest delimiter on a tie, and the repository spelling of `<dir>:<file>`', () => {
@@ -770,10 +777,15 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     // So is the first name of an output, or the first after a blank line, whatever it opens with.
     expect(recorded(rows('01-plan/part.md', numbered(7)), ruleOf('exclude 01-plan/**'))).toEqual(prohibited('01-plan/part.md'));
     expect(recorded(rows('src/a.ts', numbered(3), '', '01-plan/part.md', numbered(7)), ruleOf('exclude 01-plan/**'))).toEqual(prohibited('01-plan/part.md'));
-    // A name on a line of its own is judged by an outside shape too, as `path:N:` is.
-    expect(recorded(rows('/abs/repo/vendor/x.md', numbered(7)))).toEqual(prohibited('/abs/repo/vendor/x.md'));
-    expect(recorded(rows('C:\\repo\\x.md', numbered(7)))).toEqual(prohibited('C:/repo/x.md'));
-    expect(recorded(rows('/abs/repo/vendor/x.md'))).toEqual([]);
+    // A parent-relative name on a line of its own is outside the package; an absolute one, a bare `.`
+    // and `..` are not read by their shape: a working directory above a date is no search result.
+    expect(recorded(rows('../vendor/notes.md', numbered(7)))).toEqual(prohibited('../vendor/notes.md'));
+    for (const [name, line] of [['/work/lane/repo', '2026-10-30'], ['/work/lane/repo', '12:30:15 started'], ['C:\\repo\\x.md', numbered(7)], ['/abs/repo/vendor/x.md', numbered(7)], ['.', '3-4 weeks'], ['..', '3-4 weeks'], ['./', '10:30 standup']] as const) {
+      expect(recorded(rows(name, line)), `${name} / ${line}`).toEqual([]);
+    }
+    // git's own line for a binary file closes a group: the next name still opens one.
+    expect(recorded(rows('src/a.ts', numbered(3), 'Binary file src/x.bin matches', ARTIFACT, numbered(9)))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows('Binary file src/x.bin matches', ARTIFACT, numbered(9)))).toEqual(prohibited(ARTIFACT));
     // The text of a numbered line is text: it names no file, with a heading above it or none.
     expect(recorded(rows('build.log', numbered(3, 'vendor/a.js:12:5: error foo')), vendor)).toEqual([]);
     expect(recorded(numbered(3, 'vendor/a.js:12:5: error foo'), vendor)).toEqual([]);
