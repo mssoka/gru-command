@@ -700,7 +700,7 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(context(named('HEAD', 'docs/issues:1-1-story.md'), 7))).toEqual(prohibited('docs/issues/1-1-story.md'));
     // A whitespace-free capture stays the path the older rule reads, so a name
     // whose dotted part is followed by a written-out part is the whole file, not `report.final`.
-    for (const rule of [DEFAULT_BLIND_ISOLATION_RULE, suffix]) {
+    for (const rule of [ruleOf('exclude vendor/**'), suffix]) {
       expect(recorded(match('vendor/report.final-2-of-3.md', 7), rule), 'written-out name').toEqual(prohibited('vendor/report.final-2-of-3.md'));
     }
     // A date before the first space of a spaced name.
