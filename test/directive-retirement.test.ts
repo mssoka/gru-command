@@ -1083,6 +1083,72 @@ describe('directive retirement — live ownership fails closed', () => {
     expect((await retire(h, 'req-p', laneHead(lane))).status).toBe(200);
   });
 
+  it('retires past a live registry row whose spawned pid is gone and leaves that row live', async () => {
+    const repo = makeFixtureRepo('retire-registry-stale');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-stale', 'req-p-stale');
+    // The scheduler records its own spawned service at spawn; a restart
+    // before `onSettled` leaves the row live with a pid nothing can own.
+    const dead = 2 ** 31 - 1;
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: dead, command: 'node dist/main.js', evidence: 'registry' }],
+      state: 'live',
+    });
+    const retired = await retire(h, 'req-p-stale', laneHead(lane));
+    expect(retired.status).toBe(200);
+    // The read path never rewrites the ledger: reaping stays the sweep's job.
+    expect(h.ledger.listWorktreeProcesses(lane.id)).toContainEqual(
+      expect.objectContaining({ pid: dead, evidence: 'registry', state: 'live' }),
+    );
+  });
+
+  it('refuses while a live registry row names a running process', async () => {
+    const repo = makeFixtureRepo('retire-registry-live');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-live', 'req-p-live');
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: process.pid, command: 'node dist/main.js', evidence: 'registry' }],
+      state: 'live',
+    });
+    const refused = await retire(h, 'req-p-live', laneHead(lane));
+    expect(refused.status).toBe(409);
+    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('live lane process(es)');
+  });
+
+  it('keeps fencing a live cwd row whose pid cannot be alive', async () => {
+    const repo = makeFixtureRepo('retire-cwd-dead');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-cwd', 'req-p-cwd');
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: 2 ** 31 - 1, command: 'node dist/main.js', evidence: 'cwd' }],
+      state: 'live',
+    });
+    const refused = await retire(h, 'req-p-cwd', laneHead(lane));
+    expect(refused.status).toBe(409);
+    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('live lane process(es)');
+  });
+
+  it('retires past a live registry row with a non-positive pid', async () => {
+    const repo = makeFixtureRepo('retire-registry-zero');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-zero', 'req-p-zero');
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: 0, command: 'node dist/main.js', evidence: 'registry' }],
+      state: 'live',
+    });
+    // pid 0 signals this process group, so this proves `pidAlive`'s
+    // non-positive guard is wired in rather than reimplemented here.
+    expect((await retire(h, 'req-p-zero', laneHead(lane))).status).toBe(200);
+  });
+
   it('refuses when the job has no resolvable lane and never guesses', async () => {
     const repo = makeFixtureRepo('retire-no-lane');
     cleanupRepos.push(repo);
