@@ -155,6 +155,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'review-inputs-wave.test.ts',
     workload: 'real git fixture repos and review worktrees across three wave freezes',
   },
+  {
+    file: 'review-gitlab-ci-wave.test.ts',
+    workload: 'real git fixture repos and review worktrees across a freeze per case, with a GitLab endpoint double',
+  },
   { file: 'review-git-environment.test.ts', workload: 'real review admission, canonical Git identities, invocation-custody races, worktree lifecycle and environment isolation' },
   { file: 'service-port-guard.test.ts', workload: 'real service spawns and port behavior' },
   { file: 'shutdown.test.ts', workload: 'real service signal lifecycle' },
