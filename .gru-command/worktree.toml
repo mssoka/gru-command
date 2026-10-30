@@ -12,7 +12,7 @@ full = "npm test"
 
 typecheck = "npm run typecheck"
 # Briefing-review round-cap ruling (owner ruling 2026-10-29, journal j-1200):
-# the role canon, routing docs and four user-visible guidance strings record a
+# the role canon, routing docs and briefing-review guidance strings record a
 # push-back plus one material corrective amendment at the cap instead of an
 # owner escalation, and briefings are written to settle in one round. Focused
 # regression, static product checks, and the final-test-bytes fail-before leg

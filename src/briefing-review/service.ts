@@ -565,9 +565,7 @@ export class BriefingReviewService {
     };
   }
 
-  /** The proactive routing text. At the cap a re-commission is refused, so
-   * the notification names the cap's push-back/dispatch/amendment path instead
-   * of pointing at an action the service will reject. */
+  /** The chain's newest review, or undefined for an empty chain. */
   private chainTail(chainKey: string): ArmedReview | undefined {
     const chain = armedChain(this.ledger, chainKey);
     return [...new Map(chain.map((record) => [record.reviewId, record])).values()].at(-1);
@@ -596,7 +594,8 @@ export class BriefingReviewService {
   private announce(armed: ArmedReview, input: { readonly verdict: BriefingReviewVerdict; readonly caught: number }): void {
     const jobs = armed.lenses.map((lens) => `${lens} (${lensJobId(armed.reviewId, lens)})`).join(', ');
     const tail = this.chainTail(armed.chainKey);
-    const tailLine = tail !== undefined && tail.reviewId !== armed.reviewId
+    const tailVerdict = tail === undefined ? null : decisiveVerdict(reviewVerdicts(this.ledger, tail.reviewId), tail.generation);
+    const tailLine = tail !== undefined && tail.reviewId !== armed.reviewId && tailVerdict !== null
       ? [`Last reviewed text: review ${tail.reviewId} (round ${String(tail.round)}), briefing sha256 ${tail.briefingSha256}.`]
       : [];
     this.options.notifications.post({

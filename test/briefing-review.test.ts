@@ -639,6 +639,16 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     expect(finalNotice).toContain(newest.briefingSha256);
     expect(finalNotice).toContain('Last reviewed text:');
   });
+
+  it('does not call a still-pending newest review the last reviewed text', async () => {
+    const h = harness();
+    await h.service.commission(commission(h));
+    await h.service.commission(commission(h, { briefing: `${BRIEFING}\n- A later revision is still under review.` }));
+    h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
+    const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expect(notice).not.toContain('Last reviewed text:');
+    expect(notice).toContain('re-commission at this tier');
+  });
 });
 
 describe('Nefario briefing review — the staged dispatch gate', () => {
@@ -778,9 +788,9 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
   });
 
   it('a matching CHANGES-NEEDED block on an enforced tier names the push-back path, never an owner escalation', async () => {
-    // The supplied-block branch (`briefing_review_not_ready` at gate.ts:187)
-    // is separate from the no-block branch: only a caller that carries the
-    // block reaches it, so it needs its own dispatch test.
+    // The supplied-block `briefing_review_not_ready` branch is separate from
+    // the no-block branch: only a caller that carries the block reaches it, so
+    // it needs its own dispatch test.
     const h = harness({ stage: 3 });
     await h.service.commission(commission(h, { tier: 'medium' }));
     const armed = armedOf(h);
