@@ -554,8 +554,12 @@ export class ProviderRecoverySensor {
    * pre-existing/generic blocks (those states AT establishment) HOLD with
    * zero I/O — EXCEPT a block that the ledger attributes to this wait's
    * OWN failed turn (the settle raced the wait): that is still this
-   * blocker's churn, never a generic hold. Active review gates, stale
-   * incidents and suspensions also HOLD. */
+   * blocker's churn, never a generic hold, and EXCEPT a DISPOSED waiter
+   * with nothing live on the lane, which is retired instead of held.
+   * Active review gates, stale incidents and suspensions also HOLD. The
+   * disposed carve-out never pre-empts an otherwise eligible wait: a
+   * normal wall stop establishes its wait before disposing its own minion,
+   * so that continuation is still probed and recovered. */
   private validateWaiter(wait: ProviderWaitRecord): 'eligible' | 'cancel' | 'retire' | 'supersede' | 'hold' {
     if (wait.waiterKind === 'job-minion') {
       const job = wait.jobId !== null ? this.ledger.getJob(wait.jobId) : null;
@@ -587,35 +591,6 @@ export class ProviderRecoverySensor {
       // provider recovery). Delivered/in-review WITHOUT an active round is
       // expected churn (the round already settled or never opened).
       if (job.status === 'in-review' && this.hasActiveReviewRound(wait.jobId)) return 'hold';
-      // A wait whose recorded agent is DISPOSED protects no work: the
-      // 2026-10-30T17:59Z provider wall stopped those minions and they never
-      // came back, so the wait only fences the lane's next directive. Retire
-      // it through the normal waiter disposition path, but ONLY while nothing
-      // live owns the lane: any agent for the job in `spawning`/`streaming` —
-      // implementer, review-only session or tracked child — keeps the wait. An
-      // ABSENT agent row is unknown, never gone (fixtures and legacy rows
-      // establish waits without a registered agent), and an `error` agent may
-      // still be resumed.
-      //
-      // This deliberately OUTRANKS the establishment-status hold below: a job
-      // that was already blocked/delivered/in-review when the wait was
-      // established still has no owner once its agent is disposed, and the
-      // 2026-10-31 re-brief records three 25-hour waits fenced by exactly that
-      // ordering, unrecoverable after the credential rotated. Every check
-      // ABOVE still wins — terminal, retired debt, parked, newer implementer,
-      // incident currency, suspension and an active review round all encode
-      // real work or real authority, and a live agent vetoes retirement here.
-      const waiterAgent = wait.agentId !== null ? this.ledger.getAgent(wait.agentId) : null;
-      if (waiterAgent !== null && waiterAgent.state === 'disposed') {
-        const live = this.ledger
-          .listAgents()
-          .some(
-            (agent) =>
-              agent.jobId === job.id &&
-              (agent.state === 'spawning' || agent.state === 'streaming'),
-          );
-        if (!live) return 'retire';
-      }
       // Generic/unknown block: the job was ALREADY blocked/delivered/in-review
       // when the provider stop was classified — the interrupted-turn churn
       // explanation does not apply; hold with zero I/O until ruled otherwise.
@@ -623,11 +598,43 @@ export class ProviderRecoverySensor {
       // wait's own failing turn (the dispatch settle raced the wait) is the
       // blocker's own settlement, not a foreign hold (r4 directive).
       const atEstablishment = wait.jobStatusAtEstablishment;
-      if (atEstablishment === 'blocked') {
-        if (!blockedByOwnWallSettle(this.ledger, { jobId: wait.jobId, agentId: wait.agentId })) {
-          return 'hold';
+      const establishmentHold =
+        atEstablishment === 'blocked'
+          ? !blockedByOwnWallSettle(this.ledger, { jobId: wait.jobId, agentId: wait.agentId })
+          : atEstablishment === 'delivered' || atEstablishment === 'in-review';
+      if (establishmentHold) {
+        // A wait whose recorded agent is DISPOSED protects no work when the
+        // establishment-status hold is the only thing keeping it from probing:
+        // the 2026-10-30T17:59Z wall left those minions gone and the wait only
+        // fences the lane's next directive. Retire it through the normal waiter
+        // disposition path, but ONLY while nothing live owns the lane: any
+        // agent for the job in `spawning`/`streaming` — implementer, review-only
+        // session or tracked child — keeps the wait. An ABSENT agent row is
+        // unknown, never gone (fixtures and legacy rows establish waits without
+        // a registered agent), and an `error` agent may still be resumed.
+        //
+        // This deliberately OUTRANKS the establishment-status hold: a job that
+        // was already blocked/delivered/in-review when the wait was established
+        // still has no owner once its agent is disposed, and the 2026-10-31
+        // re-brief records three 25-hour waits fenced by exactly that ordering,
+        // unrecoverable after the credential rotated. It does NOT pre-empt an
+        // otherwise ELIGIBLE wait: a normal wall stop establishes the wait
+        // before its own disposal, keeps its continuation, and must still be
+        // probed and recovered. Every check ABOVE still wins — terminal, retired
+        // debt, parked, newer implementer, incident currency, suspension and an
+        // active review round all encode real work or real authority, and a live
+        // agent vetoes retirement here.
+        const waiterAgent = wait.agentId !== null ? this.ledger.getAgent(wait.agentId) : null;
+        if (waiterAgent !== null && waiterAgent.state === 'disposed') {
+          const live = this.ledger
+            .listAgents()
+            .some(
+              (agent) =>
+                agent.jobId === job.id &&
+                (agent.state === 'spawning' || agent.state === 'streaming'),
+            );
+          if (!live) return 'retire';
         }
-      } else if (atEstablishment === 'delivered' || atEstablishment === 'in-review') {
         return 'hold';
       }
       // Otherwise: current approved continuation — eligible through the

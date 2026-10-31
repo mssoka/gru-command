@@ -1202,12 +1202,14 @@ gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182
 # has no spawning/streaming agent is retired through the sensor's existing
 # waiter-disposition path (status `cancelled`, recorded why `waiter-gone` from
 # the tick and `waiter-gone-during-check` from the probe's re-validation). The
-# disposed-and-nothing-live rule now OUTRANKS the job_status_at_establishment
-# hold (blocked and delivered/in-review variants), while terminal, retired
-# debt, parked, newer-implementer, incident-currency, suspension, active-round
-# and live-agent checks all still win. `waiter-gone-focused` runs the sensor
-# contract plus the neighboring provider-recovery suites and the suite/budget
-# pins; `waiter-gone-static` is the lint + typecheck + build gate.
+# disposed-and-nothing-live rule OUTRANKS the job_status_at_establishment hold
+# (blocked and delivered/in-review variants) only for a wait that hold would
+# otherwise keep from probing; an otherwise eligible normal wall stop is still
+# probed and recovered. Terminal, retired debt, parked, newer-implementer,
+# incident-currency, suspension, active-round and live-agent checks all still
+# win. `waiter-gone-focused` runs the sensor contract plus the neighboring
+# provider-recovery suites and the suite/budget pins; `waiter-gone-static` is
+# the lint + typecheck + build gate.
 waiter-gone-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 waiter-gone-static = "npm run lint && npm run typecheck && npm run build"
 
