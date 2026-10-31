@@ -1206,7 +1206,7 @@ gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182
 # `waiter-gone-static` is the lint + typecheck + build gate. Silent-slot waits,
 # absent agent rows, errored agents, live review/child sessions and every
 # existing supersede/hold branch are explicitly unretired.
-waiter-gone-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts -t \"one tick retires only\" test/provider-recovery-ledger.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+waiter-gone-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 waiter-gone-static = "npm run lint && npm run typecheck && npm run build"
 
 # FAIL-BEFORE evidence (acceptance A1 and A1c): the FINAL behavioral test bytes

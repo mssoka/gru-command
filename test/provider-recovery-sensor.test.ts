@@ -76,7 +76,6 @@ class Harness {
       slotReArm: this.reArmPort(),
       silasHosted: () => this.silasEnabled,
       now: () => this.clockMs,
-      log: (level, msg, fields) => { if (level === 'error') console.error('[sensor-error]', msg, JSON.stringify(fields ?? {})); },
       ...(metadataReaders !== undefined ? { metadataReaders } : {}),
     });
   }
@@ -789,7 +788,13 @@ describe('disposed waiter retirement (waiter-gone)', () => {
 
     const seedRow = async (jobId: string, agentId: string, model: string): Promise<ProviderWaitRecord> => {
       h.makeJob(jobId);
-      const wait = await h.establishMinionWait({ jobId, agentId, model, sessionFile: `/tmp/${agentId}.jsonl` });
+      const wait = await h.establishMinionWait({
+        jobId,
+        agentId,
+        model,
+        sessionFile: `/tmp/${agentId}.jsonl`,
+        incidentId: `supervision.provider-wall.${agentId}.quota_wall`,
+      });
       if (wait === null) throw new Error(`fixture: ${jobId} established no wait`);
       h.ledger.registerAgent({ id: agentId, role: 'minion', jobId });
       return wait;
@@ -856,6 +861,7 @@ describe('disposed waiter retirement (waiter-gone)', () => {
       agentId: 'agent-m-blocked',
       model: 'glm-m-blocked',
       sessionFile: '/tmp/agent-m-blocked.jsonl',
+      incidentId: 'supervision.provider-wall.agent-m-blocked.quota_wall',
     });
     if (blockedAtEstablishment === null) throw new Error('fixture: blocked lane established no wait');
     waits.set('blocked', blockedAtEstablishment);
@@ -863,15 +869,6 @@ describe('disposed waiter retirement (waiter-gone)', () => {
     h.ledger.setAgentState('agent-m-blocked', 'disposed');
 
     await h.sensor.tick();
-
-    console.error('WAITER-GONE-DIAG', JSON.stringify({
-      wait: h.ledger.getProviderWait(waits.get('gone')!.id),
-      job: h.ledger.getJob('job-m-gone'),
-      agent: h.ledger.getAgent('agent-m-gone'),
-      route: h.ledger.getProviderRoute(waits.get('gone')!.routeKey),
-      implementers: h.ledger.listImplementerMinions('job-m-gone').map((a) => ({ id: a.id, createdAt: a.createdAt, state: a.state })),
-      allAgents: h.ledger.listAgents().filter((a) => a.jobId === 'job-m-gone'),
-    }));
 
     // The one row this rule changes.
     expect(h.ledger.getProviderWait(waits.get('gone')!.id)?.status).toBe('cancelled');
