@@ -432,13 +432,16 @@ Fields, states and the read routes are in docs/PIPELINE.md.
   same practice as a direct dispatch at the review cap. Do not cancel and
   re-enqueue to correct a briefing a review flagged: a cancelled entry keeps
   its id (a re-enqueue needs a fresh id and request id), and dependents'
-  prerequisites are immutable.
+  prerequisites are immutable. If the review disagrees with the owner's intent,
+  escalate it as `scope-design` and never release it.
 - **`/cancel` is only for an entry that is no longer owed.** A dependent of a
   cancelled entry stays waiting, so cancel or re-enqueue that dependent
   explicitly.
-- **Own holds only.** Clear only holds you placed yourself (`by: "gru"`),
-  never an owner's hold. The pipeline shows every hold as `owner hold:
-  <reason>`; the stored `by` tells them apart.
+- **Own holds only.** Clear only holds you placed yourself: the ones whose
+  `hold_reason` names the release condition you recorded (`by: "gru"`), never
+  an owner's hold. The pipeline shows every hold as `owner hold: <reason>`, and
+  the `by` stored on its event is the record of who placed it. If you cannot
+  tell whose hold it is, ask the owner; never clear a hold on a guess.
 - **Pacing.** The pipeline already admits only as resident capacity allows.
   No separate pacing duty is needed.
 

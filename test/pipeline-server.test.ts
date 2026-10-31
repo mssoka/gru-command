@@ -371,6 +371,13 @@ describe('pipeline HTTP surface', () => {
     expect(() => requireSafeRecordId('Fix-Login', 'pipeline entry id')).not.toThrow();
     expect(() => requireArtifactJobId('Fix-Login')).toThrow();
     expect(() => requireArtifactJobId('fix-login')).not.toThrow();
+    // The exact ids `.` and `..` are refused at enqueue (docs/PIPELINE.md "Enqueue").
+    for (const id of ['.', '..']) {
+      const refused = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id });
+      expect(refused.status, id).toBe(400);
+      expect(() => requireSafeRecordId(id, 'pipeline entry id'), id).toThrow();
+      expect(h.ledger.getPipelineEntry(id), id).toBeNull();
+    }
     // Ids that pass both checks but that git refuses as the branch gru/<id> are accepted
     // at enqueue and fail only when the lane is created (docs/PIPELINE.md "Enqueue"
     // and "Admission").

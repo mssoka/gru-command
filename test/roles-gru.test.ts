@@ -136,10 +136,12 @@ describe('gru role definition', () => {
     expect(section).toContain('**On CHANGES-NEEDED,** record a push-back, clear the hold, and append one corrective dispatch amendment as soon as the entry is admitted');
     expect(section).toContain('That is the same practice as a direct dispatch at the review cap');
     expect(section).toContain("Do not cancel and re-enqueue to correct a briefing a review flagged: a cancelled entry keeps its id (a re-enqueue needs a fresh id and request id), and dependents' prerequisites are immutable");
+    expect(section).toContain("If the review disagrees with the owner's intent, escalate it as `scope-design` and never release it");
     expect(section).toContain('**`/cancel` is only for an entry that is no longer owed.**');
     expect(section).toContain('A dependent of a cancelled entry stays waiting, so cancel or re-enqueue that dependent explicitly');
-    expect(section).toContain('**Own holds only.** Clear only holds you placed yourself (`by: "gru"`), never an owner\'s hold');
-    expect(section).toContain('The pipeline shows every hold as `owner hold: <reason>`; the stored `by` tells them apart');
+    expect(section).toContain('**Own holds only.** Clear only holds you placed yourself: the ones whose `hold_reason` names the release condition you recorded (`by: "gru"`), never an owner\'s hold');
+    expect(section).toContain('The pipeline shows every hold as `owner hold: <reason>`, and the `by` stored on its event is the record of who placed it');
+    expect(section).toContain('If you cannot tell whose hold it is, ask the owner; never clear a hold on a guess');
     expect(section).toContain('**Pacing.** The pipeline already admits only as resident capacity allows. No separate pacing duty is needed');
   });
 
@@ -157,10 +159,12 @@ describe('gru role definition', () => {
     };
     const endpoints = between('## Endpoints', '### Enqueue');
     const enqueue = between('### Enqueue', '### Reading');
+    const reading = between('### Reading', '### Hold, clear-hold, cancel');
     const states = between('## States', '## Prerequisites and milestones');
     const milestones = between('## Prerequisites and milestones', '## Priority');
     const priority = between('## Priority', '## Exclusive scopes');
     const scopes = between('## Exclusive scopes', '## Admission');
+    const admission = between('## Admission', '## The briefing-review gate is not run on admission');
     // Routes the dispatch server mounts.
     for (const route of [
       'POST /api/pipeline/enqueue',
@@ -216,6 +220,7 @@ describe('gru role definition', () => {
     expect(doc).toContain('## The briefing-review gate is not run on admission');
     expect(doc).toContain('Making admission honour the gate is a separate change');
     expect(enqueue).toContain('Uppercase is refused by the dispatch service before any job row exists');
+    expect(enqueue).toContain('The id check rejects the exact ids `.` and `..`, but not a `..` inside a longer id');
     expect(enqueue).toContain('the others fail when the lane is created, after the job row exists');
     // The three mutations and their state matrix, and the hold text bound.
     expect(endpoints).toContain('| `POST /api/pipeline/entries/<id>/hold` | holds an entry |');
@@ -223,6 +228,15 @@ describe('gru role definition', () => {
     expect(doc).toContain('Only a `waiting` or `ready` entry. An entry with no hold comes back unchanged.');
     expect(doc).toContain('Cancelling a cancelled entry is a no-op.');
     expect(doc).toContain('`cancel` is refused on a `failed`');
+    // The placer is recorded on the event, not exposed by a read route; the role's
+    // own-hold rule uses the release-condition convention instead.
+    expect(doc).toContain('the service does not enforce which caller may clear one');
+    expect(doc).toContain('neither the list nor the entry readback exposes the placer');
+    // Pending counts active entries, not only runnable ones (held/blocked wait too).
+    expect(reading).toContain('`pending` counts the active entries (`waiting`, `ready`, `admitting`)');
+    // The live handoff failure is blocked by the pipeline itself, with its card.
+    expect(admission).toContain('when the failure escaped before that handler (for example the handoff write), the pipeline\'s interrupted-startup check blocks the job');
+    expect(admission).toContain('The pipeline never posts that card for a job the dispatch service already blocked');
     // Linked from the role section and from the dispatch flow, where dispatch is described.
     expect(readFileSync(GRU_MD, 'utf-8')).toContain('docs/PIPELINE.md');
     const flow = readFileSync(join(REPO_ROOT, 'docs', 'FLOW.md'), 'utf-8');
