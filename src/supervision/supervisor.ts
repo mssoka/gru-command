@@ -2052,9 +2052,16 @@ export class Supervisor {
   ): void {
     // Sampled before the cleanup below (it always clears the turn).
     const hadOpenTurn = agent.openTurn;
-    // The cleanup half of a stop (plus what `turn_end` clears): without it
-    // the finished turn becomes a hang candidate and climbs the restart
-    // ladder. `backgroundTasks` is only read while a turn is open.
+    // The cleanup half of a stop: an in-flight recovered-turn delivery for
+    // this entity is superseded by the settle. Without it that delivery's
+    // rejection (the same provider window) would post a contradicting
+    // "could not re-deliver its prompt" orphan note beside the settle
+    // notice — exactly what `stopForGuidance` prevents by clearing this
+    // first.
+    this.clearRecoveryAdmission(agent);
+    // Without these clears the finished turn becomes a hang candidate and
+    // climbs the restart ladder. `backgroundTasks` is only read while a turn
+    // is open.
     agent.openTurn = false;
     agent.openControl = false;
     agent.openToolCalls.clear();

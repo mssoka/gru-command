@@ -3988,6 +3988,23 @@ interface ChatWindowRig {
   readonly slot: SupervisedSlot;
 }
 
+/** Model a LIVE chat record that already retains a captured turn. The field's
+ * own contract keeps such a capture across failed rungs and breaker re-arms,
+ * and a later restart rung would replay it through recoverInterruptedTurn.
+ * The settle must clear it (hazard H4). */
+function seedRetainedCapture(h: Harness, agentId: string): void {
+  const record = agentRecordOf(h.supervisor, agentId) as { pendingRecovery: unknown } | undefined;
+  if (record === undefined) throw new Error(`no live supervision record for ${agentId}`);
+  record.pendingRecovery = {
+    jobId: null,
+    authorityEpoch: null,
+    producerIdentity: null,
+    pending: { text: 'the message from the interrupted turn', owner: 'chat' },
+    hadOpenTurn: true,
+    originAgentId: agentId,
+  };
+}
+
 /** Adopt a live Gru chat handle through a DECLARED `gru-main` slot (an
  * unbound handle answers `canReplace()` true regardless of state, so the slot
  * assertion is only meaningful when the slot owns the agent) and open the
@@ -4002,6 +4019,8 @@ async function openChatWindowTurn(h: Harness, agentId: string): Promise<ChatWind
     spawn: (options) => h.registry.spawn('gru', options),
   });
   await slot.adoptReplacement(handle);
+  seedRetainedCapture(h, handle.id);
+  expect(agentRecordOf(h.supervisor, handle.id)?.pendingRecovery).not.toBeNull();
   handle.emit({ type: 'turn_start' });
   handle.emit({ type: 'tool_start', callId: 'call-window', tool: 'bash' });
   handle.emit({ type: 'compaction_start' });
@@ -4009,12 +4028,32 @@ async function openChatWindowTurn(h: Harness, agentId: string): Promise<ChatWind
   return { handle, slot };
 }
 
+interface ProviderWindowEvidence {
+  readonly provider: string;
+  readonly model: string;
+  readonly status: number | null;
+  readonly body_code: string | null;
+  readonly retry_after_ms: number | null;
+}
+
+const ZAI_WINDOW_EVIDENCE: ProviderWindowEvidence = {
+  provider: 'zai-coding-cn',
+  model: 'glm-5.3',
+  status: 429,
+  body_code: '1302',
+  retry_after_ms: 60_000,
+};
+
 /** Shared A1/A1b acceptance for ONE settled temporary usage window: the chat
  * agent stays live, the wall is recorded once as a non-stop machine notice,
- * the retained capture stays null, and the finished turn's residuals cannot
+ * the retained capture is cleared, and the finished turn's residuals cannot
  * become hang evidence (A2 rides inside the same body by design). Returns the
  * notice so the caller can pin dedupe on the same open row. */
-async function expectChatTurnSurvivedProviderWindow(h: Harness, rig: ChatWindowRig): Promise<NotificationRecord> {
+async function expectChatTurnSurvivedProviderWindow(
+  h: Harness,
+  rig: ChatWindowRig,
+  evidence: ProviderWindowEvidence = ZAI_WINDOW_EVIDENCE,
+): Promise<NotificationRecord> {
   const { handle, slot } = rig;
   const noticeKind = `supervision.provider-window.${handle.id}.quota_wall`;
   // A1 — the chat agent is NOT stopped and NOT disposed.
@@ -4028,18 +4067,17 @@ async function expectChatTurnSurvivedProviderWindow(h: Harness, rig: ChatWindowR
   expect(windows[0]?.payload).toMatchObject({
     class: 'quota_wall',
     role: 'gru',
-    provider: 'zai-coding-cn',
-    model: 'glm-5.3',
-    status: 429,
-    body_code: '1302',
-    retry_after_ms: 60_000,
     had_open_turn: true,
+    ...evidence,
   });
   // The wall is VISIBLE, as ONE machine notice of its own kind — never the
   // durable-stop kind the boot lookup binds and the sensor hand-back keys on.
   const notices = h.notificationsOfKind(noticeKind);
   expect(notices).toHaveLength(1);
   expect(notices[0]).toMatchObject({ routing: 'action-required', severity: 'error', agentId: handle.id });
+  // The owner-facing row must state the non-stop truth it exists to carry.
+  expect(notices[0]?.title).toContain('stayed up');
+  expect(notices[0]?.detail ?? '').toContain('temporary provider usage window');
   expect(h.api.findNotificationByKind(noticeKind, 'unacked')?.id).toBe(notices[0]!.id);
   // `canWakeGru` reads this: a closed breaker and proven custody.
   expect(slot.canReplace()).toBe(true);
@@ -4063,9 +4101,8 @@ async function expectChatTurnSurvivedProviderWindow(h: Harness, rig: ChatWindowR
 it('a typed temporary usage window settles the gru chat turn in place instead of stopping the agent', async () => {
   // Owner ruling chat-wait-dont-stop-20261031 (option dont-stop). Pacing is
   // OFF (boot's default), so the first typed 429 reaches the settle path
-  // directly; with the shipped pacing enabled the same path is reached at
-  // budget exhaustion (pinned by 'retries with exponential backoff, records
-  // every attempt, and exhausts into the ladder').
+  // directly; the shipped pacing configuration reaches the same path at
+  // budget exhaustion, pinned by the paced case below.
   const h = boot();
   try {
     const rig = await openChatWindowTurn(h, 'gru-provider-window');
@@ -4083,6 +4120,112 @@ it('a typed temporary usage window settles the gru chat turn in place instead of
     expect(after[0]?.id).toBe(notice.id);
     expect(h.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
     expect(rig.handle.disposed).toBe(false);
+  } finally {
+    h.dispose();
+  }
+});
+
+it('a typed usage window on a provider with no sensor adapter still settles the gru chat turn in place', async () => {
+  // `providerSupportsSensor` is the probe adapter's gate and must NOT gate
+  // this path; eligibility is the typed body code (1302), not only status 429.
+  const h = boot();
+  try {
+    const rig = await openChatWindowTurn(h, 'gru-provider-window-unsupported');
+    rig.handle.emit(providerErrorEvent(
+      '1302: {"error":{"code":"1302","message":"usage limit reached"}}',
+      { bodyCode: '1302' },
+      { provider: 'openai', model: 'gpt-6-luna' },
+    ));
+    await flushMicrotasks();
+    expect(rig.handle.disposed).toBe(false);
+    await expectChatTurnSurvivedProviderWindow(h, rig, {
+      provider: 'openai',
+      model: 'gpt-6-luna',
+      status: null,
+      body_code: '1302',
+      retry_after_ms: null,
+    });
+  } finally {
+    h.dispose();
+  }
+});
+
+it('with the shipped pacing policy the gru chat turn settles at retry exhaustion instead of stopping', async () => {
+  const sleeper = new ManualSleeper();
+  const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+  try {
+    const rig = await openChatWindowTurn(h, 'gru-provider-window-paced');
+    // A capturable chat turn: pacing re-delivers it on each rung.
+    rig.handle.pendingTurnSnapshot = { text: 'hello from the owner', owner: 'chat' };
+    rig.handle.promptHook = () => { rig.handle.emit(providerWindowEvent()); };
+    rig.handle.emit(providerWindowEvent());
+    expect(sleeper.delays).toEqual([100]);
+    expect(h.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    await sleeper.release(); // rung 1 fails -> rung 2
+    await sleeper.release(); // rung 2 fails -> rung 3
+    await sleeper.release(); // rung 3 fails -> budget spent: the settle path
+    await flushMicrotasks();
+    expect(rig.handle.promptCalls.map((call) => call.text)).toEqual([
+      'hello from the owner', 'hello from the owner', 'hello from the owner',
+    ]);
+    expect(eventsOfKind(h, 'pacing.auto-retry-exhausted')).toHaveLength(1);
+    expect(rig.handle.disposed).toBe(false);
+    expect(h.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, stopReason: null });
+    expect(h.notificationsOfKind(`supervision.provider-wall.${rig.handle.id}.quota_wall`)).toHaveLength(0);
+    expect(h.notificationsOfKind(`supervision.provider-window.${rig.handle.id}.quota_wall`)).toHaveLength(1);
+    const windows = eventsOfKind(h, 'supervision.provider-window');
+    expect(windows).toHaveLength(1);
+    expect(windows[0]?.payload).toMatchObject({ class: 'quota_wall', role: 'gru', ...ZAI_WINDOW_EVIDENCE });
+    // The exhausted attempt concluded the turn; its silence is not a hang.
+    expect(h.supervisor.viewFor(rig.handle.id)).toMatchObject({ openTurn: false, openControl: false, openToolCalls: 0 });
+    h.advance(60);
+    expect(eventsOfKind(h, 'supervision.restart')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    expect(rig.handle.disposed).toBe(false);
+  } finally {
+    h.dispose();
+  }
+});
+
+it('a usage window that rejects a recovered chat turn settles it without a contradicting orphan note', async () => {
+  const h = boot();
+  try {
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-main',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = new FakeHandle('gru', 'gru-window-recovered', null);
+    h.registry.adopt(first);
+    await slot.adoptReplacement(first);
+    // A live turn the next restart rung will re-deliver on the replacement.
+    first.pendingTurnSnapshot = { text: 'the message before the restart', owner: 'chat' };
+    // The replacement's recovered prompt meets the same usage window (the
+    // adapter emits its typed error, then rejects the prompt — asynchronously,
+    // exactly as the rung's own settlement already ran).
+    h.registry.spawnImpl = async (role) => {
+      const next = new FakeHandle(role, 'gru-window-recovered-2', null);
+      next.promptHook = () => new Promise<void>((_resolve, reject) => {
+        setTimeout(() => {
+          next.emit(providerWindowEvent());
+          reject(new Error('429 usage window'));
+        }, 0);
+      });
+      return next;
+    };
+    hang(first);
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.provider-window.gru-window-recovered-2.quota_wall')).toHaveLength(1);
+    }, { timeout: 2_000 });
+    await sleep(60);
+    // The settle owns the failed turn: the superseded delivery posts nothing.
+    expect(h.notificationsOfKind('supervision.turn-orphaned.gru-window-recovered')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.turn-orphaned.gru-window-recovered-2')).toHaveLength(0);
+    expect(h.supervisor.viewFor('gru-window-recovered-2')).toMatchObject({
+      state: 'watching', breakerOpen: false, stopReason: null, openTurn: false, openControl: false,
+    });
+    expect(h.notificationsOfKind('supervision.provider-wall.gru-window-recovered-2.quota_wall')).toHaveLength(0);
   } finally {
     h.dispose();
   }
