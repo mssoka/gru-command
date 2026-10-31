@@ -33,6 +33,7 @@ import { stageSpawnRegistration } from '../runtime/spawn-registration.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { surfaceDirectiveRecovery } from '../dispatch/directive-progress.js';
 import { observeDisposalSettlement } from '../runtime/disposal-observation.js';
+import { classifyProviderRejection } from '../provider-recovery/classify.js';
 import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDebt } from './restart-cleanup.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -1839,6 +1840,15 @@ export class Supervisor {
       return;
     }
     const deterministicClass = deterministicFailureClass(reason, source?.typed);
+    // Owner ruling chat-wait-dont-stop-20261031 (option dont-stop): an
+    // eligible temporary provider usage window is NOT a stop for the Gru
+    // chat agent. `!allowRestart` is the in-band discriminator: the fatal
+    // path and the hang ladder pass `true`, so this branch can never
+    // weaken their recovery.
+    if (!allowRestart && this.chatSurvivesProviderWindow(agent, deterministicClass, source)) {
+      this.settleTurnForProviderWindow(agent, deterministicClass, source);
+      return;
+    }
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
@@ -1995,6 +2005,106 @@ export class Supervisor {
         if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(replay);
         await replay;
       }
+    }
+  }
+
+  /** Owner ruling chat-wait-dont-stop-20261031 (option dont-stop): would
+   * this failure be an ELIGIBLE temporary provider usage window for the Gru
+   * chat agent? Pure and narrow — one role, one class, typed evidence, and
+   * the provider-recovery sensor's own boundary classifier (429 / GLM
+   * 1302/1308; never 401/402/403/1113). `providerSupportsSensor` is
+   * deliberately NOT required: that gate exists for the wait adapter, and
+   * this path probes nothing. */
+  private chatSurvivesProviderWindow(
+    agent: SupervisedAgent,
+    failureClass: string,
+    source: ProviderErrorSource | null,
+  ): boolean {
+    if (!this.cfg.enabled) return false;
+    if (agent.role !== 'gru') return false;
+    if (failureClass !== 'quota_wall') return false;
+    if (agent.breakerOpen || agent.inRestart || agent.handle === null) return false;
+    const provider = source?.provider ?? null;
+    const model = source?.model ?? null;
+    const typed = source?.typed ?? null;
+    // Typed provider-response provenance is mandatory: prose alone can never
+    // establish a usage window.
+    if (provider === null || provider === '' || model === null || model === '' || typed === null) return false;
+    return classifyProviderRejection({
+      provider,
+      model,
+      errorMessage: source?.error ?? '',
+      ...(typed.status !== undefined ? { status: typed.status } : {}),
+      ...(typed.bodyCode !== undefined ? { bodyCode: typed.bodyCode } : {}),
+      ...(typed.retryAfterMs !== undefined ? { retryAfterMs: typed.retryAfterMs } : {}),
+    }).kind === 'temporary-recoverable';
+  }
+
+  /** Settle an eligible chat usage window IN PLACE: the agent stays up and
+   * its session/slot are kept. The failed turn is concluded so it can never
+   * read as a hang, no captured turn is retained for a later restart rung
+   * to replay, and the wall stays VISIBLE as one machine notice without
+   * being a stop. */
+  private settleTurnForProviderWindow(
+    agent: SupervisedAgent,
+    failureClass: string,
+    source: ProviderErrorSource | null,
+  ): void {
+    // Sampled before the cleanup below (it always clears the turn).
+    const hadOpenTurn = agent.openTurn;
+    // The cleanup half of a stop (plus what `turn_end` clears): without it
+    // the finished turn becomes a hang candidate and climbs the restart
+    // ladder. `backgroundTasks` is only read while a turn is open.
+    agent.openTurn = false;
+    agent.openControl = false;
+    agent.openToolCalls.clear();
+    agent.backgroundTasks = [];
+    // Never capture the chat turn: a later restart rung would replay this
+    // failed prompt through recoverInterruptedTurn and duplicate the user's
+    // message.
+    agent.pendingRecovery = null;
+    this.recordEvent('supervision.provider-window', agent.agentId, {
+      class: failureClass,
+      role: agent.role,
+      provider: source?.provider ?? null,
+      model: source?.model ?? null,
+      status: source?.typed?.status ?? null,
+      body_code: source?.typed?.bodyCode ?? null,
+      retry_after_ms: source?.typed?.retryAfterMs ?? null,
+      had_open_turn: hadOpenTurn,
+    });
+    this.log('warn', 'temporary provider usage window — chat turn settled in place, agent stays up', {
+      agent_id: agent.agentId,
+      class: failureClass,
+      provider: source?.provider ?? null,
+      model: source?.model ?? null,
+      retry_after_ms: source?.typed?.retryAfterMs ?? null,
+      had_open_turn: hadOpenTurn,
+    });
+    try {
+      // A NEW kind, never `supervision.provider-wall.*`: that kind is the
+      // durable-stop fallback control the boot lookup binds and the sensor
+      // hand-back keys on. `unacked` reuses the open row while the same
+      // window keeps rejecting turns.
+      this.notifications.postIncident({
+        kind: `supervision.provider-window.${agent.agentId}.${failureClass}`,
+        routing: 'action-required',
+        severity: 'error',
+        title: `Agent ${agent.agentId}: the provider usage window rejected a chat turn — the agent stayed up`,
+        detail:
+          'The chat turn failed on a temporary provider usage window (not a stop). ' +
+          'The agent and its session stayed up; no restart, breaker or re-arm was scheduled. ' +
+          'Send a new message once the window reopens.',
+        agentId: agent.agentId,
+        dedupe: 'unacked',
+      });
+    } catch (error) {
+      // The settle itself must never fail: a notice fault is logged, and the
+      // ledger event above still records the window.
+      this.log('error', 'provider-window notice could not be posted', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
     }
   }
 
