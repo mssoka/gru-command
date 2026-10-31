@@ -46,7 +46,7 @@ JS
 helper='binds a verification event to its command by the raw line or its masked form, and no other (#534 R2)'
 readback='records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)'
 gate='P37 a declared full command carrying a credential still settles the gate: its masked verification events bind to it (#534 R2)'
-for pair in "ledger-api:$helper" "verification-server:$readback" "directive-retirement:$gate"; do
+for pair in "ledger-api-records-command:$helper" "verification-server:$readback" "directive-retirement:$gate"; do
   file=${pair%%:*}
   title=${pair#*:}
   if ! grep -qF "it('$title'" "test/$file.test.ts"; then
@@ -56,7 +56,7 @@ for pair in "ledger-api:$helper" "verification-server:$readback" "directive-reti
 done
 node tools/patch-vitest-rpc-timeout.mjs
 set +e
-npx vitest run --reporter=json --outputFile="$d/fast-results.json" test/ledger-api.test.ts test/directive-retirement.test.ts -t '#534'
+npx vitest run --reporter=json --outputFile="$d/fast-results.json" test/ledger-api.test.ts test/ledger-api-records-command.test.ts test/directive-retirement.test.ts -t '#534'
 fast=$?
 npx vitest run --reporter=json --outputFile="$d/heavy-results.json" --config vitest.heavy.config.ts test/verification-server.test.ts -t '#534'
 heavy=$?

@@ -36,6 +36,10 @@ rm -f "$d/base.tar"
 # Every test-side file the continuation adds or edits (tests and helpers), as
 # committed at the candidate head.
 git diff --name-only --diff-filter=AM "$base" "$headrev" -- test | while IFS= read -r f; do
+  # The `recordsCommand` helper pin is a head-side unit guard for a symbol this
+  # archived base does not export; copied in, it would only add a runtime
+  # TypeError to the leg and say nothing about the fail-before claim.
+  case "$f" in test/ledger-api-records-command.test.ts) continue;; esac
   mkdir -p "$d/$(dirname "$f")"
   git show "$headrev:$f" > "$d/$f"
 done

@@ -307,6 +307,10 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     [`curl -u "deploy":${ARGV_SECRET} https://host/x`, `curl -u "deploy":${REDACTION_PLACEHOLDER} https://host/x`],
     [`curl -u "deploy:${ARGV_SECRET} word" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
     [`curl -u 'deploy:${ARGV_SECRET} word' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    // A token flag's case does not matter: the `=` form is masked by the
+    // case-insensitive keyword rule, so the space form masks alike.
+    [`curl --TOKEN ${ARGV_SECRET} https://host/x`, `curl --TOKEN ${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl --Token ${ARGV_SECRET} https://host/x`, `curl --Token ${REDACTION_PLACEHOLDER} https://host/x`],
     // Each occurrence in one command line.
     [`cli --token ${ARGV_SECRET} -u a:${ARGV_SECRET}`, `cli --token ${REDACTION_PLACEHOLDER} -u a:${REDACTION_PLACEHOLDER}`],
   ];

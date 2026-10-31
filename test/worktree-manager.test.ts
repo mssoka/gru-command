@@ -2927,3 +2927,32 @@ describe('#534 R1: a process is the recorded one by the digest of its raw comman
     expect(h.ledger.listEvents({ limit: 300 }).find((event) => event.kind === 'worktree.kill-confirmed')?.payload).toMatchObject({ pids: [pid] });
   });
 });
+
+describe('worktree process rows recorded before the digest', () => {
+  it('the sweep re-records a masked registry row that has no digest without masking its text a second time', async () => {
+    const h = harness(); // injected enumerator returns []: the tracked pid is no longer rooted in the lane
+    const repo = h.make();
+    ledgerJob(h, 'job-argv-stale-mask', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-argv-stale-mask' });
+    const outsider = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    try {
+      // A registry row written before the digest existed: its line is already masked, and the
+      // placeholder is glued to `;`, so a second masking pass would rewrite the recorded text.
+      const recorded = 'cli --token [REDACTED];echo done';
+      h.ledgerDb.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+        VALUES ('job-argv-stale-mask', ?, ?, 'registry', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(outsider.pid as number, recorded);
+      const swept = await h.manager.release({ worktreeId: 'job-argv-stale-mask' });
+      expect(swept.status).toBe('swept');
+      // The stale row is reconciled to its end, and its audit text is the text it was recorded with.
+      expect(h.ledger.listWorktreeProcesses('job-argv-stale-mask').find((proc) => proc.pid === outsider.pid))
+        .toMatchObject({ state: 'killed', command: recorded, commandSha256: null });
+      expect(outsider.kill(0)).toBe(true);
+    } finally {
+      try {
+        outsider.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+});

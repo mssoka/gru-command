@@ -141,7 +141,7 @@ const REDACTIONS: readonly Redaction[] = [
   // A whole quoted value (`-u "deploy:secret with space"`) runs to its own
   // closing quote, so the password's spaces are inside the mask.
   replacing(new RegExp(`(\\bAuthorization\\s*:\\s*token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
-  replacing(new RegExp(`(?<![A-Za-z0-9-])(--token\\s+)${ARGV_VALUE}`, 'gu'), keepPrefix),
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(--token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
   // A whole-quoted value runs to its own closing quote, so a password that
   // holds the other quote character (`-u "deploy:it's-secret"`) still masks
   // whole; the two delimiter-specific passes keep the quotes as `ps` shows

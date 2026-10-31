@@ -3637,8 +3637,11 @@ export class LedgerApi {
    * with the SHA-256 of the raw line beside it: the masked text is for display,
    * the digest is what a later decision that a live process is this one
    * compares. A caller that holds a row it read back (not a raw line) passes
-   * that row's `commandSha256` through, `null` when the row has none (a row
-   * from before the digest may hold the line as listed, so it is masked). */
+   * that row's `commandSha256` through, `null` when the row has none, and its
+   * recorded text is kept exactly as it is: masking a row's own display text
+   * again would rewrite a line whose placeholder touches `;` or `)` (masking
+   * is not idempotent), and a row without a digest has no identity to keep or
+   * gain. */
   recordWorktreeProcesses(input: {
     worktreeId: string;
     processes: readonly { pid: number; command: string; evidence: string; commandSha256?: string | null }[];
@@ -3673,10 +3676,14 @@ export class LedgerApi {
            evidence = CASE WHEN excluded.evidence = 'lane-token' OR (state <> 'live' AND excluded.state = 'live') THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
+        // `undefined` is a raw line the caller holds (a fresh enumeration or a
+        // registry write): it is masked and digested here. A row read back from
+        // this table passes its digest through — the string, or `null` when it
+        // has none — and its recorded text is stored unchanged: re-masking a
+        // masked line is not idempotent for a placeholder glued to `;` or `)`,
+        // so it would silently rewrite the row's audit text.
         const digest = proc.commandSha256 === undefined ? processCommandSha256(proc.command) : proc.commandSha256;
-        // A row read back with its digest holds its masked text already (a row is only given a digest by this write),
-        // and masking is not idempotent for every shape, so that text is kept as it is.
-        const command = typeof proc.commandSha256 === 'string' ? proc.command : redactCredentials(proc.command);
+        const command = proc.commandSha256 === undefined ? redactCredentials(proc.command) : proc.command;
         upsert.run(input.worktreeId, proc.pid, command, digest, proc.evidence, input.state, ts, ts);
       }
       this.appendEvent({
