@@ -288,7 +288,8 @@ const WINDOW_MS = 3_600_000;
  * and whose job has no spawning/streaming agent left: the agent is gone and
  * nothing live owns the lane. Each disposition CALLER records its own reason
  * (`tickRoute` vs the probe's re-validation), so the audit trail says where
- * the retirement was seen. */
+ * the retirement was seen. Distinct from `waiter-invalid` on purpose: the
+ * audit trail must say the lane was empty, not that the waiter was malformed. */
 const WAITER_GONE_WHY = 'waiter-gone';
 const WAITER_GONE_DURING_CHECK_WHY = 'waiter-gone-during-check';
 
@@ -586,6 +587,35 @@ export class ProviderRecoverySensor {
       // provider recovery). Delivered/in-review WITHOUT an active round is
       // expected churn (the round already settled or never opened).
       if (job.status === 'in-review' && this.hasActiveReviewRound(wait.jobId)) return 'hold';
+      // A wait whose recorded agent is DISPOSED protects no work: the
+      // 2026-10-30T17:59Z provider wall stopped those minions and they never
+      // came back, so the wait only fences the lane's next directive. Retire
+      // it through the normal waiter disposition path, but ONLY while nothing
+      // live owns the lane: any agent for the job in `spawning`/`streaming` —
+      // implementer, review-only session or tracked child — keeps the wait. An
+      // ABSENT agent row is unknown, never gone (fixtures and legacy rows
+      // establish waits without a registered agent), and an `error` agent may
+      // still be resumed.
+      //
+      // This deliberately OUTRANKS the establishment-status hold below: a job
+      // that was already blocked/delivered/in-review when the wait was
+      // established still has no owner once its agent is disposed, and the
+      // 2026-10-31 re-brief records three 25-hour waits fenced by exactly that
+      // ordering, unrecoverable after the credential rotated. Every check
+      // ABOVE still wins — terminal, retired debt, parked, newer implementer,
+      // incident currency, suspension and an active review round all encode
+      // real work or real authority, and a live agent vetoes retirement here.
+      const waiterAgent = wait.agentId !== null ? this.ledger.getAgent(wait.agentId) : null;
+      if (waiterAgent !== null && waiterAgent.state === 'disposed') {
+        const live = this.ledger
+          .listAgents()
+          .some(
+            (agent) =>
+              agent.jobId === job.id &&
+              (agent.state === 'spawning' || agent.state === 'streaming'),
+          );
+        if (!live) return 'retire';
+      }
       // Generic/unknown block: the job was ALREADY blocked/delivered/in-review
       // when the provider stop was classified — the interrupted-turn churn
       // explanation does not apply; hold with zero I/O until ruled otherwise.
@@ -599,27 +629,6 @@ export class ProviderRecoverySensor {
         }
       } else if (atEstablishment === 'delivered' || atEstablishment === 'in-review') {
         return 'hold';
-      }
-      // LAST, after every check above has had its say: a wait whose recorded
-      // agent is DISPOSED protects no work — the 2026-10-30T17:59Z provider
-      // wall stopped those minions and they never came back, so the wait only
-      // fences the lane's next directive. Retire it through the normal waiter
-      // disposition path, but ONLY while nothing live owns the lane: any
-      // agent for the job in `spawning`/`streaming` — implementer,
-      // review-only session or tracked child — keeps the wait. An ABSENT
-      // agent row is unknown, never gone (fixtures and legacy rows establish
-      // waits without a registered agent), and an `error` agent may still be
-      // resumed. Supersede/hold above always win.
-      const waiterAgent = wait.agentId !== null ? this.ledger.getAgent(wait.agentId) : null;
-      if (waiterAgent !== null && waiterAgent.state === 'disposed') {
-        const live = this.ledger
-          .listAgents()
-          .some(
-            (agent) =>
-              agent.jobId === job.id &&
-              (agent.state === 'spawning' || agent.state === 'streaming'),
-          );
-        if (!live) return 'retire';
       }
       // Otherwise: current approved continuation — eligible through the
       // expected post-establishment status churn.
