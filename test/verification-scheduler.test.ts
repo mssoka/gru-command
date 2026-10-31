@@ -816,19 +816,22 @@ describe('verification scheduler — global budget', () => {
   });
 
   it('an output pipe a stray descendant still holds at the drain cut-off is closed by the runner, never a failed run (#523 verification repair)', async () => {
-    // #523's guards scope went red on an exit-0 vitest step whose pipes were
-    // still open 2s after the shell exited: the runner then destroyed its own
-    // pipes and recorded the iteration's ERR_STREAM_PREMATURE_CLOSE as the
-    // run's error. A background `sleep` inherits the step's stdout/stderr and
-    // outlives its exit-0 shell, so this reproduces that window every time.
+    // #523's guards scope went red on an exit-0 step whose pipes were still
+    // open 2s after the shell exited: the runner destroyed its own pipes HARD
+    // (the iteration then reports ERR_STREAM_PREMATURE_CLOSE), and because the
+    // late error landed while the NEXT step ran, that innocent step was marked
+    // failed and the whole run was not promotable. A background `sleep`
+    // inherits the step's stdout/stderr and outlives its exit-0 shell, so this
+    // reproduces the window every time; the second step is what the late error
+    // used to fall on.
     const { scheduler, records } = makeScheduler();
     scheduler.start();
     const frames: VerificationProgress[] = [];
     const outcome = await scheduler.run(
-      spec('job-stray-pipe', '/bin/sh -c "sleep 3 & exit 0"'),
+      spec('job-stray-pipe', '/bin/sh -c "sleep 3 & exit 0" && node -e "process.exit(0)"'),
       (frame) => { frames.push(frame); },
     );
-    // The exit verdict stands: no manufactured run error, no failed step.
+    // The exit verdict stands: no manufactured run error, no innocent step red.
     expect(outcome.exitCode).toBe(0);
     expect(outcome.error).toBeNull();
     expect(outcome.ok).toBe(true);
@@ -838,7 +841,7 @@ describe('verification scheduler — global budget', () => {
       .filter((frame): frame is Extract<VerificationProgress, { type: 'output' }> => frame.type === 'output')
       .map((frame) => frame.text)
       .join('');
-    expect(output).toContain('output pipes were still open 2s after the step exited; the runner closed them (the exit verdict stands)');
+    expect(output).toContain('step 1: output pipes were still open 2s after the step exited; the runner closed them (the exit verdict stands)');
     expect(records.find((record) => record.kind === 'verification.completed')?.payload).toMatchObject({ ok: true, exit_code: 0 });
     expect(scheduler.activeCount()).toBe(0);
   });
