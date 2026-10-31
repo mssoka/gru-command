@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -12,6 +13,7 @@ import {
   captureOwnerPath,
   captureReceiptPath,
   captureReceiptSucceeded,
+  captureRefusalDetail,
   identityMismatch,
   openExclusiveCaptureSink,
   parseCapturedNdjson,
@@ -76,6 +78,7 @@ function ownerRecord(sink: string, overrides: Partial<CaptureOwnerRecord> = {}):
   };
 }
 
+const CAPTURED_TEXT = 'ok\n';
 const COMPLETED_OUTCOME = {
   runId: 'run-capture-1',
   jobId: 'job-capture',
@@ -91,9 +94,12 @@ const COMPLETED_OUTCOME = {
   sha: 'a'.repeat(40),
   trackedDirty: false,
   workers: 2,
-  outputBytes: 128,
-  outputSha256: 'b'.repeat(64),
-  outputTail: 'ok',
+  // Internally consistent with the `output` frame below: a completed run is
+  // promotable only when the sink's reassembled output equals these numbers
+  // (issue #554), so the fixture states the truth it streams.
+  outputBytes: Buffer.byteLength(CAPTURED_TEXT),
+  outputSha256: createHash('sha256').update(CAPTURED_TEXT).digest('hex'),
+  outputTail: CAPTURED_TEXT,
   error: null,
 };
 
@@ -101,7 +107,7 @@ function completedNdjson(outcome: Record<string, unknown> = COMPLETED_OUTCOME): 
   return (
     `${JSON.stringify({ type: 'queued', runId: outcome['runId'], position: 0, active: 0, limit: 1 })}\n` +
     `${JSON.stringify({ type: 'started', runId: outcome['runId'], workers: 2, sha: outcome['sha'], queuedMs: 3 })}\n` +
-    `${JSON.stringify({ type: 'output', runId: outcome['runId'], stream: 'stdout', text: 'ok\\n' })}\n` +
+    `${JSON.stringify({ type: 'output', runId: outcome['runId'], stream: 'stdout', text: CAPTURED_TEXT })}\n` +
     `${JSON.stringify({ type: 'completed', runId: outcome['runId'], outcome })}\n`
   );
 }
@@ -144,8 +150,14 @@ describe('capture receipts', () => {
       timed_out: false,
       output_bytes: 128,
       output_sha256: 'b'.repeat(64),
+      captured_output_bytes: 128,
+      captured_output_sha256: 'b'.repeat(64),
+      replayed_output: null,
+      attempts: 1,
+      abandoned_after_ms: null,
       started: true,
       error: null,
+      detail: null,
       completed_at: '2026-10-06T12:00:00.000Z',
       ...overrides,
     };
@@ -167,6 +179,32 @@ describe('capture receipts', () => {
     expect(captureReceiptSucceeded(receipt({ reconciled: true }))).toBe(false);
     expect(captureReceiptSucceeded(receipt({ exit_code: null }))).toBe(false);
     expect(captureReceiptSucceeded(receipt({ exit_code: 7, ok: false }))).toBe(false);
+  });
+
+  it('#554: completeness is part of the same predicate — the sink must hold the run\'s exact output', () => {
+    // A completed run whose sink is missing output bytes is not success …
+    expect(captureReceiptSucceeded(receipt({ captured_output_bytes: 127 }))).toBe(false);
+    expect(captureReceiptSucceeded(receipt({ captured_output_sha256: 'd'.repeat(64) }))).toBe(false);
+    // … and a reconciled replay is promotable only when it carried the
+    // run's output from byte 0.
+    expect(captureReceiptSucceeded(receipt({ reconciled: true, replayed_output: 'complete' }))).toBe(true);
+    expect(captureReceiptSucceeded(receipt({ reconciled: true, replayed_output: 'incomplete' }))).toBe(false);
+    expect(captureReceiptSucceeded(receipt({ reconciled: true, replayed_output: 'none' }))).toBe(false);
+    expect(captureReceiptSucceeded(receipt({ reconciled: true, replayed_output: null }))).toBe(false);
+    // A live capture records no replay marker; the numbers alone decide.
+    expect(captureReceiptSucceeded(receipt({ replayed_output: 'complete' }))).toBe(true);
+
+    // The refusal detail names what is missing (required for A3).
+    expect(captureRefusalDetail(receipt())).toBeNull();
+    const missingOutput = captureRefusalDetail(receipt({ captured_output_bytes: 100 }));
+    expect(missingOutput).toContain('capture is incomplete');
+    expect(missingOutput).toContain('28 bytes of output are missing');
+    expect(missingOutput).toContain('run-1');
+    const missingReplay = captureRefusalDetail(receipt({ reconciled: true, replayed_output: 'none' }));
+    expect(missingReplay).toContain('replayed capture is incomplete');
+    expect(missingReplay).toContain('replayed_output: "none"');
+    expect(missingReplay).toContain('verification.completed');
+    expect(missingReplay).toContain('do not rerun');
   });
 
   it('counts torn/malformed records, foreign run ids, and post-terminal frames', () => {
@@ -659,10 +697,12 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(Date.now() - started).toBeLessThan(5_000);
 
       // The capture command records it in the receipt as UNKNOWN — never a hang.
+      // #554 bounds the re-submit loop with `--wait-budget-ms` so the same
+      // never-answering service ends the helper well inside this test.
       const dir = tempDir();
       const sinkPath = join(dir, 'hung.ndjson');
       const code = await runCaptureCli(
-        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-hung', '--url', base, '--token', 't'],
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-hung', '--url', base, '--token', 't', '--wait-budget-ms', '300'],
         deps({ stdout: () => {}, responseHeadersTimeoutMs: 150 }),
       );
       expect(code).toBe(CAPTURE_EXIT.unknown);
@@ -670,6 +710,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(receipt.outcome).toBe('unknown');
       expect(receipt.error).toContain('no response within 150 ms');
       expect(receipt.error).toContain(CAPTURE_RESPONSE_TIMEOUT_CODE);
+      expect(receipt.abandoned_after_ms).not.toBeNull();
 
       // `status` uses the same bounded transport.
       const errors: string[] = [];
@@ -954,7 +995,191 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(receipt.outcome).toBe('completed');
     expect(receipt.reconciled).toBe(true);
     expect(captureReceiptSucceeded(receipt)).toBe(false);
-    expect(receipt.error).toContain('replayed terminal receipt');
+    // A reconciled replay that carried no output marker at all is treated as
+    // having carried none: the detail names what is missing and the ledger.
+    expect(receipt.error).toContain('replayed capture is incomplete');
+    expect(receipt.error).toContain('replayed_output');
+  });
+
+  it('#554: only a response-headers timeout re-submits — the same request id and body, never a connect refusal', async () => {
+    const headersTimeout = (ms: number): Error =>
+      Object.assign(
+        new Error(`POST http://127.0.0.1:9/api/verify: no response within ${String(ms)} ms (connect + response headers)`),
+        { code: CAPTURE_RESPONSE_TIMEOUT_CODE },
+      );
+    const dir = tempDir();
+    // (a) A refused connection is today's single-attempt UNKNOWN: re-submitting
+    // a request the service never saw as this identity recovers nothing.
+    const refusedSink = join(dir, 'refused.ndjson');
+    let refusedCalls = 0;
+    const refused = await runCaptureCli(
+      [...BASE_ARGS, '--sink', refusedSink, '--request-id', 'req-no-retry', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({
+        stdout: () => {},
+        sleep: async () => {},
+        fetchImpl: async () => {
+          refusedCalls += 1;
+          throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9'), { code: 'ECONNREFUSED' });
+        },
+      }),
+    );
+    expect(refusedCalls).toBe(1);
+    expect(refused).toBe(CAPTURE_EXIT.unknown);
+
+    // (b) A headers timeout re-submits the SAME `request_id` and body until a
+    // response arrives; the sink and receipt are byte-identical to a capture
+    // that was answered on the first try.
+    const sinkPath = join(dir, 'resubmit.ndjson');
+    const bodies: string[] = [];
+    let calls = 0;
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-resubmit', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({
+        stdout: () => {},
+        sleep: async () => {},
+        fetchImpl: async (_input: string, init?: RequestInit): Promise<Response> => {
+          calls += 1;
+          bodies.push(String(init?.body));
+          if (calls === 1) throw headersTimeout(150);
+          return new Response(completedNdjson(), { status: 200 });
+        },
+      }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    expect(calls).toBe(2);
+    expect(bodies[0]).toBe(bodies[1]);
+    expect(JSON.parse(bodies[1] ?? '{}')).toMatchObject({
+      request_id: 'req-resubmit',
+      job_id: 'job-capture',
+      scope: 'full',
+    });
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt!.attempts).toBe(2);
+    expect(receipt!.abandoned_after_ms).toBeNull();
+    expect(receipt!.replayed_output).toBeNull();
+    expect(captureReceiptSucceeded(receipt!)).toBe(true);
+    expect(readFileSync(sinkPath, 'utf-8')).toBe(completedNdjson());
+  });
+
+  it('A4 #554: --wait-budget-ms abandons a never-answering service loudly and names the request id', async () => {
+    const hung = createServer(() => {
+      // Accepts the connection and never answers.
+    });
+    await new Promise<void>((resolveListen) => hung.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const base = `http://127.0.0.1:${String((hung.address() as AddressInfo).port)}`;
+      const dir = tempDir();
+      const sinkPath = join(dir, 'abandoned.ndjson');
+      const started = Date.now();
+      const code = await runCaptureCli(
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-a4-abandon', '--url', base, '--token', 't', '--wait-budget-ms', '300'],
+        deps({ stdout: () => {}, responseHeadersTimeoutMs: 60 }),
+      );
+      // Bounded: the helper exits inside 5 s instead of waiting out 60 s.
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(code).toBe(CAPTURE_EXIT.unknown);
+      const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+      expect(receipt!.outcome).toBe('unknown');
+      expect(receipt!.abandoned_after_ms).toBeGreaterThanOrEqual(250);
+      expect(receipt!.abandoned_after_ms).toBeLessThan(5_000);
+      expect(receipt!.attempts).toBeGreaterThan(1);
+      expect(receipt!.request_id).toBe('req-a4-abandon');
+      // The detail names the identity and the reconcile path — never a silent
+      // 0-byte "nothing happened".
+      expect(receipt!.error).toContain('req-a4-abandon');
+      expect(receipt!.error).toContain('may still be accepted and complete');
+      expect(receipt!.error).toContain('status action');
+      expect(receipt!.error).toContain('verification.completed');
+      expect(receipt!.error).toContain(CAPTURE_RESPONSE_TIMEOUT_CODE);
+      expect(receipt!.detail).toBe(receipt!.error);
+      expect(captureReceiptSucceeded(receipt!)).toBe(false);
+    } finally {
+      hung.closeAllConnections();
+      await new Promise<void>((resolveClose) => hung.close(() => resolveClose()));
+    }
+  });
+
+  it('#554: a sink missing output bytes is unpromotable and names what is missing', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'short.ndjson');
+    const wholeOutput = 'ok\nmore\n';
+    const outcome = {
+      ...COMPLETED_OUTCOME,
+      outputBytes: Buffer.byteLength(wholeOutput),
+      outputSha256: createHash('sha256').update(wholeOutput).digest('hex'),
+      outputTail: wholeOutput,
+    };
+    const body =
+      `${JSON.stringify({ type: 'output', runId: 'run-capture-1', stream: 'stdout', text: CAPTURED_TEXT })}\n` +
+      `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome })}\n`;
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-short', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ fetchImpl: async () => new Response(body, { status: 200 }), stdout: () => {} }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.failed);
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt!.outcome).toBe('completed');
+    expect(receipt!.reconciled).toBe(false);
+    expect(receipt!.captured_output_bytes).toBe(Buffer.byteLength(CAPTURED_TEXT));
+    expect(receipt!.captured_output_sha256).toBe(COMPLETED_OUTCOME.outputSha256);
+    expect(receipt!.output_bytes).toBe(Buffer.byteLength(wholeOutput));
+    expect(captureReceiptSucceeded(receipt!)).toBe(false);
+    expect(receipt!.error).toContain('capture is incomplete');
+    expect(receipt!.error).toContain('bytes of output are missing');
+    expect(receipt!.error).toContain('run-capture-1');
+    expect(receipt!.detail).toBe(receipt!.error);
+  });
+
+  it('#554: a reconciled replay carrying no retained output stays unpromotable even when the numbers match', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'gone.ndjson');
+    const empty = createHash('sha256').update('').digest('hex');
+    const outcome = { ...COMPLETED_OUTCOME, outputBytes: 0, outputSha256: empty, outputTail: '' };
+    const body = `${JSON.stringify({
+      type: 'completed',
+      runId: 'run-capture-1',
+      reconciled: true,
+      replayed_output: 'none',
+      outcome,
+    })}\n`;
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-gone', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ fetchImpl: async () => new Response(body, { status: 200 }), stdout: () => {} }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.failed);
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt!.reconciled).toBe(true);
+    expect(receipt!.replayed_output).toBe('none');
+    expect(receipt!.captured_output_bytes).toBe(0);
+    // Zero bytes, matching hash: still not evidence — the replay carried none.
+    expect(captureReceiptSucceeded(receipt!)).toBe(false);
+    expect(receipt!.error).toContain('replayed capture is incomplete');
+    expect(receipt!.error).toContain('replayed_output: "none"');
+    expect(receipt!.error).toContain('verification.completed');
+  });
+
+  it('#554: a reconciled replay that carried the complete output is promotable (positive control)', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'replayed-complete.ndjson');
+    const body =
+      `${JSON.stringify({ type: 'output', runId: 'run-capture-1', stream: 'stdout', text: CAPTURED_TEXT })}\n` +
+      `${JSON.stringify({
+        type: 'completed',
+        runId: 'run-capture-1',
+        reconciled: true,
+        replayed_output: 'complete',
+        outcome: COMPLETED_OUTCOME,
+      })}\n`;
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-replayed-ok', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ fetchImpl: async () => new Response(body, { status: 200 }), stdout: () => {} }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt!.reconciled).toBe(true);
+    expect(receipt!.replayed_output).toBe('complete');
+    expect(receipt!.error).toBeNull();
+    expect(captureReceiptSucceeded(receipt!)).toBe(true);
   });
 
   it('exits 1 when a completed frame lacks the full success bindings (no exit code)', async () => {

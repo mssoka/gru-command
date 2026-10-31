@@ -495,20 +495,30 @@ verification budget.
   exit/outcome and output length/hash. A stream without a valid terminal
   completion, with torn/foreign records, or whose single run identity does
   not hold across the whole stream is `unknown` and is never promoted to
-  success; a replayed terminal receipt is marked `reconciled` and is an
-  honest failure (the outcome is known, the original full capture is not
-  reconstructable, and a rerun to recover logs is refused).
+  success. A capture is complete only when the sink's reassembled `output`
+  frames (text, in order) are exactly the run's recorded
+  `output_bytes`/`output_sha256`; the receipt states both as
+  `captured_output_bytes`/`captured_output_sha256`, so a gap can never be
+  promoted.
   Connecting and receiving the response headers are bounded (60 s,
-  #389): a service that never completes the connection or never
-  answers yields an `unknown` receipt whose error names the timeout
-  (`ERESPONSETIMEOUT`) instead of a hung helper (a refused connection
-  fails at once with `ECONNREFUSED`). A request that reached the
-  service may still have been accepted, so run the helper's `status`
-  action with the same `--request-id` (recorded in the receipt) before
-  rerunning. The body itself has no idle timeout, so a long quiet run is
-  never cut off. Owned helpers are withdrawn only with identity
-  validation (pid + start time + command/cwd); malformed pid records,
-  crashes and stale owners are cleared without touching unrelated
+  #389). A headers timeout does NOT abandon an accepted request: `run`
+  re-submits the same `request_id` and body, the scheduler attaches it to
+  the in-flight run (handing back the output frames it missed, from byte 0)
+  or replays the completed run's retained output, and the total wait is
+  bounded by `--wait-budget-ms` (default 900,000 + 1,800,000 + 120,000 ms —
+  the shipped `[verify]` bounds plus a margin; the helper never reads the
+  service's limits). Only past that bound is the receipt an honest
+  `unknown` naming the request id, `abandoned_after_ms` and the reconcile
+  path (`status --request-id`, then `verification.completed` in the ledger).
+  A refused connection still fails at once, and a stream severed after the
+  headers keeps today's `unknown`. Retained output lives in the service's
+  memory only: up to 8 MiB per run and 64 MiB across runs, kept 30 minutes
+  after completion; a replay past the window or the caps says
+  `replayed_output: "none"`/`"incomplete"` and stays unpromotable instead
+  of becoming a silent 0-byte success. The body itself has no idle timeout,
+  so a long quiet run is never cut off. Owned helpers are withdrawn only
+  with identity validation (pid + start time + command/cwd); malformed pid
+  records, crashes and stale owners are cleared without touching unrelated
   processes, and sinks/receipts are preserved.
 - **One worker budget across runs.** Total test workers stay within
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run

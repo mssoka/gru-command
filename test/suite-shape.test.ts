@@ -402,8 +402,10 @@ const PINS: Record<string, number> = {
   'verdict-publication-identity.test.ts': 18,
   'verification-build-reuse.test.ts': 32,
   'verification-evidence.test.ts': 13,
+  'verification-retention-store.test.ts': 7,
   'verification-scheduler.test.ts': 58,
-  'verification-server.test.ts': 50,
+  'verification-server.test.ts': 54,
+  'verification-retention.test.ts': 7,
   'verify-perkins-resource.test.ts': 3,
   'wake-e2e.test.ts': 4,
   'wake-policy.test.ts': 24,
@@ -434,7 +436,7 @@ const PINS: Record<string, number> = {
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 10,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 47,
+  'verification-capture.test.ts': 53,
 
 };
 

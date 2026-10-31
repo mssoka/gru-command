@@ -13,6 +13,7 @@ import {
   planCommand,
   type VerificationCheck,
 } from './build-reuse.js';
+import { OutputRetention, type ReplayedOutput } from './output-retention.js';
 
 export type { VerificationCheck, VerificationCheckStatus } from './build-reuse.js';
 
@@ -140,6 +141,9 @@ export type VerificationProgress =
       readonly requestId: string | null;
       readonly head: string | null;
       readonly dedupeKey: string;
+      /** Same-`request_id` re-submits only: what the retained-output replay
+       * carried (issue #554). Absent for a different-id attacher (unchanged). */
+      readonly replayed_output?: ReplayedOutput;
     }
   | {
       readonly type: 'started';
@@ -161,6 +165,9 @@ export type VerificationProgress =
       /** True when a replayed request_id returned the recorded outcome
        * instead of running a new producer. */
       readonly reconciled?: boolean;
+      /** How much of the run's output this replay carried (issue #554): a
+       * reconciled receipt is promotable only when this is `complete`. */
+      readonly replayed_output?: ReplayedOutput;
     };
 
 export type VerificationProgressSink = (progress: VerificationProgress) => void | Promise<void>;
@@ -723,6 +730,9 @@ export class VerificationScheduler {
   private readonly attemptsByRequest = new Map<string, Attempt>();
   /** Bounded terminal request history for reconnect reconciliation. */
   private readonly requestHistory = new Map<string, RequestHistoryEntry>();
+  /** Every run's output from the first byte, kept for same-id replays
+   * (issue #554): separate from (and outliving) the bounded history above. */
+  private readonly outputRetention: OutputRetention;
   /** Append-only terminal identities: NEVER silently forgotten -> never rerun. */
   private readonly requestIndex = new Map<string, TerminalIdentity>();
   private waiters: Waiter[] = [];
@@ -762,6 +772,7 @@ export class VerificationScheduler {
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 15_000;
     this.stateFile = join(opts.storageDir, STATE_FILE);
     this.requestLogFile = join(opts.storageDir, REQUEST_LOG_FILE);
+    this.outputRetention = new OutputRetention({ now: this.now });
     this.buildReuseRoots =
       opts.buildReuse === false ? null : (opts.buildReuse?.roots ?? DEFAULT_BUILD_OUTPUT_ROOTS);
   }
@@ -1147,12 +1158,11 @@ export class VerificationScheduler {
               `recorded outcome for request_id "${requestId}" is unreadable — refusing to rerun; inspect the ledger verification.completed record`,
             );
           }
-          await this.writeFrame(sink, {
-            type: 'completed',
-            runId: history.outcome.runId,
-            outcome: history.outcome,
-            reconciled: true,
-          });
+          // A same-identity re-submit is handed the output it missed before
+          // the recorded terminal frame (issue #554): complete when every
+          // frame from the first byte is still retained, else `none` or
+          // `incomplete` so the receipt stays honestly unpromotable.
+          await this.replayCompletedOutput(history.outcome, sink);
           this.safeRecord({
             kind: 'verification.reconciled',
             jobId: resolvedSpec.jobId,
@@ -1189,12 +1199,15 @@ export class VerificationScheduler {
         ) {
           throw new VerificationRequestConflictError(requestId);
         }
-        await this.attach(bound, sink, requestId);
+        await this.attach(bound, sink, requestId, true);
         return bound.promise;
       }
       // A terminal identity whose full outcome is no longer retained (evicted
       // from the bounded history, or crash-interrupted) is NEVER rerun: the
-      // ledger holds the record; the caller mints a new identity.
+      // ledger holds the record; the caller mints a new identity. Output kept
+      // by the retention store outlives the 64-entry history bound, so a
+      // matching completed identity whose frames (and recorded outcome) are
+      // still retained replays them instead of expiring.
       const known = this.requestIndex.get(requestId);
       if (known !== undefined) {
         if (known.reason === 'scheduler_disposed') { this.retryNoStart(); throw new VerificationDisposedError(); }
@@ -1202,14 +1215,38 @@ export class VerificationScheduler {
         if (known.state === 'admission-failed') {
           this.requestIndex.delete(requestId);
         } else {
-          throw new VerificationRequestExpiredError(requestId, known.run_id, known.state);
+          const retainedOutcome =
+            known.state === 'completed' &&
+            known.job_id === resolvedSpec.jobId &&
+            known.scope === resolvedSpec.scope &&
+            known.cwd === resolvedSpec.cwd &&
+            known.command === resolvedSpec.command &&
+            known.head === head
+              ? this.outputRetention.recordedOutcome(known.run_id)
+              : null;
+          if (retainedOutcome === null) {
+            throw new VerificationRequestExpiredError(requestId, known.run_id, known.state);
+          }
+          await this.replayCompletedOutput(retainedOutcome, sink);
+          this.safeRecord({
+            kind: 'verification.reconciled',
+            jobId: resolvedSpec.jobId,
+            payload: {
+              request_id: requestId,
+              run_id: retainedOutcome.runId,
+              state: 'completed',
+              scope: resolvedSpec.scope,
+              head,
+            },
+          });
+          return retainedOutcome;
         }
       }
     }
 
     const inFlight = this.attempts.get(key);
     if (inFlight !== undefined) {
-      await this.attach(inFlight, sink, requestId);
+      await this.attach(inFlight, sink, requestId, false);
       return inFlight.promise;
     }
 
@@ -1472,13 +1509,23 @@ export class VerificationScheduler {
     };
   }
 
-  /** Attach a duplicate submission to the in-flight producer (issue #159). */
+  /** Attach a duplicate submission to the in-flight producer (issue #159).
+   * `replay` is set for a same-`request_id` re-submit: that sink alone is
+   * handed the run's retained output from byte 0 (issue #554) before the
+   * `attached` acknowledgement and the live frames. A different-`request_id`
+   * attacher is unchanged: no replay, no replay marker. */
   private async attach(
     attempt: Attempt,
     sink: VerificationProgressSink,
     requestId: string | null,
+    replay: boolean,
   ): Promise<void> {
     attempt.sinks.add(sink);
+    // Snapshot the retained prefix NOW, before any await: every output frame
+    // broadcast from here on fans out to this sink as a live frame, so the
+    // snapshot can never duplicate one. A frame broadcast earlier is already
+    // in the snapshot and was not sent to this sink.
+    const retained = replay ? this.outputRetention.replay(attempt.runId) : null;
     if (requestId !== null) {
       attempt.requestIds.add(requestId);
       this.attemptsByRequest.set(requestId, attempt);
@@ -1497,6 +1544,11 @@ export class VerificationScheduler {
         state: attempt.started ? 'running' : 'queued',
       },
     });
+    if (retained !== null && retained.frames.length > 0) {
+      // ONE queue item for the whole prefix: enqueued synchronously in order,
+      // so no live frame can interleave with the replayed frames.
+      void this.enqueueSinkFrames(attempt, sink, retained.frames);
+    }
     // The attach acknowledgement is for THIS caller only — existing
     // subscribers must not receive another client's request identity.
     await this.broadcastTo(attempt, sink, {
@@ -1506,6 +1558,7 @@ export class VerificationScheduler {
       requestId,
       head: attempt.head,
       dedupeKey: attempt.key,
+      ...(retained === null ? {} : { replayed_output: retained.replayed }),
     });
     // A terminal frame is enqueued with a snapshot of the sinks that existed
     // at that instant. An attach whose `attached` frame was queued after that
@@ -1516,6 +1569,7 @@ export class VerificationScheduler {
         type: 'completed',
         runId: attempt.runId,
         outcome: attempt.outcome,
+        ...(retained === null ? {} : { replayed_output: retained.replayed }),
       });
     }
   }
@@ -1530,15 +1584,27 @@ export class VerificationScheduler {
     sink: VerificationProgressSink,
     frame: VerificationProgress,
   ): Promise<void> {
+    return this.enqueueSinkFrames(attempt, sink, [frame]);
+  }
+
+  /** One queue item writing several frames to ONE sink, in order (replay). */
+  private enqueueSinkFrames(
+    attempt: Attempt,
+    sink: VerificationProgressSink,
+    frames: readonly VerificationProgress[],
+  ): Promise<void> {
     attempt.queue = attempt.queue.then(async () => {
-      try {
-        await sink(frame);
-      } catch (error) {
-        attempt.sinks.delete(sink);
-        this.log('warn', 'verification sink write failed; sink dropped', {
-          run: attempt.runId,
-          error: String(error),
-        });
+      for (const frame of frames) {
+        try {
+          await sink(frame);
+        } catch (error) {
+          attempt.sinks.delete(sink);
+          this.log('warn', 'verification sink write failed; sink dropped', {
+            run: attempt.runId,
+            error: String(error),
+          });
+          return;
+        }
       }
     });
     return attempt.queue;
@@ -1550,6 +1616,9 @@ export class VerificationScheduler {
    * is dropped without failing the run (the ledger outcome is the record).
    */
   private broadcast(attempt: Attempt, frame: VerificationProgress): Promise<void> {
+    // Retain output from the first byte (issue #554). This is synchronous
+    // with the enqueue below, so retention order is exactly frame order.
+    if (frame.type === 'output') this.outputRetention.retain(frame);
     // Snapshot the sinks at enqueue time: a sink that attaches AFTER an
     // already-queued frame must not receive that frame out of order — its
     // first frame is the `attached` one enqueued by attach().
@@ -1582,6 +1651,28 @@ export class VerificationScheduler {
     }
   }
 
+  /**
+   * Replay a completed run to a same-`request_id` re-submit (issue #554):
+   * the retained output frames from byte 0, then the recorded terminal frame
+   * marked `reconciled` with what the replay actually carried. A missing
+   * retained output is never hidden: `replayed_output` says `none` or
+   * `incomplete`, and the receipt built from it stays unpromotable.
+   */
+  private async replayCompletedOutput(
+    outcome: VerificationOutcome,
+    sink: VerificationProgressSink,
+  ): Promise<void> {
+    const retained = this.outputRetention.replay(outcome.runId);
+    for (const frame of retained.frames) await this.writeFrame(sink, frame);
+    await this.writeFrame(sink, {
+      type: 'completed',
+      runId: outcome.runId,
+      outcome,
+      reconciled: true,
+      replayed_output: retained.replayed,
+    });
+  }
+
   /** Run one admitted attempt and settle every attached caller exactly once. */
   private async executeAttempt(attempt: Attempt): Promise<void> {
     try {
@@ -1611,6 +1702,10 @@ export class VerificationScheduler {
         return this.broadcast(attempt, frame);
       });
       attempt.outcome = outcome;
+      // Retention is completed BEFORE the terminal broadcast: a re-submit that
+      // races the terminal either attaches (and gets the late terminal) or
+      // finds the retained output plus outcome here.
+      this.outputRetention.complete(attempt.runId, outcome);
       await this.broadcast(attempt, { type: 'completed', runId: lease.runId, outcome });
       this.rememberHistory(attempt, { state: 'completed', outcome, error: null });
       attempt.resolve(outcome);
@@ -1629,6 +1724,9 @@ export class VerificationScheduler {
       });
       attempt.reject(failure);
     } finally {
+      // A run that settled without an outcome has nothing to replay; its
+      // retained prefix must not linger as an unprunable live entry.
+      if (attempt.outcome === null) this.outputRetention.discard(attempt.runId);
       this.attempts.delete(attempt.key);
       for (const requestId of attempt.requestIds) this.attemptsByRequest.delete(requestId);
       if (attempt.lease !== null) this.release(attempt.lease);
@@ -2002,12 +2100,17 @@ export class VerificationScheduler {
     };
 
     // Every byte the caller sees is hashed here, so the exact-output proof
-    // also covers the scheduler's own reuse note.
+    // also covers the scheduler's own reuse note. The count/hash/tail are
+    // updated PER FRAME immediately before that frame is enqueued: the sink
+    // chain is the only serialization point, so two concurrent consumers
+    // (stdout, stderr) can interleave their frames across `await`s, and only
+    // this order makes `output_sha256` the hash of the concatenated frame
+    // text that a capture actually reassembles (issue #554).
     const emit = async (streamName: 'stdout' | 'stderr', text: string): Promise<void> => {
-      outputBytes += Buffer.byteLength(text);
-      hash.update(text);
-      outputTail = (outputTail + text).slice(-OUTPUT_TAIL_MAX_BYTES);
       for (const frame of splitFrames(text)) {
+        outputBytes += Buffer.byteLength(frame);
+        hash.update(frame);
+        outputTail = (outputTail + frame).slice(-OUTPUT_TAIL_MAX_BYTES);
         await sink({ type: 'output', runId: lease.runId, stream: streamName, text: frame });
       }
     };

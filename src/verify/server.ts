@@ -439,10 +439,14 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     // or a request_id replay is an existing producer/record, not a new
     // admission, and still reconciles below. The scope is already validated,
     // so the refusal row names a declared scope.
+    const existingRequestState = (): VerificationAttemptState =>
+      requestId === undefined ? 'unknown' : scheduler.attemptStatus({ requestId }).state;
+    const existingRequest = (): boolean => {
+      const state = existingRequestState();
+      return state === 'accepted' || state === 'running' || state === 'completed';
+    };
     if (job.status === 'parked') {
-      const prior = requestId === undefined ? 'unknown' : scheduler.attemptStatus({ requestId }).state;
-      const existing = prior === 'accepted' || prior === 'running' || prior === 'completed';
-      if (!existing) {
+      if (!existingRequest()) {
         ledger.appendCustomEvent({
           kind: 'verification.refused',
           jobId,
@@ -461,8 +465,12 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     // Exact-head evidence (issue #159): when the caller names the head it
     // intends to verify, a lane that moved is refused before any producer
     // exists. The run itself still binds the true head it reads at spawn.
+    // Issue #554: a re-submit whose request_id is already accepted, running
+    // or completed is an existing producer/record — a reconnect after a
+    // headers timeout — and is never refused as a NEW head_changed
+    // verification; a fresh request_id keeps the refuse-on-moved-lane rule.
     const git = readGitState(lane.path);
-    if (expectedHead !== undefined && git.sha !== expectedHead) {
+    if (expectedHead !== undefined && git.sha !== expectedHead && !existingRequest()) {
       json(res, 409, {
         error: 'head_changed',
         detail:
@@ -482,6 +490,17 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       'cache-control': 'no-store',
       connection: 'close',
     });
+    // Issue #554: writeHead alone does not put the header block on the wire
+    // (Node flushes it with the first body write). A saturated event loop or a
+    // back-pressured sibling sink can delay that first frame past a client's
+    // connect+headers bound; the accept must be visible immediately. A peer
+    // that vanished first has nobody to stream to — the run still proceeds and
+    // the ledger records it.
+    try {
+      res.flushHeaders();
+    } catch {
+      /* the socket is already gone; writeFrame drops a dead sink */
+    }
     let closed = false;
     // Terminal for THIS stream: once `completed`/`error` is written, no
     // transport frame may follow it (a post-terminal frame would be counted
