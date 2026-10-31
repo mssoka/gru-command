@@ -76,6 +76,7 @@ class Harness {
       slotReArm: this.reArmPort(),
       silasHosted: () => this.silasEnabled,
       now: () => this.clockMs,
+      log: (level, msg, fields) => { if (level === 'error') console.error('[sensor-error]', msg, JSON.stringify(fields ?? {})); },
       ...(metadataReaders !== undefined ? { metadataReaders } : {}),
     });
   }
@@ -862,6 +863,15 @@ describe('disposed waiter retirement (waiter-gone)', () => {
     h.ledger.setAgentState('agent-m-blocked', 'disposed');
 
     await h.sensor.tick();
+
+    console.error('WAITER-GONE-DIAG', JSON.stringify({
+      wait: h.ledger.getProviderWait(waits.get('gone')!.id),
+      job: h.ledger.getJob('job-m-gone'),
+      agent: h.ledger.getAgent('agent-m-gone'),
+      route: h.ledger.getProviderRoute(waits.get('gone')!.routeKey),
+      implementers: h.ledger.listImplementerMinions('job-m-gone').map((a) => ({ id: a.id, createdAt: a.createdAt, state: a.state })),
+      allAgents: h.ledger.listAgents().filter((a) => a.jobId === 'job-m-gone'),
+    }));
 
     // The one row this rule changes.
     expect(h.ledger.getProviderWait(waits.get('gone')!.id)?.status).toBe('cancelled');
