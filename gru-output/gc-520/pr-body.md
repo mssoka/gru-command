@@ -32,14 +32,14 @@ Every scope ran through the authenticated verify scheduler. The property-real fi
 
 | Scope | Head | Run id | Outcome |
 |---|---|---|---|
-| `gc-520-focused` | 99432789 | `a2a40ec1-5cad-4bd2-91e1-3ebcd4d92da6` | exit 0 |
-| `gc-520-static` | 99432789 | `90f169f7-356e-4a1b-b2c3-d48517feb81e` | exit 0 |
-| `gc-520-msg-check` | 99432789 | `466d93f4-4a24-422b-8939-7cdef480b1f8` | exit 0 |
-| `gc-520-red` | 99432789 | `b9413df6-f899-48f6-980f-2652258efd66` | exit 1 by design; classifier RED PROVEN for A1-A6 at the contract's base |
-| `gc-520-red-4a269d13` | 99432789 | `216eba76-766e-454b-8c31-a88af9c00cc0` | exit 1 by design; classifier RED PROVEN for the six cases at the earlier lane's head |
-| `full` | 99432789 | `309b1ec5-b6f5-44e5-925c-42e898340a1c`, `3932691b-f657-4a7c-a08b-730356b63551` | **not green**: host-load timeouts in untouched tests (see below) |
+| `gc-520-focused` | `b6c83574` | `e3b2800c-e0a1-459a-93e2-5c9a9154d0cc` | exit 0 |
+| `gc-520-static` | `b6c83574` | `18ea4a10-5b7c-4584-9e3c-078ce63317bd` | exit 0 |
+| `gc-520-msg-check` | `b6c83574` | `8157272f-5e13-4417-bbcf-fa34458035d1` | exit 0 (re-run at this text's own head below) |
+| `full` | `b6c83574` | `02d82039-db52-49ce-b710-615a423cd6af` | exit 0 (fast and heavy phases) |
+| `gc-520-red` | `99432789` | `b9413df6-f899-48f6-980f-2652258efd66` | exit 1 by design; classifier RED PROVEN for A1-A6 at the contract's base |
+| `gc-520-red-4a269d13` | `99432789` | `216eba76-766e-454b-8c31-a88af9c00cc0` | exit 1 by design; classifier RED PROVEN for the six cases at the earlier lane's head |
 
-`full` at this head passed its fast phase outright on both attempts (212 files passed, 4 skipped) and failed only in the heavy phase, on one untouched test that exceeds its 120 s ceiling under this host's load average of 12-24 — a different test from the two 30 s fast-phase timeouts seen on the previous head, and unrelated to any file this change touches. The newest attempt's run id and outcome are recorded in this PR's final comment; `gc-520-focused`, `gc-520-static`, `gc-520-msg-check` and both red scopes are green at the delivered head.
+The red scopes ran at `99432789`, one text-only commit below the head that carries the two required green scopes; the test file they copy is identical at both heads (`git diff 99432789..b6c83574` shows the PR text file only). Three earlier `full` attempts at `1d04f78c` and `99432789` failed on host-load timeouts in untouched tests (two 30 s fast-phase timeouts in `directive-retirement.test.ts` when the load average was 19-24, then one 120 s heavy-phase timeout in `review-git-environment.test.ts`) while their fast phases otherwise passed; the delivered head's run is green in both phases.
 
 ## Red proof
 
