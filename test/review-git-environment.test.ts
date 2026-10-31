@@ -394,7 +394,11 @@ describe('review Git repository environment isolation (GH-270)', () => {
     }
   });
 
-  it('accepts exhaustive authentic handoff history beyond 1000 and rejects later-page incomplete or duplicate proof (ordinary review)', async () => {
+  // Over 1000 real handoff commits: 96.9 s on this host at idle, so the heavy
+  // phase's 120 s ceiling is exceeded when its two workers share the box (full
+  // run 1e3b8f7a at 0fcd0446, also seen in other lanes). The allowance changes
+  // no assertion.
+  it('accepts exhaustive authentic handoff history beyond 1000 and rejects later-page incomplete or duplicate proof (ordinary review)', { timeout: 300_000 }, async () => {
     const repo = fixture('ordinary-history'), h = manager();
     const originalJob = h.ledger.addJob({ id: 'history-original', repo: 'assigned', title: 'independent original' });
     const original = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: originalJob.id });
