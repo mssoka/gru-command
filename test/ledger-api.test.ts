@@ -2586,9 +2586,14 @@ it('redacts argv credentials in the verify registry write', () => {
     // The table itself, and what the writes put on the event stream, hold no credential.
     expect(JSON.stringify(db.handle.prepare('SELECT * FROM worktree_processes').all())).not.toContain(secret);
     expect(JSON.stringify(api.listEvents({ limit: 100 }))).not.toContain(secret);
-    // Recording a masked line again changes nothing.
-    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'killed', processes: [{ pid: 4242, command: stored!.command, evidence: 'registry' }] });
-    expect(api.listWorktreeProcesses('registry-write').find((proc) => proc.pid === 4242)?.command).toBe(stored?.command);
+    // Recording a row read back from the table changes neither its text nor its identity: the row is not a raw line,
+    // so the writer must hand its digest back (`undefined` would digest the masked text as if it were the raw command,
+    // and the row could then never be matched by the live process again).
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'killed', processes: [{ pid: 4242, command: stored!.command, commandSha256: stored!.commandSha256, evidence: 'registry' }] });
+    const rerecorded = api.listWorktreeProcesses('registry-write').find((proc) => proc.pid === 4242);
+    expect(rerecorded?.command).toBe(stored?.command);
+    expect(rerecorded?.commandSha256).toBe(stored?.commandSha256);
+    expect(rerecorded?.commandSha256).toBe(createHash('sha256').update(command).digest('hex'));
   } finally { db.close(); }
 });
 

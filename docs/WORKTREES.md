@@ -220,12 +220,17 @@ scheduler records every run it spawns for a lane (pid + argv, evidence
 `registry`) and reconciles it on exit. A service the orchestrator started
 for a lane is the lane's to tear down — not a stranger's.
 
-A row's `command` line is recorded with its credentials masked (#534),
-whoever writes it: `redactCredentials` runs inside the ledger write, so a
-pause, a reap and the verification scheduler's `registry` rows all record
-the masked line, and every process record that leaves GC — the release's
-paused result, the `worktree.paused` payload, the `onSweepPaused`
-processes and details, and the refusal error's processes — carries it for
+A row's `command` line is recorded with its credentials masked (#534)
+when the writer holds a raw line: `redactCredentials` runs inside the
+ledger write, so a pause, a reap and the verification scheduler's
+`registry` rows all record the masked line. A writer that hands back a row
+it read from the table passes that row's digest back too (the string, or
+`null` when the row has none), and is not a raw line: the row keeps its
+recorded text and its digest exactly as they are, so a row written before
+#534 keeps its line until a fresh enumeration re-records it (there is no
+backfill). Every process record that leaves GC — the release's paused
+result, the `worktree.paused` payload, the `onSweepPaused` processes and
+details, and the refusal error's processes — carries it for
 the credential forms `redactCredentials` recognizes (the pairing token's
 `Authorization: Bearer`, the keyword assignments, and the `--token`,
 `-u user:value` and `Authorization: token` argv forms; the inventory in
@@ -236,11 +241,16 @@ their command lines masked too: the `command`, `process_command` and
 verification events, each per-step check's `command`, and the request's
 `dedupe_key` (and the `verification.refused` event of a held job). The
 raw `ps` line stays in memory for the checks that need it (tree matching,
-token naming, `ps -E` provenance). The scheduler's own state file (mode 0600,
-in the data directory) keeps the raw line too: a restarted scheduler compares
-a holder's recorded argv with the live process to recognise it as its own, so
-it is an identity input, not an event or a row. A verification run's own
-response frames and status name the command to the client that submitted it.
+token naming, `ps -E` provenance). The scheduler's own durable files (mode
+0600, in the data directory) keep the raw line too: its state file and its
+terminal-identity log (`requests.ndjson`), because a restarted scheduler
+compares a holder's recorded argv with the live process to recognise it as
+its own and refuses a replayed identity by that command; they are identity
+inputs, not events or rows. The capture helper's owner record
+(`<sink>.owner.json`, mode 0600) keeps its own invocation line for the same
+reason: withdrawal validates the live helper against it. A verification
+run's own response frames and status name the command to the client that
+submitted it.
 
 The masked text is for display and audit, never an identity: two commands
 whose credentials differ mask to the same line. Each row therefore also

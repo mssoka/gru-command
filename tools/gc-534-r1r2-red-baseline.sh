@@ -13,8 +13,10 @@
 #       readback closed a registry row by masked text (another credential, a
 #       row with no digest);
 #   R2  the verification events (requested, started, process-started,
-#       completed, the dedupe key and a held job's refusal) carried the scope's
-#       command raw, at the scheduler's record boundary and in the ledger.
+#       completed, the dedupe key, a planned run's per-step checks, a
+#       credential-bearing no-start refusal and a held job's refusal) carried
+#       the scope's command raw, at the scheduler's record boundary and in the
+#       ledger.
 # The fast files and the heavy files run under their own Vitest configs;
 # their JSON reports are merged and classified once by
 # tools/assert-named-red-baseline.mjs, which exits 2 (FAILS-BEFORE CLAIM
@@ -55,7 +57,9 @@ r1_identity_inner='closes a registry row at the terminal readback only by the di
 r2_readback_inner='records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)'
 r2_scheduler='records every verification event with its command lines masked while the run keeps and spawns the raw command (#534 R2)'
 r2_held_inner='records the held-job refusal with the scope command masked (#534 R2)'
-for pair in "worktree-manager:$r1_swap_inner" "worktree-manager:$r1_nodigest_inner" "ledger-api:$r1_ledger" "ledger-db:$r1_migration_inner" "verification-server:$r1_identity_inner" "verification-server:$r2_readback_inner" "verification-server:$r2_held_inner" "verification-scheduler:$r2_scheduler"; do
+r2_checks='records a planned run with its per-step checks masked while the run keeps the raw steps (#534 R2)'
+r2_nostart='records a credential-bearing no-start refusal with its command masked (#534 R2)'
+for pair in "worktree-manager:$r1_swap_inner" "worktree-manager:$r1_nodigest_inner" "ledger-api:$r1_ledger" "ledger-db:$r1_migration_inner" "verification-server:$r1_identity_inner" "verification-server:$r2_readback_inner" "verification-server:$r2_held_inner" "verification-scheduler:$r2_scheduler" "verification-scheduler:$r2_checks" "verification-scheduler:$r2_nostart"; do
   file=${pair%%:*}
   title=${pair#*:}
   if ! grep -qF "it('$title'" "test/$file.test.ts"; then
@@ -92,6 +96,8 @@ node "$root/tools/assert-named-red-baseline.mjs" gc-534-r1r2 "$d/results.json" \
   "POST /api/verify $r1_identity_inner" \
   "POST /api/verify $r2_readback_inner" \
   "POST /api/verify $r2_held_inner" \
-  "$r2_scheduler" || exit 2
+  "$r2_scheduler" \
+  "$r2_checks" \
+  "$r2_nostart" || exit 2
 echo "EXPECTED-NONZERO: R1 (raw-command digest identity) and R2 (masked verification events) regressions failed behaviorally against 0e7d5f95"
 exit 1

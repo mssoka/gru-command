@@ -1439,3 +1439,46 @@ it('records every verification event with its command lines masked while the run
     expect(records.filter((record) => record.kind === 'verification.started' && record.jobId === 'job-clean')[0]!.payload['command']).toBe('node -e "process.exit(0)"');
   } finally { await scheduler.dispose(); }
 });
+
+it('records a planned run with its per-step checks masked while the run keeps the raw steps (#534 R2)', async () => {
+  // `planCommand` decomposes this chain into two steps and records a check per step in the completed outcome; the
+  // recorded event must carry each check's command masked, not only the outcome's top-level command line.
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const repo = makeRepo();
+  repo.commitFile('package.json', `${JSON.stringify({ name: 'verify-fixture', private: true, scripts: { build: 'node -e "process.exit(0)"' } }, null, 2)}\n`);
+  const { scheduler, records } = makeScheduler();
+  scheduler.start();
+  const command = `npm run build && node verify.mjs pass --token ${secret}`;
+  const secondStep = 'node verify.mjs pass --token [REDACTED]';
+  try {
+    const outcome = await scheduler.submit(repoSpec(repo, 'job-checks', { command, requestId: 'checks-request', scope: 'docs' }));
+    // The run itself is the raw chain: its outcome (the caller's own) names it and carries both raw steps.
+    expect(outcome.command).toBe(command);
+    expect(outcome.checks?.map((check) => check.command)).toEqual(['npm run build', `node verify.mjs pass --token ${secret}`]);
+    const completed = records.filter((record) => record.kind === 'verification.completed' && record.jobId === 'job-checks');
+    expect(completed).toHaveLength(1);
+    const checks = completed[0]!.payload['checks'] as { command: string }[];
+    expect(checks).toHaveLength(2);
+    expect(checks.map((check) => check.command)).toEqual(['npm run build', secondStep]);
+    for (const check of checks) expect(check.command).not.toContain(secret);
+    expect(JSON.stringify(records)).not.toContain(secret);
+  } finally { await scheduler.dispose(); }
+});
+
+it('records a credential-bearing no-start refusal with its command masked (#534 R2)', async () => {
+  // A run that cannot spawn never emits `verification.started`; its `verification.no-start` record is written at a
+  // direct record site, and it carries the scope's command. That site masks too.
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const { scheduler, records } = makeScheduler();
+  scheduler.start();
+  const command = `node verify.mjs pass --token ${secret}`;
+  const cwd = join(tempDir(), 'does-not-exist');
+  try {
+    await expect(scheduler.submit({ jobId: 'job-no-start', scope: 'full', command, cwd, head: null, requestId: 'no-start-request' }))
+      .rejects.toThrow(/ENOENT/u);
+    const noStart = records.filter((record) => record.kind === 'verification.no-start');
+    expect(noStart).toHaveLength(1);
+    expect(noStart[0]!.payload).toMatchObject({ request_ids: ['no-start-request'], cwd, command: 'node verify.mjs pass --token [REDACTED]', started: false, reason: 'spawn_failed' });
+    expect(JSON.stringify(records)).not.toContain(secret);
+  } finally { await scheduler.dispose(); }
+});
