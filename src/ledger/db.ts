@@ -1248,4 +1248,63 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_request_closeouts_job ON request_closeouts(job_id);
     `,
   },
+  {
+    // #523: owner approvals. Gru proposes one owner-reserved action on a FOR
+    // YOU card and the owner's Approve makes the server carry it out; this is
+    // the durable record of each proposal and where it stands (`proposed`,
+    // `approved`, `executing`, then `succeeded`, `denied`, `refused` or
+    // `withdrawn`). At most one non-terminal record per request, so a crash
+    // resumes the one operation and never starts a second. Additive: no
+    // existing table changes. LANDING COLLISION (same convention as
+    // migrations 10-33): renumber ONLY this never-applied migration if main
+    // lands id 34 first.
+    id: 34,
+    name: 'owner-approvals',
+    sql: `
+      CREATE TABLE owner_approvals (
+        id                    TEXT PRIMARY KEY,
+        kind                  TEXT NOT NULL CHECK (kind IN ('directive-abandon')),
+        request_id            TEXT NOT NULL REFERENCES pending_directives(request_id),
+        job_id                TEXT NOT NULL REFERENCES jobs(id),
+        fence_state           TEXT NOT NULL CHECK (fence_state IN ('dispatching','admitted')),
+        fence_payload_hash    TEXT NOT NULL,
+        fence_debt_generation INTEGER,
+        reason                TEXT NOT NULL,
+        idempotency_key       TEXT NOT NULL UNIQUE,
+        body_fingerprint      TEXT NOT NULL,
+        notification_id       TEXT NOT NULL UNIQUE,
+        state                 TEXT NOT NULL CHECK (state IN ('proposed','approved','executing','succeeded','denied','refused','withdrawn')),
+        attempts              INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        executing_seq         INTEGER,
+        abandonment_event_seq INTEGER,
+        refusal_code          TEXT,
+        refusal_blockers      TEXT,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_owner_approvals_active ON owner_approvals(request_id) WHERE state IN ('proposed','approved','executing');
+      CREATE INDEX idx_owner_approvals_job ON owner_approvals(job_id);
+    `,
+  },
+  {
+    // #523: the result a producer closes an owner card with. The follow-through
+    // that carried out (or refused) the owner's choice, and the withdrawal of a
+    // proposal that went stale, each give a detail; until now it lived only in
+    // the `notification.resolved` event, so the card the owner looks at showed
+    // its original text and a "resolved" chip. Kept on the row, the board can
+    // render it on the card itself. Additive and nullable: a row resolved
+    // before this migration (or by a path that gives no detail) keeps null.
+    // LANDING COLLISION: renumber ONLY this never-applied migration if main
+    // lands id 35 first.
+    //
+    // The board keeps an owner card in its snapshot for a while after it
+    // resolves (so its result can be read however many notifications arrived
+    // since it was posted); the partial index makes that range read cheap.
+    id: 35,
+    name: 'notification-resolution-detail',
+    sql: `
+      ALTER TABLE notifications ADD COLUMN resolution_detail TEXT;
+      CREATE INDEX idx_notifications_resolved_at ON notifications(resolved_at) WHERE resolved_at IS NOT NULL;
+    `,
+  },
 ];

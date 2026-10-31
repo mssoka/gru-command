@@ -352,8 +352,11 @@ or automatic binning — the write itself is the ordinary status surface):
   authorized surfaces first — the board keeps showing the live producer and
   the worktree stays on the record. A live directive or re-brief marker
   whose producer custody the service cannot establish is closed by the
-  owner's abandonment (`by: "owner"`, `confirm_intent: true`; Gru asks, never
-  calls it), never by binning; it refuses while any producer is known to
+  owner's abandonment, never by binning: for a directive request Gru proposes
+  it with `POST /api/owner-approvals` and the owner's Approve on the card
+  carries it out ([Owner approval of abandonment](./DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment)),
+  which makes the terminal call (`by: "owner"`, `confirm_intent: true`; Gru
+  never calls it) on the server; it refuses while any producer is known to
   run ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-abandonment-unknown-custody)). A `working` label alone is not proof of a live
   producer; idle `working` jobs remain bin-eligible.
 

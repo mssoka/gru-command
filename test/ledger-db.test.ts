@@ -147,6 +147,21 @@ describe('ledger db + migration runner', () => {
     upgraded.close();
   });
 
+  it('adds the nullable notification resolution detail and leaves a row resolved before it null (#523)', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 34) });
+    old.handle.prepare(`INSERT INTO notifications (id, ts, kind, routing, severity, title, detail, resolved_at, resolved_by)
+      VALUES ('n-old', 't', 'k', 'needs-owner', 'error', 'T', 'D', 't2', 'gru')`).run();
+    expect(old.handle.prepare('PRAGMA table_info(notifications)').all().map((row) => row['name'])).not.toContain('resolution_detail');
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    expect(upgraded.handle.prepare("SELECT id, name FROM schema_migrations WHERE id = 35").get()).toEqual({ id: 35, name: 'notification-resolution-detail' });
+    expect(upgraded.handle.prepare('PRAGMA table_info(notifications)').all().find((row) => row['name'] === 'resolution_detail')).toMatchObject({ type: 'TEXT', notnull: 0 });
+    const api = new LedgerApi(upgraded.handle);
+    expect(api.getNotification('n-old')).toMatchObject({ resolvedBy: 'gru', detail: 'D', resolutionDetail: null });
+    upgraded.close();
+  });
+
   it('upgrades a pre-retirement ledger keeping existing directive rows live and readable', () => {
     const dir = tmpDir();
     const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 22) });

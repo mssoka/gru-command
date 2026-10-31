@@ -23,6 +23,7 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
 import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof, directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
+import { historicalLiveRequest, seededLiveRequest, seedJob } from './helpers/directive-fixtures.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { VerificationScheduler } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
@@ -287,12 +288,6 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
-function seedJob(h: Harness, jobId: string, status = 'working', deliverable?: 'review' | 'artifact' | 'investigation'): JobRecord {
-  const job = h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: jobId, briefing: `briefing for ${jobId}`, ...(deliverable === undefined ? {} : { deliverable }) });
-  if (status !== 'dispatched') h.ledger.setJobStatus(jobId, status as never);
-  return job;
-}
-
 async function seedLane(h: Harness, repo: FixtureRepo, jobId: string): Promise<WorktreeLane> {
   return h.worktrees.createJobWorktree({ repoPath: repo.path, jobId });
 }
@@ -400,19 +395,6 @@ async function waitFor(condition: () => boolean, what: string, timeoutMs = 10_00
   const deadline = Date.now() + timeoutMs;
   while (!condition() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
   if (!condition()) throw new Error(`timed out waiting for ${what}`);
-}
-
-/** One live intent on a ready lane with the fixture repo. */
-async function seededLiveRequest(
-  h: Harness,
-  repo: FixtureRepo,
-  jobId: string,
-  requestId: string,
-): Promise<{ lane: WorktreeLane; row: DirectiveRequestRecord }> {
-  seedJob(h, jobId);
-  const lane = await seedLane(h, repo, jobId);
-  const begun = h.ledger.beginDirectiveIntent({ jobId, directive: `repair ${jobId}`, holder: 'silas-ops', requestId });
-  return { lane, row: begun.record };
 }
 
 describe('directive retirement — evidence-fenced control closure', () => {
@@ -1382,11 +1364,6 @@ describe('directive retirement — unknown custody and owner abandonment', () =>
 
 describe('directive retirement — owner abandonment never discards known live work', () => {
   /** A historical live request: its producer identity and journal never existed. */
-  async function historicalLiveRequest(h: Harness, repo: FixtureRepo, jobId: string, requestId: string): Promise<{ lane: WorktreeLane; row: DirectiveRequestRecord }> {
-    const seeded = await seededLiveRequest(h, repo, jobId, requestId);
-    markHistoricalDirectiveFixture(h.ledger, requestId);
-    return { lane: seeded.lane, row: h.ledger.getDirective(requestId)! };
-  }
   const providerWait = (id: string, jobId: string) => ({ id, routeKey: `route-${id}`, provider: 'p', model: 'm', endpoint: 'e', credentialFingerprint: 'fp',
     waiterKind: 'job-minion' as const, jobId, agentId: null, slotId: null, sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working' as const,
     lineageKey: null, incidentId: `incident-${id}`, incidentGeneration: 1, reasonClass: 'temporary-limit' as const });

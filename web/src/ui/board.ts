@@ -2716,6 +2716,13 @@ export class BoardView {
       // and offer no fake control.
       card.append(el('div', 'board-notification__guidance', ownerNoticeGuidance(item.kind)));
     }
+    // What the card was closed with (#523): the follow-through's result, or a
+    // producer's withdrawal, on the card itself and not only in the audit
+    // event. A line per blocker, so it reads as the producer wrote it.
+    const resolution = item.resolvedAt !== null && item.resolutionDetail !== undefined && item.resolutionDetail !== null && item.resolutionDetail !== ''
+      ? item.resolutionDetail
+      : null;
+    if (resolution !== null) card.append(el('div', 'board-notification__result', `Result: ${resolution}`));
     if (detail !== null && !(decision === null && shortDetail)) {
       card.append(this.detailsDisclosure(item.id, item.kind, detail, bandVisible));
     }
@@ -2888,7 +2895,7 @@ export class BoardView {
     this.decisionSubmissions.set(item.id, submission);
     this.rerenderNotifications();
     void client
-      .decideNotification(item.id, optionId, expectedDecision)
+      .decideNotification(item.id, optionId, expectedDecision, item.kind)
       .then((row) => {
         if (submission.generation !== this.clientGeneration) return; // re-paired: old work is dropped
         this.decisionSubmissions.delete(item.id);

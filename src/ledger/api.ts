@@ -181,6 +181,28 @@ import {
   type CloseoutRequester,
   type CloseoutSupersededReason,
 } from './closeouts.js';
+import {
+  insertOwnerApproval,
+  OWNER_APPROVAL_CARD_KIND,
+  OWNER_APPROVAL_ENDINGS,
+  OWNER_APPROVAL_HISTORY_SQL,
+  OWNER_APPROVAL_MAX_ATTEMPTS,
+  ownerApprovalEventKind,
+  ownerApprovalFingerprint,
+  selectActiveOwnerApprovalForRequest,
+  selectActiveOwnerApprovalIds,
+  selectEndedOwnerApprovalIdsWithOpenCard,
+  selectOwnerApproval,
+  selectOwnerApprovalByKey,
+  selectOwnerApprovalByNotification,
+  updateOwnerApproval,
+  type OwnerApprovalFences,
+  type OwnerApprovalHistoryEntry,
+  type OwnerApprovalKind,
+  type OwnerApprovalOutcome,
+  type OwnerApprovalProposal,
+  type OwnerApprovalRecord,
+} from './owner-approvals.js';
 
 const VERIFICATION_KIND = 'verification.completed';
 const MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS = 4_096;
@@ -193,6 +215,16 @@ export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirement
 export { DirectiveRetirementError } from './directives.js';
 export type { CloseoutBlocker, CloseoutIntent, CloseoutState, CloseoutSupersededReason } from './closeouts.js';
 export { CloseoutPendingError, TerminalLiveWorkError } from './closeouts.js';
+export type {
+  OwnerApprovalFences,
+  OwnerApprovalHistoryEntry,
+  OwnerApprovalKind,
+  OwnerApprovalOutcome,
+  OwnerApprovalProposal,
+  OwnerApprovalRecord,
+  OwnerApprovalRefusal,
+  OwnerApprovalState,
+} from './owner-approvals.js';
 export type {
   DecisionActor,
   DecisionKind,
@@ -677,6 +709,10 @@ export interface NotificationRecord {
   /** System resolution is distinct from a human acknowledgement. */
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** What a follow-through (or a producer's withdrawal of a stale proposal)
+   * closed the card with: the result the owner reads on the card itself
+   * (#523). Null while the card is open, and on a resolution that gave none. */
+  readonly resolutionDetail: string | null;
   /** Typed owner-decision metadata (null on legacy/machine rows). */
   readonly decision: NotificationDecision | null;
   /** The recorded owner decision — DISTINCT from ack and resolution: it
@@ -5922,6 +5958,17 @@ export class LedgerApi {
       .map((row) => this.notificationFromRow(row));
   }
 
+  /** Owner cards resolved at or after `since`, newest resolution first. A card
+   * leaves the snapshot's newest-rows window and the unresolved scans the moment
+   * it resolves; the board reads these so the result a follow-through closed it
+   * with stays readable for a while, however many notifications arrived since
+   * the card was posted (#523). */
+  listRecentlyResolvedOwnerNotifications(since: string, limit: number): readonly NotificationRecord[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('recently resolved notification limit must be positive');
+    return (this.db.prepare("SELECT * FROM notifications WHERE routing = 'needs-owner' AND resolved_at IS NOT NULL AND resolved_at >= ? ORDER BY resolved_at DESC, id LIMIT ?")
+      .all(since, limit) as Row[]).map((row) => this.notificationFromRow(row));
+  }
+
   /** Count action-required notifications still awaiting a machine
    * disposition, INCLUDING terminal-bound closed receipts. Read straight
    * from the TABLE — not the bounded feed window. Receipts belong to the
@@ -6212,7 +6259,7 @@ export class LedgerApi {
       if (current.decidedAt !== null) {
         throw new NotificationDecisionRefusal('decision_recorded', `notification "${id}" already records decision "${current.decidedOption}"; it is carried out, never withdrawn`);
       }
-      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?').run(nowIso(), 'producer-withdrawn', id);
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ?, resolution_detail = ? WHERE id = ?').run(nowIso(), 'producer-withdrawn', detail, id);
       this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'producer-withdrawn', detail, withdrawn: true } });
       return this.getNotification(id);
     });
@@ -6284,8 +6331,8 @@ export class LedgerApi {
         );
       }
       if (current.resolvedAt !== null) return current; // idempotent
-      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
-        .run(nowIso(), 'gru', id);
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ?, resolution_detail = ? WHERE id = ?')
+        .run(nowIso(), 'gru', detail, id);
       this.appendEvent({
         kind: 'notification.resolved',
         agentId: current.agentId,
@@ -10531,6 +10578,160 @@ export class LedgerApi {
   }
 
   // ------------------------------------------------------------------
+  // Owner approvals (#523)
+  //
+  // Gru proposes one owner-reserved action; the owner's Approve on the
+  // proposal's card makes the service carry it out. Every state change is one
+  // transaction that appends an `owner-approval.<state>` event; at most one
+  // non-terminal record exists per request.
+  // ------------------------------------------------------------------
+
+  getOwnerApproval(id: string): OwnerApprovalRecord | null {
+    return selectOwnerApproval(this.db, id);
+  }
+
+  /** The record whose FOR YOU card is this notification. */
+  ownerApprovalForNotification(notificationId: string): OwnerApprovalRecord | null {
+    return selectOwnerApprovalByNotification(this.db, notificationId);
+  }
+
+  /** The request's `proposed`, `approved` or `executing` record, if any. */
+  activeOwnerApprovalForRequest(requestId: string): OwnerApprovalRecord | null {
+    return selectActiveOwnerApprovalForRequest(this.db, requestId);
+  }
+
+  /** The id of every non-terminal record, oldest first. */
+  listActiveOwnerApprovalIds(): readonly string[] {
+    return selectActiveOwnerApprovalIds(this.db);
+  }
+
+  /** The id of every ended record whose card is still open, oldest first. */
+  listEndedOwnerApprovalIdsWithOpenCard(): readonly string[] {
+    return selectEndedOwnerApprovalIdsWithOpenCard(this.db);
+  }
+
+  /** The record's state changes in order, from its `owner-approval.*` events. */
+  ownerApprovalHistory(id: string): readonly OwnerApprovalHistoryEntry[] {
+    const rows = this.db.prepare(OWNER_APPROVAL_HISTORY_SQL).all(id) as Row[];
+    return rows.map((row) => {
+      const detail = (JSON.parse(str(row.payload)) as { detail?: unknown }).detail;
+      return { state: str(row.kind).slice('owner-approval.'.length), at: str(row.ts), detail: typeof detail === 'string' ? detail : null };
+    });
+  }
+
+  /** The facts a directive-abandon approval is bound to, as they are now: the
+   * request's job, its state as readers name it, its payload hash and its
+   * recovery-debt generation (null when it owes none). Null for an unknown
+   * request. */
+  ownerApprovalFenceReadback(requestId: string): { readonly jobId: string; readonly state: string; readonly payloadHash: string; readonly debtGeneration: number | null } | null {
+    const row = this.getDirective(requestId);
+    if (row === null) return null;
+    return { jobId: row.jobId, state: directiveStateName(row), payloadHash: row.payloadHash,
+      debtGeneration: this.recoveryObligation(row.jobId, 'directive', row.requestId)?.generation ?? null };
+  }
+
+  /** Record a proposal: the replay of an idempotency key first, then the
+   * request (it exists and is live), then the one-open-record rule. Nothing
+   * is written unless a record is created. */
+  proposeOwnerApproval(input: {
+    readonly kind: OwnerApprovalKind;
+    readonly requestId: string;
+    readonly reason: string;
+    readonly idempotencyKey: string;
+  }): OwnerApprovalProposal {
+    return this.transaction((): OwnerApprovalProposal => {
+      const fingerprint = ownerApprovalFingerprint(input.kind, input.requestId, input.reason);
+      const keyed = selectOwnerApprovalByKey(this.db, input.idempotencyKey);
+      if (keyed !== null) return { kind: keyed.bodyFingerprint === fingerprint ? 'replayed' : 'key_conflict', approval: keyed };
+      const row = this.getDirective(input.requestId);
+      if (row === null) return { kind: 'unknown_request' };
+      if (row.state !== 'dispatching' && row.state !== 'admitted') return { kind: 'not_live', state: directiveStateName(row) };
+      const active = selectActiveOwnerApprovalForRequest(this.db, input.requestId);
+      if (active !== null) return { kind: 'pending', approval: active };
+      const fences: OwnerApprovalFences = { jobId: row.jobId, state: row.state, payloadHash: row.payloadHash,
+        debtGeneration: this.recoveryObligation(row.jobId, 'directive', row.requestId)?.generation ?? null };
+      const id = `oa-${randomUUID()}`;
+      const notificationId = `owner-approval:${id}`;
+      const ts = nowIso();
+      insertOwnerApproval(this.db, { id, kind: input.kind, requestId: input.requestId, fences, reason: input.reason,
+        idempotencyKey: input.idempotencyKey, bodyFingerprint: fingerprint, notificationId, createdAt: ts, updatedAt: ts });
+      this.appendEvent({ kind: ownerApprovalEventKind('proposed'), jobId: row.jobId,
+        payload: { id, approval_kind: input.kind, request_id: input.requestId, notification_id: notificationId,
+          card_kind: OWNER_APPROVAL_CARD_KIND[input.kind], fences, detail: 'proposed by gru' } });
+      return { kind: 'created', approval: selectOwnerApproval(this.db, id) as OwnerApprovalRecord };
+    });
+  }
+
+  private ownerApprovalOrThrow(id: string, from: readonly OwnerApprovalRecord['state'][], to: string): OwnerApprovalRecord {
+    const current = selectOwnerApproval(this.db, id);
+    if (current === null) throw new RecordNotFound(`owner approval "${id}" not found`);
+    if (!from.includes(current.state)) {
+      throw new Error(`owner approval "${id}" is ${current.state} — it moves to ${to} only from ${from.join(' or ')}`);
+    }
+    return current;
+  }
+
+  /** The owner said yes: `proposed` → `approved`. */
+  approveOwnerApproval(id: string, detail: string): OwnerApprovalRecord {
+    return this.transaction(() => {
+      const current = this.ownerApprovalOrThrow(id, ['proposed'], 'approved');
+      updateOwnerApproval(this.db, id, { state: 'approved', updatedAt: nowIso() });
+      this.appendEvent({ kind: ownerApprovalEventKind('approved'), jobId: current.jobId,
+        payload: { id, request_id: current.requestId, detail } });
+      return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
+    });
+  }
+
+  /** The fences held: `approved` → `executing`, remembering the event's seq
+   * so an abandonment can be told apart as before or after it. */
+  beginOwnerApprovalExecution(id: string, detail: string): OwnerApprovalRecord {
+    return this.transaction(() => {
+      const current = this.ownerApprovalOrThrow(id, ['approved'], 'executing');
+      const event = this.appendEvent({ kind: ownerApprovalEventKind('executing'), jobId: current.jobId,
+        payload: { id, request_id: current.requestId, detail } });
+      updateOwnerApproval(this.db, id, { state: 'executing', executingSeq: event.seq, updatedAt: nowIso() });
+      return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
+    });
+  }
+
+  /** End a record: `succeeded` from `executing`, `denied` and `withdrawn` from
+   * `proposed`, `refused` from any non-terminal state. */
+  endOwnerApproval(id: string, outcome: OwnerApprovalOutcome): OwnerApprovalRecord {
+    return this.transaction(() => {
+      const current = this.ownerApprovalOrThrow(id, OWNER_APPROVAL_ENDINGS[outcome.state], outcome.state);
+      updateOwnerApproval(this.db, id, {
+        state: outcome.state,
+        ...(outcome.state === 'succeeded' ? { abandonmentEventSeq: outcome.abandonmentEventSeq } : {}),
+        ...(outcome.state === 'refused' ? { refusal: outcome.refusal } : {}),
+        updatedAt: nowIso(),
+      });
+      this.appendEvent({ kind: ownerApprovalEventKind(outcome.state), jobId: current.jobId,
+        payload: { id, request_id: current.requestId, detail: outcome.detail,
+          ...(outcome.state === 'succeeded' ? { abandonment_event_seq: outcome.abandonmentEventSeq } : {}),
+          ...(outcome.state === 'refused' ? { code: outcome.refusal.code, blockers: outcome.refusal.blockers } : {}) } });
+      return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
+    });
+  }
+
+  /** One failed attempt at carrying the action out: counted and recorded; it
+   * stays `executing` for the next reconcile, and the last allowed attempt
+   * ends it `refused` as `execution-error` in the same transaction. */
+  recordOwnerApprovalAttemptFailure(id: string, message: string): OwnerApprovalRecord {
+    return this.transaction(() => {
+      const current = this.ownerApprovalOrThrow(id, ['executing'], 'another attempt');
+      const attempts = current.attempts + 1;
+      updateOwnerApproval(this.db, id, { state: 'executing', attempts, updatedAt: nowIso() });
+      this.appendEvent({ kind: ownerApprovalEventKind('attempt-failed'), jobId: current.jobId,
+        payload: { id, request_id: current.requestId, attempt: attempts, detail: message } });
+      if (attempts >= OWNER_APPROVAL_MAX_ATTEMPTS) {
+        return this.endOwnerApproval(id, { state: 'refused', refusal: { code: 'execution-error', blockers: [message] },
+          detail: `Not run: execution-error after ${String(attempts)} attempts` });
+      }
+      return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Canceled-request closeout (#523)
   //
   // Binning a job whose only live request was deferred before reaching its
@@ -12521,6 +12722,7 @@ export class LedgerApi {
       ackedBy: nstr(row.acked_by),
       resolvedAt: nstr(row.resolved_at),
       resolvedBy: nstr(row.resolved_by),
+      resolutionDetail: nstr(row.resolution_detail),
       decision: parseStoredNotificationDecision(nstr(row.decision_json)),
       decidedAt: nstr(row.decided_at),
       decidedBy: nstr(row.decided_by),

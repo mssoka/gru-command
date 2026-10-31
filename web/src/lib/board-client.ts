@@ -76,6 +76,10 @@ const TRAILING_BURST = 2;
 /** ...then wait, capped — owed demand is kept, never dropped. */
 const TRAILING_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
 
+/** The one card kind whose decision the owner makes: the owner-reserved
+ * abandonment proposal (#523). Every other card records `web`. */
+const OWNER_RESERVED_DECISION_KIND = 'owner-approval.directive-abandon';
+
 /** The wait before trailing refetch number `run + 1` of one chain. */
 function trailingDelay(run: number): number {
   if (run < TRAILING_BURST) return 0;
@@ -544,15 +548,20 @@ export class BoardClient {
   /** Record the owner's typed decision (owner release 2026-10-11). The
    * server validates both the option and the displayed decision snapshot;
    * the returned row carries the authoritative decided state. Recording a
-   * decision is not completion — the row stays until its producer resolves it. */
+   * decision is not completion — the row stays until its producer resolves it.
+   *
+   * `kind` is the card's kind: the owner-reserved abandonment proposal
+   * (#523) records its decider as `owner` so the server's follow-through may
+   * carry the abandonment out, and every other card keeps `web`. */
   async decideNotification(
     id: string,
     optionId: string,
     expectedDecision: NotificationDecisionView,
+    kind: string,
   ): Promise<NotificationView> {
     const { body } = await this.postApiWithStatus(`/api/notifications/${encodeURIComponent(id)}/decision`, {
       optionId,
-      by: 'web',
+      by: kind === OWNER_RESERVED_DECISION_KIND ? 'owner' : 'web',
       expectedDecision,
     });
     if (!isNotificationView(body)) throw new Error('decision reply is malformed');

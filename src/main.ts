@@ -105,6 +105,7 @@ import type { VectorBoardView } from './vector/board.js';
 import { BriefingReviewService } from './briefing-review/service.js';
 import type { BriefingReviewBoardCounts } from './briefing-review/board.js';
 import { createVectorServer } from './vector/server.js';
+import { createOwnerApprovalService, withdrawUnhostedOwnerApprovals, type OwnerApprovalService } from './dispatch/owner-approvals.js';
 import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
 import { onboardingProbesDir } from './onboarding/proof.js';
 import { createOnboardingServer } from './onboarding/server.js';
@@ -1756,6 +1757,24 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   briefingReviewBoardCounts = () => briefingReview.boardCounts();
+  // Owner approvals (#523): hosted where the abandon route is hosted (Silas
+  // ops), because both read the same worktrees and producer evidence. Gru
+  // proposes, the owner's Approve on the card carries out the abandonment.
+  const ownerApprovals: OwnerApprovalService | undefined = config.silas.enabled && silasSlot !== null
+    ? createOwnerApprovalService({
+        ledger,
+        notifications,
+        bus,
+        worktrees: worktreeManager,
+        workerGate: pacing.gate,
+        pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      })
+    : undefined;
+  // Not hosted (Silas ops off): an approval card an earlier boot left open
+  // would take the owner's Approve and nothing would carry it out. End what
+  // is open now, before any route can record a decision on it.
+  if (ownerApprovals === undefined) withdrawUnhostedOwnerApprovals({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) });
   const dispatchServer = createDispatchServer({
     config,
     intake,
@@ -1780,6 +1799,7 @@ async function main(): Promise<number> {
     closeout: canceledRequestCloseout,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     observeBlindTurn,
+    ...(ownerApprovals !== undefined ? { ownerApprovals } : {}),
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null
       ? {
@@ -2035,6 +2055,12 @@ async function main(): Promise<number> {
   // for shutdown first, so a stop during a scan aborts its origin probes.
   state.onboarding = onboarding;
   startOnboarding(onboarding, (level, msg, fields) => logger.log(level, msg, fields));
+  // Owner approvals (#523) follow the owner's decisions and finish what a
+  // crash left half done; registered for shutdown before starting.
+  if (ownerApprovals !== undefined) {
+    state.ownerApprovals = ownerApprovals;
+    ownerApprovals.start();
+  }
   // Lane slimming (#427) runs off the boot path and is never fatal.
   state.laneSlimmer = laneSlimmer;
   startLaneSlimmer(laneSlimmer, (level, msg, fields) => logger.log(level, msg, fields));

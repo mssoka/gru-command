@@ -98,9 +98,9 @@ describe('prune-stale-dist', () => {
     // packages): 151 catalogued names (142 of them ship executable files; the
     // rest are peers, optionals and type-only packages), from which the 0.85.1
     // shrinkwrap's esbuild, clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5301);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5303);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('595f113d2105dde3914c69368dec75831c70c0abfa17302ac640fdc4519fde81');
+      .toBe('bdf778c43a36ec01c5b324e2de3b9aac55b5108341eccb6e0ea4debbc4f80229');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));
