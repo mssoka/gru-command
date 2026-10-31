@@ -364,6 +364,25 @@ computed per-snapshot.
   (activity stamp first, registration order when unknown). A re-dispatched
   lane is never COLD on the superseded stop's stamp.
 
+**A temporary provider usage window is never a chat stop (owner ruling
+2026-10-31).** A non-fatal, typed, temporary-recoverable provider rejection —
+HTTP 429 or a GLM `1302`/`1308` usage-window body code — on a **Gru chat turn**
+settles the failed turn IN PLACE instead of stopping the agent: the turn's open
+state (`openTurn`, `openControl`, open tool calls, background tasks) is cleared
+so it cannot read as a hang, no captured turn is retained for a restart rung to
+replay, no restart or re-arm is scheduled, and the wall stays VISIBLE as ONE
+`action-required`/`error` machine row of its own kind
+(`supervision.provider-window.<agent>.quota_wall`, deduplicated while unacked)
+saying the turn failed on the window and the agent stayed up. One ledger event,
+`supervision.provider-window`, records `{class, role, provider, model, status,
+body_code, retry_after_ms, had_open_turn}`. It is not a durable stop (the boot
+lookup and the sensor hand-back key on `supervision.provider-wall.*` only), and
+the chat slot keeps serving the next message. Every other role and every
+ineligible wall — 401, 402, 403, billing `1113`, prose-only quota text with no
+typed evidence, or a fatal error — still stops with the durable provider-wall
+row. Provider pacing still spends its bounded retry budget before the settle
+path is reached.
+
 **Ack ids — nothing shown is unproven.** Every notification carries a
 stable id (the ack contract). When a client displays one — a toast, the
 bell panel, a browser notification — it posts
