@@ -8,6 +8,10 @@ import {
 } from '../src/service-shutdown.js';
 import { DISK_RECLAIM_STOP_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from '../src/shutdown-budget.js';
 import { CESSATION_IDLE_TIMEOUT_MS } from '../src/runtime/pi-adapter.js';
+import {
+  createOwnerApprovalService,
+  OWNER_APPROVAL_RECONCILE_INTERVAL_MS,
+} from '../src/dispatch/owner-approvals.js';
 import type { RuntimeRegistry } from '../src/runtime/registry.js';
 import type { SessionStore } from '../src/sessions/store.js';
 import type { LedgerDb } from '../src/ledger/db.js';
@@ -311,11 +315,34 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['onboarding stop failed']);
   });
 
-  it('stops the owner-approval service after onboarding; a failing stop never skips what follows (#523)', async () => {
+  it('stops the REAL owner-approval service after onboarding; its interval is cleared and a failing stop never skips what follows (#523)', async () => {
+    // The object main.ts hands the shutdown orchestration is the real service,
+    // so the REAL stop() must run: its reconcile interval is cleared. The
+    // wrapper then throws (a stop that fails) and the stops after it still run.
     const order: string[] = [];
+    const cleared: unknown[] = [];
+    const armed: unknown[] = [];
+    const service = createOwnerApprovalService({
+      ledger: {
+        listActiveOwnerApprovalIds: () => [],
+        listEndedOwnerApprovalIdsWithOpenCard: () => [],
+      } as unknown as Parameters<typeof createOwnerApprovalService>[0]['ledger'],
+      notifications: { post: async () => { throw new Error('the shutdown pin never posts a card'); } },
+      bus: { subscribe: () => () => {} },
+      worktrees: { listWorktrees: async () => [] },
+      pendingProducerBlockers: () => [],
+      setInterval: ((fn: () => void, ms?: number) => {
+        armed.push([fn, ms]);
+        return 1 as unknown as NodeJS.Timeout;
+      }) as unknown as typeof setInterval,
+      clearInterval: ((timer: NodeJS.Timeout) => { cleared.push(timer); }) as unknown as typeof clearInterval,
+    });
+    service.start();
+    expect(armed).toHaveLength(1);
+    expect(armed[0]).toEqual([expect.any(Function), OWNER_APPROVAL_RECONCILE_INTERVAL_MS]);
     const state: ServiceShutdownState = {
       onboarding: { stop: () => { order.push('onboarding.stop'); } },
-      ownerApprovals: { stop: () => { order.push('ownerApprovals.stop'); throw new Error('timer already cleared'); } },
+      ownerApprovals: { stop: () => { service.stop(); order.push('ownerApprovals.stop'); throw new Error('timer already cleared'); } },
       laneSlimmer: { stop: async () => { order.push('laneSlimmer.stop'); } },
       handle: fakeHandle(order),
     };
@@ -323,7 +350,12 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     await run.exited;
     expect(run.exits).toEqual([0]);
     expect(order).toEqual(['onboarding.stop', 'ownerApprovals.stop', 'laneSlimmer.stop', 'handle.stop']);
+    // The real stop cleared the real reconcile interval exactly once.
+    expect(cleared).toEqual([1]);
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['owner approvals stop failed']);
+    // Idempotent: a second stop clears nothing twice.
+    service.stop();
+    expect(cleared).toEqual([1]);
   });
 
   it('stops lane slimming after onboarding and waits for the slim pass that is running; a failing stop never skips what follows (#427)', async () => {

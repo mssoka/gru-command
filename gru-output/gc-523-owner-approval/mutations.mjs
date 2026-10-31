@@ -49,6 +49,8 @@ class AnchorError extends Error {}
 const once = (from, to) => ({ from, to });
 
 const NOOP_ANCHOR = '  /** Carry out the abandonment the record is bound to.';
+/** The production abandonment the execution step runs (the dep's default). */
+const ABANDONMENT_SEAM = '    const abandonment = deps.abandonment ?? abandonLiveDirectiveFromRoute;\n';
 const NOOP = [
   '  /** MUTATION (verification red baseline): a no-op instead of the native',
   "   * owner abandonment. It returns the request's current row unchanged. */",
@@ -81,7 +83,7 @@ const LIVENESS_FIRST = [
 const MUTATIONS = [
   {
     id: 'A1-A2 no-op abandonment',
-    edits: [{ file: SERVICE, ...once('      outcome = abandonLiveDirectiveFromRoute({', '      outcome = mutatedNoop({') },
+    edits: [{ file: SERVICE, ...once(ABANDONMENT_SEAM, '    const abandonment = mutatedNoop;\n') },
       { file: SERVICE, ...once(NOOP_ANCHOR, `${NOOP}${NOOP_ANCHOR}`) }],
     titles: [
       `${A} abandons an unknown-custody request as outcome-unknown and closes the card with what happened`,

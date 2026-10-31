@@ -100,6 +100,11 @@ export interface OwnerApprovalServiceDeps {
   /** Test seam: called after a named step has been written. Throwing from it
    * stands in for a crash at that point. Production never passes it. */
   readonly afterStep?: (step: OwnerApprovalStep) => void;
+  /** Test seam: the native owner abandonment the execution step runs.
+   * Production never passes it — `abandonLiveDirectiveFromRoute` is the
+   * default — and the crash/failure tests use it to make that one call throw
+   * without spying on the ledger. */
+  readonly abandonment?: (input: Parameters<typeof abandonLiveDirectiveFromRoute>[0]) => ReturnType<typeof abandonLiveDirectiveFromRoute>;
 }
 
 export interface OwnerApprovalService {
@@ -437,9 +442,10 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
    * it must (a live producer, retirement available); anything else it throws
    * is an attempt that failed. */
   const execute = (record: OwnerApprovalRecord): void => {
+    const abandonment = deps.abandonment ?? abandonLiveDirectiveFromRoute;
     let outcome: ReturnType<typeof abandonLiveDirectiveFromRoute>;
     try {
-      outcome = abandonLiveDirectiveFromRoute({
+      outcome = abandonment({
         ledger,
         worktrees: deps.worktrees,
         ...(deps.workerGate !== undefined ? { workerGate: deps.workerGate } : {}),

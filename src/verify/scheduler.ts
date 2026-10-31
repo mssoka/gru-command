@@ -2075,20 +2075,41 @@ export class VerificationScheduler {
       this.persistBestEffort();
       if (!startedEmitted) await emitStarted();
 
+      // The runner's OWN drain cut-off is not the step's verdict. A pipe a
+      // stray descendant still holds is closed by `destroy()` below, and the
+      // async iteration reports that close as ERR_STREAM_PREMATURE_CLOSE —
+      // the runner's action, never evidence against the command (#523: three
+      // lanes went red this way in one afternoon, every one on an exit-0
+      // step). A stream that really fails BEFORE the cut-off still fails the
+      // run: `cutOff` is set only right before the runner destroys the pipes.
+      let cutOff = false;
       const streamsDone = Promise.all([
         consume(child.stdout, 'stdout'),
         consume(child.stderr, 'stderr'),
       ]).catch((error: unknown) => {
+        if (cutOff) return;
         runError ??= error instanceof Error ? error : new Error(String(error));
       });
       try {
         await exited;
         // Streams normally close with the process; cap the drain so an
         // inherited pipe from a stray grandchild cannot hold the slot.
-        await Promise.race([streamsDone, delay(2_000)]);
+        const drained = await Promise.race([streamsDone.then(() => true), delay(2_000).then(() => false)]);
+        cutOff = !drained;
       } finally {
         child.stdout?.destroy();
         child.stderr?.destroy();
+      }
+      if (cutOff) {
+        // Said, not swallowed: the exit verdict stands and the capture names
+        // the reason the pipes were closed by the runner. Best effort — a
+        // capture that cannot take the note must not decide the run.
+        try {
+          await emit(
+            'stdout',
+            `[gru-verify] step ${index + 1}: output pipes were still open 2s after the step exited; the runner closed them (the exit verdict stands).\n`,
+          );
+        } catch { /* the note is diagnostic only */ }
       }
       // Detach only this exact positively exited native child after drain.
       // A spawn/error without exit remains UNKNOWN and is not erased. The

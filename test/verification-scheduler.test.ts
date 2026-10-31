@@ -815,6 +815,34 @@ describe('verification scheduler — global budget', () => {
     scheduler.release(lease);
   });
 
+  it('an output pipe a stray descendant still holds at the drain cut-off is closed by the runner, never a failed run (#523 verification repair)', async () => {
+    // #523's guards scope went red on an exit-0 vitest step whose pipes were
+    // still open 2s after the shell exited: the runner then destroyed its own
+    // pipes and recorded the iteration's ERR_STREAM_PREMATURE_CLOSE as the
+    // run's error. A background `sleep` inherits the step's stdout/stderr and
+    // outlives its exit-0 shell, so this reproduces that window every time.
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const frames: VerificationProgress[] = [];
+    const outcome = await scheduler.run(
+      spec('job-stray-pipe', '/bin/sh -c "sleep 3 & exit 0"'),
+      (frame) => { frames.push(frame); },
+    );
+    // The exit verdict stands: no manufactured run error, no failed step.
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.error).toBeNull();
+    expect(outcome.ok).toBe(true);
+    expect(outcome.timedOut).toBe(false);
+    // The capture says what the runner did instead of hiding it.
+    const output = frames
+      .filter((frame): frame is Extract<VerificationProgress, { type: 'output' }> => frame.type === 'output')
+      .map((frame) => frame.text)
+      .join('');
+    expect(output).toContain('output pipes were still open 2s after the step exited; the runner closed them (the exit verdict stands)');
+    expect(records.find((record) => record.kind === 'verification.completed')?.payload).toMatchObject({ ok: true, exit_code: 0 });
+    expect(scheduler.activeCount()).toBe(0);
+  });
+
   it('kills the process group on run timeout and persists an emptied holder file', async () => {
     const { scheduler, storageDir } = makeScheduler({ runTimeoutMs: 250, lockWaitTimeoutMs: 500 });
     scheduler.start();

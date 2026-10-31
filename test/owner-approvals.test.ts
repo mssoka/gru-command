@@ -19,6 +19,7 @@ import {
   ownerApprovalReasonPrefix,
   withdrawUnhostedOwnerApprovals,
   type OwnerApprovalService,
+  type OwnerApprovalServiceDeps,
   type OwnerApprovalStep,
 } from '../src/dispatch/owner-approvals.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
@@ -113,6 +114,8 @@ interface BootOptions {
   readonly notifications?: Pick<NotificationCenter, 'post'>;
   readonly workerGate?: PacingGate;
   readonly pendingProducerBlockers?: (jobId: string) => readonly string[];
+  /** The execution seam: makes the native owner abandonment throw (A9/F6). */
+  readonly abandonment?: NonNullable<OwnerApprovalServiceDeps['abandonment']>;
 }
 
 async function boot(options: BootOptions = {}): Promise<Harness> {
@@ -175,6 +178,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
       ...(crashAt.length > 0 ? { afterStep: (step: OwnerApprovalStep) => {
         if (crashAt.includes(step)) throw new Error(`fixture crash after ${step}`);
       } } : {}),
+      ...((overrides.abandonment ?? options.abandonment) === undefined ? {} : { abandonment: (overrides.abandonment ?? options.abandonment)! }),
     });
   };
 
@@ -943,14 +947,15 @@ describe('owner approval — a failing action is bounded and says so without lea
   it('counts attempts across restarts and refuses execution-error on the third', async () => {
     const repo = makeFixtureRepo('oa-execution-error');
     cleanupRepos.push(repo);
-    const h = await boot();
+    const h = await boot({
+      abandonment: () => {
+        throw new Error(`native abandonment transport failed (Authorization: Bearer ${SENTINEL}) while the ledger was busy`);
+      },
+    });
     await historicalLiveRequest(h, repo, 'job-e1', 'req-e1');
     const proposal = await propose(h, 'req-e1');
     const approval = createdApproval(proposal);
     const card = approvalCard(h, field<string>(approval, 'notification_id'));
-    vi.spyOn(h.ledger, 'abandonLiveDirective').mockImplementation(() => {
-      throw new Error(`native abandonment transport failed (Authorization: Bearer ${SENTINEL}) while the ledger was busy`);
-    });
     await decide(h, card.id, 'approve', 'owner');
     // The request first: a failing native call leaves it live.
     expect(requestState(h, 'req-e1')).toBe('dispatching');
@@ -1032,11 +1037,10 @@ describe('owner approval — the stored failure message is redacted, then cut to
   const failThrice = async (label: string, message: string): Promise<{ h: Harness; record: ReturnType<LedgerApi['getOwnerApproval']> & object; cardId: string }> => {
     const repo = makeFixtureRepo(`oa-cut-${label}`);
     cleanupRepos.push(repo);
-    const h = await boot();
+    const h = await boot({ abandonment: () => { throw new Error(message); } });
     await historicalLiveRequest(h, repo, `job-cut-${label}`, `req-cut-${label}`);
     const approval = createdApproval(await propose(h, `req-cut-${label}`));
     const card = approvalCard(h, field<string>(approval, 'notification_id'));
-    vi.spyOn(h.ledger, 'abandonLiveDirective').mockImplementation(() => { throw new Error(message); });
     await decide(h, card.id, 'approve', 'owner');
     expect(requestState(h, `req-cut-${label}`)).toBe('dispatching');
     h.restart().reconcile();
