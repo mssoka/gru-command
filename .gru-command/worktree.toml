@@ -1196,3 +1196,31 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts && npx vitest run test/review-ci-evidence.test.ts test/gitlab-mr-read.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-519-static = "npm run lint && npm run typecheck && npm run build"
 gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
+
+# #530 disposed-waiter retirement (extended by the 2026-10-31 re-brief): a
+# `job-minion` provider wait whose recorded agent is `disposed` and whose job
+# has no spawning/streaming agent is retired through the sensor's existing
+# waiter-disposition path (status `cancelled`, recorded why `waiter-gone` from
+# the tick and `waiter-gone-during-check` from the probe's re-validation). The
+# disposed-and-nothing-live rule now OUTRANKS the job_status_at_establishment
+# hold (blocked and delivered/in-review variants), while terminal, retired
+# debt, parked, newer-implementer, incident-currency, suspension, active-round
+# and live-agent checks all still win. `waiter-gone-focused` runs the sensor
+# contract plus the neighboring provider-recovery suites and the suite/budget
+# pins; `waiter-gone-static` is the lint + typecheck + build gate.
+waiter-gone-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+waiter-gone-static = "npm run lint && npm run typecheck && npm run build"
+
+# FAIL-BEFORE evidence for the 2026-10-31 re-brief: the FINAL behavioral test
+# bytes are overlaid on an isolated git-archive snapshot of the dispatch base
+# 191fff12c6309be7225d91c077181058a34609ec (root node_modules symlinked — no
+# download/install; approved RPC patch prerequisite; unchanged configs and
+# budgets). The base has no disposed-waiter rule, so the blocked-at-
+# establishment tick assertion REDs (the wait stays `waiting`) and the same
+# establishment-status wait seen by the re-validation REDs (the base holds it
+# instead of cancelling it with `waiter-gone-during-check`). The Vitest JSON
+# report is classified by tools/assert-named-red-baseline.mjs, which exits 2
+# on a collection/setup/import failure or a named test that did not fail by
+# its own assertion; the vitest exit is echoed intact and never masked; the
+# snapshot directory and the ignored pointer file are preserved.
+waiter-gone-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-waiter-gone-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/provider-recovery-sensor.test.ts "$d/test/provider-recovery-sensor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "waiter-gone-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/waiter-gone-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/provider-recovery-sensor.test.ts -t "retires a blocked-at-establishment wait whose agent is disposed"; a=$?; set -e; echo "waiter-gone-red vitest exit=$a EXPECTED-NONZERO: pre-change base holds the blocked-at-establishment wait on the tick and on re-validation"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly" >&2; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" waiter-gone "$d/results.json" "disposed waiter retirement (waiter-gone) retires a blocked-at-establishment wait whose agent is disposed on the tick" "disposed waiter retirement (waiter-gone) retires a blocked-at-establishment wait whose agent is disposed during the probe re-validation"; echo "EXPECTED-NONZERO: the establishment-status override REDs by assertion against the pre-change base"; exit 1'
