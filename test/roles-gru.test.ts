@@ -82,7 +82,7 @@ describe('gru role definition', () => {
     expect(gru).not.toContain('while the fix is in flight');
   });
 
-  it('the chief keeps pending work in the pipeline: enqueue now, dependencies, immutable briefings, review before release, pacing', () => {
+  it('the chief keeps pending work in the pipeline: enqueue now, dependencies, immutable briefings, one review while held, own holds', () => {
     const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
     // The section sits after Nefario's stress-test and before onboarding; every
     // assertion below reads the section alone, so words the rest of the role
@@ -107,30 +107,40 @@ describe('gru role definition', () => {
     for (const optional of ['`priority`', '`prerequisites`', '`exclusive_scopes`', '`hold_reason`', '`request_id`', '`"by": "gru"`']) {
       expect(section, `role section missing ${optional}`).toContain(optional);
     }
-    expect(section).toContain('a lower number is admitted first');
-    expect(section).toContain('The `id` becomes the job id, so make it lowercase');
+    expect(section).toContain(`\`priority\` (${PIPELINE_PRIORITY_MIN} to ${PIPELINE_PRIORITY_MAX}; a lower number is admitted first)`);
+    expect(section).toContain(
+      'The `id` becomes the job id and the branch `gru/<id>`, so make it lowercase and a valid branch name (no `..`, no trailing `.`, no `.lock`)',
+    );
     // Dependencies: pipeline entries with the closed milestone set; outside heists are holds.
     const milestones = PIPELINE_MILESTONES.map((milestone) => `\`${milestone}\``);
     expect(section).toContain(`the milestone is ${milestones.slice(0, -1).join(', ')} or ${milestones.at(-1)}`);
     expect(section).toContain('A prerequisite names another pipeline entry');
-    expect(section).toContain('`merged` and `done` are separate endings of a job and neither satisfies the other; `delivered` is satisfied by either');
+    expect(section).toContain(
+      '`merged` and `done` are separate endings of a job and neither satisfies the other; `delivered` accepts either ending only with a proven delivery on record',
+    );
+    expect(section).toContain('so depend on `merged` or `done` when the ending itself must release you');
     expect(section).toContain('A dependency on a heist dispatched outside the pipeline is a `hold_reason` that names that heist');
     expect(section).toContain('`POST /api/pipeline/entries/<id>/clear-hold`');
     expect(section).toContain('`POST /api/pipeline/entries/<id>/cancel`');
     expect(section).toContain('An entry has one hold reason, so when it also owes its review (below), name both and clear the hold only when each is met');
     expect(section).toContain('A failed entry cannot be cancelled: supersede it under a new `id`');
-    // Immutability, review before release, pacing.
+    // Immutability, one review while held (contract revision 1, amendment #1).
     expect(section).toContain('Briefings are immutable once enqueued');
-    expect(section).toContain('A correction before admission is a cancel and re-enqueue under a new `id` (and a new `request_id` if you set one)');
+    expect(section).toContain('A change to the briefing before admission is a cancel and re-enqueue under a new `id` (and a new `request_id` if you set one)');
     expect(section).toContain('After admission it is an ordinary dispatch amendment');
-    expect(section).toContain('Pipeline admission does not run the briefing-review gate');
-    expect(section).toContain('enqueue each entry held');
-    expect(section).toContain('run one briefing review of the exact briefing before you clear the hold');
-    expect(section).toContain('correct it with one amendment after admission, not a cancel for another round');
-    expect(section).toContain("the round-cap rule's spirit: one review, fix, dispatch");
-    expect(section).toContain('is still escalated as `scope-design`, never released');
-    expect(section).toContain('The pipeline admits as resident worker capacity allows');
-    expect(section).toContain('release holds gradually');
+    expect(section).toContain('**Enqueue held.** Enqueue every entry with a `hold_reason` that names its release condition as a heist plus a milestone');
+    expect(section).toContain('"release after gc-520-continue is merged"');
+    expect(section).toContain('**One review while held.** While the entry is held, run one briefing review of its exact text');
+    expect(section).toContain('Pipeline admission does not run the review gate today (#551)');
+    expect(section).toContain('**On READY,** clear the hold');
+    expect(section).toContain('**On CHANGES-NEEDED,** record a push-back, clear the hold, and append one corrective dispatch amendment as soon as the entry is admitted');
+    expect(section).toContain('That is the same practice as a direct dispatch at the review cap');
+    expect(section).toContain("Do not cancel and re-enqueue to correct a briefing a review flagged: a cancelled entry keeps its id (a re-enqueue needs a fresh id and request id), and dependents' prerequisites are immutable");
+    expect(section).toContain('**`/cancel` is only for an entry that is no longer owed.**');
+    expect(section).toContain('A dependent of a cancelled entry stays waiting, so cancel or re-enqueue that dependent explicitly');
+    expect(section).toContain('**Own holds only.** Clear only holds you placed yourself (`by: "gru"`), never an owner\'s hold');
+    expect(section).toContain('The pipeline shows every hold as `owner hold: <reason>`; the stored `by` tells them apart');
+    expect(section).toContain('**Pacing.** The pipeline already admits only as resident capacity allows. No separate pacing duty is needed');
   });
 
   it('docs/PIPELINE.md documents the routes, states, milestones, bounds and gate gap the code defines, and is linked from the role, FLOW and BRIEFING-REVIEW', () => {
@@ -171,13 +181,28 @@ describe('gru role definition', () => {
     for (const state of PIPELINE_STATES) {
       expect(states, `docs/PIPELINE.md missing state ${state}`).toContain(`| \`${state}\` |`);
     }
+    // Each state row keeps its own meaning (a row cannot swap with another).
+    for (const row of [
+      '| `waiting` | Enqueued, held, or blocked.',
+      '| `ready` | Nothing blocks it.',
+      '| `admitting` | The service claimed it',
+      '| `admitted` | Dispatched. The entry id is now the job id',
+      '| `failed` | Terminal. Admission failed three times before any job existed.',
+      '| `cancelled` | Terminal. Closed by `cancel`.',
+    ]) {
+      expect(states, `docs/PIPELINE.md state row changed: ${row}`).toContain(row);
+    }
     for (const milestone of PIPELINE_MILESTONES) {
       expect(milestones, `docs/PIPELINE.md missing milestone ${milestone}`).toContain(`| \`${milestone}\` |`);
     }
     // merged and done are separate endings; the role relies on that.
     expect(milestones).toContain('| `merged` | has a job whose status is exactly `merged`. |');
     expect(milestones).toContain('| `done` | has a job whose status is exactly `done`. |');
-    expect(milestones).toContain('`delivered` is the milestone both endings satisfy');
+    expect(milestones).toContain('| `admitted` | is `admitted` and its job has a recorded worker start');
+    expect(milestones).toContain('Nothing here reads the job\'s later status.');
+    expect(milestones).toContain('| `delivered` | has a job with a proven candidate delivery on record');
+    expect(milestones).toContain('and a status of `delivered`, `in-review`, `merged` or `done`.');
+    expect(milestones).toContain('`delivered` accepts either ending, but only with a proven candidate delivery on record');
     expect(milestones).toContain('A binned dependency does not release a `delivered` dependent');
     // Priority bounds, default and direction, at every site that states them.
     const bounds = `${PIPELINE_PRIORITY_MIN} to ${PIPELINE_PRIORITY_MAX}`;
@@ -190,7 +215,14 @@ describe('gru role definition', () => {
     // The gate gap and the sharp edges the role depends on.
     expect(doc).toContain('## The briefing-review gate is not run on admission');
     expect(doc).toContain('Making admission honour the gate is a separate change');
-    expect(enqueue).toContain('admission refuses them');
+    expect(enqueue).toContain('Uppercase is refused by the dispatch service before any job row exists');
+    expect(enqueue).toContain('the others fail when the lane is created, after the job row exists');
+    // The three mutations and their state matrix, and the hold text bound.
+    expect(endpoints).toContain('| `POST /api/pipeline/entries/<id>/hold` | holds an entry |');
+    expect(doc).toContain('The reason is trimmed and cut to 500 characters; holding a held entry replaces the reason.');
+    expect(doc).toContain('Only a `waiting` or `ready` entry. An entry with no hold comes back unchanged.');
+    expect(doc).toContain('Cancelling a cancelled entry is a no-op.');
+    expect(doc).toContain('`cancel` is refused on a `failed`');
     // Linked from the role section and from the dispatch flow, where dispatch is described.
     expect(readFileSync(GRU_MD, 'utf-8')).toContain('docs/PIPELINE.md');
     const flow = readFileSync(join(REPO_ROOT, 'docs', 'FLOW.md'), 'utf-8');

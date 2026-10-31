@@ -40,7 +40,7 @@ the instance has no token). A build that does not host the queue answers
 
 | Field | Required | Meaning |
 |---|---|---|
-| `id` | yes | The entry id. It becomes the job id (and the branch `gru/<id>`) on admission, so use 1 to 128 lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit, that make a valid branch name (no `..`, no trailing `.`, no `.lock` ending). Enqueue itself also accepts uppercase letters, but admission refuses them: such an entry answers `201` and then fails at admission, and its id stays burned (see [Admission](#admission)). |
+| `id` | yes | The entry id. It becomes the job id (and the branch `gru/<id>`) on admission, so use 1 to 128 lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit, that make a valid branch name (no `..`, no trailing `.`, no `.lock` ending). Enqueue accepts uppercase letters, and neither it nor the id check rejects `..`, a trailing `.` or a `.lock` ending. Uppercase is refused by the dispatch service before any job row exists, so admission retries and then makes the entry `failed`, its id burned; the others fail when the lane is created, after the job row exists. The entry answers `201` either way (see [Admission](#admission)). |
 | `repo_path` | yes | Path of the repository the lane is created from. Enqueue checks only that it is not blank; a path the dispatch service refuses surfaces at admission. |
 | `title` | yes | The heist title. |
 | `briefing` | yes | The complete briefing, stored verbatim. |
@@ -81,8 +81,11 @@ it returns the acceptance receipt with `duplicate: true` and creates nothing.
 - the prerequisites would form a dependency cycle.
 
 An entry that lists itself as a prerequisite is a `400`. While an entry exists,
-its `id` is reserved: a direct `POST /api/dispatch` cannot take that job id
-unless it is the entry's own admission.
+its `id` is reserved against a direct `POST /api/dispatch` — except while the
+entry is `admitting`, when the reservation stands aside and any caller may take
+the id. A direct dispatch that takes it makes the pipeline's own creation fail;
+the pipeline counts that attempt, unless the direct job carries the entry's
+exact briefing and repo, in which case it adopts the job.
 
 ### Reading
 
@@ -109,12 +112,12 @@ otherwise:
 ```json
 { "entry": { "id": "…", "repoPath": "…", "repo": "…", "title": "…",
              "briefing": "…", "briefingHash": "…", "priority": 5, "enqueueSeq": 12,
-             "state": "waiting", "holdReason": null, "prerequisites": [],
+             "state": "waiting", "holdReason": "waiting for the release", "prerequisites": [],
              "exclusiveScopes": [], "requestId": "…", "payloadHash": "…",
              "jobId": null, "claim": null, "failureReason": null, "failureCount": 0,
              "reconcileNote": null, "queuedAt": "…", "claimedAt": null,
              "admittedAt": null, "updatedAt": "…" },
-  "live_state": "waiting", "live_reason": null }
+  "live_state": "waiting", "live_reason": "owner hold: waiting for the release" }
 ```
 
 `entry.state` is the stored state. `live_state` and `live_reason` are what the
@@ -139,8 +142,10 @@ it now; stop the job through its own controls). `hold` and `clear-hold` are also
 refused on a `failed` or `cancelled` entry. `cancel` is refused on a `failed`
 entry, whose failure record is kept as history: supersede it by enqueueing the
 work again under a new `id` and `request_id`, and re-enqueue its dependents. Any authenticated caller can
-hold or clear a hold: the service does not tell one caller's hold from
-another's, and the entry's reason reads `owner hold: <reason>` whoever placed it.
+hold or clear a hold: the service records `by` on the event but does not tell
+one caller's hold from another's, and the entry's reason reads
+`owner hold: <reason>` whoever placed it. The role tells Gru to clear only the
+holds it placed itself.
 
 ## States
 
@@ -196,8 +201,10 @@ job and clear the hold when the job lands.
   which looks at the start and never at the later status, still counts it.
 - `merged` and `done` are separate terminal statuses and neither implies the
   other. A job that ends `done` never satisfies `merged`, and one that ends
-  `merged` never satisfies `done`. `delivered` is the milestone both endings
-  satisfy.
+  `merged` never satisfies `done`. `delivered` accepts either ending, but only
+  with a proven candidate delivery on record: a job that closes without one
+  never satisfies it and its dependent waits as
+  `waiting for <id> to be delivered (now done)`.
 - A dependency that is `cancelled` or `failed` leaves its dependents `waiting`
   (`prerequisite <id> cancelled|failed`) until they are cancelled too. The
   service never cancels a dependent for you.
@@ -252,9 +259,14 @@ then marks the entry `admitted`. A failed dispatch never duplicates work:
   trigger runs it sooner). The third such failure makes the entry `failed` and
   posts one `pipeline.admission-failed` notification (`action-required`: it wakes
   Gru, not the owner's bell);
-- a dispatch that created the job before failing is adopted, not repeated. If
-  no worker ever started, the job is blocked with a note and one
-  `pipeline.adopted-without-worker` notification (`action-required`) is posted;
+- a dispatch that created the job before failing (for example a lane that git
+  refuses to create, such as an `id` that is not a valid branch name) is
+  adopted, not repeated: the entry becomes `admitted`, the dispatch service has
+  already blocked the job with the failure noted, and the id is burned. The
+  pipeline posts its own `pipeline.adopted-without-worker` notification
+  (`action-required`) only when it has to block the job itself — an interrupted
+  startup it finds in claim reconciliation, at boot or in a live pass — never
+  when the dispatch service has already blocked the job;
 - a claim left over from a crash is reconciled at boot: a committed job is
   adopted, otherwise the entry returns to `waiting` with its briefing intact.
 
@@ -271,7 +283,9 @@ directive or re-brief ([REVIEW-INPUTS.md](./REVIEW-INPUTS.md)), so the worker's
 first turn runs on the text as enqueued.
 
 Until then, the discipline is Gru's: enqueue the entry held, review the exact
-briefing before the first release, then clear the hold (see the role).
+briefing while it is held, clear the hold on READY, and on CHANGES-NEEDED record
+a push-back, clear the hold, and correct the worker with one dispatch amendment
+after admission (see the role).
 
 ## Immutability and correction
 
@@ -282,7 +296,9 @@ is admitted, cancel it and enqueue the corrected briefing under a **new** `id` (
 entry's id stays reserved), with a new `request_id` too if you set one: a new
 `id` under the old `request_id` is a `409`. Entries that listed the cancelled one as
 a prerequisite stay `waiting` on it, so they are cancelled and re-enqueued
-against the new id as well. After admission the briefing is the job's, and a
+against the new id as well. A briefing-review finding is not a briefing change:
+it is recorded as a push-back and reaches the worker as a post-admission
+amendment (see the gate section). After admission the briefing is the job's, and a
 correction is an ordinary dispatch amendment
 (`POST /api/dispatch/amendment`, see [FLOW.md](./FLOW.md)).
 
