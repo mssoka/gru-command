@@ -902,10 +902,10 @@ function fileLikeOutside(candidate: string): boolean {
  * its SHAPE alone (absolute, `..`) may classify it. A space-free capture is
  * the path itself. A spaced capture (#357) is ambiguous — prose or a clock
  * time reaches a `:digits:` too — so it, and every suffix of it that starts a
- * word or a path component (`Matches in docs/issues/a b.md:1:` names
- * `docs/issues/a b.md`; `/srv/a b/repo/docs/issues/x.md:1:` names
- * `docs/issues/x.md`), is judged by the isolation globs; by shape only when
- * it is file-like (see fileLikeOutside). */
+ * word or a path component (prose in front of a spaced excluded path names
+ * that path, and so does a spaced absolute prefix in front of a repository
+ * path), is judged by the isolation globs; by shape only when it is file-like
+ * (see fileLikeOutside). */
 export function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {
   const captured = GREP_LINE.exec(line)?.[1];
   if (captured === undefined) return [];
@@ -930,10 +930,229 @@ function excludedGrepPath(candidate: { readonly path: string; readonly byShape: 
   return classifyBlindPath(candidate.path, rule);
 }
 
+/** The numbers `git grep -n` prints between a name and the rest of a line:
+ * `:7:` after a match, `-7-` after a context line. The closing character is
+ * only looked at, so `a-10-29-b.md-7-x` offers `-10-`, `-29-` and `-7-`. */
+const GREP_NUMBER_DELIMITER = /[:-]\d+(?=[:-])/gu;
+/** A line is only searched this far: its first this-many delimiters. */
+const MAX_GREP_DELIMITERS = 64;
+/** A name with no whitespace that ends in a dotted extension. */
+const UNSPACED_FILE_NAME = /^\S*\.[A-Za-z][A-Za-z0-9]{0,15}$/u;
+/** What a name goes on with after a dotted part of its own, up to its real
+ * extension: dash-separated numbers (`report.final` + `-2026-10-29.md`). */
+const DATED_NAME_TAIL = /^(?:-\d+)+\.[A-Za-z][A-Za-z0-9]{0,15}$/u;
+
+/** A name a grep result may offer, with whether its SHAPE alone may classify
+ * it (see gitGrepCandidate). */
+interface GrepCandidate {
+  readonly path: string;
+  readonly byShape: boolean;
+}
+
+/** An excluded path a grep result named, with why it is excluded. */
+interface GrepHit {
+  readonly path: string;
+  readonly detail: string;
+}
+
+/** The guesses at a repository path a result offers, head by head, and
+ * whether its path is settled (`closed`: a match line's number, or a name that
+ * ends in an extension, ended it) or the heads are all there is. `regionEnd`
+ * is where the heads stop: the index of the delimiter the last head stands
+ * before, so the line's own grammar says the path ended there. */
+interface GrepNames {
+  readonly heads: readonly (readonly GrepCandidate[])[];
+  readonly closed: boolean;
+  readonly regionEnd: number;
+}
+
+/** A text reaches a repository file name when its last component ends in a
+ * dotted extension (`…/deferred-work.md`, `<rev>:…/a.md`). A head that only
+ * reaches a date-like part of a name (`…/2026`, `…/2026-10`) has not: the
+ * rest of the name may still follow. */
+function endsAtFileName(text: string): boolean {
+  return /\.[A-Za-z][A-Za-z0-9]{0,15}$/u.test(text.trimEnd());
+}
+
+type GrepShape = 'none' | 'parent';
+
+/** One guess at a repository path. Only a parent-relative guess (`../x`) may
+ * be judged by its shape, the way `path:N:` judges one: a ref can hold no
+ * `..`, so whatever follows `<rev>:` that does is a path outside the checkout
+ * (`git grep -n x HEAD -- ..` run from a subdirectory prints it). An absolute
+ * or drive-letter guess is not, nor is a bare `.` or `..`: git prints no such
+ * name after a revision, and a stack frame or URL (`file:///srv/a.js:12:3`)
+ * reads as one. A spaced guess needs a file-like end (see fileLikeOutside),
+ * so prose never counts. */
+function gitGrepCandidate(path: string, shape: GrepShape): GrepCandidate {
+  const slashed = path.replace(/\\/gu, '/');
+  const absolute = slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed);
+  const outside = shape === 'parent' && !absolute && /(^|\/)\.\.(\/|$)/u.test(slashed) && /[^./]/u.test(slashed);
+  return { path, byShape: outside && (!/\s/u.test(slashed) || fileLikeOutside(slashed)) };
+}
+
+/** What a head — the line up to a delimiter — may name. A head without a `:`
+ * is a repository path itself (a worktree line). One with a `:` names
+ * `<rev>:<…>`, never a repository path itself, so it offers what follows the
+ * revision, the remaining `:` read as `/` (`<dir>:<file>`; that slash form
+ * first, it is the repository spelling) and as written. The tree root,
+ * `<rev>:`, prints `<rev>::<path>`: its path follows a second colon, which is
+ * no part of it. */
+function gitGrepHeadPaths(head: string): readonly GrepCandidate[] {
+  const name = head.trimEnd();
+  const colon = name.indexOf(':');
+  if (colon < 0) return name === '' ? [] : [gitGrepCandidate(name, 'parent')];
+  const revision = name.slice(0, colon);
+  // Up to six digits is the line number of an earlier grep, not a commit id.
+  if (/^\d{1,6}$/u.test(revision)) return [];
+  const tree = name.slice(colon + 1);
+  const stripped = tree.startsWith(':') ? tree.slice(1) : tree;
+  // A ref holds no whitespace: prose before the colon names no revision, so
+  // what follows it is judged by the globs alone, never by its shape.
+  const shape: GrepShape = /\s/u.test(revision) || /^(?:[/\\]|[A-Za-z]:[/\\])/u.test(stripped) ? 'none' : 'parent';
+  const joined = stripped.replace(/:/gu, '/');
+  const out: GrepCandidate[] = [];
+  if (joined !== '') out.push(gitGrepCandidate(joined, shape));
+  if (stripped !== joined) out.push(gitGrepCandidate(stripped, shape));
+  return out;
+}
+
+/**
+ * What a `git grep -n` line may name beyond the `path:LINE:` form (#520).
+ * Against a revision it prints `<rev>:<path>:7:text` (`<rev>:<path>-7-text`
+ * for context) and against `<rev>:<dir>` it prints `<rev>:<dir>:<file>:7:text`;
+ * in the worktree a context line is `<path>-7-text`. So everything before a
+ * delimiter may be a path, and what the first colon ends may be a revision,
+ * whatever it is spelled — it is never validated as a ref, but the numbers
+ * and dots inside it (`pr-528`, `v2.beta-5-gabc1234`, `release-2026-10-29`)
+ * are no delimiters of the path: the search starts behind it. A prefix that
+ * holds a delimiter of its own is also read as a worktree line, because the
+ * text of a context line may open with `word:` (`…-7-Status: done`).
+ *
+ * The matched line's TEXT carries delimiters of its own (`...:7:Updated on
+ * 2026-10-29`, `...-7-DATE=2026-10-29`, a quoted `notes.md:12:`), and
+ * `ProhibitedAccess.excerptSha256` is digest only: the private text never
+ * rides the ledger, and a recorded `path` is a repository path. So only the
+ * heads of the PATH REGION are guesses at a path — the line up to the first
+ * delimiter that ends the path:
+ *
+ * - a match line's line number, `:7:` (opened and closed by a colon) — unless
+ *   whitespace follows an earlier delimiter and the head has not reached a file
+ *   name, when it is more likely text (`NOTES-7-meeting at 12:30:45`);
+ * - a head that has reached a file name (see endsAtFileName), unless the name
+ *   goes on with dash-separated numbers to a later extension
+ *   (`report.final-2026-10-29.md` holds a dotted part of its own, see
+ *   DATED_NAME_TAIL): `.../2026-10-29-notes.md-7-` ends at `.md`, not at the
+ *   `-10-` or `-29-` before it, and what follows is text.
+ *
+ * Every head up to there is a guess (a date-like part of a name is a prefix
+ * of the whole name). A path that no delimiter settled (no extension) offers
+ * the heads that hold no whitespace — a spaced one may be prose — and a line
+ * whose last number sits inside a name (its tail is an unspaced name with an
+ * extension, `dir/gc-520-notes.md`) is a listing, not a grep line. A line
+ * opening with whitespace is no grep line either (an indented frame). Only the
+ * first MAX_GREP_DELIMITERS delimiters of a line count, and a head longer than
+ * MAX_PATH_CHARS is never a path. Judge these by the isolation globs (and the
+ * shape rule of gitGrepCandidate): they are guesses at a path.
+ */
+function gitGrepLineNames(line: string): readonly GrepNames[] {
+  if (line === '' || /^\s/u.test(line)) return [];
+  const colon = line.indexOf(':');
+  const revisionEnd = colon > 0 && colon <= MAX_PATH_CHARS && !/\s/u.test(line.slice(0, colon)) && !/\d/u.test(line[colon + 1] ?? '') ? colon + 1 : 0;
+  const behind = gitGrepNamesBehind(line, revisionEnd);
+  // The text of a worktree context line may open with `word:` (`…-7-Status: done`, a URL):
+  // that colon is no revision's. A prefix that holds a delimiter of its own is read both ways.
+  const worktree = revisionEnd > 0 && new RegExp(GREP_NUMBER_DELIMITER).test(line.slice(0, revisionEnd - 1)) ? gitGrepNamesBehind(line, 0) : null;
+  return [behind, worktree].filter((names): names is GrepNames => names !== null);
+}
+
+function gitGrepNamesBehind(line: string, revisionEnd: number): GrepNames | null {
+  const delimiter = new RegExp(GREP_NUMBER_DELIMITER);
+  delimiter.lastIndex = revisionEnd;
+  const found: { readonly index: number; readonly length: number }[] = [];
+  for (let match = delimiter.exec(line); match !== null && found.length < MAX_GREP_DELIMITERS && match.index <= MAX_PATH_CHARS; match = delimiter.exec(line)) {
+    found.push({ index: match.index, length: match[0].length });
+  }
+  if (found.length === 0) return null;
+  const lineNumber = found.map((d) => line[d.index] === ':' && line[d.index + d.length] === ':');
+  const fileName = found.map((d) => endsAtFileName(line.slice(Math.max(0, d.index - 32), d.index)));
+  let stop = -1;
+  for (let k = 0; k < found.length; k += 1) {
+    if (lineNumber[k]) {
+      // After a first delimiter and whitespace, `:7:` is more likely text (`… at 12:30:45`) than the line number.
+      if (k === 0 || fileName[k] || !/\s/u.test(line.slice(found[0]!.index, found[k]!.index))) { stop = k; break; }
+      continue;
+    }
+    if (!fileName[k]) continue;
+    const next = found.findIndex((_, j) => j > k && fileName[j]);
+    if (next < 0 || !DATED_NAME_TAIL.test(line.slice(found[k]!.index, found[next]!.index))) { stop = k; break; }
+  }
+  const last = stop >= 0 ? stop : found.length - 1;
+  if (!(stop >= 0 && lineNumber[stop])) {
+    const end = found[last]!.index + found[last]!.length + 1;
+    const tail = line.slice(end, end + MAX_PATH_CHARS + 1).trimEnd();
+    if (tail.length <= MAX_PATH_CHARS && UNSPACED_FILE_NAME.test(tail)) return null;
+  }
+  const space = line.slice(0, MAX_PATH_CHARS + 1).search(/\s/u);
+  const heads: (readonly GrepCandidate[])[] = [];
+  for (let k = 0; k <= last; k += 1) {
+    if (stop < 0 && space >= 0 && space < found[k]!.index) continue;
+    heads.push(gitGrepHeadPaths(line.slice(0, found[k]!.index)));
+  }
+  return { heads, closed: stop >= 0, regionEnd: found[last]!.index };
+}
+
+/** The excluded path some names offer: when the path is settled the longest
+ * (a date-like part of a name is a prefix of the whole), otherwise the
+ * shortest, so a guess that has run on into the text is never preferred over
+ * the one before it; of equal length the first, and within a head the
+ * repository spelling. Of several readings of one line, the longest. */
+function excludedNames(readings: readonly GrepNames[], rule: BlindIsolationRule): GrepHit | undefined {
+  let found: GrepHit | undefined;
+  for (const names of readings) {
+    let best: GrepHit | undefined;
+    for (const head of names.heads) {
+      for (const candidate of head) {
+        if (best !== undefined && (names.closed ? candidate.path.length <= best.path.length : candidate.path.length >= best.path.length)) continue;
+        // The repository itself (`.`, `./`) is no file of it, so no read of one.
+        if (normalizeRepoPath(candidate.path) === '') continue;
+        const detail = excludedGrepPath(candidate, rule);
+        if (detail !== null) best = { path: candidate.path, detail };
+      }
+    }
+    if (best !== undefined && (found === undefined || best.path.length > found.path.length)) found = best;
+  }
+  return found;
+}
+
+/** The excluded path a result's `git grep` revision and context-line forms
+ * name (see gitGrepLineNames), over the lines' readings: per reading the path
+ * its names offer (excludedNames), over the result the longest, and of equal
+ * length the first, so one tool result always records one path. Undefined when
+ * none is excluded. */
+function gitGrepHit(
+  readings: readonly { readonly line: string; readonly names: readonly GrepNames[] }[],
+  rule: BlindIsolationRule,
+): GrepHit | undefined {
+  let best: GrepHit | undefined;
+  for (const { names } of readings) {
+    for (const reading of names) {
+      const hit = excludedNames([reading], rule);
+      if (hit !== undefined && (best === undefined || hit.path.length > best.path.length)) best = hit;
+    }
+  }
+  return best;
+}
+
 /**
  * What the reviewer actually SAW: tool results whose grep lines land in an
  * excluded path or whose body is history-bearing text. This is observed
  * access, not inferred intent from a file name or a search command.
+ *
+ * The `git grep --heading` form is not observed: a file's name on a line of
+ * its own, with its numbered lines under it, is no form this scanner reads
+ * (the follow-up to #520 covers it). Only lines that name a path and a line
+ * number themselves are judged.
  */
 export function scanObservedAccess(
   results: readonly ObservedToolResult[],
@@ -961,11 +1180,27 @@ export function scanObservedAccess(
       });
       continue;
     }
-    const excluded = result.text
-      .split('\n')
-      .flatMap((line) => grepPathCandidates(line))
+    const lines = result.text.split('\n').map((raw) => (raw.endsWith('\r') ? raw.slice(0, -1) : raw));
+    // CRLF output: the separators are git's own, the carriage return is not part of them.
+    const readings = lines.map((line) => ({ line, names: gitGrepLineNames(line) }));
+    // The `path:LINE:` forms first (unchanged: a spaced capture records the
+    // whole capture, so prose in front of a spaced path still names it), except
+    // on a line whose own grep grammar ends its path before that capture: a
+    // context-line number inside the capture means the rest is the line's text,
+    // which never rides the record. That line is judged by its path region.
+    const grammarDecides = ({ line, names }: { readonly line: string; readonly names: readonly GrepNames[] }): boolean => {
+      const capture = GREP_LINE.exec(line)?.[1];
+      // Only a spaced capture is ambiguous enough for the line's grammar to
+      // override it (prose or a clock time reaches a `:digits:` too); a
+      // whitespace-free capture is the path the older rule has always read.
+      if (capture === undefined || !/\s/u.test(capture)) return false;
+      return names.some((reading) => reading.closed && reading.regionEnd < capture.length);
+    };
+    const excluded = readings
+      .filter((reading) => !grammarDecides(reading))
+      .flatMap((reading) => grepPathCandidates(reading.line))
       .map((candidate) => ({ path: candidate.path, detail: excludedGrepPath(candidate, rule) }))
-      .find((hit) => hit.detail !== null);
+      .find((hit) => hit.detail !== null) ?? gitGrepHit(readings, rule);
     if (excluded !== undefined) {
       out.push({
         index: result.index,
