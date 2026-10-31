@@ -725,6 +725,20 @@ Events: `silas.closeout-intent`, `silas.closeout-stopped`,
 `by: "canceled-request-closeout"`). See
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
 
+### Process identity is the raw command's digest (#534)
+
+Migration 34 (`worktree-process-command-digest`) is additive: it adds
+`worktree_processes.command_sha256`, the SHA-256 hex of the **raw** command
+line a process was listed with. The row's `command` is recorded masked
+(credentials replaced, see [WORKTREES.md §2](./WORKTREES.md)), and two
+commands whose credentials differ mask to the same text, so every write
+records the digest beside it and every decision that a live process is the
+one a row describes (an acknowledged kill, the terminal readback of a
+verification run) compares the digest. A row written before the migration
+keeps NULL: its identity is unknown, so it never matches by its masked
+text; its process is asked about again and a registry row of that kind is
+left to the sweep's reap. The digest is a column, never an event field.
+
 ### Lane tokens and processes reaped by them (#486)
 
 Migration 31 (`worktree-lane-token`) adds `worktrees.lane_token`: a random

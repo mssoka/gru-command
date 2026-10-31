@@ -220,6 +220,57 @@ scheduler records every run it spawns for a lane (pid + argv, evidence
 `registry`) and reconciles it on exit. A service the orchestrator started
 for a lane is the lane's to tear down — not a stranger's.
 
+A row's `command` line is recorded with its credentials masked (#534)
+when the writer holds a raw line: `redactCredentials` runs inside the
+ledger write, so a pause, a reap and the verification scheduler's
+`registry` rows all record the masked line. A writer that hands back a row
+it read from the table passes that row's digest back too (the string, or
+`null` when the row has none), and is not a raw line: the row keeps its
+recorded text and its digest exactly as they are, so a row written before
+#534 keeps its line until a fresh enumeration re-records it (there is no
+backfill). Every process record that leaves GC — the release's paused
+result, the `worktree.paused` payload, the `onSweepPaused` processes and
+details, and the refusal error's processes — carries it for
+the credential forms `redactCredentials` recognizes (the pairing token's
+`Authorization: Bearer`, the keyword assignments, and the `--token`,
+`-u user:value` and `Authorization: token` argv forms; the inventory in
+#534's PR names the boundary). The verification scheduler's events carry
+their command lines masked too: the `command`, `process_command` and
+`step_command` of `verification.started`, `verification.process-started`,
+`verification.requested`, `verification.completed` and the other
+verification events, each per-step check's `command`, and the request's
+`dedupe_key` (and the `verification.refused` event of a held job). The
+raw `ps` line stays in memory for the checks that need it (tree matching,
+token naming, `ps -E` provenance). The scheduler's own durable files (mode
+0600, in the data directory) keep the raw line too: its state file and its
+terminal-identity log (`requests.ndjson`), because a restarted scheduler
+compares a holder's recorded argv with the live process to recognise it as
+its own and refuses a replayed identity by that command; they are identity
+inputs, not events or rows. The capture helper's owner record
+(`<sink>.owner.json`, mode 0600) keeps its own invocation line for the same
+reason: withdrawal validates the live helper against it. A verification
+run's own response frames and status name the command to the client that
+submitted it.
+
+The masked text is for display and audit, never an identity: two commands
+whose credentials differ mask to the same line. Each row therefore also
+records `command_sha256`, the SHA-256 hex of the **raw** command line, on
+every write, and every decision that a live process is the one a row
+describes compares that digest. An acknowledged pid is killed only while
+the fresh enumeration's raw command digests to the row's; the terminal
+readback of a verification run closes a `registry` row only when its digest
+equals that of the raw process command the reconcile derives from the run's
+own command (the events it reads hold the masked text, so they bind
+receipts to the run but never identify a process). A row with no digest (one
+written before the digest existed) has no identity: it never matches by its
+masked text, so its process is asked about again and the fresh row replaces
+it, and a registry row of that kind is left to the sweep's reap: a
+verification run in flight when the digest first shipped leaves such a row
+`live` until its lane's sweep, and until then the lane stays fenced against
+retirement and its turn-settled lane-token reap is skipped. A row whose
+process exits without being paused again keeps its recorded text: there is
+no backfill of existing rows.
+
 Each row also carries the lane's **token** (`lane_token`, #486): random per
 lane incarnation, minted when the row is registered (lanes not yet swept
 when the column arrived got one then). Every session GC spawns in the lane
@@ -420,8 +471,12 @@ carries it, and so does everything that session starts
    enumeration — later arrivals were never acknowledged), and only while
    the fresh enumeration still finds each rooted in the tree running the
    command it was recorded with (#486: an answer given late never reaches a
-   pid that now runs another command), with a SIGTERM grace before
-   SIGKILL. Survivors re-pause; newcomers get their own ask;
+   pid that now runs another command). "The command it was recorded with" is
+   the SHA-256 of the raw command line stored beside the row (#534), not the
+   row's masked `command`, which two commands with different credentials
+   share; a row without that digest never matches and is asked about again.
+   A SIGTERM grace precedes SIGKILL. Survivors re-pause; newcomers get
+   their own ask;
    `confirm_kill` without a recorded pause is not honored. Silent kills
    do not exist for processes nothing ties to the lane. The owner's card
    ([§3a](#3a-lane-provenance-486)) names what runs and offers that answer

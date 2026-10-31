@@ -1248,4 +1248,19 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_request_closeouts_job ON request_closeouts(job_id);
     `,
   },
+  {
+    // #534: a process row's `command` is recorded with its credentials masked,
+    // so two commands that differ only in a credential read the same. The row
+    // also carries the SHA-256 hex of the RAW command line, which is what a
+    // decision that a live process is the recorded one compares. A row written
+    // before this column keeps NULL: its identity is unknown, so it never
+    // authorises a kill or a registry match by its masked text. Additive.
+    // LANDING COLLISION (same convention as migrations 10-33): renumber ONLY
+    // this never-applied migration if main lands id 34 first.
+    id: 34,
+    name: 'worktree-process-command-digest',
+    sql: `
+      ALTER TABLE worktree_processes ADD COLUMN command_sha256 TEXT;
+    `,
+  },
 ];

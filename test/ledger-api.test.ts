@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2564,3 +2565,85 @@ describe('GH-305 additive mailbox metadata authority', () => {
   });
 
 });
+
+it('redacts argv credentials in the verify registry write', () => {
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const dir = tmpDir();
+  const db = new LedgerDb(dir);
+  const api = new LedgerApi(db.handle);
+  try {
+    api.addJob({ id: 'registry-write', repo: 'r', title: 'j' });
+    api.registerWorktree({ id: 'registry-write', kind: 'job', repoPath: '/tmp/registry-repo', repoName: 'r', path: '/tmp/registry-write', branch: 'gru/registry-write', sha: 'a'.repeat(40), jobId: 'registry-write' });
+    const command = `/bin/sh -c curl -H 'Authorization: Bearer ${secret}' --token ${secret} https://user:${secret}@host/x`;
+    // What the verification server records at spawn (evidence 'registry'), and settles after.
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'live', processes: [{ pid: 4242, command, evidence: 'registry' }] });
+    const stored = api.listWorktreeProcesses('registry-write').find((proc) => proc.pid === 4242);
+    expect(stored).toMatchObject({ evidence: 'registry', state: 'live' });
+    expect(stored?.command).not.toContain(secret);
+    expect(stored?.command).toContain('[REDACTED]');
+    expect(stored?.command).toContain('/bin/sh -c curl -H');
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'killed', processes: [{ pid: 4242, command, evidence: 'registry' }] });
+    // The table itself, and what the writes put on the event stream, hold no credential.
+    expect(JSON.stringify(db.handle.prepare('SELECT * FROM worktree_processes').all())).not.toContain(secret);
+    expect(JSON.stringify(api.listEvents({ limit: 100 }))).not.toContain(secret);
+    // Recording a row read back from the table changes neither its text nor its identity: the row is not a raw line,
+    // so the writer must hand its digest back (`undefined` would digest the masked text as if it were the raw command,
+    // and the row could then never be matched by the live process again).
+    api.recordWorktreeProcesses({ worktreeId: 'registry-write', state: 'killed', processes: [{ pid: 4242, command: stored!.command, commandSha256: stored!.commandSha256, evidence: 'registry' }] });
+    const rerecorded = api.listWorktreeProcesses('registry-write').find((proc) => proc.pid === 4242);
+    expect(rerecorded?.command).toBe(stored?.command);
+    expect(rerecorded?.commandSha256).toBe(stored?.commandSha256);
+    expect(rerecorded?.commandSha256).toBe(createHash('sha256').update(command).digest('hex'));
+  } finally { db.close(); }
+});
+
+it('records the SHA-256 of the raw command beside the masked command on every process write (#534 R1)', () => {
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const other = 'Zx5Hn2Bv8Qd4Wm7Lt3Pc';
+  const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+  const dir = tmpDir();
+  const db = new LedgerDb(dir);
+  const api = new LedgerApi(db.handle);
+  try {
+    api.addJob({ id: 'digest-write', repo: 'r', title: 'j' });
+    api.registerWorktree({ id: 'digest-write', kind: 'job', repoPath: '/tmp/digest-repo', repoName: 'r', path: '/tmp/digest-write', branch: 'gru/digest-write', sha: 'a'.repeat(40), jobId: 'digest-write' });
+    const row = (pid: number) => api.listWorktreeProcesses('digest-write').find((proc) => proc.pid === pid);
+    const raw = `curl -u deploy:${secret} https://host/x`;
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'live', processes: [{ pid: 7001, command: raw, evidence: 'argv' }] });
+    // The text is masked for display; the identity is the digest of the raw line.
+    expect(row(7001)?.command).toBe(`curl -u deploy:[REDACTED] https://host/x`);
+    expect(row(7001)?.commandSha256).toBe(sha256(raw));
+    // Another credential masks to the same text and digests to another identity.
+    const rival = raw.replace(secret, other);
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'live', processes: [{ pid: 7001, command: rival, evidence: 'argv' }] });
+    expect(row(7001)?.command).toBe(`curl -u deploy:[REDACTED] https://host/x`);
+    expect(row(7001)?.commandSha256).toBe(sha256(rival));
+    expect(sha256(rival)).not.toBe(sha256(raw));
+    // A credential-free line is digested too, and a killed write keeps the digest of the line it was given.
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'live', processes: [{ pid: 7002, command: 'node server.js', evidence: 'cwd' }] });
+    expect(row(7002)?.commandSha256).toBe(sha256('node server.js'));
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7002, command: 'node server.js --port 1', evidence: 'cwd' }] });
+    expect(row(7002)).toMatchObject({ state: 'killed', commandSha256: sha256('node server.js --port 1') });
+    // A writer that read a row back passes the row's digest through: the explicit digest, or none.
+    const stored = row(7001)!;
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7001, command: stored.command, commandSha256: stored.commandSha256, evidence: 'argv' }] });
+    expect(row(7001)).toMatchObject({ state: 'killed', commandSha256: sha256(rival) });
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7003, command: 'legacy line', commandSha256: null, evidence: 'argv' }] });
+    expect(row(7003)?.commandSha256).toBeNull();
+    // A row read back with its digest holds its masked text already and keeps it as it is, even for a shape that masking
+    // again would change. A row without a digest is the same: its recorded text is the audit record and is kept, and it
+    // keeps no identity (the ack re-asks, the reconcile refuses).
+    const glued = `cli --token "${secret}";echo done`;
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'live', processes: [{ pid: 7004, command: glued, evidence: 'argv' }] });
+    const writtenOnce = row(7004)!;
+    expect(writtenOnce.command).toBe('cli --token [REDACTED];echo done');
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7004, command: writtenOnce.command, commandSha256: writtenOnce.commandSha256, evidence: 'argv' }] });
+    expect(row(7004)).toMatchObject({ state: 'killed', command: 'cli --token [REDACTED];echo done', commandSha256: sha256(glued) });
+    api.recordWorktreeProcesses({ worktreeId: 'digest-write', state: 'killed', processes: [{ pid: 7005, command: writtenOnce.command, commandSha256: null, evidence: 'argv' }] });
+    expect(row(7005)).toMatchObject({ command: 'cli --token [REDACTED];echo done', commandSha256: null });
+    // The digest is a column of the table and never leaves the ledger on the event stream.
+    expect(db.handle.prepare('SELECT command_sha256 FROM worktree_processes WHERE pid = 7001').get()).toEqual({ command_sha256: sha256(rival) });
+    expect(JSON.stringify(api.listEvents({ limit: 100 }))).not.toContain(sha256(rival));
+  } finally { db.close(); }
+});
+

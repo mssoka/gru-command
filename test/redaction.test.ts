@@ -239,3 +239,125 @@ describe('redactCredentialWindow', () => {
     expect(redactCredentialWindow('before\n-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIEsecretbody\n')).toBe(`before\n${REDACTION_PLACEHOLDER}`);
   });
 });
+
+/**
+ * Process command lines (#534): a worktree process's argv reaches the ledger,
+ * an event and a response through `redactCredentials`. These top-level cases
+ * keep their Vitest `fullName`s exactly the names the heist's red scope passes.
+ */
+const ARGV_SECRET = 'Zx9Kq3Lm7Pw2Vb5Nc8Td';
+
+it('redacts argv credentials: new token, user and auth-scheme forms', () => {
+  const cases: readonly (readonly [string, string])[] = [
+    [`curl --token ${ARGV_SECRET} https://host/x`, `curl --token ${REDACTION_PLACEHOLDER} https://host/x`],
+    [`node cli.js --token ${ARGV_SECRET}`, `node cli.js --token ${REDACTION_PLACEHOLDER}`],
+    [`curl -u deploy:${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy:${ARGV_SECRET}`, `curl -u deploy:${REDACTION_PLACEHOLDER}`],
+    // A user that looks like an address is still a user; a `//` tail after
+    // the colon (a scheme URL) is masked like any other value, so no
+    // credential spelling is left whole.
+    [`curl -u user@example.com:${ARGV_SECRET} https://host/x`, `curl -u user@example.com:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy://${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u "deploy://${ARGV_SECRET}" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    // curl accepts an empty user; the part after the colon is the credential.
+    [`curl -u :${ARGV_SECRET} https://host/x`, `curl -u :${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u ":${ARGV_SECRET}" https://host/x`, `curl -u ":${REDACTION_PLACEHOLDER}" https://host/x`],
+    // A whole-quoted value may hold the other quote character in its password,
+    // and a quoted password may start with a digit or symbol.
+    [`curl -u "deploy:it's-${ARGV_SECRET}" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    [`curl -u 'deploy:say"hi-${ARGV_SECRET}' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl -u deploy:"it's-${ARGV_SECRET}" https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u 'deploy:1234 5678${ARGV_SECRET}' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl -u 'deploy:$ecret pass phrase' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl -u 'a b:1234 ${ARGV_SECRET}' https://host/x`, `curl -u 'a b:${REDACTION_PLACEHOLDER}' https://host/x`],
+    // A child's argv has no shell quotes: a quote, backtick or shell-spliced
+    // word in the value still runs to whitespace and masks whole. (A value the
+    // shell already split on whitespace is not recoverable from argv.)
+    [`curl -u deploy:it's-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy:pa\`ss-${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`/bin/sh -c curl -u 'deploy:it'\\''s-${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`curl --token it's-${ARGV_SECRET}`, `curl --token ${REDACTION_PLACEHOLDER}`],
+    // A quoted token of six or more characters masks whole, even when its
+    // inner value is shorter; the exact six-character minimum masks.
+    ['cli --token "abc12"', `cli --token ${REDACTION_PLACEHOLDER}`],
+    ["cli --token '12345'", `cli --token ${REDACTION_PLACEHOLDER}`],
+    ['curl -u a:"abc12"', `curl -u a:${REDACTION_PLACEHOLDER}`],
+    ['cli --token abc123', `cli --token ${REDACTION_PLACEHOLDER}`],
+    ['curl -u a:abc123', `curl -u a:${REDACTION_PLACEHOLDER}`],
+    // A value beginning with the placeholder is a credential too; only the
+    // exact placeholder is left alone (A4).
+    [`curl -u deploy:[REDACTED]${ARGV_SECRET} https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u a:"[REDACTED]${ARGV_SECRET}" https://host/x`, `curl -u a:${REDACTION_PLACEHOLDER} https://host/x`],
+    ['curl -H Authorization: token abc123', `curl -H Authorization: token ${REDACTION_PLACEHOLDER}`],
+    // A named user:group is indistinguishable from user:password, so it masks;
+    // only the all-digit uid:gid pair is left alone (A4).
+    ['docker run -u postgres:postgres image', `docker run -u postgres:${REDACTION_PLACEHOLDER} image`],
+    [`curl -H Authorization: token ${ARGV_SECRET} https://host/x`, `curl -H Authorization: token ${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -H authorization:Token ${ARGV_SECRET}`, `curl -H authorization:Token ${REDACTION_PLACEHOLDER}`],
+    // Inside a shell string, the quote ends the value.
+    [`/bin/sh -c curl -H 'Authorization: token ${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -H 'Authorization: token ${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`/bin/sh -c curl -u 'deploy:${ARGV_SECRET}' https://host/x`, `/bin/sh -c curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    [`/bin/sh -c cli --token "${ARGV_SECRET}" --verbose`, `/bin/sh -c cli --token ${REDACTION_PLACEHOLDER} --verbose`],
+    // A password that starts with a dash is still a password after `user:`.
+    [`curl -u deploy:-${ARGV_SECRET}`, `curl -u deploy:${REDACTION_PLACEHOLDER}`],
+    // A quoted password (its quotes are part of the `ps` line), a quoted
+    // user, and a whole quoted value whose password holds a space.
+    [`curl -u deploy:'${ARGV_SECRET}' https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u deploy:"${ARGV_SECRET}" https://host/x`, `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u "deploy":${ARGV_SECRET} https://host/x`, `curl -u "deploy":${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl -u "deploy:${ARGV_SECRET} word" https://host/x`, `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    [`curl -u 'deploy:${ARGV_SECRET} word' https://host/x`, `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
+    // A token flag's case does not matter: the `=` form is masked by the
+    // case-insensitive keyword rule, so the space form masks alike.
+    [`curl --TOKEN ${ARGV_SECRET} https://host/x`, `curl --TOKEN ${REDACTION_PLACEHOLDER} https://host/x`],
+    [`curl --Token ${ARGV_SECRET} https://host/x`, `curl --Token ${REDACTION_PLACEHOLDER} https://host/x`],
+    // Each occurrence in one command line.
+    [`cli --token ${ARGV_SECRET} -u a:${ARGV_SECRET}`, `cli --token ${REDACTION_PLACEHOLDER} -u a:${REDACTION_PLACEHOLDER}`],
+  ];
+  for (const [text, expected] of cases) {
+    const redacted = redactCredentials(text);
+    expect(redacted, text).not.toContain(ARGV_SECRET);
+    expect(redacted, text).toContain(REDACTION_PLACEHOLDER);
+    expect(redacted, text).toBe(expected);
+  }
+});
+
+it('keeps argv near misses unchanged: a flag with no credential value, a short, symbol-only or numeric -u part, an id pair', () => {
+  for (const kept of [
+    '--token --verbose',
+    'node cli.js --token',
+    'node cli.js --token --verbose build',
+    'docker run -u 1000:1000 image',
+    'docker run -u 165536:165536 image',
+    'curl -u deploy:1234567 https://host/x',
+    'curl -u "deploy:1234567" https://host/x',
+    'curl -u \'deploy:1234567\' https://host/x',
+    'docker exec -u alice bash',
+    'git push -u origin main',
+    'git push -u origin HEAD:refs/heads/main',
+    'cli --token abc12',
+    'curl -u deploy:[REDACTED]',
+    'cli --token "abc"',
+    'curl -u a:"abc"',
+    "curl -u a:'12345'",
+    'cli --token ******',
+    'cli --tokenize abcdefgh',
+    'cli --token-file /tmp/token-file',
+    'curl -H Authorization: token',
+    'curl -H Authorization: token --verbose',
+    'curl -H Authorization: token abc',
+    'curl -H Authorization: tokens abcdefghij',
+    'cli -u:abcdefghij',
+  ]) expect(redactCredentials(kept), kept).toBe(kept);
+});
+
+it('redacts a command line once: a redacted argv redacts to itself', () => {
+  for (const text of [
+    `curl -H Authorization: Bearer ${ARGV_SECRET} --token ${ARGV_SECRET} -u me:${ARGV_SECRET} -H Authorization: token ${ARGV_SECRET} https://me:${ARGV_SECRET}@host/x`,
+    `cli --token=${ARGV_SECRET} -H PRIVATE-TOKEN: ${ARGV_SECRET}`,
+  ]) {
+    const once = redactCredentials(text);
+    expect(once).not.toContain(ARGV_SECRET);
+    expect(redactCredentials(once)).toBe(once);
+  }
+});

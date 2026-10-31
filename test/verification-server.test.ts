@@ -244,6 +244,122 @@ describe('POST /api/verify', () => {
     await h.close();
   });
 
+  it('records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-readback';
+    const command = `node verify.mjs pass --token ${secret}`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      // The port may be ledger-backed (the row exists) or a test double (it does not).
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      // What the server recorded at the run's spawn and settlement.
+      const recorded = h.ledger.listWorktreeProcesses(lane.id);
+      expect(recorded.length).toBeGreaterThan(0);
+      for (const row of recorded) { expect(row.command).not.toContain(secret); expect(row.command).toContain('[REDACTED]'); }
+      // R2: the whole event stream the run left holds the scope's command masked, in every field that carries it.
+      const lifecycle = h.ledger.listJobEventsByKinds(h.jobId, ['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']);
+      expect(new Set(lifecycle.map((event) => event.kind))).toEqual(new Set(['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']));
+      for (const event of lifecycle) {
+        const fields = event.payload as Record<string, unknown>;
+        for (const field of ['command', 'process_command', 'step_command', 'dedupe_key']) {
+          if (fields[field] === undefined) continue;
+          expect(String(fields[field]), `${event.kind}.${field}`).not.toContain(secret);
+          expect(String(fields[field]), `${event.kind}.${field}`).toContain('[REDACTED]');
+        }
+      }
+      expect(lifecycle.find((event) => event.kind === 'verification.started')?.payload).toMatchObject({ command: 'node verify.mjs pass --token [REDACTED]' });
+      expect(lifecycle.find((event) => event.kind === 'verification.process-started')?.payload)
+        .toMatchObject({ command: 'node verify.mjs pass --token [REDACTED]', process_command: '/bin/sh -c node verify.mjs pass --token [REDACTED]', step_command: 'node verify.mjs pass --token [REDACTED]' });
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+      // The run's process is gone; its row, live again, is closed by the readback of the original receipts. The
+      // readback's command is the raw one the scheduler kept: the events hold it masked. The row is the one the
+      // server's own spawn write recorded: its digest is that of the raw argv, which is the identity the reconcile derives.
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string };
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      const reconcile = () => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()?.commandSha256).toBe(createHash('sha256').update(`/bin/sh -c ${command}`).digest('hex'));
+      h.db.handle.prepare("UPDATE worktree_processes SET state = 'live' WHERE worktree_id = ? AND pid = ?").run(lane.id, facts.pid);
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      const audit = h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled');
+      expect(audit?.payload).toMatchObject({ pid: facts.pid, request_id: requestId });
+      expect(String((audit?.payload as { command: string }).command)).not.toContain(secret);
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
+  it('closes a registry row at the terminal readback for a command whose masked line masking again would change (#534 R2)', async () => {
+    // A quoted credential followed directly by `;` is masked once to `--token [REDACTED];echo done`; a second pass would
+    // take `[REDACTED];echo` for a value. The events hold the line as it was written, and the readback binds to it.
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-glued';
+    const command = `node verify.mjs pass --token "${secret}";echo done`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command.replaceAll('"', '\\"')}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string; command: string };
+      expect(facts.command).toBe('node verify.mjs pass --token [REDACTED];echo done');
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      expect(liveRow()?.commandSha256).toBe(createHash('sha256').update(`/bin/sh -c ${command}`).digest('hex'));
+      h.db.handle.prepare("UPDATE worktree_processes SET state = 'live' WHERE worktree_id = ? AND pid = ?").run(lane.id, facts.pid);
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
+  it('closes a registry row at the terminal readback only by the digest of its raw command: another credential under the same masked text, and a row without a digest, stay live (#534 R1)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const other = 'Zx5Hn2Bv8Qd4Wm7Lt3Pc'; const requestId = 'argv-redaction-identity';
+    const command = `node verify.mjs pass --token ${secret}`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string };
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      const reconcile = () => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      const reconciled = () => h.ledger.listJobEventsByKinds(h.jobId, ['verification.process-reconciled']).length;
+      const seed = (rowCommand: string) => h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: rowCommand, evidence: 'registry' }] });
+      const masked = `/bin/sh -c node verify.mjs pass --token [REDACTED]`;
+
+      // The same masked text under another credential is another command: the row stays live.
+      seed(`/bin/sh -c ${command.replace(secret, other)}`);
+      expect(liveRow()).toMatchObject({ state: 'live', command: masked });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      expect(reconciled()).toBe(0);
+
+      // A row recorded without a digest (before the digest existed) has no identity, whatever its text says.
+      h.db.handle.prepare('DELETE FROM worktree_processes WHERE worktree_id = ? AND pid = ?').run(lane.id, facts.pid);
+      h.db.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+        VALUES (?, ?, ?, 'registry', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(lane.id, facts.pid, masked);
+      expect(liveRow()).toMatchObject({ state: 'live', commandSha256: null });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      expect(reconciled()).toBe(0);
+      h.db.handle.prepare('UPDATE worktree_processes SET command = ? WHERE worktree_id = ? AND pid = ?').run(`/bin/sh -c ${command}`, lane.id, facts.pid);
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      expect(reconciled()).toBe(0);
+
+      // The identical raw command, recorded by the registry write, still closes the row.
+      seed(`/bin/sh -c ${command}`);
+      expect(liveRow()).toMatchObject({ state: 'live', command: masked });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      expect(reconciled()).toBe(1);
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(other);
+    } finally { await h.close(); }
+  });
+
   it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     expect(manifest).not.toBeNull();
@@ -296,6 +412,24 @@ describe('POST /api/verify', () => {
         status: 'parked',
       });
       expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.started')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('records the held-job refusal with the scope command masked (#534 R2)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+    const harness = await boot({ manifest: `[verify]\nfull = "node verify.mjs pass --token ${secret}"\n` });
+    harness.ledger.setJobStatus(harness.jobId, 'parked');
+    try {
+      const result = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
+      expect(result.status).toBe(409);
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.refused')?.payload).toMatchObject({
+        scope: 'full',
+        code: 'job_held',
+        command: 'node verify.mjs pass --token [REDACTED]',
+      });
+      expect(JSON.stringify(harness.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
     } finally {
       await harness.close();
     }

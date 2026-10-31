@@ -2254,7 +2254,11 @@ describe('systemone failure-path mapping (review: both protocols covered)', () =
           endpoint: TYPESAFE_ENDPOINT,
           model: 'jev-latest',
           credential: 'typesafe',
-          timeoutMs: 20,
+          // The reject-mode cases map an HTTP status; a deadline is not what they
+          // test. A 20 ms budget races the event loop on a loaded host and has
+          // classified an already-produced 402 as `timeout` in the full suite,
+          // so only the hang case, which does test the deadline, stays tight.
+          timeoutMs: mode === 'hang' ? 20 : 5_000,
           inputPricePerMtok: 0.042,
         },
         key: 'typesafe-test-key',

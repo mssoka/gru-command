@@ -26,6 +26,28 @@ const keepPrefix = (_match: string, prefix: string): string => `${prefix}${REDAC
  * digit, so a diagnostic such as `Unexpected token: ')'` is left whole. */
 const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,})';
 
+/** The value a command line gives a credential flag or auth scheme (#534):
+ * one that does not start with `-`, so the next flag (`--token --verbose`)
+ * is no value. A bare token runs to whitespace and may carry quote or
+ * backtick characters: `ps` shows a child's argv (or a shell-spliced word)
+ * without the shell's quotation, so `--token it's-secret` is one value. */
+const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{4,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{4,}\'|(?=[^\\s]*[A-Za-z0-9])[^\\s]{5,}[^\\s"\'])';
+
+/** The value of a bare `-u user:password` (or `-u :password`): at least 6
+ * characters with a letter (a uid:gid pair such as `165536:165536` is no
+ * credential), running to whitespace. A bare token may hold quote or
+ * backtick characters — a child's argv and a shell-spliced word shed the
+ * shell's quotation — and may start with `-`. The value after the colon is
+ * masked however it looks, so a `scheme://` tail is masked too: the mask is
+ * also the recorded-command identity the acknowledged kill compares, and
+ * masking no credential there would be worse than collapsing two
+ * non-credential `-u` arguments. Only a value that is exactly the placeholder
+ * is left alone (idempotence). A value the shell already split on
+ * whitespace (a child spawned with a space inside its `-u` value) is not
+ * recoverable from the argv; its quoted shell source is handled by the
+ * whole-quoted passes below. */
+const ARGV_TOKEN = '(?!["\']?\\[REDACTED\\]["\']?(?=$|[\\s"\']))(?:"(?=[^"]*[A-Za-z])[^"]{4,}"|\'(?=[^\']*[A-Za-z])[^\']{4,}\'|(?=[^\\s]*[A-Za-z])[^\\s]{5,}[^\\s"\'])';
+
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret
  * access key, a private key in JSON (a service-account file), kubeconfig's
@@ -112,6 +134,25 @@ const REDACTIONS: readonly Redaction[] = [
   // rescans a long run of scheme characters: linear in the text.
   replacing(/(?<=[A-Za-z0-9+.-])(:\/\/)[^\s/@:]+:[^\s/@]+(?=@)/gu, keepPrefix),
   replacing(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix),
+  // The forms a process's command line carries (#534). `Authorization: token
+  // <value>` (GitHub's scheme), `--token <value>` with a space (the `=` form
+  // is the keyword rule's), and curl's `-u <user>:<password>`, whose `-u` is
+  // not the tail of a longer flag. A flag with no such value masks nothing.
+  // A whole quoted value (`-u "deploy:secret with space"`) runs to its own
+  // closing quote, so the password's spaces are inside the mask.
+  replacing(new RegExp(`(\\bAuthorization\\s*:\\s*token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(--token\\s+)${ARGV_VALUE}`, 'giu'), keepPrefix),
+  // A whole-quoted value runs to its own closing quote, so a password that
+  // holds the other quote character (`-u "deploy:it's-secret"`) still masks
+  // whole; the two delimiter-specific passes keep the quotes as `ps` shows
+  // them. The user may be empty (`-u ":secret"`).
+  replacing(/(?<![A-Za-z0-9-])(-u\s+"[^":]{0,64}:)(?=[^"]*[A-Za-z])[^"]{6,}"/gu,
+    (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
+  replacing(/(?<![A-Za-z0-9-])(-u\s+'[^':]{0,64}:)(?=[^']*[A-Za-z])[^']{6,}'/gu,
+    (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
+  // A bare user (an empty one too: `-u :secret`) with a bare value. The
+  // lookbehind keeps `cli -u:value` and `--tokenize` alone.
+  replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-]?[^\\s:'"\`]*["']?:)${ARGV_TOKEN}`, 'gu'), keepPrefix),
   redactNpmrcAuth,
   // A key, then an optional closing quote (JSON's `"password": "…"`), then
   // `:` or `=`. One whose identifier starts right after a `/` is part of a
