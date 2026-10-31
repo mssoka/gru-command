@@ -327,9 +327,9 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
         listActiveOwnerApprovalIds: () => [],
         listEndedOwnerApprovalIdsWithOpenCard: () => [],
       } as unknown as Parameters<typeof createOwnerApprovalService>[0]['ledger'],
-      notifications: { post: async () => { throw new Error('the shutdown pin never posts a card'); } },
+      notifications: { post: () => { throw new Error('the shutdown pin never posts a card'); } },
       bus: { subscribe: () => () => {} },
-      worktrees: { listWorktrees: async () => [] },
+      worktrees: { listWorktrees: () => [] },
       pendingProducerBlockers: () => [],
       setInterval: ((fn: () => void, ms?: number) => {
         armed.push([fn, ms]);
