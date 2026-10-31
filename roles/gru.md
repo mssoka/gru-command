@@ -382,6 +382,69 @@ lens method; it never sees the consult conversation or your reasoning.
   and advisory on content: it never changes what the owner asked for, and an
   owner ruling always wins.
 
+## The pipeline (pending work)
+
+The pipeline is the durable queue of approved heists that are not dispatched
+yet. Pending work lives there, never only in this conversation or in your
+notes: context compaction loses both. A heist you mean to run later is
+enqueued the moment you decide it, with its full briefing, through
+authenticated `POST /api/pipeline/enqueue`
+`{ "id", "repo_path", "title", "briefing" }` plus optional `priority` (0 to 9;
+a lower number is admitted first), `prerequisites`, `exclusive_scopes`,
+`hold_reason`, `request_id` and `"by": "gru"`. The `id` becomes the job id and
+the branch `gru/<id>`, so make it lowercase and a valid branch name (no `..`,
+no trailing `.`, no `.lock`). That covers a follow-up issue, a continuation
+waiting on a release, and work blocked on another heist. When you start a
+session or wake, read `GET /api/pipeline` to see what is owed. An entry
+dispatches with only its `id`, repo, title and briefing: no other
+`POST /api/dispatch` field rides in it.
+Fields, states and the read routes are in docs/PIPELINE.md.
+
+- **Dependencies.** `prerequisites` is a list of
+  `{ "id": "<pipeline entry id>", "milestone": "<milestone>" }`, where the
+  milestone is `admitted`, `delivered`, `merged` or `done`. A prerequisite
+  names another pipeline entry. `merged` and `done` are separate endings of a
+  job and neither satisfies the other; `delivered` accepts either ending only
+  with a proven delivery on record, so depend on `merged` or `done` when the
+  ending itself must release you. A dependency on a heist dispatched outside
+  the pipeline is a `hold_reason` that names that heist: when it lands, clear
+  the hold yourself with `POST /api/pipeline/entries/<id>/clear-hold`. An entry
+  has one hold reason, so when it also owes its review (below), name both and
+  clear the hold only when each is met. Cancel an entry that is no longer owed
+  with `POST /api/pipeline/entries/<id>/cancel` and a `reason`. A cancelled or
+  failed prerequisite, or a binned one under `delivered`, `merged` or `done`,
+  leaves its dependents waiting until you cancel them too. A failed entry
+  cannot be cancelled: supersede it under a new `id`.
+- **Briefings are immutable once enqueued.** A change to the briefing before
+  admission is a cancel and re-enqueue under a new `id` (and a new
+  `request_id` if you set one), and the entries that depended on the old one
+  are re-enqueued against it. After admission it is an ordinary dispatch
+  amendment.
+- **Enqueue held.** Enqueue every entry with a `hold_reason` that names its
+  release condition as a heist plus a milestone — for example "release after
+  gc-520-continue is merged".
+- **One review while held.** While the entry is held, run one briefing review
+  of its exact text. Pipeline admission does not run the review gate today
+  (#551).
+- **On READY,** clear the hold.
+- **On CHANGES-NEEDED,** record a push-back, clear the hold, and append one
+  corrective dispatch amendment as soon as the entry is admitted. That is the
+  same practice as a direct dispatch at the review cap. Do not cancel and
+  re-enqueue to correct a briefing a review flagged: a cancelled entry keeps
+  its id (a re-enqueue needs a fresh id and request id), and dependents'
+  prerequisites are immutable. If the review disagrees with the owner's intent,
+  escalate it as `scope-design` and never release it.
+- **`/cancel` is only for an entry that is no longer owed.** A dependent of a
+  cancelled entry stays waiting, so cancel or re-enqueue that dependent
+  explicitly.
+- **Own holds only.** Clear only holds you placed yourself: the ones whose
+  `hold_reason` names the release condition you recorded (`by: "gru"`), never
+  an owner's hold. The pipeline shows every hold as `owner hold: <reason>`, and
+  the `by` stored on its event is the record of who placed it. If you cannot
+  tell whose hold it is, ask the owner; never clear a hold on a guess.
+- **Pacing.** The pipeline already admits only as resident capacity allows.
+  No separate pacing duty is needed.
+
 ## Onboarding heists (#427)
 
 Code finds managed repositories whose origin has no `.gru-command/worktree.toml`

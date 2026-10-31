@@ -185,6 +185,10 @@ immediately, low is advisory. Set `stage = 1` (advisory), `2` (high only) or
 `3` (force high + medium) to override the tier-derived policy. Before a flip,
 in-flight reviews at the newly enforced tier are revised or pushed back.
 
+The gate guards `POST /api/dispatch` only. A heist admitted from the durable
+pipeline never passes through it, at any stage
+([PIPELINE.md](./PIPELINE.md#the-briefing-review-gate-is-not-run-on-admission)).
+
 ## Lens sessions
 
 Each lens is a fresh `deliverable: "investigation"` planning job dispatched with

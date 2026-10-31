@@ -332,6 +332,41 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     db.close();
   });
 
+  it('keeps merged and done separate endings and makes delivered need a delivery on record (docs/PIPELINE.md)', () => {
+    const { db, ledger } = boot();
+    const admitted = (id: string, path: readonly ('working' | 'in-review' | 'merged' | 'done')[]): void => {
+      enqueue(ledger, id);
+      ledger.claimPipelineEntry({ id, holder: 'silas' });
+      ledger.addJob({ id, repo: 'demo', title: `Entry ${id}`, briefing: `Briefing for ${id}` });
+      ledger.markPipelineAdmitted({ id, jobId: id });
+      for (const status of path) ledger.setJobStatus(id, status);
+    };
+    admitted('pipe-m', ['working', 'in-review', 'merged']);
+    admitted('pipe-d', ['working', 'done']);
+    for (const [dependency, milestone] of [
+      ['pipe-m', 'merged'],
+      ['pipe-m', 'done'],
+      ['pipe-d', 'merged'],
+      ['pipe-d', 'done'],
+      ['pipe-d', 'delivered'],
+    ] as const) {
+      enqueue(ledger, `dep-${milestone}-${dependency}`, { prerequisites: [{ id: dependency, milestone }] });
+    }
+    const reason = (id: string): string | null =>
+      ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === id)?.reason ?? null;
+    // A job that ends merged releases only the merged dependent; one that ends done, only the done one.
+    expect(reason('dep-merged-pipe-m')).toBeNull();
+    expect(reason('dep-done-pipe-m')).toBe('waiting for pipe-m to be done (now merged)');
+    expect(reason('dep-done-pipe-d')).toBeNull();
+    expect(reason('dep-merged-pipe-d')).toBe('waiting for pipe-d to be merged (now done)');
+    // delivered accepts either ending, but only with a recorded delivery: a job that closed
+    // as done without one never satisfies it.
+    expect(reason('dep-delivered-pipe-d')).toBe('waiting for pipe-d to be delivered (now done)');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-d', payload: {} });
+    expect(reason('dep-delivered-pipe-d')).toBeNull();
+    db.close();
+  });
+
   it('never releases an admitted milestone without durable worker-start evidence', () => {
     const { db, ledger } = boot();
     enqueue(ledger, 'pipe-a');
