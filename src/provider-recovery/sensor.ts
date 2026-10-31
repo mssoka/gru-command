@@ -284,6 +284,14 @@ function switchFor(provider: string): 'claude_native' | 'enabled' {
 /** Rolling budget window (1 h, per the approval's 12/hour pin). */
 const WINDOW_MS = 3_600_000;
 
+/** Recorded reasons for retiring a `job-minion` wait whose agent is disposed
+ * and whose job has no spawning/streaming agent left: the agent is gone and
+ * nothing live owns the lane. Each disposition CALLER records its own reason
+ * (`tickRoute` vs the probe's re-validation), so the audit trail says where
+ * the retirement was seen. */
+const WAITER_GONE_WHY = 'waiter-gone';
+const WAITER_GONE_DURING_CHECK_WHY = 'waiter-gone-during-check';
+
 export class ProviderRecoverySensor {
   readonly enabled: boolean;
   private readonly cfg: ProviderRecoveryConfig;
@@ -465,6 +473,8 @@ export class ProviderRecoverySensor {
       if (disposition === 'eligible') eligible.push(wait);
       else if (disposition === 'cancel') {
         this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'waiter-invalid' });
+      } else if (disposition === 'retire') {
+        this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: WAITER_GONE_WHY });
       } else if (disposition === 'supersede') {
         this.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'replaced' });
       }
@@ -545,7 +555,7 @@ export class ProviderRecoverySensor {
    * OWN failed turn (the settle raced the wait): that is still this
    * blocker's churn, never a generic hold. Active review gates, stale
    * incidents and suspensions also HOLD. */
-  private validateWaiter(wait: ProviderWaitRecord): 'eligible' | 'cancel' | 'supersede' | 'hold' {
+  private validateWaiter(wait: ProviderWaitRecord): 'eligible' | 'cancel' | 'retire' | 'supersede' | 'hold' {
     if (wait.waiterKind === 'job-minion') {
       const job = wait.jobId !== null ? this.ledger.getJob(wait.jobId) : null;
       if (job === null || isJobTerminal(job.status)) return 'cancel';
@@ -589,6 +599,27 @@ export class ProviderRecoverySensor {
         }
       } else if (atEstablishment === 'delivered' || atEstablishment === 'in-review') {
         return 'hold';
+      }
+      // LAST, after every check above has had its say: a wait whose recorded
+      // agent is DISPOSED protects no work — the 2026-10-30T17:59Z provider
+      // wall stopped those minions and they never came back, so the wait only
+      // fences the lane's next directive. Retire it through the normal waiter
+      // disposition path, but ONLY while nothing live owns the lane: any
+      // agent for the job in `spawning`/`streaming` — implementer,
+      // review-only session or tracked child — keeps the wait. An ABSENT
+      // agent row is unknown, never gone (fixtures and legacy rows establish
+      // waits without a registered agent), and an `error` agent may still be
+      // resumed. Supersede/hold above always win.
+      const waiterAgent = wait.agentId !== null ? this.ledger.getAgent(wait.agentId) : null;
+      if (waiterAgent !== null && waiterAgent.state === 'disposed') {
+        const live = this.ledger
+          .listAgents()
+          .some(
+            (agent) =>
+              agent.jobId === job.id &&
+              (agent.state === 'spawning' || agent.state === 'streaming'),
+          );
+        if (!live) return 'retire';
       }
       // Otherwise: current approved continuation — eligible through the
       // expected post-establishment status churn.
@@ -798,6 +829,8 @@ export class ProviderRecoverySensor {
       if (disposition === 'eligible') eligible.push(wait);
       else if (disposition === 'cancel') {
         this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'waiter-invalid-during-check' });
+      } else if (disposition === 'retire') {
+        this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: WAITER_GONE_DURING_CHECK_WHY });
       } else if (disposition === 'supersede') {
         this.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'replaced-during-check' });
       }

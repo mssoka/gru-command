@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerApi, type ProviderWaitRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { projectMailbox } from '../src/gru-mailbox/projection.js';
@@ -585,6 +585,300 @@ describe('eligibility invalidation (acceptance 2)', () => {
     restartedClock.ms += 240_001;
     await sensor2.tick();
     expect(h.probe.calls).toHaveLength(2);
+  });
+});
+
+describe('disposed waiter retirement (waiter-gone)', () => {
+  /** The recorded `provider.wait-status` rows for one wait (oldest last). */
+  const statusEvents = (h: Harness, waitId: string): { from: string; to: string; why: string }[] =>
+    h.ledger
+      .listEvents({ limit: 1000 })
+      .filter((event) => event.kind === 'provider.wait-status')
+      .map((event) => event.payload as Record<string, unknown>)
+      .filter((payload) => payload['id'] === waitId)
+      .map((payload) => ({
+        from: String(payload['from']),
+        to: String(payload['to']),
+        why: String(payload['why'] ?? ''),
+      }));
+
+  it('retires a job-minion wait whose agent is disposed and whose lane has nothing live, releasing the lane', async () => {
+    const h = new Harness();
+    h.makeJob('job-gone');
+    const wait = await h.establishMinionWait({
+      jobId: 'job-gone',
+      agentId: 'agent-gone',
+      sessionFile: '/tmp/agent-gone.jsonl',
+    });
+    expect(wait?.waiterKind).toBe('job-minion');
+    if (wait === null) throw new Error('fixture: no wait established');
+    h.ledger.registerAgent({ id: 'agent-gone', role: 'minion', jobId: 'job-gone' });
+    // The 17:59Z wall: the lane is blocked and the minion was disposed.
+    h.ledger.setJobStatus('job-gone', 'blocked');
+    h.ledger.setAgentState('agent-gone', 'disposed');
+    // The fence is real before the tick: the public open-waits read lists it.
+    expect(h.ledger.listOpenProviderWaitsForJob('job-gone')).toHaveLength(1);
+
+    await h.sensor.tick();
+
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('cancelled');
+    expect(statusEvents(h, wait.id).map((event) => event.why)).toEqual(['waiter-gone']);
+    // The lane is no longer fenced by that wait.
+    expect(h.ledger.listOpenProviderWaitsForJob('job-gone')).toEqual([]);
+    expect(h.probe.calls).toEqual([]);
+    h.sensor.stop();
+  });
+
+  it('cancels the same disposed waiter seen by the probe re-validation with its own recorded reason', async () => {
+    const h = new Harness();
+    h.makeJob('job-recheck');
+    const wait = await h.establishMinionWait({
+      jobId: 'job-recheck',
+      agentId: 'agent-recheck',
+      sessionFile: '/tmp/agent-recheck.jsonl',
+    });
+    if (wait === null) throw new Error('fixture: no wait established');
+    h.ledger.registerAgent({ id: 'agent-recheck', role: 'minion', jobId: 'job-recheck' });
+    // The agent is live when the tick admits the wait (so the probe runs),
+    // and is disposed while that check is in flight.
+    h.probe.onProbeStart = () => {
+      h.ledger.setAgentState('agent-recheck', 'disposed');
+    };
+    h.probe.queueCompleted();
+
+    await h.sensor.tick();
+
+    expect(h.probe.calls).toHaveLength(1);
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('cancelled');
+    expect(statusEvents(h, wait.id).map((event) => event.why)).toEqual(['waiter-gone-during-check']);
+    expect(h.ledger.listOpenProviderWaitsForJob('job-recheck')).toEqual([]);
+    // The completed probe never delivered a recovery for a lane nobody owns.
+    expect(h.ledger.listPendingProviderRecoveries()).toEqual([]);
+    expect(h.wakes).toEqual([]);
+    h.sensor.stop();
+  });
+
+  it('never retires an errored agent — it may still be resumed', async () => {
+    const h = new Harness();
+    h.makeJob('job-errored');
+    const wait = await h.establishMinionWait({
+      jobId: 'job-errored',
+      agentId: 'agent-errored',
+      sessionFile: '/tmp/agent-errored.jsonl',
+    });
+    if (wait === null) throw new Error('fixture: no wait established');
+    h.ledger.registerAgent({ id: 'agent-errored', role: 'minion', jobId: 'job-errored' });
+    h.ledger.setAgentState('agent-errored', 'error');
+    h.ledger.setJobStatus('job-errored', 'blocked');
+
+    await h.sensor.tick();
+
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('waiting');
+    expect(statusEvents(h, wait.id)).toEqual([]);
+    expect(h.probe.calls).toHaveLength(1);
+    h.sensor.stop();
+  });
+
+  it('keeps and probes a wait whose agent is spawning, streaming or idle', async () => {
+    for (const state of ['spawning', 'streaming', 'idle'] as const) {
+      const h = new Harness();
+      const jobId = `job-live-${state}`;
+      const agentId = `agent-live-${state}`;
+      h.makeJob(jobId);
+      const wait = await h.establishMinionWait({
+        jobId,
+        agentId,
+        sessionFile: `/tmp/${agentId}.jsonl`,
+      });
+      if (wait === null) throw new Error(`fixture: no wait established for ${state}`);
+      h.ledger.registerAgent({ id: agentId, role: 'minion', jobId });
+      h.ledger.setAgentState(agentId, state);
+
+      await h.sensor.tick();
+
+      expect(h.ledger.getProviderWait(wait.id)?.status, state).toBe('waiting');
+      expect(statusEvents(h, wait.id), state).toEqual([]);
+      expect(h.probe.calls, state).toHaveLength(1);
+      h.sensor.stop();
+    }
+  });
+
+  it('never retires a disposed waiter while any agent for the job is spawning or streaming', async () => {
+    for (const shape of ['review-only', 'tracked-child'] as const) {
+      const h = new Harness();
+      const jobId = `job-live-${shape}`;
+      h.makeJob(jobId);
+      const wait = await h.establishMinionWait({
+        jobId,
+        agentId: 'agent-writer',
+        sessionFile: '/tmp/agent-writer.jsonl',
+      });
+      if (wait === null) throw new Error(`fixture: no wait established for ${shape}`);
+      h.ledger.registerAgent({ id: 'agent-writer', role: 'minion', jobId });
+      h.ledger.setAgentState('agent-writer', 'disposed');
+      if (shape === 'review-only') {
+        const round = h.ledger.addRound({ jobId, lenses: ['blind'] });
+        h.ledger.registerAgent({ id: 'agent-review', role: 'minion', jobId, roundId: round.id });
+      } else {
+        h.ledger.registerAgent({
+          id: 'agent-child',
+          role: 'minion',
+          jobId,
+          parentage: 'child',
+          parentAgentId: 'agent-writer',
+        });
+        h.ledger.setAgentState('agent-child', 'streaming');
+      }
+
+      await h.sensor.tick();
+
+      // A live non-implementer owner (round-bound review session or tracked
+      // child) is still work in the lane: the disposed writer's wait stays.
+      expect(h.ledger.getProviderWait(wait.id)?.status, shape).toBe('waiting');
+      expect(statusEvents(h, wait.id), shape).toEqual([]);
+      expect(h.probe.calls, shape).toHaveLength(1);
+      h.sensor.stop();
+    }
+  });
+
+  it('keeps a parked lane cancel reason exactly as today through both callers', async () => {
+    // The tick path: parked before admission -> waiter-invalid.
+    const tick = new Harness();
+    tick.makeJob('job-parked');
+    const tickWait = await tick.establishMinionWait({
+      jobId: 'job-parked',
+      agentId: 'agent-parked',
+      sessionFile: '/tmp/agent-parked.jsonl',
+    });
+    if (tickWait === null) throw new Error('fixture: no wait established');
+    tick.ledger.registerAgent({ id: 'agent-parked', role: 'minion', jobId: 'job-parked' });
+    tick.ledger.setAgentState('agent-parked', 'disposed');
+    tick.ledger.setJobStatus('job-parked', 'parked');
+    await tick.sensor.tick();
+    expect(tick.ledger.getProviderWait(tickWait.id)?.status).toBe('cancelled');
+    expect(statusEvents(tick, tickWait.id).map((event) => event.why)).toEqual(['waiter-invalid']);
+    expect(tick.probe.calls).toEqual([]);
+    tick.sensor.stop();
+
+    // The probe re-validation path: parked mid-check -> the during-check reason.
+    const recheck = new Harness();
+    recheck.makeJob('job-parked-late');
+    const recheckWait = await recheck.establishMinionWait({
+      jobId: 'job-parked-late',
+      agentId: 'agent-parked-late',
+      sessionFile: '/tmp/agent-parked-late.jsonl',
+    });
+    if (recheckWait === null) throw new Error('fixture: no wait established');
+    recheck.ledger.registerAgent({ id: 'agent-parked-late', role: 'minion', jobId: 'job-parked-late' });
+    recheck.probe.onProbeStart = () => {
+      recheck.ledger.setJobStatus('job-parked-late', 'parked');
+    };
+    recheck.probe.queueCompleted();
+    await recheck.sensor.tick();
+    expect(recheck.ledger.getProviderWait(recheckWait.id)?.status).toBe('cancelled');
+    expect(statusEvents(recheck, recheckWait.id).map((event) => event.why)).toEqual([
+      'waiter-invalid-during-check',
+    ]);
+    recheck.sensor.stop();
+  });
+
+  it('one tick retires only the disposed waiter — every existing supersede and hold keeps its status and reason', async () => {
+    const h = new Harness();
+    const waits = new Map<string, ProviderWaitRecord>();
+
+    const seedRow = async (jobId: string, agentId: string, model: string): Promise<ProviderWaitRecord> => {
+      h.makeJob(jobId);
+      const wait = await h.establishMinionWait({ jobId, agentId, model, sessionFile: `/tmp/${agentId}.jsonl` });
+      if (wait === null) throw new Error(`fixture: ${jobId} established no wait`);
+      h.ledger.registerAgent({ id: agentId, role: 'minion', jobId });
+      return wait;
+    };
+
+    // A1: disposed agent, blocked AFTER establishment, nothing live.
+    waits.set('gone', await seedRow('job-m-gone', 'agent-m-gone', 'glm-m-gone'));
+    h.ledger.setAgentState('agent-m-gone', 'disposed');
+    h.ledger.setJobStatus('job-m-gone', 'blocked');
+    // A1b: an errored agent may still be resumed.
+    waits.set('errored', await seedRow('job-m-errored', 'agent-m-errored', 'glm-m-errored'));
+    h.ledger.setAgentState('agent-m-errored', 'error');
+    h.ledger.setJobStatus('job-m-errored', 'blocked');
+    // A2: an idle agent is not gone.
+    waits.set('idle', await seedRow('job-m-idle', 'agent-m-idle', 'glm-m-idle'));
+    h.ledger.setAgentState('agent-m-idle', 'idle');
+    // A3: a tracked child still streams — the lane has a live owner.
+    waits.set('child', await seedRow('job-m-child', 'agent-m-child', 'glm-m-child'));
+    h.ledger.setAgentState('agent-m-child', 'disposed');
+    h.ledger.registerAgent({
+      id: 'agent-m-child-worker',
+      role: 'minion',
+      jobId: 'job-m-child',
+      parentage: 'child',
+      parentAgentId: 'agent-m-child',
+    });
+    h.ledger.setAgentState('agent-m-child-worker', 'streaming');
+    // Existing check 1: a newer implementer supersedes (it is idle, so the
+    // new rule would have retired the wait had it been evaluated first).
+    waits.set('newer', await seedRow('job-m-newer', 'agent-m-newer', 'glm-m-newer'));
+    h.ledger.setAgentState('agent-m-newer', 'disposed');
+    h.ledger.registerAgent({ id: 'agent-m-newer-2', role: 'minion', jobId: 'job-m-newer' });
+    h.ledger.setAgentState('agent-m-newer-2', 'idle');
+    // Existing check 2: a rotated route binding holds.
+    waits.set('rotated', await seedRow('job-m-rotated', 'agent-m-rotated', 'glm-m-rotated'));
+    h.ledger.setAgentState('agent-m-rotated', 'disposed');
+    const rotatedRoute = h.ledger.getProviderRoute(waits.get('rotated')!.routeKey);
+    if (rotatedRoute === null) throw new Error('fixture: rotated route missing');
+    h.ledger.upsertProviderRoute({
+      ...rotatedRoute,
+      endpoint: 'https://rotated.invalid/api',
+      updatedAt: new Date().toISOString(),
+    });
+    // Existing check 3: a suspended route holds.
+    waits.set('suspended', await seedRow('job-m-suspended', 'agent-m-suspended', 'glm-m-suspended'));
+    h.ledger.setAgentState('agent-m-suspended', 'disposed');
+    const suspendedRoute = h.ledger.getProviderRoute(waits.get('suspended')!.routeKey);
+    if (suspendedRoute === null) throw new Error('fixture: suspended route missing');
+    h.ledger.upsertProviderRoute({
+      ...suspendedRoute,
+      suspendedUntil: new Date(h.now + 60_000).toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    // Existing check 4: an active review round holds.
+    waits.set('round', await seedRow('job-m-round', 'agent-m-round', 'glm-m-round'));
+    h.ledger.setAgentState('agent-m-round', 'disposed');
+    h.ledger.addRound({ jobId: 'job-m-round', lenses: ['blind'] });
+    h.ledger.setJobStatus('job-m-round', 'in-review');
+    // Existing check 5: a job blocked AT establishment holds.
+    h.makeJob('job-m-blocked');
+    h.ledger.setJobStatus('job-m-blocked', 'blocked');
+    const blockedAtEstablishment = await h.establishMinionWait({
+      jobId: 'job-m-blocked',
+      agentId: 'agent-m-blocked',
+      model: 'glm-m-blocked',
+      sessionFile: '/tmp/agent-m-blocked.jsonl',
+    });
+    if (blockedAtEstablishment === null) throw new Error('fixture: blocked lane established no wait');
+    waits.set('blocked', blockedAtEstablishment);
+    h.ledger.registerAgent({ id: 'agent-m-blocked', role: 'minion', jobId: 'job-m-blocked' });
+    h.ledger.setAgentState('agent-m-blocked', 'disposed');
+
+    await h.sensor.tick();
+
+    // The one row this rule changes.
+    expect(h.ledger.getProviderWait(waits.get('gone')!.id)?.status).toBe('cancelled');
+    expect(statusEvents(h, waits.get('gone')!.id).map((event) => event.why)).toEqual(['waiter-gone']);
+    expect(h.ledger.listOpenProviderWaitsForJob('job-m-gone')).toEqual([]);
+    // The existing supersede row changes too, separately and with its reason.
+    expect(h.ledger.getProviderWait(waits.get('newer')!.id)?.status).toBe('superseded');
+    expect(statusEvents(h, waits.get('newer')!.id).map((event) => event.why)).toEqual(['replaced']);
+    // Every other row keeps waiting and records no status change at all.
+    for (const key of ['errored', 'idle', 'child', 'rotated', 'suspended', 'round', 'blocked'] as const) {
+      const wait = waits.get(key)!;
+      expect(h.ledger.getProviderWait(wait.id)?.status, key).toBe('waiting');
+      expect(statusEvents(h, wait.id), key).toEqual([]);
+    }
+    // Only the three eligible rows were probed.
+    expect(h.probe.calls.map((call) => call.model).sort()).toEqual(['glm-m-child', 'glm-m-errored', 'glm-m-idle']);
+    h.sensor.stop();
   });
 });
 
