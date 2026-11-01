@@ -248,6 +248,20 @@ Authorization: Bearer <pairing token>
 }
 ```
 
+**Round-cap corrective amendment (owner ruling journal j-1200).** When a
+heist reaches the briefing-review round cap (three trailing CHANGES-NEEDED
+rounds), Gru records a push-back on the last reviewed text, dispatches that
+exact text without the `briefing_review` block, and appends one
+`effect: "material"` amendment through
+`POST /api/dispatch/amendment` that fixes that round's blocking findings. That
+amendment's `approval.reference` cites owner ruling journal j-1200. A round cap
+never escalates to the owner, except for a finding whose content says the
+owner's requested outcome cannot be met as stated: that finding cannot be
+repaired by an amendment without changing the owner's scope, so it takes the
+owner-escalation path and holds only the step it gates; a plain disagreement
+never escalates. This is the product's rule on every install, not a per-install
+choice.
+
 - `effect` is required (owner rule 1, 2026-10-08):
   - `"material"`: the approved change requires implementation. It raises the job's
     required work revision to this amendment's version, makes the delivered candidate
@@ -625,8 +639,18 @@ answers `qualifying | invalidated | unattested | unobserved | not-blind | unclas
 derived only from the admission, `review.blind-access-observed` and
 `job.blind-access-unobservable` facts (plus, for whether a `qualifying` report
 still owns its coverage, the commissioner's release below). The reviewer's session tool results are
-scanned at turn settle (grep lines landing in excluded paths, paged reads
-returning history-bearing text, and any file-content tool call — pi `read`/`edit`,
+scanned at turn settle (grep lines landing in excluded paths — also in the forms
+`git grep` prints against a revision and for context lines, where the recorded
+path is the repository path, never the revision, and never a line's text where
+the line's own delimiters settle the path end; the one shape that keeps a tail
+is an extensionless excluded name whose line text holds a dotted token before a
+delimiter, which is recorded as written; the `git grep --heading` form, a
+`git grep` run without `-n` (`path:text`), a `Binary file … matches` line and
+`--color=always` output are not observed; a worktree context line is read by
+its own path region, so a quoted `name:N:` in its text is not recorded, and the
+spaced-path rule reads a spaced capture only where the line itself ended no
+earlier — paged reads returning
+history-bearing text, and any file-content tool call — pi `read`/`edit`,
 Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit`, and a content
 search (pi `grep`, Claude `Grep`) — whose result returned, even empty or binary,
 for a path that is excluded, however its bytes look. A call is judged by the path

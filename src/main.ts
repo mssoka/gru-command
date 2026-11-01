@@ -1510,16 +1510,6 @@ async function main(): Promise<number> {
   // Automatic admission retries live in memory (owner decision 2026-10-08):
   // one pending when the service stopped escalates now instead of resuming.
   wave.escalateInterruptedAdmissionRetries();
-  // A crash between `requested` and the verdict, or a stop that could not be
-  // proven, is re-attempted once the review/child recovery seams are up.
-  void jobExecutionStop.reconcileOnBoot().then(
-    (passes) => {
-      if (passes > 0) logger.log('info', 'job execution stop boot re-proof', { passes });
-    },
-    (error: unknown) => {
-      logger.log('error', 'job execution stop boot re-proof failed', { error: String(error) });
-    },
-  );
   // Historical re-brief markers never authorize replay. Observe a bounded
   // page for genuine spent/terminal evidence or concrete Gru judgment;
   // DirectiveProgressService ticks fairly visit the remaining generations.
@@ -1986,6 +1976,33 @@ async function main(): Promise<number> {
   // whose provider-wall row the hand-back resolves hydrates with a fresh
   // re-arm control rather than one bound to a resolved row.
   handBackThenStartSupervision(providerRecoverySensor, supervisorLive, (level, msg, fields) => logger.log(level, msg, fields));
+  // Issue #547: a turn a previous process left spawning/streaming has no
+  // handle here and no further events, yet every live-work fence counts it as
+  // an open worker turn. Once per boot, after the registry and supervision are
+  // up and the boot recoveries above (re-brief, child, directive) have read
+  // the ledger as they found it and started whatever they re-run, move each
+  // such row out of the live states and surface it as orphaned.
+  const hostAbsentTurns = supervisorLive.settleHostAbsentTurns();
+  if (hostAbsentTurns.examined > 0) {
+    logger.info('host-absent agent turns settled at boot', {
+      examined: hostAbsentTurns.examined,
+      live: hostAbsentTurns.live,
+      settled: hostAbsentTurns.settled.length,
+      failed: hostAbsentTurns.failed.length,
+    });
+  }
+  // A crash between `requested` and the verdict, or a stop that could not be
+  // proven, is re-attempted once the review/child recovery seams are up. It
+  // runs after the settlement above so its verdict reads a ghost turn as the
+  // settled row it is, whichever parked job it visits first.
+  void jobExecutionStop.reconcileOnBoot().then(
+    (passes) => {
+      if (passes > 0) logger.log('info', 'job execution stop boot re-proof', { passes });
+    },
+    (error: unknown) => {
+      logger.log('error', 'job execution stop boot re-proof failed', { error: String(error) });
+    },
+  );
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);
