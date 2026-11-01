@@ -94,8 +94,10 @@ import {
   readSessionToolResults,
   recordBlindAdmission,
   recordObservedAccess,
+  releaseBlindCoverage,
   renderBlindPackageBlock,
   type BlindCoverage,
+  type BlindCoverageReleaseOutcome,
 } from './blind-review.js';
 import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult, type ReviewRole } from './blind-input.js';
 import { assertPreBootstrapPatchDispatchBinding, preBootstrapIntakeIdentitySha256, readPreBootstrapDependencyPatchPackage, PreBootstrapPatchError, type LoadedPreBootstrapPatch, type PreBootstrapPatchReference } from '../worktrees/prebootstrap-patch.js';
@@ -1492,6 +1494,13 @@ export class DispatchService {
    * admission and observed access — never from settlement). */
   blindCoverage(jobId: string): BlindCoverage {
     return blindCoverageOf(this.opts.ledger, jobId);
+  }
+
+  /** Issue #513: release the same-target coverage a delivered blind report
+   * holds, so a corrected review can be commissioned (one audited event,
+   * nothing else changes). */
+  releaseBlindCoverage(jobId: string, input: { readonly reason: unknown; readonly by: unknown }): BlindCoverageReleaseOutcome {
+    return releaseBlindCoverage(this.opts.ledger, jobId, input);
   }
 
   /** Issue #316: record tool results observed outside the settle path (a
