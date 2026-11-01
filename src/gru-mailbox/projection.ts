@@ -1,4 +1,4 @@
-import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import { LIVE_DIRECTIVE_STATES, directiveRecoveryCardIdentity } from '../ledger/directives.js';
 import { createHash } from 'node:crypto';
 import type { DecisionRecord, LedgerApi, NotificationRecord, ObligationRecord } from '../ledger/api.js';
 import { producerResolvedBy } from '../ledger/api.js';
@@ -19,7 +19,10 @@ function notificationIdentity(row: NotificationRecord): string {
 }
 function notificationBasis(ledger: LedgerApi, row: NotificationRecord, reportSource = row): string {
   const source = reportHandbackJobId(row.kind) === null ? row : reportSource;
-  const evidence = [notificationIdentity(row), row.kind, source.detail, source.severity];
+  // A directive recovery card is one incident per request and debt generation: its
+  // identity line stands for the detail, so refreshing the reason text keeps the
+  // basis a recorded mailbox disposition was made against (#523).
+  const evidence = [notificationIdentity(row), row.kind, directiveRecoveryCardIdentity(source) ?? source.detail, source.severity];
   const jobId = reportHandbackJobId(row.kind);
   if (jobId === null) return mailboxBasis(evidence);
   const job = ledger.getJob(jobId);

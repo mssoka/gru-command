@@ -100,14 +100,18 @@ export function incidentSubjectOf(row: IncidentRow): string {
  * The signal family the row raises — the token a decision's `covers` list
  * names (`pr-conflict`, `ci-failed`, …). Producer namespacing
  * (`github.`, `silas.`) is stripped and the scope suffix dropped;
- * unscoped kinds are their own signal. The dot-scoped rebrief producer
- * maps to its family token like the colon-scoped ones; a red default
- * branch is the `ci-failed` family.
+ * unscoped kinds are their own signal. The dot-scoped rebrief and
+ * directive recovery producers map to their family tokens like the
+ * colon-scoped ones (a request id would otherwise run the directive token
+ * past the decision signal bound); a red default branch is the
+ * `ci-failed` family.
  */
 export function incidentSignalOf(row: IncidentRow): string {
   if (defaultBranchCiScope(row.kind) !== null) return 'ci-failed';
   const rebrief = /^silas\.rebrief-unreconciled\./.exec(row.kind);
   if (rebrief !== null) return 'rebrief-unreconciled';
+  // The request id would run the token past the decision signal bound.
+  if (row.kind.startsWith('silas.directive-unreconciled.')) return 'directive-unreconciled';
   const withoutNamespace = row.kind.replace(/^(github|silas)\./, '');
   const colon = withoutNamespace.indexOf(':');
   const family = colon > 0 ? withoutNamespace.slice(0, colon) : withoutNamespace;
