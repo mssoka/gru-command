@@ -626,8 +626,12 @@ derived only from the admission, `review.blind-access-observed` and
 `job.blind-access-unobservable` facts. The reviewer's session tool results are
 scanned at turn settle (grep lines landing in excluded paths — also in the forms
 `git grep` prints against a revision and for context lines, where the recorded
-path is the repository path, never the revision or a line's text; the
-`git grep --heading` form is not observed; a worktree context line is read by
+path is the repository path, never the revision, and never a line's text where
+the line's own delimiters settle the path end; the one shape that keeps a tail
+is an extensionless excluded name whose line text holds a dotted token before a
+delimiter, which is recorded as written; the `git grep --heading` form, a
+`git grep` run without `-n` (`path:text`), a `Binary file … matches` line and
+`--color=always` output are not observed; a worktree context line is read by
 its own path region, so a quoted `name:N:` in its text is not recorded, and the
 spaced-path rule reads a spaced capture only where the line itself ended no
 earlier — paged reads returning

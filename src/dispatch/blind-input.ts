@@ -1006,6 +1006,9 @@ function gitGrepHeadPaths(head: string): readonly GrepCandidate[] {
   // Up to six digits is the line number of an earlier grep, not a commit id.
   if (/^\d{1,6}$/u.test(revision)) return [];
   const tree = name.slice(colon + 1);
+  // git never prints `<rev>: <path>`: a space right after the colon is prose,
+  // so it names no revision form and records nothing.
+  if (/^\s/u.test(tree)) return [];
   const stripped = tree.startsWith(':') ? tree.slice(1) : tree;
   // A ref holds no whitespace: prose before the colon names no revision, so
   // what follows it is judged by the globs alone, never by its shape.

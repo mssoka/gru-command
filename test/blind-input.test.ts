@@ -625,6 +625,21 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(recorded(context(named('HEAD', 'src/clean.md'), 7, quoted), rule)).toEqual(prohibited('src/clean.md'));
   });
 
+  it('R1: prose before a colon is no revision form, so a spaced tail records nothing', () => {
+    // A compiler or prose line (`error: docs/issues/x.md:12:5: boom`) puts a
+    // SPACE right after the first colon; git never prints `<rev>: <path>`, so
+    // the tail is not a repository path and must not be recorded as a read.
+    const suffix = deriveBlindIsolationRule({ briefing: 'blind-isolation: exclude **/*.md', amendments: [] });
+    for (const text of [
+      'error: docs/issues/x.md:12:5: boom',
+      'warning: docs/issues/x.md-12-note',
+      'note: notes.md',
+    ]) {
+      expect(recorded(match(named('HEAD', 'src/clean.ts'), 12, text), suffix), text).toEqual([]);
+      expect(recorded(context(named('HEAD', 'src/clean.ts'), 12, text), suffix), text).toEqual([]);
+    }
+  });
+
   it('R1: a worktree context line records the path itself, never the text that follows the line number', () => {
     // The line's own grammar ends the path at `-7-`; the quoted `name:12:` in the text is
     // the line's text, and the spaced-capture rule does not get to record it instead.
