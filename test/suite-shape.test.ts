@@ -202,7 +202,7 @@ const PINS: Record<string, number> = {
   'briefing-review-server.test.ts': 6,
   'blind-coverage-release.test.ts': 15,
   'blind-input-dispatch.test.ts': 28,
-  'blind-input.test.ts': 67,
+  'blind-input.test.ts': 69,
   'blind-observer-service.test.ts': 2,
   'blind-review.test.ts': 18,
   'bmad-legacy-retirement.test.ts': 5,

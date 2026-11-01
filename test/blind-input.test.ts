@@ -825,6 +825,21 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(scan(rows('src/main.ts', '4:34:56 started'))).toEqual([]);
   });
 
+  it('#546: a heading whose first component begins with digits is judged by the globs, as any other name', () => {
+    // `1-1-notes/NOTES` opens with a `<digits>-` component, the shape a numbered line has
+    // too. The globs exclude the name, so it is the heading and the match under it is a read.
+    expect(recorded(rows('1-1-notes/NOTES', '3:x'), ruleOf('exclude 1-1-notes/**')))
+      .toEqual(prohibited('1-1-notes/NOTES'));
+  });
+
+  it('#546: a digit-leading name the globs do not exclude is no heading of its own, and never clears the excluded name above it', () => {
+    // A non-excluded digit-leading name above numbered lines is inherently ambiguous: it is
+    // either a heading of a file spelled that way, or a `path-N-text` context line of the
+    // excluded name above it. The globs do not exclude it, so it is no heading of its own and
+    // it leaves the heading above in force: the fail-closed reading records the excluded name.
+    expect(recorded(rows('docs/issues/a.md', '2026-10-29-notes.md', '3:y'))).toEqual(prohibited('docs/issues/a.md'));
+  });
+
   it.skipIf(branchMessages === null)('R4: this branch\'s own commit messages are no excluded read, as written or as a log shows them', () => {
     // Commit messages are output a blind reviewer reads: no message of this
     // branch may spell an excluded path in a form a grep prints.

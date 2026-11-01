@@ -1160,8 +1160,10 @@ function gitGrepHit(
  * numbered line (`N:text`, `N-text`) and the isolation globs exclude the path
  * one of its heads names (`gitGrepHeadPaths`): a worktree name, a spaced name
  * or a `<rev>:<path>` head. The globs decide, never the shape of the name, so
- * an extensionless or spaced heading the rule excludes counts like any other.
- * Null when the line is no heading. */
+ * an extensionless or spaced heading the rule excludes counts like any other,
+ * and a name whose first component begins with digits (`1-1-notes/NOTES`) is
+ * no less a name: it is a heading whenever the globs exclude it. Null when the
+ * line is no heading. */
 function gitGrepHeadingFor(line: string, next: string | undefined, rule: BlindIsolationRule): string | null {
   if (line === '' || line === '--' || /^\s/u.test(line)) return null;
   // A heading introduces numbered lines; a name with no lines under it (a listing, `git grep -l`) names nothing.
@@ -1169,9 +1171,8 @@ function gitGrepHeadingFor(line: string, next: string | undefined, rule: BlindIs
   if (line.length > MAX_PATH_CHARS) return null;
   // A line that already names a path and a line number is a match line, not a heading.
   if (GREP_LINE.test(line)) return null;
-  const path = line.replace(/\\/gu, '/');
-  // The repository itself and a directory name are no file of it.
-  if (path === '.' || path === '..' || path.endsWith('/')) return null;
+  // The repository itself and a directory name are no file of it (a Windows-style name ends at `\` as at `/`).
+  if (line === '.' || line === '..' || line.endsWith('/') || line.endsWith('\\')) return null;
   const excluded = gitGrepHeadPaths(line).some(
     (candidate) => normalizeRepoPath(candidate.path) !== '' && excludedGrepPath(candidate, rule) !== null,
   );
@@ -1183,14 +1184,20 @@ function gitGrepHeadingFor(line: string, next: string | undefined, rule: BlindIs
  * excluded path or whose body is history-bearing text. This is observed
  * access, not inferred intent from a file name or a search command.
  *
- * The `git grep --heading` form is observed: a line that names no line number
- * of its own and stands above a numbered line is a heading when the isolation
- * globs exclude the path it names (see gitGrepHeadingFor), and every numbered
- * line under it is then judged as the equivalent `path:N:text` line, so the
- * recorded path is the heading's repository path. Attribution ends at a blank
- * line, at `--`, or at the next heading: every non-numbered line replaces the
- * heading, numbered lines leave it in force. So the change can only ADD a
- * recorded read.
+ * The `git grep --heading` form is observed: a line that stands above a
+ * numbered line is a heading when the isolation globs exclude the path it names
+ * (see gitGrepHeadingFor), and the numbered lines under it are then judged as
+ * the equivalent `path:N:text` line, so the recorded path is the heading's
+ * repository path. The globs decide, never the shape of the name: a name whose
+ * first component begins with digits is still a heading when the globs exclude
+ * it, and only a line that is itself a `path:N:text` match line is none (a bare
+ * `N:text` line cannot be one: gitGrepHeadPaths rejects a 1-6 digit revision).
+ * Attribution ends at a blank line, at `--`, or at the next heading: every
+ * non-numbered line replaces the heading, numbered lines leave it in force. One
+ * reading is taken per heading — the first numbered line under it names the
+ * same path candidates as every other, because the capture ends at its own
+ * `:N:` — so a result with many numbered lines stays one result. So the change
+ * can only ADD a recorded read.
  */
 export function scanObservedAccess(
   results: readonly ObservedToolResult[],
@@ -1220,20 +1227,39 @@ export function scanObservedAccess(
     }
     const lines = result.text.split('\n').map((raw) => (raw.endsWith('\r') ? raw.slice(0, -1) : raw));
     // CRLF output: the separators are git's own, the carriage return is not part of them.
-    // Every numbered line under an excluded heading also reads as the
-    // equivalent `path:N:text` line, so the heading's path is recorded as the
-    // non-heading form records it.
+    // An excluded heading's numbered lines also read as the equivalent
+    // `path:N:text` line, so the heading's path is recorded as the non-heading
+    // form records it.
     const readings: { readonly line: string; readonly names: readonly GrepNames[] }[] = [];
     let heading: string | null = null;
+    // One attributed reading per heading: the first numbered line under it already
+    // carries every path candidate its siblings would, so the record stays bounded
+    // by the headings of a result, not by its numbered lines.
+    let attributed = false;
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i]!;
       const numbered = /^\d+[:-]/u.test(line);
-      if (line === '' || line === '--') heading = null;
-      else if (!numbered) heading = gitGrepHeadingFor(line, lines[i + 1], rule);
+      if (line === '' || line === '--') {
+        heading = null;
+        attributed = false;
+      } else {
+        // An excluded name wins over the numbered branch: a repository name may
+        // begin with digits, and only a real `path:N:text` line is no heading (a
+        // bare numbered line is rejected by gitGrepHeadPaths, see gitGrepHeadingFor).
+        const found = gitGrepHeadingFor(line, lines[i + 1], rule);
+        if (found !== null) {
+          heading = found;
+          attributed = false;
+        } else if (!numbered) {
+          heading = null;
+          attributed = false;
+        }
+      }
       readings.push({ line, names: gitGrepLineNames(line) });
-      if (numbered && heading !== null) {
-        const attributed = `${heading}:${line}`;
-        readings.push({ line: attributed, names: gitGrepLineNames(attributed) });
+      if (numbered && heading !== null && !attributed) {
+        attributed = true;
+        const asMatch = `${heading}:${line}`;
+        readings.push({ line: asMatch, names: gitGrepLineNames(asMatch) });
       }
     }
     // The `path:LINE:` forms first (unchanged: a spaced capture records the
