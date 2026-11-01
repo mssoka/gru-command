@@ -1067,10 +1067,11 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     const first = await pending;
     expect(outcomeOf(completedFrame(first.frames))['runId']).toBe(resumedOutcome['runId']);
     expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toHaveLength(1);
-    // A NEW identity keeps the #159 exact-head refusal.
+    // A NEW identity keeps the #159 exact-head refusal (the manifest here
+    // declares only `hold`, so ask for that declared scope).
     const refused = await call(harness.port, {
       job_id: harness.jobId,
-      scope: 'full',
+      scope: 'hold',
       request_id: 'req-a5-new',
       expected_head: laneHead,
     });
