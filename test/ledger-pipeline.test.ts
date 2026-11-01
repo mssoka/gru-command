@@ -148,6 +148,42 @@ describe('pipeline ledger — claims and admission', () => {
     db.close();
   });
 
+  it('enforces the hold text bound, the hold/clear state matrix and the exclusive-scope bounds the doc states', () => {
+    const { db, ledger } = boot();
+    // Enqueue trims and cuts the hold reason to 500 characters.
+    const held = enqueue(ledger, 'pipe-hold', { holdReason: `  ${'x'.repeat(600)}  ` });
+    expect(held.holdReason).toBe('x'.repeat(500));
+    // Holding a waiting entry replaces the reason; clear-hold is idempotent.
+    expect(ledger.holdPipelineEntry({ id: 'pipe-hold', reason: 'second', by: 'gru' }).holdReason).toBe('second');
+    expect(ledger.clearPipelineHold({ id: 'pipe-hold' }).holdReason).toBeNull();
+    expect(ledger.clearPipelineHold({ id: 'pipe-hold' }).holdReason).toBeNull();
+    // A cancelled entry refuses hold and clear-hold; a failed one refuses all three.
+    enqueue(ledger, 'pipe-cancel');
+    ledger.cancelPipelineEntry({ id: 'pipe-cancel', reason: 'withdrawn' });
+    expect(() => ledger.holdPipelineEntry({ id: 'pipe-cancel', reason: 'nope' })).toThrow(/cancelled/);
+    expect(() => ledger.clearPipelineHold({ id: 'pipe-cancel' })).toThrow(/cancelled/);
+    enqueue(ledger, 'pipe-fail');
+    ledger.claimPipelineEntry({ id: 'pipe-fail', holder: 'silas' });
+    ledger.releasePipelineClaim({ id: 'pipe-fail', reason: 'admission failed: boom', outcome: 'failed' });
+    expect(() => ledger.holdPipelineEntry({ id: 'pipe-fail', reason: 'nope' })).toThrow(/failed/);
+    expect(() => ledger.clearPipelineHold({ id: 'pipe-fail' })).toThrow(/failed/);
+    expect(() => ledger.cancelPipelineEntry({ id: 'pipe-fail', reason: 'nope' })).toThrow(/failed/);
+    // An admitted entry is the job's; the queue refuses all three.
+    enqueue(ledger, 'pipe-admit');
+    ledger.claimPipelineEntry({ id: 'pipe-admit', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-admit', repo: 'demo', title: 'Entry pipe-admit', briefing: 'Briefing for pipe-admit' });
+    ledger.markPipelineAdmitted({ id: 'pipe-admit', jobId: 'pipe-admit' });
+    expect(() => ledger.holdPipelineEntry({ id: 'pipe-admit', reason: 'nope' })).toThrow(/admitted/);
+    expect(() => ledger.clearPipelineHold({ id: 'pipe-admit' })).toThrow(/admitted/);
+    expect(() => ledger.cancelPipelineEntry({ id: 'pipe-admit', reason: 'nope' })).toThrow(/admitted/);
+    // Exclusive scopes: the 200-character boundary, padding and duplicates.
+    expect(() => enqueue(ledger, 'pipe-scope-ok', { exclusiveScopes: ['s'.repeat(200)] })).not.toThrow();
+    expect(() => enqueue(ledger, 'pipe-scope-long', { exclusiveScopes: ['s'.repeat(201)] })).toThrow(/200/);
+    expect(() => enqueue(ledger, 'pipe-scope-pad', { exclusiveScopes: [' scoped'] })).toThrow(/whitespace-padded/);
+    expect(() => enqueue(ledger, 'pipe-scope-dup', { exclusiveScopes: ['a', 'a'] })).toThrow(/listed twice/);
+    db.close();
+  });
+
   it('admits only against a job that carries the exact accepted briefing', () => {
     const { db, ledger } = boot();
     const entry = enqueue(ledger, 'pipe-a');
@@ -332,6 +368,41 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     db.close();
   });
 
+  it('keeps merged and done separate endings and makes delivered need a delivery on record (docs/PIPELINE.md)', () => {
+    const { db, ledger } = boot();
+    const admitted = (id: string, path: readonly ('working' | 'in-review' | 'merged' | 'done')[]): void => {
+      enqueue(ledger, id);
+      ledger.claimPipelineEntry({ id, holder: 'silas' });
+      ledger.addJob({ id, repo: 'demo', title: `Entry ${id}`, briefing: `Briefing for ${id}` });
+      ledger.markPipelineAdmitted({ id, jobId: id });
+      for (const status of path) ledger.setJobStatus(id, status);
+    };
+    admitted('pipe-m', ['working', 'in-review', 'merged']);
+    admitted('pipe-d', ['working', 'done']);
+    for (const [dependency, milestone] of [
+      ['pipe-m', 'merged'],
+      ['pipe-m', 'done'],
+      ['pipe-d', 'merged'],
+      ['pipe-d', 'done'],
+      ['pipe-d', 'delivered'],
+    ] as const) {
+      enqueue(ledger, `dep-${milestone}-${dependency}`, { prerequisites: [{ id: dependency, milestone }] });
+    }
+    const reason = (id: string): string | null =>
+      ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === id)?.reason ?? null;
+    // A job that ends merged releases only the merged dependent; one that ends done, only the done one.
+    expect(reason('dep-merged-pipe-m')).toBeNull();
+    expect(reason('dep-done-pipe-m')).toBe('waiting for pipe-m to be done (now merged)');
+    expect(reason('dep-done-pipe-d')).toBeNull();
+    expect(reason('dep-merged-pipe-d')).toBe('waiting for pipe-d to be merged (now done)');
+    // delivered accepts either ending, but only with a recorded delivery: a job that closed
+    // as done without one never satisfies it.
+    expect(reason('dep-delivered-pipe-d')).toBe('waiting for pipe-d to be delivered (now done)');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-d', payload: {} });
+    expect(reason('dep-delivered-pipe-d')).toBeNull();
+    db.close();
+  });
+
   it('never releases an admitted milestone without durable worker-start evidence', () => {
     const { db, ledger } = boot();
     enqueue(ledger, 'pipe-a');
@@ -466,6 +537,55 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     enqueue(ledger2, 'pipe-c');
     expect(entryOf(ledger2, 'pipe-c').enqueueSeq).toBe(3);
     db2.close();
+  });
+
+  it('reports the FIRST applicable reason in the documented order when several causes apply at once', () => {
+    // docs/PIPELINE.md:162-173 is normative: "the first of these that applies,
+    // checked in this order". A single-cause fixture cannot tell that order from
+    // any other, so this one entry carries every cause at once and peels them
+    // off one at a time, asserting the reason that survives each step.
+    const { db, ledger } = boot();
+    const holder = enqueue(ledger, 'ord-holder', { exclusiveScopes: ['shared-scope'] });
+    // A hand-made cycle: the API refuses to create one, but a pre-existing row
+    // must still be explained (and must outrank a missing prerequisite).
+    const writeRow = (id: string, prerequisiteId: string, scopes: string): void => {
+      db.handle
+        .prepare(
+          `INSERT INTO pipeline_entries
+             (id, repo_path, repo, title, briefing, briefing_hash, priority, enqueue_seq, state,
+              prerequisites, exclusive_scopes, request_id, payload_hash, failure_count, queued_at, updated_at)
+           VALUES (?, '/tmp/demo', 'demo', 'T', 'b', 'h', 5, ?, 'waiting', ?, ?, ?, 'p', 0, ?, ?)`,
+        )
+        .run(id, id === 'ord-target' ? 900 : 901, JSON.stringify([{ id: prerequisiteId, milestone: 'merged' }]), scopes, `req-${id}`, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    };
+    writeRow('ord-target', 'ord-cycle', '["shared-scope"]');
+    writeRow('ord-cycle', 'ord-target', '[]');
+    const context = (): Parameters<typeof pipelineBlockingReason>[1] => ({
+      entries: [holder, ...(ledger.listPipelineEntries() as readonly PipelineEntryRecord[])],
+      jobStatusOf: () => null,
+      jobDeliveredOf: () => false,
+      jobStartedOf: () => false,
+      capacity: FULL_CAPACITY,
+    });
+    const reason = (): string | null => pipelineBlockingReason(ledger.getPipelineEntry('ord-target')!, context());
+
+    // 1. hold outranks everything else present.
+    ledger.holdPipelineEntry({ id: 'ord-target', reason: 'owner deciding', by: 'owner' });
+    expect(reason()).toBe('owner hold: owner deciding');
+    // 2. with the hold gone, the cycle outranks the prerequisite and the scope.
+    ledger.clearPipelineHold({ id: 'ord-target', by: 'owner' });
+    expect(reason()).toContain('dependency cycle');
+    // 3. cycle broken by cancelling the partner: its cancelled state is the
+    //    prerequisite reason, still ahead of the exclusive scope.
+    ledger.cancelPipelineEntry({ id: 'ord-cycle', reason: 'withdrawn' });
+    expect(reason()).toBe('prerequisite ord-cycle cancelled');
+    // 4. all that is left is the scope the other entry holds. A scope is HELD
+    //    only once its holder is claiming or admitted (a waiting entry holds
+    //    nothing), so the holder is put into `admitting`.
+    db.handle.prepare("UPDATE pipeline_entries SET prerequisites = '[]' WHERE id = 'ord-target'").run();
+    db.handle.prepare("UPDATE pipeline_entries SET state = 'admitting' WHERE id = 'ord-holder'").run();
+    expect(reason()).toBe('exclusive scope "shared-scope" held by ord-holder');
+    db.close();
   });
 
   it('evaluates pure blocking reasons without a capacity context (service use)', () => {
