@@ -13,7 +13,12 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
-import { DirectiveCheckpointError, classifyDeadDirectiveTurn, describeDeadTurn, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareClaudeDirectiveBinding, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveAuthorityRefusal, recordDirectiveCompletion, recordDirectiveIndependentController, recordDirectiveProducerCessation, recordDirectiveToolRefusal, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveProducer, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareClaudeDirectiveBinding, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveAuthorityRefusal, recordDirectiveCompletion, recordDirectiveIndependentController, recordDirectiveProducerCessation, recordDirectiveToolRefusal, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveProducer, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+// The dead-turn classifier is this change's own API. It is imported dynamically so the
+// fail-before (custody-red) run can copy only this test file onto the change's base,
+// where those exports do not exist yet: the route-level A1/A2 cases must fail at the
+// custody refusal, never at module link. Only the classifier cases below reach it.
+const { classifyDeadDirectiveTurn, describeDeadTurn } = await import('../src/runtime/directive-checkpoint.js');
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery, type DirectiveProgressDeps } from '../src/dispatch/directive-progress.js';
@@ -3567,7 +3572,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   // whether anything it did needs a human.
   // ------------------------------------------------------------------
 
-  type DeadShape = 'open' | 'quiet' | 'refused' | 'bounded' | 'hostile' | 'pending' | 'torn-transcript' | 'torn-bindings';
+  type DeadShape = 'open' | 'quiet' | 'refused' | 'bounded' | 'one' | 'unanswered-error' | 'malformed-then-content' | 'foreign-prompt' | 'torn-final' | 'hostile' | 'pending' | 'torn-transcript' | 'torn-bindings';
   interface DeadScene {
     readonly ledger: LedgerApi;
     readonly db: LedgerDb;
@@ -3623,7 +3628,20 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     if (shape === 'refused') {
       call('call-1', 'bash'); recordDirectiveToolRefusal(producer, 'call-1', 'live native directive authority changed before effect'); result('call-1', 'bash', true); fail();
     }
-    if (shape === 'bounded') { call('call-1', 'bash'); result('call-1', 'bash', false); call('call-2', 'edit'); result('call-2', 'edit', true); fail(); }
+    // The failed tool first, a completed one last: a turn whose LAST completion is an
+    // unanswered failure is unbounded (contract revision 1, rule 1), so `bounded` is
+    // pinned by a turn that went on to complete another tool.
+    if (shape === 'bounded') { call('call-1', 'edit'); result('call-1', 'edit', true); call('call-2', 'bash'); result('call-2', 'bash', false); fail(); }
+    if (shape === 'one') { call('call-1', 'bash'); result('call-1', 'bash', false); fail(); }
+    // No row after the failed result: the turn's last completion is a failure it never answered.
+    if (shape === 'unanswered-error') { call('call-1', 'bash'); result('call-1', 'bash', true); }
+    // A complete malformed entry, then more content.
+    if (shape === 'malformed-then-content') { appendFileSync(f.file, `${JSON.stringify({ type: 'message', message: { role: 'assistant', stopReason: 'stop', content: [] } })}\n`); call('call-1', 'bash'); }
+    // A steer no request admitted enters the unfinished turn.
+    if (shape === 'foreign-prompt') { call('call-1', 'bash'); result('call-1', 'bash', false); f.native.append({ role: 'user', content: [{ type: 'text', text: 'a steer no request admitted' }] }); call('call-2', 'edit'); }
+    // A torn final line after a complete intent and its result: no evidence either way.
+    // (A provider terminal first: a resumable turn is continued, not surfaced as a decision.)
+    if (shape === 'torn-final') { call('call-1', 'bash'); result('call-1', 'bash', false); fail(); appendFileSync(f.file, '{"type":"message","id":"torn-tail","parentId":null,"message":{"role":"assistant"'); }
     if (shape === 'hostile') { call(HOSTILE_ID, HOSTILE_NAME); result(HOSTILE_ID, HOSTILE_NAME, false); fail(); }
     if (shape === 'pending') call('call-1', 'bash');
     // A second entry with the receipt's own id: another writer's, not evidence.
@@ -3662,7 +3680,17 @@ describe('restart-recovery-progress — exact native request matrix', () => {
         // The host denied it (a guard receipt) and the CLI answered with the denial.
         use('toolu_1', 'Bash'); recordDirectiveToolRefusal(producer, 'toolu_1', 'live native directive authority changed before effect'); result('toolu_1', true);
       }
-      if (shape === 'bounded') { use('toolu_1', 'Read'); result('toolu_1', false); use('toolu_2', 'Edit'); result('toolu_2', true); }
+      if (shape === 'bounded') { use('toolu_1', 'Edit'); result('toolu_1', true); use('toolu_2', 'Read'); result('toolu_2', false); }
+      if (shape === 'one') { use('toolu_1', 'Read'); result('toolu_1', false); }
+      // No frame after the failed result: the turn's last completion is a failure it never answered.
+      if (shape === 'unanswered-error') { use('toolu_1', 'Bash'); result('toolu_1', true); }
+      // A complete malformed frame, then more content.
+      if (shape === 'malformed-then-content') { appendFileSync(sessionFile, 'this frame is not JSON\n'); use('toolu_1', 'Read'); }
+      // A prompt that entered the unfinished turn (a replayed steer, as the CLI records one).
+      if (shape === 'foreign-prompt') { use('toolu_1', 'Read'); result('toolu_1', false);
+        frame({ type: 'user', isReplay: true, session_id: sessionId, parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text: 'a steer' }] } }); use('toolu_2', 'Bash'); }
+      // A torn final line after a complete intent and its result: no evidence either way.
+      if (shape === 'torn-final') { use('toolu_1', 'Read'); result('toolu_1', false); appendFileSync(sessionFile, `${JSON.stringify({ type: 'assistant', session_id: sessionId, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_torn', name: 'Bash' }] } })}`.slice(0, 60)); }
       if (shape === 'hostile') { use(HOSTILE_ID, HOSTILE_NAME); result(HOSTILE_ID, false); }
       if (shape === 'pending') use('toolu_1', 'Bash');
       if (shape === 'torn-transcript') appendFileSync(sessionFile, 'this frame is not JSON\n');
@@ -3713,7 +3741,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   /** A1/A2: a dead turn whose evidence bounds its effects needs no owner decision. */
   async function assertDeadTurnSettled(runtime: 'pi' | 'claude-code', shape: DeadShape, verdict: 'none' | 'bounded', effects: readonly string[]) {
     await withDeadScene(runtime, shape, async (s) => {
-      const debt = await restartPass(s);
+      // The restart pass is where the custody refusal fires on the change's base. Name it
+      // as the failing assertion the fail-before run must quote, never a setup error.
+      const debt = await restartPass(s).catch((error: unknown) =>
+        expect.fail(`the restart pass must not refuse a dead turn its own evidence bounds: ${String(error)}`));
       // The restart pass accounted for the dead producer instead of refusing it, and
       // repaired the stale open turn: nothing about it is left to certify.
       expect(s.ledger.getAgent(s.agentId)?.state).toBe('disposed');
@@ -3739,14 +3770,15 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       // Contract revision 1's field: the service-computed verdict, never the caller's.
       const custody = (decided.payload as { custody_verdict: { verdict: string; effects?: { tool_use_id: string; name: string }[]; reason?: string } }).custody_verdict;
       expect(custody).toMatchObject({ verdict });
+      const listedEffects = effects.filter((effect) => effect.endsWith('completed') || effect.endsWith('failed'));
       if (verdict === 'bounded') {
-        expect(custody.effects).toHaveLength(2);
+        expect(custody.effects).toHaveLength(listedEffects.length);
         expect(custody.effects?.every((effect) => typeof effect.tool_use_id === 'string' && typeof effect.name === 'string')).toBe(true);
       } else expect(custody.effects).toBeUndefined();
       const note = storedText(s, 'dead-turn-successor');
       expect(note).toContain('finish the approved work'); expect(note).toContain(`${verdict}:`);
       for (const effect of effects) expect(note).toContain(effect);
-      if (verdict === 'bounded') expect((decided.payload as { dead_turn: { effects: unknown[] } }).dead_turn.effects).toHaveLength(effects.filter((effect) => effect.endsWith('completed') || effect.endsWith('failed')).length);
+      if (verdict === 'bounded') expect((decided.payload as { dead_turn: { effects: unknown[] } }).dead_turn.effects).toHaveLength(listedEffects.length);
       // The successor is admitted and runs: the dead producer refuses nothing of its own dispatch.
       await executeAcceptedDirective(s.deps, 'dead-turn-successor');
       expect(s.ledger.getDirective('dead-turn-successor')).toMatchObject({ state: 'settled', admissionSeq: expect.any(Number) });
@@ -3758,12 +3790,33 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   }
   it('A1 pi: a dead turn with no tool intent is resumed by a rebrief-successor without any owner decision, verdict none', () => assertDeadTurnSettled('pi', 'quiet', 'none', []));
   it('A1 claude-code: a dead turn killed after the echo is resumed by a rebrief-successor without any owner decision, verdict none', () => assertDeadTurnSettled('claude-code', 'quiet', 'none', []));
+  it('A1r pi: a resumable turn (no terminal) is classified too: verdict none is recorded and the successor is admitted', async () => {
+    await withDeadScene('pi', 'open', async (s) => {
+      // Before the change a resumable checkpoint returned no verdict at all (deadTurnEvidence null).
+      expect(s.ledger.deadTurnEvidence(s.requestId)).toMatchObject({ dead: { verdict: 'none', runtime: 'pi', refused: [], boundaryRefusals: 0 } });
+      // The dead producer's own un-ceased start is excluded from this request's cleanup blockers.
+      expect(s.ledger.directiveProgressBlockers(s.requestId, s.lane.id).filter((blocker) => blocker.includes('unproven producer cleanup'))).toEqual([]);
+      // Repair the killed turn's own stale row the way the restart pass does, then Gru recovers.
+      s.ledger.setAgentState(s.agentId, 'disposed');
+      const debt = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the resumable turn owes a recovery decision');
+      const accepted = recoverInterruptedDirectiveFromRoute(recoveryInput(s, debt, { kind: 'rebrief-successor', requestId: 'resumable-successor', note: 'finish the approved work' }));
+      expect(accepted).toMatchObject({ successor: { requestId: 'resumable-successor' }, custody_verdict: { verdict: 'none' } });
+    });
+  });
   it('A2 pi: an intent whose only follow-up is a guard refusal is verdict none', () => assertDeadTurnSettled('pi', 'refused', 'none', ['the guard refused bash (call-1)']));
   it('A2 claude-code: an intent whose only follow-up is a recorded guard refusal is verdict none', () => assertDeadTurnSettled('claude-code', 'refused', 'none', ['the guard refused Bash (toolu_1)']));
+  it('A2 pi: one completed intent is verdict bounded, names its effect and still admits the successor', () =>
+    assertDeadTurnSettled('pi', 'one', 'bounded', ['bash (call-1) completed']));
+  it('A2 claude-code: one completed intent is verdict bounded, names its effect and still admits the successor', () =>
+    assertDeadTurnSettled('claude-code', 'one', 'bounded', ['Read (toolu_1) completed']));
   it('A2 pi: completed intents are verdict bounded, name their effects and still admit the successor', () =>
-    assertDeadTurnSettled('pi', 'bounded', 'bounded', ['bash (call-1) completed', 'edit (call-2) failed', 'a failed tool can have left partial effects']));
+    assertDeadTurnSettled('pi', 'bounded', 'bounded', ['edit (call-1) failed', 'bash (call-2) completed', 'a failed tool can have left partial effects']));
   it('A2 claude-code: completed intents are verdict bounded, name their effects and still admit the successor', () =>
-    assertDeadTurnSettled('claude-code', 'bounded', 'bounded', ['Read (toolu_1) completed', 'Edit (toolu_2) failed', 'a failed tool can have left partial effects']));
+    assertDeadTurnSettled('claude-code', 'bounded', 'bounded', ['Edit (toolu_1) failed', 'Read (toolu_2) completed', 'a failed tool can have left partial effects']));
+  it('A3 torn final line: a complete intent and its result before a torn tail are still bounded', async () => {
+    await assertDeadTurnSettled('pi', 'torn-final', 'bounded', ['bash (call-1) completed']);
+    await assertDeadTurnSettled('claude-code', 'torn-final', 'bounded', ['Read (toolu_1) completed']);
+  });
 
   it('A5: a replay returns the stored custody verdict; a decision recorded before the field existed still replays', async () => {
     await withDeadScene('pi', 'bounded', async (s) => {
@@ -3816,16 +3869,18 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expect(named).toEqual([expect.stringMatching(/^original host absent but native effects\/checkpoint remain UNKNOWN \(unbounded: /u)]);
       expect(named[0]).toMatch(reason);
       expect(blockers.length).toBeGreaterThan(1);
-      // The card asks the question a human can answer, and offers the owner's exit.
+      // The card says the owner is needed and offers the owner's exit, and it asks no
+      // "continue?" question (contract revision 1 forbids one; that answer has no path yet).
       const card = activeCard(s);
       expect(card?.detail).toContain('unbounded:'); expect(card?.detail).toContain('ask the owner'); expect(card?.detail).toContain('It needs the owner');
-      expect(card?.detail).not.toMatch(/recover with a fresh named successor/u);
+      expect(card?.detail).not.toMatch(/recover with a fresh named successor/u); expect(card?.detail).not.toContain('continue?');
       // Today's owner-facing next action for the debt, unchanged.
       expect(JSON.stringify(s.ledger.recoveryObligation(s.jobId, 'directive', s.requestId)?.nextAction)).toContain('ask the owner');
-      expect(card?.detail).toMatch(/this turn may have run (bash \(call-1\)|Bash \(toolu_1\)|tools GC cannot account for); continue\?/u);
       if (pass) {
         expect(s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-producer-ceased', s.requestId)).toBeNull();
-        expect(s.ledger.getAgent(s.agentId)?.state).toBe('streaming');
+        // The killed service's stale row is repaired even when the turn stays unbounded,
+        // so the owner's abandon exit (below) is not refused as a live open turn.
+        expect(s.ledger.getAgent(s.agentId)?.state).toBe('disposed');
       }
       const before = s.ledger.latestEventSeq();
       let refusal: unknown;
@@ -3839,6 +3894,18 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     assertDeadTurnRefused('pi', 'pending', /bash \(call-1\) has neither a completion nor a recorded refusal/u, true));
   it('A3 claude-code: an intent with neither completion nor refusal is unbounded: named blocker, no successor', () =>
     assertDeadTurnRefused('claude-code', 'pending', /Bash \(toolu_1\) has neither a completion nor a recorded refusal/u, true));
+  it('A3 pi: a failed result the turn never answered is unbounded', () =>
+    assertDeadTurnRefused('pi', 'unanswered-error', /native tool error the turn never answered requires a recovery judgment/u, true));
+  it('A3 claude-code: a failed result the turn never answered is unbounded', () =>
+    assertDeadTurnRefused('claude-code', 'unanswered-error', /native tool error the turn never answered requires a recovery judgment/u, true));
+  it('A3 pi: a malformed frame followed by more content is unbounded', () =>
+    assertDeadTurnRefused('pi', 'malformed-then-content', /native checkpoint walk refuses this turn: native checkpoint has a malformed or duplicate entry identity/u, true));
+  it('A3 claude-code: a malformed frame followed by more content is unbounded', () =>
+    assertDeadTurnRefused('claude-code', 'malformed-then-content', /native checkpoint walk refuses this turn: malformed native frame after the directive prefix/u, true));
+  it('A3 pi: a foreign prompt inside the turn is unbounded', () =>
+    assertDeadTurnRefused('pi', 'foreign-prompt', /native checkpoint walk refuses this turn: another user\/custom message owns this session/u, true));
+  it('A3 claude-code: a foreign prompt inside the turn is unbounded', () =>
+    assertDeadTurnRefused('claude-code', 'foreign-prompt', /native checkpoint walk refuses this turn: another prompt entered the directive turn/u, true));
   it('A3 pi: an unreadable transcript is unbounded and says so', () =>
     assertDeadTurnRefused('pi', 'torn-transcript', /the native checkpoint walk refuses this turn: native checkpoint has a malformed or duplicate entry identity/u, true));
   it('A3 claude-code: an unreadable transcript is unbounded and says so', () =>
@@ -3847,6 +3914,55 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     assertDeadTurnRefused('pi', 'torn-bindings', /native checkpoint is unreadable: .*partial write/u, false));
   it('A3 claude-code: an unreadable association journal is unbounded and says so', () =>
     assertDeadTurnRefused('claude-code', 'torn-bindings', /native checkpoint is unreadable: .*partial write/u, false));
+  it('A3: the unbounded residue keeps the owner exit the card offers: /abandon is accepted, no successor is possible', async () => {
+    await withDeadScene('pi', 'pending', async (s) => {
+      await restartPass(s);
+      // The stale streaming row is repaired even though the turn stays unbounded.
+      expect(s.ledger.getAgent(s.agentId)?.state).toBe('disposed');
+      const abandoned = abandonLiveDirectiveFromRoute({ ledger: s.ledger, worktrees: s.deps.worktrees, pendingProducerBlockers: () => [], requestId: s.requestId,
+        expected: { jobId: s.jobId, state: 'admitted', payloadHash: s.ledger.getDirective(s.requestId)!.payloadHash },
+        reason: 'the owner accepts the unknown effect residue', by: 'owner' });
+      expect(abandoned.idempotent).toBe(false);
+      expect(s.ledger.getDirective(s.requestId)?.state).toBe('abandoned');
+    });
+  });
+  it('A debt first opened while the producer was live is re-planned from the dead turn evidence after the restart pass', async () => {
+    await withDeadScene('pi', 'refused', async (s) => {
+      // Before the restart pass the dead producer's start is still un-ceased: Gru's plan is the owner ask.
+      const before = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the crash left the turn unfinished');
+      expect(JSON.stringify(before.nextAction)).toContain('ask the owner');
+      const after = await restartPass(s);
+      // The same obligation row is re-planned once the restart pass records the dead producer's cessation.
+      expect(after.id).toBe(before.id);
+      expect(after.planRevision).toBeGreaterThan(before.planRevision);
+      expect(JSON.stringify(after.nextAction)).not.toContain('ask the owner');
+      expect(activeCard(s)?.detail).toContain('This needs no owner');
+    });
+  });
+
+  it('a card whose only blocker is a live fence says to wait, never that a successor is accepted', async () => {
+    await withDeadScene('pi', 'quiet', async (s) => {
+      s.ledger.setAgentState(s.agentId, 'disposed');
+      s.ledger.registerAgent({ id: 'card-live-minion', role: 'minion', jobId: s.jobId, sessionFile: `${s.file}.card`, parentage: 'top-level' });
+      s.ledger.setAgentState('card-live-minion', 'streaming');
+      surfaceDirectiveRecovery(s.deps, s.requestId, 'producer ownership remains: open worker turn(s): card-live-minion (streaming)');
+      const detail = activeCard(s)?.detail ?? '';
+      expect(detail).toContain('wait for the live fence');
+      expect(detail).not.toContain('This needs no owner');
+      expect(detail).not.toContain('recover with a fresh named successor');
+    });
+  });
+  it('a card whose producer evidence is unknown asks the owner instead of pointing at a successor the route refuses', async () => {
+    await withDeadScene('pi', 'quiet', async (s) => {
+      // A second evidence state on the same producer (an unobserved independent controller): no dead-turn verdict exists.
+      recordDirectiveIndependentController(s.producer);
+      surfaceDirectiveRecovery(s.deps, s.requestId, 'producer ownership remains unknown');
+      const detail = activeCard(s)?.detail ?? '';
+      expect(detail).toContain('It needs the owner');
+      expect(detail).not.toContain('This needs no owner');
+      expect(detail).not.toContain('recover with a fresh named successor');
+    });
+  });
 
   /** What claude-adapter really leaves behind: the CLI child was never observed to close. */
   it('a Claude turn whose CLI child was never observed to close stays UNKNOWN and owner-gated: the verdicts need a host-absent producer', async () => {
@@ -3904,13 +4020,19 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expect(verdictOf(s)).toMatchObject({ verdict: 'none' });
     });
   });
-  it('classifier pi: a host authority-boundary refusal is counted and told, never read as a tool refusal', async () => {
-    await withDeadScene('pi', 'quiet', async (s) => {
+  it('classifier claude-code: a host authority-boundary refusal covers an uncompleted intent that follows it', async () => {
+    await withDeadScene('claude-code', 'pending', async (s) => {
       recordDirectiveAuthorityRefusal(s.producer, 'live native directive role/tools/model authority changed before completion');
       const dead = verdictOf(s);
       expect(dead).toMatchObject({ verdict: 'none', refused: [], boundaryRefusals: 1 });
       expect(describeDeadTurn(dead)).toContain('the host also recorded 1 authority-boundary refusal(s)');
     });
+  });
+  it('the recorded custody verdict caps its effect list like the sibling dead_turn record', async () => {
+    const { custodyVerdictOf } = await import('../src/runtime/directive-checkpoint.js');
+    const effects = Array.from({ length: 25 }, (_, index) => ({ id: `call-${String(index)}`, name: 'bash', outcome: 'completed' as const }));
+    const verdict = custodyVerdictOf({ verdict: 'bounded', runtime: 'pi', effects, refused: [], boundaryRefusals: 0 });
+    expect(verdict.effects).toHaveLength(20);
   });
   /** A tool intent whose only follow-up is a recorded guard refusal (the turn died before the denial's result was written) is `none`. */
   it('classifier pi: an intent whose only follow-up is a guard refusal, with no result written, is none and lists the refusal', async () => {
@@ -4029,10 +4151,28 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', reason: 'a native tool intent is malformed or repeats its tool_use id' });
     });
   });
-  it('classifier claude-code: a torn final frame is unbounded, never silently dropped', async () => {
+  it('classifier claude-code: a torn final frame after a complete intent and result is dropped, never unbounded', async () => {
     await withDeadScene('claude-code', 'quiet', async (s) => {
+      claudeUse(s, 'toolu_1'); claudeResult(s, 'toolu_1');
       appendFileSync(s.file, `${JSON.stringify({ type: 'assistant', session_id: String(readDirectiveSessionHeader(s.file).id), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_torn', name: 'Bash', input: {} }] } })}`.slice(0, 60));
-      expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', reason: expect.stringMatching(/native evidence is unreadable: .*partial entry/u) });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded', effects: [{ id: 'toolu_1', name: 'Read', outcome: 'completed' }] });
+    });
+  });
+  it('classifier pi: a torn final line after a complete intent and result is dropped, never unbounded', async () => {
+    await withDeadScene('pi', 'open', async (s) => {
+      s.append({ role: 'assistant', stopReason: 'toolUse', content: [piCall('call-1')] }); s.append(piResult('call-1'));
+      appendFileSync(s.file, '{"type":"message","id":"torn-tail","parentId":"x","message":{"role":"assistant"');
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded', effects: [{ id: 'call-1', name: 'bash', outcome: 'completed' }] });
+    });
+  });
+  it('classifier pi: a failed result the turn never answered is unbounded, by the checkpoint contract\'s own reason', async () => {
+    await withDeadScene('pi', 'open', async (s) => {
+      s.append({ role: 'assistant', stopReason: 'toolUse', content: [piCall('call-1')] });
+      s.append(piResult('call-1', 'bash', true));
+      expect(verdictOf(s)).toMatchObject({ verdict: 'unbounded', reason: 'native tool error the turn never answered requires a recovery judgment' });
+      // An assistant row the turn went on to write answers it: the turn is bounded again.
+      s.append({ role: 'assistant', stopReason: 'stop', content: plain('the failure is handled') });
+      expect(verdictOf(s)).toMatchObject({ verdict: 'bounded', effects: [{ id: 'call-1', name: 'bash', outcome: 'failed' }] });
     });
   });
 
