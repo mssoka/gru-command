@@ -8,9 +8,30 @@ on:
 permissions:
   contents: read
 
+# A pushed head supersedes its own in-flight pull-request run: the merge train
+# re-bases constantly and a superseded run only burns runners. `main` is never
+# cancelled — every commit that lands there gets its own verdict.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# THE GATE, SHARDED.
+#
+# `npm test` is still the single definition of green (lint, typecheck, build,
+# fast backend, heavy backend, web) and still runs that way locally and in a
+# lane. CI runs the same phases as separate jobs because one runner serialised
+# them into ~27 minutes: the heavy phase alone is capped at two workers by the
+# approved budget (journal j-829) and therefore cannot be made faster by adding
+# workers — only by spreading its FILES over more runners. Each shard still runs
+# at its own worker cap, so no run ever exceeds the budget.
+#
+# Every phase stays unconditional: nothing here filters on paths, labels or
+# event type, so a pull request and a push to `main` get exactly the same
+# coverage. `test/suite-shape.test.ts` pins that, including that the shard
+# matrices tile 1..N with no gap.
 jobs:
-  test:
-    name: Full suite (Node 22)
+  static:
+    name: Full suite (Node 22) · static
     runs-on: ubuntu-latest
     steps:
       # PRs test GitHub's merge result against the current base branch.
@@ -28,20 +49,8 @@ jobs:
           node-version: '22'
           cache: npm
 
-      # BMAD onboarding exercises the real uv bootstrap; PTY suites exercise
-      # expect(1). Install on the disposable runner, not on user machines.
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: '0.8.22'
-
-      - name: Install PTY test prerequisite
-        run: sudo apt-get update && sudo apt-get install -y expect
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Provision locked property test fixture (isolated, no lifecycle scripts)
-        run: node tools/provision-property-real-fixture.mjs materialize
 
       - name: Lint
         run: npm run lint
@@ -52,30 +61,142 @@ jobs:
       - name: Build
         run: npm run build
 
-      # This repo's `npm test` re-runs lint/typecheck/build as its own
-      # definition of green, then the backend + web suites. Keeping the
-      # stages above as separate steps makes a failure legible at a glance;
-      # this step is the authoritative backend/web gate. The browser e2e
-      # below gates every Playwright project.
-      - name: Full test suite
-        run: npm test
+  fast:
+    name: Full suite (Node 22) · fast ${{ matrix.shard }}/3
+    runs-on: ubuntu-latest
+    strategy:
+      # One shard's failure must never hide another shard's, and a red shard is
+      # a red gate either way.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      # BMAD onboarding exercises the real uv bootstrap.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.8.22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Provision locked property test fixture (isolated, no lifecycle scripts)
+        run: node tools/provision-property-real-fixture.mjs materialize
+
+      # Some fast suites read the compiled output; a shard that guessed would
+      # fail for the wrong reason.
+      - name: Build
+        run: npm run build
+
+      - name: Fast backend, shard ${{ matrix.shard }} of 3
+        run: npm run test:backend -- --shard=${{ matrix.shard }}/3
+
+  heavy:
+    name: Full suite (Node 22) · heavy ${{ matrix.shard }}/6
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.8.22'
+
+      # PTY suites exercise expect(1). Install on the disposable runner, not on
+      # user machines. Only the heavy phase shells out to it.
+      - name: Install PTY test prerequisite
+        run: sudo apt-get update && sudo apt-get install -y expect
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Provision locked property test fixture (isolated, no lifecycle scripts)
+        run: node tools/provision-property-real-fixture.mjs materialize
+
+      - name: Build
+        run: npm run build
+
+      - name: Heavy backend, shard ${{ matrix.shard }} of 6
+        run: npm run test:backend:heavy -- --shard=${{ matrix.shard }}/6
+
+  web:
+    name: Full suite (Node 22) · web unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Web unit suite
+        run: npm run test:web
+
+  e2e:
+    name: Full suite (Node 22) · browser e2e ${{ matrix.shard }}/3
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The real-service and intake specs boot the compiled service, so the
+      # backend build is part of the browser gate, not just the web shell.
+      - name: Build
+        run: npm run build
 
       - name: Build paired browser shell
         run: npm run build:web
 
       - name: Install browser e2e prerequisite
-        working-directory: web
         run: npx playwright install --with-deps chromium
 
       # Every Playwright project gates CI, not just intake (#402): board
       # geometry/hit-target, notification, strip and real-service specs
       # regressed on main unnoticed while only intake ran here. Screenshot
       # baselines are recorded on darwin only, so this Linux runner skips
-      # the pixel comparisons; every behavioral assertion still runs.
-      - name: Browser e2e (all projects)
+      # the pixel comparisons; every behavioral assertion still runs. The
+      # shards split the same all-project run, never a `--project` subset.
+      - name: Browser e2e (all projects), shard ${{ matrix.shard }} of 3
         id: browser-e2e
         working-directory: web
-        run: npx playwright test --ignore-snapshots
+        run: npx playwright test --ignore-snapshots --shard=${{ matrix.shard }}/3
 
       # A Linux-only e2e failure is debuggable from its traces/screenshots
       # and the strip specs' evidence captures. always() lifts the implicit
@@ -84,7 +205,7 @@ jobs:
         if: always() && (steps.browser-e2e.outcome == 'failure' || steps.browser-e2e.outcome == 'cancelled')
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-results
+          name: playwright-results-shard-${{ matrix.shard }}
           path: |
             web/test-results*/
             web/e2e-artifacts/
