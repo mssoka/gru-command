@@ -71,6 +71,11 @@ export interface SupervisorRegistry {
   quarantineHandle(handle: AgentHandle): void;
   spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle>;
   disposeHandle(handle: AgentHandle): Promise<void>;
+  /** Every handle this process holds — unpublished and quarantined ones
+   * included, which `getHandle` hides. Only the one-shot boot settlement of a
+   * previous process's open turns reads it (issue #547); a registry without it
+   * makes that settlement refuse by name rather than guess. */
+  listHandles?(): readonly AgentHandle[];
 }
 
 /**
@@ -460,6 +465,24 @@ export type SupervisorRestartPolicy =
   | { readonly options: SpawnOptions }
   | { readonly refuse: string };
 
+/** The reason a boot settlement records on a previous process's open turn:
+ * the `error` carried by its `agent.state` event and the orphan notice's
+ * reason (issue #547). */
+export const HOST_ABSENT_AT_BOOT = 'host-absent at boot';
+
+/** What one boot settlement did to the agent rows a previous service process
+ * left in `spawning` or `streaming` (issue #547). */
+export interface HostAbsentTurnSettlement {
+  /** Agent rows found open (`spawning` or `streaming`). */
+  readonly examined: number;
+  /** Open rows this process owns (a registry handle, a supervised record or an unfinished tracked child worker): untouched. */
+  readonly live: number;
+  /** Agent ids moved to `error` and surfaced through the orphan notice. */
+  readonly settled: readonly string[];
+  /** Agent ids whose move failed: still open, so the next boot retries them. */
+  readonly failed: readonly string[];
+}
+
 export class Supervisor {
   private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
@@ -512,6 +535,8 @@ export class Supervisor {
   /** Wall-clock of the previous watchdog tick (sleep/wake detection). */
   private lastTickWallAt: number | null = null;
   private disposed = false;
+  /** The boot settlement of a previous process's open turns ran (once per process). */
+  private hostAbsentSettled = false;
 
   constructor(opts: SupervisorOptions) {
     this.cfg = opts.config;
@@ -576,6 +601,89 @@ export class Supervisor {
       }
     }, this.tickMs);
     this.ticker.unref?.();
+  }
+
+  /**
+   * Issue #547: an agent row a previous service process left `spawning` or
+   * `streaming` has no process, no registry handle and no further events, yet
+   * every live-work fence counts it as an open worker turn, so nothing ever
+   * clears it. Call this ONCE per boot, after hydration (`start`) and after
+   * the boot recoveries that re-run work under an existing agent id: a row
+   * that no registry handle (published or not), no supervised record and no
+   * unfinished tracked child worker owns belonged to a previous process. Each
+   * such row leaves the live states through the same `error` move a dead turn
+   * takes (an `agent.state` event naming {@link HOST_ABSENT_AT_BOOT}) and is
+   * surfaced by the orphan notice. Agent rows only: the turn is not resumed,
+   * and no producer cessation, retirement, abandonment, completion or
+   * delivery is recorded. A second call, and any turn this process runs, is
+   * left alone.
+   *
+   * A row whose ownership cannot be read, or whose move fails, stays open and
+   * is reported `failed` (the next boot retries it). A registry that cannot
+   * list its handles, or an agent listing that fails, throws: the supervisor
+   * must not guess which turns are another process's.
+   */
+  settleHostAbsentTurns(): HostAbsentTurnSettlement {
+    if (this.disposed || this.hostAbsentSettled) return { examined: 0, live: 0, settled: [], failed: [] };
+    if (typeof this.registry.listHandles !== 'function') {
+      throw new Error(
+        'the supervisor registry cannot list its handles, so a previous process\'s open turns cannot be told from this ' +
+          'process\'s — no agent row is settled; give the registry a listHandles() that includes unpublished handles',
+      );
+    }
+    // One synchronous snapshot: no spawn or disposal can interleave between
+    // the rows and the handles that are compared against them.
+    const open = this.ledger.listAgents().filter((row) => row.state === 'spawning' || row.state === 'streaming');
+    const held = new Set(this.registry.listHandles().map((handle) => handle.id));
+    this.hostAbsentSettled = true;
+    const settled: string[] = [];
+    const failed: string[] = [];
+    let owned = 0;
+    for (const row of open) {
+      try {
+        // A tracked child admitted but not finished is re-run by the child
+        // service's own boot reconciliation under this same agent id; its row
+        // reads `spawning` until the spawn returns a handle.
+        if (held.has(row.id) || this.agents.has(row.id) || this.ledger.childWorkerByAgent(row.id)?.resultState === null) {
+          owned += 1;
+          continue;
+        }
+        this.ledger.setAgentState(row.id, 'error', HOST_ABSENT_AT_BOOT);
+      } catch (error) {
+        failed.push(row.id);
+        this.log('error', 'host-absent agent turn could not be settled at boot — it stays open until the next boot', {
+          agent_id: row.id,
+          state: row.state,
+          error: failureText(error),
+        });
+        continue;
+      }
+      settled.push(row.id);
+      this.postOrphanedTurn(
+        row.id,
+        HOST_ABSENT_AT_BOOT,
+        `its row was still ${row.state} when this service process booted and this process holds no handle for it — ` +
+          'the host that ran it is gone, and nothing was re-delivered',
+        this.hasRecoverableLane(row.jobId),
+      );
+    }
+    return { examined: open.length, live: owned, settled, failed };
+  }
+
+  /** Whether a turn's job still exists and is not finished: only then is there
+   * a lane for an action-required orphan note to recover. A turn of a
+   * finished job, or of no job (Gru, Bob, Silas, the vector session), is
+   * still moved out of the open states and recorded, without the note. A
+   * lookup that fails reads as recoverable: noise is the safer error. */
+  private hasRecoverableLane(jobId: string | null): boolean {
+    if (jobId === null) return false;
+    try {
+      const job = this.ledger.getJob(jobId);
+      return job !== null && !isJobTerminal(job.status);
+    } catch (error) {
+      this.log('warn', 'job lookup for the orphan note failed — raising the note', { job: jobId, error: String(error) });
+      return true;
+    }
   }
 
   /** Declare a supervision slot (stable identity across restarts). */
@@ -3146,13 +3254,17 @@ export class Supervisor {
     }
   }
 
-  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string): void {
+  /** Record an orphaned turn and, unless `notify` is false, raise the lane's
+   * action-required note. `notify: false` keeps the durable record for a turn
+   * with no lane left to recover (#547). */
+  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string, notify = true): void {
     const lane = this.laneContext(laneAgentId);
     this.recordEvent('supervision.turn-recovery', laneAgentId, {
       disposition: 'orphaned',
       reason,
       note: detail,
     });
+    if (!notify) return;
     try {
       this.notifications.postIncident({
         kind: `supervision.turn-orphaned.${laneAgentId}`,

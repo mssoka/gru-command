@@ -4014,16 +4014,23 @@ describe('#542 a pi directive turn and its own verification run', () => {
 
   it('pi\'s admission-time check refuses an unsettled run that is in place before the admission', async () => {
     const f = await fixture(); registerLane(f);
+    // Since #541 a `registry` row only fences while its pid or group exists, so
+    // the row that must fence here carries a real process.
+    const earlierPid = spawn('/bin/sh', ['-c', 'sleep 120'], { detached: true, stdio: 'ignore' }).pid!;
     let seeded = false;
-    throughDirective(f, (directive) => ({ ...directive, beforeAdmission: () => {
-      if (!seeded) { seeded = true; requestRun(f, 'earlier-run', 51002); }
-      directive.beforeAdmission();
-    } }));
-    await executeAcceptedDirective(f.deps, f.intent.requestId);
-    const row = f.ledger.getDirective(f.intent.requestId)!;
-    expect(f.native.prompts).toEqual([]);
-    expect(row.nativeBinding).toBeNull();
-    expect(row.failReason).toContain('unsettled verification run(s) hold the lane');
-    expect(row.failReason).toContain(`live lane process(es): ${f.lane.id} pid 51002`);
+    try {
+      throughDirective(f, (directive) => ({ ...directive, beforeAdmission: () => {
+        if (!seeded) { seeded = true; requestRun(f, 'earlier-run', earlierPid); }
+        directive.beforeAdmission();
+      } }));
+      await executeAcceptedDirective(f.deps, f.intent.requestId);
+      const row = f.ledger.getDirective(f.intent.requestId)!;
+      expect(f.native.prompts).toEqual([]);
+      expect(row.nativeBinding).toBeNull();
+      expect(row.failReason).toContain('unsettled verification run(s) hold the lane');
+      expect(row.failReason).toContain(`live lane process(es): ${f.lane.id} pid ${earlierPid}`);
+    } finally {
+      try { process.kill(-earlierPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
   });
 });

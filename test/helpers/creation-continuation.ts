@@ -108,6 +108,17 @@ export function committedStall(): string {
   ]);
 }
 
+/** A synthetic Git wrapper commits its update-ref normally and exits `delayMs`
+ * after the real Git child closed: a healthy transaction that is only slow to
+ * close, as under load. The delay starts after the service has ended the
+ * child's stdin, so its close is never earlier than `delayMs` after the
+ * service began waiting for it. */
+export function committedSlowClose(delayMs: number): string {
+  return gitWrapper([
+    `child.on("close", code => { setTimeout(() => process.exit(code ?? 1), ${delayMs}); });`,
+  ]);
+}
+
 /** The wrapper commits and exits, but a detached descendant keeps the
  * service's pipes open until `releaseFile` exists; its pid is written to
  * `pidFile`. */
@@ -123,7 +134,7 @@ export function processGone(pid: number): boolean {
 }
 
 export async function retainedFixture(jobId: string, options: { readonly prepare?: (repo: FixtureRepo) => void; readonly manager?: Partial<WorktreeManagerOptions> } = {}) {
-  const h = managerFixture(`retained-${jobId}`, options.manager);
+  const h = managerFixture(`retained-${jobId}`, { committedRefCloseMs: 1_000, ...options.manager });
   options.prepare?.(h.repo);
   const job = h.ledger.addJob({ id: jobId, repo: basename(h.repo.path), title: `Title ${jobId}`, baseBranch: 'main', briefing: `Original briefing ${jobId}` });
   h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: { repo: job.repo, repoPath: h.repo.path } });

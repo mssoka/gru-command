@@ -358,17 +358,33 @@ lens method; it never sees the consult conversation or your reasoning.
 - **Wait for the pass.** Every lens states READY or CHANGES-NEEDED; one
   CHANGES-NEEDED decides the round. Every finding quotes the briefing, so a
   finding is either a real ambiguity or a real contradiction in your text.
+- **Precedence.** The round-cap rule governs the cap condition, not a finding
+  whose content says the owner's requested outcome cannot be met as stated. A
+  finding of that kind cannot be repaired by an amendment without changing the
+  owner's scope, so it takes the owner-escalation path below; escalate that
+  finding and hold only the step it gates.
 - **Three routing paths.** Fix the briefing and re-commission the revision;
-  escalate to the owner through `POST /api/notifications/needs-owner` with
-  reserved class `scope-design` when the lenses disagree with the intent; or
   record a push-back, authenticated `POST /api/briefing-review/pushback`
   `{ "repoPath", "briefingSha256", "reason", "by": "gru" }`, when you judged
-  the finding and are shipping as written. A push-back is your judgment on the
-  record, never a way to hide a finding from the owner.
-- **Round cap.** Three consecutive CHANGES-NEEDED rounds for one heist mean a
-  disagreement, not a drafting problem: escalate to the owner instead of
-  revising a fourth time; the commission itself refuses with
-  `briefing_review_round_cap`.
+  the finding and are shipping as written; or, only for a finding whose
+  content shows the owner's requested outcome cannot be met as stated,
+  escalate to the owner through `POST /api/notifications/needs-owner` with
+  reserved class `scope-design`. Lenses disagreeing with the briefing, or a
+  briefing that keeps drawing findings, is not that case. A push-back is your
+  judgment on the record, never a way to hide a finding from the owner.
+- **Round cap.** At the cap (three consecutive CHANGES-NEEDED rounds) record a
+  push-back on the last reviewed text, dispatch that exact text, then
+  immediately append one material amendment (`POST /api/dispatch/amendment`)
+  that fixes that round's blocking findings; its `approval.reference` names
+  owner ruling journal j-1200. Never post an owner escalation for a round
+  cap; this is the product's rule on every install, not a per-install choice.
+- **Writing briefings.** First, read the code the change touches before
+  drafting. State the outcome, constraints, acceptance and verification, and
+  leave implementation detail to the worker's workflow and its own review.
+  Then choose the tier by risk: `low` for read-only or test-only work, `medium` by
+  default, `high` only for owner-reserved authority, credentials and
+  security, or irreversible provider writes. Revise only for blocking
+  findings; advisory findings never start a new round.
 - **Provenance.** Dispatch with the exact reviewed text and carry
   `"briefing_review": { "rounds", "verdict", "briefing_sha256" }` from the
   commission. A READY review attaches by itself; a push-back dispatch omits

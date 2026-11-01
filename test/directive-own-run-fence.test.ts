@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -101,6 +102,26 @@ async function scene(kind: 'directive' | 'rebrief' = 'directive') {
   return { ledger, lane, deps, intent, release, dir, accept, sessionFile: (): string => ledger.getDirective(intent.requestId)!.nativeTarget!.sessionFile };
 }
 type Scene = Awaited<ReturnType<typeof scene>>;
+
+/** Real, alive pids. Since #541 a `registry` row whose recorded pid and
+ * process group are both gone is stale bookkeeping a restart left behind, and
+ * it never fences — so a synthetic pid can no longer stand for "a live lane
+ * process": a row that must FENCE needs a process that exists. A sleeping shell
+ * in its own group is the cheapest one, reaped after every test. */
+const liveChildren: ChildProcess[] = [];
+function livePid(): number {
+  const child = spawn('/bin/sh', ['-c', 'sleep 120'], { detached: true, stdio: 'ignore' });
+  child.unref();
+  liveChildren.push(child);
+  if (child.pid === undefined) throw new Error('live pid helper could not start a holder process');
+  return child.pid;
+}
+
+afterEach(() => {
+  for (const child of liveChildren.splice(0)) {
+    try { if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+});
 
 /** What the tests need of a job: its ledger and its registered lane. */
 interface Home { readonly ledger: LedgerApi; readonly lane: Pick<WorktreeLane, 'id' | 'path'> }
@@ -221,13 +242,14 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
 
   it('a run requested before the admission still refuses the tool and ends the turn', async () => {
     const s = await scene();
-    seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: 41004 }), 'after');
+    const earlierPid = livePid();
+    seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: earlierPid }), 'after');
     await takeTurn(s, () => {});
     const file = s.sessionFile();
     const admissionSeq = s.ledger.getDirective(s.intent.requestId)!.admissionSeq!;
     expect(s.ledger.latestJobEvent(JOB, 'verification.requested')!.seq).toBeLessThan(admissionSeq);
     expect(guardRefusals(file)).toEqual([expect.stringContaining(UNSETTLED)]);
-    expect(guardRefusals(file)[0]).toContain(`live lane process(es): ${s.lane.id} pid 41004`);
+    expect(guardRefusals(file)[0]).toContain(`live lane process(es): ${s.lane.id} pid ${earlierPid}`);
     expect(hostAllowed(file)).toBe(false);
     expect(toolResults(file)).toEqual([expect.objectContaining({ is_error: true })]);
     expect(inspectDirectiveCheckpoint(file, s.ledger.directiveTurnIdentity(s.intent.requestId))).not.toMatchObject({ state: 'terminal', ok: true });
@@ -236,28 +258,30 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
   it('a pre-admission run beside a post-admission one still refuses the tool, and names the pid it spawns only after the admission', async () => {
     const s = await scene();
     // The earlier run is queued: requested before the admission, with no process yet.
-    seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: 41005, process: false }), 'after');
+    const earlierPid = livePid();
+    seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: earlierPid, process: false }), 'after');
     await takeTurn(s, () => {
       requestRun(s, { runId: 'own-run', pid: 41006 });
       // The queued run starts only now: its started frame and its process come after the admission.
       startRun(s, 'earlier-run');
-      startProcess(s, 'earlier-run', 41005);
+      startProcess(s, 'earlier-run', earlierPid);
     });
     const refusal = guardRefusals(s.sessionFile());
     expect(refusal).toEqual([expect.stringContaining(UNSETTLED)]);
-    expect(refusal[0]).toContain(`live lane process(es): ${s.lane.id} pid 41005`);
+    expect(refusal[0]).toContain(`live lane process(es): ${s.lane.id} pid ${earlierPid}`);
     expect(refusal[0]).not.toContain('41006');
     expect(hostAllowed(s.sessionFile())).toBe(false);
   });
 
   it('a lane process the post-admission run did not start still refuses the tool; the run\'s own pid is not named', async () => {
     const s = await scene();
+    const foreignPid = livePid();
     await takeTurn(s, () => {
       requestRun(s, { runId: 'own-run', pid: 41007 });
-      s.ledger.recordWorktreeProcesses({ worktreeId: s.lane.id, processes: [{ pid: 41008, command: 'node server.js', evidence: 'registry' }], state: 'live' });
+      s.ledger.recordWorktreeProcesses({ worktreeId: s.lane.id, processes: [{ pid: foreignPid, command: 'node server.js', evidence: 'registry' }], state: 'live' });
     });
     const refusal = guardRefusals(s.sessionFile());
-    expect(refusal).toEqual([expect.stringContaining(`live lane process(es): ${s.lane.id} pid 41008`)]);
+    expect(refusal).toEqual([expect.stringContaining(`live lane process(es): ${s.lane.id} pid ${foreignPid}`)]);
     expect(refusal[0]).not.toContain('41007');
     expect(refusal[0]).not.toContain(UNSETTLED);
     expect(hostAllowed(s.sessionFile())).toBe(false);
@@ -282,14 +306,15 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
 
   it('the admission itself is refused by an unsettled run, with the turn\'s producer already prepared', async () => {
     const s = await scene();
-    seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: 41011 }), 'before');
+    const earlierPid = livePid();
+    seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: earlierPid }), 'before');
     await executeAcceptedDirective(s.deps, s.intent.requestId);
     const refused = s.ledger.getDirective(s.intent.requestId)!;
     expect(refused.nativeBinding).toBeNull();
     expect(refused.admissionSeq).toBeNull();
     expect(s.ledger.latestJobEventByRequestId(JOB, 'silas.directive-sent', s.intent.requestId)).toBeNull();
     expect(refused.failReason).toContain(UNSETTLED);
-    expect(refused.failReason).toContain(`live lane process(es): ${s.lane.id} pid 41011`);
+    expect(refused.failReason).toContain(`live lane process(es): ${s.lane.id} pid ${earlierPid}`);
   });
 
   it('a later request\'s admission is still refused by a run that postdates an earlier request\'s admission', async () => {
@@ -298,7 +323,8 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
     expect(s.ledger.getDirective(s.intent.requestId)?.state).toBe('settled');
     const earlierAdmission = s.ledger.getDirective(s.intent.requestId)!.admissionSeq!;
     // A run the earlier turn could have called its own, left unsettled when it ended.
-    requestRun(s, { runId: 'left-behind-run', pid: 41012 });
+    const leftBehindPid = livePid();
+    requestRun(s, { runId: 'left-behind-run', pid: leftBehindPid });
     expect(s.ledger.latestJobEvent(JOB, 'verification.requested')!.seq).toBeGreaterThan(earlierAdmission);
     const later = s.accept('later-request', 'tool:Read the next approved step');
     await executeAcceptedDirective(s.deps, later.requestId);
@@ -306,7 +332,7 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
     expect(refused.nativeBinding).toBeNull();
     expect(refused.state).not.toBe('settled');
     expect(refused.failReason).toContain(UNSETTLED);
-    expect(refused.failReason).toContain(`live lane process(es): ${s.lane.id} pid 41012`);
+    expect(refused.failReason).toContain(`live lane process(es): ${s.lane.id} pid ${leftBehindPid}`);
   });
 });
 
@@ -328,33 +354,36 @@ describe('#542 the ledger exempts a request\'s post-admission runs only once it 
     const child = ledger.registerWorktree({ id: 'zz-child-lane', kind: 'child', repoPath: repo.path, repoName: 'fixture', path: join(dir, 'child-lane'), sha: 'a'.repeat(40), jobId: JOB });
     const home: Home = { ledger, lane };
     const request = ledger.beginDirectiveIntent({ jobId: JOB, requestId: 'ledger-request', directive: 'finish', holder: 'gru' }).record;
+    // Since #541 a `registry` row only fences while its pid or group exists,
+    // so these rows carry real processes.
+    const [beforePid, afterPid, latePid] = [livePid(), livePid(), livePid()];
     const only = (blockers: readonly string[]): readonly string[] => blockers.filter((blocker) => blocker.startsWith('unsettled verification run') || blocker.startsWith('live lane process'));
     const runBlockers = (exempt: boolean): readonly string[] => only(ledger.directiveProgressBlockers(request.requestId, lane.id, undefined, undefined, undefined, exempt));
     const rows = (...entries: readonly (readonly [string, number])[]): string => `live lane process(es): ${entries.map(([worktree, pid]) => `${worktree} pid ${pid}`).join(', ')}`;
     // Not admitted: there is no admission seq, so the flag exempts nothing.
-    requestRun(home, { runId: 'before-run', pid: 41101 });
-    expect(runBlockers(true)).toEqual([UNSETTLED, rows([lane.id, 41101])]);
+    requestRun(home, { runId: 'before-run', pid: beforePid });
+    expect(runBlockers(true)).toEqual([UNSETTLED, rows([lane.id, beforePid])]);
     admitNativeDirectiveFixture(ledger, request.requestId, 'ledger-minion', join(dir, 'native.jsonl'));
     expect(ledger.getDirective(request.requestId)!.admissionSeq!).toBeGreaterThan(ledger.latestJobEvent(JOB, 'verification.requested')!.seq);
     // Admitted: a run requested before the admission is still nobody's to pass.
-    expect(runBlockers(true)).toEqual([UNSETTLED, rows([lane.id, 41101])]);
+    expect(runBlockers(true)).toEqual([UNSETTLED, rows([lane.id, beforePid])]);
     // That earlier run spawns another process only now: still its pid, not a post-admission run's.
-    startProcess(home, 'before-run', 41103);
+    startProcess(home, 'before-run', latePid);
     // A post-admission run, and another worktree of the job holding a row with that run's pid.
-    requestRun(home, { runId: 'after-run', pid: 41102 });
-    ledger.recordWorktreeProcesses({ worktreeId: child.id, processes: [{ pid: 41102, command: 'node other.js', evidence: 'argv' }], state: 'live' });
-    const all = rows([lane.id, 41101], [lane.id, 41102], [lane.id, 41103], [child.id, 41102]);
+    requestRun(home, { runId: 'after-run', pid: afterPid });
+    ledger.recordWorktreeProcesses({ worktreeId: child.id, processes: [{ pid: afterPid, command: 'node other.js', evidence: 'argv' }], state: 'live' });
+    const all = rows([lane.id, beforePid], [lane.id, afterPid], [lane.id, latePid], [child.id, afterPid]);
     expect(runBlockers(false)).toEqual([UNSETTLED, all]);
     // The default is no exemption: the callers that never pass the flag (/recover, the pi continuation) keep every blocker.
     expect(only(ledger.directiveProgressBlockers(request.requestId, lane.id))).toEqual([UNSETTLED, all]);
     // On request, only the post-admission run and the lane's row for its pid pass.
-    expect(runBlockers(true)).toEqual([UNSETTLED, rows([lane.id, 41101], [lane.id, 41103], [child.id, 41102])]);
+    expect(runBlockers(true)).toEqual([UNSETTLED, rows([lane.id, beforePid], [lane.id, latePid], [child.id, afterPid])]);
     // With the earlier run settled and its rows gone, only the post-admission run is left, and it passes.
-    settleRun(home, 'before-run', 41101);
-    ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: [{ pid: 41103, command: '/bin/sh -c npm test', evidence: 'registry' }], state: 'killed' });
-    expect(runBlockers(true)).toEqual([rows([child.id, 41102])]);
-    ledger.recordWorktreeProcesses({ worktreeId: child.id, processes: [{ pid: 41102, command: 'node other.js', evidence: 'argv' }], state: 'killed' });
+    settleRun(home, 'before-run', beforePid);
+    ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: [{ pid: latePid, command: '/bin/sh -c npm test', evidence: 'registry' }], state: 'killed' });
+    expect(runBlockers(true)).toEqual([rows([child.id, afterPid])]);
+    ledger.recordWorktreeProcesses({ worktreeId: child.id, processes: [{ pid: afterPid, command: 'node other.js', evidence: 'argv' }], state: 'killed' });
     expect(runBlockers(true)).toEqual([]);
-    expect(runBlockers(false)).toEqual([UNSETTLED, rows([lane.id, 41102])]);
+    expect(runBlockers(false)).toEqual([UNSETTLED, rows([lane.id, afterPid])]);
   });
 });
