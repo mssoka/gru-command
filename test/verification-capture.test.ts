@@ -710,7 +710,11 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(code).toBe(CAPTURE_EXIT.unknown);
       const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
       expect(receipt.outcome).toBe('unknown');
-      expect(receipt.error).toContain('no response within 150 ms');
+      // The direct transport assertion above pins the configured 150 ms bound;
+      // this receipt names the timeout's shape (the last, budget-sized
+      // re-submit carries the final message) and its errno code.
+      expect(receipt.error).toContain('no response within');
+      expect(receipt.error).toContain('connect + response headers');
       expect(receipt.error).toContain(CAPTURE_RESPONSE_TIMEOUT_CODE);
       expect(receipt.abandoned_after_ms).not.toBeNull();
 
