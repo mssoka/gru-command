@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import type { LedgerApi } from '../ledger/api.js';
+import { RecordNotFound, type EventRecord, type LedgerApi } from '../ledger/api.js';
 import {
   BlindInputRefusal,
   DEFAULT_BLIND_ISOLATION_RULE,
@@ -24,7 +24,7 @@ import {
 /**
  * Blind-review admission, validity and reuse (issue #316), on the ledger.
  *
- * Three durable facts, none of which rewrite a report or a settlement:
+ * Four durable facts, none of which rewrite a report or a settlement:
  *  - `review.blind-input-admitted` (job): the commissioning decision — role,
  *    the effective parent rule it was validated against, and the validated
  *    package provenance (digests only, never the private bytes).
@@ -32,15 +32,24 @@ import {
  *    actually returned, checked against that same rule.
  *  - `review.blind-input-refused` (requested job id, no job row): the audited
  *    refusal that spent no reviewer turn.
+ *  - `review.blind-coverage-released` (job): the commissioner's audited
+ *    decision (#513) that a delivered report cannot serve as a completed
+ *    review, so its coverage no longer blocks a corrected commission.
  *
  * Validity is DERIVED from those facts (`blindCoverageOf`): lifecycle
  * settlement (`delivered`/`done`, disposition `acted`) is deliberately not an
- * input, so a settled report can never read as independent coverage.
+ * input, so a settled report can never read as independent coverage — and a
+ * settled report never stops owning it either, until it is released.
  */
 
 export const BLIND_ADMITTED_EVENT = 'review.blind-input-admitted';
 export const BLIND_ACCESS_EVENT = 'review.blind-access-observed';
 export const BLIND_REFUSED_EVENT = 'review.blind-input-refused';
+export const BLIND_RELEASED_EVENT = 'review.blind-coverage-released';
+
+/** The only actor that may release coverage, and the longest reason it may give. */
+export const BLIND_RELEASE_ACTOR = 'gru';
+export const BLIND_RELEASE_REASON_MAX = 500;
 
 export type BlindCoverageState = 'qualifying' | 'invalidated' | 'unattested' | 'unobserved' | 'not-blind' | 'unclassified';
 
@@ -52,11 +61,24 @@ export const BLIND_ACCESS_UNOBSERVABLE_EVENT = 'job.blind-access-unobservable';
  * again for the job (provider recovery) is briefed with the same input. */
 export const BLIND_PACKAGE_EVENT = 'review.blind-input-package';
 
+/** The recorded release of a job's coverage (#513), as readback shows it. */
+export interface BlindCoverageRelease {
+  readonly by: typeof BLIND_RELEASE_ACTOR;
+  readonly reason: string;
+  readonly at: string;
+  readonly event_seq: number;
+}
+
 export interface BlindCoverage {
   readonly jobId: string;
+  /** What the admission and the observed access say, exactly as before a
+   * release existed: a release never rewrites it. */
   readonly state: BlindCoverageState;
-  /** True only for `qualifying`: the one fact "independent blind coverage" rests on. */
+  /** True only for `qualifying` that has not been released: the one fact
+   * "independent blind coverage" rests on. */
   readonly qualifying: boolean;
+  /** Null until the commissioner releases the coverage; permanent after. */
+  readonly released: BlindCoverageRelease | null;
   readonly role: ReviewRole | null;
   readonly targetSha: string | null;
   readonly packageSha256: string | null;
@@ -308,7 +330,9 @@ export function admitBlindReview(input: {
           status: 409,
           message: `blind coverage of sibling review "${sibling.id}" cannot be read: ${error instanceof Error ? error.message : String(error)}`,
           violations: [],
-          correction: `Inspect and repair "${sibling.id}"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`,
+          correction: error instanceof BlindReleaseRecordError
+            ? `Inspect and repair "${sibling.id}"'s ${BLIND_RELEASED_EVENT} event in the ledger (its coverage cannot be computed until it is readable), then commission again.`
+            : `Inspect and repair "${sibling.id}"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`,
           details: { coverage_job_id: sibling.id },
         }),
         rule.sha256,
@@ -323,7 +347,9 @@ export function admitBlindReview(input: {
           status: 409,
           message: `blind coverage of ${targetSha ?? 'this target'} is already owned by "${sibling.id}" — no replacement reviewer is needed`,
           violations: [],
-          correction: `Reuse "${sibling.id}" (GET /api/dispatch/jobs/${sibling.id}/blind-coverage). Commission a new blind review only for a new target_sha, or after that coverage is invalidated by observed access.`,
+          correction:
+            `Reuse "${sibling.id}" (GET /api/dispatch/jobs/${sibling.id}/blind-coverage). Commission a new blind review only for a new target_sha, or after that coverage is invalidated by observed access. ` +
+            `If "${sibling.id}" delivered a report that cannot serve as a completed review, release its coverage (POST /api/dispatch/jobs/${sibling.id}/blind-coverage/release {"reason":"…","by":"gru"}) and commission again; a live failed reviewer is parked or binned instead.`,
           details: { coverage_job_id: sibling.id, package_sha256: coverage.packageSha256 },
         }),
         rule.sha256,
@@ -523,10 +549,28 @@ function scanSessionIdentity(sessionFile: string): string {
 
 /**
  * Validity of one review job as blind coverage. Derived ONLY from the
- * admission and the observed-access facts; job status and report
- * disposition are not inputs (settlement is not validity).
+ * admission, the observed-access facts and the commissioner's release of the
+ * coverage (#513); job status and report disposition are not inputs
+ * (settlement is not validity). A release leaves `state` as the facts say and
+ * only withdraws `qualifying`: the report was never invalid, it simply cannot
+ * serve as the completed review.
  */
 export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage {
+  const derived = derivedCoverageOf(ledger, jobId);
+  const released = releaseOf(ledger, jobId)?.release ?? null;
+  return {
+    ...derived,
+    qualifying: derived.qualifying && released === null,
+    released,
+    reasons: released === null ? derived.reasons : [...derived.reasons, `coverage released by ${released.by}: ${released.reason}`],
+  };
+}
+
+/** The coverage the admission and the observed access alone establish, before
+ * any release. */
+type DerivedCoverage = Omit<BlindCoverage, 'released'>;
+
+function derivedCoverageOf(ledger: LedgerApi, jobId: string): DerivedCoverage {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null) {
     return {
@@ -615,6 +659,129 @@ export function recordObservedAccess(
     payload: { source, session, scanned: results.length, rule_sha256: rule.sha256, prohibited },
   });
   return blindCoverageOf(ledger, jobId);
+}
+
+/** A job's `review.blind-coverage-released` record is not a well-formed
+ * release: it must never read as "not released", so the coverage cannot be
+ * computed until the record is repaired. */
+export class BlindReleaseRecordError extends Error {
+  constructor(message: string) { super(message); this.name = 'BlindReleaseRecordError'; }
+}
+
+/** The recorded release of a job's coverage, or null when none was recorded.
+ * A record that is not a well-formed release throws BlindReleaseRecordError. */
+function releaseOf(
+  ledger: Pick<LedgerApi, 'latestJobEvent'>,
+  jobId: string,
+): { readonly event: EventRecord; readonly release: BlindCoverageRelease } | null {
+  const event = ledger.latestJobEvent(jobId, BLIND_RELEASED_EVENT);
+  if (event === null) return null;
+  const payload = event.payload as { reason?: unknown; by?: unknown } | null;
+  if (typeof payload !== 'object' || payload === null || typeof payload.reason !== 'string' || payload.reason.trim() === '' || payload.by !== BLIND_RELEASE_ACTOR) {
+    throw new BlindReleaseRecordError(
+      `job "${jobId}": its ${BLIND_RELEASED_EVENT} record (event ${String(event.seq)}) is malformed — a release names a reason and "${BLIND_RELEASE_ACTOR}" as its actor`,
+    );
+  }
+  return { event, release: { by: BLIND_RELEASE_ACTOR, reason: payload.reason, at: event.ts, event_seq: event.seq } };
+}
+
+export interface BlindCoverageReleaseOutcome {
+  /** True when the coverage was already released with this reason: nothing was appended. */
+  readonly idempotent: boolean;
+  readonly event: EventRecord;
+  readonly coverage: BlindCoverage;
+}
+
+function releaseRefusal(
+  code: 'invalid_request' | 'blind_coverage_not_blind' | 'blind_coverage_live' | 'blind_coverage_not_owned' | 'blind_coverage_already_released',
+  status: 400 | 409,
+  message: string,
+  correction: string,
+  details: Readonly<Record<string, unknown>> = {},
+): BlindInputRefusal {
+  return new BlindInputRefusal({ code, status, message, violations: [], correction, details });
+}
+
+/**
+ * Release the same-target coverage a delivered blind report holds (#513), so
+ * a corrected review of the same target can be commissioned. The one thing it
+ * writes is a `review.blind-coverage-released` event on the job: no access
+ * event, no status change, no disposition and no report edit. Only a blind
+ * report that is `delivered` or `done` and still `qualifying` is releasable
+ * (a live reviewer is parked or binned instead); a repeat with the same
+ * reason answers the existing event, a different reason is refused. A refusal
+ * writes nothing. The checks and the append run in one synchronous turn of the
+ * ledger's single writer, so no status change can slip between them.
+ */
+export function releaseBlindCoverage(
+  ledger: LedgerApi,
+  jobId: string,
+  input: { readonly reason: unknown; readonly by: unknown },
+): BlindCoverageReleaseOutcome {
+  const shape = `Send {"reason":"<why this report cannot serve as a completed review, 1-${String(BLIND_RELEASE_REASON_MAX)} characters>","by":"${BLIND_RELEASE_ACTOR}"}.`;
+  const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+  if (reason === '' || Array.from(reason).length > BLIND_RELEASE_REASON_MAX) {
+    throw releaseRefusal(
+      'invalid_request',
+      400,
+      `reason must be a non-empty string of at most ${String(BLIND_RELEASE_REASON_MAX)} characters`,
+      shape,
+    );
+  }
+  if (input.by !== BLIND_RELEASE_ACTOR) {
+    throw releaseRefusal('invalid_request', 400, `by must be "${BLIND_RELEASE_ACTOR}" — only the chief releases blind coverage`, shape);
+  }
+  const job = ledger.getJob(jobId);
+  if (job === null) throw new RecordNotFound(`job "${jobId}" not found`);
+  const admitted = admittedOf(ledger, jobId);
+  if (admitted === null || admitted.role !== 'blind') {
+    throw releaseRefusal(
+      'blind_coverage_not_blind',
+      409,
+      `job "${jobId}" was not admitted as a blind review (${admitted === null ? 'no blind-input admission' : `role ${admitted.role}`}) — it holds no blind coverage to release`,
+      `Read GET /api/dispatch/jobs/${jobId}/blind-coverage: only an isolated blind review owns coverage, so a claims, unclassified or historical review has nothing to release.`,
+    );
+  }
+  const existing = releaseOf(ledger, jobId);
+  if (existing !== null) {
+    if (existing.release.reason === reason) return { idempotent: true, event: existing.event, coverage: blindCoverageOf(ledger, jobId) };
+    throw releaseRefusal(
+      'blind_coverage_already_released',
+      409,
+      `blind coverage of "${jobId}" was already released (event ${String(existing.event.seq)}) with a different reason`,
+      `A release is permanent and keeps its first reason. Repeat it with that exact reason to read it back, or commission the corrected review: "${jobId}" no longer owns coverage.`,
+      { released: existing.release },
+    );
+  }
+  if (job.status !== 'delivered' && job.status !== 'done') {
+    // A blocked, parked or binned sibling is already skipped by the reuse check.
+    const skipped = job.status === 'blocked' || job.status === 'parked' || job.status === 'binned';
+    throw releaseRefusal(
+      'blind_coverage_live',
+      409,
+      `job "${jobId}" is ${job.status} — only a delivered or done blind report can have its coverage released`,
+      skipped
+        ? `A ${job.status} reviewer is already skipped by the reuse check: a corrected same-target commission is admitted without a release.`
+        : `Release applies only to a report that was delivered or dismissed (job delivered or done), and a reviewer that is ${job.status} is neither. It keeps its coverage; park or bin a failed reviewer that is still working, which the reuse check then skips.`,
+      { job_status: job.status },
+    );
+  }
+  const coverage = blindCoverageOf(ledger, jobId);
+  if (coverage.state !== 'qualifying') {
+    throw releaseRefusal(
+      'blind_coverage_not_owned',
+      409,
+      `blind coverage of "${jobId}" is ${coverage.state}, not qualifying — it owns no coverage to release`,
+      `A report that is invalidated, unattested or unobserved already does not own coverage: commission the corrected review and it is admitted, naming "${jobId}" in replaces.`,
+      { coverage_state: coverage.state },
+    );
+  }
+  const event = ledger.appendCustomEvent({
+    kind: BLIND_RELEASED_EVENT,
+    jobId,
+    payload: { reason, by: BLIND_RELEASE_ACTOR, target_sha: admitted.target_sha, package_sha256: admitted.package?.packageSha256 ?? null },
+  });
+  return { idempotent: false, event, coverage: blindCoverageOf(ledger, jobId) };
 }
 
 /** The sessions of the job found unreadable that no later scan of that same
