@@ -587,7 +587,7 @@ export function pidAlive(pid: number): boolean {
 
 /** Does any member of a process group exist (`kill(-pgid, 0)`)? EPERM
  * also proves existence. */
-function groupAlive(pgid: number): boolean {
+export function groupAlive(pgid: number): boolean {
   if (!Number.isInteger(pgid) || pgid <= 1) return false;
   try {
     process.kill(-pgid, 0);
