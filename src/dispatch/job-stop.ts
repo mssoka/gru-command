@@ -60,6 +60,7 @@ export interface JobStopDeps {
     | 'getJob'
     | 'listJobs'
     | 'latestJobEvent'
+    | 'listJobEventsByKinds'
     | 'listAgents'
     | 'listRounds'
     | 'listChildWorkers'
@@ -100,6 +101,19 @@ export function jobStopResidue(outcome: JobStopOutcome): readonly string[] {
     ...(outcome.reviews.state === 'unproven' ? [`review: ${outcome.reviews.detail ?? 'unproven'}`] : []),
     ...outcome.outstanding,
   ];
+}
+
+/** The owner-facing notice for an unproven stop. Pure and exported so the
+ * incident title/detail can be asserted, and so the residue text an owner
+ * reads is the same text the durable event records. */
+export function jobStopUnprovenNotice(outcome: JobStopOutcome): { readonly title: string; readonly detail: string } {
+  return {
+    title: `Parked job ${outcome.jobId}: producer stop is unproven`,
+    detail:
+      `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
+      'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
+      'Where nothing is running for the lane, resuming or closing the job lifts the hold; this notice settles on the next stop reconcile at boot.',
+  };
 }
 
 /**
@@ -193,8 +207,7 @@ export class JobExecutionStop {
     // existed, so an empty registry says nothing about its producers.
     const priorStopEvent = ledger.latestJobEvent(input.jobId, 'job.execution-stop');
     const legacy = priorStopEvent === null;
-
-    ledger.appendCustomEvent({
+    const requested = ledger.appendCustomEvent({
       kind: 'job.execution-stop',
       jobId: input.jobId,
       payload: { state: 'requested', by: input.by, reason: input.reason, job_status: job.status },
@@ -308,15 +321,22 @@ export class JobExecutionStop {
     // Review evidence proves a stop only when it proves something: a
     // genuine round supersession (already proven terminal by
     // `supersedeReviews`) or the job-level receipt for a fallback gate
-    // written after this lane's prior stop event. The vacuous
+    // written after the start of THIS hold. `fence` is the newest of the
+    // lane's prior stop event, the `job.status` park that opened the current
+    // hold, and this pass's own `requested` write, so a receipt from an
+    // earlier supersession (the writer gate, an accepted material amendment)
+    // can never prove a stop it has nothing to do with. The vacuous
     // `confirmed: true` a lane with no review operation gets back is
     // evidence of nothing, so it can neither prove a stop nor count as a
     // target.
+    const parkedAt = ledger
+      .listJobEventsByKinds(input.jobId, ['job.status']) // newest first, so `.find` is the latest park
+      .find((event) => (event.payload as { readonly to?: unknown } | null)?.to === 'parked');
+    const fence = Math.max(priorStopEvent?.seq ?? 0, parkedAt?.seq ?? 0, requested.seq);
     const reviewProven =
       reviews.state === 'stopped' &&
       (reviews.roundIds.length > 0 ||
-        (ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0) >
-          (priorStopEvent?.seq ?? 0));
+        (ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0) > fence);
     const provenTargets =
       agents.filter((agent) => agent.state === 'stopped').length +
       children.filter((child) => child.state === 'stopped').length +

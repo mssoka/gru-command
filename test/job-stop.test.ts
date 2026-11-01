@@ -6,6 +6,7 @@ import { EventBus, type BusEvent } from '../src/events/bus.js';
 import {
   JobExecutionStop,
   jobStopResidue,
+  jobStopUnprovenNotice,
   watchParkedJobs,
   type JobStopDeps,
 } from '../src/dispatch/job-stop.js';
@@ -380,6 +381,24 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
+  // The owner notice is user-visible (AGENTS.md): the residue an owner reads
+  // and the way out of the hold are pinned here, not only in `main.ts`.
+  it('tells the owner what an unproven stop means and how the hold lifts', async () => {
+    const f = fixture();
+    try {
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(jobStopUnprovenNotice(outcome)).toEqual({
+        title: `Parked job ${JOB}: producer stop is unproven`,
+        detail:
+          'The explicit owner hold is recorded, but the service cannot prove every producer stopped: parked before stop events existed; registry absence is not evidence. ' +
+          'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
+          'Where nothing is running for the lane, resuming or closing the job lifts the hold; this notice settles on the next stop reconcile at boot.',
+      });
+    } finally {
+      f.close();
+    }
+  });
+
   it('names a non-legacy empty target set as unproven with the stop-target residue', async () => {
     const f = fixture();
     try {
@@ -451,17 +470,40 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
-  it('counts a job-level review-supersession-confirmed written after the prior stop as proven review evidence', async () => {
+  it('counts a job-level review-supersession-confirmed written by this pass as proven review evidence', async () => {
     const f = fixture({
-      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+      // The real `WaveRunner.supersedeReviews` writes the job-level receipt
+      // itself, i.e. during the pass and after its `requested` fence.
+      reviews: {
+        supersedeReviews: async () => {
+          f.ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'perkins', operations: 1 } });
+          return { jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null };
+        },
+      },
     });
     try {
-      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'requested', by: 'crash', reason: 'interrupted' } });
-      f.ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'tester', operations: 1 } });
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(outcome.state).toBe('stopped');
       expect(outcome.reviews.state).toBe('stopped');
       expect(outcome.outstanding).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  // A receipt from an earlier supersession (the writer gate, an accepted
+  // material amendment) proves nothing about this hold: it predates both the
+  // park that opened the hold and this pass's own `requested` write.
+  it('ignores a review-supersession-confirmed written before the current hold', async () => {
+    const f = fixture({
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'writer', operations: 1 } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.reviews.state).toBe('stopped');
+      expect(outcome.outstanding).toContain('parked before stop events existed; registry absence is not evidence');
     } finally {
       f.close();
     }

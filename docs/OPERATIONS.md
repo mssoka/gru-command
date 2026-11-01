@@ -246,17 +246,23 @@ producer stopped, so the service answers the two facts separately.
   confirmed review supersession) **and at least one target was actually
   proven**. A review confirmation counts only when it proves something: a
   superseded round, or the job-level fallback receipt written after the
-  lane's prior stop event. The vacuous `confirmed: true` a lane with no
-  review operation receives proves nothing and is neither a target nor a
-  residue.
+  start of the current hold (the newest of the lane's `job.status` park,
+  its prior stop event and this pass's own `requested` write). A receipt
+  from an earlier supersession — the writer gate, an accepted material
+  amendment — proves nothing about this hold. The vacuous
+  `confirmed: true` a lane with no review operation receives proves
+  nothing and is neither a target nor a residue.
 - **Registry absence is not cessation.** An empty target set — nothing
   spawned, everything already disposed, or rows a restart settled — never
   yields `state: "stopped"`. The pass records `unproven` and names the
   residue: `parked before stop events existed; registry absence is not
   evidence` for a lane with no `job.execution-stop` history at all, or
   `no stop target exists — registry absence is not evidence of cessation`
-  otherwise. A lane with no live producer can still be held: resuming or
-  closing the job is what clears that hold.
+  otherwise. The first sentence names the record condition — there is no
+  stop history for this lane, which includes a lane's first stop — and not
+  a claim about when the feature shipped. A lane with no live producer can
+  still be held: resuming or closing the job lifts the hold, and the
+  notice and its incident settle on the next stop reconcile at boot.
 - **An unproven stop is named, never fabricated.** A failed dispose, a
   ledger open turn the runtime no longer holds, an unsettled verification
   run or an in-flight producer admission leaves `state: "unproven"` with the
@@ -276,8 +282,9 @@ producer stopped, so the service answers the two facts separately.
   event at all (parked before stop events existed) is visited exactly
   once: the boot pass writes `requested` then `unproven`, preserves the
   park, and later boots re-prove the now-`unproven` lane the ordinary way.
-  The owner incident clears only when a later pass proves the stop, or the
-  owner resumes or closes the job.
+  The owner incident clears when a later pass proves the stop; after the
+  owner resumes or closes the job it clears on the next boot's stop
+  reconcile.
 
 ## Administrative closeout of a parked PR-backed lane
 
