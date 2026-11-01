@@ -1317,6 +1317,23 @@ gc-532-static = "npm run lint && npm run typecheck && npm run build"
 gc-532-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-532-red.XXXXXX"); trap "rm -rf -- $d" EXIT; git archive "$base" | tar -x -C "$d"; cp test/creation-continuation-custody.test.ts "$d/test/creation-continuation-custody.test.ts"; cp test/helpers/creation-continuation.ts "$d/test/helpers/creation-continuation.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-532 RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts test/creation-continuation-custody.test.ts --testNamePattern "creates the job when a committed Git child closes after the old one-second bound"'
 gc-532-mutants = "node tools/patch-vitest-rpc-timeout.mjs && node gru-output/gc-532-git-close-wait/mutations.mjs"
 
+# Restart custody: a dead turn (original producer host-absent) is settled from the
+# transcript and guard receipts GC wrote, so a restart owes the owner nothing.
+# `custody-focused` is the heavy restart-recovery suite (A1-A4, both runtimes) plus
+# the retirement suite, the registry pins and the #485 refusal-text scan (whose
+# resolved-constant pin carries the three named checkpoint reasons); `custody-static`
+# is the lint + typecheck + build gate; `custody-red` runs the fail-before cases
+# A1 and A2 by test name (contract revision 1; A3 is not in the red run because the
+# base already refuses) against a scratch extract of ccd6337f (the briefing's named
+# base; no directive, ledger or runtime code differs from the PR base) with only the
+# final test file copied in, and exits non-zero by design. The file links on the base
+# because the change's own classifier API is imported dynamically (only the
+# classifier cases reach it); each selected case then fails at the custody refusal,
+# quoted by the `expect.fail` line around the restart pass — never at import or setup.
+# The verbose reporter lists which cases failed there.
+custody-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts && npx vitest run test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/decisions.test.ts"
+custody-static = "npm run lint && npm run typecheck && npm run build"
+custody-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-custody-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/restart-recovery-progress.test.ts "$d/test/restart-recovery-progress.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "custody baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/restart-recovery-progress.test.ts --testNamePattern "A[12] (pi|claude-code):"'
 # #523 owner approval of abandonment: the service, its ledger table, the
 # registry/wiring, both text surfaces and the web client's owner actor.
 gc-523-approval-focused = "npm run build && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/directive-retirement.test.ts test/roles-gru.test.ts test/board-engine.test.ts test/notification-decisions.test.ts test/restart-recovery-schema.test.ts test/ledger-db.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/service-shutdown.test.ts test/verification-scheduler.test.ts && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts src/lib/board-client.test.ts src/lib/board-protocol.test.ts"

@@ -534,7 +534,11 @@ describe('typed decision semantics', () => {
     for (const site of skipped) unscanned[site] = (unscanned[site] ?? 0) + 1;
     expect(unscanned).toEqual(KNOWN_UNSCANNED);
     expect(texts.some((text) => text.startsWith('an earlier directive failure refused this turn'))).toBe(true);
-    expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'ENTRY_OVERSIZED', 'HEADER_OVERSIZED', 'MALFORMED', 'RETRIED_TWICE', 'UNBOUND_TAIL']));
+    // The constants the scan resolved, each read in full above (blank and wall checks below).
+    // The three checkpoint reasons are named constants so the checkpoint walks and the
+    // restart-custody verdict share one spelling; their texts are unchanged.
+    expect(new Set(resolved)).toEqual(new Set(['EARLIER_DIRECTIVE_FAILURE', 'ENTRY_OVERSIZED', 'HEADER_OVERSIZED', 'MALFORMED', 'RETRIED_TWICE',
+      'TOOLS_INCOMPLETE', 'TOOL_ERROR_UNANSWERED', 'TURN_UNFINISHED', 'UNBOUND_TAIL']));
     expect(texts).toEqual(expect.arrayContaining(['native error row has no matching live SDK retry-start receipt',
       'native receipted error row holds content that is not retry history', 'native receipted error row has no retried answer after it',
       'native compaction follows another compaction', 'native compaction lacks a summary',

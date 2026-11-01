@@ -3055,6 +3055,8 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
       decision: { kind: 'successor', request_id: successorId, directive: 'inspect preserved artifacts; finish only current approved remaining scope' } };
     const accepted = await call(h.port, 'POST', `${f.route}/recover`, successorBody, TOKEN);
     expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    // Contract revision 1's verdict is on the HTTP surface, not only the stored event.
+    expect(accepted.json).toHaveProperty('custody_verdict');
     for (let i = 0; i < 200 && h.ledger.getDirective(successorId)?.state !== 'settled'; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     expect(h.ledger.getDirective(successorId)?.state).toBe('settled'); expect(h.ledger.getObligation(next.id)?.state).toBe('settled');
     const successorSession = h.ledger.getDirective(successorId)?.nativeTarget?.sessionFile;
@@ -3072,6 +3074,7 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
     const replay = await call(h.port, 'POST', `${f.route}/recover`, successorBody, TOKEN);
     expect(replay.status, JSON.stringify(replay.json)).toBe(200);
     expect(replay.json).toMatchObject({ idempotent: true, successor_request_id: successorId });
+    expect(replay.json).toHaveProperty('custody_verdict');
     expect(h.spawns).toHaveLength(spawnsBeforeReplay);
     expect(h.ledger.getDirective(successorId)?.admissionSeq).toBe(admissionBeforeReplay);
     expect(h.ledger.listJobEventsByKinds(f.jobId, ['silas.directive-sent', 'job.delivered'])).toEqual(eventsBeforeReplay);

@@ -4,10 +4,10 @@ import { isDeepStrictEqual } from 'node:util';
 import type { LedgerApi } from '../ledger/api.js';
 import { DIRECTIVE_RECOVERY_CARD_PREFIX, LIVE_DIRECTIVE_STATES, directiveRecoveryCardIdentity, directiveRecoveryIdentityLine, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, classifyDeadDirectiveTurn, describeDeadTurn, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
-import { lineSafeLiteral } from './line-safe.js';
+import { lineSafeLiteral, shownText } from './line-safe.js';
 import { DirectiveDispatchDeferredError, DirectivePromptRefusedError, flipJobToWorking, freshReviewInput, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { isAdmittedBlind } from './blind-review.js';
 import { observePendingRebriefs, postRecoveryIncident, type RecoveryNotifications } from './rebrief-recovery.js';
@@ -336,28 +336,48 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
 }
 
 /** Account only for exact physical ownership. A safe transcript never alone
- * proves producer cessation, and original host death never proves tool death. */
+ * proves producer cessation, and original host death alone never proves tool
+ * death: only a dead turn's own evidence bounding its effects does (see
+ * classifyDeadDirectiveTurn). */
 function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): void {
   const row = deps.ledger.getDirective(identity.requestId)!;
   if (row.nativeTarget === null) return;
-  const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
   const owners = inspectDirectiveProducers(row.nativeTarget.sessionFile, identity);
   const sessionOwners = inspectDirectiveProducers(row.nativeTarget.sessionFile);
+  // A proven-dead host may have left a torn final line; it is no evidence either way.
+  const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity, { tolerateTornTail: owners.some(({ evidence }) => evidence === 'host-absent') });
   if (owners.length === 0 || sessionOwners.some(({ evidence }) => evidence === 'unknown')) throw new DirectiveCheckpointError(`exact original physical native producer cessation unproven; start ${deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId)?.seq ?? 'unbound'}`);
-  if (owners.some(({ evidence }) => evidence === 'host-absent') && (proof.state === 'unknown' || (proof.state === 'terminal' && !proof.ok))) {
-    throw new DirectiveCheckpointError('original host absent but native effects/checkpoint remain incomplete');
+  // Host absence proves the producer gone, not what it did. The turn's own durable
+  // evidence bounds its effects (`none`, `bounded`), and then the cessation is
+  // accounted for like a completed turn's; otherwise the refusal stands — after the
+  // exact stale turn row is repaired (below).
+  let deadRefusal: DirectiveCheckpointError | null = null;
+  if (owners.some(({ evidence }) => evidence === 'host-absent') &&
+      (proof.state === 'unknown' || proof.state === 'resumable' || (proof.state === 'terminal' && !proof.ok))) {
+    const dead = classifyDeadDirectiveTurn(row.nativeTarget.sessionFile, identity);
+    if (dead.verdict === 'unbounded') deadRefusal = new DirectiveCheckpointError(`original host absent but native effects/checkpoint remain incomplete (${describeDeadTurn(dead)})`);
   }
   const start = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId);
   const producer = (start?.payload as { native_producer?: unknown } | undefined)?.native_producer;
   const owner = start === null ? owners.at(-1) : owners.find(({ producer: native }) => JSON.stringify(native) === JSON.stringify(producer));
+  /** The killed service also left the dead turn `streaming`. That row records the
+   * dead process, not a live turn (a live turn always holds a handle); repairing
+   * it is exact physical cessation, never permission. Before the `unbounded`
+   * refusal it is what makes the card's owner exit (/abandon) reachable: the
+   * abandonment route refuses any `live` entry, and this row would be one. */
+  const repairExactCessationRow = (): void => {
+    if (owner === undefined) return;
+    const stale = deps.ledger.getAgent(owner.producer.agentId);
+    if (JSON.stringify(sessionOwners.at(-1)?.producer) === JSON.stringify(owner.producer) && stale?.jobId === identity.jobId &&
+        stale.sessionFile === owner.producer.sessionFile && deps.registry.getHandle(stale.id) === null && stale.state !== 'disposed') {
+      deps.ledger.setAgentState(stale.id, 'disposed');
+    }
+  };
+  if (deadRefusal !== null) { repairExactCessationRow(); throw deadRefusal; }
   if (owner === undefined) throw new DirectiveCheckpointError('legacy/unbound physical producer start remains UNKNOWN');
-  const agent = deps.ledger.getAgent(owner.producer.agentId);
   const lockBlocker = directiveProducerLockBlocker(sessionOwners.at(-1)!.producer);
   if (lockBlocker !== null) throw new DirectiveCheckpointError(lockBlocker);
-  if (JSON.stringify(sessionOwners.at(-1)?.producer) === JSON.stringify(owner.producer) && agent?.jobId === identity.jobId &&
-      agent.sessionFile === owner.producer.sessionFile && deps.registry.getHandle(agent.id) === null && agent.state !== 'disposed') {
-    deps.ledger.setAgentState(agent.id, 'disposed'); // exact physical cessation, never permission; repair receipt replay too
-  }
+  repairExactCessationRow();
   if (start === null) return;
   const ceased = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-ceased', identity.requestId);
   if ((ceased?.payload as { producer_start_seq?: unknown } | undefined)?.producer_start_seq === start.seq) return;
@@ -470,7 +490,7 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
   return true;
 }
 
-export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledger' | 'notifications'>, requestId: string, reason: string): void {
+export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledger' | 'notifications'> & { readonly worktrees?: Pick<WorktreePort, 'listWorktrees'> }, requestId: string, reason: string): void {
   const row = deps.ledger.getDirective(requestId);
   const job = row === null ? null : deps.ledger.getJob(row.jobId);
   if (row === null || isDirectiveTerminal(row.state) || job === null || isJobTerminal(job.status)) return;
@@ -483,25 +503,70 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
   const debt = deps.ledger.openDirectiveRecoveryDebt(requestId, reason);
   const current = deps.ledger.directiveCurrentAuthority(row.jobId);
   const custody = deps.ledger.directiveCustodyGaps(row);
+  // #523: the card's identity is (request, debt generation). Gru resolving it for
+  // this generation, with nothing about it changed since, is an answer — a later
+  // pass does not raise it again. A card of another generation, or one written
+  // before the identity line existed, is not that answer.
   const kind = `${DIRECTIVE_RECOVERY_CARD_PREFIX}${requestId}`;
   const identityLine = directiveRecoveryIdentityLine(requestId, debt.generation);
-  // Gru resolved the card for this request and debt generation, and nothing about
-  // either changed since: a new pass does not raise it again (#523). A card of
-  // another generation, or one written before the identity line, is not that answer.
   if (deps.ledger.findNotificationByKind(kind, 'active') === null) {
     const newest = deps.ledger.latestNotificationByKind(kind);
     if (newest !== null && directiveRecoveryCardIdentity(newest) === identityLine) return;
   }
+  // The card's own instruction must match what /recover will do: custody that is
+  // still unknown needs the owner, and a live fence refuses until it clears. The
+  // tags come from the same ownership read the route uses (never a reason string).
+  let fences: readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[];
+  try {
+    const lane = deps.worktrees?.listWorktrees({ jobId: row.jobId }).find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+    fences = deps.ledger.directiveOwnershipBlockers(requestId, lane?.id ?? '');
+  } catch { fences = [{ text: 'the producer fences could not be read', custody: 'unknown' }]; }
+  const unknownCustody = custody.length > 0 || fences.some(({ custody: tagged }) => tagged === 'unknown');
+  const dead = deadTurnLine(deps.ledger, requestId, !unknownCustody);
   postRecoveryIncident(deps.notifications, { kind, routing: 'action-required', severity: 'error',
     title: `Directive ${requestId}: concrete Gru recovery decision owed (job ${row.jobId})`,
     detail: `${identityLine}\nRequest ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
-      `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}. Inspect GET /api/silas/directives/${requestId}, ` +
-      (custody.length > 0
-        ? `but its producer custody is unknown (${custody.join('; ')}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk()}`
+      `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}.${dead.line} Inspect GET /api/silas/directives/${requestId}, ` +
+      (custody.length > 0 || unknownCustody || dead.unbounded
+        ? `but its producer custody is unknown (${[
+          ...custody,
+          ...(dead.unbounded ? [DEAD_TURN_UNBOUNDED] : []),
+          ...fences.filter(({ custody: tagged }) => tagged === 'unknown').map(({ text }) => text),
+        ].join('; ') || 'no dead-turn verdict exists'}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk()}`
         : `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
+          'if a live fence is still named above (a worker turn, session lock or lane process on the job), wait for it to clear first — the successor or retirement is refused until then, and no owner decision is needed for it; ' +
           'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
           'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.'),
     ...(row.admissionMinion === null ? {} : { agentId: row.admissionMinion }), dedupe: 'active' });
+}
+
+/** The one dead-turn verdict that still needs a human: the evidence was read
+ * and did not bound the turn. A request whose verdict is absent (an `unknown`
+ * producer, a foreign host, an unobserved independent controller, a torn
+ * journal) has NO verdict at all — the card must say that, never hand the owner
+ * the unbounded judgement the service never made. */
+export const DEAD_TURN_UNBOUNDED = 'the dead turn is unbounded';
+
+/** What the service read from a dead turn's own evidence (restart custody),
+ * for the recovery card; empty when the request's producer is not host-absent.
+ * `none` and `bounded` need no owner. `unbounded` is the one residue a human
+ * can still judge; the card keeps today's owner-abandonment ask and names the
+ * verdict, never a "continue?" question (the authorisation path for that answer
+ * is a separate change). */
+function deadTurnLine(ledger: Pick<LedgerApi, 'deadTurnEvidence'>, requestId: string, allowNoOwner: boolean): { readonly line: string; readonly unbounded: boolean } {
+  try {
+    const found = ledger.deadTurnEvidence(requestId);
+    if (found === null) return { line: '', unbounded: false };
+    const { dead } = found;
+    // A live fence or a custody gap keeps the request with its own fence; the card says so below.
+    if (dead.verdict !== 'unbounded') return { unbounded: false, line: ` Dead turn (its host is gone), read from its own evidence — ${describeDeadTurn(dead)}.${allowNoOwner ? ' This needs no owner: the dead turn is settled and only a live fence named above can still refuse a successor.' : ''}` };
+    // The owner's ask closes the card (a successor is refused while the verdict is unbounded).
+    return { unbounded: true, line: ` Dead turn (its host is gone), read from its own evidence — ${describeDeadTurn(dead)}.` };
+  } catch (error) {
+    // Unreadable evidence is unbounded, as it is at every other custody surface:
+    // the card must ask the owner, never point at a successor call the preflight refuses.
+    return { unbounded: true, line: ` The dead turn's evidence could not be read (${shownText(String(error), 200)}).` };
+  }
 }
 
 /** The card text that hands an unknown-custody request to the owner: Gru
