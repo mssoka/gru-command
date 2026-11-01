@@ -3546,6 +3546,7 @@ a.repo-row__name:hover {
 .board-notification--error .board-notification__recommendation,
 .board-notification--error .board-notification__why,
 .board-notification--error .board-notification__decided,
+.board-notification--error .board-notification__result,
 .board-notification--error .board-notification__guidance,
 .board-notification--error .board-notification__discuss,
 .board-notification--error .board-notification__discuss-text,
@@ -3620,10 +3621,16 @@ a.repo-row__name:hover {
 .board-notification__recommendation,
 .board-notification__why,
 .board-notification__decided,
+.board-notification__result,
 .board-notification__guidance,
 .board-notification__discuss {
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+/* The result a follow-through closed the card with: one line per blocker. */
+.board-notification__result {
+  white-space: pre-line;
 }
 
 .board-notification__discuss {
@@ -3639,6 +3646,7 @@ a.repo-row__name:hover {
 
 .board-notification__why,
 .board-notification__decided,
+.board-notification__result,
 .board-notification__guidance,
 .board-notification__discuss,
 .board-notification__option-consequence,
