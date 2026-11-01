@@ -10617,7 +10617,9 @@ export class LedgerApi {
    * Current candidacy and current permission never erase accepted history. */
   private assertNoCompletedNativeRetirement(row: DirectiveRequestRecord): void {
     if (row.nativeBinding === null || row.nativeTarget === null) return;
-    const proof = inspectDirectiveCheckpoint(row.nativeBinding.sessionFile, this.directiveTurnIdentity(row.requestId));
+    // A torn final line cannot be a completed turn's terminal: an incomplete line is
+    // not a durable `result` frame, so tolerance here never hides completion evidence.
+    const proof = inspectDirectiveCheckpoint(row.nativeBinding.sessionFile, this.directiveTurnIdentity(row.requestId), { tolerateTornTail: true });
     if (proof.state === 'terminal' && proof.ok && isDeepStrictEqual(proof.binding, row.nativeBinding)) {
       throw new DirectiveRetirementError('terminal_receipt_present', `directive request "${row.requestId}" has successful native completion — normal settlement owns it; do not clear writers or retire it to execute a successor`);
     }

@@ -1656,10 +1656,11 @@ export function deadTurnList(tools: readonly DeadTurnTool[], limit = 6): string 
   return tools.length > limit ? `${shown}, and ${String(tools.length - limit)} more` : shown;
 }
 /** `intents`: tool id → name, in transcript order; `results`: tool id → whether
- * the result was an error; `unanswered`: the turn's last completion is a failed
- * result it never went on to answer (the checkpoint walk's own contract). */
+ * the result was an error; `unanswered`: the tool id of a failed completion the turn
+ * never went on to answer (the checkpoint walk's own contract). A refused tool's
+ * failed result is the CLI's denial of that tool, not an effect. */
 function settleDeadTurn(runtime: DirectiveNativeBinding['runtime'], intents: ReadonlyMap<string, string>, results: ReadonlyMap<string, boolean>,
-  refusedIds: ReadonlySet<string>, boundaryRefusals: number, unanswered: boolean): DeadTurnVerdict {
+  refusedIds: ReadonlySet<string>, boundaryRefusals: number, unanswered: string | null): DeadTurnVerdict {
   const refused: DeadTurnTool[] = [];
   const pending: DeadTurnTool[] = [];
   const effects: DeadTurnEffect[] = [];
@@ -1672,7 +1673,7 @@ function settleDeadTurn(runtime: DirectiveNativeBinding['runtime'], intents: Rea
   }
   if (pending.length > 0) return unboundedDeadTurn(runtime, `tool intent ${deadTurnList(pending)} has neither a completion nor a recorded refusal`, pending);
   // A failed completion the turn never answered may be an interrupted effect.
-  if (unanswered) return unboundedDeadTurn(runtime, TOOL_ERROR_UNANSWERED);
+  if (unanswered !== null && !refusedIds.has(unanswered)) return unboundedDeadTurn(runtime, TOOL_ERROR_UNANSWERED);
   return effects.length === 0 ? { verdict: 'none', runtime, refused, boundaryRefusals } : { verdict: 'bounded', runtime, effects, refused, boundaryRefusals };
 }
 
@@ -1684,7 +1685,7 @@ function claudeDeadTurn(file: string, binding: DirectiveNativeBinding, refusedId
   return withClaudeTurn(file, binding, (turn) => {
     const intents = new Map<string, string>();
     const results = new Map<string, boolean>();
-    let unanswered = false;
+    let unanswered: string | null = null;
     for (let index = turn.echo + 1; ; index += 1) {
       const frame = turn.frame(index);
       if (frame === undefined) break;
@@ -1696,7 +1697,7 @@ function claudeDeadTurn(file: string, binding: DirectiveNativeBinding, refusedId
       const blocks = Array.isArray(message?.content) ? message.content as Record<string, unknown>[] : [];
       if (type === 'assistant') {
         // Only the main agent's own frame answers it, never a sub-agent's.
-        if (frame['parent_tool_use_id'] == null) unanswered = false;
+        if (frame['parent_tool_use_id'] == null) unanswered = null;
         for (const block of blocks) {
           if (block['type'] !== 'tool_use') continue;
           const { id, name } = block;
@@ -1708,7 +1709,7 @@ function claudeDeadTurn(file: string, binding: DirectiveNativeBinding, refusedId
         for (const block of blocks) {
           if (block['type'] !== 'tool_result' || typeof block['tool_use_id'] !== 'string') continue;
           results.set(block['tool_use_id'], block['is_error'] === true);
-          if (block['is_error'] === true) unanswered = true;
+          if (block['is_error'] === true) unanswered = block['tool_use_id'];
         }
       }
     }
@@ -1725,7 +1726,7 @@ function piDeadTurn(file: string, binding: DirectiveNativeBinding, refusedIds: R
     const intents = new Map<string, string>();
     const results = new Map<string, boolean>();
     const notExecuted = new Set<string>();
-    let unanswered = false;
+    let unanswered: string | null = null;
     for (let index = at.index + 1; ; index += 1) {
       const entry = turn(index);
       if (entry === undefined) break;
@@ -1740,9 +1741,9 @@ function piDeadTurn(file: string, binding: DirectiveNativeBinding, refusedIds: R
         results.set(message['toolCallId'], message['isError'] === true);
         // The SDK's own "not executed" answer to a length row is no effect either way.
         const notRun = notExecuted.delete(message['toolCallId']) && message['isError'] === true;
-        if (message['isError'] === true && !notRun) unanswered = true;
+        if (message['isError'] === true && !notRun) unanswered = message['toolCallId'];
       } else if (role === 'assistant' && Array.isArray(message['content'])) {
-        unanswered = false;
+        unanswered = null;
         // The SDK runs none of an error or aborted row's calls and answers a length row's itself; every other row's calls count.
         const calls = rowCalls(message['stopReason']);
         if (calls === 'never-run') continue;

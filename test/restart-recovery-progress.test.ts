@@ -3929,12 +3929,13 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     });
   });
   it('A debt first opened while the producer was live is re-planned from the dead turn evidence after the restart pass', async () => {
-    await withDeadScene('pi', 'refused', async (s) => {
+    await withDeadScene('pi', 'quiet', async (s) => {
       // The crash first left a producer whose cessation was unproven (a live pid in its journal):
       // the debt opened then owes the owner ask. Rewriting the journal is the fixture's own move.
       const journal = `${s.file}.producers.jsonl`;
       const deadText = readFileSync(journal, 'utf8');
-      writeFileSync(journal, deadText.replace(`"pid":${String(s.producer.pid)},`, `"pid":${String(process.pid)},`));
+      const liveText = deadText.split(`"pid":${String(s.producer.pid)},`).join(`"pid":${String(process.pid)},`);
+      writeFileSync(journal, liveText);
       expect(inspectDirectiveProducers(s.file, s.identity).map(({ evidence }) => evidence)).toEqual(['unknown']);
       const before = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the crash left the turn unfinished');
       expect(JSON.stringify(before.nextAction)).toContain('ask the owner');
