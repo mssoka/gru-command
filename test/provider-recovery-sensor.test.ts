@@ -717,6 +717,59 @@ describe('disposed waiter retirement (waiter-gone)', () => {
     }
   });
 
+  it('holds a delivered-at-establishment disposed waiter while an active review round owns the lane', async () => {
+    const h = new Harness();
+    h.makeJob('job-delivered-round');
+    h.ledger.setJobStatus('job-delivered-round', 'delivered');
+    h.ledger.registerAgent({ id: 'agent-delivered-round', role: 'minion', jobId: 'job-delivered-round' });
+    const wait = await h.establishMinionWait({
+      jobId: 'job-delivered-round',
+      agentId: 'agent-delivered-round',
+      sessionFile: '/tmp/agent-delivered-round.jsonl',
+    });
+    if (wait === null) throw new Error('fixture: no wait established');
+    expect(wait.jobStatusAtEstablishment).toBe('delivered');
+    h.ledger.setAgentState('agent-delivered-round', 'disposed');
+    h.ledger.addRound({ jobId: 'job-delivered-round', lenses: ['blind'] });
+
+    await h.sensor.tick();
+
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('waiting');
+    expect(statusEvents(h, wait.id)).toEqual([]);
+    expect(h.probe.calls).toEqual([]);
+    expect(h.reArms).toEqual([]);
+    h.sensor.stop();
+  });
+
+  it('keeps probing a blocked-at-establishment wait whose own wall settle explains the block', async () => {
+    const h = new Harness();
+    h.makeJob('job-own-settle');
+    h.ledger.registerAgent({ id: 'agent-own-settle', role: 'minion', jobId: 'job-own-settle' });
+    // The documented dispatch order: the failing turn's minion error lands,
+    // then the job flips blocked. That block is this wait's own settlement.
+    h.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: 'job-own-settle',
+      payload: { agentId: 'agent-own-settle', error: 'runtime error: 429: ...' },
+    });
+    h.ledger.setJobStatus('job-own-settle', 'blocked');
+    const wait = await h.establishMinionWait({
+      jobId: 'job-own-settle',
+      agentId: 'agent-own-settle',
+      sessionFile: '/tmp/agent-own-settle.jsonl',
+    });
+    if (wait === null) throw new Error('fixture: no wait established');
+    expect(wait.jobStatusAtEstablishment).toBe('blocked');
+    h.ledger.setAgentState('agent-own-settle', 'disposed');
+
+    await h.sensor.tick();
+
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('waiting');
+    expect(statusEvents(h, wait.id)).toEqual([]);
+    expect(h.probe.calls).toHaveLength(1);
+    h.sensor.stop();
+  });
+
   it('retires a blocked-at-establishment disposed waiter while idle or errored siblings own no live work', async () => {
     for (const siblingState of ['idle', 'error'] as const) {
       const h = new Harness();
@@ -872,8 +925,10 @@ describe('disposed waiter retirement (waiter-gone)', () => {
       h.ledger.registerAgent({ id: 'agent-writer', role: 'minion', jobId });
       h.ledger.setAgentState('agent-writer', 'disposed');
       if (shape === 'review-only') {
-        const round = h.ledger.addRound({ jobId, lenses: ['blind'] });
-        h.ledger.registerAgent({ id: 'agent-review', role: 'minion', jobId, roundId: round.id });
+        // A review worker is excluded from listImplementerMinions by role;
+        // no round is needed here, so this exercises the live-agent veto
+        // rather than the separate active-round gate.
+        h.ledger.registerAgent({ id: 'agent-review', role: 'perkins', jobId });
       } else {
         h.ledger.registerAgent({
           id: 'agent-child',
@@ -887,9 +942,9 @@ describe('disposed waiter retirement (waiter-gone)', () => {
 
       await h.sensor.tick();
 
-      // A live non-implementer owner (round-bound review session or tracked
-      // child) is still work in the lane: the disposed writer's wait stays
-      // held and is not probed.
+      // A live non-implementer owner (review worker or tracked child) is
+      // still work in the lane: the disposed writer's wait stays held and
+      // is not probed.
       expect(h.ledger.getProviderWait(wait.id)?.status, shape).toBe('waiting');
       expect(statusEvents(h, wait.id), shape).toEqual([]);
       expect(h.probe.calls, shape).toEqual([]);

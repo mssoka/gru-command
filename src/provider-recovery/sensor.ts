@@ -603,6 +603,10 @@ export class ProviderRecoverySensor {
           ? !blockedByOwnWallSettle(this.ledger, { jobId: wait.jobId, agentId: wait.agentId })
           : atEstablishment === 'delivered' || atEstablishment === 'in-review';
       if (establishmentHold) {
+        // An ACTIVE review round owns the lane regardless of the job status
+        // recorded at establishment (a delivered job can carry a pending/live
+        // round): never retire under it.
+        if (this.hasActiveReviewRound(wait.jobId)) return 'hold';
         // A wait whose recorded agent is DISPOSED protects no work when the
         // establishment-status hold is the only thing keeping it from probing:
         // the 2026-10-30T17:59Z wall left those minions gone and the wait only
