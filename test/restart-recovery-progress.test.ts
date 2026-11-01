@@ -25,6 +25,7 @@ import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedD
 import { admitBlindReview, recordBlindAdmission } from '../src/dispatch/blind-review.js';
 import { abandonLiveDirectiveFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
+import { HOST_ABSENT_AT_BOOT } from '../src/supervision/supervisor.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, PromptOptions, SpawnOptions } from '../src/runtime/types.js';
 import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
@@ -3999,6 +4000,49 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       // "unbounded" judgement the service did not make.
       expect(detail).toContain('original native physical owner cessation remains UNKNOWN');
       expect(detail).not.toContain('the dead turn is unbounded');
+    });
+  });
+
+  it('the owner-gated card\'s exit is reachable once the boot settles the dead turn\'s stale row (#547 composes with this)', async () => {
+    // For the families this PR deliberately keeps owner-gated (an `unknown`
+    // producer: a Claude independent controller, a torn producer journal) the
+    // dead turn's `streaming` row is NOT repaired by the reconciliation, and the
+    // card sends the owner to owner-approvals. Since #547 that row is settled to
+    // `error` by `Supervisor.settleHostAbsentTurns()` at boot — every handle-less
+    // `spawning`/`streaming` row a previous process left behind — so the exit the
+    // card offers is reachable. This pins the composition of the two changes; the
+    // boot move is applied exactly as the supervisor applies it.
+    await withDeadScene('pi', 'quiet', async (s) => {
+      s.ledger.setAgentState(s.agentId, 'disposed');
+      recordDirectiveIndependentController(s.producer);
+      surfaceDirectiveRecovery(s.deps, s.requestId, 'producer ownership remains unknown');
+      expect(activeCard(s)?.detail ?? '').toContain('It needs the owner');
+      // 1. As the crash left it: the stale row is `streaming`, no handle is held,
+      //    and the exit the card offers is refused — the blocker this PR records.
+      s.ledger.setAgentState('logical-minion', 'streaming');
+      const attempt = (): unknown => {
+        try {
+          abandonLiveDirectiveFromRoute({
+            ledger: s.ledger, worktrees: s.deps.worktrees, pendingProducerBlockers: () => [], requestId: s.requestId,
+            expected: { jobId: s.jobId, state: 'admitted', payloadHash: s.ledger.getDirective(s.requestId)!.payloadHash },
+            reason: 'the owner accepts the unknown effect residue', by: 'owner',
+          });
+          return null;
+        } catch (error) { return error; }
+      };
+      expect(attempt()).toMatchObject({ code: 'live_work' });
+      expect(s.ledger.getDirective(s.requestId)?.state).toBe('admitted');
+      // 2. The boot settles exactly this row (#547's `settleHostAbsentTurns`), and
+      //    the owner's exit then goes through — the composition this pins.
+      s.ledger.setAgentState('logical-minion', 'error', HOST_ABSENT_AT_BOOT);
+      const abandoned = abandonLiveDirectiveFromRoute({
+        ledger: s.ledger, worktrees: s.deps.worktrees, pendingProducerBlockers: () => [], requestId: s.requestId,
+        expected: { jobId: s.jobId, state: 'admitted', payloadHash: s.ledger.getDirective(s.requestId)!.payloadHash },
+        reason: 'the owner accepts the unknown effect residue', by: 'owner',
+      });
+      expect(abandoned.idempotent).toBe(false);
+      expect(s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-abandoned', s.requestId)?.payload).toMatchObject({ by: 'owner' });
+      expect(s.ledger.getDirective(s.requestId)).toMatchObject({ state: 'failed', abandonedBy: 'owner' });
     });
   });
 
