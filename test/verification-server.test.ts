@@ -133,6 +133,12 @@ async function boot(opts: {
             runTimeoutMs: config.verify.runTimeoutMs,
           },
           now: opts.now,
+          // The injected scheduler must still record the run to the ledger, as
+          // the server-owned one does: #554's retention-window cases assert the
+          // run happened exactly once (verification.started/completed).
+          record: (event) => {
+            ledger.appendCustomEvent({ kind: event.kind, jobId: event.jobId, payload: event.payload });
+          },
         });
   let server = createVerificationServer({
     config,

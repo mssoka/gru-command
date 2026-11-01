@@ -703,7 +703,9 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const sinkPath = join(dir, 'hung.ndjson');
       const code = await runCaptureCli(
         [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-hung', '--url', base, '--token', 't', '--wait-budget-ms', '300'],
-        deps({ stdout: () => {}, responseHeadersTimeoutMs: 150 }),
+        // The wait budget is measured on the injected clock: this case pins
+        // the real elapsed-time bound, so it must see real time.
+        deps({ stdout: () => {}, responseHeadersTimeoutMs: 150, now: () => Date.now() }),
       );
       expect(code).toBe(CAPTURE_EXIT.unknown);
       const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
@@ -1073,7 +1075,8 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const started = Date.now();
       const code = await runCaptureCli(
         [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-a4-abandon', '--url', base, '--token', 't', '--wait-budget-ms', '300'],
-        deps({ stdout: () => {}, responseHeadersTimeoutMs: 60 }),
+        // Real elapsed time: the point of A4 is the wall-clock bound.
+        deps({ stdout: () => {}, responseHeadersTimeoutMs: 60, now: () => Date.now() }),
       );
       // Bounded: the helper exits inside 5 s instead of waiting out 60 s.
       expect(Date.now() - started).toBeLessThan(5_000);
