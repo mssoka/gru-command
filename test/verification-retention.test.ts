@@ -8,6 +8,7 @@ import {
   type VerificationProgress,
   type VerificationRecord,
 } from '../src/verify/scheduler.js';
+import { RETAINED_OUTPUT_PER_RUN_MAX_BYTES } from '../src/verify/output-retention.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
@@ -243,7 +244,14 @@ describe('retained-output replay (issue #554)', () => {
     );
     expect(keptReplay.runId).toBe(kept);
     expect(replayedMarker(keptFrames[keptFrames.length - 1])).toBe('incomplete');
-    expect(Buffer.byteLength(outputText(keptFrames))).toBe(8 * 1024 * 1024);
+    // The cap is enforced at a FRAME boundary, and a frame is whatever the OS
+    // pipe handed the runner (at most `OUTPUT_FRAME_MAX_BYTES`), so the retained
+    // prefix ends within one frame below the cap. Asserting an exact 8 MiB here
+    // made this test depend on chunking: it passes on an idle host and fails on
+    // a loaded CI runner by exactly one frame.
+    const keptBytes = Buffer.byteLength(outputText(keptFrames));
+    expect(keptBytes).toBeLessThanOrEqual(RETAINED_OUTPUT_PER_RUN_MAX_BYTES);
+    expect(RETAINED_OUTPUT_PER_RUN_MAX_BYTES - keptBytes).toBeLessThanOrEqual(8 * 1024);
     await scheduler.dispose();
   });
 
