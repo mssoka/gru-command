@@ -4077,7 +4077,7 @@ async function expectChatTurnSurvivedProviderWindow(
   expect(notices[0]).toMatchObject({ routing: 'action-required', severity: 'error', agentId: handle.id });
   // The owner-facing row must state the non-stop truth it exists to carry.
   expect(notices[0]?.title).toContain('stayed up');
-  expect(notices[0]?.detail ?? '').toContain('temporary provider usage window');
+  expect(notices[0]?.detail ?? '').toContain('temporary provider usage limit');
   expect(h.api.findNotificationByKind(noticeKind, 'unacked')?.id).toBe(notices[0]!.id);
   // `canWakeGru` reads this: a closed breaker and proven custody.
   expect(slot.canReplace()).toBe(true);
@@ -4118,6 +4118,10 @@ it('a typed temporary usage window settles the gru chat turn in place instead of
     const after = h.notificationsOfKind(`supervision.provider-window.${rig.handle.id}.quota_wall`);
     expect(after).toHaveLength(1);
     expect(after[0]?.id).toBe(notice.id);
+    // ...and the window is recorded ONCE: the adapter's second frame for the
+    // same failure must not append a second durable event (or a second log
+    // line) beside the one the open card stands for.
+    expect(eventsOfKind(h, 'supervision.provider-window')).toHaveLength(1);
     expect(h.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
     expect(rig.handle.disposed).toBe(false);
   } finally {

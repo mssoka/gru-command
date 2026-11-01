@@ -2070,38 +2070,50 @@ export class Supervisor {
     // failed prompt through recoverInterruptedTurn and duplicate the user's
     // message.
     agent.pendingRecovery = null;
-    this.recordEvent('supervision.provider-window', agent.agentId, {
-      class: failureClass,
-      role: agent.role,
-      provider: source?.provider ?? null,
-      model: source?.model ?? null,
-      status: source?.typed?.status ?? null,
-      body_code: source?.typed?.bodyCode ?? null,
-      retry_after_ms: source?.typed?.retryAfterMs ?? null,
-      had_open_turn: hadOpenTurn,
-    });
-    this.log('warn', 'temporary provider usage window — chat turn settled in place, agent stays up', {
-      agent_id: agent.agentId,
-      class: failureClass,
-      provider: source?.provider ?? null,
-      model: source?.model ?? null,
-      retry_after_ms: source?.typed?.retryAfterMs ?? null,
-      had_open_turn: hadOpenTurn,
-    });
+    // A NEW kind, never `supervision.provider-wall.*`: that kind is the
+    // durable-stop fallback control the boot lookup binds and the sensor
+    // hand-back keys on. `unacked` reuses the open row while the same window
+    // keeps rejecting turns.
+    const windowKind = `supervision.provider-window.${agent.agentId}.${failureClass}`;
+    // ONE ledger event and one warn log per WINDOW, not per failing frame: the
+    // adapter reports the same failure twice (an error frame plus its sticky
+    // state), and a repeated window reuses the open card below. The open card
+    // is the durable window tick, so the second frame of a window — and a
+    // restart inside it — records nothing new, while a window whose card was
+    // acknowledged records again on its next failure.
+    const firstFrameOfWindow = this.ledger.findNotificationByKind(windowKind, 'unacked') === null;
+    if (firstFrameOfWindow) {
+      this.recordEvent('supervision.provider-window', agent.agentId, {
+        class: failureClass,
+        role: agent.role,
+        provider: source?.provider ?? null,
+        model: source?.model ?? null,
+        status: source?.typed?.status ?? null,
+        body_code: source?.typed?.bodyCode ?? null,
+        retry_after_ms: source?.typed?.retryAfterMs ?? null,
+        had_open_turn: hadOpenTurn,
+      });
+      this.log('warn', 'temporary provider usage window — chat turn settled in place, agent stays up', {
+        agent_id: agent.agentId,
+        class: failureClass,
+        provider: source?.provider ?? null,
+        model: source?.model ?? null,
+        retry_after_ms: source?.typed?.retryAfterMs ?? null,
+        had_open_turn: hadOpenTurn,
+      });
+    }
     try {
-      // A NEW kind, never `supervision.provider-wall.*`: that kind is the
-      // durable-stop fallback control the boot lookup binds and the sensor
-      // hand-back keys on. `unacked` reuses the open row while the same
-      // window keeps rejecting turns.
       this.notifications.postIncident({
-        kind: `supervision.provider-window.${agent.agentId}.${failureClass}`,
+        kind: windowKind,
         routing: 'action-required',
         severity: 'error',
-        title: `Agent ${agent.agentId}: the provider usage window rejected a chat turn — the agent stayed up`,
+        title: `Agent ${agent.agentId}: a temporary provider limit rejected a chat turn — the agent stayed up`,
         detail:
-          'The chat turn failed on a temporary provider usage window (not a stop). ' +
-          'The agent and its session stayed up; no restart, breaker or re-arm was scheduled. ' +
-          'Send a new message once the window reopens.',
+          'A chat message was refused by a temporary provider usage limit; this is not a stop. ' +
+          'The agent and its session stayed up — no restart, breaker or re-arm was scheduled. ' +
+          (source?.typed?.retryAfterMs != null
+            ? `The provider asked to wait ${String(Math.ceil(source.typed.retryAfterMs / 1000))} s more: send the next message after that.`
+            : 'Send your next message once the limit clears.'),
         agentId: agent.agentId,
         dedupe: 'unacked',
       });

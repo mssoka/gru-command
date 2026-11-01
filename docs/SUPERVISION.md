@@ -375,7 +375,10 @@ replay, no restart or re-arm is scheduled, and the wall stays VISIBLE as ONE
 (`supervision.provider-window.<agent>.quota_wall`, deduplicated while unacked)
 saying the turn failed on the window and the agent stayed up. One ledger event,
 `supervision.provider-window`, records `{class, role, provider, model, status,
-body_code, retry_after_ms, had_open_turn}`. It is not a durable stop (the boot
+body_code, retry_after_ms, had_open_turn}` once per WINDOW (the open card is the
+window's durable tick, so the adapter's second frame for one failure, or a
+restart inside the window, adds neither an event nor a log line), and the row
+states the wait the provider asked for when its evidence carries one. It is not a durable stop (the boot
 lookup and the sensor hand-back key on `supervision.provider-wall.*` only), and
 the chat slot keeps serving the next message. Every other role and every
 ineligible wall — 401, 402, 403, billing `1113`, prose-only quota text with no
