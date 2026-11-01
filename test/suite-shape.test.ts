@@ -393,7 +393,7 @@ const PINS: Record<string, number> = {
   'specialist-dispose-bounded.test.ts': 2,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 6,
+  'suite-shape.test.ts': 7,
   'supervisor.test.ts': 243,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 19,
@@ -441,7 +441,7 @@ const PINS: Record<string, number> = {
 };
 
 describe('suite shape', () => {
-  it('runs the full PR gate on the default merge-result checkout', () => {
+  it('runs every gate phase on the default merge-result checkout', () => {
     const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
     // The gate still runs on the default merge-result checkout — checkout@v6
     // with the full history as its ONLY option (so no `ref:`/head-sha
@@ -451,7 +451,50 @@ describe('suite shape', () => {
     // checkout, which a shallow fetch leaves absent.
     expect(workflow).toMatch(/- uses: actions\/checkout@v6\n\s+with:\n\s+fetch-depth: 0\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
-    expect(workflow).toContain('run: npm test');
+    // `npm test` is the single definition of green and stays that way; CI runs
+    // each of its phases directly so the heavy, worker-capped phase can be
+    // spread over runners. Every phase is unconditional — no path filter, no
+    // label, no event-type branch — so a pull request and a push to main get
+    // identical coverage.
+    expect(workflow).toContain('run: npm run test:backend -- --shard=');
+    expect(workflow).toContain('run: npm run test:backend:heavy -- --shard=');
+    expect(workflow).toContain('run: npm run test:web');
+    expect(workflow).toContain('run: npm run lint');
+    expect(workflow).toContain('run: npm run typecheck');
+    expect(workflow).toContain('run: npm run build');
+    expect(workflow).toContain('run: npx playwright test --ignore-snapshots --shard=');
+    // `main` is never cancelled: each landed commit gets its own verdict.
+    expect(workflow).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/u);
+  });
+
+  it('welds every shard matrix to the shard denominator it runs, with no gap and no duplicate', () => {
+    // The shard count appears twice per phase — as the matrix, and as the
+    // `--shard=<index>/<count>` denominator — and a mismatch silently drops
+    // test files from the gate (the matrix runs 1..N while the denominator
+    // says M). Read both from the workflow, demand they agree, and demand the
+    // index set is exactly 1..N.
+    const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
+    const sharded = [
+      /npm run test:backend -- --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
+      /npm run test:backend:heavy -- --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
+      /npx playwright test --ignore-snapshots --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
+    ];
+    const matrices = [...workflow.matchAll(/shard: \[([0-9, ]+)\]/gu)]
+      .map((match) => (match[1] ?? '').split(',').map((value) => Number(value.trim())));
+    expect(matrices, 'one shard matrix per sharded phase').toHaveLength(sharded.length);
+    sharded.forEach((pattern, index) => {
+      const denominator = Number(pattern.exec(workflow)?.[1]);
+      const shards = matrices[index]!;
+      expect(denominator, 'the run command declares its denominator').toBe(shards.length);
+      expect(shards, 'the matrix tiles 1..N with no gap and no duplicate').toEqual(
+        Array.from({ length: shards.length }, (_unused, offset) => offset + 1),
+      );
+    });
+    // Nothing but the failure-artifact upload may be conditional: a gated shard
+    // is a silently skipped slice of the suite.
+    expect([...workflow.matchAll(/^ +if: (.*)$/gmu)].map((match) => match[1]!.trim())).toEqual([
+      "always() && (steps.browser-e2e.outcome == 'failure' || steps.browser-e2e.outcome == 'cancelled')",
+    ]);
   });
 
   it('the cockpit scopes replace the retired slim-strip ones', () => {
