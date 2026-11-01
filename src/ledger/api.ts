@@ -8,7 +8,7 @@ import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifes
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
 import { newLaneToken } from '../worktrees/lane-provenance.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
-import { readGitState } from '../verify/scheduler.js';
+import { groupAlive, pidAlive, readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
@@ -10467,15 +10467,25 @@ export class LedgerApi {
     }
     // #464: a swept lane runs nothing; a row it left `live` (recorded
     // before sweeps moved them to `exited`) never fences a writer.
-    const liveProcesses = this.db
+    // A `registry` row is the orchestrator's own spawned service: the
+    // scheduler records it at spawn and `onSettled` settles it, so a live
+    // registry row whose pid and detached process group are gone is stale
+    // bookkeeping a restart left behind — it never fences. A surviving group
+    // member still runs in the lane even when its leader exited, which is
+    // exactly the state `reconcileVerificationProcesses` refuses to close.
+    // Rows observed by cwd/argv/lane-token keep their meaning: something is
+    // (or was) rooted in the tree even when its pid cannot be probed here.
+    const liveProcesses = (this.db
       .prepare(
-        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
+        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid, p.evidence AS evidence
            FROM worktree_processes p
            JOIN worktrees w ON w.id = p.worktree_id
           WHERE p.state = 'live' AND w.status <> 'swept' AND (w.job_id = ? OR p.worktree_id = ?)
           ORDER BY p.worktree_id, p.pid`,
       )
-      .all(row.jobId, laneId) as Row[];
+      .all(row.jobId, laneId) as Row[])
+      .filter((proc) => str(proc.evidence) !== 'registry' ||
+        pidAlive(Number(proc.pid)) || groupAlive(Number(proc.pid)));
     if (liveProcesses.length > 0) {
       live(
         `live lane process(es): ${liveProcesses

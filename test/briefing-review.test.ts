@@ -10,10 +10,12 @@ import {
   BRIEFING_REVIEW_REFUSED,
   BRIEFING_REVIEW_VERDICT,
   readArmed,
+  type ArmedReview,
 } from '../src/briefing-review/events.js';
 import {
   briefingMarkers,
   briefingReviewIdentity,
+  briefingSha256Of,
   BriefingReviewError,
   lensJobId,
   reviewedBriefing,
@@ -21,6 +23,7 @@ import {
   type BriefingReviewStage,
   type BriefingReviewTier,
 } from '../src/briefing-review/types.js';
+import { briefingReviewGate } from '../src/briefing-review/gate.js';
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -131,12 +134,11 @@ function armedOf(h: Harness): { reviewId: string; briefingSha256: string; lenses
 
 /** What a lens submits: its own job id, the review's sha and evidence quoted
  * from the marked briefing. */
-function result(h: Harness, input: {
+function resultFor(h: Harness, armed: { readonly reviewId: string; readonly briefingSha256: string }, input: {
   readonly lens: string;
   readonly findings?: readonly BriefingReviewFinding[];
   readonly verdict?: 'READY' | 'CHANGES-NEEDED';
 }) {
-  const armed = armedOf(h);
   // The wire carries snake_case finding fields; the service reads them into
   // the internal camelCase shape.
   const findings = (input.findings ?? []).map((finding) => ({
@@ -153,6 +155,24 @@ function result(h: Harness, input: {
     verdict: input.verdict ?? (findings.some((finding) => finding.severity === 'blocking') ? 'CHANGES-NEEDED' : 'READY'),
     findings,
   };
+}
+
+function result(h: Harness, input: {
+  readonly lens: string;
+  readonly findings?: readonly BriefingReviewFinding[];
+  readonly verdict?: 'READY' | 'CHANGES-NEEDED';
+}) {
+  return resultFor(h, armedOf(h), input);
+}
+
+function armedByRound(h: Harness, round: number): { readonly reviewId: string; readonly briefingSha256: string } {
+  const armed = h.ledger
+    .listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] })
+    .map((event) => readArmed(event))
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+    .find((entry) => entry.round === round);
+  if (armed === undefined) throw new Error(`no armed review for round ${String(round)}`);
+  return armed;
 }
 
 /** A finding as the wire carries it (snake_case, exactly four fields). */
@@ -173,6 +193,62 @@ const advisory: BriefingReviewFinding = {
   evidence: 'one test adds a refund then reads it back',
   whyItBlocks: 'one case only; an ordering bug would not fail it',
 };
+
+/** Assertions normalise message whitespace first, so a wrapped line can
+ * neither pass a negative check nor hide a phrase. */
+const normalise = (value: string): string => value.replace(/\s+/gu, ' ');
+
+/** The pre-cap route keeps its re-commission branch and never claims the cap. */
+function expectOrdinaryPushbackGuidance(message: string): void {
+  expect(message).toContain('re-commission at this tier');
+  expect(message).toContain('push-back');
+  expect(message).not.toContain('POST /api/dispatch/amendment');
+  expect(message).not.toContain('round cap');
+  expect(message).not.toMatch(/escalat/iu);
+  expect(message).not.toMatch(/needs-owner/iu);
+}
+
+/** The cap route names the exact push-back / dispatch / amendment sequence. */
+function expectCapGuidance(message: string): void {
+  expect(message).toContain('round cap');
+  expect(message).toContain('push-back');
+  expect(message).toContain('POST /api/briefing-review/pushback');
+  expect(message).toContain('dispatch that exact text');
+  expect(message).toContain('without a briefing_review block');
+  expect(message).toContain('immediately append');
+  expect(message).toContain('POST /api/dispatch/amendment');
+  expect(message).toContain('journal j-1200');
+  expect(message).not.toContain('re-commission at this tier');
+  expect(message).not.toMatch(/POST \/api\/briefing-review(?!\/pushback)/u);
+  expect(message).not.toMatch(/escalat/iu);
+  expect(message).not.toMatch(/needs-owner/iu);
+  // Order matters: push back, dispatch the exact text, then amend it.
+  expect(message.indexOf('push-back')).toBeLessThan(message.indexOf('dispatch that exact text'));
+  expect(message.indexOf('dispatch that exact text')).toBeLessThan(message.indexOf('POST /api/dispatch/amendment'));
+}
+
+/** Capture a refusal (a passing call breaks the test rather than reading as
+ * an absent message). */
+function refusalOf(action: () => unknown): unknown {
+  try {
+    action();
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected a refusal');
+}
+
+const refusalMessage = (error: unknown): string => normalise((error as Error).message);
+
+/** The async form for service calls that reject instead of throwing. */
+async function asyncRefusalOf(action: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await action();
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected a refusal');
+}
 
 describe('Nefario briefing review — commission and identity', () => {
   it('arms one review and dispatches one read-only lens job per lens, carrying the verbatim briefing, its own helper section and the result contract', async () => {
@@ -432,7 +508,10 @@ describe('Nefario briefing review — evidence-bound results', () => {
     const [notice] = [...h.notices.values()];
     expect(notice).toMatchObject({ kind: BRIEFING_REVIEW_NOTIFICATION_KIND, routing: 'action-required', severity: 'error' });
     expect(String(notice!['title'])).toContain('CHANGES-NEEDED');
-    expect(String(notice!['detail'])).toContain('POST /api/notifications/needs-owner');
+    // The routed guidance is the ordinary push-back route, never the cap
+    // route and never an owner escalation. This inverts the pre-ruling
+    // assertion that required the needs-owner URL.
+    expectOrdinaryPushbackGuidance(normalise(String(notice!['detail'])));
   });
 
   it('all lenses READY is one decisive verdict whose caught count is the blocking findings of the superseded round', async () => {
@@ -449,6 +528,8 @@ describe('Nefario briefing review — evidence-bound results', () => {
     expect(ready).toMatchObject({ decisive: true, aggregate: 'READY' });
     // Three lenses of the superseded round each reported one blocking finding.
     expect(ready.caught).toBe(3);
+    const readyNotice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expect(readyNotice).toContain('Dispatch the reviewed text with its briefing_review block');
     const decisive = h.ledger
       .listEventsAfter(0, { kinds: [BRIEFING_REVIEW_VERDICT] })
       .map((event) => event.payload as { readonly decisive?: boolean; readonly caught?: number; readonly chain_key?: string })
@@ -500,7 +581,7 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
     })).toThrow(expect.objectContaining({ code: 'briefing_review_already_ready', status: 409 }));
   });
 
-  it('caps a chain at three trailing CHANGES-NEEDED rounds with an owner-escalation instruction, still converges an exact re-commission, and resets on READY', async () => {
+  it('caps a chain at three trailing CHANGES-NEEDED rounds, names the push-back/dispatch/amendment path, still converges an exact re-commission, and resets on READY', async () => {
     const h = harness();
     const revision = (n: number): string => `${BRIEFING}\n- Revision ${String(n)} settles the empty-history case.`;
     // Rounds 1 and 2 reach CHANGES-NEEDED; round 3 reaches READY, which ends
@@ -520,17 +601,95 @@ describe('Nefario briefing review — push-back and the bounded loop', () => {
       h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
     }
     const capped = commission(h, { briefing: revision(7) });
-    await expect(h.service.commission(capped)).rejects.toMatchObject({ code: 'briefing_review_round_cap', status: 409 });
-    await expect(h.service.commission(capped)).rejects.toThrow(/POST \/api\/notifications\/needs-owner/u);
-    await expect(h.service.commission(capped)).rejects.toThrow(/scope-design/u);
+    const capRefusal = await asyncRefusalOf(() => h.service.commission(capped));
+    expect(capRefusal).toMatchObject({ code: 'briefing_review_round_cap', status: 409 });
+    const cappedMessage = refusalMessage(capRefusal);
+    expectCapGuidance(cappedMessage);
+    const sixth = readArmed(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] }).at(-1)!)!;
+    // The refusal names the chain tail's round, review and exact sha.
+    expect(cappedMessage).toContain(`round 6 (review ${sixth.reviewId}, briefing sha256 ${sixth.briefingSha256})`);
+    // The third trailing round's decisive notification must already name the
+    // cap path; re-commissioning there is refused.
+    const capNotice = [...h.notices.values()].at(-1);
+    expectCapGuidance(normalise(String(capNotice!['detail'])));
     // The refused revision created nothing; an exact re-commission of the
     // decided sixth round still converges.
     expect(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] })).toHaveLength(6);
-    const sixth = readArmed(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_ARMED] }).at(-1)!)!;
     await expect(h.service.commission(commission(h, { briefing: revision(6) }))).resolves.toMatchObject({
       status: 200,
       body: { reviewId: sixth.reviewId, round: 6 },
     });
+    // The advertised route works: push back the tail, then dispatch the exact
+    // text without the provenance block.
+    expect(h.service.pushback({
+      repoPath: h.repo.path,
+      briefingSha256: sixth.briefingSha256,
+      reason: 'owner ruling j-1200 cap path',
+      by: 'gru',
+    })).toMatchObject({ generation: 1, by: 'gru' });
+    expect(h.service.admitDispatch({
+      jobId: 'job-cap-pushback',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revision(6),
+      requested: undefined,
+    })).toMatchObject({ verdict: 'PUSHED-BACK', round: 6 });
+  });
+
+  it('announces the cap when an out-of-order older result completes the trailing run', async () => {
+    const h = harness();
+    const revision = (n: number): string => `${BRIEFING}\n- Revision ${String(n)} settles the empty-history case.`;
+    // Arm three revisions while every head is still pending, then decide them
+    // newest-first: the oldest result is the one that crosses the cap.
+    for (const round of [1, 2, 3]) {
+      await h.service.commission(commission(h, { briefing: round === 1 ? BRIEFING : revision(round) }));
+    }
+    for (const round of [3, 2]) {
+      h.service.submitResult(resultFor(h, armedByRound(h, round), { lens: 'stranger', findings: [blocking()] }));
+      expect(normalise(String([...h.notices.values()].at(-1)!['detail']))).not.toContain('round cap');
+    }
+    const newest = armedByRound(h, 3);
+    h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
+    const finalNotice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expectCapGuidance(finalNotice);
+    // The cap belongs to the chain's newest text, not to the late round-1 row.
+    expect(finalNotice).toContain(`last reviewed text is round 3 (review ${newest.reviewId}, briefing sha256 ${newest.briefingSha256})`);
+    expect(finalNotice).not.toContain('Last reviewed text:');
+  });
+
+  it('does not call a still-pending newest review the last reviewed text', async () => {
+    const h = harness();
+    await h.service.commission(commission(h));
+    await h.service.commission(commission(h, { briefing: `${BRIEFING}\n- A later revision is still under review.` }));
+    h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
+    const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expect(notice).not.toMatch(/last reviewed text/iu);
+    expect(notice).not.toContain('is READY');
+    expect(notice).toContain('re-commission at this tier');
+  });
+
+  it('a late older CHANGES-NEEDED result routes to the READY chain tail', async () => {
+    const h = harness();
+    const readyText = `${BRIEFING}\n- The revision the owner approved.`;
+    await h.service.commission(commission(h));
+    await h.service.commission(commission(h, { briefing: readyText }));
+    const readyReview = armedByRound(h, 2);
+    h.service.submitResult(resultFor(h, readyReview, { lens: 'stranger' }));
+    h.service.submitResult(resultFor(h, armedByRound(h, 1), { lens: 'stranger', findings: [blocking()] }));
+    const notice = normalise(String([...h.notices.values()].at(-1)!['detail']));
+    expect(notice).toContain('is READY');
+    expect(notice).toContain(`review ${readyReview.reviewId}`);
+    expect(notice).toContain(readyReview.briefingSha256);
+    expect(notice).toContain('dispatch that reviewed text with its briefing_review provenance');
+    expect(notice).not.toContain('re-commission at this tier');
+    // The advertised route itself admits the READY text with its block.
+    expect(h.service.admitDispatch({
+      jobId: 'job-late-ready',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: readyText,
+      requested: { rounds: 2, verdict: 'READY', briefingSha256: readyReview.briefingSha256 },
+    })).toMatchObject({ verdict: 'READY', round: 2 });
   });
 });
 
@@ -632,22 +791,204 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     });
     expect(attempt).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
     h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
-    expect(attempt).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    const notReady = refusalOf(attempt);
+    expect(notReady).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    // The no-block branch names the ordinary push-back path, never the cap
+    // route and never an escalation.
+    expectOrdinaryPushbackGuidance(refusalMessage(notReady));
     // A revised briefing is a new sha: the older round does not cover it.
     const revised = `${BRIEFING}\n- The empty history returns an empty array.`;
-    expect(() => h.service.admitDispatch({
+    const required = refusalOf(() => h.service.admitDispatch({
       jobId: 'job-9',
       repoPath: h.repo.path,
       title: 'Refunds endpoint',
       briefing: revised,
       requested: undefined,
-    })).toThrow(expect.objectContaining({ code: 'briefing_review_required', status: 409 }));
+    }));
+    expect(required).toMatchObject({ code: 'briefing_review_required', status: 409 });
+    expect(refusalMessage(required)).toContain('commission POST /api/briefing-review');
+    expect(refusalMessage(required)).not.toContain('round cap');
+    expect(refusalMessage(required)).not.toContain('POST /api/dispatch/amendment');
     const refusals = h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_REFUSED] });
     expect(refusals.map((event) => (event.payload as { readonly reason?: string }).reason)).toEqual(['pending', 'changes-needed', 'missing']);
     expect(refusals[0]!.payload).toMatchObject({ job_id: 'job-9', tier: 'high' });
     expect(refusals[2]!.payload).toMatchObject({ repo_path: h.repo.path, title: 'Refunds endpoint', job_id: 'job-9', tier: 'high' });
     // A build that never reached the service leaves no job row behind.
     expect(h.ledger.getJob('job-9')).toBeNull();
+    // Below the cap the unknown branch keeps the ordinary commission route.
+    const unknown = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-9',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revised,
+      requested: { rounds: 2, verdict: 'CHANGES-NEEDED', briefingSha256: briefingSha256Of(revised) },
+    }));
+    expect(unknown).toMatchObject({ code: 'briefing_review_unknown', status: 409 });
+    expect(refusalMessage(unknown)).toContain('commission one with POST /api/briefing-review');
+    expect(refusalMessage(unknown)).not.toContain('round cap');
+    expect(refusalMessage(unknown)).not.toContain('POST /api/dispatch/amendment');
+  });
+
+  it('a matching CHANGES-NEEDED block on an enforced tier names the push-back path, never an owner escalation', async () => {
+    // The supplied-block `briefing_review_not_ready` branch is separate from
+    // the no-block branch: only a caller that carries the block reaches it, so
+    // it needs its own dispatch test.
+    const h = harness({ stage: 3 });
+    await h.service.commission(commission(h, { tier: 'medium' }));
+    const armed = armedOf(h);
+    h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
+    const refusal = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-block-changes',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: BRIEFING,
+      requested: { rounds: 1, verdict: 'CHANGES-NEEDED', briefingSha256: armed.briefingSha256 },
+    }));
+    expect(refusal).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectOrdinaryPushbackGuidance(refusalMessage(refusal));
+  });
+
+  it('a capped chain routes every gate refusal to the push-back/dispatch/amendment path', async () => {
+    // The gate has four routing branches (not_ready with and without a block,
+    // required, unknown). At the cap none of them may send the caller to a
+    // re-commission the service refuses.
+    const h = harness({ stage: 3 });
+    const revision = (n: number): string => `${BRIEFING}\n- Revision ${String(n)} settles the empty-history case.`;
+    for (const round of [1, 2, 3]) {
+      await h.service.commission(commission(h, { tier: 'medium', briefing: round === 1 ? BRIEFING : revision(round) }));
+      h.service.submitResult(result(h, { lens: 'stranger', findings: [blocking()] }));
+      if (round === 2) {
+        // One below the cap the gate still gives the ordinary route.
+        const below = refusalOf(() => h.service.admitDispatch({
+          jobId: 'job-below-cap',
+          repoPath: h.repo.path,
+          title: 'Refunds endpoint',
+          briefing: revision(2),
+          requested: undefined,
+        }));
+        expect(below).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+        expectOrdinaryPushbackGuidance(refusalMessage(below));
+      }
+    }
+    const last = armedOf(h);
+    const lastText = revision(3);
+    const noBlock = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-cap-no-block',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: lastText,
+      requested: undefined,
+    }));
+    expect(noBlock).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectCapGuidance(refusalMessage(noBlock));
+    expect(refusalMessage(noBlock)).toContain(`round 3 (review ${last.reviewId}, briefing sha256 ${last.briefingSha256})`);
+
+    const withBlock = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-cap-block',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: lastText,
+      requested: { rounds: 3, verdict: 'CHANGES-NEEDED', briefingSha256: last.briefingSha256 },
+    }));
+    expect(withBlock).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectCapGuidance(refusalMessage(withBlock));
+    expect(refusalMessage(withBlock)).toContain(`round 3 (review ${last.reviewId}, briefing sha256 ${last.briefingSha256})`);
+
+    const revised = revision(4);
+    const required = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-cap-required',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revised,
+      requested: undefined,
+    }));
+    expect(required).toMatchObject({ code: 'briefing_review_required', status: 409 });
+    expectCapGuidance(refusalMessage(required));
+
+    const unknown = refusalOf(() => h.service.admitDispatch({
+      jobId: 'job-cap-unknown',
+      repoPath: h.repo.path,
+      title: 'Refunds endpoint',
+      briefing: revised,
+      requested: { rounds: 4, verdict: 'CHANGES-NEEDED', briefingSha256: briefingSha256Of(revised) },
+    }));
+    expect(unknown).toMatchObject({ code: 'briefing_review_unknown', status: 409 });
+    expectCapGuidance(refusalMessage(unknown));
+  });
+
+  it('a mixed-tier capped chain names the chain tail, never an older enforced READY review', () => {
+    const sha = (char: string): string => char.repeat(64);
+    const chain = [
+      { reviewId: 'review-r1', tier: 'medium', round: 1, verdict: 'READY', briefingSha256: sha('a') },
+      { reviewId: 'review-r2', tier: 'low', round: 2, verdict: 'CHANGES-NEEDED', briefingSha256: sha('b') },
+      { reviewId: 'review-r3', tier: 'low', round: 3, verdict: 'CHANGES-NEEDED', briefingSha256: sha('c') },
+      { reviewId: 'review-r4', tier: 'low', round: 4, verdict: 'CHANGES-NEEDED', briefingSha256: sha('d') },
+    ] as const;
+    const briefing = 'A revised briefing has no review of its own.';
+    const base = {
+      stage: 3 as const,
+      briefing,
+      repoPath: '/repo',
+      title: 'Refunds endpoint',
+      jobId: 'job-mixed-cap',
+      exact: null,
+      exactVerdict: null,
+      exactPushback: null,
+      chain,
+    };
+    const required = briefingReviewGate({ ...base, requested: undefined });
+    expect(required.admitted).toBe(false);
+    if (required.admitted) throw new Error('expected a refusal');
+    const requiredMessage = normalise(required.error.message);
+    expect(requiredMessage).toContain('review review-r4');
+    expect(requiredMessage).toContain(sha('d'));
+    expect(requiredMessage).not.toContain('review-r1');
+    expectCapGuidance(requiredMessage);
+
+    const unknown = briefingReviewGate({
+      ...base,
+      requested: { rounds: 4, verdict: 'CHANGES-NEEDED', briefingSha256: briefingSha256Of(briefing) },
+    });
+    expect(unknown.admitted).toBe(false);
+    if (unknown.admitted) throw new Error('expected a refusal');
+    const unknownMessage = normalise(unknown.error.message);
+    expect(unknownMessage).toContain('review review-r4');
+    expect(unknownMessage).toContain(sha('d'));
+    expectCapGuidance(unknownMessage);
+
+    // The not-ready branch can name an older enforced review when a newer
+    // advisory review is the chain tail; the cap action must still target the
+    // tail.
+    const mixed = [
+      { reviewId: 'review-r1', tier: 'medium', round: 1, verdict: 'CHANGES-NEEDED', briefingSha256: sha('a') },
+      { reviewId: 'review-r2', tier: 'low', round: 2, verdict: 'CHANGES-NEEDED', briefingSha256: sha('b') },
+      { reviewId: 'review-r3', tier: 'low', round: 3, verdict: 'CHANGES-NEEDED', briefingSha256: sha('c') },
+      { reviewId: 'review-r4', tier: 'low', round: 4, verdict: 'CHANGES-NEEDED', briefingSha256: sha('d') },
+    ] as const;
+    const exact: ArmedReview = {
+      reviewId: 'review-r1',
+      commissionKey: 'commission',
+      chainKey: 'chain',
+      briefingSha256: sha('a'),
+      repoPath: '/repo',
+      title: 'Refunds endpoint',
+      tier: 'medium',
+      justification: 'test',
+      round: 1,
+      generation: 1,
+      lenses: ['stranger'],
+      headSha: null,
+      upgradedFrom: null,
+      seq: 1,
+      ts: '2026-01-01T00:00:00.000Z',
+    };
+    const notReady = briefingReviewGate({ ...base, exact, exactVerdict: 'CHANGES-NEEDED', requested: undefined, chain: mixed });
+    expect(notReady.admitted).toBe(false);
+    if (notReady.admitted) throw new Error('expected a refusal');
+    const notReadyMessage = normalise(notReady.error.message);
+    expect(notReadyMessage).toContain('last reviewed text is round 4 (review review-r4');
+    expect(notReadyMessage).not.toContain('last reviewed text is round 1');
+    expectCapGuidance(notReadyMessage);
   });
 
   it('stage 3 enforces medium as well as high; low stays advisory, and stage 2 leaves medium advisory', async () => {
@@ -683,13 +1024,15 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
       requested: undefined,
     })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
     s3.service.submitResult(result(s3, { lens: 'stranger', findings: [blocking()] }));
-    expect(() => s3.service.admitDispatch({
+    const mediumNotReady = refusalOf(() => s3.service.admitDispatch({
       jobId: 'job-medium-s3',
       repoPath: s3.repo.path,
       title: 'Refunds endpoint',
       briefing: BRIEFING,
       requested: undefined,
-    })).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    }));
+    expect(mediumNotReady).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectOrdinaryPushbackGuidance(refusalMessage(mediumNotReady));
     expect(s3.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_REFUSED] })[0]!.payload).toMatchObject({ tier: 'medium', reason: 'pending' });
 
     // Low is advisory even at stage 3: a pending low review never holds a dispatch.
@@ -716,13 +1059,15 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
       requested: undefined,
     })).toThrow(expect.objectContaining({ code: 'briefing_review_pending', status: 409 }));
     high.service.submitResult(result(high, { lens: 'stranger', findings: [blocking()] }));
-    expect(() => high.service.admitDispatch({
+    const highNotReady = refusalOf(() => high.service.admitDispatch({
       jobId: 'job-high-s3',
       repoPath: high.repo.path,
       title: 'Refunds endpoint',
       briefing: BRIEFING,
       requested: undefined,
-    })).toThrow(expect.objectContaining({ code: 'briefing_review_not_ready', status: 409 }));
+    }));
+    expect(highNotReady).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
+    expectOrdinaryPushbackGuidance(refusalMessage(highNotReady));
 
     // Stage 3 medium: a revised briefing under the reviewed chain is refused
     // as required (with the medium tier on the refusal event), not admitted.
@@ -777,6 +1122,7 @@ describe('Nefario briefing review — the staged dispatch gate', () => {
     }
     expect(refusal).toMatchObject({ code: 'briefing_review_not_ready', status: 409 });
     expect((refusal as Error).message).toContain('auto-by-tier');
+    expectOrdinaryPushbackGuidance(refusalMessage(refusal));
 
     const low = harness({ stage: 'auto' });
     await low.service.commission(commission(low, { tier: 'low' }));
