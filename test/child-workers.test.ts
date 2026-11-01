@@ -735,6 +735,33 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(h.worktrees.getWorktree(admission.record.id)).toBeNull();
     expect(floor.view()).toEqual([]);
     expect(h.spawns).toHaveLength(0);
+    // No session ever existed: the agent row written `spawning` at admission
+    // does not stay an open worker turn (#547).
+    expect(h.ledger.getAgent(admission.record.id)?.state).toBe('disposed');
+    floor.stop();
+    h.close();
+  });
+
+  it('a child whose parent is no longer usable ends before any session and leaves its agent row out of the live states (#547)', async () => {
+    let free = 6 * GIB;
+    const floor = new DiskFloorGate({ floorGb: 10, volumes: [{ name: 'lanes', path: tmpdir() }], statfs: async () => ({ freeBytes: free, totalBytes: 500 * GIB }), device: async () => 'disk', pollMs: 60_000 });
+    const h = makeHarness({ diskFloor: floor });
+    const admission = h.request({ authority: 'writer', idempotencyKey: 'key-parent-died' });
+    await waitFor(() => floor.view().length === 1, 'the writer child to wait at the floor');
+    expect(h.ledger.getAgent(admission.record.id)?.state).toBe('spawning');
+
+    // The parent's turn died with its host and a boot settled it: an errored
+    // parent has no authority to delegate, so the waiting child must not run.
+    h.ledger.setAgentState('parent-1', 'error');
+    free = 12 * GIB;
+    floor.recheck();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultSummary).toContain('parent agent "parent-1" is error');
+    expect(h.spawns).toHaveLength(0);
+    expect(h.ledger.getAgent(admission.record.id)?.state).toBe('error');
+    expect(h.ledger.getAgent(admission.record.id)).toMatchObject({ jobId: 'job-1', parentAgentId: 'parent-1' });
     floor.stop();
     h.close();
   });
