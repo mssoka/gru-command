@@ -3745,6 +3745,11 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       // as the failing assertion the fail-before run must quote, never a setup error.
       const debt = await restartPass(s).catch((error: unknown) =>
         expect.fail(`the restart pass must not refuse a dead turn its own evidence bounds: ${String(error)}`));
+      // The custody refusal is the change's own failing point. Assert it before anything the
+      // refusal also prevents (the stale-row repair): a fail-before run quotes this, not setup.
+      const custodyBlockers = s.ledger.directiveProgressBlockers(s.requestId, s.lane.id)
+        .filter((blocker) => blocker.includes('unbounded') || blocker.includes('remain UNKNOWN'));
+      expect(custodyBlockers, `the dead turn is still a custody refusal: ${custodyBlockers.join('; ')}`).toEqual([]);
       // The restart pass accounted for the dead producer instead of refusing it, and
       // repaired the stale open turn: nothing about it is left to certify.
       expect(s.ledger.getAgent(s.agentId)?.state).toBe('disposed');
