@@ -243,7 +243,20 @@ producer stopped, so the service answers the two facts separately.
   supersedes live review rounds. It writes `job.execution-stop` with
   `state: "stopped"` only when every target has positive cessation
   evidence (the adapter's own observation, a terminal child result, a
-  confirmed review supersession).
+  confirmed review supersession) **and at least one target was actually
+  proven**. A review confirmation counts only when it proves something: a
+  superseded round, or the job-level fallback receipt written after the
+  lane's prior stop event. The vacuous `confirmed: true` a lane with no
+  review operation receives proves nothing and is neither a target nor a
+  residue.
+- **Registry absence is not cessation.** An empty target set — nothing
+  spawned, everything already disposed, or rows a restart settled — never
+  yields `state: "stopped"`. The pass records `unproven` and names the
+  residue: `parked before stop events existed; registry absence is not
+  evidence` for a lane with no `job.execution-stop` history at all, or
+  `no stop target exists — registry absence is not evidence of cessation`
+  otherwise. A lane with no live producer can still be held: resuming or
+  closing the job is what clears that hold.
 - **An unproven stop is named, never fabricated.** A failed dispose, a
   ledger open turn the runtime no longer holds, an unsettled verification
   run or an in-flight producer admission leaves `state: "unproven"` with the
@@ -259,7 +272,12 @@ producer stopped, so the service answers the two facts separately.
 - **A restart re-proves the stop.** A crash between `requested` and the
   verdict, or an unproven residue, is retried at the next boot for lanes
   that are still parked; shutdown joins an in-flight pass (bounded) before
-  the wave and runtime teardown it drives.
+  the wave and runtime teardown it drives. A parked lane with no stop
+  event at all (parked before stop events existed) is visited exactly
+  once: the boot pass writes `requested` then `unproven`, preserves the
+  park, and later boots re-prove the now-`unproven` lane the ordinary way.
+  The owner incident clears only when a later pass proves the stop, or the
+  owner resumes or closes the job.
 
 ## Administrative closeout of a parked PR-backed lane
 

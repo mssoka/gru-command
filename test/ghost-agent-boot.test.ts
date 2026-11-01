@@ -139,7 +139,7 @@ describe('compiled service: boot settles the agent rows a previous process left 
     }
   }, 90_000);
 
-  it('re-proves a parked job\'s interrupted stop against the settled rows: a ghost turn no longer leaves it unproven', async () => {
+  it('re-proves a parked job\'s interrupted stop against the settled rows: a ghost turn is no stop target', async () => {
     const jobId = 'job-ghost-parked';
     const { home, workspace } = seedHome('gru-ghost-parked', (ledger) => {
       ledger.addJob({ id: jobId, repo: 'fixture', title: 'parked mid-turn', baseBranch: 'main', briefing: 'work' });
@@ -159,9 +159,16 @@ describe('compiled service: boot settles the agent rows a previous process left 
           .all(jobId) as unknown as { payload: string }[]).map((event) => JSON.parse(event.payload) as Record<string, unknown>));
         // The seeded request, the boot re-proof's own intent (a stop pass
         // records `requested` before any effect), then its verdict: the ghost
-        // is a settled `error` row, not an open turn the runtime fails to hold.
-        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'requested', 'stopped']);
-        expect(verdicts[2]).toMatchObject({ physical_state: 'stopped', agents: [], outstanding: [] });
+        // is a settled `error` row, not an open turn the runtime fails to
+        // hold. It also proves nothing stopped — registry absence is not
+        // evidence of cessation, and a vacuous review confirmation is no
+        // review target — so the verdict is `unproven`, never `stopped`.
+        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'requested', 'unproven']);
+        expect(verdicts[2]).toMatchObject({
+          physical_state: 'unproven',
+          agents: [],
+          outstanding: ['no stop target exists — registry absence is not evidence of cessation'],
+        });
       }, { timeout: 30_000, interval: 250 });
       expect(agentRows(home, jobId)).toEqual([{ id: 'ghost-parked', state: 'error' }]);
     } finally {

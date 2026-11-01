@@ -1481,7 +1481,8 @@ async function main(): Promise<number> {
         outcome.jobId,
         `Parked job ${outcome.jobId}: producer stop is unproven`,
         `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
-          'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles.',
+          'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
+          'Where nothing is running for the lane, resuming or closing the job clears the hold — an empty registry can never settle it.',
       );
     },
     notifyResolved: (jobId) => {

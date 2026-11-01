@@ -222,7 +222,13 @@ settlement, so it reads a ghost turn as the settled row it is instead of
 reporting an open turn "unproven" for as long as the service runs. The
 evidence behind that is the same host-absent inference the settlement
 makes (this process holds no handle for the row), not an observed process
-exit; a stop pass at any later time reads the settled row the same way. A child
+exit; a stop pass at any later time reads the settled row the same way.
+The settled ghost no longer blocks the lane as an open worker turn, but it
+is not cessation either: when nothing else is proven, the boot stop reads
+it as `no stop target exists — registry absence is not evidence of
+cessation` and records `unproven` (never `stopped`), so the lane stays
+parked and the owner incident stays open until a later pass proves a stop
+or the owner resumes/closes the job. A child
 worker the boot re-runs for a parent that was itself a ghost follows the
 child-worker rule that an errored parent has no authority to delegate: it
 may end with a terminal `error` naming the parent, as it did not before. A

@@ -768,7 +768,13 @@ describe('retained-creation continuation custody', () => {
     api.ledger.setJobStatus(api.jobId, 'parked');
     const stop = new JobExecutionStop({ ledger: api.ledger, handles: { list: () => [] }, children: null, reviews: null, log: () => {} });
     const outcome = await stop.stop({ jobId: api.jobId, by: 'fixture-owner', reason: 'stop the queued continuation' });
-    expect(outcome).toMatchObject({ state: 'stopped', outstanding: [] });
+    // #562: this lane has no producer at all (the continuation is queued, not
+    // admitted), so registry absence is not evidence of cessation — the stop
+    // is unproven, and binning is still allowed.
+    expect(outcome).toMatchObject({
+      state: 'unproven',
+      outstanding: ['parked before stop events existed; registry absence is not evidence'],
+    });
     api.ledger.setJobStatus(api.jobId, 'binned');
     held.release();
     const failed = await waitForState(api.base, api.jobId, 'stop-at-floor', 'failed');

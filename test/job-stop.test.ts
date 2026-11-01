@@ -354,6 +354,176 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
+  // #562: an empty registry proves nothing — `Array#every` over empty lists
+  // used to yield `stopped`. A lane with no stop event at all is the legacy
+  // case, and its residue names that exact fact.
+  it('records unproven for an empty registry instead of stopped: registry absence is not evidence', async () => {
+    const notifyUnproven = vi.fn();
+    const f = fixture({ notifyUnproven });
+    try {
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.agents).toEqual([]);
+      expect(outcome.children).toEqual([]);
+      expect(outcome.outstanding).toContain('parked before stop events existed; registry absence is not evidence');
+      expect(eventStates(f.ledger)).toEqual(['requested', 'unproven']);
+      expect(f.ledger.latestJobEvent(JOB, 'job.execution-stop')?.payload).toMatchObject({
+        state: 'unproven',
+        physical_state: 'unproven',
+        agents: [],
+        children: [],
+        outstanding: ['parked before stop events existed; registry absence is not evidence'],
+      });
+      expect(notifyUnproven).toHaveBeenCalledTimes(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('names a non-legacy empty target set as unproven with the stop-target residue', async () => {
+    const f = fixture();
+    try {
+      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'unproven', by: 'crash', reason: 'interrupted' } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.outstanding).toContain('no stop target exists — registry absence is not evidence of cessation');
+      expect(eventStates(f.ledger).at(-1)).toBe('unproven');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('re-proves a legacy parked lane at boot: idle rows without handles are unproven, not stopped', async () => {
+    const notifyUnproven = vi.fn();
+    const f = fixture({ agents: [{ id: 'minion-legacy', state: 'idle' }], notifyUnproven });
+    try {
+      expect(f.ledger.latestJobEvent(JOB, 'job.execution-stop')).toBeNull();
+      expect(await f.stop.reconcileOnBoot()).toBe(1);
+      expect(f.ledger.getJob(JOB)?.status).toBe('parked');
+      expect(eventStates(f.ledger)).toEqual(['requested', 'unproven']);
+      expect(f.ledger.latestJobEvent(JOB, 'job.execution-stop')?.payload).toMatchObject({
+        physical_state: 'unproven',
+        outstanding: ['parked before stop events existed; registry absence is not evidence'],
+      });
+      expect(notifyUnproven).toHaveBeenCalledTimes(1);
+      // No producer effect: the idle row is not an open turn and no handle exists.
+      expect(f.ledger.listAgents().find((agent) => agent.id === 'minion-legacy')?.state).toBe('idle');
+      // The next boot visits the now-unproven lane and still refuses to claim stop.
+      expect(await f.stop.reconcileOnBoot()).toBe(1);
+      expect(eventStates(f.ledger)).toEqual(['requested', 'unproven', 'requested', 'unproven']);
+      expect(f.ledger.getJob(JOB)?.status).toBe('parked');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('re-proves a legacy parked lane whose only row settled to error: unproven, never stopped', async () => {
+    const f = fixture({ agents: [{ id: 'minion-ghost', state: 'error' }] });
+    try {
+      expect(await f.stop.reconcileOnBoot()).toBe(1);
+      expect(eventStates(f.ledger)).toEqual(['requested', 'unproven']);
+      expect(f.ledger.latestJobEvent(JOB, 'job.execution-stop')?.payload).toMatchObject({
+        physical_state: 'unproven',
+        agents: [],
+        outstanding: ['parked before stop events existed; registry absence is not evidence'],
+      });
+      expect(f.ledger.getJob(JOB)?.status).toBe('parked');
+    } finally {
+      f.close();
+    }
+  });
+
+  // BLOCKER from the plan review: perkins.ts returns the vacuous
+  // `{ confirmed: true, roundIds: [] }` when the lane owns no review
+  // operation. It must not prove a stop on its own.
+  it('does not count a vacuous review confirmation as a stop target', async () => {
+    const f = fixture({
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.reviews.state).toBe('stopped');
+      expect(outcome.reviews.roundIds).toEqual([]);
+      expect(outcome.outstanding).toContain('parked before stop events existed; registry absence is not evidence');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('counts a job-level review-supersession-confirmed written after the prior stop as proven review evidence', async () => {
+    const f = fixture({
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'requested', by: 'crash', reason: 'interrupted' } });
+      f.ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'tester', operations: 1 } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('stopped');
+      expect(outcome.reviews.state).toBe('stopped');
+      expect(outcome.outstanding).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  // The amendment that keeps today's behaviour: a proven agent stop still
+  // settles with the vacuous review stub because that stub is no review
+  // target — it is neither proof nor residue.
+  it('keeps a proven agent stop stopped with a vacuous review confirmation', async () => {
+    const f = fixture({
+      agents: [{ id: 'minion-real', state: 'streaming' }],
+      handles: new Map([['minion-real', fakeHandle('minion-real', 'ceased')]]),
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('stopped');
+      expect(outcome.reviews.state).toBe('stopped');
+      expect(outcome.outstanding).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('proves a stop from a live handle even when the lane already carries a stop event', async () => {
+    const f = fixture({
+      agents: [{ id: 'minion-reproof', state: 'streaming' }],
+      handles: new Map([['minion-reproof', fakeHandle('minion-reproof', 'ceased')]]),
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'unproven', by: 'crash', reason: 'interrupted' } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('stopped');
+      expect(outcome.agents).toEqual([{ agentId: 'minion-reproof', role: 'minion', state: 'stopped', detail: null }]);
+      expect(eventStates(f.ledger)).toEqual(['unproven', 'requested', 'stopped']);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('leaves the owner hold untouched when the stop stays unproven', async () => {
+    const notifyUnproven = vi.fn();
+    const notifyResolved = vi.fn();
+    const f = fixture({
+      agents: [{ id: 'minion-hold', state: 'streaming' }],
+      handles: new Map([['minion-hold', fakeHandle('minion-hold', 'unknown')]]),
+      notifyUnproven,
+      notifyResolved,
+    });
+    try {
+      const statusEventsBefore = f.ledger.listJobEventsByKinds(JOB, ['job.status']).length;
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(f.ledger.getJob(JOB)?.status).toBe('parked');
+      expect(f.ledger.listJobEventsByKinds(JOB, ['job.status'])).toHaveLength(statusEventsBefore);
+      expect(notifyUnproven).toHaveBeenCalledTimes(1);
+      expect(notifyResolved).not.toHaveBeenCalled();
+    } finally {
+      f.close();
+    }
+  });
+
   // A disposal makes the producer's briefing turn reject. That rejection is
   // the CONSEQUENCE of the hold and must not rewrite the explicit owner
   // hold into a fresh `blocked` blocker.
