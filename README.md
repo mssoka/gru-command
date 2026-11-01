@@ -499,7 +499,12 @@ use `npm run test:backend:heavy` for the classified files. Both standalone
 phases assume `npm run build` has run first — several suites boot `dist/`
 artifacts — while `npm test` builds before either phase.
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is the authoritative full gate — it runs `npm test` on every pull request and push to `main`; dispatch lanes verify only their narrow suites locally.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is the authoritative full gate — on every pull
+request and push to `main` it runs each phase of `npm test` (lint, typecheck, build, fast backend, heavy
+backend, web) plus the browser e2e, with the backend phases sharded across runners so the heavy,
+two-worker-capped phase finishes in minutes instead of serialising into one 27-minute job. Nothing is
+filtered by path or label, so a pull request and a landed commit get identical coverage; dispatch lanes
+verify only their narrow suites locally.
 
 The default test suite runs fully offline (stub model provider, stubbed
 claude CLI double, fixture PATHs). Opt-in live smoke tests and the

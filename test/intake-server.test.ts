@@ -441,8 +441,12 @@ it('declares the paired-shell intake acceptance in CI — inside the all-project
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   expect(ci).toContain('run: npm run build:web');
   expect(ci).toContain('run: npx playwright install --with-deps chromium');
-  // An unfiltered run: every project, intake included, gates CI.
-  expect(ci).toMatch(/working-directory: web\s+run: npx playwright test --ignore-snapshots\n/u);
+  // An unfiltered run: every project, intake included, gates CI. The run may be
+  // split into shards (the same all-project selection, spread over runners), but
+  // it may never be narrowed to a subset of projects.
+  expect(ci).toMatch(
+    /working-directory: web\s+run: npx playwright test --ignore-snapshots(?: --shard=\$\{\{ matrix\.shard \}\}\/\d+)?\n/u,
+  );
   expect(ci).not.toMatch(/npx playwright test[^\n]*--project/u);
   const playwright = readFileSync(new URL('../web/playwright.config.ts', import.meta.url), 'utf8');
   expect(playwright).toMatch(/name: 'intake',\s+testMatch: 'intake\.spec\.ts'/u);
