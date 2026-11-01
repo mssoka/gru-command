@@ -1249,6 +1249,21 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // #534: a process row's `command` is recorded with its credentials masked,
+    // so two commands that differ only in a credential read the same. The row
+    // also carries the SHA-256 hex of the RAW command line, which is what a
+    // decision that a live process is the recorded one compares. A row written
+    // before this column keeps NULL: its identity is unknown, so it never
+    // authorises a kill or a registry match by its masked text. Additive.
+    // LANDING COLLISION (same convention as migrations 10-33): renumber ONLY
+    // this never-applied migration if main lands id 34 first.
+    id: 34,
+    name: 'worktree-process-command-digest',
+    sql: `
+      ALTER TABLE worktree_processes ADD COLUMN command_sha256 TEXT;
+    `,
+  },
+  {
     // #523: owner approvals. Gru proposes one owner-reserved action on a FOR
     // YOU card and the owner's Approve makes the server carry it out; this is
     // the durable record of each proposal and where it stands (`proposed`,
@@ -1258,7 +1273,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // existing table changes. LANDING COLLISION (same convention as
     // migrations 10-33): renumber ONLY this never-applied migration if main
     // lands id 34 first.
-    id: 34,
+    id: 35,
     name: 'owner-approvals',
     sql: `
       CREATE TABLE owner_approvals (
@@ -1300,7 +1315,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // The board keeps an owner card in its snapshot for a while after it
     // resolves (so its result can be read however many notifications arrived
     // since it was posted); the partial index makes that range read cheap.
-    id: 35,
+    id: 36,
     name: 'notification-resolution-detail',
     sql: `
       ALTER TABLE notifications ADD COLUMN resolution_detail TEXT;

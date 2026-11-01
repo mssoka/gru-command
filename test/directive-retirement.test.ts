@@ -5,7 +5,7 @@ import { CanceledRequestCloseout } from '../src/dispatch/canceled-request-closeo
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -25,7 +25,7 @@ import { originHeadProbe } from './helpers/pr-head-probe.js';
 import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof, directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { historicalLiveRequest, seededLiveRequest, seedJob } from './helpers/directive-fixtures.js';
 import { BoardEngine } from '../src/board/engine.js';
-import { VerificationScheduler } from '../src/verify/scheduler.js';
+import { VerificationScheduler, pidAlive } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { reconcilePendingDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
@@ -34,6 +34,20 @@ import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+
+/** Local detached-process-group probe. The `stale-row-red` scope overlays this
+ * file onto a base whose scheduler does not export its own `groupAlive`, and a
+ * missing export fails at collection — which proves nothing about behaviour. So
+ * the wait carries its own probe with the production rule: any errno but ESRCH
+ * still means a member exists (a pid we may not signal is not a dead one). */
+function groupAlive(leaderPid: number): boolean {
+  try {
+    process.kill(-leaderPid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 import { directiveRetirementFingerprint } from '../src/ledger/directives.js';
 import { inspectDirectiveProducers, prepareDirectiveProducer, recordDirectiveProducerCessation } from '../src/runtime/directive-checkpoint.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
@@ -552,6 +566,55 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(eventKinds(h)).toEqual(activeEvents);
   });
 
+  it('settling the ghost agent behind an admitted request drops only its open-turn blocker: the request, journal and evidence stay (#547)', async () => {
+    const repo = makeFixtureRepo('retire-ghost-agent');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane, row } = await seededLiveRequest(h, repo, 'job-ghost-agent', 'req-ghost-agent');
+    const file = join(h.dir, 'ghost-agent.jsonl');
+    admitNativeDirectiveFixture(h.ledger, row.requestId, 'ghost-agent', file);
+    // The previous service process ended mid-turn: the row still says
+    // streaming, and nothing in this process holds a handle for it.
+    h.ledger.setAgentState('ghost-agent', 'streaming');
+    const OPEN_TURN = 'open worker turn(s): ghost-agent (streaming)';
+    // The ghost agent's own rows: its state move, the orphan record and the
+    // notices derived from them. Nothing else may change.
+    const settlementOwned = (event: { readonly agentId: string | null; readonly kind: string }): boolean =>
+      event.agentId === 'ghost-agent' && ['agent.state', 'supervision.turn-recovery', 'notification.created'].includes(event.kind);
+    const evidence = () => ({
+      request: h.ledger.getDirective(row.requestId),
+      events: h.ledger.listEvents({ limit: 500 }).filter((event) => !settlementOwned(event)),
+      producers: inspectDirectiveProducers(file),
+    });
+
+    const refused = await retire(h, row.requestId, laneHead(lane));
+    expect(refused.status).toBe(409);
+    const blockersBefore = field<string[]>(refused.json, 'blockers');
+    expect(blockersBefore).toContain(OPEN_TURN);
+    const others = blockersBefore.filter((blocker) => blocker !== OPEN_TURN);
+    expect(others.length).toBeGreaterThan(0);
+    const before = evidence();
+    expect(before.request?.state).toBe('admitted');
+
+    const supervisor = new Supervisor({ ledger: h.ledger, notifications: h.notifications,
+      config: { enabled: false, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+      registry: { getHandle: () => null, listHandles: () => [], quarantineHandle: () => {}, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
+    try {
+      expect(supervisor.settleHostAbsentTurns().settled).toEqual(['ghost-agent']);
+    } finally { supervisor.dispose(); }
+
+    expect(h.ledger.getAgent('ghost-agent')?.state).toBe('error');
+    expect(evidence()).toEqual(before);
+    expect(h.ledger.getDirective(row.requestId)?.state).toBe('admitted');
+    const stillRefused = await retire(h, row.requestId, laneHead(lane));
+    expect(stillRefused.status).toBe(409);
+    expect(field<string>(stillRefused.json, 'error')).toBe('live_work');
+    // Every other blocker is still reported, in the same order; only the
+    // ghost's open-turn blocker went away.
+    expect(field<string[]>(stillRefused.json, 'blockers')).toEqual(others);
+    expect(evidence()).toEqual(before);
+  });
+
   it('retires only after exact original producer cessation, then bins through the existing job-status path', async () => {
     const repo = makeFixtureRepo('retire-positive-native-closeout');
     cleanupRepos.push(repo);
@@ -1063,6 +1126,99 @@ describe('directive retirement — live ownership fails closed', () => {
       state: 'killed',
     });
     expect((await retire(h, 'req-p', laneHead(lane))).status).toBe(200);
+  });
+
+  it('retires past a live registry row whose spawned pid is gone and leaves that row live', async () => {
+    const repo = makeFixtureRepo('retire-registry-stale');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-stale', 'req-p-stale');
+    // The scheduler records its own spawned service at spawn; a restart
+    // before `onSettled` leaves the row live with a pid nothing can own.
+    const dead = 2 ** 31 - 1;
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: dead, command: 'node dist/main.js', evidence: 'registry' }],
+      state: 'live',
+    });
+    const retired = await retire(h, 'req-p-stale', laneHead(lane));
+    expect(retired.status).toBe(200);
+    // The read path never rewrites the ledger: reaping stays the sweep's job.
+    expect(h.ledger.listWorktreeProcesses(lane.id)).toContainEqual(
+      expect.objectContaining({ pid: dead, evidence: 'registry', state: 'live' }),
+    );
+  });
+
+  it('refuses while a live registry row names a running process', async () => {
+    const repo = makeFixtureRepo('retire-registry-live');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-live', 'req-p-live');
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: process.pid, command: 'node dist/main.js', evidence: 'registry' }],
+      state: 'live',
+    });
+    const refused = await retire(h, 'req-p-live', laneHead(lane));
+    expect(refused.status).toBe(409);
+    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('live lane process(es)');
+  });
+
+  it('keeps fencing a live cwd row whose pid cannot be alive', async () => {
+    const repo = makeFixtureRepo('retire-cwd-dead');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-cwd', 'req-p-cwd');
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: 2 ** 31 - 1, command: 'node dist/main.js', evidence: 'cwd' }],
+      state: 'live',
+    });
+    const refused = await retire(h, 'req-p-cwd', laneHead(lane));
+    expect(refused.status).toBe(409);
+    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('live lane process(es)');
+  });
+
+  it('retires past a live registry row with a non-positive pid', async () => {
+    const repo = makeFixtureRepo('retire-registry-zero');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-zero', 'req-p-zero');
+    h.ledger.recordWorktreeProcesses({
+      worktreeId: lane.id,
+      processes: [{ pid: 0, command: 'node dist/main.js', evidence: 'registry' }],
+      state: 'live',
+    });
+    // pid 0 signals this process group, so this proves `pidAlive`'s
+    // non-positive guard is wired in rather than reimplemented here.
+    expect((await retire(h, 'req-p-zero', laneHead(lane))).status).toBe(200);
+  });
+
+  it('keeps fencing a registry row whose detached process group outlives its leader', async () => {
+    const repo = makeFixtureRepo('retire-registry-group');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-p-group', 'req-p-group');
+    // Every verification shell is spawned detached, so the recorded pid is a
+    // process-group leader and a descendant can outlive it. The surviving
+    // group is the spawned service still running in the lane.
+    const leader = spawn('/bin/sh', ['-c', 'sleep 60 &'], { detached: true, stdio: 'ignore' });
+    const leaderPid = leader.pid as number;
+    try {
+      await new Promise<void>((resolve) => leader.once('exit', () => resolve()));
+      await waitFor(() => groupAlive(leaderPid), 'the detached process-group member to start');
+      expect(pidAlive(leaderPid)).toBe(false);
+      h.ledger.recordWorktreeProcesses({
+        worktreeId: lane.id,
+        processes: [{ pid: leaderPid, command: 'npm test', evidence: 'registry' }],
+        state: 'live',
+      });
+      const refused = await retire(h, 'req-p-group', laneHead(lane));
+      expect(refused.status).toBe(409);
+      expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('live lane process(es)');
+    } finally {
+      try { process.kill(-leaderPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
   });
 
   it('refuses when the job has no resolvable lane and never guesses', async () => {
@@ -3062,14 +3218,15 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
 });
 
 describe('legacy proven completion without fabricated historical delivery', () => {
-  async function completedFixture(full = false, noDirectiveChanges = false, pendingProducerBlockers?: (jobId: string) => readonly string[]) {
+  const P37_FULL_COMMAND = 'test ! -f .P37-fail && printf verified';
+  async function completedFixture(full = false, noDirectiveChanges = false, pendingProducerBlockers?: (jobId: string) => readonly string[], fullCommand = P37_FULL_COMMAND) {
     const h = await boot({ completeReview: full, noDirectiveChanges, pendingProducerBlockers }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
     if (full) { attachBareOrigin(repo); repo.git(['push', 'origin', 'main']); }
     const jobId = 'completed-control-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
     if (full) {
       h.ledger.setJobPr(jobId, 'https://github.com/example/fixture/pull/1');
       mkdirSync(join(lane.path, '.gru-command'), { recursive: true });
-      writeFileSync(join(lane.path, '.gru-command', 'worktree.toml'), '[verify]\nfull = "test ! -f .P37-fail && printf verified"\n');
+      writeFileSync(join(lane.path, '.gru-command', 'worktree.toml'), `[verify]\nfull = "${fullCommand}"\n`);
       execFileSync('git', ['-C', lane.path, 'add', '.gru-command/worktree.toml']);
       execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'declare genuine full fixture gate'], { stdio: 'ignore' });
     }
@@ -3170,8 +3327,8 @@ describe('legacy proven completion without fabricated historical delivery', () =
   it('PR334 recovery directive GET and owner decision reach the exact generation beyond default pagination', () => assertCurrentRecoveryReadback('directive', true));
   it('PR334 recovery legacy GET and owner decision reach the exact generation beyond default pagination', () => assertCurrentRecoveryReadback('rebrief', true));
 
-  async function verifiedCurrentGateFixture(noDirectiveChanges = false) {
-    const f = await completedFixture(true, noDirectiveChanges); const { h } = f;
+  async function verifiedCurrentGateFixture(noDirectiveChanges = false, fullCommand = P37_FULL_COMMAND) {
+    const f = await completedFixture(true, noDirectiveChanges, undefined, fullCommand); const { h } = f;
     expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
     const closure = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
     expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: (closure.payload as { inspection_directive: string }).inspection_directive }, TOKEN)).status).toBe(202);
@@ -3181,7 +3338,7 @@ describe('legacy proven completion without fabricated historical delivery', () =
     execFileSync('git', ['-C', f.lane.path, 'push', 'origin', f.lane.branch!], { stdio: 'ignore' });
     const scheduler = new VerificationScheduler({ storageDir: join(h.dir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, record: (event) => { h.ledger.appendCustomEvent(event); } });
     try {
-      const outcome = await scheduler.submit({ jobId: f.jobId, scope: 'full', command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path, requestId: 'P37-original-full' }, () => {});
+      const outcome = await scheduler.submit({ jobId: f.jobId, scope: 'full', command: fullCommand, cwd: f.lane.path, requestId: 'P37-original-full' }, () => {});
       expect(outcome.ok).toBe(true); expect(outcome.trackedDirty).toBe(false);
       const begun = await h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! }); const result = await begun.run;
       expect(result, JSON.stringify(h.ledger.listJobEventsByKinds(f.jobId, ['round.error', 'round.status', 'round.perkins-review']))).toMatchObject({ verdict: 'approved' });
@@ -3200,6 +3357,23 @@ describe('legacy proven completion without fabricated historical delivery', () =
       expect(h.ledger.latestJobEvent(f.jobId, 'verification.reconciled')?.payload).toMatchObject({ state: 'completed', run_id: replay.runId });
       expect(h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence',
         gate: 'original successful full and whole review remain valid after read-only replay', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq } }).state).toBe('settled');
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('P37 a declared full command carrying a credential still settles the gate: its masked verification events bind to it (#534 R2)', { timeout: 120_000 }, async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+    const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture(false, `${P37_FULL_COMMAND} --token ${secret}`);
+    try {
+      // The events the actual declared full run left hold the command masked ...
+      const lifecycle = h.ledger.listJobEventsByKinds(f.jobId, ['verification.requested', 'verification.started', 'verification.completed']);
+      expect(lifecycle.length).toBeGreaterThanOrEqual(3);
+      for (const event of lifecycle) expect((event.payload as { command: string }).command, event.kind).toBe(`${P37_FULL_COMMAND} --token [REDACTED]`);
+      expect(JSON.stringify(h.ledger.listJobEventsByKinds(f.jobId, ['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']))).not.toContain(secret);
+      // ... and the gate, which reads them against the manifest's raw declared command, still settles on them.
+      const settle = () => h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence',
+        gate: 'a credential in the declared full command does not unbind its masked events', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq } });
+      expect(settle).not.toThrow();
+      expect(h.ledger.getObligation(duty.id)?.state).toBe('settled');
     } finally { await scheduler.dispose(); }
   });
 
@@ -3307,7 +3481,10 @@ describe('legacy proven completion without fabricated historical delivery', () =
     } finally { await scheduler.dispose(); }
   });
 
-  it('P37 requires both full verification and whole review after a later current candidate delivery', async () => {
+  // Real lanes, git pushes and three review rounds: 10.3 s on an idle host, and
+  // the fast phase's 30 s ceiling was exceeded under the full suite's contended
+  // workers (full run 4fb228b9 at d41f3977). The allowance changes no assertion.
+  it('P37 requires both full verification and whole review after a later current candidate delivery', { timeout: 120_000 }, async () => {
     const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture(true);
     try {
       const accepted = await call(h.port, 'POST', '/api/silas/rebrief',

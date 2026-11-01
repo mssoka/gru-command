@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { LedgerApi } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
@@ -35,6 +35,15 @@ export interface LaneProvenance {
 /** A fresh token for a new lane incarnation (128 random bits, hex). */
 export function newLaneToken(): string {
   return randomBytes(16).toString('hex');
+}
+
+/** A process's identity as the registry records it (#534): the SHA-256 hex of
+ * its RAW command line, as `ps` listed it. The recorded `command` is masked,
+ * and two commands whose credentials differ mask to the same text, so a
+ * decision that a live process is the one a row describes (an acknowledged
+ * kill, a terminal readback) compares this digest, never the masked text. */
+export function processCommandSha256(rawCommand: string): string {
+  return createHash('sha256').update(rawCommand).digest('hex');
 }
 
 export function isLaneToken(value: unknown): value is string {

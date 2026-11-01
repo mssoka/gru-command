@@ -80,7 +80,11 @@ the caller supplies expectations only:
 - **No review/source ownership**: no `pending`/`live` review round.
 - **No live lane process**: no `worktree_processes` row in `live` state
   for the job's lanes that are not swept. A swept lane runs nothing, so a
-  row it left `live` never fences (#464).
+  row it left `live` never fences (#464). A `registry` row is the
+  orchestrator's own spawned service, so it fences only while its recorded
+  pid or its detached process group still exists: a restart can leave a
+  live row naming a pid that is gone, and that stale bookkeeping never
+  fences.
 - **No correlated terminal receipt**: a `job.delivered` correlated to the
   request is refused (`terminal_receipt_present`) — normal settlement owns
   it.
@@ -552,7 +556,7 @@ blockers}`.
 owner; nothing was run.`, or `Not run: <code>` followed by the blockers, one
 per line (`retirement_available` adds `Ordinary retirement is available;
 Gru retires it instead.`). The result is stored on the card's own row
-(`notifications.resolution_detail`, migration 35) and the board renders it on
+(`notifications.resolution_detail`, migration 36) and the board renders it on
 the card as `Result: …`, one line per blocker, not only in the
 `notification.resolved` audit event. A resolved card leaves the FOR YOU band
 (as every producer's does) and is read in the bell's feed; the board keeps an

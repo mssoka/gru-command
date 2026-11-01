@@ -2668,6 +2668,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/verify/capture-cli.js",
   "dist/verify/capture.js",
   "dist/verify/evidence.js",
+  "dist/verify/output-retention.js",
   "dist/verify/scheduler.js",
   "dist/verify/server.js",
   "dist/version.js",

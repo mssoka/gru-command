@@ -725,9 +725,23 @@ Events: `silas.closeout-intent`, `silas.closeout-stopped`,
 `by: "canceled-request-closeout"`). See
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
 
+### Process identity is the raw command's digest (#534)
+
+Migration 34 (`worktree-process-command-digest`) is additive: it adds
+`worktree_processes.command_sha256`, the SHA-256 hex of the **raw** command
+line a process was listed with. The row's `command` is recorded masked
+(credentials replaced, see [WORKTREES.md §2](./WORKTREES.md)), and two
+commands whose credentials differ mask to the same text, so every write
+records the digest beside it and every decision that a live process is the
+one a row describes (an acknowledged kill, the terminal readback of a
+verification run) compares the digest. A row written before the migration
+keeps NULL: its identity is unknown, so it never matches by its masked
+text; its process is asked about again and a registry row of that kind is
+left to the sweep's reap. The digest is a column, never an event field.
+
 ### Owner approvals of abandonment (#523)
 
-Migration 34 (`owner-approvals`) is additive: no existing table changes.
+Migration 35 (`owner-approvals`) is additive: no existing table changes.
 `owner_approvals` holds one row per proposal: `id` (`oa-<uuid>`), `kind`
 (`directive-abandon`), `request_id`, `job_id`, the four fences read when Gru
 asked (`fence_state`, `fence_payload_hash`, `fence_debt_generation` and the
@@ -744,7 +758,7 @@ restart's reconcile finishes what a crash left and the native abandonment
 never runs twice. The service is `src/dispatch/owner-approvals.ts`; see
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment).
 
-Migration 35 (`notification-resolution-detail`) adds the nullable
+Migration 36 (`notification-resolution-detail`) adds the nullable
 `notifications.resolution_detail`: the result a follow-through
 (`resolveOwnerDecision`) or a producer's withdrawal (`withdrawOwnerProposal`)
 closed the card with, kept on the row so the board shows it on the card and
