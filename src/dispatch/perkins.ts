@@ -6036,8 +6036,11 @@ export class WaveRunner {
       // R4-6: the advertised-tip remote probe runs OFF the event loop —
       // a stalled remote awaits here without blocking unrelated service
       // work, then its fail-closed outcome is injected into the preflight.
+      // The wait honours the setup signal: a shutdown or a superseded round
+      // lands inside the wave's grace, and the step's own process group is
+      // killed rather than abandoned (see runOwnedGit's abort path).
       const precomputedRemoteMovement = await probeAdvertisedTipMovementAsync(
-        frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS,
+        frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, { signal: setupSignal },
       );
       // R8-3: the UNIQUE freeze receipt with full identity validation — a
       // duplicate or conflicting receipt refuses under the manifest's name
