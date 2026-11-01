@@ -3923,16 +3923,26 @@ describe('restart-recovery-progress — exact native request matrix', () => {
         expected: { jobId: s.jobId, state: 'admitted', payloadHash: s.ledger.getDirective(s.requestId)!.payloadHash },
         reason: 'the owner accepts the unknown effect residue', by: 'owner' });
       expect(abandoned.idempotent).toBe(false);
-      expect(s.ledger.getDirective(s.requestId)?.state).toBe('abandoned');
+      // Abandonment records the outcome as unknown: the row is closed and the audit says by whom.
+      expect(s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-abandoned', s.requestId)?.payload).toMatchObject({ by: 'owner' });
+      expect(s.ledger.getDirective(s.requestId)).toMatchObject({ state: 'failed', abandonedBy: 'owner' });
     });
   });
   it('A debt first opened while the producer was live is re-planned from the dead turn evidence after the restart pass', async () => {
     await withDeadScene('pi', 'refused', async (s) => {
-      // Before the restart pass the dead producer's start is still un-ceased: Gru's plan is the owner ask.
+      // The crash first left a producer whose cessation was unproven (a live pid in its journal):
+      // the debt opened then owes the owner ask. Rewriting the journal is the fixture's own move.
+      const journal = `${s.file}.producers.jsonl`;
+      const deadText = readFileSync(journal, 'utf8');
+      writeFileSync(journal, deadText.replace(`"pid":${String(s.producer.pid)},`, `"pid":${String(process.pid)},`));
+      expect(inspectDirectiveProducers(s.file, s.identity).map(({ evidence }) => evidence)).toEqual(['unknown']);
       const before = s.ledger.openDirectiveRecoveryDebt(s.requestId, 'the crash left the turn unfinished');
       expect(JSON.stringify(before.nextAction)).toContain('ask the owner');
+      // The restart proves the producer host-absent again and records its cessation.
+      writeFileSync(journal, deadText);
+      expect(inspectDirectiveProducers(s.file, s.identity).map(({ evidence }) => evidence)).toEqual(['host-absent']);
       const after = await restartPass(s);
-      // The same obligation row is re-planned once the restart pass records the dead producer's cessation.
+      // The same obligation row is re-planned; the owner ask is gone from the durable plan.
       expect(after.id).toBe(before.id);
       expect(after.planRevision).toBeGreaterThan(before.planRevision);
       expect(JSON.stringify(after.nextAction)).not.toContain('ask the owner');
@@ -3940,20 +3950,22 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     });
   });
 
-  it('a card whose only blocker is a live fence says to wait, never that a successor is accepted', async () => {
+  it('a card whose only blocker is a live fence says to wait, never that a successor is accepted as usual', async () => {
     await withDeadScene('pi', 'quiet', async (s) => {
       s.ledger.setAgentState(s.agentId, 'disposed');
       s.ledger.registerAgent({ id: 'card-live-minion', role: 'minion', jobId: s.jobId, sessionFile: `${s.file}.card`, parentage: 'top-level' });
       s.ledger.setAgentState('card-live-minion', 'streaming');
       surfaceDirectiveRecovery(s.deps, s.requestId, 'producer ownership remains: open worker turn(s): card-live-minion (streaming)');
       const detail = activeCard(s)?.detail ?? '';
-      expect(detail).toContain('wait for the live fence');
-      expect(detail).not.toContain('This needs no owner');
-      expect(detail).not.toContain('recover with a fresh named successor');
+      // The dead turn itself needs no owner, but the card must not promise a successor the route refuses.
+      expect(detail).toContain('This needs no owner');
+      expect(detail).toContain('wait for it to clear first');
+      expect(detail).not.toContain('a successor is accepted as usual');
     });
   });
   it('a card whose producer evidence is unknown asks the owner instead of pointing at a successor the route refuses', async () => {
     await withDeadScene('pi', 'quiet', async (s) => {
+      s.ledger.setAgentState(s.agentId, 'disposed');
       // A second evidence state on the same producer (an unobserved independent controller): no dead-turn verdict exists.
       recordDirectiveIndependentController(s.producer);
       surfaceDirectiveRecovery(s.deps, s.requestId, 'producer ownership remains unknown');

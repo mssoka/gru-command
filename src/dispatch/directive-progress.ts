@@ -352,21 +352,24 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
   const start = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId);
   const producer = (start?.payload as { native_producer?: unknown } | undefined)?.native_producer;
   const owner = start === null ? owners.at(-1) : owners.find(({ producer: native }) => JSON.stringify(native) === JSON.stringify(producer));
-  // Repair the request's own stale row before any refusal: a killed service also left
-  // the dead turn `streaming`, and that row records the dead process, not a live turn
-  // (a live turn always holds a handle). Without it the unbounded residue's owner exit
-  // (POST /abandon) is refused as `open worker turn(s)`, an action the card offers.
-  if (owner !== undefined) {
+  /** The killed service also left the dead turn `streaming`. That row records the
+   * dead process, not a live turn (a live turn always holds a handle); repairing
+   * it is exact physical cessation, never permission. Before the `unbounded`
+   * refusal it is what makes the card's owner exit (/abandon) reachable: the
+   * abandonment route refuses any `live` entry, and this row would be one. */
+  const repairExactCessationRow = (): void => {
+    if (owner === undefined) return;
     const stale = deps.ledger.getAgent(owner.producer.agentId);
     if (JSON.stringify(sessionOwners.at(-1)?.producer) === JSON.stringify(owner.producer) && stale?.jobId === identity.jobId &&
         stale.sessionFile === owner.producer.sessionFile && deps.registry.getHandle(stale.id) === null && stale.state !== 'disposed') {
-      deps.ledger.setAgentState(stale.id, 'disposed'); // exact physical cessation, never permission; repair receipt replay too
+      deps.ledger.setAgentState(stale.id, 'disposed');
     }
-  }
-  if (deadRefusal !== null) throw deadRefusal;
+  };
+  if (deadRefusal !== null) { repairExactCessationRow(); throw deadRefusal; }
   if (owner === undefined) throw new DirectiveCheckpointError('legacy/unbound physical producer start remains UNKNOWN');
   const lockBlocker = directiveProducerLockBlocker(sessionOwners.at(-1)!.producer);
   if (lockBlocker !== null) throw new DirectiveCheckpointError(lockBlocker);
+  repairExactCessationRow();
   if (start === null) return;
   const ceased = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-ceased', identity.requestId);
   if ((ceased?.payload as { producer_start_seq?: unknown } | undefined)?.producer_start_seq === start.seq) return;
@@ -492,29 +495,26 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
   const debt = deps.ledger.openDirectiveRecoveryDebt(requestId, reason);
   const current = deps.ledger.directiveCurrentAuthority(row.jobId);
   const custody = deps.ledger.directiveCustodyGaps(row);
-  // The card's own instruction must match what /recover will do: a live fence
-  // refuses until it clears, custody uncertainty needs the owner, and only a
-  // settled dead turn with no fence is Gru's ordinary successor call. The tags
-  // come from the same ownership read the route uses (never a reason string).
+  // The card's own instruction must match what /recover will do: custody that is
+  // still unknown needs the owner, and a live fence refuses until it clears. The
+  // tags come from the same ownership read the route uses (never a reason string).
   let fences: readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[];
   try {
     const lane = deps.worktrees?.listWorktrees({ jobId: row.jobId }).find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
     fences = deps.ledger.directiveOwnershipBlockers(requestId, lane?.id ?? '');
   } catch { fences = [{ text: 'the producer fences could not be read', custody: 'unknown' }]; }
-  const liveFence = fences.some(({ custody: kind }) => kind === 'live');
   const unknownCustody = custody.length > 0 || fences.some(({ custody: kind }) => kind === 'unknown');
-  const dead = deadTurnLine(deps.ledger, requestId, !liveFence && !unknownCustody);
+  const dead = deadTurnLine(deps.ledger, requestId, !unknownCustody);
   postRecoveryIncident(deps.notifications, { kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
     title: `Directive ${requestId}: concrete Gru recovery decision owed (job ${row.jobId})`,
     detail: `Request ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
       `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}.${dead.line} Inspect GET /api/silas/directives/${requestId}, ` +
-      (liveFence
-        ? 'and wait for the live fence named above to clear (a worker turn, session lock or lane process still owns the request): a successor or retirement is refused until then, and no owner decision is needed for it.'
-        : custody.length > 0 || unknownCustody || dead.unbounded
-          ? `but its producer custody is unknown (${custody.length > 0 ? custody.join('; ') : 'the dead turn is unbounded'}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`
-          : `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
-            'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
-            'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.'),
+      (custody.length > 0 || unknownCustody || dead.unbounded
+        ? `but its producer custody is unknown (${custody.length > 0 ? custody.join('; ') : 'the dead turn is unbounded'}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`
+        : `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
+          'if a live fence is still named above (a worker turn, session lock or lane process on the job), wait for it to clear first — the successor or retirement is refused until then, and no owner decision is needed for it; ' +
+          'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
+          'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.'),
     ...(row.admissionMinion === null ? {} : { agentId: row.admissionMinion }), dedupe: 'active' });
 }
 
