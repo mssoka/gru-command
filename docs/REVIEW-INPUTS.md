@@ -644,7 +644,13 @@ scanned at turn settle (grep lines landing in excluded paths — also in the for
 path is the repository path, never the revision, and never a line's text where
 the line's own delimiters settle the path end; the one shape that keeps a tail
 is an extensionless excluded name whose line text holds a dotted token before a
-delimiter, which is recorded as written; the `git grep --heading` form, a
+delimiter, which is recorded as written; the `git grep --heading` form is
+observed too: a line that names no line number of its own and stands above
+numbered lines is a heading exactly when the isolation globs exclude the path it
+names (a worktree name, a spaced name, a `<rev>:<path>` head — the globs decide,
+never the shape of the name), and every numbered line under it then means the
+equivalent `path:N:text` line, so the record names the heading's repository path;
+that attribution ends at a blank line, at `--` or at the next heading; a
 `git grep` run without `-n` (`path:text`), a `Binary file … matches` line and
 `--color=always` output are not observed; a worktree context line is read by
 its own path region, so a quoted `name:N:` in its text is not recorded, and the

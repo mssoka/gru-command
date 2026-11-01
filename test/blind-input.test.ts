@@ -776,13 +776,53 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     }
   });
 
-  it('the `git grep --heading` form is not observed: a name line and the numbered lines under it name no read by themselves', () => {
-    // Out of scope for #520 by contract revision 1 (the follow-up covers it). A file name
-    // on a line of its own carries no path-and-number delimiter, and a bare `N:text` line
-    // has no revision and no second delimiter, so neither is a grep hit here.
-    expect(scan(rows(ARTIFACT, '7:needle', '8-afterwards'))).toEqual([]);
-    expect(scan(rows(named('HEAD', ARTIFACT), '7:needle'))).toEqual([]);
+  it('#546: a `git grep --heading` name line attributes the numbered lines under it, and the record names its repository path', () => {
+    // The heading form: the name on a line of its own, the matches under it as `N:text`.
+    // Both numbered lines are judged as the equivalent `path:N:text` line, so the record
+    // names the repository path, past the revision like every other form.
+    const text = rows(ARTIFACT, '7:needle', '8-afterwards');
+    expect(recorded(text)).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(named('HEAD', ARTIFACT), '7:needle'))).toEqual(prohibited(ARTIFACT));
+    // A name the globs do not exclude is no heading: its numbered lines name nothing.
     expect(scan(rows('src/a.ts', '3:needle'))).toEqual([]);
+    // Digest only, and a pure function of the tool result.
+    expect(JSON.stringify(scan(text))).not.toContain('needle');
+    expect(scan(text)).toEqual(scan(text));
+  });
+
+  it('#546: context-numbered and `--column` lines under a heading name the heading\'s path', () => {
+    // `-C` prints the context lines as `N-text`, `--column` adds a column after the number.
+    expect(recorded(rows(ARTIFACT, '7-x'))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(ARTIFACT, '7:3:x'))).toEqual(prohibited(ARTIFACT));
+  });
+
+  it('#546: an extensionless or spaced heading is decided by the isolation globs, as the non-heading forms are', () => {
+    // The heading rule reads the globs, never the shape of the name: an extensionless
+    // name is no less a file of the repository, and a spaced one is judged whole.
+    expect(recorded(rows('vendor/Makefile', '7:x'), ruleOf('exclude vendor/**'))).toEqual(prohibited('vendor/Makefile'));
+    expect(recorded(rows('docs/issues/prior review.md', '1:x'), ruleOf('exclude docs/issues/**')))
+      .toEqual(prohibited('docs/issues/prior review.md'));
+  });
+
+  it('#546: attribution ends at a blank line, at `--` and at the next heading', () => {
+    // One hit per result: the numbered line under the heading is the read, and the
+    // line past the boundary adds none.
+    expect(recorded(rows(ARTIFACT, '7:x', '', '9:y'))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(ARTIFACT, '7:x', '--', '9:y'))).toEqual(prohibited(ARTIFACT));
+    expect(recorded(rows(ARTIFACT, '7:x', 'src/a.ts', '1:y'))).toEqual(prohibited(ARTIFACT));
+    // With no numbered line under the heading itself, nothing is attributed across it.
+    expect(scan(rows(ARTIFACT, '', '9:y'))).toEqual([]);
+    expect(scan(rows(ARTIFACT, '--', '9:y'))).toEqual([]);
+    expect(scan(rows(ARTIFACT, 'src/a.ts', '1:y'))).toEqual([]);
+    // A heading after a blank line is a heading still.
+    expect(recorded(rows('', ARTIFACT, '9:y'))).toEqual(prohibited(ARTIFACT));
+  });
+
+  it('#546: prose above a clock-numbered line, and a path-like heading the globs do not exclude, record nothing', () => {
+    // A heading has to be excluded by the globs itself...
+    expect(scan(rows('the build finished at', '12:34:56 build finished'))).toEqual([]);
+    // ...and clock-numbered text is no grep line, however the line above reads.
+    expect(scan(rows('src/main.ts', '4:34:56 started'))).toEqual([]);
   });
 
   it.skipIf(branchMessages === null)('R4: this branch\'s own commit messages are no excluded read, as written or as a log shows them', () => {
@@ -798,8 +838,8 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
   it('reading the files of this change is no excluded read: no line, as written or as a read gutter, a diff or any grep output shows it, reads as a grep hit', () => {
     // A blind reviewer reads these files, and what its tools print is observed. So no line of any
     // file this change touches may read as a grep hit — plain, behind a numbered gutter, as a diff
-    // line, as `grep -n` match or context output with and without a revision — nor may the file
-    // as one result, plain or numbered.
+    // line, as `grep -n` match or context output with and without a revision, as a `--heading` name
+    // line over its numbered lines — nor may the file as one result, plain or numbered.
     const files = [
       'src/dispatch/blind-input.ts', 'test/blind-input.test.ts', 'test/blind-input-dispatch.test.ts',
       'test/suite-shape.test.ts', 'docs/REVIEW-INPUTS.md', '.gru-command/worktree.toml',
@@ -813,6 +853,8 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
         const shown = [
           line, `${n}\t${line}`, `${n.padStart(6)}\t${line}`, `${n.padStart(6)}→${line}`, `+${line}`, `-${line}`, ` ${line}`,
           [file, n, line].join(':'), [file, n, line].join('-'), ['HEAD', file, n, line].join(':'), ['HEAD', file, n, line].join('-'),
+          // The `git grep --heading` shape: this line as a name, a numbered line under it.
+          [line, `${index + 2}:x`].join('\n'), [line, `${index + 2}-x`].join('\n'),
         ];
         for (const text of shown) flagged.push(...scan(text).map((hit) => `${file}:${n}: ${hit.path ?? ''}`));
       });
