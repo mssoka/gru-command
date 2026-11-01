@@ -1155,15 +1155,18 @@ function gitGrepHit(
 }
 
 /** `git grep --heading` prints a result's name on a line of its own, above the
- * numbered lines that belong to it. Such a line is a HEADING — and the
- * numbered lines under it are reads of it — exactly when it stands above a
- * numbered line (`N:text`, `N-text`) and the isolation globs exclude the path
- * one of its heads names (`gitGrepHeadPaths`): a worktree name, a spaced name
- * or a `<rev>:<path>` head. The globs decide, never the shape of the name, so
- * an extensionless or spaced heading the rule excludes counts like any other,
- * and a name whose first component begins with digits (`1-1-notes/NOTES`) is
- * no less a name: it is a heading whenever the globs exclude it. Null when the
- * line is no heading. */
+ * numbered lines that belong to it. Such a line is a HEADING — and a numbered
+ * line under it makes the name a read of that path — exactly when it stands
+ * above a numbered line (`N:text`, `N-text`) and the isolation globs exclude the
+ * path one of its heads names (`gitGrepHeadPaths`): a worktree name, a spaced
+ * name or a `<rev>:<path>` head. The globs decide, never the shape of the name,
+ * so an extensionless or spaced heading the rule excludes counts like any other,
+ * and a name whose first component begins with digits (`1-1-notes/NOTES`) is no
+ * less a name: it is a heading whenever the globs exclude it. A heading is a
+ * NAME git prints whole, so the whole line is the name unless what precedes its
+ * first colon can be a revision (a ref holds no whitespace): text before a colon
+ * (`… 'note: <path>',`) names no revision, and the line is judged as one name,
+ * never by what follows the colon. Null when the line is no heading. */
 function gitGrepHeadingFor(line: string, next: string | undefined, rule: BlindIsolationRule): string | null {
   if (line === '' || line === '--' || /^\s/u.test(line)) return null;
   // A heading introduces numbered lines; a name with no lines under it (a listing, `git grep -l`) names nothing.
@@ -1173,7 +1176,11 @@ function gitGrepHeadingFor(line: string, next: string | undefined, rule: BlindIs
   if (GREP_LINE.test(line)) return null;
   // The repository itself and a directory name are no file of it (a Windows-style name ends at `\` as at `/`).
   if (line === '.' || line === '..' || line.endsWith('/') || line.endsWith('\\')) return null;
-  const excluded = gitGrepHeadPaths(line).some(
+  const colon = line.indexOf(':');
+  const heads = colon > 0 && /\s/u.test(line.slice(0, colon))
+    ? [gitGrepCandidate(line, 'parent')]
+    : gitGrepHeadPaths(line);
+  const excluded = heads.some(
     (candidate) => normalizeRepoPath(candidate.path) !== '' && excludedGrepPath(candidate, rule) !== null,
   );
   return excluded ? line : null;
@@ -1186,18 +1193,20 @@ function gitGrepHeadingFor(line: string, next: string | undefined, rule: BlindIs
  *
  * The `git grep --heading` form is observed: a line that stands above a
  * numbered line is a heading when the isolation globs exclude the path it names
- * (see gitGrepHeadingFor), and the numbered lines under it are then judged as
- * the equivalent `path:N:text` line, so the recorded path is the heading's
+ * (see gitGrepHeadingFor), and the first numbered line under it then adds the
+ * equivalent `path:1:text` line, so the recorded path is the heading's
  * repository path. The globs decide, never the shape of the name: a name whose
  * first component begins with digits is still a heading when the globs exclude
- * it, and only a line that is itself a `path:N:text` match line is none (a bare
- * `N:text` line cannot be one: gitGrepHeadPaths rejects a 1-6 digit revision).
- * Attribution ends at a blank line, at `--`, or at the next heading: every
- * non-numbered line replaces the heading, numbered lines leave it in force. One
- * reading is taken per heading — the first numbered line under it names the
- * same path candidates as every other, because the capture ends at its own
- * `:N:` — so a result with many numbered lines stays one result. So the change
- * can only ADD a recorded read.
+ * it, and only a line that is itself a `path:N:text` or `path:N-text` line is
+ * none (a bare `N:text` line is none for any real line number:
+ * gitGrepHeadPaths rejects a 1-6 digit revision). Attribution ends at a blank
+ * line, at `--`, at any non-numbered line or at the next heading; a numbered
+ * line never replaces the heading in force, because it is either a line of that
+ * result or a digit-leading context line of it, and the heading above is the
+ * fail-closed reading either way. One reading is taken per heading — a minimal
+ * line synthesised from the heading alone, never from the numbered line's own
+ * text, which only proves that content followed it — so a result with many
+ * numbered lines stays one result. So the change can only ADD a recorded read.
  */
 export function scanObservedAccess(
   results: readonly ObservedToolResult[],
@@ -1227,14 +1236,13 @@ export function scanObservedAccess(
     }
     const lines = result.text.split('\n').map((raw) => (raw.endsWith('\r') ? raw.slice(0, -1) : raw));
     // CRLF output: the separators are git's own, the carriage return is not part of them.
-    // An excluded heading's numbered lines also read as the equivalent
-    // `path:N:text` line, so the heading's path is recorded as the non-heading
+    // An excluded heading's first numbered line also reads as the equivalent
+    // `path:1:text` line, so the heading's path is recorded as the non-heading
     // form records it.
     const readings: { readonly line: string; readonly names: readonly GrepNames[] }[] = [];
     let heading: string | null = null;
-    // One attributed reading per heading: the first numbered line under it already
-    // carries every path candidate its siblings would, so the record stays bounded
-    // by the headings of a result, not by its numbered lines.
+    // One attributed reading per heading: it is synthesised from the heading alone,
+    // so it stays bounded by the headings of a result, not by its numbered lines.
     let attributed = false;
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i]!;
@@ -1243,10 +1251,13 @@ export function scanObservedAccess(
         heading = null;
         attributed = false;
       } else {
-        // An excluded name wins over the numbered branch: a repository name may
-        // begin with digits, and only a real `path:N:text` line is no heading (a
-        // bare numbered line is rejected by gitGrepHeadPaths, see gitGrepHeadingFor).
-        const found = gitGrepHeadingFor(line, lines[i + 1], rule);
+        // An excluded name wins over the numbered branch, but only where no heading
+        // is in force: a numbered-looking line under a heading is a line of that
+        // result (a `path-N-text` context line included), so it never steals the
+        // heading. A repository name may begin with digits, and only a real
+        // `path:N:text` line is no heading (a bare numbered line names no real line
+        // number, see gitGrepHeadingFor).
+        const found: string | null = heading !== null && numbered ? null : gitGrepHeadingFor(line, lines[i + 1], rule);
         if (found !== null) {
           heading = found;
           attributed = false;
@@ -1258,7 +1269,10 @@ export function scanObservedAccess(
       readings.push({ line, names: gitGrepLineNames(line) });
       if (numbered && heading !== null && !attributed) {
         attributed = true;
-        const asMatch = `${heading}:${line}`;
+        // The heading alone: the numbered line under it only proves that content
+        // followed, and its own tail may name nothing (a `-C` context line whose
+        // whole text is an unspaced dotted token).
+        const asMatch = `${heading}:1:x`;
         readings.push({ line: asMatch, names: gitGrepLineNames(asMatch) });
       }
     }

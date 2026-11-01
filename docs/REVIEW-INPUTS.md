@@ -645,16 +645,20 @@ path is the repository path, never the revision, and never a line's text where
 the line's own delimiters settle the path end; the one shape that keeps a tail
 is an extensionless excluded name whose line text holds a dotted token before a
 delimiter, which is recorded as written; the `git grep --heading` form is
-observed too: a line that is no `path:N:text` line of its own and stands above
-numbered lines is a heading exactly when the isolation globs exclude the path it
-names (a worktree name, a spaced name, a `<rev>:<path>` head — the globs decide,
-never the shape of the name, and a heading is a repository-relative name as git
-prints it, so an absolute, drive-letter or UNC name is no heading shape), and
-every numbered line under it then means the equivalent `path:N:text` line, so
-the record names the heading's repository path; that attribution ends at a blank
-line, at `--` or at the next heading, and a name followed by numbered-looking
-text is conservatively read as access (fail-closed), so a name whose first
-component begins with digits is judged by the globs like any other; a
+observed too: a line that is no `path:N:text` or `path:N-text` line of its own
+and stands above numbered lines is a heading exactly when the isolation globs
+exclude the path it names (a worktree name, a spaced name, a `<rev>:<path>` head
+— the globs decide, never the shape of the name, and a heading is a
+repository-relative name as git prints it whole, so an absolute, drive-letter or
+UNC name is no heading shape, and text before a colon is no revision, so a line
+whose text holds a colon is judged as one name, never by what follows it), and
+the first numbered line under it adds the equivalent `path:1:text` line,
+synthesised from the heading alone because the numbered line only proves content
+followed it, so the record names the heading's repository path; that attribution
+ends at a blank line, at `--`, at any non-numbered line or at the next heading,
+and a numbered line never replaces a heading in force; a name followed by
+numbered-looking text is conservatively read as access (fail-closed), so a name
+whose first component begins with digits is judged by the globs like any other; a
 `git grep` run without `-n` (`path:text`), a `Binary file … matches` line and
 `--color=always` output are not observed; a worktree context line is read by
 its own path region, so a quoted `name:N:` in its text is not recorded, and the

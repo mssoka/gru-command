@@ -823,13 +823,38 @@ describe('observed reviewer access — the forms `git grep` prints for revisions
     expect(scan(rows('the build finished at', '12:34:56 build finished'))).toEqual([]);
     // ...and clock-numbered text is no grep line, however the line above reads.
     expect(scan(rows('src/main.ts', '4:34:56 started'))).toEqual([]);
+    // A heading is a name git prints whole: prose before a colon names no revision, so
+    // the line is judged as one name, never by the excluded path its text happens to hold.
+    expect(scan(rows(`3-      'excluded-path:${ARTIFACT}',`, '4:x'))).toEqual([]);
   });
 
   it('#546: a heading whose first component begins with digits is judged by the globs, as any other name', () => {
     // `1-1-notes/NOTES` opens with a `<digits>-` component, the shape a numbered line has
     // too. The globs exclude the name, so it is the heading and the match under it is a read.
-    expect(recorded(rows('1-1-notes/NOTES', '3:x'), ruleOf('exclude 1-1-notes/**')))
-      .toEqual(prohibited('1-1-notes/NOTES'));
+    const notes = ruleOf('exclude 1-1-notes/**');
+    expect(recorded(rows('1-1-notes/NOTES', '3:x'), notes)).toEqual(prohibited('1-1-notes/NOTES'));
+    // It is a heading wherever no heading is in force: at the start and after a blank line.
+    expect(recorded(rows('', '1-1-notes/NOTES', '3:x'), notes)).toEqual(prohibited('1-1-notes/NOTES'));
+  });
+
+  it('#546: the reading a heading contributes comes from the heading alone, wherever its numbered line spells', () => {
+    // The numbered line under a heading only proves that content followed it: a `-C`
+    // context line whose whole text is an unspaced dotted token names nothing on its own,
+    // so judging it as text would cost the heading its one reading.
+    expect(recorded(rows(named('HEAD', ARTIFACT), '7-notes.md', '8:secret'))).toEqual(prohibited(ARTIFACT));
+    // Spaced, `<rev>:<path>` and extensionless headings all still contribute.
+    expect(recorded(rows('docs/issues/prior review.md', '7-dist/build-rev.json', '8:secret')))
+      .toEqual(prohibited('docs/issues/prior review.md'));
+    expect(recorded(rows('vendor/Makefile', '7-notes.md', '8:secret'), ruleOf('exclude vendor/**')))
+      .toEqual(prohibited('vendor/Makefile'));
+  });
+
+  it('#546: a numbered-looking line never overrides a heading in force, so the record names the heading\'s path', () => {
+    // The line under the heading is a `path-N-text` context line of that result, whatever
+    // its text spells: read as a heading of its own, the glued `3-notes.md` would be the
+    // recorded path, a name no file of the repository has.
+    const md = ruleOf('exclude **/*.md');
+    expect(recorded(rows('docs/issues/a.md', '3-notes.md', '4:secret'), md)).toEqual(prohibited('docs/issues/a.md'));
   });
 
   it('#546: a digit-leading name the globs do not exclude is no heading of its own, and never clears the excluded name above it', () => {
