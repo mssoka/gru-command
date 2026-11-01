@@ -98,9 +98,12 @@ host read `Not linked (unsupported code host)`. See [BOARD.md](./BOARD.md) for
 what each row shows.
 
 Perkins GitLab delivery is separate and unchanged: it still uses `GITLAB_TOKEN`
-with the `api` scope ([FLOW.md](./FLOW.md)). Set it in the service's
-environment, for example through [`[env]`](#service-environment-env). glab
-itself prefers a `GITLAB_TOKEN` set in the service's environment over its
+with the `api` scope ([FLOW.md](./FLOW.md)). The same token also reads a GitLab
+merge request's head pipeline once per review round, as the exact-head CI
+evidence ([REVIEW-INPUTS.md](./REVIEW-INPUTS.md#gitlab-merge-requests)); with
+no `GITLAB_TOKEN` or `GL_TOKEN` that block reads `UNAVAILABLE`
+(`token-missing`). Set it in the service's environment, for example through
+[`[env]`](#service-environment-env). glab itself prefers a `GITLAB_TOKEN` set in the service's environment over its
 stored login, so when that variable is set the overview reads with it too.
 
 ## Service environment (`[env]`)

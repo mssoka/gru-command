@@ -1874,10 +1874,23 @@ export function proveRecoveredBaseMergeability(review: FrozenReview, priorBaseTi
   }
 }
 
+/** When a GitLab merge request was read, and under which ledger seq, is
+ * provenance of that read (like an attachment's freeze time): the host reads it
+ * once per round, so a round that reads the same facts again keeps the
+ * effective inputs and specialist work stays reusable. The state, the binding,
+ * the checks, the failures and the reason are the effective part. A GitHub
+ * record is compared whole, as before: its observation is the poll's event. */
+function effectiveCiIdentity(ci: CiEvidenceRecord | null | undefined): unknown {
+  if (ci === null || ci === undefined || typeof ci !== 'object') return ci;
+  if (typeof ci.sourceKind !== 'string' || !ci.sourceKind.startsWith('gitlab.')) return ci;
+  const { observedAt: _observedAt, sourceSeq: _sourceSeq, ...effective } = ci;
+  return effective;
+}
+
 function effectiveEvidenceIdentity(evidence: FrozenReviewEvidenceManifest | undefined): unknown {
   if (evidence === undefined) return undefined;
   return {
-    ci: evidence.ci,
+    ci: effectiveCiIdentity(evidence.ci),
     // Each manifest keeps its own freeze time. It is provenance of the copy,
     // not a change to the bytes or owner-authorized purpose/consent.
     attachments: evidence.attachments.map(({ frozenAt: _frozenAt, ...effective }) => effective),
