@@ -815,6 +815,37 @@ describe('verification scheduler — global budget', () => {
     scheduler.release(lease);
   });
 
+  it('an output pipe a stray descendant still holds at the drain cut-off is closed by the runner, never a failed run (#523 verification repair)', async () => {
+    // #523's guards scope went red on an exit-0 step whose pipes were still
+    // open 2s after the shell exited: the runner destroyed its own pipes HARD
+    // (the iteration then reports ERR_STREAM_PREMATURE_CLOSE), and because the
+    // late error landed while the NEXT step ran, that innocent step was marked
+    // failed and the whole run was not promotable. A background `sleep`
+    // inherits the step's stdout/stderr and outlives its exit-0 shell, so this
+    // reproduces the window every time; the second step is what the late error
+    // used to fall on.
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const frames: VerificationProgress[] = [];
+    const outcome = await scheduler.run(
+      spec('job-stray-pipe', '/bin/sh -c "sleep 3 & exit 0" && node -e "process.exit(0)"'),
+      (frame) => { frames.push(frame); },
+    );
+    // The exit verdict stands: no manufactured run error, no innocent step red.
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.error).toBeNull();
+    expect(outcome.ok).toBe(true);
+    expect(outcome.timedOut).toBe(false);
+    // The capture says what the runner did instead of hiding it.
+    const output = frames
+      .filter((frame): frame is Extract<VerificationProgress, { type: 'output' }> => frame.type === 'output')
+      .map((frame) => frame.text)
+      .join('');
+    expect(output).toContain('step 1: output pipes were still open 2s after the step exited; the runner closed them (the exit verdict stands)');
+    expect(records.find((record) => record.kind === 'verification.completed')?.payload).toMatchObject({ ok: true, exit_code: 0 });
+    expect(scheduler.activeCount()).toBe(0);
+  });
+
   it('kills the process group on run timeout and persists an emptied holder file', async () => {
     const { scheduler, storageDir } = makeScheduler({ runTimeoutMs: 250, lockWaitTimeoutMs: 500 });
     scheduler.start();
@@ -1403,4 +1434,82 @@ describe('verification scheduler — global budget', () => {
     scheduler.release(lease);
     expect(existsSync(join(storageDir, 'scheduler.json'))).toBe(true);
   });
+});
+
+it('records every verification event with its command lines masked while the run keeps and spawns the raw command (#534 R2)', async () => {
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const repo = makeRepo();
+  const { scheduler, records } = makeScheduler();
+  scheduler.start();
+  const command = `node -e "process.exit(0)" -- --token ${secret}`;
+  const masked = 'node -e "process.exit(0)" -- --token [REDACTED]';
+  try {
+    const outcome = await scheduler.submit(repoSpec(repo, 'job-mask', { command, requestId: 'mask-request' }));
+    // The run is the raw command: it ran, and its outcome (the caller's own) names it.
+    expect(outcome).toMatchObject({ ok: true, exitCode: 0, command });
+    const byKind = (kind: string) => records.filter((record) => record.kind === kind);
+    for (const kind of ['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']) {
+      expect(byKind(kind), kind).toHaveLength(1);
+    }
+    expect(byKind('verification.requested')[0]!.payload['command']).toBe(masked);
+    expect(byKind('verification.started')[0]!.payload['command']).toBe(masked);
+    expect(byKind('verification.process-started')[0]!.payload).toMatchObject({
+      command: masked, process_command: `/bin/sh -c ${masked}`, step_command: masked,
+    });
+    expect(byKind('verification.completed')[0]!.payload['command']).toBe(masked);
+    // Nothing the run published carries the credential, the dedupe key and the per-step checks included.
+    for (const record of records) {
+      expect(JSON.stringify(record), record.kind).not.toContain(secret);
+      for (const field of ['command', 'process_command', 'step_command', 'dedupe_key']) {
+        if (record.payload[field] !== undefined) expect(String(record.payload[field]), `${record.kind}.${field}`).toContain('[REDACTED]');
+      }
+    }
+    // The shape is unchanged for a command that carries nothing to mask.
+    const clean = await scheduler.submit(repoSpec(repo, 'job-clean', { requestId: 'clean-request' }));
+    expect(clean).toMatchObject({ ok: true });
+    expect(records.filter((record) => record.kind === 'verification.started' && record.jobId === 'job-clean')[0]!.payload['command']).toBe('node -e "process.exit(0)"');
+  } finally { await scheduler.dispose(); }
+});
+
+it('records a planned run with its per-step checks masked while the run keeps the raw steps (#534 R2)', async () => {
+  // `planCommand` decomposes this chain into two steps and records a check per step in the completed outcome; the
+  // recorded event must carry each check's command masked, not only the outcome's top-level command line.
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const repo = makeRepo();
+  repo.commitFile('package.json', `${JSON.stringify({ name: 'verify-fixture', private: true, scripts: { build: 'node -e "process.exit(0)"' } }, null, 2)}\n`);
+  const { scheduler, records } = makeScheduler();
+  scheduler.start();
+  const command = `npm run build && node verify.mjs pass --token ${secret}`;
+  const secondStep = 'node verify.mjs pass --token [REDACTED]';
+  try {
+    const outcome = await scheduler.submit(repoSpec(repo, 'job-checks', { command, requestId: 'checks-request', scope: 'docs' }));
+    // The run itself is the raw chain: its outcome (the caller's own) names it and carries both raw steps.
+    expect(outcome.command).toBe(command);
+    expect(outcome.checks?.map((check) => check.command)).toEqual(['npm run build', `node verify.mjs pass --token ${secret}`]);
+    const completed = records.filter((record) => record.kind === 'verification.completed' && record.jobId === 'job-checks');
+    expect(completed).toHaveLength(1);
+    const checks = completed[0]!.payload['checks'] as { command: string }[];
+    expect(checks).toHaveLength(2);
+    expect(checks.map((check) => check.command)).toEqual(['npm run build', secondStep]);
+    for (const check of checks) expect(check.command).not.toContain(secret);
+    expect(JSON.stringify(records)).not.toContain(secret);
+  } finally { await scheduler.dispose(); }
+});
+
+it('records a credential-bearing no-start refusal with its command masked (#534 R2)', async () => {
+  // A run that cannot spawn never emits `verification.started`; its `verification.no-start` record is written at a
+  // direct record site, and it carries the scope's command. That site masks too.
+  const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+  const { scheduler, records } = makeScheduler();
+  scheduler.start();
+  const command = `node verify.mjs pass --token ${secret}`;
+  const cwd = join(tempDir(), 'does-not-exist');
+  try {
+    await expect(scheduler.submit({ jobId: 'job-no-start', scope: 'full', command, cwd, head: null, requestId: 'no-start-request' }))
+      .rejects.toThrow(/ENOENT/u);
+    const noStart = records.filter((record) => record.kind === 'verification.no-start');
+    expect(noStart).toHaveLength(1);
+    expect(noStart[0]!.payload).toMatchObject({ request_ids: ['no-start-request'], cwd, command: 'node verify.mjs pass --token [REDACTED]', started: false, reason: 'spawn_failed' });
+    expect(JSON.stringify(records)).not.toContain(secret);
+  } finally { await scheduler.dispose(); }
 });

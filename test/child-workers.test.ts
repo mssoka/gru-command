@@ -735,6 +735,33 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(h.worktrees.getWorktree(admission.record.id)).toBeNull();
     expect(floor.view()).toEqual([]);
     expect(h.spawns).toHaveLength(0);
+    // No session ever existed: the agent row written `spawning` at admission
+    // does not stay an open worker turn (#547).
+    expect(h.ledger.getAgent(admission.record.id)?.state).toBe('disposed');
+    floor.stop();
+    h.close();
+  });
+
+  it('a child whose parent is no longer usable ends before any session and leaves its agent row out of the live states (#547)', async () => {
+    let free = 6 * GIB;
+    const floor = new DiskFloorGate({ floorGb: 10, volumes: [{ name: 'lanes', path: tmpdir() }], statfs: async () => ({ freeBytes: free, totalBytes: 500 * GIB }), device: async () => 'disk', pollMs: 60_000 });
+    const h = makeHarness({ diskFloor: floor });
+    const admission = h.request({ authority: 'writer', idempotencyKey: 'key-parent-died' });
+    await waitFor(() => floor.view().length === 1, 'the writer child to wait at the floor');
+    expect(h.ledger.getAgent(admission.record.id)?.state).toBe('spawning');
+
+    // The parent's turn died with its host and a boot settled it: an errored
+    // parent has no authority to delegate, so the waiting child must not run.
+    h.ledger.setAgentState('parent-1', 'error');
+    free = 12 * GIB;
+    floor.recheck();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultSummary).toContain('parent agent "parent-1" is error');
+    expect(h.spawns).toHaveLength(0);
+    expect(h.ledger.getAgent(admission.record.id)?.state).toBe('error');
+    expect(h.ledger.getAgent(admission.record.id)).toMatchObject({ jobId: 'job-1', parentAgentId: 'parent-1' });
     floor.stop();
     h.close();
   });
@@ -1068,7 +1095,6 @@ describe('tracked child workers: migration and storage', () => {
     // registered lane AND its process evidence (the FK child table the
     // worktrees rebuild must keep satisfying at commit).
     const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 14) });
-    const before = new LedgerApi(legacy.handle, {});
     // Seed through the FIXTURE's own schema: the merged build's addJob also
     // writes jobs.display_name (migration 17), which a pre-#161 fixture
     // (migrations <= 14 / <= 15) does not carry. The raw insert matches the
@@ -1088,11 +1114,15 @@ legacy.handle
          VALUES ('job-1', 'job', '/tmp/r', 'r', '/tmp/r/wt', NULL, 'abc', 'job-1', NULL, 'active', NULL, ?, ?)`,
       )
       .run(seededAt, seededAt);
-    before.recordWorktreeProcesses({
-      worktreeId: 'job-1',
-      processes: [{ pid: 123, command: 'sleep 1', evidence: 'argv' }],
-      state: 'live',
-    });
+    // The process evidence too, in the legacy columns: the merged build's
+    // recordWorktreeProcesses also writes worktree_processes.command_sha256
+    // (migration 34), which this fixture's schema does not carry.
+    legacy.handle
+      .prepare(
+        `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+         VALUES ('job-1', 123, 'sleep 1', 'argv', 'live', ?, ?)`,
+      )
+      .run(seededAt, seededAt);
     legacy.close();
     // The shipped build runs every migration: the worktrees table is
     // rebuilt for kind 'child' and the FK evidence survives.

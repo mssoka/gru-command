@@ -63,9 +63,10 @@ export interface NotificationDecision {
  * code moved; #427: the repository left managed_repos, or onboarding was
  * turned off; #427 PR 2b: a lane proposed for discard was reconnected to
  * its repository, or swept; #427 PR 3: GC got under its disk budget and
- * above the floor without the proposed reclaim). Every other undecided
+ * above the floor without the proposed reclaim; #523: the directive request
+ * proposed for abandonment ended some other way). Every other undecided
  * owner row stays open until answered. */
-const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal', 'onboarding.proposal', 'worktree.repo-mismatch', 'disk.reclaim-proposal'];
+const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal', 'onboarding.proposal', 'worktree.repo-mismatch', 'disk.reclaim-proposal', 'owner-approval.directive-abandon'];
 
 /** #486: a paused sweep's card (`worktree-sweep-paused:<lane>:<pause>`) is
  * withdrawn undecided when its lane is swept without it, or a newer pause of

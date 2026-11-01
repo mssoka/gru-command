@@ -16,6 +16,7 @@ import {
   captureOwnerPath,
   captureReceiptPath,
   captureReceiptSucceeded,
+  captureRefusalDetail,
   capturedOutcomeFields,
   openExclusiveCaptureSink,
   readCaptureOwner,
@@ -36,7 +37,7 @@ import {
  *
  *   node dist/verify/capture-cli.js run --job <id> [--scope full] \
  *     --sink <unique.ndjson> [--request-id <id>] [--expected-head <sha>] \
- *     --url <base> --config <config.toml> [--token <token>]
+ *     [--wait-budget-ms <n>] --url <base> --config <config.toml> [--token <token>]
  *
  * The sink is created exclusively BEFORE the POST, every NDJSON frame is
  * streamed to EOF, and the terminal receipt (`<sink>.receipt.json`) binds
@@ -44,6 +45,15 @@ import {
  * ends without a valid terminal completion is `unknown`, never success.
  * Reconnecting with the same `--request-id` reconciles (attach/replay) on
  * the server — it never replays an unknown-outcome submission blind.
+ *
+ * `run` never abandons an accepted request (issue #554): a connect +
+ * response-headers timeout re-submits the SAME `request_id` and body, so the
+ * scheduler attaches it to the in-flight run (and replays the output frames
+ * it missed) or replays the completed run's retained output. Its total wait
+ * is bounded by `--wait-budget-ms` (default {@link CAPTURE_WAIT_BUDGET_MS});
+ * only past that bound is the receipt an honest `unknown` that names the
+ * request id and the reconcile path. A completed capture is promotable only
+ * when the sink's reassembled output equals the run's recorded output.
  *
  *   node dist/verify/capture-cli.js status --request-id <id> --url <base> --config <c>
  *   node dist/verify/capture-cli.js withdraw --owner <sink>.owner.json
@@ -69,6 +79,17 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export const CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS = 60_000;
 /** The errno-style code a response-headers timeout carries into the receipt. */
 export const CAPTURE_RESPONSE_TIMEOUT_CODE = 'ERESPONSETIMEOUT';
+/**
+ * Default bound on ONE capture's total wait for a terminal frame (#554): the
+ * shipped `[verify]` defaults, `lock_wait_timeout_ms` (900,000) +
+ * `run_timeout_ms` (1,800,000), plus a 120,000 ms margin. The helper never
+ * reads the service's configured limits; an operator whose service uses
+ * larger bounds passes `--wait-budget-ms` explicitly.
+ */
+export const CAPTURE_WAIT_BUDGET_MS = 2_820_000;
+/** Pause between a headers-timeout re-submit and the next one (#554): a burst
+ * of tiny headers bounds must not become a busy loop against the service. */
+export const CAPTURE_RESUBMIT_DELAY_MS = 1_000;
 
 /** Node's setTimeout ceiling: a larger delay overflows and fires at once. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -263,6 +284,37 @@ function transportFor(deps: CaptureCliDeps): FetchLike {
   return deps.fetchImpl ?? ((input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs }));
 }
 
+/**
+ * A transport whose connect + response-headers bound never outlives the
+ * capture's remaining wait budget (#554): each attempt gets the smaller of
+ * the configured bound and the budget left, so `--wait-budget-ms 300`
+ * against a service that never answers abandons at ~300 ms instead of
+ * waiting out the 60 s default bound. An injected transport keeps its own
+ * timing (the caller owns it).
+ */
+function boundedTransportFor(deps: CaptureCliDeps, remainingMs: number): FetchLike {
+  if (deps.fetchImpl !== undefined) return deps.fetchImpl;
+  const configured = deps.responseHeadersTimeoutMs ?? CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS;
+  const effective = Math.max(1, Math.min(configured, Math.floor(remainingMs)));
+  checkResponseHeadersTimeoutMs(effective);
+  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: effective });
+}
+
+/** Does this transport error mean the response headers never arrived? Only
+ * that one case is re-submitted (#554); a refused/reset connection and a
+ * stream severed after the headers keep today's single-attempt receipt. */
+export function isResponseHeadersTimeout(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === CAPTURE_RESPONSE_TIMEOUT_CODE) return true;
+  const cause = (error as { readonly cause?: unknown }).cause;
+  return (
+    typeof cause === 'object' &&
+    cause !== null &&
+    (cause as NodeJS.ErrnoException).code === CAPTURE_RESPONSE_TIMEOUT_CODE
+  );
+}
+
 /** Transport errors keep the primary message and add the underlying code
  * (the runtime attaches it either on the error itself or on its cause)
  * so a severed stream is diagnosable from the receipt instead of a bare
@@ -308,7 +360,8 @@ function printUsage(stream: (text: string) => void): void {
     [
       'usage:',
       '  capture run --job <id> [--scope <scope>] --sink <path> [--request-id <id>]',
-      '              [--expected-head <sha>] [--url <base>] [--config <path> | --token <token>]',
+      '              [--expected-head <sha>] [--wait-budget-ms <n>]',
+      '              [--url <base>] [--config <path> | --token <token>]',
       '  capture status --request-id <id> [--url <base>] [--config <path> | --token <token>] [--out <path>]',
       '  capture withdraw --owner <owner.json> [--kill-grace-ms <n>]',
       '',
@@ -476,6 +529,13 @@ async function commandRun(
   const sinkPath = required(flags, 'sink');
   const requestId = flags.get('request-id') ?? randomUUID();
   const expectedHead = flags.get('expected-head') ?? null;
+  const waitBudgetRaw = flags.get('wait-budget-ms') ?? String(CAPTURE_WAIT_BUDGET_MS);
+  const waitBudgetMs = Number(waitBudgetRaw);
+  if (!Number.isInteger(waitBudgetMs) || waitBudgetMs < 1) {
+    throw new UsageError(
+      `--wait-budget-ms must be a positive integer number of milliseconds, got ${JSON.stringify(waitBudgetRaw)}`,
+    );
+  }
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
   const now = deps.now ?? Date.now;
@@ -499,7 +559,9 @@ async function commandRun(
     return CAPTURE_EXIT.usage;
   }
   // After every usage refusal above, before this command's first side effect.
-  const fetchImpl = transportFor(deps);
+  // Validates the configured headers bound (an injected transport is used
+  // as-is; the default one is rebuilt per attempt with the remaining budget).
+  transportFor(deps);
   // A live owner returned above; restating !ownerAlive keeps the deletion safe
   // even if that refusal is ever edited. The probe found this claim's owner gone.
   if (ownerRead.kind === 'owner' && !ownerAlive) removeCaptureOwner(ownerPath);
@@ -533,45 +595,90 @@ async function commandRun(
   }
 
   const captureReader = new NdjsonCaptureReader();
+  // Issue #554: a headers timeout is not a lost run. The helper re-submits
+  // the SAME request_id and body (the scheduler's single-flight then attaches
+  // it to the in-flight attempt or replays the completed one) until it gets a
+  // response, and only past the total wait bound abandons loudly.
+  const requestBody = JSON.stringify({
+    job_id: jobId,
+    scope,
+    request_id: requestId,
+    ...(expectedHead === null ? {} : { expected_head: expectedHead }),
+  });
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const waitStartedAt = now();
+  let attempts = 0;
+  let abandonedAfterMs: number | null = null;
+  let lastHeadersTimeout: unknown = null;
   let httpError: string | null = null;
   let transportError: string | null = null;
-  try {
-    const response = await fetchImpl(`${baseUrl}/api/verify`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${token}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        job_id: jobId,
-        scope,
-        request_id: requestId,
-        ...(expectedHead === null ? {} : { expected_head: expectedHead }),
-      }),
-    });
+  for (;;) {
+    attempts += 1;
+    const remainingMs = waitBudgetMs - (now() - waitStartedAt);
+    let response: Response;
+    try {
+      response = await boundedTransportFor(deps, remainingMs)(`${baseUrl}/api/verify`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          'content-type': 'application/json',
+        },
+        body: requestBody,
+      });
+    } catch (error) {
+      if (!isResponseHeadersTimeout(error)) {
+        // A refused/reset connection is today's UNKNOWN: re-submitting could
+        // not recover a request the service never saw as this identity.
+        transportError = describeTransportError(error);
+        break;
+      }
+      // Out of scope (#554): a stream severed AFTER the headers already wrote
+      // frames into this sink — never re-submit into it.
+      if (sink.bytes > 0) {
+        transportError = describeTransportError(error);
+        break;
+      }
+      lastHeadersTimeout = error;
+      const left = waitBudgetMs - (now() - waitStartedAt);
+      if (left <= 0) {
+        abandonedAfterMs = now() - waitStartedAt;
+        break;
+      }
+      await sleep(Math.min(CAPTURE_RESUBMIT_DELAY_MS, left));
+      // No post-sleep abandon: the loop re-checks the budget and makes its
+      // last submission with whatever is left (a 1 ms headers bound at the
+      // very end), so a small --wait-budget-ms still re-attaches at least
+      // once instead of spending the tail of the budget asleep.
+      continue;
+    }
+    // One response ends the re-submit loop: its body is the run's stream, and
+    // a body that then severs keeps the pre-existing UNKNOWN outcome.
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       httpError = `HTTP ${String(response.status)}: ${detail.slice(0, 500)}`;
     } else if (response.body !== null) {
       const decoder = new TextDecoder();
       const reader = response.body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value !== undefined) {
-          const text = decoder.decode(value, { stream: true });
-          sink.write(text);
-          captureReader.push(text);
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value !== undefined) {
+            const text = decoder.decode(value, { stream: true });
+            sink.write(text);
+            captureReader.push(text);
+          }
         }
-      }
-      const tail = decoder.decode();
-      if (tail !== '') {
-        sink.write(tail);
-        captureReader.push(tail);
+        const tail = decoder.decode();
+        if (tail !== '') {
+          sink.write(tail);
+          captureReader.push(tail);
+        }
+      } catch (error) {
+        transportError = describeTransportError(error);
       }
     }
-  } catch (error) {
-    transportError = describeTransportError(error);
+    break;
   }
   const digest = sink.close();
   const parsed = captureReader.finish();
@@ -580,7 +687,19 @@ async function commandRun(
   let outcome: CaptureOutcome;
   let exitCode: CaptureExitCode;
   let error: string | null = null;
-  if (httpError !== null) {
+  if (abandonedAfterMs !== null) {
+    // Past the bound: loud, never a silent 0-byte "nothing happened". The
+    // run may still have been accepted and completed, so the receipt names
+    // the identity and the reconcile path instead of inviting a rerun.
+    outcome = 'unknown';
+    exitCode = CAPTURE_EXIT.unknown;
+    error =
+      `the service never answered ${String(attempts)} submission(s) of request_id "${requestId}" within ` +
+      `--wait-budget-ms ${String(waitBudgetMs)} (abandoned after ${String(abandonedAfterMs)} ms) — the run may ` +
+      'still be accepted and complete; reconcile with the capture helper\'s status action ' +
+      `(--request-id ${requestId}) and read verification.completed in the ledger before rerunning; last attempt: ` +
+      `${lastHeadersTimeout === null ? 'no response' : describeTransportError(lastHeadersTimeout)}`;
+  } else if (httpError !== null) {
     outcome = 'unknown';
     exitCode = CAPTURE_EXIT.usage;
     error = httpError;
@@ -634,20 +753,25 @@ async function commandRun(
     timed_out: fields?.timedOut ?? null,
     output_bytes: fields?.outputBytes ?? null,
     output_sha256: fields?.outputSha256 ?? null,
+    captured_output_bytes: parsed.capturedOutputBytes,
+    captured_output_sha256: parsed.capturedOutputSha256,
+    replayed_output: parsed.replayedOutput,
+    attempts,
+    abandoned_after_ms: abandonedAfterMs,
     started: parsed.started,
     error,
+    detail: error,
     completed_at: new Date(now()).toISOString(),
   };
   // Exit 0 ONLY for the complete success predicate (clean exact head, zero
-  // exit, bound output, not a replay). A completed run that fails it is an
-  // honest exit 1 with a receipt that cannot be promoted to evidence.
+  // exit, the sink's output equal to the run's, and a replay that carried it
+  // from byte 0). A completed run that fails it is an honest exit 1 with a
+  // receipt that cannot be promoted to evidence.
   if (outcome === 'completed' && !captureReceiptSucceeded(baseReceipt)) {
     exitCode = CAPTURE_EXIT.failed;
-    error ??= baseReceipt.reconciled
-      ? 'replayed terminal receipt is not a promotable full capture — the ledger holds the run; do not rerun to recover logs'
-      : 'completed run is not a promotable exact-head PASS';
+    error ??= captureRefusalDetail(baseReceipt);
   }
-  const receipt: CaptureReceipt = { ...baseReceipt, error };
+  const receipt: CaptureReceipt = { ...baseReceipt, error, detail: error };
   writeCaptureReceipt(captureReceiptPath(sinkPath), receipt);
   if (outcome === 'completed') removeCaptureOwner(ownerPath);
   stdout(`${JSON.stringify(receipt, null, 2)}\n`);

@@ -70,6 +70,9 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // steps GC would take to get under its budget or above the floor in FOR
   // YOU for Accept or Decline.
   'disk.reclaim-proposal',
+  // Owner approval of abandoning one directive request (#523): Gru proposes,
+  // the owner's Approve makes the server carry out the abandonment.
+  'owner-approval.directive-abandon',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
@@ -94,7 +97,7 @@ const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
  * decision attached (validated at the write boundary). */
 const DECISION_REQUIRED_KINDS: readonly string[] = [
   'gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal', 'worktree.preserve-expiry', 'worktree.repo-mismatch',
-  'disk.reclaim-proposal',
+  'disk.reclaim-proposal', 'owner-approval.directive-abandon',
 ];
 
 /** Typed owner decisions whose PRODUCER service executes the recorded
@@ -111,6 +114,7 @@ const PRODUCER_FOLLOWED_DECISION_KINDS: readonly string[] = [
   'worktree.preserve-expiry',
   'worktree.repo-mismatch',
   'disk.reclaim-proposal',
+  'owner-approval.directive-abandon',
 ];
 const PRODUCER_FOLLOWED_DECISION_PREFIXES: readonly string[] = ['worktree-sweep-paused:'];
 

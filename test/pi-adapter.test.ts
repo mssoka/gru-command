@@ -7961,7 +7961,11 @@ describe('scheduled verification ordinary Pi Bash', () => {
   it('review-8 Pi SDK refuses option-terminator and heredoc-FD producers before any executable starts', async () => {
     for (const command of ['npx vitest run -- --help', 'npm 0<<EOF test\nEOF\n']) await refuses(command);
   });
-  it('strict repair every retained producing raw case refuses through ordinary Pi with zero starts', async () => {
+  // 54 independent lanes booted in one test: 8.9 s on an idle host, and the fast
+  // phase's 30 s ceiling was exceeded under the full suite's contended workers
+  // (full run 4fb228b9 at d41f3977), cascading into the next case. No assertion
+  // changes; the timeout allowance is the idiom this suite already uses.
+  it('strict repair every retained producing raw case refuses through ordinary Pi with zero starts', { timeout: 120_000 }, async () => {
     const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
     const refusedRows = nativeCorpus.filter((row) => row.refused);
     expect(refusedRows).toHaveLength(54);
