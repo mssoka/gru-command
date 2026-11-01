@@ -129,10 +129,11 @@ describe('gru role definition', () => {
     expect(section).toContain('A change to the briefing before admission is a cancel and re-enqueue under a new `id` (and a new `request_id` if you set one)');
     expect(section).toContain('After admission it is an ordinary dispatch amendment');
     expect(section).toContain('**Enqueue held.** Enqueue every entry with a `hold_reason` that names its release condition as a heist plus a milestone');
-    expect(section).toContain('"release after gc-520-continue is merged"');
+    expect(section).toContain('"release after the migration heist is merged"');
     expect(section).toContain('**One review while held.** While the entry is held, run one briefing review of its exact text');
     expect(section).toContain('Pipeline admission does not run the review gate today (#551)');
-    expect(section).toContain('**On READY,** clear the hold');
+    expect(section).toContain('**On READY,** clear the hold when the review was its only condition');
+    expect(section).toContain('When the hold also names an outside heist, keep it until that heist lands (see Dependencies)');
     expect(section).toContain('**On CHANGES-NEEDED,** record a push-back, clear the hold, and append one corrective dispatch amendment as soon as the entry is admitted');
     expect(section).toContain('That is the same practice as a direct dispatch at the review cap');
     expect(section).toContain("Do not cancel and re-enqueue to correct a briefing a review flagged: a cancelled entry keeps its id (a re-enqueue needs a fresh id and request id), and dependents' prerequisites are immutable");
@@ -165,6 +166,7 @@ describe('gru role definition', () => {
     const priority = between('## Priority', '## Exclusive scopes');
     const scopes = between('## Exclusive scopes', '## Admission');
     const admission = between('## Admission', '## The briefing-review gate is not run on admission');
+    const gate = between('## The briefing-review gate is not run on admission', '## Immutability and correction');
     // Routes the dispatch server mounts.
     for (const route of [
       'POST /api/pipeline/enqueue',
@@ -181,17 +183,24 @@ describe('gru role definition', () => {
     for (const field of ['id', 'repo_path', 'title', 'briefing', 'request_id', 'priority', 'prerequisites', 'exclusive_scopes', 'hold_reason', 'by']) {
       expect(enqueue, `docs/PIPELINE.md missing enqueue field ${field}`).toContain(`| \`${field}\` |`);
     }
-    // The closed state and milestone vocabularies, straight from the code.
+    // The two lenient optional strings say so; the route drops a non-string.
+    expect(enqueue).toContain('| `request_id` | no | A string. A non-string is ignored and the `id` is used.');
+    expect(enqueue).toContain('| `by` | no | A string; a non-string is ignored.');
+    // The endpoint intro names the 409 and 404 it documents below.
+    expect(endpoints).toContain('An enqueue conflict is `409 conflict` and an unknown entry read is `404 not_found`');
+    // The closed state and milestone vocabularies, straight from the code, and no
+    // stale extra row in either table (the names must compare both ways).
     for (const state of PIPELINE_STATES) {
       expect(states, `docs/PIPELINE.md missing state ${state}`).toContain(`| \`${state}\` |`);
     }
+    expect([...states.matchAll(/^\| `([a-z]+)` \|/gmu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_STATES].sort());
     // Each state row keeps its own meaning (a row cannot swap with another).
     for (const row of [
       '| `waiting` | Enqueued, held, or blocked.',
       '| `ready` | Nothing blocks it.',
       '| `admitting` | The service claimed it',
       '| `admitted` | Dispatched. The entry id is now the job id',
-      '| `failed` | Terminal. Admission failed three times before any job existed.',
+      '| `failed` | Terminal. Admission failed three times without an adoptable job.',
       '| `cancelled` | Terminal. Closed by `cancel`.',
     ]) {
       expect(states, `docs/PIPELINE.md state row changed: ${row}`).toContain(row);
@@ -199,6 +208,7 @@ describe('gru role definition', () => {
     for (const milestone of PIPELINE_MILESTONES) {
       expect(milestones, `docs/PIPELINE.md missing milestone ${milestone}`).toContain(`| \`${milestone}\` |`);
     }
+    expect([...milestones.matchAll(/^\| `([a-z]+)` \|/gmu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_MILESTONES].sort());
     // merged and done are separate endings; the role relies on that.
     expect(milestones).toContain('| `merged` | has a job whose status is exactly `merged`. |');
     expect(milestones).toContain('| `done` | has a job whose status is exactly `done`. |');
@@ -237,12 +247,17 @@ describe('gru role definition', () => {
     // The live handoff failure is blocked by the pipeline itself, with its card.
     expect(admission).toContain('when the failure escaped before that handler (for example the handoff write), the pipeline\'s interrupted-startup check blocks the job');
     expect(admission).toContain('The pipeline never posts that card for a job the dispatch service already blocked');
-    // Linked from the role section and from the dispatch flow, where dispatch is described.
-    expect(readFileSync(GRU_MD, 'utf-8')).toContain('docs/PIPELINE.md');
+    // The gate gap's substantive claim, not only its heading and link.
+    expect(gate).toContain('runs inside the `POST /api/dispatch` handler, before that route creates anything');
+    expect(gate).toContain('Pipeline admission calls the dispatch service directly and never passes through the handler.');
+    expect(gate).toContain('is never held for a READY review at any `stage`, is never refused for a missing review, and carries no review provenance on its job');
     const flow = readFileSync(join(REPO_ROOT, 'docs', 'FLOW.md'), 'utf-8');
     const dispatchSection = flow.slice(flow.indexOf('## 2. Ops handoff (dispatch)'), flow.indexOf('## 3. Lifecycle on the board'));
     expect(dispatchSection).toContain('(./PIPELINE.md)');
-    expect(readFileSync(join(REPO_ROOT, 'docs', 'BRIEFING-REVIEW.md'), 'utf-8')).toContain(
+    expect(dispatchSection).toContain('the briefing-review gate\ndoes not run');
+    const briefingReview = readFileSync(join(REPO_ROOT, 'docs', 'BRIEFING-REVIEW.md'), 'utf-8');
+    expect(briefingReview).toContain('A heist admitted from the durable\npipeline never passes through it, at any stage');
+    expect(briefingReview).toContain(
       '(./PIPELINE.md#the-briefing-review-gate-is-not-run-on-admission)',
     );
   });

@@ -148,6 +148,42 @@ describe('pipeline ledger — claims and admission', () => {
     db.close();
   });
 
+  it('enforces the hold text bound, the hold/clear state matrix and the exclusive-scope bounds the doc states', () => {
+    const { db, ledger } = boot();
+    // Enqueue trims and cuts the hold reason to 500 characters.
+    const held = enqueue(ledger, 'pipe-hold', { holdReason: `  ${'x'.repeat(600)}  ` });
+    expect(held.holdReason).toBe('x'.repeat(500));
+    // Holding a waiting entry replaces the reason; clear-hold is idempotent.
+    expect(ledger.holdPipelineEntry({ id: 'pipe-hold', reason: 'second', by: 'gru' }).holdReason).toBe('second');
+    expect(ledger.clearPipelineHold({ id: 'pipe-hold' }).holdReason).toBeNull();
+    expect(ledger.clearPipelineHold({ id: 'pipe-hold' }).holdReason).toBeNull();
+    // A cancelled entry refuses hold and clear-hold; a failed one refuses all three.
+    enqueue(ledger, 'pipe-cancel');
+    ledger.cancelPipelineEntry({ id: 'pipe-cancel', reason: 'withdrawn' });
+    expect(() => ledger.holdPipelineEntry({ id: 'pipe-cancel', reason: 'nope' })).toThrow(/cancelled/);
+    expect(() => ledger.clearPipelineHold({ id: 'pipe-cancel' })).toThrow(/cancelled/);
+    enqueue(ledger, 'pipe-fail');
+    ledger.claimPipelineEntry({ id: 'pipe-fail', holder: 'silas' });
+    ledger.releasePipelineClaim({ id: 'pipe-fail', reason: 'admission failed: boom', outcome: 'failed' });
+    expect(() => ledger.holdPipelineEntry({ id: 'pipe-fail', reason: 'nope' })).toThrow(/failed/);
+    expect(() => ledger.clearPipelineHold({ id: 'pipe-fail' })).toThrow(/failed/);
+    expect(() => ledger.cancelPipelineEntry({ id: 'pipe-fail', reason: 'nope' })).toThrow(/failed/);
+    // An admitted entry is the job's; the queue refuses all three.
+    enqueue(ledger, 'pipe-admit');
+    ledger.claimPipelineEntry({ id: 'pipe-admit', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-admit', repo: 'demo', title: 'Entry pipe-admit', briefing: 'Briefing for pipe-admit' });
+    ledger.markPipelineAdmitted({ id: 'pipe-admit', jobId: 'pipe-admit' });
+    expect(() => ledger.holdPipelineEntry({ id: 'pipe-admit', reason: 'nope' })).toThrow(/admitted/);
+    expect(() => ledger.clearPipelineHold({ id: 'pipe-admit' })).toThrow(/admitted/);
+    expect(() => ledger.cancelPipelineEntry({ id: 'pipe-admit', reason: 'nope' })).toThrow(/admitted/);
+    // Exclusive scopes: the 200-character boundary, padding and duplicates.
+    expect(() => enqueue(ledger, 'pipe-scope-ok', { exclusiveScopes: ['s'.repeat(200)] })).not.toThrow();
+    expect(() => enqueue(ledger, 'pipe-scope-long', { exclusiveScopes: ['s'.repeat(201)] })).toThrow(/200/);
+    expect(() => enqueue(ledger, 'pipe-scope-pad', { exclusiveScopes: [' scoped'] })).toThrow(/whitespace-padded/);
+    expect(() => enqueue(ledger, 'pipe-scope-dup', { exclusiveScopes: ['a', 'a'] })).toThrow(/listed twice/);
+    db.close();
+  });
+
   it('admits only against a job that carries the exact accepted briefing', () => {
     const { db, ledger } = boot();
     const entry = enqueue(ledger, 'pipe-a');

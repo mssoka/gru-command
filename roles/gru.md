@@ -422,11 +422,13 @@ Fields, states and the read routes are in docs/PIPELINE.md.
   amendment.
 - **Enqueue held.** Enqueue every entry with a `hold_reason` that names its
   release condition as a heist plus a milestone — for example "release after
-  gc-520-continue is merged".
+  the migration heist is merged".
 - **One review while held.** While the entry is held, run one briefing review
   of its exact text. Pipeline admission does not run the review gate today
   (#551).
-- **On READY,** clear the hold.
+- **On READY,** clear the hold when the review was its only condition. When the
+  hold also names an outside heist, keep it until that heist lands (see
+  Dependencies).
 - **On CHANGES-NEEDED,** record a push-back, clear the hold, and append one
   corrective dispatch amendment as soon as the entry is admitted. That is the
   same practice as a direct dispatch at the review cap. Do not cancel and

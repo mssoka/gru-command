@@ -22,8 +22,9 @@ Every route needs `Authorization: Bearer <token>`, the instance `[auth]` token.
 A missing or wrong token answers `401 unauthorized` (`503 not_configured` when
 the instance has no token). A build that does not host the queue answers
 `503 pipeline_not_hosted`. Any other refusal is
-`400 bad_request` with a `detail`: a malformed field, an unknown entry on
-`hold`, `clear-hold` or `cancel`, or an entry whose state refuses the action.
+`400 bad_request` with a `detail` for a malformed field or an entry state that
+refuses the action. An enqueue conflict is `409 conflict` and an unknown entry
+read is `404 not_found` (both below).
 
 | Route | Does |
 |---|---|
@@ -44,12 +45,12 @@ the instance has no token). A build that does not host the queue answers
 | `repo_path` | yes | Path of the repository the lane is created from. Enqueue checks only that it is not blank; a path the dispatch service refuses surfaces at admission. |
 | `title` | yes | The heist title. |
 | `briefing` | yes | The complete briefing, stored verbatim. |
-| `request_id` | no | Idempotency identity. Defaults to `id`. |
+| `request_id` | no | A string. A non-string is ignored and the `id` is used. Idempotency identity. Defaults to `id`. |
 | `priority` | no | A JSON number, an integer from 0 to 9. Default 5. See [Priority](#priority). |
 | `prerequisites` | no | Array of `{ "id": "<entry id>", "milestone": "<milestone>" }`. See [Prerequisites](#prerequisites-and-milestones). |
 | `exclusive_scopes` | no | Array of scope names. See [Exclusive scopes](#exclusive-scopes). |
 | `hold_reason` | no | A string. A non-blank value enqueues the entry already held. Trimmed and cut to 500 characters. A blank string is no hold; a non-string is a 400. |
-| `by` | no | Who enqueued. Recorded on the `pipeline.enqueued` event; attribution only. |
+| `by` | no | A string; a non-string is ignored. Who enqueued. Recorded on the `pipeline.enqueued` event; attribution only. |
 
 The request body is capped at 512 KiB; a larger one is rejected and the
 connection is closed, so the client sees a reset rather than a `400`. Other
@@ -155,7 +156,7 @@ exposes the placer. The role tells Gru to clear only the holds it placed itself.
 | `ready` | Nothing blocks it. It is admitted as soon as the shared budget has a slot; `reason` says what it is waiting for, or is null. |
 | `admitting` | The service claimed it and is dispatching it (`dispatch claim in flight`). |
 | `admitted` | Dispatched. The entry id is now the job id and the job's ordinary lifecycle takes over. The entry leaves the list. |
-| `failed` | Terminal. Admission failed three times before any job existed. |
+| `failed` | Terminal. Admission failed three times without an adoptable job. |
 | `cancelled` | Terminal. Closed by `cancel`. |
 
 `waiting` and `ready` flip as eligibility changes. The `reason` on a `waiting`
@@ -268,8 +269,10 @@ then marks the entry `admitted`. A failed dispatch never duplicates work:
   notes it, and posts one `pipeline.adopted-without-worker` notification
   (`action-required`). The pipeline never posts that card for a job the
   dispatch service already blocked;
-- a claim left over from a crash is reconciled at boot: a committed job is
-  adopted, otherwise the entry returns to `waiting` with its briefing intact.
+- a claim left over from a crash is reconciled at boot: a committed job
+  carrying this entry's exact briefing and repository is adopted; any other
+  committed job leaves the entry waiting (and the later attempt follows the
+  normal failure ladder);
 
 ## The briefing-review gate is not run on admission
 
@@ -284,10 +287,12 @@ directive or re-brief ([REVIEW-INPUTS.md](./REVIEW-INPUTS.md)), so the worker's
 first turn runs on the text as enqueued.
 
 Until then, the discipline is Gru's: enqueue the entry held, review the exact
-briefing while it is held, clear the hold on READY, and on CHANGES-NEEDED record
-a push-back, clear the hold, and correct the worker with one dispatch amendment
-after admission (see the role). A finding that disagrees with the owner's intent
-is escalated as `scope-design` and never released.
+briefing while it is held, clear the hold on READY when the review was its only
+condition (when the hold also names an outside heist, keep it until that heist
+lands), and on CHANGES-NEEDED record a push-back, clear the hold, and correct
+the worker with one dispatch amendment after admission (see the role). A finding
+that disagrees with the owner's intent is escalated as `scope-design` and never
+released.
 
 ## Immutability and correction
 
