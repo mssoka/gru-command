@@ -22,7 +22,7 @@ import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
 import { shownText } from '../dispatch/line-safe.js';
-import { DirectiveCheckpointError, classifyDeadDirectiveTurn, custodyVerdictOf, describeDeadTurn, shownDeadTurnTool, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveCustodyVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, CUSTODY_VERDICT_EFFECT_LIMIT, classifyDeadDirectiveTurn, custodyVerdictOf, describeDeadTurn, shownDeadTurnTool, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DeadTurnVerdict, type DirectiveCustodyVerdict, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -1227,18 +1227,24 @@ function nowIso(): string {
 function deadTurnOf(sessionFile: string, identity: DirectiveTurnIdentity, producers: readonly DirectiveProducer[]):
   { readonly dead: DeadTurnVerdict; readonly producers: readonly DirectiveProducer[] } | null {
   let checkpoint: ReturnType<typeof inspectDirectiveCheckpoint>;
-  try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity); }
+  try { checkpoint = inspectDirectiveCheckpoint(sessionFile, identity, { tolerateTornTail: true }); }
   catch (error) {
     return { dead: { verdict: 'unbounded', runtime: null, reason: `native checkpoint is unreadable: ${shownText(String(error), 200)}`, pending: [] }, producers };
   }
+  // A successful terminal is settled, not judged. A failed terminal is a dead turn
+  // (contract revision 1's "terminal, ok or not" sentence conflicts with its own
+  // A1/A2 red-at-custody-refusal requirement for pi, whose refused shapes are the
+  // failed terminal and the incomplete tool effects; see docs/DIRECTIVE-RECOVERY.md).
   if (checkpoint.state === 'terminal' && checkpoint.ok) return null;
-  if (checkpoint.state !== 'unknown' && checkpoint.state !== 'terminal') return null;
+  // `resumable`: a pi turn that died after admission (or after a completed tool
+  // round) with no terminal written. It is a dead turn too: its producer is
+  // host-absent, so the evidence, not a later continuation, decides.
   return { dead: classifyDeadDirectiveTurn(sessionFile, identity), producers };
 }
 
 /** The recovery decision's record of a dead turn's verdict (bounded in size). */
 function deadTurnRecord(dead: DeadTurnVerdict, producers: readonly DirectiveProducer[]): Record<string, unknown> {
-  const cap = <T>(items: readonly T[]): readonly T[] => items.slice(0, 20);
+  const cap = <T>(items: readonly T[]): readonly T[] => items.slice(0, CUSTODY_VERDICT_EFFECT_LIMIT);
   return {
     verdict: dead.verdict, runtime: dead.runtime, summary: describeDeadTurn(dead),
     ...(dead.verdict === 'bounded' ? { effects: cap(dead.effects).map(shownDeadTurnTool), effect_count: dead.effects.length } : {}),
@@ -9654,7 +9660,13 @@ export class LedgerApi {
   openDirectiveRecoveryDebt(requestId: string, reason: string): ObligationRecord {
     const row = this.getDirective(requestId);
     if (row === null || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('only live directive requests owe recovery judgment');
-    return this.transaction(() => this.observeRecoveryDebt('directive', requestId, row.jobId, row.baselineSeq, {
+    // A debt first opened while the producer was still live is re-planned once the
+    // dead producer's cessation is durably recorded: the old watermark would drop the
+    // new observation as stale, leaving Gru an owner-ask for a turn the evidence settles.
+    // The dead producer's own event is a stable watermark, not a moving one.
+    const ceased = this.settledDeadProducers(requestId).length === 0 ? null
+      : this.latestJobEventByRequestId(row.jobId, 'silas.directive-producer-ceased', requestId);
+    return this.transaction(() => this.observeRecoveryDebt('directive', requestId, row.jobId, Math.max(row.baselineSeq, ceased?.seq ?? 0), {
       logicalStep: 'operation', incidentKey: `directive-recovery:${requestId}`,
       category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: row.baselineSeq,
       description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
@@ -10543,6 +10555,14 @@ export class LedgerApi {
       );
     }
     return blockers;
+  }
+
+  /** The same ownership, each entry tagged (the recovery card distinguishes a
+   * live fence from custody uncertainty without re-deriving either). */
+  directiveOwnershipBlockers(requestId: string, laneId: string): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
+    const row = this.getDirective(requestId);
+    if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
+    return this.directiveOwnership(row, laneId);
   }
 
   /** Restart custody: the verdict on a request whose original native producer

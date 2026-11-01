@@ -752,8 +752,13 @@ function admitPiDirective(file: string, binding: DirectiveNativeBinding, transcr
  * the exact user child of the prepared baseline, or of Pi's compaction linked
  * on it, is admitted. Each linked Pi compaction (see linkedCompactionRefusal)
  * is walked past; a missing result, a branch, another control, an unlinked or
- * malformed compaction, or another prompt refuses continuation. */
-export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurnIdentity, options: { readonly ignoreGuardRefusals?: boolean } = {}): DirectiveCheckpoint {
+ * malformed compaction, or another prompt refuses continuation.
+ * `tolerateTornTail` is only for classifying a proven-dead turn: a tool is
+ * allowed only after its intent is durably complete, so a partial final line
+ * is no evidence either way (contract revision 1). Live continuation keeps the
+ * strict `whole` read. */
+export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurnIdentity,
+  options: { readonly ignoreGuardRefusals?: boolean; readonly tolerateTornTail?: boolean } = {}): DirectiveCheckpoint {
   validateDirectiveIdentity(identity);
   const binding = readDirectiveBinding(file, identity.requestId);
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
@@ -761,7 +766,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   const ignoreRefusals = options.ignoreGuardRefusals === true;
   if (binding.runtime === 'claude-code') return inspectClaudeDirectiveCheckpoint(file, binding, ignoreRefusals);
   if (binding.runtime !== 'pi') return unknown('exact native request association unavailable');
-  return withPiTranscript(file, binding.baseline, 'whole', (transcript) => piDirectiveCheckpoint(file, binding, transcript, ignoreRefusals));
+  return withPiTranscript(file, binding.baseline, options.tolerateTornTail === true ? 'accepted' : 'whole', (transcript) => piDirectiveCheckpoint(file, binding, transcript, ignoreRefusals));
 }
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
@@ -1604,7 +1609,15 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
  * - `bounded`: intents exist and each has a completion (or a refusal); the
  *   effects are known and listed.
  * - `unbounded`: an intent has neither, or the evidence cannot be trusted. The
- *   reason names which.
+ *   reason names which. A turn whose last completion is a failed result it
+ *   never answered is unbounded too: the failure may be an interrupted effect.
+ *
+ * A torn final line is no evidence either way: a tool is allowed only after its
+ * intent is durably complete, so the partial tail is dropped when classifying.
+ * Malformation anywhere before it is `unbounded` (the checkpoint walk's own
+ * refusal). An authority-boundary refusal receipt says the host ran no further
+ * tool after it, so an unrefused, uncompleted intent that follows one is not an
+ * unaccounted effect.
  */
 export interface DeadTurnTool { readonly id: string; readonly name: string }
 export interface DeadTurnEffect extends DeadTurnTool { readonly outcome: 'completed' | 'failed' }
@@ -1630,6 +1643,10 @@ function shownDeadTurnText(value: string): string {
 export function shownDeadTurnTool<T extends DeadTurnTool>(tool: T): T {
   return { ...tool, id: shownDeadTurnText(tool.id), name: shownDeadTurnText(tool.name) };
 }
+/** The recorded verdict's effect list is bounded like its sibling `dead_turn`
+ * record: a long turn never writes an unbounded, model-driven list into the
+ * recovery decision (the full count stays on `dead_turn.effect_count`). */
+export const CUSTODY_VERDICT_EFFECT_LIMIT = 20;
 function unboundedDeadTurn(runtime: DirectiveNativeBinding['runtime'] | null, reason: string, pending: readonly DeadTurnTool[] = []): DeadTurnVerdict {
   return { verdict: 'unbounded', runtime, reason, pending };
 }
@@ -1639,27 +1656,35 @@ export function deadTurnList(tools: readonly DeadTurnTool[], limit = 6): string 
   return tools.length > limit ? `${shown}, and ${String(tools.length - limit)} more` : shown;
 }
 /** `intents`: tool id → name, in transcript order; `results`: tool id → whether
- * the result was an error. */
-function settleDeadTurn(runtime: DirectiveNativeBinding['runtime'], intents: ReadonlyMap<string, string>, results: ReadonlyMap<string, boolean>, refusedIds: ReadonlySet<string>, boundaryRefusals: number): DeadTurnVerdict {
+ * the result was an error; `unanswered`: the turn's last completion is a failed
+ * result it never went on to answer (the checkpoint walk's own contract). */
+function settleDeadTurn(runtime: DirectiveNativeBinding['runtime'], intents: ReadonlyMap<string, string>, results: ReadonlyMap<string, boolean>,
+  refusedIds: ReadonlySet<string>, boundaryRefusals: number, unanswered: boolean): DeadTurnVerdict {
   const refused: DeadTurnTool[] = [];
   const pending: DeadTurnTool[] = [];
   const effects: DeadTurnEffect[] = [];
   for (const [id, name] of intents) {
     if (refusedIds.has(id)) refused.push({ id, name });
-    else if (!results.has(id)) pending.push({ id, name });
+    // The host recorded that no further tool ran after its authority boundary:
+    // an unrefused, uncompleted intent that follows one is no unaccounted effect.
+    else if (!results.has(id)) { if (boundaryRefusals === 0) pending.push({ id, name }); }
     else effects.push({ id, name, outcome: results.get(id) === true ? 'failed' : 'completed' });
   }
   if (pending.length > 0) return unboundedDeadTurn(runtime, `tool intent ${deadTurnList(pending)} has neither a completion nor a recorded refusal`, pending);
+  // A failed completion the turn never answered may be an interrupted effect.
+  if (unanswered) return unboundedDeadTurn(runtime, TOOL_ERROR_UNANSWERED);
   return effects.length === 0 ? { verdict: 'none', runtime, refused, boundaryRefusals } : { verdict: 'bounded', runtime, effects, refused, boundaryRefusals };
 }
 
 /** The intents and results of a turn the checkpoint walk found sound. A torn
- * final frame is no evidence either way: the Claude turn is read whole. */
+ * final frame is no evidence either way: it is dropped, and only what is
+ * complete is classified. */
 function claudeDeadTurn(file: string, binding: DirectiveNativeBinding, refusedIds: ReadonlySet<string>, boundaryRefusals: number): DeadTurnVerdict {
   const unbounded = (reason: string): DeadTurnVerdict => unboundedDeadTurn('claude-code', reason);
   return withClaudeTurn(file, binding, (turn) => {
     const intents = new Map<string, string>();
     const results = new Map<string, boolean>();
+    let unanswered = false;
     for (let index = turn.echo + 1; ; index += 1) {
       const frame = turn.frame(index);
       if (frame === undefined) break;
@@ -1670,6 +1695,8 @@ function claudeDeadTurn(file: string, binding: DirectiveNativeBinding, refusedId
       const message = frame['message'] as { content?: unknown } | undefined;
       const blocks = Array.isArray(message?.content) ? message.content as Record<string, unknown>[] : [];
       if (type === 'assistant') {
+        // Only the main agent's own frame answers it, never a sub-agent's.
+        if (frame['parent_tool_use_id'] == null) unanswered = false;
         for (const block of blocks) {
           if (block['type'] !== 'tool_use') continue;
           const { id, name } = block;
@@ -1679,22 +1706,26 @@ function claudeDeadTurn(file: string, binding: DirectiveNativeBinding, refusedId
         }
       } else if (type === 'user' && frame['isReplay'] !== true) {
         for (const block of blocks) {
-          if (block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') results.set(block['tool_use_id'], block['is_error'] === true);
+          if (block['type'] !== 'tool_result' || typeof block['tool_use_id'] !== 'string') continue;
+          results.set(block['tool_use_id'], block['is_error'] === true);
+          if (block['is_error'] === true) unanswered = true;
         }
       }
     }
-    return settleDeadTurn('claude-code', intents, results, refusedIds, boundaryRefusals);
-  }, unbounded, 'whole');
+    return settleDeadTurn('claude-code', intents, results, refusedIds, boundaryRefusals, unanswered);
+  }, unbounded, 'accepted');
 }
 
 function piDeadTurn(file: string, binding: DirectiveNativeBinding, refusedIds: ReadonlySet<string>, boundaryRefusals: number): DeadTurnVerdict {
   const unbounded = (reason: string): DeadTurnVerdict => unboundedDeadTurn('pi', reason);
-  return withPiTranscript(file, binding.baseline, 'whole', (transcript) => {
+  return withPiTranscript(file, binding.baseline, 'accepted', (transcript) => {
     const { turn } = transcript;
     const at = turn === null ? null : piReceiptAt(turn, binding.baseline, new PiAncestry(transcript));
     if (turn === null || at === null || typeof at === 'string') return unbounded('the request receipt is unavailable');
     const intents = new Map<string, string>();
     const results = new Map<string, boolean>();
+    const notExecuted = new Set<string>();
+    let unanswered = false;
     for (let index = at.index + 1; ; index += 1) {
       const entry = turn(index);
       if (entry === undefined) break;
@@ -1705,11 +1736,20 @@ function piDeadTurn(file: string, binding: DirectiveNativeBinding, refusedIds: R
       // After the turn's end, a user message is a later request's (the walk proved it bound).
       if (role === 'user') break;
       if (role === 'toolResult') {
-        if (typeof message['toolCallId'] === 'string') results.set(message['toolCallId'], message['isError'] === true);
+        if (typeof message['toolCallId'] !== 'string') continue;
+        results.set(message['toolCallId'], message['isError'] === true);
+        // The SDK's own "not executed" answer to a length row is no effect either way.
+        const notRun = notExecuted.delete(message['toolCallId']) && message['isError'] === true;
+        if (message['isError'] === true && !notRun) unanswered = true;
       } else if (role === 'assistant' && Array.isArray(message['content'])) {
+        unanswered = false;
         // The SDK runs none of an error or aborted row's calls and answers a length row's itself; every other row's calls count.
         const calls = rowCalls(message['stopReason']);
-        if (calls === 'never-run' || calls === 'not-executed') continue;
+        if (calls === 'never-run') continue;
+        if (calls === 'not-executed') {
+          for (const block of message['content'] as Record<string, unknown>[]) if (block['type'] === 'toolCall' && typeof block['id'] === 'string') notExecuted.add(block['id']);
+          continue;
+        }
         for (const block of message['content'] as Record<string, unknown>[]) {
           if (block['type'] !== 'toolCall') continue;
           const { id, name } = block;
@@ -1718,7 +1758,7 @@ function piDeadTurn(file: string, binding: DirectiveNativeBinding, refusedIds: R
         }
       }
     }
-    return settleDeadTurn('pi', intents, results, refusedIds, boundaryRefusals);
+    return settleDeadTurn('pi', intents, results, refusedIds, boundaryRefusals, unanswered);
   });
 }
 
@@ -1733,7 +1773,8 @@ export function classifyDeadDirectiveTurn(file: string, identity: DirectiveTurnI
     if (binding === null || !isDeepStrictEqual(binding.identity, identity)) return unboundedDeadTurn(null, 'exact native request association unavailable');
     runtime = binding.runtime;
     // The walk must find the turn sound; refusal receipts are counted below, not trusted to stand in for it.
-    const walk = inspectDirectiveCheckpoint(file, identity, { ignoreGuardRefusals: true });
+    // A torn final line is dropped for this classification only: what is complete decides.
+    const walk = inspectDirectiveCheckpoint(file, identity, { ignoreGuardRefusals: true, tolerateTornTail: true });
     if (walk.state === 'unknown' && !UNFINISHED_TURN_REASONS.has(walk.reason)) {
       return unboundedDeadTurn(runtime, `the native checkpoint walk refuses this turn: ${shownText(walk.reason, 200)}`);
     }
@@ -1762,7 +1803,7 @@ export interface DirectiveCustodyVerdict {
 export function custodyVerdictOf(dead: DeadTurnVerdict): DirectiveCustodyVerdict {
   if (dead.verdict === 'none') return { verdict: 'none' };
   if (dead.verdict === 'unbounded') return { verdict: 'unbounded', reason: dead.reason };
-  return { verdict: 'bounded', effects: dead.effects.map(({ id, name }) => { const shown = shownDeadTurnTool({ id, name }); return { tool_use_id: shown.id, name: shown.name }; }) };
+  return { verdict: 'bounded', effects: dead.effects.slice(0, CUSTODY_VERDICT_EFFECT_LIMIT).map(({ id, name }) => { const shown = shownDeadTurnTool({ id, name }); return { tool_use_id: shown.id, name: shown.name }; }) };
 }
 
 /** One line a card, blocker or successor note can carry. Tool names and ids
@@ -1774,8 +1815,9 @@ export function describeDeadTurn(dead: DeadTurnVerdict): string {
   if (dead.verdict === 'none') {
     return `none: the turn recorded no tool effect after admission${refused}${boundary}, so it cannot have produced one`;
   }
-  const effects = dead.effects.map((effect) => { const { name, id } = shownDeadTurnTool(effect); return `${name} (${id}) ${effect.outcome}`; });
-  const shown = effects.slice(0, 6).join(', ');
+  // Slice before showing: a long turn's list is never mapped whole just to print six.
+  const listed = dead.effects.slice(0, 6).map((effect) => { const { name, id } = shownDeadTurnTool(effect); return `${name} (${id}) ${effect.outcome}`; });
+  const shown = listed.join(', ');
   const partial = dead.effects.some(({ outcome }) => outcome === 'failed') ? '; a failed tool can have left partial effects, so inspect the lane before repeating it' : '';
-  return `bounded: ${String(dead.effects.length)} tool effect(s), each with a recorded completion: ${effects.length > 6 ? `${shown}, and ${String(effects.length - 6)} more` : shown}${refused}${boundary}${partial}`;
+  return `bounded: ${String(dead.effects.length)} tool effect(s), each with a recorded completion: ${dead.effects.length > 6 ? `${shown}, and ${String(dead.effects.length - 6)} more` : shown}${refused}${boundary}${partial}`;
 }

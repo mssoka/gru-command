@@ -2149,7 +2149,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           track(run);
         }
         json(res, !outcome.idempotent && outcome.successor !== null ? 202 : 200,
-          { request_id: requestId, idempotent: outcome.idempotent, successor_request_id: outcome.successor?.requestId ?? null });
+          { request_id: requestId, idempotent: outcome.idempotent, successor_request_id: outcome.successor?.requestId ?? null,
+            // Contract revision 1: a replay returns the stored custody verdict; a
+            // decision recorded before the field existed replays as null.
+            custody_verdict: 'custody_verdict' in outcome ? outcome.custody_verdict : null });
       } catch (error) {
         if (!(error instanceof DirectiveCheckpointError || error instanceof DirectiveRetirementError)) throw error;
         json(res, 409, { error: 'recovery_refused', detail: error.message });
