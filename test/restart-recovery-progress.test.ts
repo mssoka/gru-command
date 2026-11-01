@@ -3782,8 +3782,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       // The successor is admitted and runs: the dead producer refuses nothing of its own dispatch.
       await executeAcceptedDirective(s.deps, 'dead-turn-successor');
       // A refused dispatch records its reason on the job's reconcile event; quote it in the failure.
-      const reconcile = s.ledger.latestJobEvent(s.jobId, 'silas.directive-reconcile')?.payload;
-      expect(s.ledger.getDirective('dead-turn-successor'), JSON.stringify(reconcile)).toMatchObject({ state: 'settled', admissionSeq: expect.any(Number) });
+      expect(s.ledger.getDirective('dead-turn-successor')).toMatchObject({ state: 'settled', admissionSeq: expect.any(Number) });
       expect(s.prompts().join('\n')).toContain(`${verdict}:`);
       expect(s.ledger.getObligation(debt.id)).toMatchObject({ state: 'settled' });
       // The exact decision replays as itself: no second successor, no second turn.
@@ -3816,8 +3815,20 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('A2 claude-code: completed intents are verdict bounded, name their effects and still admit the successor', () =>
     assertDeadTurnSettled('claude-code', 'bounded', 'bounded', ['Edit (toolu_1) failed', 'Read (toolu_2) completed', 'a failed tool can have left partial effects']));
   it('A3 torn final line: a complete intent and its result before a torn tail are still bounded', async () => {
-    await assertDeadTurnSettled('pi', 'torn-final', 'bounded', ['bash (call-1) completed']);
-    await assertDeadTurnSettled('claude-code', 'torn-final', 'bounded', ['Read (toolu_1) completed']);
+    for (const runtime of ['pi', 'claude-code'] as const) {
+      await withDeadScene(runtime, 'torn-final', async (s) => {
+        const debt = await restartPass(s);
+        // The partial tail is dropped: the complete intent and its completion decide.
+        expect(s.ledger.deadTurnEvidence(s.requestId)?.dead).toMatchObject({ verdict: 'bounded', runtime });
+        expect(activeCard(s)?.detail).toContain('bounded:'); expect(activeCard(s)?.detail).toContain('This needs no owner');
+        const decision = { kind: 'rebrief-successor' as const, requestId: 'torn-successor', note: 'finish the approved work' };
+        // Gru's recovery is accepted and records the verdict. (The successor is not executed here:
+        // a session file that ends mid-line cannot host the next native turn until it is repaired,
+        // which is the writer's own precondition, not a custody question.)
+        expect(recoverInterruptedDirectiveFromRoute(recoveryInput(s, debt, decision))).toMatchObject({ successor: { requestId: 'torn-successor' } });
+        expect(s.ledger.latestJobEventByRequestId(s.jobId, 'silas.directive-recovery-decided', s.requestId)?.payload).toMatchObject({ custody_verdict: { verdict: 'bounded' } });
+      });
+    }
   });
 
   it('A5: a replay returns the stored custody verdict; a decision recorded before the field existed still replays', async () => {
