@@ -33,6 +33,7 @@ import { stageSpawnRegistration } from '../runtime/spawn-registration.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { surfaceDirectiveRecovery } from '../dispatch/directive-progress.js';
 import { observeDisposalSettlement } from '../runtime/disposal-observation.js';
+import { classifyProviderRejection } from '../provider-recovery/classify.js';
 import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDebt } from './restart-cleanup.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -71,6 +72,11 @@ export interface SupervisorRegistry {
   quarantineHandle(handle: AgentHandle): void;
   spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle>;
   disposeHandle(handle: AgentHandle): Promise<void>;
+  /** Every handle this process holds — unpublished and quarantined ones
+   * included, which `getHandle` hides. Only the one-shot boot settlement of a
+   * previous process's open turns reads it (issue #547); a registry without it
+   * makes that settlement refuse by name rather than guess. */
+  listHandles?(): readonly AgentHandle[];
 }
 
 /**
@@ -460,6 +466,24 @@ export type SupervisorRestartPolicy =
   | { readonly options: SpawnOptions }
   | { readonly refuse: string };
 
+/** The reason a boot settlement records on a previous process's open turn:
+ * the `error` carried by its `agent.state` event and the orphan notice's
+ * reason (issue #547). */
+export const HOST_ABSENT_AT_BOOT = 'host-absent at boot';
+
+/** What one boot settlement did to the agent rows a previous service process
+ * left in `spawning` or `streaming` (issue #547). */
+export interface HostAbsentTurnSettlement {
+  /** Agent rows found open (`spawning` or `streaming`). */
+  readonly examined: number;
+  /** Open rows this process owns (a registry handle, a supervised record or an unfinished tracked child worker): untouched. */
+  readonly live: number;
+  /** Agent ids moved to `error` and surfaced through the orphan notice. */
+  readonly settled: readonly string[];
+  /** Agent ids whose move failed: still open, so the next boot retries them. */
+  readonly failed: readonly string[];
+}
+
 export class Supervisor {
   private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
@@ -512,6 +536,8 @@ export class Supervisor {
   /** Wall-clock of the previous watchdog tick (sleep/wake detection). */
   private lastTickWallAt: number | null = null;
   private disposed = false;
+  /** The boot settlement of a previous process's open turns ran (once per process). */
+  private hostAbsentSettled = false;
 
   constructor(opts: SupervisorOptions) {
     this.cfg = opts.config;
@@ -576,6 +602,89 @@ export class Supervisor {
       }
     }, this.tickMs);
     this.ticker.unref?.();
+  }
+
+  /**
+   * Issue #547: an agent row a previous service process left `spawning` or
+   * `streaming` has no process, no registry handle and no further events, yet
+   * every live-work fence counts it as an open worker turn, so nothing ever
+   * clears it. Call this ONCE per boot, after hydration (`start`) and after
+   * the boot recoveries that re-run work under an existing agent id: a row
+   * that no registry handle (published or not), no supervised record and no
+   * unfinished tracked child worker owns belonged to a previous process. Each
+   * such row leaves the live states through the same `error` move a dead turn
+   * takes (an `agent.state` event naming {@link HOST_ABSENT_AT_BOOT}) and is
+   * surfaced by the orphan notice. Agent rows only: the turn is not resumed,
+   * and no producer cessation, retirement, abandonment, completion or
+   * delivery is recorded. A second call, and any turn this process runs, is
+   * left alone.
+   *
+   * A row whose ownership cannot be read, or whose move fails, stays open and
+   * is reported `failed` (the next boot retries it). A registry that cannot
+   * list its handles, or an agent listing that fails, throws: the supervisor
+   * must not guess which turns are another process's.
+   */
+  settleHostAbsentTurns(): HostAbsentTurnSettlement {
+    if (this.disposed || this.hostAbsentSettled) return { examined: 0, live: 0, settled: [], failed: [] };
+    if (typeof this.registry.listHandles !== 'function') {
+      throw new Error(
+        'the supervisor registry cannot list its handles, so a previous process\'s open turns cannot be told from this ' +
+          'process\'s — no agent row is settled; give the registry a listHandles() that includes unpublished handles',
+      );
+    }
+    // One synchronous snapshot: no spawn or disposal can interleave between
+    // the rows and the handles that are compared against them.
+    const open = this.ledger.listAgents().filter((row) => row.state === 'spawning' || row.state === 'streaming');
+    const held = new Set(this.registry.listHandles().map((handle) => handle.id));
+    this.hostAbsentSettled = true;
+    const settled: string[] = [];
+    const failed: string[] = [];
+    let owned = 0;
+    for (const row of open) {
+      try {
+        // A tracked child admitted but not finished is re-run by the child
+        // service's own boot reconciliation under this same agent id; its row
+        // reads `spawning` until the spawn returns a handle.
+        if (held.has(row.id) || this.agents.has(row.id) || this.ledger.childWorkerByAgent(row.id)?.resultState === null) {
+          owned += 1;
+          continue;
+        }
+        this.ledger.setAgentState(row.id, 'error', HOST_ABSENT_AT_BOOT);
+      } catch (error) {
+        failed.push(row.id);
+        this.log('error', 'host-absent agent turn could not be settled at boot — it stays open until the next boot', {
+          agent_id: row.id,
+          state: row.state,
+          error: failureText(error),
+        });
+        continue;
+      }
+      settled.push(row.id);
+      this.postOrphanedTurn(
+        row.id,
+        HOST_ABSENT_AT_BOOT,
+        `its row was still ${row.state} when this service process booted and this process holds no handle for it — ` +
+          'the host that ran it is gone, and nothing was re-delivered',
+        this.hasRecoverableLane(row.jobId),
+      );
+    }
+    return { examined: open.length, live: owned, settled, failed };
+  }
+
+  /** Whether a turn's job still exists and is not finished: only then is there
+   * a lane for an action-required orphan note to recover. A turn of a
+   * finished job, or of no job (Gru, Bob, Silas, the vector session), is
+   * still moved out of the open states and recorded, without the note. A
+   * lookup that fails reads as recoverable: noise is the safer error. */
+  private hasRecoverableLane(jobId: string | null): boolean {
+    if (jobId === null) return false;
+    try {
+      const job = this.ledger.getJob(jobId);
+      return job !== null && !isJobTerminal(job.status);
+    } catch (error) {
+      this.log('warn', 'job lookup for the orphan note failed — raising the note', { job: jobId, error: String(error) });
+      return true;
+    }
   }
 
   /** Declare a supervision slot (stable identity across restarts). */
@@ -1839,6 +1948,15 @@ export class Supervisor {
       return;
     }
     const deterministicClass = deterministicFailureClass(reason, source?.typed);
+    // Owner ruling chat-wait-dont-stop-20261031 (option dont-stop): an
+    // eligible temporary provider usage window is NOT a stop for the Gru
+    // chat agent. `!allowRestart` is the in-band discriminator: the fatal
+    // path and the hang ladder pass `true`, so this branch can never
+    // weaken their recovery.
+    if (!allowRestart && this.chatSurvivesProviderWindow(agent, deterministicClass, source)) {
+      this.settleTurnForProviderWindow(agent, deterministicClass, source);
+      return;
+    }
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
@@ -1995,6 +2113,125 @@ export class Supervisor {
         if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(replay);
         await replay;
       }
+    }
+  }
+
+  /** Owner ruling chat-wait-dont-stop-20261031 (option dont-stop): would
+   * this failure be an ELIGIBLE temporary provider usage window for the Gru
+   * chat agent? Pure and narrow — one role, one class, typed evidence, and
+   * the provider-recovery sensor's own boundary classifier (429 / GLM
+   * 1302/1308; never 401/402/403/1113). `providerSupportsSensor` is
+   * deliberately NOT required: that gate exists for the wait adapter, and
+   * this path probes nothing. */
+  private chatSurvivesProviderWindow(
+    agent: SupervisedAgent,
+    failureClass: string,
+    source: ProviderErrorSource | null,
+  ): boolean {
+    if (!this.cfg.enabled) return false;
+    if (agent.role !== 'gru') return false;
+    if (failureClass !== 'quota_wall') return false;
+    if (agent.breakerOpen || agent.inRestart || agent.handle === null) return false;
+    const provider = source?.provider ?? null;
+    const model = source?.model ?? null;
+    const typed = source?.typed ?? null;
+    // Typed provider-response provenance is mandatory: prose alone can never
+    // establish a usage window.
+    if (provider === null || provider === '' || model === null || model === '' || typed === null) return false;
+    return classifyProviderRejection({
+      provider,
+      model,
+      errorMessage: source?.error ?? '',
+      ...(typed.status !== undefined ? { status: typed.status } : {}),
+      ...(typed.bodyCode !== undefined ? { bodyCode: typed.bodyCode } : {}),
+      ...(typed.retryAfterMs !== undefined ? { retryAfterMs: typed.retryAfterMs } : {}),
+    }).kind === 'temporary-recoverable';
+  }
+
+  /** Settle an eligible chat usage window IN PLACE: the agent stays up and
+   * its session/slot are kept. The failed turn is concluded so it can never
+   * read as a hang, no captured turn is retained for a later restart rung
+   * to replay, and the wall stays VISIBLE as one machine notice without
+   * being a stop. */
+  private settleTurnForProviderWindow(
+    agent: SupervisedAgent,
+    failureClass: string,
+    source: ProviderErrorSource | null,
+  ): void {
+    // Sampled before the cleanup below (it always clears the turn).
+    const hadOpenTurn = agent.openTurn;
+    // The cleanup half of a stop: an in-flight recovered-turn delivery for
+    // this entity is superseded by the settle. Without it that delivery's
+    // rejection (the same provider window) would post a contradicting
+    // "could not re-deliver its prompt" orphan note beside the settle
+    // notice — exactly what `stopForGuidance` prevents by clearing this
+    // first.
+    this.clearRecoveryAdmission(agent);
+    // Without these clears the finished turn becomes a hang candidate and
+    // climbs the restart ladder. `backgroundTasks` is only read while a turn
+    // is open.
+    agent.openTurn = false;
+    agent.openControl = false;
+    agent.openToolCalls.clear();
+    agent.backgroundTasks = [];
+    // Never capture the chat turn: a later restart rung would replay this
+    // failed prompt through recoverInterruptedTurn and duplicate the user's
+    // message.
+    agent.pendingRecovery = null;
+    // A NEW kind, never `supervision.provider-wall.*`: that kind is the
+    // durable-stop fallback control the boot lookup binds and the sensor
+    // hand-back keys on. `unacked` reuses the open row while the same window
+    // keeps rejecting turns.
+    const windowKind = `supervision.provider-window.${agent.agentId}.${failureClass}`;
+    // ONE ledger event and one warn log per WINDOW, not per failing frame: the
+    // adapter reports the same failure twice (an error frame plus its sticky
+    // state), and a repeated window reuses the open card below. The open card
+    // is the durable window tick, so the second frame of a window — and a
+    // restart inside it — records nothing new, while a window whose card was
+    // acknowledged records again on its next failure.
+    const firstFrameOfWindow = this.ledger.findNotificationByKind(windowKind, 'unacked') === null;
+    if (firstFrameOfWindow) {
+      this.recordEvent('supervision.provider-window', agent.agentId, {
+        class: failureClass,
+        role: agent.role,
+        provider: source?.provider ?? null,
+        model: source?.model ?? null,
+        status: source?.typed?.status ?? null,
+        body_code: source?.typed?.bodyCode ?? null,
+        retry_after_ms: source?.typed?.retryAfterMs ?? null,
+        had_open_turn: hadOpenTurn,
+      });
+      this.log('warn', 'temporary provider usage window — chat turn settled in place, agent stays up', {
+        agent_id: agent.agentId,
+        class: failureClass,
+        provider: source?.provider ?? null,
+        model: source?.model ?? null,
+        retry_after_ms: source?.typed?.retryAfterMs ?? null,
+        had_open_turn: hadOpenTurn,
+      });
+    }
+    try {
+      this.notifications.postIncident({
+        kind: windowKind,
+        routing: 'action-required',
+        severity: 'error',
+        title: `Agent ${agent.agentId}: a temporary provider limit rejected a chat turn — the agent stayed up`,
+        detail:
+          'A chat message was refused by a temporary provider usage limit; this is not a stop. ' +
+          'The agent and its session stayed up — no restart, breaker or re-arm was scheduled. ' +
+          (source?.typed?.retryAfterMs != null
+            ? `The provider asked to wait ${String(Math.ceil(source.typed.retryAfterMs / 1000))} s more: send the next message after that.`
+            : 'Send your next message once the limit clears.'),
+        agentId: agent.agentId,
+        dedupe: 'unacked',
+      });
+    } catch (error) {
+      // The settle itself must never fail: a notice fault is logged, and the
+      // ledger event above still records the window.
+      this.log('error', 'provider-window notice could not be posted', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
     }
   }
 
@@ -3146,13 +3383,17 @@ export class Supervisor {
     }
   }
 
-  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string): void {
+  /** Record an orphaned turn and, unless `notify` is false, raise the lane's
+   * action-required note. `notify: false` keeps the durable record for a turn
+   * with no lane left to recover (#547). */
+  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string, notify = true): void {
     const lane = this.laneContext(laneAgentId);
     this.recordEvent('supervision.turn-recovery', laneAgentId, {
       disposition: 'orphaned',
       reason,
       note: detail,
     });
+    if (!notify) return;
     try {
       this.notifications.postIncident({
         kind: `supervision.turn-orphaned.${laneAgentId}`,

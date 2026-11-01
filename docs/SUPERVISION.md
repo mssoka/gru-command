@@ -193,6 +193,43 @@ name the prompt (or the re-delivery fails), the supervision posts an
 lane (job, branch, worktree, job phase), so recovery is a lane action,
 not archaeology.
 
+**A turn the previous service process left open is settled at boot (#547).**
+An agent row still `spawning` or `streaming` when the service stopped has no
+process and no registry handle in the new one, yet every live-work fence
+counts it as an open worker turn: binning, retirement, abandonment and
+recovery of its job would be refused for good. Once per boot, after
+supervision hydration, the boot recoveries (re-brief, child worker,
+directive) and before the listener serves, each such row moves to `error`
+unless this process owns it: a registry handle (published or not), a
+supervised record, or an unfinished tracked child worker that the boot just
+re-ran under the same agent id. The move is an `agent.state` event whose
+payload names `host-absent at boot`, and the turn is recorded as orphaned
+(`supervision.turn-recovery`). When its job is still unfinished it also
+surfaces through the same **action-required** `supervision.turn-orphaned.<agent>`
+note; a turn of a finished job, or of no job (Gru, Bob, Silas), has no lane
+left to recover and gets the record without the note. Every settled row also
+gets the ordinary "Agent … errored" FYI. Agent rows only: the turn is not resumed, and no producer cessation, directive
+retirement, abandonment, completion or delivery is recorded. A directive
+request whose agent was such a ghost keeps its state and its recovery
+evidence; only the "open worker turn" blocker the ghost row caused goes
+away, and every other blocker (a native session lock, an unproven producer,
+a live lane process, a queued turn) is still reported. A turn this process
+spawns is never touched. A row whose move fails stays open for the next
+boot; an agent listing that fails refuses boot.
+
+The parked-job stop re-proof (`job.execution-stop`) starts after the
+settlement, so it reads a ghost turn as the settled row it is instead of
+reporting an open turn "unproven" for as long as the service runs. The
+evidence behind that is the same host-absent inference the settlement
+makes (this process holds no handle for the row), not an observed process
+exit; a stop pass at any later time reads the settled row the same way. A child
+worker the boot re-runs for a parent that was itself a ghost follows the
+child-worker rule that an errored parent has no authority to delegate: it
+may end with a terminal `error` naming the parent, as it did not before. A
+child that ends before any session exists (that, a lane or spawn failure, a
+cancel while queued) now also moves its own agent row out of `spawning`, so
+it never becomes an open worker turn that nothing clears.
+
 **Restart ladder.** A hang or a *fatal* runtime error triggers one
 restart rung: dispose the wedged handle (its pending prompts reject),
 respawn with `resumeFile` (crash = resume — the conversation survives),
@@ -363,6 +400,28 @@ computed per-snapshot.
   stamps the stall clock), and among stops the newest recorded one speaks
   (activity stamp first, registration order when unknown). A re-dispatched
   lane is never COLD on the superseded stop's stamp.
+
+**A temporary provider usage window is never a chat stop (owner ruling
+2026-10-31).** A non-fatal, typed, temporary-recoverable provider rejection —
+HTTP 429 or a GLM `1302`/`1308` usage-window body code — on a **Gru chat turn**
+settles the failed turn IN PLACE instead of stopping the agent: the turn's open
+state (`openTurn`, `openControl`, open tool calls, background tasks) is cleared
+so it cannot read as a hang, no captured turn is retained for a restart rung to
+replay, no restart or re-arm is scheduled, and the wall stays VISIBLE as ONE
+`action-required`/`error` machine row of its own kind
+(`supervision.provider-window.<agent>.quota_wall`, deduplicated while unacked)
+saying the turn failed on the window and the agent stayed up. One ledger event,
+`supervision.provider-window`, records `{class, role, provider, model, status,
+body_code, retry_after_ms, had_open_turn}` once per WINDOW (the open card is the
+window's durable tick, so the adapter's second frame for one failure, or a
+restart inside the window, adds neither an event nor a log line), and the row
+states the wait the provider asked for when its evidence carries one. It is not a durable stop (the boot
+lookup and the sensor hand-back key on `supervision.provider-wall.*` only), and
+the chat slot keeps serving the next message. Every other role and every
+ineligible wall — 401, 402, 403, billing `1113`, prose-only quota text with no
+typed evidence, or a fatal error — still stops with the durable provider-wall
+row. Provider pacing still spends its bounded retry budget before the settle
+path is reached.
 
 **Ack ids — nothing shown is unproven.** Every notification carries a
 stable id (the ack contract). When a client displays one — a toast, the

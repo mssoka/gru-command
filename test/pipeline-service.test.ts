@@ -316,6 +316,11 @@ describe('pipeline service — failure and crash reconciliation', () => {
     expect(h.calls).toHaveLength(1);
     expect(h.service.entry('pipe-a')?.state).toBe('admitted');
     expect(h.ledger.getJob('pipe-a')?.status).toBe('blocked');
+    // The dispatch service already blocked the job and noted the failure, so the
+    // pipeline posts no adopted-without-worker card (docs/PIPELINE.md "Admission").
+    expect(
+      h.ledger.listNotifications().filter((row) => row.kind === 'pipeline.adopted-without-worker'),
+    ).toHaveLength(0);
     h.service.schedule();
     await h.service.whenIdle();
     expect(h.calls).toHaveLength(1); // never re-dispatched
