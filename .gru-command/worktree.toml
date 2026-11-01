@@ -11,6 +11,16 @@ command = "npm ci"
 full = "npm test"
 
 typecheck = "npm run typecheck"
+# Briefing-review round-cap ruling (owner ruling 2026-10-29, journal j-1200):
+# the role canon, routing docs and briefing-review guidance strings record a
+# push-back plus one material corrective amendment at the cap instead of an
+# owner escalation, and briefings are written to settle in one round. Focused
+# regression, static product checks, and the final-test-bytes fail-before leg
+# over an isolated git archive of the recorded base ccd6337f (A4, the 409 cap
+# refusal, passes on that base and is not part of the RED claim).
+gc-rules-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/roles-gru.test.ts test/briefing-review.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-rules-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
+gc-rules-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc-rules-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-rules-red base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d" > "$prep/gc-rules-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/briefing-review.test.ts -t "caps a chain at three trailing"; for f in test/roles-gru.test.ts test/briefing-review.test.ts; do git -C "$root" show "HEAD:$f" > "$d/$f"; done; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/roles-gru.test.ts test/briefing-review.test.ts; a=$?; set -e; echo "gc-rules-red vitest exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-rules "$d/results.json" "Nefario briefing review — evidence-bound results all lenses READY is one decisive verdict whose caught count is the blocking findings of the superseded round" "gru role definition the chief owns the briefing, keeps acceptance on fixed targets, and lets lanes outlive a moving main" "Nefario briefing review — evidence-bound results any CHANGES-NEEDED is decisive at once, and later lens results stay non-decisive" "Nefario briefing review — push-back and the bounded loop caps a chain at three trailing CHANGES-NEEDED rounds, names the push-back/dispatch/amendment path, still converges an exact re-commission, and resets on READY" "Nefario briefing review — the staged dispatch gate stage 2 refuses a high-tier pending, CHANGES-NEEDED or older-round dispatch before any job and records the refusal" "Nefario briefing review — the staged dispatch gate stage 3 enforces medium as well as high; low stays advisory, and stage 2 leaves medium advisory" "Nefario briefing review — the staged dispatch gate stage 3 still enforces high, and the enforced-tier chain fallback cannot be bypassed by a medium revision" "Nefario briefing review — the staged dispatch gate the shipped auto stage enforces every non-low tier and leaves low advisory" "Nefario briefing review — the staged dispatch gate a matching CHANGES-NEEDED block on an enforced tier names the push-back path, never an owner escalation" "Nefario briefing review — the staged dispatch gate a capped chain routes every gate refusal to the push-back/dispatch/amendment path" "Nefario briefing review — push-back and the bounded loop announces the cap when an out-of-order older result completes the trailing run" "Nefario briefing review — the staged dispatch gate a mixed-tier capped chain names the chain tail, never an older enforced READY review" "Nefario briefing review — push-back and the bounded loop a late older CHANGES-NEEDED result routes to the READY chain tail"'
 managed-repositories-docs = "npm run build && npm run config:docs"
 managed-repositories-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/config.test.ts test/config-generate.test.ts test/intake.test.ts test/intake-approval.test.ts test/intake-server.test.ts test/github-poll.test.ts test/managed-repositories-runtime.test.ts test/repo-overview.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/bmad-onboarding.test.ts test/intake-approval-packaged.test.ts test/workflow-runtime-packaged.test.ts test/wizard.test.ts test/wizard-interactive.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/repo-overview.test.ts"
 managed-repositories-before = 'set -e; base=79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37; headrev=$(git rev-parse HEAD); root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-managed-repositories-before.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/config-generate.test.ts > "$d/test/config-generate.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/config-generate.test.ts -t "config generation persists the explicit selected repository list"'
@@ -1196,6 +1206,29 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-503-p1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/creation-continuation.test.ts test/creation-continuation-custody.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-503-p1-static = "npm run lint && npm run typecheck && npm run build"
 gc-503-p1-mutations = "node gru-output/gc-503-p1-restart/mutations.mjs"
+# #534 argv credential redaction: a worktree process's command line reaches the
+# ledger, an event, a response and a card with its credentials masked, while the
+# raw line stays in memory. `-focused` runs the edited suites (the heavy files
+# under the heavy config) over the registry pins; `-static` is the lint +
+# typecheck + build gate; `-red` runs the changed test-side files over the
+# base's unredacted source and requires A1, A2, A3, A6 and the registry
+# readback to fail behaviorally (it exits nonzero by design once the
+# classifier accepts the red run).
+# test/decisions.test.ts is the full-suite repair of 2026-10-30: its systemone
+# status-mapping fixture stopped racing a 20 ms deadline for a response it
+# already produces (the hang case keeps the tight deadline it tests).
+gc-534-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/redaction.test.ts test/ledger-api.test.ts test/ledger-api-records-command.test.ts test/ledger-db.test.ts test/restart-recovery-schema.test.ts test/verification-scheduler.test.ts test/child-workers.test.ts test/decisions.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run test/directive-retirement.test.ts -t '#534' && npx vitest run --config vitest.heavy.config.ts test/worktree-manager.test.ts test/verification-server.test.ts"
+gc-534-static = "npm run lint && npm run typecheck && npm run build"
+gc-534-red = "sh tools/gc-534-red-baseline.sh"
+# The continuation of #534 (review r6b: R1, a process row is identified by the
+# digest of its raw command, never its masked text; R2, the verification events
+# carry their commands masked): the changed tests run over the stranded lane's
+# last head 0e7d5f95 and must fail behaviorally (nonzero by design, as above).
+gc-534-r1r2-red = "sh tools/gc-534-r1r2-red-baseline.sh"
+# One string edit to the candidate head reduces the event-to-run binding helper
+# (`recordsCommand`) to strict equality; the helper pin, the terminal readback and
+# the retirement-gate guard must fail by assertion (nonzero by design).
+gc-534-mutation = "sh tools/gc-534-binding-mutation.sh"
 # #513 blind coverage release: `gc-513-focused` is the new endpoint/readback
 # suite, the suites that must keep passing with their assertions unchanged
 # (heavy ones routed through the heavy config), the playbook wording, the
@@ -1218,7 +1251,175 @@ gc-513-red = "node gru-output/gc-513-blind-coverage-release/red.mjs"
 gc-519-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts && npx vitest run test/review-ci-evidence.test.ts test/gitlab-mr-read.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-519-static = "npm run lint && npm run typecheck && npm run build"
 gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc519-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for name in review-ci-evidence review-gitlab-ci-wave; do cp "test/$name.test.ts" "$d/test/$name.test.ts"; done; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC519 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0 && { npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/review-gitlab-ci-wave.test.ts || status=$?; } && { npx vitest run --reporter=verbose test/review-ci-evidence.test.ts || status=$?; } && exit "$status"'
+# #554 capture replay: a headers timeout re-submits the same request identity and
+# the scheduler replays retained output. Focused = the capture, scheduler and
+# server suites plus the new retention store/scheduler suites (the latter heavy:
+# real spawned runs) and the suite/budget pins; approved RPC patch first, exits
+# never masked.
+gc-554-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-capture.test.ts test/verification-retention-store.test.ts test/verification-scheduler.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-retention.test.ts test/verification-server.test.ts"
+gc-554-static = "npm run lint && npm run typecheck && npm run build"
+# Fail-before evidence: the FINAL A1-A3 regressions are overlaid onto an
+# isolated git-archive snapshot of 191fff12 (root node_modules symlinked — no
+# download/install; approved RPC patch prerequisite; unchanged configs and
+# budgets). The base has no headers-timeout re-submit and no retained-output
+# replay, so the named cases RED by behavioral assertion. Each leg must exit
+# non-zero AND carry an AssertionError; a collection/setup/import failure or an
+# unexpectedly green leg exits 2 (FAILS-BEFORE CLAIM BROKEN). The snapshot and
+# the two logs are preserved for inspection; nothing is checked out.
+gc-554-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc554-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; for f in test/verification-retention.test.ts test/verification-server.test.ts test/helpers/test-budgets.ts; do mkdir -p "$d/$(dirname "$f")"; cp "$f" "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; printf "GC554 RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/verification-retention.test.ts -t "A2 #554|A3 #554" > "$d/retention.log" 2>&1; a=$?; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/verification-server.test.ts -t "A1 #554|A2 #554|A3 #554" > "$d/server.log" 2>&1; b=$?; set -e; cat "$d/retention.log"; cat "$d/server.log"; echo "gc-554-red vitest exits: retention=$a server=$b EXPECTED-NONZERO: 191fff12 has no re-submit and no retained-output replay"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; grep -q "AssertionError" "$d/retention.log" || { echo "retention leg did not fail by assertion (collection/setup failure?)"; exit 2; }; grep -q "AssertionError" "$d/server.log" || { echo "server leg did not fail by assertion (collection/setup failure?)"; exit 2; }; echo "EXPECTED-NONZERO: the A1-A3 regressions fail by assertion against 191fff12"; exit 1'
+# #532 committed-ref close wait: the Git child that has confirmed `commit` gets
+# `committedRefCloseMs` (default 30 s) to close; every other wait stays 1 s.
+# `-focused` is the edited custody/continuation/Git-environment suites plus the
+# worktree manager suite and the registry pins; `-static` is the lint +
+# typecheck + build gate; `-red` runs the slow-close test alone (A1) against a
+# `git archive` extract of the base commit with the candidate test and helper
+# copied in, and is expected to fail there.
+# `-mutants` changes one bound at a time in a scratch extract of the head and
+# requires the tests that guard it to fail (gru-output/gc-532-git-close-wait).
+gc-532-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/creation-continuation.test.ts test/creation-continuation-custody.test.ts test/review-git-environment.test.ts test/worktree-manager.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-532-static = "npm run lint && npm run typecheck && npm run build"
+gc-532-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-532-red.XXXXXX"); trap "rm -rf -- $d" EXIT; git archive "$base" | tar -x -C "$d"; cp test/creation-continuation-custody.test.ts "$d/test/creation-continuation-custody.test.ts"; cp test/helpers/creation-continuation.ts "$d/test/helpers/creation-continuation.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-532 RED base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts test/creation-continuation-custody.test.ts --testNamePattern "creates the job when a committed Git child closes after the old one-second bound"'
+gc-532-mutants = "node tools/patch-vitest-rpc-timeout.mjs && node gru-output/gc-532-git-close-wait/mutations.mjs"
 
+# #523 owner approval of abandonment: the service, its ledger table, the
+# registry/wiring, both text surfaces and the web client's owner actor.
+gc-523-approval-focused = "npm run build && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/directive-retirement.test.ts test/roles-gru.test.ts test/board-engine.test.ts test/notification-decisions.test.ts test/restart-recovery-schema.test.ts test/ledger-db.test.ts test/prune-stale-dist.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/service-shutdown.test.ts test/verification-scheduler.test.ts && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts src/lib/board-client.test.ts src/lib/board-protocol.test.ts"
+gc-523-approval-static = "npm run lint && npm run typecheck && npm run build"
+# The fast loop over the files a review fix touches (also the red run of the
+# tests committed ahead of their fix).
+gc-523-approval-quick = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/notification-decisions.test.ts test/service-shutdown.test.ts test/ledger-db.test.ts test/board-engine.test.ts test/verification-scheduler.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts src/lib/board-protocol.test.ts"
+# A14 against the ORIGINAL base `ccd6337f`: the text file imports only modules
+# that exist there and inlines its fixtures, so every case fails by assertion
+# (the old confirm_intent recipe, no new section, no pointer, no reason rule),
+# never by import or collection. Run by test name.
+gc-523-approval-red-a14 = 'base=ccd6337fb629f3fc69bea725d06873733b363182; root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-523-red-a14.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp test/owner-approval-text.test.ts "$d/test/owner-approval-text.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/owner-approval-text.test.ts -t "the text that sends Gru and the owner to the new route"; a=$?; set -e; echo "gc-523-approval-red-a14 vitest exit=$a (EXPECTED-NONZERO)"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: the base already satisfies A14"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-523-approval-red-a14 "$d/results.json" "owner approval - the text that sends Gru and the owner to the new route both unknown-custody cards ask for a proposal and carry no terminal recipe" "owner approval - the text that sends Gru and the owner to the new route roles/gru.md routes a directive request to the proposal and keeps the re-brief marker instruction" "owner approval - the text that sends Gru and the owner to the new route docs/DIRECTIVE-RECOVERY.md documents both routes, every state and every refusal code" "owner approval - the text that sends Gru and the owner to the new route docs/DIRECTIVE-RECOVERY.md states the reason rule and that approval cards need the service hosted" "owner approval - the text that sends Gru and the owner to the new route docs/OPERATIONS.md points the unknown-custody sentence at the owner-approval section"; echo "EXPECTED-NONZERO: A14 fails by assertion on the base"; exit 1'
+# The verification repair's fail-before: the scheduler test at the head whose
+# guards run died with ERR_STREAM_PREMATURE_CLOSE. `src/verify/scheduler.ts` is
+# unchanged between 2f2ce13f and the stranded head, so the runner's own drain
+# cut-off manufactures that run error there and the new test fails by
+# assertion (never by import or collection).
+gc-523-approval-red-drain = 'base=2f2ce13f9dc474aed46989ba12a14c7c37299ca9; root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-523-red-drain.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp test/verification-scheduler.test.ts "$d/test/verification-scheduler.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-scheduler.test.ts -t "an output pipe a stray descendant still holds at the drain cut-off"; a=$?; set -e; echo "gc-523-approval-red-drain vitest exit=$a (EXPECTED-NONZERO)"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: the pre-repair head already passes the drain test"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-523-approval-red-drain "$d/results.json" "verification scheduler — global budget an output pipe a stray descendant still holds at the drain cut-off is closed by the runner, never a failed run (#523 verification repair)"; echo "EXPECTED-NONZERO: the drain repair fails by assertion at 2f2ce13f"; exit 1'
+# The defect findings (F1-F4, F14) against the stranded head 3f3f2d33.
+gc-523-approval-red-defects = "node gru-output/gc-523-owner-approval/red-defects.mjs"
+# Mutation red evidence, one mutation at a time on the candidate's own archive:
+# the abandonment call as a no-op (A1/A2), and the F5-F9 guards removed. Each
+# named test must fail by assertion; a rotted anchor exits 3, never 1.
+gc-523-approval-mutations = "node gru-output/gc-523-owner-approval/mutations.mjs"
+# #523 owner approval guards: the suites that already cover /abandon,
+# /retire, /recover, binning closeout and the ledger schema, plus the pins on
+# the moved copy (the re-brief recovery text, the installed Gru playbook) and
+# the shared shutdown.
+gc-523-approval-guards = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/board-server.test.ts test/ledger-api.test.ts test/directive-markers.test.ts test/restart-recovery-schema.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/rebrief-recovery.test.ts test/roles-installed-playbook.test.ts test/service-shutdown.test.ts && npx vitest run --config vitest.heavy.config.ts test/canceled-request-closeout.test.ts test/dispatch-server.test.ts test/shutdown.test.ts"
+# #520 blind access: the forms `git grep` prints for revisions and context
+# lines (contract revision 1). `-focused` runs the edited unit and dispatch
+# suites, the unchanged blind-review suite and the registry pins; `-static` is
+# the lint + typecheck + build gate; `-msg-check` applies the scanner's own rule
+# to this branch's commit messages and to the PR text kept in
+# gru-output/gc-520/pr-body.md (reviewer-visible text) and requires 0 hits;
+# `-red` runs the contract's fail-before cases against a scratch extract of the
+# base the contract names, and `-red-4a269d13` the cases the contract revision
+# names against the earlier lane's head. Both red scopes classify their report
+# (every named case must fail BY ASSERTION, never by import) and then exit
+# non-zero by design.
+gc-520-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/blind-input.test.ts test/blind-input-dispatch.test.ts test/blind-review.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-520-static = "npm run lint && npm run typecheck && npm run build"
+gc-520-msg-check = "node gru-output/gc-520/msg-check.mjs"
+gc-520-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts test/blind-input-dispatch.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 red base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" -t "A1: |A2: |A3: |A4: |A5: |A6: " test/blind-input.test.ts test/blind-input-dispatch.test.ts; status=$?; set -e; printf "GC520 red vitest exit=%s (nonzero expected)\n" "$status"; test "$status" -ne 0; node "$root/gru-output/gc-520/red-classify.mjs" "$d/results.json" a1a6; printf "EXPECTED-NONZERO: the contract fail-before cases fail by assertion on %s\n" "$base"; exit 1'
+gc-520-red-4a269d13 = 'set -e; root="$PWD"; base=4a269d13f492688570ac0b1c8af737cc0d8bc8b5; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc520-red-prior.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/blind-input.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC520 red-4a269d13 base=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" -t "A2: any revision spelling|worktree context line records the path itself|clean file.s worktree context line|extensionless name with date-like segments|R1.R2:|parent-relative path behind a revision" test/blind-input.test.ts; status=$?; set -e; printf "GC520 red-4a269d13 vitest exit=%s (nonzero expected)\n" "$status"; test "$status" -ne 0; node "$root/gru-output/gc-520/red-classify.mjs" "$d/results.json" 4a269d13; printf "EXPECTED-NONZERO: the named cases of contract revision 1 fail by assertion on %s\n" "$base"; exit 1'
+# Chat agent vs. an eligible temporary provider usage window (job
+# gc-chat-provider-window; owner ruling chat-wait-dont-stop-20261031, option
+# dont-stop): `chat-window-focused` covers the supervisor settle path, the
+# provider-wall seam and the suite/scope pins — all fast files on the root
+# config; `chat-window-static` is the lint + typecheck + build gate;
+# `chat-window-red` proves A1 fails BY ASSERTION against the dispatch base
+# 191fff12 (the FINAL test bytes over an isolated archive, node_modules
+# symlinked, approved RPC patch first, JSON report classified by
+# tools/assert-named-red-baseline.mjs — a collection/setup/import failure, a
+# green case or a missing title exits 2; the vitest exit is echoed intact).
+chat-window-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/provider-recovery-seam.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+chat-window-static = "npm run lint && npm run typecheck && npm run build"
+chat-window-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-chat-window-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "chat-window-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/chat-window-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/supervisor.test.ts -t "settles the gru chat turn in place instead of stopping the agent"; a=$?; set -e; echo "chat-window-red vitest exit=$a EXPECTED-NONZERO: the pre-change base disposes the chat agent on the typed 429 usage window"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: chat-window A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" chat-window "$d/results.json" "a typed temporary usage window settles the gru chat turn in place instead of stopping the agent" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by behavioral assertion against the pre-change base"; exit 1'
+# #542 an admitted directive/re-brief turn's post-admission verification run no
+# longer fences its later tools. `own-run-fence` runs the A1-A6 tests: the new
+# suite (heavy: the real Claude adapter over the CLI double), the pi cases in
+# restart-recovery-progress and the real-scheduler contract case in verification-server. `own-run-fence-a7` builds first (claude-adapter
+# reads dist/) and runs the existing suites unchanged, plus the registry pins.
+# `-static` is the lint + typecheck + build gate. `-red` runs the A1 tests
+# against a scratch extract of the base commit (the heavy-test list is overlaid
+# so the new heavy file is included) and exits non-zero by design: the verbose
+# reporter lists which cases failed there.
+own-run-fence = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/directive-own-run-fence.test.ts && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts test/verification-server.test.ts --testNamePattern '#542'"
+own-run-fence-a7 = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts test/restart-recovery-progress.test.ts test/fix-directive.test.ts test/canceled-request-closeout.test.ts && npx vitest run test/claude-directive.test.ts test/pi-adapter.test.ts test/directive-retirement.test.ts test/job-stop.test.ts test/ledger-api.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+own-run-fence-static = "npm run lint && npm run typecheck && npm run build"
+own-run-fence-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc542-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/directive-own-run-fence.test.ts "$d/test/directive-own-run-fence.test.ts"; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC542 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/directive-own-run-fence.test.ts --testNamePattern "keeps working while its own run is unsettled"'
+# #547 agent rows a previous service process left spawning/streaming. `gc-547-focused`
+# builds, runs the booted-service suite (heavy: compiled dist/main.js) and the
+# supervisor, directive-retirement and registry-pin suites; `gc-547-static` is the
+# lint + typecheck + build gate; `gc-547-red` extracts the base commit, overlays
+# the new booted-service test (and the heavy list that includes it), builds that
+# base and runs the test by name: it must fail there by assertion, so it exits
+# non-zero by design.
+gc-547-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/ghost-agent-boot.test.ts && npx vitest run test/supervisor.test.ts test/directive-retirement.test.ts test/child-workers.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-547-static = "npm run lint && npm run typecheck && npm run build"
+gc-547-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc547-red.XXXXXX"); trap "rm -rf -- \"$d\"" EXIT; git archive "$base" | tar -x -C "$d"; cp test/ghost-agent-boot.test.ts "$d/test/ghost-agent-boot.test.ts"; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC547 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npm run build; npx vitest run --config vitest.heavy.config.ts --reporter=verbose test/ghost-agent-boot.test.ts'
+# #530 disposed-waiter retirement (extended by the 2026-10-31 re-brief): a
+# `job-minion` provider wait whose recorded agent is `disposed` and whose job
+# has no spawning/streaming agent is retired through the sensor's existing
+# waiter-disposition path (status `cancelled`, recorded why `waiter-gone` from
+# the tick and `waiter-gone-during-check` from the probe's re-validation). The
+# disposed-and-nothing-live rule OUTRANKS the job_status_at_establishment hold
+# (blocked and delivered/in-review variants) only for a wait that hold would
+# otherwise keep from probing; an otherwise eligible normal wall stop is still
+# probed and recovered. Terminal, retired debt, parked, newer-implementer,
+# incident-currency, suspension, active-round and live-agent checks all still
+# win. `waiter-gone-focused` runs the sensor contract plus the neighboring
+# provider-recovery suites and the suite/budget pins; `waiter-gone-static` is
+# the lint + typecheck + build gate.
+waiter-gone-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+waiter-gone-static = "npm run lint && npm run typecheck && npm run build"
+
+# FAIL-BEFORE evidence for the 2026-10-31 re-brief: the FINAL behavioral test
+# bytes are overlaid on an isolated git-archive snapshot of the dispatch base
+# 191fff12c6309be7225d91c077181058a34609ec (root node_modules symlinked — no
+# download/install; approved RPC patch prerequisite; unchanged configs and
+# budgets). The base has no disposed-waiter rule, so the blocked-at-
+# establishment tick assertion REDs (the wait stays `waiting`) and the same
+# establishment-status wait seen by the re-validation REDs (the base holds it
+# instead of cancelling it with `waiter-gone-during-check`). The Vitest JSON
+# report is classified by tools/assert-named-red-baseline.mjs, which exits 2
+# on a collection/setup/import failure or a named test that did not fail by
+# its own assertion; the vitest exit is echoed intact and never masked; the
+# snapshot directory and the ignored pointer file are preserved.
+waiter-gone-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-waiter-gone-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/provider-recovery-sensor.test.ts "$d/test/provider-recovery-sensor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "waiter-gone-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/waiter-gone-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/provider-recovery-sensor.test.ts -t "retires a blocked-at-establishment wait whose agent is disposed"; a=$?; set -e; echo "waiter-gone-red vitest exit=$a EXPECTED-NONZERO: pre-change base holds the blocked-at-establishment wait on the tick and on re-validation"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly" >&2; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" waiter-gone "$d/results.json" "disposed waiter retirement (waiter-gone) retires a blocked-at-establishment wait whose agent is disposed on the tick" "disposed waiter retirement (waiter-gone) retires a blocked-at-establishment wait whose agent is disposed during the probe re-validation"; echo "EXPECTED-NONZERO: the establishment-status override REDs by assertion against the pre-change base"; exit 1'
+# Lane-fence stale registry row: a `live` `registry` row names a service this
+# orchestrator spawned (the verify scheduler records it at spawn and its
+# onSettled settles it), so a dead pid/group there is stale bookkeeping a
+# restart left behind and must not fence directive retirement. Rows with
+# cwd/argv/lane-token evidence keep fencing exactly as before. Focused = the
+# retirement suite, the suite/budget pins and the red classifier's own
+# accept/refuse contract; the approved RPC patch runs first because the
+# scheduler invokes the command directly and does not run npm's pretest hook.
+stale-row-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/assert-stale-row-red.test.ts"
+
+# Static product checks for the same change: lint, compiler and full build
+# (including the pinned Perkins resource verifier).
+stale-row-static = "npm run lint && npm run typecheck && npm run build"
+
+# Fails-before evidence: the FINAL directive-retirement test bytes (which
+# carry A1) are overlaid onto an isolated git-archive snapshot of the task's
+# referenced pre-change base ccd6337f (its fence source and this test file
+# are byte-identical to the branch base 191fff12 at review time), so the
+# stale-registry retirement assertion REDs by behavior there. A bare base
+# archive has no A1 test and would be green for nothing. Dependencies are
+# linked by symlink (no download/install), the approved RPC patch
+# prerequisite runs first, and the Vitest JSON report is classified by
+# tools/assert-stale-row-red.mjs: collection/setup/import failures, a
+# missing/green A1 case, or a failure without the named 409-vs-200
+# AssertionError exits 2. The expected failure exits 1 so the evidence stays
+# visible. The snapshot directory and the ignored pointer file are preserved
+# for inspection; nothing is deleted or checked out and no branch/worktree
+# holds the sha.
+stale-row-red = 'set -e; base=ccd6337fb629f3fc69bea725d06873733b363182; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-stale-row-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/directive-retirement.test.ts "$d/test/directive-retirement.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "stale-row-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/stale-row-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/directive-retirement.test.ts -t "retires past a live registry row whose spawned pid is gone"; a=$?; set -e; echo "stale-row-red vitest exit=$a EXPECTED-NONZERO: pre-change base fences on the stale registry row"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-stale-row-red.mjs" "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the stale-row retirement REDs by assertion against the pre-change base"; exit 1'
 # #526 GitLab quick actions: the canonical publication body escapes every
 # line-leading `/`. `gc-526-focused` runs the edited heavy wave suite plus the
 # registry pins; `-static` is the lint + typecheck + build gate; `-red` runs

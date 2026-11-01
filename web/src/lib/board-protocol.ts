@@ -206,6 +206,9 @@ export interface NotificationView {
   readonly ackedAt: string | null;
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** What the card was closed with (a follow-through's result or a producer's
+   * withdrawal); optional on pre-upgrade servers, strictly typed when present. */
+  readonly resolutionDetail?: string | null;
   /** Optional on pre-upgrade servers; strictly typed when present. */
   readonly decision?: NotificationDecisionView | null;
   readonly decidedAt?: string | null;
@@ -241,6 +244,7 @@ export function isNotificationView(value: unknown): value is NotificationView {
     (value.ackedAt === null || typeof value.ackedAt === 'string') &&
     (value.resolvedAt === null || typeof value.resolvedAt === 'string') &&
     (value.resolvedBy === null || typeof value.resolvedBy === 'string') &&
+    (value.resolutionDetail === undefined || value.resolutionDetail === null || typeof value.resolutionDetail === 'string') &&
     // Owner-decision fields are optional (pre-upgrade servers) but strictly
     // typed when present: a junk decision must never render as a readable
     // question or an executable option.

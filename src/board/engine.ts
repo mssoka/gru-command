@@ -39,6 +39,12 @@ import type { EventRecord } from '../ledger/api.js';
  * served by the paged `GET /api/notifications/receipts` route. */
 const RECEIPT_WINDOW = 30;
 
+/** An owner card stays in the snapshot this long after it resolves, at most
+ * RESOLVED_OWNER_LIMIT of them, so the result its follow-through closed it
+ * with can be read even when the card is older than the newest rows (#523). */
+const RESOLVED_OWNER_WINDOW_MS = 24 * 60 * 60 * 1000;
+const RESOLVED_OWNER_LIMIT = 20;
+
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
@@ -207,6 +213,10 @@ export interface NotificationView {
   readonly ackedAt: string | null;
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** The result the card was closed with (a follow-through's outcome or a
+   * producer's withdrawal): shown on the card itself, not only in the audit
+   * event (#523). Null while open or when the resolution gave none. */
+  readonly resolutionDetail: string | null;
   /** Typed owner-decision metadata (owner release 2026-10-11; null on
    * legacy/machine rows). */
   readonly decision: NotificationDecision | null;
@@ -1341,6 +1351,8 @@ export class BoardEngine {
         if (page.length < 50) break;
       }
     }
+    const resolvedSince = new Date(this.now() - RESOLVED_OWNER_WINDOW_MS).toISOString();
+    for (const row of this.ledger.listRecentlyResolvedOwnerNotifications(resolvedSince, RESOLVED_OWNER_LIMIT)) byId.set(row.id, row);
     return [...byId.values()]
       .sort((a, b) => b.ts.localeCompare(a.ts) || a.id.localeCompare(b.id))
       .map((row) => ({
@@ -1356,6 +1368,7 @@ export class BoardEngine {
         ackedAt: row.ackedAt,
         resolvedAt: row.resolvedAt,
         resolvedBy: row.resolvedBy,
+        resolutionDetail: row.resolutionDetail,
         decision: row.decision,
         decidedAt: row.decidedAt,
         decidedBy: row.decidedBy,

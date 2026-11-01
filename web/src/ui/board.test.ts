@@ -3045,7 +3045,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:keep"]')!.disabled).toBe(true);
     expect(band.querySelector('.board-notification__submission--submitting')?.textContent).toContain('ecording');
     busy.click(); // duplicate click on the in-flight option: no second request
-    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve', stop.decision));
+    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve', stop.decision, 'gru.owner-escalation'));
     expect(failing.decideNotification).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(band.querySelector('.board-notification__submission--unconfirmed')).not.toBeNull());
     // Ambiguous transport failure → the copy must NOT claim nothing was
@@ -3128,6 +3128,43 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     (document.getElementById('notification-bell') as HTMLButtonElement).click();
     expect(client.decideNotification).not.toHaveBeenCalled();
     expect(client.ackNotification).not.toHaveBeenCalled();
+  });
+
+  it('shows the result a follow-through closed an owner card with, on the card itself (#523)', () => {
+    const view = new BoardView(() => {});
+    const closed = notification('approval-closed', {
+      routing: 'needs-owner',
+      kind: 'owner-approval.directive-abandon',
+      severity: 'error',
+      title: 'Abandon directive request req-1?',
+      detail: 'Gru proposes abandoning directive request req-1 as outcome-unknown.',
+      decision: ownerDecision({ question: 'Abandon directive request req-1 as outcome-unknown?', options: [
+        { id: 'approve', label: 'Approve', consequence: 'Closes the request as outcome-unknown.' },
+        { id: 'deny', label: 'Deny', consequence: 'Nothing runs.' },
+      ] }),
+      decidedAt: '2026-01-01T00:09:00.000Z',
+      decidedBy: 'owner',
+      decidedOption: 'approve',
+      resolvedAt: '2026-01-01T00:10:00.000Z',
+      resolvedBy: 'gru',
+      resolutionDetail: 'Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1',
+    });
+    view.render(snapshot({ notifications: [closed] }));
+    // A resolved card leaves the FOR YOU band (for every producer) and is read in the bell's feed.
+    expect(document.getElementById('board-owner')!.querySelector('[data-notification-id="approval-closed"]')).toBeNull();
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const card = document.getElementById('notification-list')!.querySelector<HTMLElement>('[data-notification-id="approval-closed"]')!;
+    // The card says what happened: the code first, then each blocker on its own line.
+    expect(card.querySelector<HTMLElement>('.board-notification__result')?.textContent).toBe('Result: Not run: live_work\nlive lane process(es): lane-1 pid 4242\nqueued worker turn for job-1');
+    expect(card.textContent).toContain('follow-through resolved');
+    // A card without a recorded result renders no result line.
+    view.render(snapshot({ notifications: [{ ...closed, resolutionDetail: null }] }));
+    expect(document.querySelector('.board-notification__result')).toBeNull();
+    view.render(snapshot({ notifications: [{ ...closed, resolutionDetail: undefined }] }));
+    expect(document.querySelector('.board-notification__result')).toBeNull();
+    // An open card never shows a result, even from a stale field.
+    view.render(snapshot({ notifications: [{ ...closed, resolvedAt: null, resolvedBy: null, decidedAt: null, decidedBy: null, decidedOption: null }] }));
+    expect(document.querySelector('.board-notification__result')).toBeNull();
   });
 
   it('board band and bell render the SAME decision question, recommendation and options', () => {
@@ -5357,7 +5394,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       )?.textContent,
     ).toBe('Approve the replacement route');
     currentChoice?.click();
-    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve', replacement.decision);
+    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve', replacement.decision, 'test.notice');
   });
 
   it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {
