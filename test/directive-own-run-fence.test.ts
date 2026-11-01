@@ -193,16 +193,20 @@ async function takeTurn(s: Scene, moveLedger: () => void): Promise<void> {
 describe('#542 the in-turn tool fence and the turn\'s post-admission verification run', () => {
   it('a directive turn keeps working while its own run is unsettled; closeout still waits for the run', async () => {
     const s = await scene();
+    // A REAL pid: since #541 a `registry` row with no live pid is dropped before
+    // #542's exemption can act, so a synthetic pid would make this scenario pass
+    // even with the exemption deleted.
+    const ownPid = livePid();
     let admissionSeq = 0;
     await takeTurn(s, () => {
       admissionSeq = s.ledger.getDirective(s.intent.requestId)!.admissionSeq!;
-      requestRun(s, { runId: 'own-run', pid: 41001 });
+      requestRun(s, { runId: 'own-run', pid: ownPid });
     });
     const file = s.sessionFile();
     // The run postdates the admission, is unsettled, and its pid row is live: both blockers stand.
     expect(s.ledger.latestJobEvent(JOB, 'verification.requested')!.seq).toBeGreaterThan(admissionSeq);
     expect(s.ledger.hasUnsettledVerificationRun(JOB)).toBe(true);
-    expect(s.ledger.listWorktreeProcesses(s.lane.id)).toEqual([expect.objectContaining({ pid: 41001, state: 'live', evidence: 'registry' })]);
+    expect(s.ledger.listWorktreeProcesses(s.lane.id)).toEqual([expect.objectContaining({ pid: ownPid, state: 'live', evidence: 'registry' })]);
     // The tool after the request was allowed and ran; the turn was not ended.
     expect(guardRefusals(file)).toEqual([]);
     expect(hostAllowed(file)).toBe(true);
@@ -214,7 +218,7 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
     expect(held.state).toBe('admitted');
     expect(held.failReason).toContain(UNSETTLED);
     // Once the run settles, normal progress settles the request.
-    settleRun(s, 'own-run', 41001);
+    settleRun(s, 'own-run', ownPid);
     const service = new DirectiveProgressService(s.deps);
     try { service.reconsider(); await service.settled(); } finally { await service.dispose(); }
     expect(s.ledger.getDirective(s.intent.requestId)?.state).toBe('settled');
@@ -222,7 +226,8 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
 
   it('a re-brief turn keeps working while its own run is unsettled', async () => {
     const s = await scene('rebrief');
-    await takeTurn(s, () => requestRun(s, { runId: 'own-run', pid: 41002 }));
+    const ownPid = livePid();
+    await takeTurn(s, () => requestRun(s, { runId: 'own-run', pid: ownPid }));
     const file = s.sessionFile();
     expect(s.ledger.hasUnsettledVerificationRun(JOB)).toBe(true);
     expect(guardRefusals(file)).toEqual([]);
@@ -232,10 +237,11 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
 
   it('the pid row of a post-admission run that settled while its row is still live is exempt too', async () => {
     const s = await scene();
-    await takeTurn(s, () => requestRun(s, { runId: 'own-run', pid: 41003, settled: true }));
+    const ownPid = livePid();
+    await takeTurn(s, () => requestRun(s, { runId: 'own-run', pid: ownPid, settled: true }));
     const file = s.sessionFile();
     expect(s.ledger.hasUnsettledVerificationRun(JOB)).toBe(false);
-    expect(s.ledger.listWorktreeProcesses(s.lane.id)).toEqual([expect.objectContaining({ pid: 41003, state: 'live' })]);
+    expect(s.ledger.listWorktreeProcesses(s.lane.id)).toEqual([expect.objectContaining({ pid: ownPid, state: 'live' })]);
     expect(guardRefusals(file)).toEqual([]);
     expect(toolResults(file)).toEqual([expect.objectContaining({ content: 'ok' })]);
   });
@@ -260,8 +266,9 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
     // The earlier run is queued: requested before the admission, with no process yet.
     const earlierPid = livePid();
     seedAtAdmissionCheck(() => requestRun(s, { runId: 'earlier-run', pid: earlierPid, process: false }), 'after');
+    const ownPid = livePid();
     await takeTurn(s, () => {
-      requestRun(s, { runId: 'own-run', pid: 41006 });
+      requestRun(s, { runId: 'own-run', pid: ownPid });
       // The queued run starts only now: its started frame and its process come after the admission.
       startRun(s, 'earlier-run');
       startProcess(s, 'earlier-run', earlierPid);
@@ -269,20 +276,21 @@ describe('#542 the in-turn tool fence and the turn\'s post-admission verificatio
     const refusal = guardRefusals(s.sessionFile());
     expect(refusal).toEqual([expect.stringContaining(UNSETTLED)]);
     expect(refusal[0]).toContain(`live lane process(es): ${s.lane.id} pid ${earlierPid}`);
-    expect(refusal[0]).not.toContain('41006');
+    expect(refusal[0]).not.toContain(String(ownPid));
     expect(hostAllowed(s.sessionFile())).toBe(false);
   });
 
   it('a lane process the post-admission run did not start still refuses the tool; the run\'s own pid is not named', async () => {
     const s = await scene();
     const foreignPid = livePid();
+    const ownPid = livePid();
     await takeTurn(s, () => {
-      requestRun(s, { runId: 'own-run', pid: 41007 });
+      requestRun(s, { runId: 'own-run', pid: ownPid });
       s.ledger.recordWorktreeProcesses({ worktreeId: s.lane.id, processes: [{ pid: foreignPid, command: 'node server.js', evidence: 'registry' }], state: 'live' });
     });
     const refusal = guardRefusals(s.sessionFile());
     expect(refusal).toEqual([expect.stringContaining(`live lane process(es): ${s.lane.id} pid ${foreignPid}`)]);
-    expect(refusal[0]).not.toContain('41007');
+    expect(refusal[0]).not.toContain(String(ownPid));
     expect(refusal[0]).not.toContain(UNSETTLED);
     expect(hostAllowed(s.sessionFile())).toBe(false);
   });
