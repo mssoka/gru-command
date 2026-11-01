@@ -38,11 +38,11 @@ const ARGV_VALUE = '(?!-)(?:"(?=[^"]*[A-Za-z0-9])[^"]{4,}"|\'(?=[^\']*[A-Za-z0-9
  * credential), running to whitespace. A bare token may hold quote or
  * backtick characters — a child's argv and a shell-spliced word shed the
  * shell's quotation — and may start with `-`. The value after the colon is
- * masked however it looks, so a `scheme://` tail is masked too: the mask is
- * also the recorded-command identity the acknowledged kill compares, and
- * masking no credential there would be worse than collapsing two
- * non-credential `-u` arguments. Only a value that is exactly the placeholder
- * is left alone (idempotence). A value the shell already split on
+ * masked however it looks, so a `scheme://` tail is masked too: masking no
+ * credential there would be worse than collapsing two non-credential `-u`
+ * arguments. The mask is for display only; the row's raw-command digest is
+ * what the acknowledged kill and the readback compare (#534 R1). Only a value
+ * that is exactly the placeholder is left alone (idempotence). A value the shell already split on
  * whitespace (a child spawned with a space inside its `-u` value) is not
  * recoverable from the argv; its quoted shell source is handled by the
  * whole-quoted passes below. */
@@ -150,6 +150,17 @@ const REDACTIONS: readonly Redaction[] = [
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
   replacing(/(?<![A-Za-z0-9-])(-u\s+'[^':]{0,64}:)(?=[^']*[A-Za-z])[^']{6,}'/gu,
     (match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}${match.slice(-1)}`),
+  // A NAMED user with an all-digit value: `-u deploy:1234567`. The passes
+  // above and below require a letter in the value, because a bare value that
+  // is all digits is usually a uid:gid pair (`-u 165536:165536`), which is no
+  // credential. That exemption belongs to an all-numeric PAIR only — a user
+  // that carries a letter makes everything after its colon a password,
+  // however it looks. The opening quote is consumed with the user and the
+  // closing one is re-emitted, so a whole quoted value stays balanced.
+  replacing(
+    /(?<![A-Za-z0-9-])(-u\s+["']?(?=[^\s:'"`]*[A-Za-z])[^\s:'"`-]?[^\s:'"`]*["']?:)\d{6,}(["']?)/gu,
+    (_match: string, prefix: string, closing: string): string => `${prefix}${REDACTION_PLACEHOLDER}${closing}`,
+  ),
   // A bare user (an empty one too: `-u :secret`) with a bare value. The
   // lookbehind keeps `cli -u:value` and `--tokenize` alone.
   replacing(new RegExp(`(?<![A-Za-z0-9-])(-u\\s+["']?[^\\s:'"\`-]?[^\\s:'"\`]*["']?:)${ARGV_TOKEN}`, 'gu'), keepPrefix),

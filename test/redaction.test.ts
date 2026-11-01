@@ -292,6 +292,11 @@ it('redacts argv credentials: new token, user and auth-scheme forms', () => {
     // A named user:group is indistinguishable from user:password, so it masks;
     // only the all-digit uid:gid pair is left alone (A4).
     ['docker run -u postgres:postgres image', `docker run -u postgres:${REDACTION_PLACEHOLDER} image`],
+    // A digits-only value after a NAMED user is a password, not a uid:gid
+    // pair: only an all-numeric pair is left alone (A4).
+    ['curl -u deploy:1234567 https://host/x', `curl -u deploy:${REDACTION_PLACEHOLDER} https://host/x`],
+    ['curl -u "deploy:1234567" https://host/x', `curl -u "deploy:${REDACTION_PLACEHOLDER}" https://host/x`],
+    ["curl -u 'deploy:1234567' https://host/x", `curl -u 'deploy:${REDACTION_PLACEHOLDER}' https://host/x`],
     [`curl -H Authorization: token ${ARGV_SECRET} https://host/x`, `curl -H Authorization: token ${REDACTION_PLACEHOLDER} https://host/x`],
     [`curl -H authorization:Token ${ARGV_SECRET}`, `curl -H authorization:Token ${REDACTION_PLACEHOLDER}`],
     // Inside a shell string, the quote ends the value.
@@ -329,9 +334,6 @@ it('keeps argv near misses unchanged: a flag with no credential value, a short, 
     'node cli.js --token --verbose build',
     'docker run -u 1000:1000 image',
     'docker run -u 165536:165536 image',
-    'curl -u deploy:1234567 https://host/x',
-    'curl -u "deploy:1234567" https://host/x',
-    'curl -u \'deploy:1234567\' https://host/x',
     'docker exec -u alice bash',
     'git push -u origin main',
     'git push -u origin HEAD:refs/heads/main',
