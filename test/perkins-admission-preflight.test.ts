@@ -524,6 +524,92 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('runOwnedGit kills the step\'s own process group when its signal aborts, and publishes only an observed stop (#545)', async () => {
+    // The probe-level test above drives a fake exec, so it proves the PLUMBING.
+    // This one proves the KILL: a real runner, a real detached group, a real
+    // signal — the half of the change that would otherwise be untested.
+    const review = branchTargetReview('aborted-owned-step');
+    const repo = review.manifest.repoPath;
+    const pidFile = join(repo, 'aborted.pid');
+    // The shim leaves a member running in the step's group and records its pid,
+    // so the test can prove that member is gone afterwards.
+    const restore = gitShim('rev-parse', `sleep 30 >/dev/null 2>&1 & echo $! > "${pidFile}"; wait`);
+    const controller = new AbortController();
+    try {
+      const running = runOwnedGit(repo, ['rev-parse', 'HEAD'], 30_000, undefined, controller.signal);
+      // The member is up before the abort: the abort kills a live group, not a
+      // race with a step that never started.
+      for (let attempt = 0; attempt < 100 && !existsSync(pidFile); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(existsSync(pidFile)).toBe(true);
+      controller.abort();
+      await expect(running).rejects.toThrow(/HEAD/u);
+      // The step's group is observed gone, and the published refusal carries
+      // the proof (`ownedStopped`), never a bare timeout.
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
+      const rejection = await running.catch((error: unknown) => error as { ownedStopped?: unknown });
+      expect(rejection).toMatchObject({ ownedStopped: true });
+    } finally {
+      restore();
+    }
+  });
+
+  it('runOwnedGit spawns nothing at all for a signal that is already aborted (#545)', async () => {
+    const review = branchTargetReview('pre-aborted-owned-step');
+    const repo = review.manifest.repoPath;
+    const marker = join(repo, 'pre-aborted.ran');
+    const restore = gitShim('rev-parse', `echo ran > "${marker}"`);
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      await expect(runOwnedGit(repo, ['rev-parse', 'HEAD'], 5_000, undefined, controller.signal)).rejects.toThrow(/cancelled before it started/u);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it('a setup abort ends the probe and kills the step it started (#545)', async () => {
+    // The admission probe was the one setup step whose await had no cancellation.
+    // Its budget grew to 30 s and a suspend may renew it once, so a shutdown that
+    // landed mid-probe could overrun both the wave's stop deadline and the
+    // service's force-exit guard. The wait now honours the setup signal AND the
+    // step's own process group is killed, not abandoned.
+    const controller = new AbortController();
+    let started = 0;
+    const gated: NonNullable<Parameters<typeof probeAdvertisedTipMovementAsync>[2]>['exec'] = (_repo, _args, _timeout, signal) => {
+      started += 1;
+      return new Promise<string>((_resolve, reject) => {
+        if (signal === undefined) throw new Error('the probe must hand its step the setup signal');
+        signal.addEventListener('abort', () => reject(Object.assign(new Error('git step cancelled'), { ownedStopped: true })), { once: true });
+      });
+    };
+    const review = { manifest: { repoPath: '/tmp/probe-abort', targetRef: 'feature/x', targetSha: 'a'.repeat(40) } } as never;
+    const running = probeAdvertisedTipMovementAsync(review, 30_000, {
+      signal: controller.signal,
+      exec: gated,
+      evidence: { platform: 'darwin', wallNow: () => 0, suspendedSince: async () => false } as never,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(started).toBe(1);
+    controller.abort();
+    await expect(running).rejects.toThrow(/cancelled/u);
+  });
+
+  it('a setup signal already aborted starts no git step at all (#545)', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    const review = { manifest: { repoPath: '/tmp/probe-abort', targetRef: 'feature/x', targetSha: 'a'.repeat(40) } } as never;
+    await expect(
+      probeAdvertisedTipMovementAsync(review, 30_000, {
+        signal: controller.signal,
+        exec: () => { calls += 1; return Promise.resolve(''); },
+        evidence: { platform: 'darwin', wallNow: () => 0, suspendedSince: async () => false } as never,
+      }),
+    ).rejects.toThrow(/cancelled/u);
+    expect(calls).toBe(0);
+  });
+
   it('probes the advertised tip OFF the event loop: unrelated work completes while a stalled remote waits (R4-6)', async () => {
     const repo = makeFixtureRepo('admission-async-probe');
     fixtures.trackRepo(repo);

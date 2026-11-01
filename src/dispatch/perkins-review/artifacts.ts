@@ -621,8 +621,14 @@ function afterPrivateDirRemoved<T>(privateDir: string, command: string, outcome:
  * the numeric exit `code`, `stderr` (with `stderrTruncated` when cut), and
  * `ownedStopped` — proof the step's group stopped; a timeout, kill, spawn
  * failure or incomplete answer has no code. */
-export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs: number, maxBytes = PROBE_MAX_OUTPUT_BYTES): Promise<string> {
+export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs: number, maxBytes = PROBE_MAX_OUTPUT_BYTES, signal?: AbortSignal): Promise<string> {
   const command = `git ${args.join(' ')}`;
+  // Never spawn a step whose wait is already over: nothing to stop, and the
+  // caller's interruption stands. Checked BEFORE the launch, so the step's
+  // private directory is never created only to be abandoned (R9-14).
+  if (signal?.aborted === true) {
+    return Promise.reject(Object.assign(new Error(`${command}: cancelled before it started`), { ownedStopped: true }));
+  }
   const launch = runnerLaunch(repoPath, args, timeoutMs, maxBytes);
   return new Promise<string>((resolve, reject) => {
     const runner = OWNED_GIT_SEAMS.spawn(process.execPath, launch.argv, { detached: true, stdio: 'ignore', env: launch.env });
@@ -646,10 +652,30 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
         settle();
       }
     }, timeoutMs + OWNED_GIT_SEAMS.guardSlackMs);
+    // A service shutdown or a superseded round aborts the setup signal. The step
+    // is this process's unreaped child, so its group is provably ours: kill it
+    // and take the ordinary `answer()` path, which observes the group is gone
+    // before publishing. Without this the admission probe's await had no
+    // cancellation at all, and widening its budget to 30 s pushed a shutdown
+    // that landed mid-probe past the wave's stop deadline and the service's
+    // force-exit guard (#341's loss path).
+    const onAbort = (): void => {
+      if (ended) return;
+      if (pid !== null && !exited) {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      settle();
+    };
+    if (signal !== undefined) signal.addEventListener('abort', onAbort, { once: true });
     const settle = (): void => {
       if (ended) return;
       ended = true;
       clearTimeout(guard);
+      if (signal !== undefined) signal.removeEventListener('abort', onAbort);
       // R9-14: the private directory is removed BEFORE the outcome is
       // published, inside the one observed settlement — a removal failure
       // can never surface as an unhandled rejection.
@@ -1482,7 +1508,11 @@ export interface AdmissionProbeSeams {
   /** Budget clock (default performance.now). */
   readonly now?: () => number;
   /** One bounded git invocation (default execFile, killed at timeoutMs). */
-  readonly exec?: (repoPath: string, args: readonly string[], timeoutMs: number) => Promise<string>;
+  readonly exec?: (repoPath: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal) => Promise<string>;
+  /** The setup's abort signal: a shutdown or a superseded round ends the probe
+   * inside whatever grace the wave still has, instead of after its own budget
+   * (which a suspend retry may renew once). */
+  readonly signal?: AbortSignal;
   /** Where suspend evidence is read (default: the real OS). */
   readonly evidence?: SuspendEvidenceIo;
 }
@@ -1506,8 +1536,8 @@ export function remainingTimeoutMs(deadline: number, now: number): number | null
  * remote, ls-remote) and runs in its own process group, SIGKILLed at its
  * bound and when it ends: neither a git or wrapper that ignores SIGTERM nor
  * anything it spawned can hold admission open or overlap a retry. */
-export const defaultProbeExec = (repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> =>
-  runOwnedGit(repoPath, args, timeoutMs);
+export const defaultProbeExec = (repoPath: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<string> =>
+  runOwnedGit(repoPath, args, timeoutMs, PROBE_MAX_OUTPUT_BYTES, signal);
 
 /** `sysctl -n kern.waketime` by absolute path — the service's PATH need
  * not include /usr/sbin. */
@@ -1623,6 +1653,10 @@ export async function probeAdvertisedTipMovementAsync(
   const now = seams.now ?? (() => performance.now());
   const exec = seams.exec ?? defaultProbeExec;
   const io = seams.evidence ?? OS_EVIDENCE;
+  const signal = seams.signal;
+  // An aborted setup abandons the probe at the stage boundary too: no step is
+  // started, and no suspend retry is armed, once the wave has begun stopping.
+  const aborted = (): boolean => signal?.aborted === true;
   // The first attempt's budget starts NOW: reading the Linux baseline is
   // charged against it (R6-4), so it can never add to the bound.
   const firstDeadline = now() + timeoutMs;
@@ -1631,13 +1665,16 @@ export async function probeAdvertisedTipMovementAsync(
     monoMs: now(),
     bootMs: io.platform === 'linux' ? await bootClockMs(io, now, firstDeadline) : null,
   };
-  const first = await probeAdvertisedTipOnce(review, firstDeadline, now, exec);
+  if (aborted()) throw Object.assign(new Error('admission remote probe cancelled before it started'), { ownedStopped: true });
+  const first = await probeAdvertisedTipOnce(review, firstDeadline, now, exec, signal);
   if (first === null || first.cause !== 'check-failed') return first;
   // A git step that would not stop may still be running: never start
   // another while it might live (owner decision 2026-10-07, R6-5).
   if (first.cleanupUnconfirmed === true) return first;
+  if (aborted()) return first;
   if (!(await osSuspendedSince(start, now, io))) return first;
-  return probeAdvertisedTipOnce(review, now() + timeoutMs, now, exec);
+  if (aborted()) return first;
+  return probeAdvertisedTipOnce(review, now() + timeoutMs, now, exec, signal);
 }
 
 async function probeAdvertisedTipOnce(
@@ -1645,6 +1682,7 @@ async function probeAdvertisedTipOnce(
   deadline: number,
   now: () => number,
   exec: NonNullable<AdmissionProbeSeams['exec']>,
+  signal?: AbortSignal,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
   // R6-4: ONE cumulative admission budget (an absolute deadline) across
@@ -1664,7 +1702,7 @@ async function probeAdvertisedTipOnce(
     );
     let stdout: string;
     try {
-      stdout = await exec(review.manifest.repoPath, args, timeout);
+      stdout = await exec(review.manifest.repoPath, args, timeout, signal);
     } catch (error) {
       // A step that might still be running keeps saying so (R6-5): the
       // late-budget message must never launder it into a retryable one —
@@ -1720,10 +1758,17 @@ async function probeAdvertisedTipOnce(
     const remotes = (await run(['remote'])).split('\n');
     return remotes.includes(remote) ? { remote, branch: remoteRef.slice(slash + 1) } : null;
   };
+  // An aborted setup is not a probe result: never publish a fail-closed movement
+  // for a step the wave cancelled, or the round records a refusal for an attempt
+  // it abandoned.
+  const cancelIfAborted = (error: unknown): void => {
+    if (signal?.aborted === true) throw Object.assign(new Error('admission remote probe cancelled'), { ownedStopped: true, cause: error });
+  };
   let remoteTarget: { remote: string; branch: string } | null = null;
   try {
     remoteTarget = await identify();
   } catch (error) {
+    cancelIfAborted(error);
     return failedCheck(error);
   }
   if (remoteTarget === null) return null;
@@ -1738,6 +1783,7 @@ async function probeAdvertisedTipOnce(
     }
     return null;
   } catch (error) {
+    cancelIfAborted(error);
     return failedCheck(error);
   }
 }

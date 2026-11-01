@@ -17,8 +17,8 @@ import { headMovedSinceFreeze } from './whole.js';
  * advertised-tip ls-remote so a stalled remote cannot block the service
  * event loop at request time. A probe that exceeds the bound yields a
  * fail-closed, retryable `head-binding` refusal — never a silent pass and
- * never an unbounded stall. Default: 5 seconds. */
-export const ADMISSION_REMOTE_PROBE_TIMEOUT_MS = 5_000;
+ * never an unbounded stall. Default: 30 seconds. */
+export const ADMISSION_REMOTE_PROBE_TIMEOUT_MS = 30_000;
 
 export interface AdmissionPreflightOptions {
   readonly remoteProbeTimeoutMs?: number;
