@@ -478,7 +478,7 @@ describe('suite shape', () => {
       /npx playwright test --ignore-snapshots --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
     ];
     const matrices = [...workflow.matchAll(/shard: \[([0-9, ]+)\]/gu)]
-      .map((match) => match[1].split(',').map((value) => Number(value.trim())));
+      .map((match) => (match[1] ?? '').split(',').map((value) => Number(value.trim())));
     expect(matrices, 'one shard matrix per sharded phase').toHaveLength(sharded.length);
     sharded.forEach((pattern, index) => {
       const denominator = Number(pattern.exec(workflow)?.[1]);
