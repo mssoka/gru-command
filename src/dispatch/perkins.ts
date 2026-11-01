@@ -57,6 +57,7 @@ import {
   FROZEN_SPEC_MAX_BYTES,
   type FreezeReviewInput,
   type FrozenReview,
+  awaitUnlessInterrupted,
 } from './perkins-review/artifacts.js';
 import { renderEffectiveContract } from '../review-inputs/amendments.js';
 import {
@@ -5996,8 +5997,12 @@ export class WaveRunner {
       // R4-6: the advertised-tip remote probe runs OFF the event loop —
       // a stalled remote awaits here without blocking unrelated service
       // work, then its fail-closed outcome is injected into the preflight.
-      const precomputedRemoteMovement = await probeAdvertisedTipMovementAsync(
-        frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS,
+      // The wait is railed against the setup signal: this probe's own
+      // ceiling can stand for twice its budget, and a shutdown that lands
+      // mid-probe must still land inside the wave's stop grace.
+      const precomputedRemoteMovement = await awaitUnlessInterrupted(
+        probeAdvertisedTipMovementAsync(frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS),
+        setupSignal,
       );
       // R8-3: the UNIQUE freeze receipt with full identity validation — a
       // duplicate or conflicting receipt refuses under the manifest's name

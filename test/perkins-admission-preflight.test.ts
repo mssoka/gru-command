@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { admissionPreflight, ReviewAdmissionError } from '../src/dispatch/perkins-review/admission.js';
 import {
+  awaitUnlessInterrupted,
   defaultProbeExec,
   parseKernWaketime,
   probeAdvertisedTipMovementAsync,
@@ -2505,5 +2506,59 @@ test('fails before its own assertions', () => {
     // The corrupted file is still the only change — the evidence copy and
     // every digest-bearing artifact survive both preflight runs untouched.
     expect(existsSync(join(review.directory, 'evidence', 'ev1.bin'))).toBe(true);
+  });
+});
+
+describe('admission probe wait honours the setup signal (#545)', () => {
+  it('abandons the wait on abort, keeps the step bounded, and swallows its late outcome', async () => {
+    // The probe's own ceiling can stand for twice its budget (a fresh budget
+    // on suspend evidence), so a shutdown that lands mid-probe must not wait
+    // for it: the wave would then overrun its stop deadline and the service's
+    // force-exit guard. The abandoned step still settles on its own terms and
+    // its late rejection is never unhandled.
+    const controller = new AbortController();
+    let release: (() => void) | undefined;
+    const never = new Promise<string>((resolve) => { release = () => resolve('late'); });
+    const racing = awaitUnlessInterrupted(never, controller.signal);
+    controller.abort();
+    await expect(racing).rejects.toThrow(/abort/iu);
+    release?.();
+  });
+
+  it('consumes a step that rejects after its wait was abandoned, and one refused up front', async () => {
+    // A rejection created just before an abort must never escape as an
+    // unhandled rejection: the wait is gone, but the step is still observed.
+    const controller = new AbortController();
+    controller.abort();
+    await expect(awaitUnlessInterrupted(Promise.reject(new Error('late failure')), controller.signal))
+      .rejects.toThrow(/abort/iu);
+    const live = new AbortController();
+    let release: ((error: Error) => void) | undefined;
+    const step = new Promise<string>((_resolve, reject) => { release = (error) => reject(error); });
+    const racing = awaitUnlessInterrupted(step, live.signal);
+    live.abort();
+    await expect(racing).rejects.toThrow(/abort/iu);
+    release?.(new Error('late failure'));
+    // One macrotask later the abandoned rejection is still consumed by the
+    // helper's own observer, so the process is not taken down by it.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+
+  it('never starts the step as abandoned: an already-aborted setup signal refuses before the probe runs', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('review setup was interrupted'));
+    let ran = false;
+    const step = (async () => { ran = true; return 'probe'; })();
+    await expect(awaitUnlessInterrupted(step, controller.signal)).rejects.toThrow(/interrupted/u);
+    // The step itself is not cancelled — only the WAIT is.
+    await expect(step).resolves.toBe('probe');
+    expect(ran).toBe(true);
+  });
+
+  it('passes the step outcome through untouched while the signal stays live', async () => {
+    const controller = new AbortController();
+    await expect(awaitUnlessInterrupted(Promise.resolve('movement'), controller.signal)).resolves.toBe('movement');
+    // Its abort listener is removed on the normal path, so a later abort is inert.
+    controller.abort();
   });
 });

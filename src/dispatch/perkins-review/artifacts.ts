@@ -1615,6 +1615,47 @@ async function osSuspendedSince(start: ProbeStart, now: () => number, io: Suspen
  * event loop blocked by the service's own work — the probe is refused
  * within the single deadline (R7-3), plus at most the bounded evidence
  * allowance (SUSPEND_EVIDENCE_ALLOWANCE_MS) spent looking for a suspend. */
+/** Awaits one frozen SETUP step that carries its own internal bound, and
+ * abandons the WAIT — not the step — the moment the setup signal aborts.
+ *
+ * The admission remote probe is the one step in review setup whose await is
+ * handed no signal: its own ceiling is `budget + guard`, and the suspend
+ * carve-out renews that budget once on real sleep evidence, so on macOS (where
+ * every Node clock keeps counting through sleep) it can stand for twice that.
+ * Awaiting it after a shutdown has begun would push the wave past its own stop
+ * deadline and past the service's force-exit guard — the #341 loss path (lock
+ * release and final snapshot skipped). Racing keeps the step's own bound while
+ * letting a cut land inside the wave's grace; the setup catch already
+ * classifies any throw raised while the signal is aborted as an interruption.
+ *
+ * The abandoned step finishes on its own terms. Its outcome is consumed here,
+ * so a late rejection is never unhandled, and any git child it owns stays
+ * bounded by `runOwnedGit`'s own guard. */
+export async function awaitUnlessInterrupted<T>(step: Promise<T>, signal: AbortSignal): Promise<T> {
+  const reason = (): unknown => signal.reason ?? new Error('review setup was interrupted');
+  // The step is observed on its OWN terms from the first instant, whatever
+  // this wait decides: an abandoned step must never surface its late
+  // rejection as an unhandled rejection of the whole service.
+  const observed = step.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  if (signal.aborted) throw reason();
+  let onAbort: (() => void) | undefined;
+  const interrupted = new Promise<null>((resolve) => {
+    onAbort = () => resolve(null);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    const outcome = await Promise.race([observed, interrupted]);
+    if (outcome === null) throw reason();
+    if (outcome.ok) return outcome.value;
+    throw outcome.error;
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+  }
+}
+
 export async function probeAdvertisedTipMovementAsync(
   review: FrozenReview,
   timeoutMs: number,
