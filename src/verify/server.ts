@@ -13,6 +13,7 @@ import {
   VerificationScheduler,
   isValidVerificationRequestId,
   readGitState,
+  type VerificationAttemptState,
   type VerificationAttemptStatus,
   type VerificationLease,
   type VerificationProgress,

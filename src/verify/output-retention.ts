@@ -115,6 +115,16 @@ export class OutputRetention {
   }
 
   /**
+   * Open a live entry before its first byte so a same-`request_id` re-submit
+   * that arrives while the run is still queued is answered `complete` with
+   * zero frames (nothing produced yet), never a false `none` (which means the
+   * output was lost). Idempotent.
+   */
+  begin(runId: string): void {
+    this.entryFor(runId);
+  }
+
+  /**
    * Retain one output frame from the moment it is first streamed. Once the
    * per-run cap is crossed the entry stops retaining (and reports
    * `incomplete`) rather than silently replacing earlier bytes.

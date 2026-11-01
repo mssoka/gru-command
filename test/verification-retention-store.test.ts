@@ -70,6 +70,10 @@ describe('retained output store (issue #554)', () => {
 
   it('retains a running run from the first byte and snapshots the replay', () => {
     const { retention } = store();
+    // Accepted but not yet streaming: an attach must learn `complete` with
+    // nothing missing, never a false `none` (which means the output was lost).
+    retention.begin('run-a');
+    expect(retention.replay('run-a')).toEqual({ frames: [], replayed: 'complete' });
     retention.retain(frame('run-a', 'first\n'));
     retention.retain(frame('run-a', 'second\n', 'stderr'));
     expect(retention.bytes).toBe(13);

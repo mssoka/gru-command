@@ -609,7 +609,7 @@ async function commandRun(
   const waitStartedAt = now();
   let attempts = 0;
   let abandonedAfterMs: number | null = null;
-  let lastHeadersTimeout: Error | null = null;
+  let lastHeadersTimeout: unknown = null;
   let httpError: string | null = null;
   let transportError: string | null = null;
   for (;;) {

@@ -1267,6 +1267,10 @@ export class VerificationScheduler {
     }
 
     const attempt = this.createAttempt(key, resolvedSpec, head, requestId, sink, hooks);
+    // Retained output is tracked from acceptance, not from the first byte: a
+    // same-`request_id` re-submit that lands while the run is still queued is
+    // answered `complete` with nothing missing (issue #554).
+    this.outputRetention.begin(attempt.runId);
     this.attempts.set(key, attempt);
     for (const id of attempt.requestIds) this.attemptsByRequest.set(id, attempt);
     this.safeRecord({
