@@ -193,7 +193,7 @@ describe('gru role definition', () => {
     for (const state of PIPELINE_STATES) {
       expect(states, `docs/PIPELINE.md missing state ${state}`).toContain(`| \`${state}\` |`);
     }
-    expect([...states.matchAll(/^\| `([a-z]+)` \|/gmu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_STATES].sort());
+    expect([...states.matchAll(/\| `([a-z]+)` \|/gu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_STATES].sort());
     // Each state row keeps its own meaning (a row cannot swap with another).
     for (const row of [
       '| `waiting` | Enqueued, held, or blocked.',
@@ -208,7 +208,7 @@ describe('gru role definition', () => {
     for (const milestone of PIPELINE_MILESTONES) {
       expect(milestones, `docs/PIPELINE.md missing milestone ${milestone}`).toContain(`| \`${milestone}\` |`);
     }
-    expect([...milestones.matchAll(/^\| `([a-z]+)` \|/gmu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_MILESTONES].sort());
+    expect([...milestones.matchAll(/\| `([a-z]+)` \|/gu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_MILESTONES].sort());
     // merged and done are separate endings; the role relies on that.
     expect(milestones).toContain('| `merged` | has a job whose status is exactly `merged`. |');
     expect(milestones).toContain('| `done` | has a job whose status is exactly `done`. |');
