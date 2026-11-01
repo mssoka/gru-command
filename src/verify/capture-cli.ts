@@ -645,10 +645,10 @@ async function commandRun(
         break;
       }
       await sleep(Math.min(CAPTURE_RESUBMIT_DELAY_MS, left));
-      if (waitBudgetMs - (now() - waitStartedAt) <= 0) {
-        abandonedAfterMs = now() - waitStartedAt;
-        break;
-      }
+      // No post-sleep abandon: the loop re-checks the budget and makes its
+      // last submission with whatever is left (a 1 ms headers bound at the
+      // very end), so a small --wait-budget-ms still re-attaches at least
+      // once instead of spending the tail of the budget asleep.
       continue;
     }
     // One response ends the re-submit loop: its body is the run's stream, and
