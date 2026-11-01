@@ -27,6 +27,7 @@ import {
 import { runCaptureCli, type CaptureCliDeps } from '../src/verify/capture-cli.js';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 /**
  * POST /api/verify (contention fix, 2026-09-22): the lane-facing surface —
@@ -212,6 +213,36 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<voi
 }
 
 describe('POST /api/verify', () => {
+  it('#542 a real run\'s request, process-started pid and lane row are what the in-turn fence passes for an admitted request', async () => {
+    // The run holds until the test releases it, so both blockers are live when they are read.
+    const release = join(tmpdir(), `gru-542-release-${process.pid}-${Date.now()}`);
+    const h = await boot({
+      manifest: '[verify]\nhold = "node hold.mjs"\n',
+      files: { 'hold.mjs': `import { existsSync } from 'node:fs';\nwhile (!existsSync(${JSON.stringify(release)})) await new Promise((done) => setTimeout(done, 20));\n` },
+    });
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    // The server records a run's process against the lane only when the ledger has the lane.
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+      sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    const request = h.ledger.beginDirectiveIntent({ jobId: h.jobId, requestId: 'request-542-real-run', directive: 'run the suite', holder: 'gru' }).record;
+    admitNativeDirectiveFixture(h.ledger, request.requestId, 'minion-542', join(h.config.dataDir, 'native-542.jsonl'));
+    const runBlockers = (exempt: boolean): readonly string[] => h.ledger.directiveProgressBlockers(request.requestId, lane.id, undefined, undefined, undefined, exempt)
+      .filter((blocker) => blocker.startsWith('unsettled verification run') || blocker.startsWith('live lane process'));
+    const run = call(h.port, { job_id: h.jobId, scope: 'hold' });
+    try {
+      await waitFor(() => h.ledger.listWorktreeProcesses(lane.id).some((row) => row.state === 'live'), 20_000);
+      // The scheduler's own events and the server's own row: both blockers stand, and both pass for the admitted request.
+      expect(runBlockers(false)).toEqual([expect.stringContaining('unsettled verification run(s) hold the lane'), expect.stringContaining('live lane process(es)')]);
+      expect(runBlockers(true)).toEqual([]);
+    } finally {
+      writeFileSync(release, '');
+    }
+    expect(completedFrame((await run).frames)).toBeDefined();
+    expect(runBlockers(false)).toEqual([]);
+    rmSync(release, { force: true });
+    await h.close();
+  });
+
   it('PR334 receipt aggregate verification bounds are enforced without eager payload materialization', async () => {
     const h = await boot(); const requestId = 'pr334-bounded-receipts';
     const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
