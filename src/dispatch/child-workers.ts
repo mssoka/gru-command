@@ -954,6 +954,13 @@ export class ChildWorkerService {
         });
       }
       const terminal = this.opts.ledger.getChildWorker(record.id)?.resultState !== null;
+      if (terminal && handle === null) {
+        this.settleUnspawnedAgentRow(
+          record,
+          run.cancelReason !== null || this.signal.aborted,
+          engineFailure ?? run.cancelReason ?? 'the child ended before its session started',
+        );
+      }
       // A terminal result with UNPROVEN cessation is still durable cleanup
       // debt: the work outcome is recorded (a successful turn is a
       // successful turn), but the process/lane ownership is not claimed
@@ -998,6 +1005,32 @@ export class ChildWorkerService {
       ) {
         await this.releaseLaneQuietly(record.id);
       }
+    }
+  }
+
+  /**
+   * A child admitted but ended before any session existed (an ineligible
+   * parent, a lane or spawn failure, a cancel while queued) never reaches the
+   * board engine's state taps, so the agent row written `spawning` at
+   * admission would stay an open worker turn for good and fence its job
+   * (#547). Move it out of the open states: `disposed` for a cancel, `error`
+   * for a failure. Best effort and loud: the result is already recorded, and
+   * the next boot's settlement of previous-process turns still catches a row
+   * this write misses.
+   */
+  private settleUnspawnedAgentRow(record: ChildWorkerRecord, cancelled: boolean, reason: string): void {
+    const agentId = record.agentId ?? record.id;
+    try {
+      const row = this.opts.ledger.getAgent(agentId);
+      if (row === null || (row.state !== 'spawning' && row.state !== 'streaming')) return;
+      if (cancelled) this.opts.ledger.setAgentState(agentId, 'disposed');
+      else this.opts.ledger.setAgentState(agentId, 'error', reason);
+    } catch (error) {
+      this.log('error', 'child worker agent row could not be settled after a run that never spawned', {
+        child: record.id,
+        agent: agentId,
+        error: String(error),
+      });
     }
   }
 
