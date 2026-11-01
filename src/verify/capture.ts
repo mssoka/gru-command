@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { dirname } from 'node:path';
 import { isValidVerificationRequestId } from './scheduler.js';
+import type { ReplayedOutput } from './output-retention.js';
 
 /**
  * Supported verification capture (issue #159). The observed incident: six
@@ -340,7 +341,6 @@ export function identityMismatch(record: CaptureOwnerRecord, probe: ProcessProbe
 // ------------------------------------------------------------------
 
 export type CaptureOutcome = 'completed' | 'unknown' | 'admission-failed';
-
 export interface CaptureReceipt {
   readonly version: 1;
   readonly request_id: string;
@@ -366,8 +366,24 @@ export interface CaptureReceipt {
   readonly timed_out: boolean | null;
   readonly output_bytes: number | null;
   readonly output_sha256: string | null;
+  /** The text of every `output` frame the sink actually holds, reassembled
+   * in order, as a UTF-8 byte count and SHA-256 (issue #554). A capture is
+   * complete only when these equal `output_bytes`/`output_sha256`. */
+  readonly captured_output_bytes: number;
+  readonly captured_output_sha256: string;
+  /** The replay marker a same-`request_id` re-submit received, if any; null
+   * for an ordinary first capture. */
+  readonly replayed_output: ReplayedOutput | null;
+  /** Submissions this helper made (a headers-timeout re-submit counts). */
+  readonly attempts: number;
+  /** Milliseconds spent waiting before the re-submit bound was abandoned. */
+  readonly abandoned_after_ms: number | null;
   readonly started: boolean;
   readonly error: string | null;
+  /** The same detail as `error` (issue #554 names it `detail` in the
+   * re-submit/abandon contract) so a reader never has to guess which field
+   * carries the explanation. */
+  readonly detail: string | null;
   readonly completed_at: string;
 }
 
@@ -404,7 +420,31 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
     ) {
       return null;
     }
-    return parsed;
+    // Issue #554's fields are additive to receipt version 1. A receipt
+    // written before them truthfully proved nothing about output
+    // completeness (captured bytes 0 / no hash), made one submission and
+    // never replayed, so an ABSENT value normalizes to that pre-change
+    // meaning; a present-but-corrupt value is refused loudly.
+    const legacy = { ...parsed } as Record<string, unknown>;
+    if (legacy['captured_output_bytes'] === undefined) legacy['captured_output_bytes'] = 0;
+    if (legacy['captured_output_sha256'] === undefined) legacy['captured_output_sha256'] = '';
+    if (legacy['replayed_output'] === undefined) legacy['replayed_output'] = null;
+    if (legacy['attempts'] === undefined) legacy['attempts'] = 1;
+    if (legacy['abandoned_after_ms'] === undefined) legacy['abandoned_after_ms'] = null;
+    if (legacy['detail'] === undefined) legacy['detail'] = legacy['error'] ?? null;
+    const capturedBytes = legacy['captured_output_bytes'];
+    const capturedSha = legacy['captured_output_sha256'];
+    const replayed = legacy['replayed_output'];
+    const attempts = legacy['attempts'];
+    const abandoned = legacy['abandoned_after_ms'];
+    const detail = legacy['detail'];
+    if (typeof capturedBytes !== 'number' || !Number.isInteger(capturedBytes) || capturedBytes < 0) return null;
+    if (typeof capturedSha !== 'string') return null;
+    if (replayed !== null && replayed !== 'complete' && replayed !== 'incomplete' && replayed !== 'none') return null;
+    if (typeof attempts !== 'number' || !Number.isInteger(attempts) || attempts < 1) return null;
+    if (abandoned !== null && (typeof abandoned !== 'number' || !Number.isFinite(abandoned) || abandoned < 0)) return null;
+    if (detail !== null && typeof detail !== 'string') return null;
+    return legacy as unknown as CaptureReceipt;
   } catch {
     return null;
   }
@@ -416,11 +456,16 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
  * and an output hash, was not a recorded-outcome replay, and the
  * caller-named head (when given) matches; an unknown/admission-failed
  * stream is never success.
+ *
+ * Issue #554 adds the completeness proof to the same predicate: the sink's
+ * reassembled output must equal the run's recorded output exactly, and a
+ * reconciled replay is promotable only when it carried the run's output from
+ * byte 0 (`replayed_output: "complete"`). A replayed receipt without retained
+ * output therefore stays unpromotable — never a silent 0-byte success.
  */
 export function captureReceiptSucceeded(receipt: CaptureReceipt): boolean {
   return (
     receipt.outcome === 'completed' &&
-    receipt.reconciled !== true &&
     receipt.ok === true &&
     receipt.exit_code === 0 &&
     receipt.run_id !== null &&
@@ -429,8 +474,47 @@ export function captureReceiptSucceeded(receipt: CaptureReceipt): boolean {
     receipt.output_sha256 !== null &&
     receipt.output_sha256 !== '' &&
     receipt.error === null &&
-    (receipt.expected_head === null || receipt.expected_head === receipt.head)
+    (receipt.expected_head === null || receipt.expected_head === receipt.head) &&
+    receipt.captured_output_bytes === receipt.output_bytes &&
+    receipt.captured_output_sha256 === receipt.output_sha256 &&
+    (receipt.reconciled !== true || receipt.replayed_output === 'complete')
   );
+}
+
+/**
+ * Why a completed capture cannot be promoted, in the order the proof fails:
+ * a reconciled replay that carried missing output first (it names what is
+ * gone and points at the ledger), then a sink whose reassembled output does
+ * not equal the run's record, then today's exact-head/clean-exit messages.
+ * Null when `captureReceiptSucceeded` holds.
+ */
+export function captureRefusalDetail(receipt: CaptureReceipt): string | null {
+  if (captureReceiptSucceeded(receipt)) return null;
+  if (receipt.reconciled === true && receipt.replayed_output !== 'complete') {
+    return (
+      `replayed capture is incomplete (replayed_output: ${JSON.stringify(receipt.replayed_output ?? 'none')}): ` +
+      `this sink was not handed the run's full output — the ledger's verification.completed record keeps ` +
+      `run ${receipt.run_id ?? 'unknown'} output_bytes ${String(receipt.output_bytes)} output_sha256 ` +
+      `${String(receipt.output_sha256)} and its retained tail; do not rerun to recover logs`
+    );
+  }
+  if (
+    receipt.captured_output_sha256 !== receipt.output_sha256 ||
+    receipt.captured_output_bytes !== receipt.output_bytes
+  ) {
+    const recorded = receipt.output_bytes;
+    const captured = receipt.captured_output_bytes;
+    const missing = recorded === null ? 'an unknown number of' : String(Math.max(recorded - captured, 0));
+    return (
+      `capture is incomplete: the sink holds ${String(captured)} output bytes (sha256 ` +
+      `${JSON.stringify(receipt.captured_output_sha256)}), the run recorded ${String(recorded)} bytes (sha256 ` +
+      `${String(receipt.output_sha256)}) — ${missing} bytes of output are missing from this capture ` +
+      `(run ${receipt.run_id ?? 'unknown'}); the ledger's verification.completed record keeps the retained tail`
+    );
+  }
+  return receipt.reconciled
+    ? 'replayed terminal receipt is not a promotable full capture — the ledger holds the run; do not rerun to recover logs'
+    : 'completed run is not a promotable exact-head PASS';
 }
 
 // ------------------------------------------------------------------
@@ -450,6 +534,12 @@ export interface CapturedNdjson {
   readonly started: boolean;
   readonly errorCode: string | null;
   readonly errorDetail: string | null;
+  /** UTF-8 bytes of every accepted `output` frame's text, in order. */
+  readonly capturedOutputBytes: number;
+  /** SHA-256 of that same concatenated text (issue #554 completeness). */
+  readonly capturedOutputSha256: string;
+  /** The replay marker carried by an `attached`/`completed` frame, if any. */
+  readonly replayedOutput: ReplayedOutput | null;
 }
 
 /** Bound on a single buffered line before it is treated as a torn record. */
@@ -477,6 +567,9 @@ export class NdjsonCaptureReader {
   private errorDetail: string | null = null;
   private runId: string | null = null;
   private terminalSeen = false;
+  private readonly capturedHash = createHash('sha256');
+  private capturedBytes = 0;
+  private replayedOutput: ReplayedOutput | null = null;
 
   push(text: string): void {
     this.buffer += text;
@@ -506,6 +599,9 @@ export class NdjsonCaptureReader {
       started: this.started,
       errorCode: this.errorCode,
       errorDetail: this.errorDetail,
+      capturedOutputBytes: this.capturedBytes,
+      capturedOutputSha256: this.capturedHash.copy().digest('hex'),
+      replayedOutput: this.replayedOutput,
     };
   }
 
@@ -562,6 +658,19 @@ export class NdjsonCaptureReader {
     }
     const type = frame['type'];
     if (type === 'started' || (type === 'attached' && frame['state'] === 'running')) this.started = true;
+    if (type === 'output' && typeof frame['text'] === 'string') {
+      // The sink's output is the NDJSON frame stream: the run's complete
+      // output is these texts, in order, nothing more (issue #554).
+      const text = frame['text'];
+      this.capturedHash.update(Buffer.from(text, 'utf8'));
+      this.capturedBytes += Buffer.byteLength(text, 'utf8');
+    }
+    const replayed = frame['replayed_output'];
+    if (type === 'attached' || type === 'completed') {
+      if (replayed === 'complete' || replayed === 'incomplete' || replayed === 'none') {
+        this.replayedOutput = replayed;
+      }
+    }
     if (type === 'completed') {
       this.terminalSeen = true;
       if (frame['reconciled'] === true) this.reconciled = true;

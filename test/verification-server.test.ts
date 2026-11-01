@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import { createServer, request, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import { EventEmitter } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { loadConfig, type GruCommandConfig } from '../src/config.js';
@@ -13,7 +13,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
-import { VerificationLockTimeoutError, type VerificationScheduler } from '../src/verify/scheduler.js';
+import { VerificationLockTimeoutError, VerificationScheduler } from '../src/verify/scheduler.js';
 import {
   createVerificationServer,
   type VerificationServer,
@@ -24,9 +24,10 @@ import {
   parseCapturedNdjson,
   readCaptureReceipt,
 } from '../src/verify/capture.js';
-import { runCaptureCli, type CaptureCliDeps } from '../src/verify/capture-cli.js';
+import { runCaptureCli, CAPTURE_EXIT, type CaptureCliDeps } from '../src/verify/capture-cli.js';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 /**
  * POST /api/verify (contention fix, 2026-09-22): the lane-facing surface —
@@ -86,6 +87,8 @@ async function boot(opts: {
   workerBudget?: number;
   heartbeatMs?: number;
   files?: Readonly<Record<string, string>>;
+  /** Injected scheduler clock (issue #554 retention-window tests). */
+  now?: () => number;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-verify-server-'));
   dirs.push(dir);
@@ -119,10 +122,30 @@ async function boot(opts: {
   ledger.addJob({ id: jobId, repo: 'verify-app', title: 'verify the lane', baseBranch: 'main', briefing: 'verify' });
   ledger.setJobStatus(jobId, 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
+  const injectedScheduler =
+    opts.now === undefined
+      ? undefined
+      : new VerificationScheduler({
+          storageDir: join(dir, 'verify'),
+          limits: {
+            maxConcurrent: config.verify.maxConcurrent,
+            workerBudget: config.verify.workerBudget,
+            lockWaitTimeoutMs: config.verify.lockWaitTimeoutMs,
+            runTimeoutMs: config.verify.runTimeoutMs,
+          },
+          now: opts.now,
+          // The injected scheduler must still record the run to the ledger, as
+          // the server-owned one does: #554's retention-window cases assert the
+          // run happened exactly once (verification.started/completed).
+          record: (event) => {
+            ledger.appendCustomEvent({ kind: event.kind, jobId: event.jobId, payload: event.payload });
+          },
+        });
   let server = createVerificationServer({
     config,
     ledger,
     worktrees,
+    ...(injectedScheduler === undefined ? {} : { scheduler: injectedScheduler }),
     ...(opts.heartbeatMs === undefined ? {} : { heartbeatMs: opts.heartbeatMs }),
   });
   const http: HttpServer = createServer((req, res) => {
@@ -211,7 +234,87 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<voi
   }
 }
 
+/**
+ * A forwarding proxy that holds the FIRST response's headers for `delayMs`
+ * while the request itself reaches the service immediately — the #554 shape:
+ * the run is accepted and completes, but a capture helper with a shorter
+ * connect+headers bound gives up before it sees a single response byte.
+ */
+interface DelayingProxy {
+  readonly port: number;
+  readonly close: () => Promise<void>;
+}
+
+async function startDelayingProxy(upstreamPort: number, delayMs: number): Promise<DelayingProxy> {
+  let held = false;
+  const proxy = createServer((req, res) => {
+    const delay = held ? 0 : delayMs;
+    held = true;
+    const upstream = request(
+      { host: '127.0.0.1', port: upstreamPort, path: req.url, method: req.method, headers: req.headers },
+      (upstreamResponse) => {
+        const forward = (): void => {
+          if (res.destroyed || res.writableEnded) {
+            upstreamResponse.destroy();
+            return;
+          }
+          res.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+          res.flushHeaders();
+          upstreamResponse.pipe(res);
+        };
+        if (delay > 0) setTimeout(forward, delay);
+        else forward();
+      },
+    );
+    upstream.on('error', () => {
+      if (!res.destroyed) res.destroy();
+    });
+    res.on('close', () => {
+      upstream.destroy();
+    });
+    req.pipe(upstream);
+  });
+  await new Promise<void>((resolveListen) => proxy.listen(0, '127.0.0.1', resolveListen));
+  return {
+    port: (proxy.address() as AddressInfo).port,
+    close: async () => {
+      proxy.closeAllConnections();
+      await new Promise<void>((resolveClose) => proxy.close(() => resolveClose()));
+    },
+  };
+}
+
 describe('POST /api/verify', () => {
+  it('#542 a real run\'s request, process-started pid and lane row are what the in-turn fence passes for an admitted request', async () => {
+    // The run holds until the test releases it, so both blockers are live when they are read.
+    const release = join(tmpdir(), `gru-542-release-${process.pid}-${Date.now()}`);
+    const h = await boot({
+      manifest: '[verify]\nhold = "node hold.mjs"\n',
+      files: { 'hold.mjs': `import { existsSync } from 'node:fs';\nwhile (!existsSync(${JSON.stringify(release)})) await new Promise((done) => setTimeout(done, 20));\n` },
+    });
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    // The server records a run's process against the lane only when the ledger has the lane.
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+      sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    const request = h.ledger.beginDirectiveIntent({ jobId: h.jobId, requestId: 'request-542-real-run', directive: 'run the suite', holder: 'gru' }).record;
+    admitNativeDirectiveFixture(h.ledger, request.requestId, 'minion-542', join(h.config.dataDir, 'native-542.jsonl'));
+    const runBlockers = (exempt: boolean): readonly string[] => h.ledger.directiveProgressBlockers(request.requestId, lane.id, undefined, undefined, undefined, exempt)
+      .filter((blocker) => blocker.startsWith('unsettled verification run') || blocker.startsWith('live lane process'));
+    const run = call(h.port, { job_id: h.jobId, scope: 'hold' });
+    try {
+      await waitFor(() => h.ledger.listWorktreeProcesses(lane.id).some((row) => row.state === 'live'), 20_000);
+      // The scheduler's own events and the server's own row: both blockers stand, and both pass for the admitted request.
+      expect(runBlockers(false)).toEqual([expect.stringContaining('unsettled verification run(s) hold the lane'), expect.stringContaining('live lane process(es)')]);
+      expect(runBlockers(true)).toEqual([]);
+    } finally {
+      writeFileSync(release, '');
+    }
+    expect(completedFrame((await run).frames)).toBeDefined();
+    expect(runBlockers(false)).toEqual([]);
+    rmSync(release, { force: true });
+    await h.close();
+  });
+
   it('PR334 receipt aggregate verification bounds are enforced without eager payload materialization', async () => {
     const h = await boot(); const requestId = 'pr334-bounded-receipts';
     const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
@@ -242,6 +345,122 @@ describe('POST /api/verify', () => {
       expect(h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled')).toBeNull();
     } finally { spy.mockRestore(); }
     await h.close();
+  });
+
+  it('records a credential-bearing scope command masked in the lane process row, and the terminal readback still closes that row (#534)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-readback';
+    const command = `node verify.mjs pass --token ${secret}`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      // The port may be ledger-backed (the row exists) or a test double (it does not).
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      // What the server recorded at the run's spawn and settlement.
+      const recorded = h.ledger.listWorktreeProcesses(lane.id);
+      expect(recorded.length).toBeGreaterThan(0);
+      for (const row of recorded) { expect(row.command).not.toContain(secret); expect(row.command).toContain('[REDACTED]'); }
+      // R2: the whole event stream the run left holds the scope's command masked, in every field that carries it.
+      const lifecycle = h.ledger.listJobEventsByKinds(h.jobId, ['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']);
+      expect(new Set(lifecycle.map((event) => event.kind))).toEqual(new Set(['verification.requested', 'verification.started', 'verification.process-started', 'verification.completed']));
+      for (const event of lifecycle) {
+        const fields = event.payload as Record<string, unknown>;
+        for (const field of ['command', 'process_command', 'step_command', 'dedupe_key']) {
+          if (fields[field] === undefined) continue;
+          expect(String(fields[field]), `${event.kind}.${field}`).not.toContain(secret);
+          expect(String(fields[field]), `${event.kind}.${field}`).toContain('[REDACTED]');
+        }
+      }
+      expect(lifecycle.find((event) => event.kind === 'verification.started')?.payload).toMatchObject({ command: 'node verify.mjs pass --token [REDACTED]' });
+      expect(lifecycle.find((event) => event.kind === 'verification.process-started')?.payload)
+        .toMatchObject({ command: 'node verify.mjs pass --token [REDACTED]', process_command: '/bin/sh -c node verify.mjs pass --token [REDACTED]', step_command: 'node verify.mjs pass --token [REDACTED]' });
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+      // The run's process is gone; its row, live again, is closed by the readback of the original receipts. The
+      // readback's command is the raw one the scheduler kept: the events hold it masked. The row is the one the
+      // server's own spawn write recorded: its digest is that of the raw argv, which is the identity the reconcile derives.
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string };
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      const reconcile = () => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()?.commandSha256).toBe(createHash('sha256').update(`/bin/sh -c ${command}`).digest('hex'));
+      h.db.handle.prepare("UPDATE worktree_processes SET state = 'live' WHERE worktree_id = ? AND pid = ?").run(lane.id, facts.pid);
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      const audit = h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled');
+      expect(audit?.payload).toMatchObject({ pid: facts.pid, request_id: requestId });
+      expect(String((audit?.payload as { command: string }).command)).not.toContain(secret);
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
+  it('closes a registry row at the terminal readback for a command whose masked line masking again would change (#534 R2)', async () => {
+    // A quoted credential followed directly by `;` is masked once to `--token [REDACTED];echo done`; a second pass would
+    // take `[REDACTED];echo` for a value. The events hold the line as it was written, and the readback binds to it.
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const requestId = 'argv-redaction-glued';
+    const command = `node verify.mjs pass --token "${secret}";echo done`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command.replaceAll('"', '\\"')}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string; command: string };
+      expect(facts.command).toBe('node verify.mjs pass --token [REDACTED];echo done');
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      expect(liveRow()?.commandSha256).toBe(createHash('sha256').update(`/bin/sh -c ${command}`).digest('hex'));
+      h.db.handle.prepare("UPDATE worktree_processes SET state = 'live' WHERE worktree_id = ? AND pid = ?").run(lane.id, facts.pid);
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+    } finally { await h.close(); }
+  });
+
+  it('closes a registry row at the terminal readback only by the digest of its raw command: another credential under the same masked text, and a row without a digest, stay live (#534 R1)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4'; const other = 'Zx5Hn2Bv8Qd4Wm7Lt3Pc'; const requestId = 'argv-redaction-identity';
+    const command = `node verify.mjs pass --token ${secret}`;
+    const h = await boot({ manifest: `[verify]\nfull = "${command}"\n` });
+    try {
+      const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+      if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+      const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+      const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+      const facts = h.ledger.latestJobEvent(h.jobId, 'verification.started')!.payload as { pid: number; cwd: string };
+      const liveRow = () => h.ledger.listWorktreeProcesses(lane.id).find((row) => row.pid === facts.pid);
+      const reconcile = () => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId, command, cwd: facts.cwd, worktreeId: lane.id });
+      const reconciled = () => h.ledger.listJobEventsByKinds(h.jobId, ['verification.process-reconciled']).length;
+      const seed = (rowCommand: string) => h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: rowCommand, evidence: 'registry' }] });
+      const masked = `/bin/sh -c node verify.mjs pass --token [REDACTED]`;
+
+      // The same masked text under another credential is another command: the row stays live.
+      seed(`/bin/sh -c ${command.replace(secret, other)}`);
+      expect(liveRow()).toMatchObject({ state: 'live', command: masked });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      expect(reconciled()).toBe(0);
+
+      // A row recorded without a digest (before the digest existed) has no identity, whatever its text says.
+      h.db.handle.prepare('DELETE FROM worktree_processes WHERE worktree_id = ? AND pid = ?').run(lane.id, facts.pid);
+      h.db.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+        VALUES (?, ?, ?, 'registry', 'live', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`).run(lane.id, facts.pid, masked);
+      expect(liveRow()).toMatchObject({ state: 'live', commandSha256: null });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      expect(reconciled()).toBe(0);
+      h.db.handle.prepare('UPDATE worktree_processes SET command = ? WHERE worktree_id = ? AND pid = ?').run(`/bin/sh -c ${command}`, lane.id, facts.pid);
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'live' });
+      expect(reconciled()).toBe(0);
+
+      // The identical raw command, recorded by the registry write, still closes the row.
+      seed(`/bin/sh -c ${command}`);
+      expect(liveRow()).toMatchObject({ state: 'live', command: masked });
+      reconcile();
+      expect(liveRow()).toMatchObject({ state: 'killed' });
+      expect(reconciled()).toBe(1);
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
+      expect(JSON.stringify(h.ledger.listEvents({ limit: 5_000 }))).not.toContain(other);
+    } finally { await h.close(); }
   });
 
   it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
@@ -296,6 +515,24 @@ describe('POST /api/verify', () => {
         status: 'parked',
       });
       expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.started')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('records the held-job refusal with the scope command masked (#534 R2)', async () => {
+    const secret = 'Kq7ZmW3xP9tR2vLd8Nc4';
+    const harness = await boot({ manifest: `[verify]\nfull = "node verify.mjs pass --token ${secret}"\n` });
+    harness.ledger.setJobStatus(harness.jobId, 'parked');
+    try {
+      const result = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
+      expect(result.status).toBe(409);
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.refused')?.payload).toMatchObject({
+        scope: 'full',
+        code: 'job_held',
+        command: 'node verify.mjs pass --token [REDACTED]',
+      });
+      expect(JSON.stringify(harness.ledger.listEvents({ limit: 5_000 }))).not.toContain(secret);
     } finally {
       await harness.close();
     }
@@ -608,8 +845,10 @@ describe('verification single-flight + reconcile (issue #159)', () => {
         .toThrow('inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
     }
     const replay = await call(h.port, { job_id: h.jobId, scope: 'docs', request_id: requestId });
-    expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true });
-    expect(outcomeOf(replay.frames[0]!)).toEqual(outcome);
+    // Issue #554: the retained output frames lead; the reconciled terminal closes.
+    const replayTerminal = completedFrame(replay.frames);
+    expect(replayTerminal).toMatchObject({ type: 'completed', reconciled: true });
+    expect(outcomeOf(replayTerminal)).toEqual(outcome);
     for (const row of originalRows) expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(expect.arrayContaining([expect.objectContaining({ pid: row.pid, command: row.command, state: receiptFault === undefined ? 'killed' : 'live' })]));
     expect(h.ledger.latestJobEvent(h.jobId, 'verification.completed')).toEqual(completed);
     expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.started', 'verification.process-started'], { limit: 4100 })).toEqual(originalStarts);
@@ -705,9 +944,17 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     });
 
     const replay = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
-    expect(replay.frames).toHaveLength(1);
-    expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true });
-    expect(outcomeOf(replay.frames[0]!)['runId']).toBe(firstOutcome['runId']);
+    // Issue #554: a same-request_id re-submit is handed the run's retained
+    // output from byte 0 BEFORE the recorded terminal frame.
+    const replayTerminal = completedFrame(replay.frames);
+    expect(replayTerminal).toMatchObject({ type: 'completed', reconciled: true, replayed_output: 'complete' });
+    expect(outcomeOf(replayTerminal)['runId']).toBe(firstOutcome['runId']);
+    const retainedFrames = replay.frames.slice(0, replay.frames.indexOf(replayTerminal));
+    expect(retainedFrames.length).toBeGreaterThan(0);
+    expect(retainedFrames.every((frame) => frame.type === 'output')).toBe(true);
+    const reassembled = retainedFrames.map((frame) => String(frame['text'] ?? '')).join('');
+    expect(Buffer.byteLength(reassembled)).toBe(outcomeOf(replayTerminal)['outputBytes']);
+    expect(createHash('sha256').update(reassembled).digest('hex')).toBe(outcomeOf(replayTerminal)['outputSha256']);
 
     const started = harness.ledger
       .listJobEvents(harness.jobId)
@@ -743,14 +990,258 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     const running = await statusCall(harness.port, `request_id=${requestId}`);
     expect(running.json).toMatchObject({ state: 'running', started: true });
 
-    // Reconnecting with the SAME identity attaches to the one producer.
+    // Reconnecting with the SAME identity attaches to the one producer and
+    // (issue #554) is handed whatever output it missed from byte 0 first.
     const resumed = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
-    expect(resumed.frames[0]?.['type']).toBe('attached');
+    const attached = resumed.frames.find((frame) => frame.type === 'attached');
+    expect(attached).toBeDefined();
+    expect(['complete', 'none']).toContain(attached?.['replayed_output']);
+    expect(resumed.frames.filter((frame) => frame.type === 'attached')).toHaveLength(1);
     expect(outcomeOf(completedFrame(resumed.frames))['ok']).toBe(true);
     const started = harness.ledger
       .listJobEvents(harness.jobId)
       .filter((event) => event.kind === 'verification.started');
     expect(started).toHaveLength(1);
+    await harness.close();
+  });
+
+  function captureCliDeps(lanePath: string): CaptureCliDeps {
+    return {
+      probe: () => ({
+        alive: true,
+        startTime: 'Mon Oct  6 12:00:00 2026',
+        cwd: lanePath,
+        command: 'node capture-cli run',
+      }),
+      argv: ['capture-cli', 'run'],
+      stdout: () => {},
+      stderr: () => {},
+    };
+  }
+
+  const HOLD_SCRIPT = [
+    'process.stdout.write("hold-first\\n");',
+    'setTimeout(() => { process.stdout.write("hold-second\\n"); process.exit(0); }, 2000);',
+  ].join('\n');
+  const HOLD_MANIFEST = ['[verify]', 'hold = "node hold.mjs"', ''].join('\n');
+
+  it('A1 #554: a headers timeout past the helper bound re-submits and captures the completed run in full', async () => {
+    const harness = await boot({ maxConcurrent: 2 });
+    const proxy = await startDelayingProxy(harness.port, 500);
+    try {
+      const sinkPath = join(harness.lanePath, 'verify-capture-a1.ndjson');
+      const started = Date.now();
+      const code = await runCaptureCli(
+        [
+          'run',
+          '--job',
+          harness.jobId,
+          '--scope',
+          'full',
+          '--sink',
+          sinkPath,
+          '--request-id',
+          'req-a1-headers',
+          '--url',
+          `http://127.0.0.1:${String(proxy.port)}`,
+          '--token',
+          TOKEN,
+          '--wait-budget-ms',
+          '20000',
+        ],
+        { ...captureCliDeps(harness.lanePath), responseHeadersTimeoutMs: 120 },
+      );
+      expect(code).toBe(CAPTURE_EXIT.ok);
+      expect(Date.now() - started).toBeLessThan(20_000);
+      const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+      expect(receipt).not.toBeNull();
+      // Two submissions: the first only timed out on the headers, so the
+      // second re-attached with the same identity instead of restarting.
+      expect(receipt!.request_id).toBe('req-a1-headers');
+      expect(receipt!.attempts).toBe(2);
+      expect(receipt!.reconciled).toBe(true);
+      expect(receipt!.replayed_output).toBe('complete');
+      expect(receipt!.abandoned_after_ms).toBeNull();
+      expect(captureReceiptSucceeded(receipt!)).toBe(true);
+      // The capture's byte count and SHA-256 are the ledger's.
+      const recorded = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
+      const payload = recorded?.payload as { output_bytes?: unknown; output_sha256?: unknown } | undefined;
+      expect(receipt!.output_bytes).toBe(payload?.output_bytes);
+      expect(receipt!.output_sha256).toBe(payload?.output_sha256);
+      expect(receipt!.captured_output_bytes).toBe(payload?.output_bytes);
+      expect(receipt!.captured_output_sha256).toBe(payload?.output_sha256);
+      // The sink holds every output frame of that one run.
+      const parsed = parseCapturedNdjson(readFileSync(sinkPath, 'utf-8'));
+      expect(parsed.malformed).toBe(0);
+      expect(parsed.reconciled).toBe(true);
+      expect(parsed.replayedOutput).toBe('complete');
+      expect(parsed.capturedOutputBytes).toBe(payload?.output_bytes);
+      expect(parsed.capturedOutputSha256).toBe(payload?.output_sha256);
+      expect(
+        harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started']),
+      ).toHaveLength(1);
+    } finally {
+      await proxy.close();
+    }
+    await harness.close();
+  });
+
+  it('A2 #554: a re-submit that lands while the run is running gets the output from byte 0, then the live tail', async () => {
+    const harness = await boot({
+      maxConcurrent: 2,
+      manifest: HOLD_MANIFEST,
+      files: { 'hold.mjs': HOLD_SCRIPT },
+    });
+    const proxy = await startDelayingProxy(harness.port, 500);
+    try {
+      const sinkPath = join(harness.lanePath, 'verify-capture-a2.ndjson');
+      const code = await runCaptureCli(
+        [
+          'run',
+          '--job',
+          harness.jobId,
+          '--scope',
+          'hold',
+          '--sink',
+          sinkPath,
+          '--request-id',
+          'req-a2-running',
+          '--url',
+          `http://127.0.0.1:${String(proxy.port)}`,
+          '--token',
+          TOKEN,
+          '--wait-budget-ms',
+          '20000',
+        ],
+        { ...captureCliDeps(harness.lanePath), responseHeadersTimeoutMs: 120 },
+      );
+      expect(code).toBe(CAPTURE_EXIT.ok);
+      const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+      expect(receipt!.attempts).toBe(2);
+      expect(receipt!.reconciled).toBe(false);
+      expect(receipt!.replayed_output).toBe('complete');
+      expect(captureReceiptSucceeded(receipt!)).toBe(true);
+      const recorded = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
+      const payload = recorded?.payload as { output_bytes?: unknown; output_sha256?: unknown } | undefined;
+      expect(receipt!.captured_output_bytes).toBe(payload?.output_bytes);
+      expect(receipt!.captured_output_sha256).toBe(payload?.output_sha256);
+      // The sink shows the shape: the replayed prefix, the attach ack, the
+      // live tail — no gap, no duplicate.
+      const frames = readFileSync(sinkPath, 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as Frame);
+      const attachedAt = frames.findIndex((frame) => frame.type === 'attached');
+      expect(attachedAt).toBeGreaterThan(0);
+      expect(frames[attachedAt]).toMatchObject({ type: 'attached', state: 'running', replayed_output: 'complete' });
+      const prefix = frames.slice(0, attachedAt).filter((frame) => frame.type === 'output');
+      const liveTail = frames.slice(attachedAt + 1).filter((frame) => frame.type === 'output');
+      expect(prefix.map((frame) => frame['text']).join('')).toBe('hold-first\n');
+      expect(liveTail.map((frame) => frame['text']).join('')).toBe('hold-second\n');
+      expect(frames.filter((frame) => frame.type === 'completed')).toHaveLength(1);
+      expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toHaveLength(1);
+    } finally {
+      await proxy.close();
+    }
+    await harness.close();
+  });
+
+  it('A3 #554: past the retention window a re-submit gets no output and the receipt says what is missing', async () => {
+    const clock = { value: 2_000_000 };
+    const harness = await boot({ maxConcurrent: 2, now: () => clock.value });
+    const requestId = 'req-a3-expired-capture';
+    const first = await call(harness.port, { job_id: harness.jobId, scope: 'full', request_id: requestId });
+    const outcome = outcomeOf(completedFrame(first.frames));
+    expect(outcome['ok']).toBe(true);
+    // The 30-minute retention window is measured on the scheduler's clock.
+    clock.value += 30 * 60 * 1000 + 1;
+    const sinkPath = join(harness.lanePath, 'verify-capture-a3-expired.ndjson');
+    const code = await runCaptureCli(
+      [
+        'run',
+        '--job',
+        harness.jobId,
+        '--scope',
+        'full',
+        '--sink',
+        sinkPath,
+        '--request-id',
+        requestId,
+        '--url',
+        `http://127.0.0.1:${String(harness.port)}`,
+        '--token',
+        TOKEN,
+      ],
+      captureCliDeps(harness.lanePath),
+    );
+    // Loud, unpromotable, never a silent 0-byte capture.
+    expect(code).toBe(CAPTURE_EXIT.failed);
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt!.outcome).toBe('completed');
+    expect(receipt!.reconciled).toBe(true);
+    expect(receipt!.replayed_output).toBe('none');
+    expect(receipt!.captured_output_bytes).toBe(0);
+    expect(receipt!.output_sha256).toBe(outcome['outputSha256']);
+    expect(captureReceiptSucceeded(receipt!)).toBe(false);
+    expect(receipt!.error).toContain('replayed capture is incomplete');
+    expect(receipt!.error).toContain('replayed_output: "none"');
+    expect(receipt!.error).toContain('verification.completed');
+    expect(receipt!.error).toContain('do not rerun');
+    const frames = readFileSync(sinkPath, 'utf-8')
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as Frame);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ type: 'completed', reconciled: true, replayed_output: 'none' });
+    expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toHaveLength(1);
+    await harness.close();
+  });
+
+  it('A5 #554: an accepted request_id re-submits through a moved lane head; a new request_id is still refused', async () => {
+    const harness = await boot({
+      maxConcurrent: 2,
+      manifest: HOLD_MANIFEST,
+      files: { 'hold.mjs': HOLD_SCRIPT },
+    });
+    const laneHead = harness.repo.head();
+    const pending = call(harness.port, {
+      job_id: harness.jobId,
+      scope: 'hold',
+      request_id: 'req-a5-moved',
+      expected_head: laneHead,
+    });
+    await waitFor(() => harness.ledger.latestJobEvent(harness.jobId, 'verification.started') !== null, 10_000);
+    // The lane moves while the accepted run is still executing.
+    harness.repo.git(
+      ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '--allow-empty', '-m', 'move the lane head'],
+      harness.lanePath,
+    );
+    const movedHead = harness.repo.git(['rev-parse', 'HEAD'], harness.lanePath);
+    expect(movedHead).not.toBe(laneHead);
+    const resubmit = await call(harness.port, {
+      job_id: harness.jobId,
+      scope: 'hold',
+      request_id: 'req-a5-moved',
+      expected_head: laneHead,
+    });
+    expect(resubmit.status).toBe(200);
+    expect(resubmit.frames.some((frame) => frame.type === 'attached')).toBe(true);
+    const resumedOutcome = outcomeOf(completedFrame(resubmit.frames));
+    expect(resumedOutcome['ok']).toBe(true);
+    expect(resumedOutcome['sha']).toBe(laneHead);
+    const first = await pending;
+    expect(outcomeOf(completedFrame(first.frames))['runId']).toBe(resumedOutcome['runId']);
+    expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toHaveLength(1);
+    // A NEW identity keeps the #159 exact-head refusal (the manifest here
+    // declares only `hold`, so ask for that declared scope).
+    const refused = await call(harness.port, {
+      job_id: harness.jobId,
+      scope: 'hold',
+      request_id: 'req-a5-new',
+      expected_head: laneHead,
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.json).toMatchObject({ error: 'head_changed', current_head: movedHead });
     await harness.close();
   });
 
@@ -833,17 +1324,22 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     expect(readFileSync(sinkPath, 'utf-8')).toBe(captured);
 
     // Reconnecting with the SAME request identity replays the recorded run
-    // into a fresh sink: no second execution, and the replay is honestly
-    // marked as an unpromotable partial capture (the run's outcome is
-    // known; the original full logs are NOT reconstructable).
+    // into a fresh sink: no second execution, and — issue #554 — the sink is
+    // handed the run's retained output from byte 0, so the reconciled
+    // capture is promotable and its output matches the ledger exactly.
     const replaySink = join(harness.lanePath, 'verify-capture-replay.ndjson');
     const replayArgs = [...args];
     replayArgs[replayArgs.indexOf(sinkPath)] = replaySink;
-    expect(await runCaptureCli(replayArgs, cliDeps)).toBe(1);
+    expect(await runCaptureCli(replayArgs, cliDeps)).toBe(0);
     const replayReceipt = readCaptureReceipt(captureReceiptPath(replaySink));
     expect(replayReceipt!.run_id).toBe(receipt!.run_id);
     expect(replayReceipt!.reconciled).toBe(true);
-    expect(captureReceiptSucceeded(replayReceipt!)).toBe(false);
+    expect(replayReceipt!.replayed_output).toBe('complete');
+    expect(captureReceiptSucceeded(replayReceipt!)).toBe(true);
+    const recordedPayload = recorded?.payload as { output_bytes?: unknown; output_sha256?: unknown } | undefined;
+    expect(replayReceipt!.captured_output_bytes).toBe(recordedPayload?.output_bytes);
+    expect(replayReceipt!.captured_output_sha256).toBe(recordedPayload?.output_sha256);
+    expect(receipt!.captured_output_sha256).toBe(recordedPayload?.output_sha256);
     const started = harness.ledger
       .listJobEvents(harness.jobId)
       .filter((event) => event.kind === 'verification.started');

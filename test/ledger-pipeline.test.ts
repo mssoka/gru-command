@@ -539,6 +539,55 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     db2.close();
   });
 
+  it('reports the FIRST applicable reason in the documented order when several causes apply at once', () => {
+    // docs/PIPELINE.md:162-173 is normative: "the first of these that applies,
+    // checked in this order". A single-cause fixture cannot tell that order from
+    // any other, so this one entry carries every cause at once and peels them
+    // off one at a time, asserting the reason that survives each step.
+    const { db, ledger } = boot();
+    const holder = enqueue(ledger, 'ord-holder', { exclusiveScopes: ['shared-scope'] });
+    // A hand-made cycle: the API refuses to create one, but a pre-existing row
+    // must still be explained (and must outrank a missing prerequisite).
+    const writeRow = (id: string, prerequisiteId: string, scopes: string): void => {
+      db.handle
+        .prepare(
+          `INSERT INTO pipeline_entries
+             (id, repo_path, repo, title, briefing, briefing_hash, priority, enqueue_seq, state,
+              prerequisites, exclusive_scopes, request_id, payload_hash, failure_count, queued_at, updated_at)
+           VALUES (?, '/tmp/demo', 'demo', 'T', 'b', 'h', 5, ?, 'waiting', ?, ?, ?, 'p', 0, ?, ?)`,
+        )
+        .run(id, id === 'ord-target' ? 900 : 901, JSON.stringify([{ id: prerequisiteId, milestone: 'merged' }]), scopes, `req-${id}`, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    };
+    writeRow('ord-target', 'ord-cycle', '["shared-scope"]');
+    writeRow('ord-cycle', 'ord-target', '[]');
+    const context = (): Parameters<typeof pipelineBlockingReason>[1] => ({
+      entries: [holder, ...(ledger.listPipelineEntries() as readonly PipelineEntryRecord[])],
+      jobStatusOf: () => null,
+      jobDeliveredOf: () => false,
+      jobStartedOf: () => false,
+      capacity: FULL_CAPACITY,
+    });
+    const reason = (): string | null => pipelineBlockingReason(ledger.getPipelineEntry('ord-target')!, context());
+
+    // 1. hold outranks everything else present.
+    ledger.holdPipelineEntry({ id: 'ord-target', reason: 'owner deciding', by: 'owner' });
+    expect(reason()).toBe('owner hold: owner deciding');
+    // 2. with the hold gone, the cycle outranks the prerequisite and the scope.
+    ledger.clearPipelineHold({ id: 'ord-target', by: 'owner' });
+    expect(reason()).toContain('dependency cycle');
+    // 3. cycle broken by cancelling the partner: its cancelled state is the
+    //    prerequisite reason, still ahead of the exclusive scope.
+    ledger.cancelPipelineEntry({ id: 'ord-cycle', reason: 'withdrawn' });
+    expect(reason()).toBe('prerequisite ord-cycle cancelled');
+    // 4. all that is left is the scope the other entry holds. A scope is HELD
+    //    only once its holder is claiming or admitted (a waiting entry holds
+    //    nothing), so the holder is put into `admitting`.
+    db.handle.prepare("UPDATE pipeline_entries SET prerequisites = '[]' WHERE id = 'ord-target'").run();
+    db.handle.prepare("UPDATE pipeline_entries SET state = 'admitting' WHERE id = 'ord-holder'").run();
+    expect(reason()).toBe('exclusive scope "shared-scope" held by ord-holder');
+    db.close();
+  });
+
   it('evaluates pure blocking reasons without a capacity context (service use)', () => {
     const { db, ledger } = boot();
     const entry = enqueue(ledger, 'pipe-a', { prerequisites: [{ id: 'pipe-b', milestone: 'merged' }] });

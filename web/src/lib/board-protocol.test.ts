@@ -730,6 +730,33 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(unknown)).toBe(false);
   });
 
+  it('accepts a resolution detail that is text or absent and rejects anything else (#523)', () => {
+    const row: NotificationView = {
+      id: 'n-result',
+      ts: '2026-09-23T00:00:00.000Z',
+      kind: 'owner-approval.directive-abandon',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Abandon directive request req-1?',
+      detail: null,
+      agentId: null,
+      shownAt: null,
+      ackedAt: null,
+      resolvedAt: '2026-09-23T00:01:00.000Z',
+      resolvedBy: 'gru',
+    };
+    for (const resolutionDetail of [undefined, null, 'Not run: live_work\nlive lane process(es): lane-1 pid 4242']) {
+      const valid = snapshot();
+      (valid.notifications as unknown[]).push({ ...row, ...(resolutionDetail === undefined ? {} : { resolutionDetail }) });
+      expect(isValidSnapshot(valid), String(resolutionDetail)).toBe(true);
+    }
+    for (const junk of [7, true, ['Not run'], { text: 'Not run' }]) {
+      const invalid = snapshot();
+      (invalid.notifications as unknown[]).push({ ...row, resolutionDetail: junk });
+      expect(isValidSnapshot(invalid), JSON.stringify(junk)).toBe(false);
+    }
+  });
+
   it('classifies only done+canonical-notused records as unused — no prose downgrade', () => {
     // The canonical record: done + the lead's not-used note.
     expect(lensChipState({ state: 'done', note: 'not used — lead-owned whole-PR review' })).toBe('unused');
