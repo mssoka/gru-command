@@ -510,13 +510,24 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
     detail: `Request ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
       `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}.${dead.line} Inspect GET /api/silas/directives/${requestId}, ` +
       (custody.length > 0 || unknownCustody || dead.unbounded
-        ? `but its producer custody is unknown (${custody.length > 0 ? custody.join('; ') : 'the dead turn is unbounded'}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`
+        ? `but its producer custody is unknown (${[
+          ...custody,
+          ...(dead.unbounded ? [DEAD_TURN_UNBOUNDED] : []),
+          ...fences.filter(({ custody: kind }) => kind === 'unknown').map(({ text }) => text),
+        ].join('; ') || 'no dead-turn verdict exists'}): a successor or retirement is refused. It needs the owner: ${ownerAbandonmentAsk(requestId)}`
         : `then POST /api/silas/directives/${requestId}/recover with a fresh named successor (rebrief-successor when the work needs a fresh session) or a real reserved owner obligation; ` +
           'if a live fence is still named above (a worker turn, session lock or lane process on the job), wait for it to clear first — the successor or retirement is refused until then, and no owner decision is needed for it; ' +
           'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request. ' +
           'No prompt replay. Retirement alone, generic Ops holds and prose disposition do not settle this debt.'),
     ...(row.admissionMinion === null ? {} : { agentId: row.admissionMinion }), dedupe: 'active' });
 }
+
+/** The one dead-turn verdict that still needs a human: the evidence was read
+ * and did not bound the turn. A request whose verdict is absent (an `unknown`
+ * producer, a foreign host, an unobserved independent controller, a torn
+ * journal) has NO verdict at all — the card must say that, never hand the owner
+ * the unbounded judgement the service never made. */
+export const DEAD_TURN_UNBOUNDED = 'the dead turn is unbounded';
 
 /** What the service read from a dead turn's own evidence (restart custody),
  * for the recovery card; empty when the request's producer is not host-absent.

@@ -3992,6 +3992,11 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expect(detail).toContain('It needs the owner');
       expect(detail).not.toContain('This needs no owner');
       expect(detail).not.toContain('recover with a fresh named successor');
+      // No verdict exists for this producer, so the card must name the real
+      // source (the unknown cessation evidence) and never hand the owner the
+      // "unbounded" judgement the service did not make.
+      expect(detail).toContain('original native physical owner cessation remains UNKNOWN');
+      expect(detail).not.toContain('the dead turn is unbounded');
     });
   });
 

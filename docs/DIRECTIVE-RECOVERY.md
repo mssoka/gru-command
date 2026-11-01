@@ -668,11 +668,15 @@ only that exact start token, never a later same-logical-minion incarnation.
 
 #### A dead turn is settled from its own evidence (restart custody)
 
-Host absence proves the producer gone, not what its turn did. When a request's
-original producer is `host-absent` (no live lock, process, open turn or queued
-work) and its checkpoint is not a completed turn, the service reads the
-evidence GC itself wrote for that turn identity and returns one verdict. It
-never asks a human to certify what a dead process did.
+Host absence proves the producer gone, not what its turn did. A request's
+original producer is `host-absent` when the pid the service recorded for that
+exact incarnation returns ESRCH on this host; classification reads nothing else
+(no lock, open turn or queued work is consulted to decide it), and every other
+answer — a live, frozen or reused pid, a foreign host, EPERM, a torn or legacy
+journal — stays UNKNOWN. When the producer is `host-absent` and its checkpoint
+is not a completed turn, the service reads the evidence GC itself wrote for that
+turn identity and returns one verdict. It never asks a human to certify what a
+dead process did.
 
 | Verdict | Evidence it rests on | Custody blocker? |
 |---|---|---|
