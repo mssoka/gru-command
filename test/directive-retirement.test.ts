@@ -24,7 +24,7 @@ import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/f
 import { originHeadProbe } from './helpers/pr-head-probe.js';
 import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof, directiveRetirementInputs, markLegacyTerminalJobFixture } from './helpers/directive-native-fixture.js';
 import { BoardEngine } from '../src/board/engine.js';
-import { VerificationScheduler, groupAlive, pidAlive } from '../src/verify/scheduler.js';
+import { VerificationScheduler, pidAlive } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { reconcilePendingDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
@@ -33,6 +33,20 @@ import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+
+/** Local detached-process-group probe. The `stale-row-red` scope overlays this
+ * file onto a base whose scheduler does not export its own `groupAlive`, and a
+ * missing export fails at collection — which proves nothing about behaviour. So
+ * the wait carries its own probe with the production rule: any errno but ESRCH
+ * still means a member exists (a pid we may not signal is not a dead one). */
+function groupAlive(leaderPid: number): boolean {
+  try {
+    process.kill(-leaderPid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 import { directiveRetirementFingerprint } from '../src/ledger/directives.js';
 import { inspectDirectiveProducers, prepareDirectiveProducer, recordDirectiveProducerCessation } from '../src/runtime/directive-checkpoint.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
