@@ -887,6 +887,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     const [waiting] = ledger2.listRounds(job2.id);
     expect(waiting?.status).toBe('pending');
+    // Wait until the admission is actually QUEUED before cutting it. A shutdown
+    // that lands while setup's remote probe is still running is a different (and
+    // also clean) abort: the round is aborted with `perkins-incomplete`, and no
+    // `residency-cancelled` is owed because nothing was ever queued. Which of the
+    // two a fixed tick hits depends on how fast the probe's git step answers,
+    // which is exactly what differs between a quiet host and a loaded runner.
+    for (let waited = 0; waited < 400 && ledger2.latestRoundEvent(waiting!.id, 'round.residency-queued') === null; waited += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    expect(ledger2.latestRoundEvent(waiting!.id, 'round.residency-queued')).not.toBeNull();
     await wave2.shutdown(); // aborts the active controller → admission rejects
     await pending.catch(() => {});
     expect(ledger2.getRound(waiting!.id)?.status).toBe('aborted');
