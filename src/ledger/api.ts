@@ -6,10 +6,11 @@ import { realpathSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
-import { newLaneToken } from '../worktrees/lane-provenance.js';
+import { newLaneToken, processCommandSha256 } from '../worktrees/lane-provenance.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
-import { readGitState } from '../verify/scheduler.js';
+import { groupAlive, pidAlive, readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
+import { redactCredentials } from '../redaction.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
 import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
@@ -215,6 +216,14 @@ export type {
 } from './pipeline.js';
 
 type Row = Record<string, unknown>;
+
+/** The verification runs of one admitted directive request that the in-turn
+ * tool fence does not count as blockers (#542); see `ownVerificationRuns`. */
+interface OwnVerificationRuns {
+  readonly laneId: string;
+  readonly runIds: ReadonlySet<string>;
+  readonly pids: ReadonlySet<number>;
+}
 
 /**
  * The API of record (EPICS E6 story 1): every mutation updates its row AND
@@ -1215,6 +1224,20 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** Whether a verification event's recorded command field is the command `raw`.
+ * An event is recorded with its command masked once (#534); one recorded before
+ * the masking holds the command as listed. The masked line is compared as it was
+ * written, never masked again: masking is not idempotent for every shape (a
+ * quoted credential followed directly by `;` or `)` leaves a placeholder that a
+ * second pass would take for a value). Masking both sides is the last resort, so
+ * an event recorded under an earlier set of redaction rules still binds. This
+ * binds an event to a run; whether a live process is the one a registry row
+ * describes is the row's raw-command digest, never this comparison. */
+export function recordsCommand(recorded: unknown, raw: string): boolean {
+  return typeof recorded === 'string'
+    && (recorded === raw || recorded === redactCredentials(raw) || redactCredentials(recorded) === redactCredentials(raw));
+}
+
 function str(value: unknown): string {
   if (typeof value !== 'string') throw new Error(`ledger row field is not a string: ${String(value)}`);
   return value;
@@ -1652,9 +1675,15 @@ export class LedgerApi {
    * can never hide an open run. `verification.attached` settles nothing
    * (issue #159). */
   hasUnsettledVerificationRun(jobId: string): boolean {
-    const row = this.db
+    return this.unsettledVerificationRunIds(jobId, 1).length > 0;
+  }
+
+  /** The run ids {@link hasUnsettledVerificationRun} counts (a run recorded
+   * without an id is one `null` entry), at most `limit` of them. */
+  private unsettledVerificationRunIds(jobId: string, limit = -1): readonly (string | null)[] {
+    const rows = this.db
       .prepare(
-        `SELECT 1 AS unsettled FROM (
+        `SELECT run_id FROM (
            SELECT json_extract(payload, '$.run_id') AS run_id,
                   MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
                   MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start') THEN seq ELSE 0 END) AS settled_seq
@@ -1664,10 +1693,10 @@ export class LedgerApi {
              'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start'
            )
            GROUP BY run_id
-         ) WHERE open_seq > settled_seq LIMIT 1`,
+         ) WHERE open_seq > settled_seq LIMIT ?`,
       )
-      .get(jobId) as Row | undefined;
-    return row !== undefined;
+      .all(jobId, limit) as Row[];
+    return rows.map((row) => (typeof row.run_id === 'string' ? row.run_id : null));
   }
 
   /** Authoritative terminal readback may close only absent matching physical
@@ -1685,11 +1714,11 @@ export class LedgerApi {
       const terminal = this.db.prepare(`SELECT seq FROM events WHERE job_id = ?
         AND (kind = 'verification.completed' OR kind = 'verification.reconciled' AND json_extract(payload, '$.state') = 'completed')
         AND json_extract(payload, '$.run_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.jobId, input.runId) as Row | undefined;
-      const conflictingTerminal = this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-        AND json_extract(payload, '$.run_id') = ? AND
-        (json_extract(payload, '$.command') IS NOT ? OR json_extract(payload, '$.cwd') IS NOT ?) LIMIT 1`)
-        .get(input.jobId, input.runId, input.command, input.cwd);
-      if (conflictingTerminal !== undefined) return;
+      // A completed event for this run that names another command or directory fences the readback.
+      const completions = this.db.prepare(`SELECT json_extract(payload, '$.command') AS command, json_extract(payload, '$.cwd') AS cwd
+        FROM events WHERE job_id = ? AND kind = 'verification.completed' AND json_extract(payload, '$.run_id') = ?`)
+        .all(input.jobId, input.runId) as Row[];
+      if (completions.some((completion) => !recordsCommand(completion.command, input.command) || completion.cwd !== input.cwd)) return;
       if (terminal === undefined || !this.hasJobEventWithPayloadValues(input.jobId, ['verification.requested', 'verification.attached'],
         [{ key: 'run_id', value: input.runId }, { key: 'request_id', value: input.requestId }], 0)) return;
       const evidence = this.db.prepare(`SELECT seq, kind,
@@ -1712,10 +1741,13 @@ export class LedgerApi {
       const started = starts[0];
       if (started === undefined || Number(started.seq) >= Number(terminal.seq)) return;
       const physical = JSON.parse(str(started.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown; sha?: unknown };
-      if (!Number.isSafeInteger(physical.pid) || Number(physical.pid) <= 0 || physical.command !== input.command || physical.cwd !== input.cwd ||
+      if (!Number.isSafeInteger(physical.pid) || Number(physical.pid) <= 0 || !recordsCommand(physical.command, input.command) || physical.cwd !== input.cwd ||
           starts.some((event) => { const facts = JSON.parse(str(event.payload)) as typeof physical;
-            return Number(event.seq) >= Number(terminal.seq) || facts.pid !== physical.pid || facts.command !== input.command || facts.cwd !== input.cwd; })) return;
+            return Number(event.seq) >= Number(terminal.seq) || facts.pid !== physical.pid || !recordsCommand(facts.command, input.command) || facts.cwd !== input.cwd; })) return;
       const nativeStarts = receipts.filter((row) => row.kind === 'verification.process-started');
+      // `command` is the RAW process command line the reconcile derives from the
+      // caller's raw `input.command`, never read back from an event (events hold
+      // it masked): the registry row is matched by its digest.
       const identities: Array<{ readonly seq: number; readonly pid: number; readonly command: string }> = [];
       if (nativeStarts.length === 0) {
         // Prior whole-command receipts stay valid exactly as recorded. A null
@@ -1733,16 +1765,17 @@ export class LedgerApi {
           const index = Number(facts.step_index);
           const count = Number(facts.step_count);
           const pid = Number(facts.pid);
-          const monolithic = count === 1 && index === 0 && facts.step_command === input.command;
+          const monolithic = count === 1 && index === 0 && recordsCommand(facts.step_command, input.command);
+          // The raw step this receipt claims, as the reconcile itself derives it.
+          const step = monolithic ? input.command : count === steps.length ? steps[index] : undefined;
           if (!Number.isSafeInteger(facts.pid) || pid <= 0 || !Number.isSafeInteger(facts.step_index) || !Number.isSafeInteger(facts.step_count) ||
               index < 0 || count <= 0 || index >= count || indices.has(index) || pids.has(pid) ||
-              Number(event.seq) >= Number(terminal.seq) || facts.command !== input.command || facts.cwd !== input.cwd || facts.sha !== physical.sha ||
-              facts.process_command !== `/bin/sh -c ${String(facts.step_command)}` ||
-              (!monolithic && (count !== steps.length || facts.step_command !== steps[index])) ||
+              Number(event.seq) >= Number(terminal.seq) || !recordsCommand(facts.command, input.command) || facts.cwd !== input.cwd || facts.sha !== physical.sha ||
+              step === undefined || !recordsCommand(facts.step_command, step) || !recordsCommand(facts.process_command, `/bin/sh -c ${step}`) ||
               (stepCount !== null && count !== stepCount)) return;
           stepCount = count;
           indices.add(index); pids.add(pid);
-          identities.push({ seq: Number(event.seq), pid, command: String(facts.process_command) });
+          identities.push({ seq: Number(event.seq), pid, command: `/bin/sh -c ${step}` });
         }
         if (identities[0]?.pid !== physical.pid) return;
       }
@@ -1752,8 +1785,16 @@ export class LedgerApi {
           AND json_extract(payload, '$.pid') = ? AND (job_id IS NOT ? OR json_extract(payload, '$.run_id') IS NOT ?) LIMIT 1`)
           .get(identity.pid, input.jobId, input.runId);
         if (conflicting !== undefined) continue;
+        const digest = processCommandSha256(identity.command);
         for (const row of this.listWorktreeProcesses(input.worktreeId)) {
-          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== identity.command || !absent(row.pid) || !absent(-row.pid)) continue;
+          // The row is this run's process only by the digest of its raw command
+          // line (#534): the stored `command` is masked, so two commands whose
+          // credentials differ read the same. A row recorded before the digest
+          // existed (`null`) has no identity to match and is left to the sweep's
+          // reap. The audit carries the masked text.
+          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry'
+            || row.commandSha256 === null || row.commandSha256 !== digest
+            || !absent(row.pid) || !absent(-row.pid)) continue;
           this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
           this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
             request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
@@ -3605,10 +3646,19 @@ export class LedgerApi {
   /** Observed-process records (SPEC ruling 18b's spawned-processes arm):
    * every pid a pause or confirmed kill is grounded on lands here — the
    * registry is the authoritative map job → worktree → branch →
-   * processes, so the ask can always name what was live. */
+   * processes, so the ask can always name what was live. A command line is
+   * recorded with its credentials masked (#534), whoever the writer is, and
+   * with the SHA-256 of the raw line beside it: the masked text is for display,
+   * the digest is what a later decision that a live process is this one
+   * compares. A caller that holds a row it read back (not a raw line) passes
+   * that row's `commandSha256` through, `null` when the row has none, and its
+   * recorded text is kept exactly as it is: masking a row's own display text
+   * again would rewrite a line whose placeholder touches `;` or `)` (masking
+   * is not idempotent), and a row without a digest has no identity to keep or
+   * gain. */
   recordWorktreeProcesses(input: {
     worktreeId: string;
-    processes: readonly { pid: number; command: string; evidence: string }[];
+    processes: readonly { pid: number; command: string; evidence: string; commandSha256?: string | null }[];
     state: 'live' | 'killed';
   }): void {
     if (input.processes.length === 0) return;
@@ -3624,11 +3674,12 @@ export class LedgerApi {
       const revived = input.state === 'live'
         ? input.processes.map((proc) => proc.pid).filter((pid) => exited.get(input.worktreeId, pid) !== undefined) : [];
       const upsert = this.db.prepare(
-        `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO worktree_processes (worktree_id, pid, command, command_sha256, evidence, state, first_seen, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (worktree_id, pid) DO UPDATE SET
            state = excluded.state,
            command = excluded.command,
+           command_sha256 = excluded.command_sha256,
            last_seen = excluded.last_seen,
            -- #486: a reap by the lane's token is the row's proof, whatever
            -- first tied the pid to the tree; and a row that had left 'live'
@@ -3639,7 +3690,15 @@ export class LedgerApi {
            evidence = CASE WHEN excluded.evidence = 'lane-token' OR (state <> 'live' AND excluded.state = 'live') THEN excluded.evidence ELSE evidence END`,
       );
       for (const proc of input.processes) {
-        upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
+        // `undefined` is a raw line the caller holds (a fresh enumeration or a
+        // registry write): it is masked and digested here. A row read back from
+        // this table passes its digest through — the string, or `null` when it
+        // has none — and its recorded text is stored unchanged: re-masking a
+        // masked line is not idempotent for a placeholder glued to `;` or `)`,
+        // so it would silently rewrite the row's audit text.
+        const digest = proc.commandSha256 === undefined ? processCommandSha256(proc.command) : proc.commandSha256;
+        const command = proc.commandSha256 === undefined ? redactCredentials(proc.command) : proc.command;
+        upsert.run(input.worktreeId, proc.pid, command, digest, proc.evidence, input.state, ts, ts);
       }
       this.appendEvent({
         kind: 'worktree.processes',
@@ -3689,18 +3748,24 @@ export class LedgerApi {
 
   listWorktreeProcesses(worktreeId: string): readonly {
     readonly pid: number;
+    /** Masked since #534 (a row written before keeps the line as listed; there is no
+     * backfill): for display and audit, never an identity. */
     readonly command: string;
+    /** SHA-256 hex of the raw command line; `null` for a row written before
+     * the digest existed (its identity is unknown). */
+    readonly commandSha256: string | null;
     readonly evidence: string;
     readonly state: string;
     readonly lastSeen: string;
   }[] {
     return (
       this.db
-        .prepare('SELECT pid, command, evidence, state, last_seen FROM worktree_processes WHERE worktree_id = ? ORDER BY first_seen, pid')
+        .prepare('SELECT pid, command, command_sha256, evidence, state, last_seen FROM worktree_processes WHERE worktree_id = ? ORDER BY first_seen, pid')
         .all(worktreeId) as Row[]
     ).map((row) => ({
       pid: Number(row.pid),
       command: str(row.command),
+      commandSha256: row.command_sha256 === null ? null : str(row.command_sha256),
       evidence: str(row.evidence),
       state: str(row.state),
       lastSeen: str(row.last_seen),
@@ -7266,7 +7331,7 @@ export class LedgerApi {
     if (attempts === undefined) refuse('requires declared full scheduler attempt');
     const requested = this.eventFromRow(attempts!); const request = requested.payload as Record<string, unknown>;
     const amendedAt = this.latestJobEvent(row.jobId, 'job.amendment-accepted')?.seq ?? 0;
-    if (requested.seq <= Math.max(root!.seq, amendedAt, candidate!.seq) || request['command'] !== command || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings or predates the current candidate delivery');
+    if (requested.seq <= Math.max(root!.seq, amendedAt, candidate!.seq) || !recordsCommand(request['command'], command) || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings or predates the current candidate delivery');
     const latestFull = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('verification.requested', 'verification.started', 'verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout') AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
     if (latestFull === undefined || (JSON.parse(str(latestFull.payload)) as { run_id?: unknown }).run_id !== request['run_id']) refuse('newer relevant full attempt is failed or UNKNOWN');
     const lifecycle = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind LIKE 'verification.%' AND json_extract(payload, '$.run_id') = ? ORDER BY seq").all(row.jobId, request['run_id'] as string) as Row[];
@@ -7287,7 +7352,7 @@ export class LedgerApi {
     const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout'].includes(event.kind) && !completedReadback(event));
     const terminal = terminals[0]; const start = starts[0]; const run = terminal?.payload as Record<string, unknown> | undefined;
     const started = start?.payload as Record<string, unknown> | undefined;
-    if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started?.['command'] !== command || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run?.['command'] !== command || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');
+    if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started === undefined || !recordsCommand(started['command'], command) || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run === undefined || !recordsCommand(run['command'], command) || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');
     const round = this.listRounds(row.jobId).at(-1);
     const review = citedReview;
     const reviewed = review?.payload as Record<string, unknown> | undefined;
@@ -9296,7 +9361,12 @@ export class LedgerApi {
     })];
   }
 
-  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
+  /** `exemptOwnRuns` is the in-turn tool fence's (#542): the request's
+   * post-admission verification runs (see {@link ownVerificationRuns}) do not
+   * count as blockers. It exempts nothing while the request has no correlated
+   * admission, and no caller but the runtimes' shared tool-time check passes
+   * it: admission, `/recover`, closeout and the rest keep every blocker. */
+  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer, exemptOwnRuns = false): readonly string[] {
     const row = this.getDirective(requestId);
     if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
     if (ownProducerStartSeq !== undefined && this.directiveProducerStart(this.directiveTurnIdentity(requestId)) !== ownProducerStartSeq) {
@@ -9320,7 +9390,35 @@ export class LedgerApi {
         throw new DirectiveCheckpointError('active native producer is ceased/unbound or another physical incarnation remains UNKNOWN');
       }
     }
-    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer);
+    const ownRuns = exemptOwnRuns ? this.ownVerificationRuns(row, laneId) : undefined;
+    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer, ownRuns);
+  }
+
+  /** The request's post-admission verification runs: each one's
+   * `verification.requested` (once per run id) is for the request's job, has
+   * the job's registered lane path as its `cwd`, and follows the request's
+   * correlated admission (`silas.directive-sent`). The events carry no
+   * requester, so "own" is time and place only. A run requested at or before
+   * the admission is never one, whenever its frames or processes arrive.
+   * `pids` are the pids of those runs' `verification.process-started`; the
+   * verify server records each against the lane whose path is the run's cwd.
+   * Undefined while the request has no admission. */
+  private ownVerificationRuns(row: DirectiveRequestRecord, laneId: string): OwnVerificationRuns | undefined {
+    const lane = this.getWorktree(laneId);
+    if (row.admissionSeq === null || lane === null || lane.jobId !== row.jobId) return undefined;
+    const requests = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.cwd') AS cwd
+      FROM events WHERE job_id = ? AND kind = 'verification.requested' AND seq > ?`).all(row.jobId, row.admissionSeq) as Row[];
+    const runIds = new Set<string>();
+    for (const request of requests) {
+      if (typeof request.run_id === 'string' && request.cwd === lane.path) runIds.add(request.run_id);
+    }
+    const starts = this.db.prepare(`SELECT json_extract(payload, '$.run_id') AS run_id, json_extract(payload, '$.pid') AS pid
+      FROM events WHERE job_id = ? AND kind = 'verification.process-started' AND seq > ?`).all(row.jobId, row.admissionSeq) as Row[];
+    const pids = new Set<number>();
+    for (const start of starts) {
+      if (typeof start.run_id === 'string' && runIds.has(start.run_id) && Number.isSafeInteger(start.pid)) pids.add(Number(start.pid));
+    }
+    return { laneId: lane.id, runIds, pids };
   }
 
   claimDirectiveCheckpoint(identity: DirectiveTurnIdentity, checkpointId: string): void {
@@ -10400,8 +10498,9 @@ export class LedgerApi {
    * read is durable state or the process-local admission registry (the
    * same boundary every producer must reserve before its first await), so
    * a synchronous check inside the state transaction is authoritative. */
-  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
-    return this.directiveOwnership(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer).map(({ text }) => text);
+  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer,
+    ownRuns?: OwnVerificationRuns): readonly string[] {
+    return this.directiveOwnership(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer, ownRuns).map(({ text }) => text);
   }
 
   /** The same ownership, each entry tagged: `unknown` when it records only
@@ -10411,7 +10510,7 @@ export class LedgerApi {
    * re-brief or another request owning the lane, a provider continuation, a
    * verification run, a review round, a lane process). */
   private directiveOwnership(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number,
-    ownNativeProducer?: DirectiveProducer): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
+    ownNativeProducer?: DirectiveProducer, ownRuns?: OwnVerificationRuns): readonly { readonly text: string; readonly custody: 'unknown' | 'live' }[] {
     const blockers: { text: string; custody: 'unknown' | 'live' }[] = this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)
       .map((text) => ({ text, custody: 'unknown' }));
     const unknown = (text: string) => blockers.push({ text, custody: 'unknown' });
@@ -10460,22 +10559,37 @@ export class LedgerApi {
     if (waits.length > 0) {
       live(`open provider continuation(s): ${waits.map((wait) => `${wait.id} (${wait.status})`).join(', ')}`);
     }
-    if (this.hasUnsettledVerificationRun(row.jobId)) live('unsettled verification run(s) hold the lane');
+    // #542: the in-turn tool fence passes the runs the admitted request itself requested.
+    if (this.unsettledVerificationRunIds(row.jobId).some((runId) => runId === null || ownRuns?.runIds.has(runId) !== true)) live('unsettled verification run(s) hold the lane');
     const rounds = this.listRounds(row.jobId).filter((round) => round.status === 'pending' || round.status === 'live');
     if (rounds.length > 0) {
       live(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
     }
     // #464: a swept lane runs nothing; a row it left `live` (recorded
     // before sweeps moved them to `exited`) never fences a writer.
-    const liveProcesses = this.db
+    // A `registry` row is the orchestrator's own spawned service: the
+    // scheduler records it at spawn and `onSettled` settles it, so a live
+    // registry row whose pid and detached process group are gone is stale
+    // bookkeeping a restart left behind — it never fences. A surviving group
+    // member still runs in the lane even when its leader exited, which is
+    // exactly the state `reconcileVerificationProcesses` refuses to close.
+    // Rows observed by cwd/argv/lane-token keep their meaning: something is
+    // (or was) rooted in the tree even when its pid cannot be probed here.
+    const liveProcesses = (this.db
       .prepare(
-        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
+        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid, p.evidence AS evidence
            FROM worktree_processes p
            JOIN worktrees w ON w.id = p.worktree_id
           WHERE p.state = 'live' AND w.status <> 'swept' AND (w.job_id = ? OR p.worktree_id = ?)
           ORDER BY p.worktree_id, p.pid`,
       )
-      .all(row.jobId, laneId) as Row[];
+      .all(row.jobId, laneId) as Row[])
+      // #542: the lane's row for a pid a post-admission run's process-started named.
+      .filter((proc) => !(ownRuns !== undefined && str(proc.worktree_id) === ownRuns.laneId && ownRuns.pids.has(Number(proc.pid))))
+      // #541: a `registry` row whose pid and detached group are both gone is
+      // stale bookkeeping a restart left behind, and never fences the lane.
+      .filter((proc) => str(proc.evidence) !== 'registry' ||
+        pidAlive(Number(proc.pid)) || groupAlive(Number(proc.pid)));
     if (liveProcesses.length > 0) {
       live(
         `live lane process(es): ${liveProcesses

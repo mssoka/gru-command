@@ -5,6 +5,7 @@ import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import type { LogLevel } from '../logger.js';
+import { redactCredentials } from '../redaction.js';
 import {
   BuildRecords,
   DEFAULT_BUILD_OUTPUT_ROOTS,
@@ -180,6 +181,33 @@ export interface VerificationRecord {
 }
 
 export type VerificationRecorder = (record: VerificationRecord) => void;
+
+/** The command lines a verification event carries: the scope's command, the
+ * native process's argv, the step that process runs, and the request's dedupe
+ * key (the job, directory, scope, head and command joined, the command last). */
+const EVENT_COMMAND_FIELDS = ['command', 'process_command', 'step_command', 'dedupe_key'] as const;
+
+/** An event payload as it is recorded (#534): every command line it carries,
+ * and each per-step check's, with its credentials masked. The scheduler keeps
+ * the raw command in memory (it is the run's identity, and what the process
+ * registry digests at spawn); a ledger event, which the board, a review and an
+ * audit read, holds it masked. Apply it once, at the record boundary: masking a
+ * masked line again is not a no-op for every shape. */
+export function maskedEventPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const masked: Record<string, unknown> = { ...payload };
+  for (const field of EVENT_COMMAND_FIELDS) {
+    const value = masked[field];
+    if (typeof value === 'string') masked[field] = redactCredentials(value);
+  }
+  const checks = masked['checks'];
+  if (Array.isArray(checks)) {
+    masked['checks'] = (checks as unknown[]).map((check) => {
+      const command = (check as { command?: unknown } | null)?.command;
+      return typeof command === 'string' ? { ...(check as object), command: redactCredentials(command) } : check;
+    });
+  }
+  return masked;
+}
 
 /** Raised when a queued request waits past lock_wait_timeout_ms. */
 export class VerificationLockTimeoutError extends Error {
@@ -594,7 +622,7 @@ export function pidAlive(pid: number): boolean {
 
 /** Does any member of a process group exist (`kill(-pgid, 0)`)? EPERM
  * also proves existence. */
-function groupAlive(pgid: number): boolean {
+export function groupAlive(pgid: number): boolean {
   if (!Number.isInteger(pgid) || pgid <= 1) return false;
   try {
     process.kill(-pgid, 0);
@@ -1777,7 +1805,7 @@ export class VerificationScheduler {
           }
         }
         this.persistBestEffort();
-        this.recordEvent(record);
+        this.recordEvent({ ...record, payload: maskedEventPayload(record.payload) });
         this.noStartSettled.add(runId);
         this.pendingNoStart.delete(runId);
         published = true;
@@ -2395,7 +2423,7 @@ export class VerificationScheduler {
 
   private safeRecord(record: VerificationRecord): void {
     try {
-      this.recordEvent(record);
+      this.recordEvent({ ...record, payload: maskedEventPayload(record.payload) });
     } catch (error) {
       this.log('error', 'verification ledger record failed', {
         kind: record.kind,

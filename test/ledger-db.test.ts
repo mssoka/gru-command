@@ -116,6 +116,23 @@ describe('ledger db + migration runner', () => {
     upgraded.close();
   });
 
+  it('upgrades a v33 ledger adding the process command digest without touching existing rows, which keep no identity (#534)', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 33) });
+    old.handle.prepare(`INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, status, created_at, updated_at)
+      VALUES ('wt-old', 'job', '/r', 'r', '/r/wt-old', 'gru/wt-old', 'abc', 'paused', 't', 't')`).run();
+    old.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('wt-old', 4242, 'node server.js', 'argv', 'live', 't', 't')`).run();
+    expect(old.handle.prepare('PRAGMA table_info(worktree_processes)').all().map((column) => column['name'])).not.toContain('command_sha256');
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    expect(upgraded.handle.prepare('SELECT id, name FROM schema_migrations WHERE id = 34').get()).toEqual({ id: 34, name: 'worktree-process-command-digest' });
+    expect(upgraded.handle.prepare('SELECT pid, command, command_sha256, state FROM worktree_processes').all())
+      .toEqual([{ pid: 4242, command: 'node server.js', command_sha256: null, state: 'live' }]);
+    expect(new LedgerApi(upgraded.handle).listWorktreeProcesses('wt-old')).toEqual([expect.objectContaining({ pid: 4242, commandSha256: null })]);
+    upgraded.close();
+  });
+
   it('upgrades a v32 ledger adding request_closeouts without touching existing rows, and the table keeps one open or stopped intent per request (#523)', () => {
     const dir = tmpDir();
     const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 32) });

@@ -44,10 +44,10 @@ import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/ap
 import { applyWorktreeManifest, loadWorktreeManifest, MANIFEST_PATH, parseWorktreeManifest, WorktreeSetupError, type WorktreeManifest } from './manifest.js';
 import { reclaimIgnored, reclaimState, reclaimTrackedFiles, removeTree, treeUsage } from './reclaim.js';
 import { redactedText } from '../decisions/questions.js';
-import { boundedTail, recordedTail, redactCredentialWindow } from '../redaction.js';
+import { boundedTail, recordedTail, redactCredentials, redactCredentialWindow } from '../redaction.js';
 import { oneLineErrorText } from '../property/error-text.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
-import { readLaneTokens, readProcessFacts, type LaneTokenRead, type LaneTokenReader, type ProcessFacts } from './lane-provenance.js';
+import { processCommandSha256, readLaneTokens, readProcessFacts, type LaneTokenRead, type LaneTokenReader, type ProcessFacts } from './lane-provenance.js';
 import type { ManagedRepoPath } from '../repos/managed-names.js';
 import { assertSafeRequirementsPatch, originIdentitySha256, readPreBootstrapDependencyPatchPackage, PreBootstrapPatchError, type LoadedPreBootstrapPatch } from './prebootstrap-patch.js';
 
@@ -78,7 +78,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *     release, never the held sha.
  */
 
-/** One process believed to be rooted in a worktree (pid + evidence). */
+/** One process believed to be rooted in a worktree (pid + evidence). Its
+ * `command` is the raw line `ps` listed, in memory only: the checks that tie a
+ * process to a tree, to a token or to its environment read it as listed, and
+ * everything GC records, returns or hands on carries {@link maskedProcess}. */
 export interface TreeProcess {
   readonly pid: number;
   readonly command: string;
@@ -87,6 +90,12 @@ export interface TreeProcess {
   /** Its working directory, when the listing read it (#486: the owner's
    * card names it). */
   readonly cwd?: string;
+}
+
+/** A process as it leaves GC (#534): a ledger row, an event, a response, a
+ * card. Its command line's credentials are masked. */
+function maskedProcess(proc: TreeProcess): TreeProcess {
+  return { ...proc, command: redactCredentials(proc.command) };
 }
 
 /** #486: why GC did not stop a process a sweep paused on by itself. */
@@ -675,6 +684,11 @@ export interface WorktreeManagerOptions {
   /** How long an exited job branch-creation Git child's pipes are still
    * read for their own close, the producer's settlement (default 10 min). */
   readonly creationCloseWindowMs?: number;
+  /** How long a branch-ref `git update-ref --stdin` child that has confirmed
+   * `commit` is waited on for its own close (default 30 s). Every other wait
+   * on that child — before the commit, and after each termination signal —
+   * stays 1 s. */
+  readonly committedRefCloseMs?: number;
   /** Fetch budget for origin base resolution (default 30 s) — a network
    * op degrades to the declared local fallback, it never hangs the lane. */
   readonly fetchTimeoutMs?: number;
@@ -2984,7 +2998,9 @@ export class WorktreeManager {
    * other way round.
    */
   async release(input: SweepRequest): Promise<SweepResult> {
-    return this.withLaneLock(input.worktreeId, async () => this.releaseLane(input));
+    const result = await this.withLaneLock(input.worktreeId, async () => this.releaseLane(input));
+    // What a pause names leaves here with its command lines' credentials masked (#534).
+    return result.status === 'paused' ? { ...result, processes: result.processes.map(maskedProcess) } : result;
   }
 
   /**
@@ -3254,7 +3270,7 @@ export class WorktreeManager {
     if (gone.length > 0) this.opts.ledger.recordWorktreeProcessesExited({ worktreeId: row.id, pids: gone, reason: 'not-enumerated' });
     // A release nobody answers refuses instead of pausing (#427 PR 3): the
     // caller's catch withdraws the preserve copy, and the tree is retained.
-    if (processes.length > 0 && refuse) throw new LaneLiveProcessError(row.path, processes);
+    if (processes.length > 0 && refuse) throw new LaneLiveProcessError(row.path, processes.map(maskedProcess));
     if (processes.length > 0) {
       // Perkins r2 B2: confirmKill is answered against the RECORDED set
       // (ruling 18b rows from a prior pause), never a fresh enumeration
@@ -3264,15 +3280,20 @@ export class WorktreeManager {
       // and an acknowledged pid is killed only while this enumeration still
       // finds it rooted here running the command it was recorded with (an
       // answer given late, or carried out after a restart, never reaches a
-      // recycled pid).
+      // recycled pid). The record holds the command line masked (#534), and two
+      // commands whose credentials differ mask alike, so "the command it was
+      // recorded with" is the digest of the RAW line: a row without one (written
+      // before the digest existed) has no identity, never matches, and is asked
+      // about again.
       const named = input.confirmKillPids === undefined ? null : new Set(input.confirmKillPids);
-      const running = new Map(processes.map((proc) => [proc.pid, proc.command]));
+      const running = new Map(processes.map((proc) => [proc.pid, processCommandSha256(proc.command)]));
       const acknowledged =
         input.confirmKill === true && row.status === 'paused'
           ? this.opts.ledger
               .listWorktreeProcesses(row.id)
-              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid)) && running.get(proc.pid) === proc.command)
-              .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
+              .filter((proc) => proc.state === 'live' && (named === null || named.has(proc.pid))
+                && proc.commandSha256 !== null && running.get(proc.pid) === proc.commandSha256)
+              .map((proc) => ({ pid: proc.pid, command: proc.command, commandSha256: proc.commandSha256, evidence: proc.evidence }))
           : [];
       if (input.confirmKill === true && acknowledged.length > 0) {
         return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch, assertCleanup, attempt);
@@ -3334,6 +3355,7 @@ export class WorktreeManager {
         processes: stranded.map((proc) => ({
           pid: proc.pid,
           command: proc.command,
+          commandSha256: proc.commandSha256,
           evidence: proc.evidence,
         })),
         state: 'killed',
@@ -3360,7 +3382,7 @@ export class WorktreeManager {
         worktreeId: row.id,
         processes: targets
           .filter((proc) => killedSet.has(proc.pid))
-          .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence })),
+          .map((proc) => ({ pid: proc.pid, command: proc.command, commandSha256: proc.commandSha256, evidence: proc.evidence })),
         state: 'killed',
       });
     }
@@ -3457,13 +3479,13 @@ export class WorktreeManager {
       jobId: row.jobId,
       roundId: row.roundId,
       payload: {
-        id: row.id, path: row.path, processes, pause_id: pauseId,
+        id: row.id, path: row.path, processes: processes.map(maskedProcess), pause_id: pauseId,
         ...(reason !== null ? { reason } : {}), ...(baseBranch !== undefined ? { base_branch: baseBranch } : {}),
       },
     });
     if (this.opts.onSweepPaused === undefined) return;
     const details = await this.describePaused(row, processes);
-    this.opts.onSweepPaused({ worktree: row, processes, pauseId, details });
+    this.opts.onSweepPaused({ worktree: row, processes: processes.map(maskedProcess), pauseId, details });
   }
 
   /** What each paused-on process is (best effort, display only). */
@@ -3483,10 +3505,11 @@ export class WorktreeManager {
         : read.token === null ? 'no-token'
         : read.token === row.laneToken ? 'this-lane' : 'other-lane';
       const fact = facts.get(proc.pid);
+      const { command } = maskedProcess(proc);
       return {
         pid: proc.pid,
-        command: proc.command,
-        name: fact?.name ?? basename(proc.command.split(' ')[0] ?? proc.command),
+        command,
+        name: fact?.name ?? basename(command.split(' ')[0] ?? command),
         startedAt: fact?.startedAt ?? null,
         cwd: proc.cwd ?? null,
         provenance,
@@ -3852,10 +3875,10 @@ export class WorktreeManager {
         };
       });
     };
-    const waitForStop = async (): Promise<boolean> => {
+    const waitForStop = async (timeoutMs: number): Promise<boolean> => {
       if (closed) return true;
       return new Promise<boolean>((done) => {
-        const timer = setTimeout(() => done(false), stopTimeoutMs);
+        const timer = setTimeout(() => done(false), timeoutMs);
         void stopped.then(() => { clearTimeout(timer); done(true); });
       });
     };
@@ -3900,16 +3923,20 @@ export class WorktreeManager {
     } finally {
       try { child.stdin.end(committed ? '' : 'abort\n'); }
       catch (error) { fail(transactionError(String(error))); }
-      if (!await waitForStop()) {
-        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} did not close within 1000ms`);
+      // A confirmed commit has already changed the ref; the child is then only
+      // finishing, and under load that can take longer than the abort path's
+      // second. Only this first wait gets the committed bound.
+      const closeBoundMs = committed ? this.opts.committedRefCloseMs ?? 30_000 : stopTimeoutMs;
+      if (!await waitForStop(closeBoundMs)) {
+        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} did not close within ${closeBoundMs}ms`);
         // Signal only the ChildProcess we spawned, never a group, discovered
         // PID or ref lock. An exited child may just have inherited pipes open.
         if (!exited && child.pid !== undefined) {
           try { child.kill('SIGTERM'); } catch (error) { fail(transactionError(String(error))); }
         }
-        if (!await waitForStop() && !exited && child.pid !== undefined) {
+        if (!await waitForStop(stopTimeoutMs) && !exited && child.pid !== undefined) {
           try { child.kill('SIGKILL'); } catch (error) { fail(transactionError(String(error))); }
-          await waitForStop();
+          await waitForStop(stopTimeoutMs);
         }
       }
       child.stdin.destroy();
@@ -4372,7 +4399,7 @@ export class WorktreeManager {
    */
   private async killAcknowledgedAndContinue(
     row: WorktreeRecord,
-    acknowledged: readonly { pid: number; command: string; evidence: string }[],
+    acknowledged: readonly { pid: number; command: string; commandSha256: string | null; evidence: string }[],
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
     assertCleanup: () => void,
