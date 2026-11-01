@@ -424,13 +424,50 @@ export const PUBLICATION_BODY_MAX_BYTES = 60_000;
 /** Ruby `String#rstrip` whitespace: GitLab's stored-note normalization. */
 const GITLAB_TRAILING_WHITESPACE = ' \t\n\v\f\0';
 
-/** GitLab normalizes every MR note body before storing it: its quick-action
- * extractor deletes each CR and strips trailing whitespace (`rstrip`). New
- * publication intent is canonicalized to those stored bytes before
- * artifact/digest/attempt/POST creation; the helper is idempotent, and
- * historical artifacts and receipts are never rewritten through it.
- * Quick-action lines themselves are not modeled here (#526). */
+/** A line whose first non-whitespace character is `/` (JavaScript `\s`). */
+const LINE_LEADING_SLASH = /^(\s*)\//u;
+
+/** GitLab runs every MR note body through its quick-action extractor before
+ * storing it: the extractor deletes each CR, EXECUTES every line that is a
+ * quick action (`/merge`, `/approve`, `/close`, `/label …`) as the posting
+ * account, removes that line from the stored note, and strips trailing
+ * whitespace (`rstrip`). The report part of a publication is written by the
+ * review lead after it reads code the MR author controls, so a line-leading
+ * `/` must never reach the POST as a command.
+ *
+ * New publication intent is canonicalized before artifact/digest/attempt/POST
+ * creation, in this order:
+ * 1. delete every CR (a CR can be the only thing between a newline and a `/`);
+ * 2. insert one `\` before the `/` of every line whose first non-whitespace
+ *    character is `/`, everywhere in the body (code, quote and HTML blocks
+ *    included — GitLab's extractor and command table are deliberately NOT
+ *    modeled, so a future command or extractor change cannot reopen the hole;
+ *    inside a code block the `\` renders literally). A line that already
+ *    starts with `\/` is left alone, which keeps the helper idempotent;
+ * 3. strip trailing whitespace.
+ *
+ * The result is the one set of bytes that is hashed, recorded, POSTed and
+ * compared with the provider receipt, and GitLab stores it unchanged. The
+ * helper is idempotent. Historical artifacts and receipts are never rewritten
+ * through it; reconciliation compares them through
+ * `legacyGitLabStoredNoteBody` instead (#526). */
 export function canonicalGitLabPublicationBody(body: string): string {
+  const withoutQuickActions = body
+    .replaceAll('\r', '')
+    .split('\n')
+    .map((line) => line.replace(LINE_LEADING_SLASH, (_match, leading: string) => `${leading}\\/`))
+    .join('\n');
+  let end = withoutQuickActions.length;
+  while (end > 0 && GITLAB_TRAILING_WHITESPACE.includes(withoutQuickActions[end - 1]!)) end -= 1;
+  return withoutQuickActions.slice(0, end);
+}
+
+/** FROZEN. The GitLab canonical bytes before quick-action neutralization:
+ * every CR deleted, then trailing whitespace stripped. Attempts written
+ * before #526 recorded exactly these bytes, so the reconciliation lookup keeps
+ * comparing their stored notes through it. It must not follow later changes to
+ * `canonicalGitLabPublicationBody`. */
+function legacyGitLabStoredNoteBody(body: string): string {
   const withoutCr = body.replaceAll('\r', '');
   let end = withoutCr.length;
   while (end > 0 && GITLAB_TRAILING_WHITESPACE.includes(withoutCr[end - 1]!)) end -= 1;
@@ -451,10 +488,11 @@ export function publicationBodyFor(
 ): string {
   const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals, reviewEvent)}\n`;
   // Enforce the early assembly bound on the provider-canonical bytes:
-  // GitLab deletes CRs and the terminal LF, so a body just over the
-  // threshold can still fit after that known transformation. The body
-  // itself stays raw: redaction must see the authored bytes (a CR can be
-  // the boundary that exposes a token), and delivery canonicalizes after
+  // GitLab deletes CRs and the terminal LF (a body just over the threshold
+  // can still fit after that) and the canonical form adds one `\` per
+  // line-leading `/` (a body just under it can overflow). The body itself
+  // stays raw: redaction must see the authored bytes (a CR can be the
+  // boundary that exposes a token), and delivery canonicalizes after
   // redaction, then checks the bound again on the final bytes.
   const boundedBytes = Buffer.byteLength(provider === 'gitlab' ? canonicalGitLabPublicationBody(body) : body, 'utf8');
   if (boundedBytes > PUBLICATION_BODY_MAX_BYTES) {
@@ -1519,8 +1557,10 @@ export class GitLabMrPoster implements VerdictPoster {
         // Historical attempts can predate the GitLab canonical publication
         // bytes. A note equal to the attempt body after GitLab's own
         // normalization is a match for ambiguity purposes, never a receipt
-        // or absence.
-        const legacyCanonicalMatch = note.body === canonicalGitLabPublicationBody(input.body);
+        // or absence. The frozen CR/rstrip-only form is used on purpose: a
+        // historical body's `/path/…` line was stored as written, and the
+        // current canonical form would insert a `\` it never had (#526).
+        const legacyCanonicalMatch = note.body === legacyGitLabStoredNoteBody(input.body);
         if (!exactBodyMatch && !legacyCanonicalMatch) continue;
         const noteAuthor = typeof note.author?.username === 'string' ? note.author.username.trim() : '';
         if (noteAuthor !== '' && noteAuthor.toLowerCase() === author.toLowerCase()) {
@@ -6995,9 +7035,11 @@ export class WaveRunner {
         }
         const redactedBody = redactReviewForPublication(publicationBody);
         // The GitLab note API stores normalized bodies (CRs deleted, trailing
-        // whitespace stripped). Make the canonical bytes explicit after
-        // redaction and before the durable artifact, digest, attempt, or
-        // irreversible POST; GitHub bytes remain unchanged.
+        // whitespace stripped) and executes line-leading quick actions as the
+        // posting account. Make the canonical bytes explicit — quick actions
+        // neutralized — after redaction and before the durable artifact,
+        // digest, attempt, or irreversible POST; GitHub bytes remain
+        // unchanged.
         const finalBody = providerKind === 'gitlab'
           ? canonicalGitLabPublicationBody(redactedBody)
           : redactedBody;
