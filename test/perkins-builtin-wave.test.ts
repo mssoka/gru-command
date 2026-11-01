@@ -6689,6 +6689,460 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     }
   });
 
+  describe('quick-action neutralization (#526)', () => {
+    // GitLab executes every note line that starts with a quick action as the
+    // posting account and deletes it from the stored note. The report part of
+    // a publication is written by the review lead after it reads code the MR
+    // author controls, so every line-leading `/` is escaped before the POST.
+    // Expected bytes below are written out literally, never derived from the
+    // helper under test.
+    const spacedParagraphs = [
+      'Intro paragraph.', '',
+      '/merge', '',
+      '/approve', '',
+      '/close', '',
+      '/label ~x', '',
+      '/assign @someone', '',
+      '/zzz-future-command arg', '',
+      '  /merge', '',
+      'Closing paragraph.',
+    ].join('\n');
+    const spacedParagraphsNeutralized = [
+      'Intro paragraph.', '',
+      '\\/merge', '',
+      '\\/approve', '',
+      '\\/close', '',
+      '\\/label ~x', '',
+      '\\/assign @someone', '',
+      '\\/zzz-future-command arg', '',
+      '  \\/merge', '',
+      'Closing paragraph.',
+    ].join('\n');
+    const packedParagraph = ['Intro', '/merge', '/approve', '/close', '/label ~x', '/assign @someone', '/zzz-future-command arg', '  /merge', 'Outro'].join('\n');
+    const packedParagraphNeutralized = ['Intro', '\\/merge', '\\/approve', '\\/close', '\\/label ~x', '\\/assign @someone', '\\/zzz-future-command arg', '  \\/merge', 'Outro'].join('\n');
+    // The A1 command lines, in order, and the exact bytes each must become.
+    const commandLines = ['/merge', '/approve', '/close', '/label ~x', '/assign @someone', '/zzz-future-command arg', '  /merge'];
+    const neutralizedCommandLines = ['\\/merge', '\\/approve', '\\/close', '\\/label ~x', '\\/assign @someone', '\\/zzz-future-command arg', '  \\/merge'];
+    const blockCases: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      ['fenced code block', ['```', ...commandLines, '```'].join('\n'), ['```', ...neutralizedCommandLines, '```'].join('\n')],
+      ['unclosed fence', ['```', ...commandLines].join('\n'), ['```', ...neutralizedCommandLines].join('\n')],
+      ['indented code block', ['Paragraph.', '', ...commandLines.map((line) => `    ${line}`)].join('\n'), ['Paragraph.', '', ...neutralizedCommandLines.map((line) => `    ${line}`)].join('\n')],
+      ['>>> quote block', ['>>>', ...commandLines, '>>>'].join('\n'), ['>>>', ...neutralizedCommandLines, '>>>'].join('\n')],
+      ['HTML block', ['<details>', ...commandLines, '</details>'].join('\n'), ['<details>', ...neutralizedCommandLines, '</details>'].join('\n')],
+      ...commandLines.map((line, index): readonly [string, string, string] =>
+        [`lazy continuation after a quote line (${JSON.stringify(line)})`, `> quote\n${line}`, `> quote\n${neutralizedCommandLines[index]}`]),
+      ['tab-led line', 'Paragraph.\n\n\t/merge', 'Paragraph.\n\n\t\\/merge'],
+      // GitLab's extractor only acts on a line that starts with `/`: a quoted
+      // command line stays byte-identical.
+      ['quoted command lines', commandLines.map((line) => `> ${line}`).join('\n'), commandLines.map((line) => `> ${line}`).join('\n')],
+    ];
+    const edgeCases: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      ['empty body', '', ''],
+      ['whitespace-only body', '   \n\t\n', ''],
+      ['a lone slash', '/', '\\/'],
+      ['a quick action first in the body', '/merge\ntext', '\\/merge\ntext'],
+      ['a quick action last in the body', 'text\n/merge', 'text\n\\/merge'],
+      ['a CR between the newline and the slash', 'text\n\r/merge', 'text\n\\/merge'],
+      ['CRLF line ends', '\r\n/merge\r\n/close\r\n', '\n\\/merge\n\\/close'],
+      ['trailing whitespace after a final quick action', '/merge  \n\n', '\\/merge'],
+      ['a mixed whitespace lead', '\t /merge', '\t \\/merge'],
+      // Whitespace is JavaScript `\s`, a superset of ASCII: a Unicode-space
+      // lead is escaped too, never left as a possible command.
+      ['a no-break-space lead', '\u00a0/merge', '\u00a0\\/merge'],
+      // GitLab's extractor deletes only CRs and needs the slash at the very
+      // start of the line, so a NUL before it is not a command position.
+      ['a NUL before the slash', 'text\n\0/merge', 'text\n\0/merge'],
+      // The rule is model-free: a path-like line is escaped like a command.
+      ['a path-like slash line', 'See\r\n/path/to/x\r\n', 'See\n\\/path/to/x'],
+      ['a CR that joins a slash onto a line', 'a\r/merge', 'a/merge'],
+      ['slashes inside a line', 'see /merge here\nhttp://example.test/a/b\na /label ~x', 'see /merge here\nhttp://example.test/a/b\na /label ~x'],
+      ['an already escaped line', '\\/merge', '\\/merge'],
+      ['an indented escaped line', 'text\n  \\/merge', 'text\n  \\/merge'],
+      ['a doubled backslash', '\\\\/merge', '\\\\/merge'],
+    ];
+
+    /** A GitLab that behaves like the real note endpoint, written without the
+     * production helper: it deletes CRs, removes and "executes" every line
+     * matching `^/[A-Za-z]`, and strips trailing whitespace. */
+    function gitLabQuickActionEndpoint(headSha: string) {
+      const executed: string[] = [];
+      const posted: string[] = [];
+      const stored: string[] = [];
+      const reply = (status: number, payload: unknown): { ok: boolean; status: number; text(): Promise<string> } =>
+        ({ ok: status < 300, status, text: async () => JSON.stringify(payload) });
+      const fetchImpl = async (url: string, init?: { method?: string; body?: string }): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+        if (url.endsWith('/user')) return reply(200, { username: 'gru-bot' });
+        if (url.endsWith('/notes') && init?.method === 'POST') {
+          const sent = (JSON.parse(init.body ?? '{}') as { body: string }).body;
+          posted.push(sent);
+          const kept = sent.replaceAll('\r', '').split('\n').filter((line) => {
+            if (!/^\/[A-Za-z]/u.test(line)) return true;
+            executed.push(line);
+            return false;
+          });
+          const note = kept.join('\n').replace(/[ \t\n\v\f\0]+$/u, '');
+          stored.push(note);
+          return reply(201, { id: 712, body: note, author: { username: 'gru-bot' } });
+        }
+        return reply(200, { sha: headSha, diff_refs: { base_sha: 'b'.repeat(40) } });
+      };
+      return { fetchImpl, executed, posted, stored };
+    }
+
+    /** One real review round over a git fixture whose lead report is
+     * transformed, delivered through the poster the caller builds. */
+    async function runQuickActionRound<Extra>(options: {
+      readonly name: string;
+      readonly prUrl: string;
+      readonly makePoster: (context: { readonly gitBinary: string; readonly target: string }) => { readonly poster: VerdictPoster; readonly extra: Extra };
+      readonly transformReport: (report: string, target: string) => string;
+    }) {
+      const repo = makeFixtureRepo(`perkins-qa-${options.name}`);
+      repos.push(repo);
+      const branch = `feature/qa-${options.name}`;
+      repo.git(['checkout', '-b', branch]);
+      const target = repo.commitFile('src/main.ts', 'export function answer(): number { return 42; }\n');
+      const root = mkdtempSync(join(tmpdir(), `perkins-qa-${options.name}-port-`));
+      const artifacts = mkdtempSync(join(tmpdir(), `perkins-qa-${options.name}-artifacts-`));
+      const sessions = mkdtempSync(join(tmpdir(), `perkins-qa-${options.name}-sessions-`));
+      dirs.push(root, artifacts, sessions);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `perkins-qa-${options.name}-db-`)));
+      dbs.push(db);
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      const port = new GitReviewPort(root, branch, target, ledger);
+      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-qa-${options.name}` });
+      const job = ledger.addJob({ id: `job-qa-${options.name}`, repo: 'fixture', title: `quick actions ${options.name}`, baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(job.id, 'working');
+      settleLane(ledger, job.id);
+      ledger.setJobPr(job.id, options.prUrl);
+      attachOrigin(repo, branch, root);
+      // The poster's origin identity is the GitLab URL; source freezing keeps
+      // the isolated local bare origin and performs no network access.
+      const gitWrapper = join(root, 'git-identity-wrapper.sh');
+      writeFileSync(gitWrapper, `#!/bin/sh\nif [ "$3" = "remote" ] && [ "$4" = "get-url" ] && [ "$5" = "origin" ]; then\n  printf '%s\\n' 'https://gitlab.example.test/acme/widget.git'\n  exit 0\nfi\nexec git "$@"\n`, 'utf8');
+      chmodSync(gitWrapper, 0o755);
+      const { poster, extra } = options.makePoster({ gitBinary: gitWrapper, target });
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger, worktrees: port,
+        spawner: fakeWholeSpawner(sessions, {
+          specialists: [],
+          childAnswer: () => '[]',
+          transformReport: (report) => options.transformReport(report, target),
+        }).spawner,
+        reviewArtifactRoot: artifacts, poster, prHeadProbe: localHeadProbe(branch),
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      const outcome = asWave(await wave.runRound({ jobId: job.id }));
+      return { ledger, outcome, artifacts, target, extra, escalations };
+    }
+
+    it('escapes every line-leading slash in ordinary paragraphs and changes nothing else (A1)', () => {
+      expect(canonicalGitLabPublicationBody(spacedParagraphs)).toBe(spacedParagraphsNeutralized);
+      expect(canonicalGitLabPublicationBody(packedParagraph)).toBe(packedParagraphNeutralized);
+      // The same lines with a trailing newline and CRLF ends: the quick
+      // actions are escaped and the stored-note normalization still applies.
+      expect(canonicalGitLabPublicationBody(`${packedParagraph.replaceAll('\n', '\r\n')}\r\n`)).toBe(packedParagraphNeutralized);
+    });
+
+    it('applies the same rule inside code, quote and HTML blocks and after lazy continuation, and leaves a quoted command line alone (A2)', () => {
+      for (const [name, input, expected] of blockCases) {
+        expect(canonicalGitLabPublicationBody(input), name).toBe(expected);
+      }
+    });
+
+    it('treats the byte stream, not the markdown: CR deletion creates line starts, mid-line slashes and escapes stay (A1 edges)', () => {
+      for (const [name, input, expected] of edgeCases) {
+        expect(canonicalGitLabPublicationBody(input), name).toBe(expected);
+      }
+    });
+
+    it('is idempotent over the whole quick-action corpus (A5)', () => {
+      const corpus = [
+        spacedParagraphs, packedParagraph,
+        ...blockCases.map(([, input]) => input),
+        ...edgeCases.map(([, input]) => input),
+      ];
+      for (const input of corpus) {
+        const once = canonicalGitLabPublicationBody(input);
+        expect(canonicalGitLabPublicationBody(once), JSON.stringify(input)).toBe(once);
+      }
+    });
+
+    it('delivers only neutralized bytes: a GitLab that executes quick actions executes nothing and stores the POSTed bytes (A3)', async () => {
+      const { ledger, outcome, extra: endpoint } = await runQuickActionRound({
+        name: 'gitlab-delivery',
+        prUrl: mrUrl,
+        makePoster: ({ gitBinary, target }) => {
+          const extra = gitLabQuickActionEndpoint(target);
+          return { poster: new GitLabMrPoster({ token: 'glpat-isolated-test-token', gitBinary, fetchImpl: extra.fetchImpl }), extra };
+        },
+        transformReport: (report) => `${report}\n\n${spacedParagraphs}\n`,
+      });
+      expect(endpoint.executed).toEqual([]);
+      expect(endpoint.posted).toHaveLength(1);
+      expect(endpoint.stored).toEqual(endpoint.posted);
+      const sent = endpoint.posted[0]!;
+      expect(sent).toContain(`\n\n${spacedParagraphsNeutralized}\n\n`);
+      // The fake above acts on column 0 only, as specified. An independent
+      // check on the POSTed bytes covers the space-led command too: no line
+      // of the note starts with a slash after any leading whitespace.
+      expect(sent.split('\n').filter((line) => /^\s*\//u.test(line))).toEqual([]);
+      expect(outcome.posted).toBe(true);
+      expect(outcome.round.status).toBe('verdict-posted');
+      const events = ledger.listEvents({ limit: 500 }).filter((event) => event.roundId === outcome.round.id);
+      const posted = events.find((event) => event.kind === 'round.posted');
+      const attempt = events.find((event) => event.kind === 'round.publication-attempt');
+      const postedPayload = posted?.payload as { publicationFile: string; publicationSha256: string; receipt: { bodySha256: string; actor: string } } | undefined;
+      const attemptPayload = attempt?.payload as { publicationFile: string; publicationSha256: string } | undefined;
+      const digest = createHash('sha256').update(sent, 'utf8').digest('hex');
+      expect(readFileSync(postedPayload!.publicationFile, 'utf8')).toBe(sent);
+      expect(readFileSync(attemptPayload!.publicationFile, 'utf8')).toBe(sent);
+      expect(attemptPayload?.publicationSha256).toBe(digest);
+      expect(postedPayload).toMatchObject({ publicationSha256: digest, receipt: { bodySha256: digest, actor: 'gru-bot' } });
+    });
+
+    it('counts the neutralized bytes against the provider bound before assembly succeeds (A4, assembly site)', () => {
+      const minimalReview = { findings: [], specialistRuns: [], priorDispositions: [] };
+      const emptyBodyBytes = Buffer.byteLength(canonicalGitLabPublicationBody(publicationBodyFor('', minimalReview, 'gitlab', [])), 'utf8');
+      // `pad` plus one quick-action line: the CR/rstrip-only form would be
+      // exactly at the bound, the neutralized form is one byte over it.
+      const pad = PUBLICATION_BODY_MAX_BYTES - emptyBodyBytes - '\n/y'.length;
+      expect(() => publicationBodyFor(`${'x'.repeat(pad)}\n/y`, minimalReview, 'gitlab', []))
+        .toThrow(/exceeds the provider review-body limit/u);
+      // One byte less of padding fits exactly at the bound once neutralized.
+      const fitting = publicationBodyFor(`${'x'.repeat(pad - 1)}\n/y`, minimalReview, 'gitlab', []);
+      expect(Buffer.byteLength(canonicalGitLabPublicationBody(fitting), 'utf8')).toBe(PUBLICATION_BODY_MAX_BYTES);
+      // GitHub bytes are not neutralized, so the same report fits there.
+      const githubEmptyBytes = Buffer.byteLength(publicationBodyFor('', minimalReview, 'github', []), 'utf8');
+      const githubPad = PUBLICATION_BODY_MAX_BYTES - githubEmptyBytes - '\n/y'.length;
+      expect(() => publicationBodyFor(`${'x'.repeat(githubPad)}\n/y`, minimalReview, 'github', [])).not.toThrow();
+    });
+
+    it('refuses a publication that fits only before neutralization, writes the overflow artifact and never POSTs (A4, delivery)', async () => {
+      const post = vi.fn();
+      const slashLines = 15_000;
+      const { ledger, outcome, artifacts } = await runQuickActionRound({
+        name: 'gitlab-overflow',
+        prUrl: mrUrl,
+        makePoster: () => ({ poster: { post } as unknown as VerdictPoster, extra: null }),
+        transformReport: (report) => `${report}\n\n${Array.from({ length: slashLines }, () => '/x').join('\n')}\n`,
+      });
+      expect(outcome.posted).toBe(false);
+      expect(post).not.toHaveBeenCalled();
+      expect(ledger.latestRoundEvent(outcome.round.id, 'round.publication-attempt')).toBeNull();
+      const overflowPath = join(artifacts, outcome.round.id, 'perkins-report.publication-overflow.json');
+      expect(existsSync(overflowPath)).toBe(true);
+      const reason = (JSON.parse(readFileSync(overflowPath, 'utf8')) as { reason: string }).reason;
+      const neutralizedBytes = Number(/publication body \((\d+) bytes\) exceeds the provider review-body limit/u.exec(reason)?.[1]);
+      // One backslash per slash line: without neutralization the body fit.
+      expect(neutralizedBytes).toBeGreaterThan(PUBLICATION_BODY_MAX_BYTES);
+      expect(neutralizedBytes - slashLines).toBeLessThanOrEqual(PUBLICATION_BODY_MAX_BYTES);
+    });
+
+    it('counts the neutralized bytes at the final-bytes site too: a redacted body that fits only without them is refused (A4, final bytes)', async () => {
+      // Assembly passes (the report fits once neutralized), and the redacted
+      // body would fit without neutralization; only redaction expansion PLUS
+      // the added backslashes cross the bound, so the second size-bound site
+      // is the one that must refuse it.
+      const post = vi.fn();
+      const slashLines = 5_000;
+      const urlToken = 'https://u:p@h ';
+      const expansionPerToken = Buffer.byteLength(redactReviewForPublication(urlToken), 'utf8') - Buffer.byteLength(urlToken, 'utf8');
+      expect(expansionPerToken).toBeGreaterThan(0);
+      const tokens = Math.ceil(5_000 / expansionPerToken);
+      const urlLine = urlToken.repeat(tokens).trimEnd();
+      expect(Buffer.byteLength(redactReviewForPublication(urlLine), 'utf8') - Buffer.byteLength(urlLine, 'utf8'))
+        .toBeGreaterThanOrEqual((tokens - 1) * expansionPerToken);
+      const reportBytes = 50_500;
+      const { ledger, outcome, artifacts, escalations } = await runQuickActionRound({
+        name: 'gitlab-final-bytes',
+        prUrl: mrUrl,
+        makePoster: () => ({ poster: { post } as unknown as VerdictPoster, extra: null }),
+        transformReport: (report) => {
+          const slashBlock = Array.from({ length: slashLines }, () => '/x').join('\n');
+          const head = `${report}\n\n${urlLine}\n\n`;
+          const tail = `\n\n${slashBlock}`;
+          return `${head}${'a'.repeat(reportBytes - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8'))}${tail}`;
+        },
+      });
+      expect(outcome.posted).toBe(false);
+      expect(post).not.toHaveBeenCalled();
+      expect(ledger.latestRoundEvent(outcome.round.id, 'round.publication-attempt')).toBeNull();
+      const overflowPath = join(artifacts, outcome.round.id, 'perkins-report.publication-overflow.json');
+      expect(existsSync(overflowPath)).toBe(true);
+      expect((JSON.parse(readFileSync(overflowPath, 'utf8')) as { reason: string }).reason)
+        .toBe('redaction expanded the assembled publication body past the provider review-body limit');
+      const refusedBytes = Number(/redacted publication body \((\d+) bytes\) exceeds the provider review-body limit/u.exec(escalations.join('\n'))?.[1]);
+      // One backslash per slash line: without neutralization the redacted body fit.
+      expect(refusedBytes).toBeGreaterThan(PUBLICATION_BODY_MAX_BYTES);
+      expect(refusedBytes - slashLines).toBeLessThanOrEqual(PUBLICATION_BODY_MAX_BYTES);
+    });
+
+    it('keeps the receipt comparison strict: no quick-action, whitespace or CR equivalence, and the author and head checks stay (A6)', async () => {
+      const { repoPath, cleanup } = fixture();
+      try {
+        const attempt = async (sent: string, echoed: string, options: { readonly author?: string; readonly confirmedHead?: string } = {}) => {
+          const poster = new GitLabMrPoster({
+            token: 'glpat-token',
+            fetchImpl: fetchSequence([
+              { status: 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) },
+              { status: 201, body: JSON.stringify({ id: 60, body: echoed, author: { username: options.author ?? 'gru-bot' } }) },
+              { status: 200, body: JSON.stringify({ sha: options.confirmedHead ?? head, diff_refs: { base_sha: base } }) },
+            ], []),
+          });
+          return poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: sent, targetSha: head, baseSha: base, reviewEvent: 'COMMENT' });
+        };
+        // GitLab removed a quick-action line (escaped or not) from the note.
+        await expect(attempt('intro\n\\/merge\ntail', 'intro\ntail')).rejects.toThrow(/provider receipt body does not match/u);
+        await expect(attempt('intro\n/merge\ntail', 'intro\ntail')).rejects.toThrow(/provider receipt body does not match/u);
+        // The echoed note differs only by trailing whitespace or a CR.
+        await expect(attempt('text  ', 'text')).rejects.toThrow(/provider receipt body does not match/u);
+        await expect(attempt('a\r\nb', 'a\nb')).rejects.toThrow(/provider receipt body does not match/u);
+        await expect(attempt('exact', 'exact', { author: 'someone-else' })).rejects.toThrow(/is not the authenticated posting account/u);
+        await expect(attempt('exact', 'exact', { confirmedHead: 'e'.repeat(40) })).rejects.toThrow(/identity moved/u);
+        await expect(attempt('exact', 'exact')).resolves.toMatchObject({ reviewId: '60', actor: 'gru-bot', headSha: head });
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('keeps a historical CR/rstrip-only attempt matched as fail-closed ambiguity — in reconcile and in restart recovery (A7)', async () => {
+      // A body written before neutralization: it carries CRs and a slash
+      // line that is not a quick action (`/path/to/x`), which GitLab stored
+      // as written. Its stored note is the CR/rstrip-only form.
+      const historicalBody = '# Perkins Code Review\r\n\r\nSee\r\n/path/to/x\r\nfor the cited file.\r\n';
+      const storedNote = '# Perkins Code Review\n\nSee\n/path/to/x\nfor the cited file.';
+      const notesFetch = (body: string, calls: Array<{ readonly url: string; readonly method?: string }>, targetSha: string) =>
+        async (url: string, init?: { method?: string }): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+          calls.push({ url, ...(init?.method !== undefined ? { method: init.method } : {}) });
+          const reply = (payload: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(payload) });
+          if (url.endsWith('/user')) return reply({ username: 'gru-bot' });
+          if (url.includes('/notes?')) return reply([{ id: 901, body, author: { username: 'gru-bot' } }]);
+          return reply({ sha: targetSha, diff_refs: { base_sha: base } });
+        };
+      const { repoPath, cleanup } = fixture();
+      try {
+        const calls: Array<{ readonly url: string; readonly method?: string }> = [];
+        const poster = new GitLabMrPoster({ token: 'glpat-token', fetchImpl: notesFetch(storedNote, calls, head) });
+        const input = { prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: historicalBody, targetSha: head, baseSha: base, reviewEvent: 'COMMENT' as const };
+        await expect(poster.reconcile!(input)).rejects.toThrow(/historical match is NOT delivery evidence/u);
+        // A new publication (neutralized body) matches its stored note by the exact digest.
+        const neutralized = canonicalGitLabPublicationBody(historicalBody);
+        const current = new GitLabMrPoster({ token: 'glpat-token', fetchImpl: notesFetch(neutralized, calls, head) });
+        await expect(current.reconcile!({ ...input, body: neutralized })).rejects.toThrow(/historical match is NOT delivery evidence/u);
+        expect(calls.some((call) => call.method === 'POST')).toBe(false);
+      } finally {
+        cleanup();
+      }
+
+      const repo = makeFixtureRepo('perkins-qa-historical-restart');
+      repos.push(repo);
+      repo.git(['checkout', '-b', 'feature/qa-historical-restart']);
+      const target = repo.commitFile('src/main.ts', 'export const answer = 42;\n');
+      try { repo.git(['remote', 'add', 'origin', 'https://gitlab.example.test/acme/widget.git']); }
+      catch { repo.git(['remote', 'set-url', 'origin', 'https://gitlab.example.test/acme/widget.git']); }
+      const artifacts = mkdtempSync(join(tmpdir(), 'perkins-qa-historical-artifacts-'));
+      dirs.push(artifacts);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-qa-historical-db-')));
+      dbs.push(db);
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      const jobId = 'job-qa-historical';
+      ledger.addJob({ id: jobId, repo: 'fixture', title: 'historical attempt', baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: target } });
+      ledger.setJobPr(jobId, mrUrl);
+      const round = ledger.addRound({ jobId, lenses: ['blind'], targetRef: target });
+      ledger.setRoundStatus(round.id, 'live');
+      ledger.setJobStatus(jobId, 'in-review');
+      const roundDir = join(artifacts, round.id);
+      mkdirSync(roundDir, { recursive: true });
+      const publicationFile = join(roundDir, 'perkins-report.publication.md');
+      writeFileSync(publicationFile, historicalBody, 'utf8');
+      writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo.path }), 'utf8');
+      ledger.appendCustomEvent({
+        kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: mrUrl, host: 'gitlab.example.test',
+          targetSha: target, baseSha: base, publicationFile,
+          publicationSha256: createHash('sha256').update(historicalBody, 'utf8').digest('hex'), reviewEvent: 'COMMENT',
+        },
+      });
+      ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'gru-bot', host: 'gitlab.example.test', targetSha: target } });
+      const restartCalls: Array<{ readonly url: string; readonly method?: string }> = [];
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger, worktrees: ({ listWorktrees: () => [] }) as unknown as WorktreePort, reviewArtifactRoot: artifacts,
+        spawner: vi.fn() as unknown as AgentSpawner,
+        poster: new GitLabMrPoster({ token: 'glpat-token', fetchImpl: notesFetch(storedNote, restartCalls, target) }),
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      await wave.recoverInterruptedRounds();
+      // Fail closed: never absence, never a second POST, the attempt stays open.
+      expect(ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT), escalations.join('\n')).toBeNull();
+      expect(pendingPublicationAttempt(ledger, round.id)?.kind).toBe('unresolved-attempt');
+      expect(ledger.getRound(round.id)?.status).toBe('aborted');
+      expect(escalations.join('\n')).toMatch(/stays unresolved/u);
+      expect(escalations.join('\n')).toMatch(/body-matching note by gru-bot/u);
+      expect(restartCalls.some((call) => call.url.includes('/notes?'))).toBe(true);
+      expect(restartCalls.some((call) => call.method === 'POST')).toBe(false);
+    }, 120_000);
+
+    it('leaves GitHub publication bytes untouched through the full delivery path (A8)', async () => {
+      // The whole report is written out here, so the expected bytes do not
+      // come from the code under test; only the two frozen SHAs vary.
+      const reportFor = (target: string, diffBase: string): string => [
+        '# Perkins Code Review', '', '**Verdict: READY TO MERGE**', '',
+        `Frozen target: ${target}`, `Frozen base: ${diffBase}`, '',
+        'Lines quoted from the reviewed change:', '',
+        '/merge', '  /approve', '\r/close', '```', '/label ~x', '```',
+      ].join('\n');
+      const publicationLines: Readonly<Record<string, string>> = {
+        APPROVE: 'Publication: formal GitHub approval — review event APPROVE submitted on the reviewed commit by the service posting account; the durable delivery receipt is the record of the provider state actually enacted. The substantive verdict is the independent review judgment recorded in this report.',
+        COMMENT: 'Publication: authenticated COMMENT review on the reviewed commit by the service posting account; the substantive verdict is the independent review judgment recorded in this report, not a formal GitHub APPROVED/CHANGES_REQUESTED event.',
+      };
+      let expectedReport = '';
+      const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      }));
+      const { ledger, outcome } = await runQuickActionRound({
+        name: 'github-untouched',
+        prUrl: 'https://github.com/acme/fixture/pull/48',
+        makePoster: () => ({ poster: { post } as unknown as VerdictPoster, extra: null }),
+        transformReport: (report, target) => {
+          const diffBase = /Frozen base: ([0-9a-f]{40})/u.exec(report)?.[1];
+          if (diffBase === undefined) throw new Error('the lead double no longer states the frozen base');
+          expectedReport = reportFor(target, diffBase);
+          return expectedReport;
+        },
+      });
+      expect(outcome.posted).toBe(true);
+      expect(post).toHaveBeenCalledTimes(1);
+      const call = post.mock.calls[0]![0];
+      const sent = call.body;
+      const event = call.reviewEvent ?? 'COMMENT';
+      expect(Object.keys(publicationLines)).toContain(event);
+      // Pinned bytes: the report with its slash lines and CR, the appendix
+      // opening, the publication line and GitHub's terminal newline. The
+      // bullet lines between are host-recorded counts and CI facts.
+      const opening = `${expectedReport}\n\n---\n\n## Execution and findings (host-recorded facts)\n\n- Retained findings: 0\n- none retained\n`;
+      const closing = `${publicationLines[event]!}\n`;
+      expect(sent.slice(0, opening.length)).toBe(opening);
+      expect(sent.slice(-closing.length)).toBe(closing);
+      const middle = sent.slice(opening.length, sent.length - closing.length);
+      expect(middle.split('\n').slice(0, -1).every((line) => line.startsWith('- '))).toBe(true);
+      expect(middle.endsWith('\n')).toBe(true);
+      expect(sent).toContain('\r/close\n');
+      expect(sent).not.toContain('\\/');
+      const posted = ledger.listEvents({ limit: 500 }).find((event) => event.roundId === outcome.round.id && event.kind === 'round.posted');
+      const postedPayload = posted?.payload as { publicationFile: string; publicationSha256: string } | undefined;
+      expect(readFileSync(postedPayload!.publicationFile, 'utf8')).toBe(sent);
+      expect(postedPayload?.publicationSha256).toBe(createHash('sha256').update(sent, 'utf8').digest('hex'));
+    });
+  });
+
   it('routes by code host and refuses unsupported hosts', async () => {
     const github = { post: vi.fn(async () => ({ headSha: 'github-head', baseSha: 'github-base' })) } as unknown as VerdictPoster;
     const gitlab = { post: vi.fn(async () => ({ headSha: 'gitlab-head', baseSha: 'gitlab-base' })) } as unknown as VerdictPoster;
