@@ -1187,7 +1187,6 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
 
-<<<<<<< HEAD
 # #523 second PR: the reconsider-driven directive recovery card is not raised
 # again after Gru resolves it, keeps a recorded mailbox disposition across a
 # text-only refresh and has a decision signal that fits the decision API.
@@ -1201,7 +1200,6 @@ pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-523-attention-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-recovery-attention.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-523-attention-static = "npm run lint && npm run typecheck && npm run build"
 gc-523-attention-red = "sh gru-output/gc-523-attention/red.sh"
-=======
 # #513 blind coverage release: `gc-513-focused` is the new endpoint/readback
 # suite, the suites that must keep passing with their assertions unchanged
 # (heavy ones routed through the heavy config), the playbook wording, the
@@ -1235,4 +1233,3 @@ gc-519-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182
 gc-526-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
 gc-526-static = "npm run lint && npm run typecheck && npm run build"
 gc-526-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b363182; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc526-red.XXXXXX"); trap "rm -rf -- $d" EXIT; git archive "$base" | tar -x -C "$d"; cp test/perkins-builtin-wave.test.ts "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GC526 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; status=0; npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "quick-action neutralization" --reporter=verbose --reporter=json --outputFile.json="$d/red.json" || status=$?; g="GitLab SHA-bound merge-request delivery quick-action neutralization (#526)"; node "$root/tools/assert-named-red-baseline.mjs" gc-526 "$d/red.json" "$g escapes every line-leading slash in ordinary paragraphs and changes nothing else (A1)" "$g applies the same rule inside code, quote and HTML blocks and after lazy continuation, and leaves a quoted command line alone (A2)" "$g treats the byte stream, not the markdown: CR deletion creates line starts, mid-line slashes and escapes stay (A1 edges)" "$g delivers only neutralized bytes: a GitLab that executes quick actions executes nothing and stores the POSTed bytes (A3)" "$g counts the neutralized bytes against the provider bound before assembly succeeds (A4, assembly site)" "$g refuses a publication that fits only before neutralization, writes the overflow artifact and never POSTs (A4, delivery)" "$g counts the neutralized bytes at the final-bytes site too: a redacted body that fits only without them is refused (A4, final bytes)" || exit 2; node -e "const r=JSON.parse(require(\"fs\").readFileSync(process.argv[1],\"utf8\"));if(r.numFailedTests!==7||r.numPassedTests!==4){console.error(\"GC526 red shape: failed=\"+r.numFailedTests+\" passed=\"+r.numPassedTests+\", expected 7 and 4\");process.exit(2)}console.log(\"GC526 red shape: \"+r.numFailedTests+\" failed, \"+r.numPassedTests+\" passed (the guards)\")" "$d/red.json" || exit 2; exit "$status"'
->>>>>>> origin/main
