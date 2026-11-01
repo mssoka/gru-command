@@ -176,6 +176,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
   { file: 'ghost-agent-boot.test.ts', workload: 'real compiled service booted against a seeded data home: agent rows a previous process left open are settled before the listener' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands and recreated persisted-server original-PID/no-start reconciliation' },
+  {
+    file: 'verification-retention.test.ts',
+    workload: 'retained-output replay over real spawned verification runs: a live re-submit prefix, a completed replay, the 30-minute window, the 8 MiB per-run and 64 MiB total caps, and the stdout/stderr interleave hash',
+  },
   { file: 'wake-e2e.test.ts', workload: 'real service wake-on-alert flow' },
   { file: 'workflow-runtime-packaged.test.ts', workload: 'extracts the actual npm archive and drives compiled workflow CLIs over a real git lane' },
   {
