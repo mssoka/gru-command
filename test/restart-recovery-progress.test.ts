@@ -3781,7 +3781,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       if (verdict === 'bounded') expect((decided.payload as { dead_turn: { effects: unknown[] } }).dead_turn.effects).toHaveLength(listedEffects.length);
       // The successor is admitted and runs: the dead producer refuses nothing of its own dispatch.
       await executeAcceptedDirective(s.deps, 'dead-turn-successor');
-      expect(s.ledger.getDirective('dead-turn-successor')).toMatchObject({ state: 'settled', admissionSeq: expect.any(Number) });
+      // A refused dispatch records its reason on the job's reconcile event; quote it in the failure.
+      const reconcile = s.ledger.latestJobEvent(s.jobId, 'silas.directive-reconcile')?.payload;
+      expect(s.ledger.getDirective('dead-turn-successor'), JSON.stringify(reconcile)).toMatchObject({ state: 'settled', admissionSeq: expect.any(Number) });
       expect(s.prompts().join('\n')).toContain(`${verdict}:`);
       expect(s.ledger.getObligation(debt.id)).toMatchObject({ state: 'settled' });
       // The exact decision replays as itself: no second successor, no second turn.
