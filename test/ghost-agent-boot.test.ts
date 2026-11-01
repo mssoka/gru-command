@@ -26,7 +26,7 @@ afterEach(() => {
 
 interface AgentRow { readonly id: string; readonly state: string }
 interface EventRow { readonly agent_id: string | null; readonly kind: string; readonly payload: string }
-interface NoticeRow { readonly kind: string; readonly routing: string; readonly severity: string; readonly agent_id: string | null }
+interface NoticeRow { readonly kind: string; readonly routing: string; readonly severity: string; readonly agent_id: string | null; readonly detail?: string | null }
 
 /** Read the booted service's ledger without writing to it. */
 function readLedger<T>(home: string, read: (db: DatabaseSync) => T): T {
@@ -50,6 +50,15 @@ function agentEvents(home: string, agentId: string, kind: string): readonly unkn
 function orphanNotices(home: string, agentId: string): readonly NoticeRow[] {
   return readLedger(home, (db) => db.prepare('SELECT kind, routing, severity, agent_id FROM notifications WHERE kind = ? AND resolved_at IS NULL')
     .all(`supervision.turn-orphaned.${agentId}`) as unknown as NoticeRow[]);
+}
+
+function openIncidents(home: string, kind: string): readonly NoticeRow[] {
+  return readLedger(home, (db) => db.prepare('SELECT kind, routing, severity, agent_id, detail FROM notifications WHERE kind = ? AND resolved_at IS NULL')
+    .all(kind) as unknown as NoticeRow[]);
+}
+
+function jobStatus(home: string, jobId: string): string | undefined {
+  return readLedger(home, (db) => (db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId) as { readonly status: string } | undefined)?.status);
 }
 
 function seedHome(prefix: string, seed: (ledger: LedgerApi, home: string) => void): { readonly home: string; readonly workspace: string } {
@@ -139,7 +148,7 @@ describe('compiled service: boot settles the agent rows a previous process left 
     }
   }, 90_000);
 
-  it('re-proves a parked job\'s interrupted stop against the settled rows: a ghost turn no longer leaves it unproven', async () => {
+  it('re-proves a parked job\'s interrupted stop against the settled rows: a ghost turn is no stop target', async () => {
     const jobId = 'job-ghost-parked';
     const { home, workspace } = seedHome('gru-ghost-parked', (ledger) => {
       ledger.addJob({ id: jobId, repo: 'fixture', title: 'parked mid-turn', baseBranch: 'main', briefing: 'work' });
@@ -159,9 +168,23 @@ describe('compiled service: boot settles the agent rows a previous process left 
           .all(jobId) as unknown as { payload: string }[]).map((event) => JSON.parse(event.payload) as Record<string, unknown>));
         // The seeded request, the boot re-proof's own intent (a stop pass
         // records `requested` before any effect), then its verdict: the ghost
-        // is a settled `error` row, not an open turn the runtime fails to hold.
-        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'requested', 'stopped']);
-        expect(verdicts[2]).toMatchObject({ physical_state: 'stopped', agents: [], outstanding: [] });
+        // is a settled `error` row, not an open turn the runtime fails to
+        // hold. It also proves nothing stopped — registry absence is not
+        // evidence of cessation, and a vacuous review confirmation is no
+        // review target — so the verdict is `unproven`, never `stopped`.
+        expect(verdicts.map((verdict) => verdict['state'])).toEqual(['requested', 'requested', 'unproven']);
+        expect(verdicts[2]).toMatchObject({
+          physical_state: 'unproven',
+          agents: [],
+          outstanding: ['no stop target exists — registry absence is not evidence of cessation'],
+        });
+        // The verdict is not permission: the hold stands, and the owner gets
+        // exactly one incident naming the residue they must act on.
+        expect(jobStatus(home, jobId)).toBe('parked');
+        const incidents = openIncidents(home, `job-stop-unproven:${jobId}`);
+        expect(incidents.map((incident) => ({ kind: incident.kind, routing: incident.routing, severity: incident.severity })))
+          .toEqual([{ kind: `job-stop-unproven:${jobId}`, routing: 'needs-owner', severity: 'error' }]);
+        expect(incidents[0]?.detail).toContain('no stop target exists — registry absence is not evidence of cessation');
       }, { timeout: 30_000, interval: 250 });
       expect(agentRows(home, jobId)).toEqual([{ id: 'ghost-parked', state: 'error' }]);
     } finally {

@@ -68,7 +68,7 @@ import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
-import { JobExecutionStop, jobStopResidue, watchParkedJobs } from './dispatch/job-stop.js';
+import { JobExecutionStop, jobStopUnprovenNotice, watchParkedJobs } from './dispatch/job-stop.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
@@ -1477,12 +1477,8 @@ async function main(): Promise<number> {
     children: childWorkers,
     reviews: wave,
     notifyUnproven: (outcome) => {
-      openJobStopIncident(
-        outcome.jobId,
-        `Parked job ${outcome.jobId}: producer stop is unproven`,
-        `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
-          'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles.',
-      );
+      const notice = jobStopUnprovenNotice(outcome);
+      openJobStopIncident(outcome.jobId, notice.title, notice.detail);
     },
     notifyResolved: (jobId) => {
       notifications.resolveExactKind(jobStopIncident(jobId), 'job-service-stop');

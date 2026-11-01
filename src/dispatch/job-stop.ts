@@ -10,7 +10,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 
 /** One target's verdict. `stopped` is only ever recorded on positive
  * cessation evidence; `unproven` preserves the truth when the service
- * cannot prove the producer is gone (issue #455). */
+ * cannot prove the producer is gone (issue #455). A pass records `stopped`
+ * only when every live target is proven AND at least one target was proven;
+ * registry absence is never evidence of cessation (#562). */
 export type JobStopTargetState = 'stopped' | 'unproven';
 
 export interface JobStopAgentOutcome {
@@ -36,8 +38,9 @@ export interface JobStopReviewOutcome {
 
 export interface JobStopOutcome {
   readonly jobId: string;
-  /** `stopped` requires EVERY live target to be positively proven stopped.
-   * Anything less is `unproven` with the exact residue named. */
+  /** `stopped` requires EVERY live target to be positively proven stopped
+   * AND at least one proven target. Anything less is `unproven` with the
+   * exact residue named; an empty target set is never `stopped`. */
   readonly state: JobStopTargetState;
   /** True when the job left the owner hold while this pass was awaited:
    * the physical results are still reported, but the verdict no longer
@@ -57,6 +60,7 @@ export interface JobStopDeps {
     | 'getJob'
     | 'listJobs'
     | 'latestJobEvent'
+    | 'listJobEventsByKinds'
     | 'listAgents'
     | 'listRounds'
     | 'listChildWorkers'
@@ -99,6 +103,19 @@ export function jobStopResidue(outcome: JobStopOutcome): readonly string[] {
   ];
 }
 
+/** The owner-facing notice for an unproven stop. Pure and exported so the
+ * incident title/detail can be asserted, and so the residue text an owner
+ * reads is the same text the durable event records. */
+export function jobStopUnprovenNotice(outcome: JobStopOutcome): { readonly title: string; readonly detail: string } {
+  return {
+    title: `Parked job ${outcome.jobId}: producer stop is unproven`,
+    detail:
+      `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
+      'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
+      'Where nothing is running for the lane, resuming or closing the job lifts the hold; this notice settles on the next stop reconcile at boot.',
+  };
+}
+
 /**
  * Physical producer stop for an explicit owner hold (issue #455).
  *
@@ -113,6 +130,11 @@ export function jobStopResidue(outcome: JobStopOutcome): readonly string[] {
  * The durable `job.execution-stop` event is written twice: `requested`
  * before any effect (so a crash mid-stop leaves honest intent), then the
  * final verdict. A caller may retry; only an in-flight pass is joined.
+ *
+ * A `stopped` verdict needs every live target proven AND at least one
+ * proven target: an empty registry (nothing spawned, nothing left after a
+ * restart, everything already disposed) is not evidence of cessation, and
+ * a vacuous review confirmation proves nothing (#562).
  */
 export class JobExecutionStop {
   private readonly inFlight = new Map<string, Promise<JobStopOutcome>>();
@@ -143,12 +165,15 @@ export class JobExecutionStop {
     let passes = 0;
     for (const job of this.deps.ledger.listJobs()) {
       const latest = this.deps.ledger.latestJobEvent(job.id, 'job.execution-stop');
+      const hasEvent = latest !== null;
       const state = (latest?.payload as { readonly state?: unknown } | null)?.state;
-      if (state !== 'requested' && state !== 'unproven') continue;
+      if (hasEvent && state !== 'requested' && state !== 'unproven') continue;
       if (job.status !== 'parked') {
         // The hold was lifted (or the job moved on): no stop pass will run
-        // again, so the open owner incident is settled here.
-        this.deps.notifyResolved?.(job.id);
+        // again, so the open owner incident is settled here. Without any
+        // stop event there is nothing to settle — and no write, so boot
+        // does not open a transaction for every historical lane.
+        if (hasEvent) this.deps.notifyResolved?.(job.id);
         continue;
       }
       passes += 1;
@@ -177,7 +202,12 @@ export class JobExecutionStop {
     const job = ledger.getJob(input.jobId);
     if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
 
-    ledger.appendCustomEvent({
+    // Captured before this pass writes its own intent: a lane with no
+    // `job.execution-stop` history at all was parked before stop events
+    // existed, so an empty registry says nothing about its producers.
+    const priorStopEvent = ledger.latestJobEvent(input.jobId, 'job.execution-stop');
+    const legacy = priorStopEvent === null;
+    const requested = ledger.appendCustomEvent({
       kind: 'job.execution-stop',
       jobId: input.jobId,
       payload: { state: 'requested', by: input.by, reason: input.reason, job_status: job.status },
@@ -288,6 +318,37 @@ export class JobExecutionStop {
         : { state: 'skipped', roundIds: [], detail: 'no review service is wired and no live round is recorded' };
     }
 
+    // Review evidence proves a stop only when it proves something: a
+    // genuine round supersession (already proven terminal by
+    // `supersedeReviews`) or the job-level receipt for a fallback gate
+    // written after the current hold began. `fence` is therefore the CURRENT
+    // HOLD's start — the later of the `job.status` park that opened the hold
+    // and the lane's prior stop event — so a receipt written after that park
+    // proves review cessation for THIS hold, including one an interrupted
+    // pass of this same hold wrote before it died (the boot re-proof honours
+    // it: the hold did not change, so neither does the fence). A receipt
+    // written before the hold (the writer gate, an accepted material
+    // amendment) proves nothing about it and can never prove a stop it has
+    // nothing to do with. Only a lane with no park event at all — legacy —
+    // falls back to this pass's own `requested` write, the only fence such a
+    // lane has. The vacuous `confirmed: true` a lane with no review
+    // operation gets back is evidence of nothing, so it can neither prove a
+    // stop nor count as a target.
+    const parkedAt = ledger
+      .listJobEventsByKinds(input.jobId, ['job.status']) // newest first, so `.find` is the latest park
+      .find((event) => (event.payload as { readonly to?: unknown } | null)?.to === 'parked');
+    const fence = parkedAt !== undefined
+      ? Math.max(priorStopEvent?.seq ?? 0, parkedAt.seq)
+      : (priorStopEvent?.seq ?? requested.seq);
+    const reviewProven =
+      reviews.state === 'stopped' &&
+      (reviews.roundIds.length > 0 ||
+        (ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0) > fence);
+    const provenTargets =
+      agents.filter((agent) => agent.state === 'stopped').length +
+      children.filter((child) => child.state === 'stopped').length +
+      (reviewProven ? 1 : 0);
+
     // A pre-existing verification cannot be interrupted through the
     // scheduler's per-job surface; an in-flight admission is pre-spawn
     // work this pass does not own. Both are named, never hidden behind a
@@ -301,13 +362,24 @@ export class JobExecutionStop {
       outstanding.push(`in-flight producer admission(s) remain: ${admissions.join(', ')}`);
     }
 
-    const state: JobStopTargetState =
+    // A vacuous review `stopped` (no rounds, no job-level receipt) is "no
+    // review target": it is neither proof nor residue. A failed/unknown
+    // review stays residue.
+    const noResidue =
       agents.every((agent) => agent.state === 'stopped') &&
       children.every((child) => child.state === 'stopped') &&
-      (reviews.state === 'stopped' || reviews.state === 'skipped') &&
-      outstanding.length === 0
-        ? 'stopped'
-        : 'unproven';
+      reviews.state !== 'unproven' &&
+      outstanding.length === 0;
+    // With no proven target, the residue channel carries the reason to the
+    // owner notice and `jobStopResidue()`: the pass cannot settle on absence.
+    if (noResidue && provenTargets === 0) {
+      outstanding.push(
+        legacy
+          ? 'parked before stop events existed; registry absence is not evidence'
+          : 'no stop target exists — registry absence is not evidence of cessation',
+      );
+    }
+    const state: JobStopTargetState = noResidue && provenTargets > 0 ? 'stopped' : 'unproven';
     const current = ledger.getJob(input.jobId);
     const superseded = current === null || current.status !== 'parked';
 
