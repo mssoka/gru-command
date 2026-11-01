@@ -321,18 +321,25 @@ export class JobExecutionStop {
     // Review evidence proves a stop only when it proves something: a
     // genuine round supersession (already proven terminal by
     // `supersedeReviews`) or the job-level receipt for a fallback gate
-    // written after the start of THIS hold. `fence` is the newest of the
-    // lane's prior stop event, the `job.status` park that opened the current
-    // hold, and this pass's own `requested` write, so a receipt from an
-    // earlier supersession (the writer gate, an accepted material amendment)
-    // can never prove a stop it has nothing to do with. The vacuous
-    // `confirmed: true` a lane with no review operation gets back is
-    // evidence of nothing, so it can neither prove a stop nor count as a
-    // target.
+    // written after the current hold began. `fence` is therefore the CURRENT
+    // HOLD's start — the later of the `job.status` park that opened the hold
+    // and the lane's prior stop event — so a receipt written after that park
+    // proves review cessation for THIS hold, including one an interrupted
+    // pass of this same hold wrote before it died (the boot re-proof honours
+    // it: the hold did not change, so neither does the fence). A receipt
+    // written before the hold (the writer gate, an accepted material
+    // amendment) proves nothing about it and can never prove a stop it has
+    // nothing to do with. Only a lane with no park event at all — legacy —
+    // falls back to this pass's own `requested` write, the only fence such a
+    // lane has. The vacuous `confirmed: true` a lane with no review
+    // operation gets back is evidence of nothing, so it can neither prove a
+    // stop nor count as a target.
     const parkedAt = ledger
       .listJobEventsByKinds(input.jobId, ['job.status']) // newest first, so `.find` is the latest park
       .find((event) => (event.payload as { readonly to?: unknown } | null)?.to === 'parked');
-    const fence = Math.max(priorStopEvent?.seq ?? 0, parkedAt?.seq ?? 0, requested.seq);
+    const fence = parkedAt !== undefined
+      ? Math.max(priorStopEvent?.seq ?? 0, parkedAt.seq)
+      : (priorStopEvent?.seq ?? requested.seq);
     const reviewProven =
       reviews.state === 'stopped' &&
       (reviews.roundIds.length > 0 ||

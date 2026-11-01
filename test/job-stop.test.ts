@@ -62,6 +62,9 @@ function fixture(opts: {
   readonly reviews?: JobStopDeps['reviews'];
   readonly notifyUnproven?: JobStopDeps['notifyUnproven'];
   readonly notifyResolved?: JobStopDeps['notifyResolved'];
+  /** Runs after the lane is working and BEFORE the park that opens the
+   * hold, so a test can seed events that genuinely predate the hold. */
+  readonly beforePark?: (ledger: LedgerApi) => void;
 } = {}): Fixture {
   const dir = mkdtempSync(join(tmpdir(), 'gru-job-stop-'));
   dirs.push(dir);
@@ -69,6 +72,7 @@ function fixture(opts: {
   const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
   ledger.addJob({ id: JOB, repo: 'gru-command', title: 'stop the producers', briefing: 'b' });
   ledger.setJobStatus(JOB, 'working');
+  opts.beforePark?.(ledger);
   ledger.setJobStatus(JOB, 'parked');
   for (const agent of opts.agents ?? []) {
     ledger.registerAgent({ id: agent.id, role: 'minion', jobId: JOB, parentage: 'top-level' });
@@ -496,14 +500,44 @@ describe('job execution stop (issue #455)', () => {
   // park that opened the hold and this pass's own `requested` write.
   it('ignores a review-supersession-confirmed written before the current hold', async () => {
     const f = fixture({
+      // Seeded BEFORE the park, so the receipt genuinely predates the hold.
+      beforePark: (ledger) => {
+        ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'writer', operations: 1 } });
+      },
       reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
     });
     try {
-      f.ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'writer', operations: 1 } });
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(outcome.state).toBe('unproven');
       expect(outcome.reviews.state).toBe('stopped');
       expect(outcome.outstanding).toContain('parked before stop events existed; registry absence is not evidence');
+    } finally {
+      f.close();
+    }
+  });
+
+  // The crash-mid-pass shape `perkins.ts` names ("A restart that interrupted
+  // the pass leaves exactly this shape"): the interrupted pass wrote its
+  // `requested`, superseded the fallback review and wrote the job-level
+  // receipt, then died before the verdict. The hold did not change, so the
+  // boot re-proof must honour that receipt — otherwise every retry writes a
+  // newer `requested` and the lane can never be proven while parked.
+  it('honours a review-supersession-confirmed the interrupted pass of this hold wrote', async () => {
+    const f = fixture({
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'requested', by: 'crash', reason: 'interrupted' } });
+      f.ledger.appendCustomEvent({ kind: 'job.review-supersession-confirmed', jobId: JOB, payload: { by: 'perkins', operations: 1 } });
+      const outcome = await f.stop.stop({
+        jobId: JOB,
+        by: 'service:boot',
+        reason: 're-proving an interrupted producer stop for a parked lane',
+      });
+      expect(outcome.state).toBe('stopped');
+      expect(outcome.reviews.state).toBe('stopped');
+      expect(outcome.outstanding).toEqual([]);
+      expect(eventStates(f.ledger)).toEqual(['requested', 'requested', 'stopped']);
     } finally {
       f.close();
     }

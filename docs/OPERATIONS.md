@@ -246,10 +246,12 @@ producer stopped, so the service answers the two facts separately.
   confirmed review supersession) **and at least one target was actually
   proven**. A review confirmation counts only when it proves something: a
   superseded round, or the job-level fallback receipt written after the
-  start of the current hold (the newest of the lane's `job.status` park,
-  its prior stop event and this pass's own `requested` write). A receipt
-  from an earlier supersession — the writer gate, an accepted material
-  amendment — proves nothing about this hold. The vacuous
+  start of the current hold (the later of the lane's newest `job.status`
+  park and its prior stop event; only a lane with no park event at all
+  fences against the pass's own `requested` write). A receipt written by an
+  interrupted pass of the same hold still proves it — the boot re-proof
+  honours it. A receipt from before the hold — the writer gate, an accepted
+  material amendment — proves nothing about it. The vacuous
   `confirmed: true` a lane with no review operation receives proves
   nothing and is neither a target nor a residue.
 - **Registry absence is not cessation.** An empty target set — nothing
