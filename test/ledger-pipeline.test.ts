@@ -560,6 +560,11 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     };
     writeRow('ord-target', 'ord-cycle', '["shared-scope"]');
     writeRow('ord-cycle', 'ord-target', '[]');
+    // A scope is HELD only once its holder is claiming or admitted (a waiting
+    // entry holds nothing), so claim it up front: every step below then has all
+    // four causes present except the ones already peeled, which is what makes a
+    // reordering mutant fail rather than just a missing-reason mutant.
+    ledger.claimPipelineEntry({ id: 'ord-holder', holder: 'silas' });
     const context = (): Parameters<typeof pipelineBlockingReason>[1] => ({
       entries: [holder, ...(ledger.listPipelineEntries() as readonly PipelineEntryRecord[])],
       jobStatusOf: () => null,
@@ -579,11 +584,8 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     //    prerequisite reason, still ahead of the exclusive scope.
     ledger.cancelPipelineEntry({ id: 'ord-cycle', reason: 'withdrawn' });
     expect(reason()).toBe('prerequisite ord-cycle cancelled');
-    // 4. all that is left is the scope the other entry holds. A scope is HELD
-    //    only once its holder is claiming or admitted (a waiting entry holds
-    //    nothing), so the holder is put into `admitting`.
+    // 4. all that is left is the scope the held entry owns.
     db.handle.prepare("UPDATE pipeline_entries SET prerequisites = '[]' WHERE id = 'ord-target'").run();
-    db.handle.prepare("UPDATE pipeline_entries SET state = 'admitting' WHERE id = 'ord-holder'").run();
     expect(reason()).toBe('exclusive scope "shared-scope" held by ord-holder');
     db.close();
   });
