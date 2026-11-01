@@ -471,8 +471,12 @@ describe('suite shape', () => {
     expect(workflow).toContain('run: npm run typecheck');
     expect(workflow).toContain('run: npm run build');
     expect(workflow).toContain('run: npx playwright test --ignore-snapshots --shard=');
-    // `main` is never cancelled: each landed commit gets its own verdict.
+    // `main` is never cancelled or collapsed: each landed commit gets its own
+    // verdict, so a push run's concurrency group carries the commit sha. Without
+    // it GitHub keeps only one queued run per ref and silently drops the rest —
+    // which is exactly what happened while landing the backlog.
     expect(workflow).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/u);
+    expect(workflow).toMatch(/group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}-\$\{\{ github\.event_name == 'push' && github\.sha \|\| 'pull' \}\}/u);
   });
 
   it('welds every shard matrix to the shard denominator it runs, with no gap and no duplicate', () => {

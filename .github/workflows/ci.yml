@@ -10,9 +10,12 @@ permissions:
 
 # A pushed head supersedes its own in-flight pull-request run: the merge train
 # re-bases constantly and a superseded run only burns runners. `main` is never
-# cancelled — every commit that lands there gets its own verdict.
+# cancelled or collapsed — every commit that lands there gets its own verdict,
+# which is why a PUSH takes the commit sha into its group. Sharing one group per
+# ref would let GitHub drop older *queued* runs during a merge train, silently
+# leaving landed commits unverified.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'pull' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # THE GATE, SHARDED.
