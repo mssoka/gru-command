@@ -1187,7 +1187,6 @@ pi-1-4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 # registry pins.
 pi-1-4-catalog = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/prune-stale-dist.test.ts test/review-build-identity.test.ts test/review-runtime-swap.test.ts test/unshare-review-hardlinks.test.ts test/suite-shape.test.ts"
 
-<<<<<<< HEAD
 # #534 argv credential redaction: a worktree process's command line reaches the
 # ledger, an event, a response and a card with its credentials masked, while the
 # raw line stays in memory. `-focused` runs the edited suites (the heavy files
@@ -1211,7 +1210,6 @@ gc-534-r1r2-red = "sh tools/gc-534-r1r2-red-baseline.sh"
 # (`recordsCommand`) to strict equality; the helper pin, the terminal readback and
 # the retirement-gate guard must fail by assertion (nonzero by design).
 gc-534-mutation = "sh tools/gc-534-binding-mutation.sh"
-=======
 # #513 blind coverage release: `gc-513-focused` is the new endpoint/readback
 # suite, the suites that must keep passing with their assertions unchanged
 # (heavy ones routed through the heavy config), the playbook wording, the
@@ -1224,7 +1222,6 @@ gc-534-mutation = "sh tools/gc-534-binding-mutation.sh"
 gc-513-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/blind-coverage-release.test.ts test/blind-input.test.ts test/blind-input-dispatch.test.ts test/blind-review.test.ts test/rebrief-recovery.test.ts test/provider-recovery-resume.test.ts test/workflow-runtime.test.ts test/workflow-session.test.ts test/intake-slicing.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npm run build && npx vitest run --config vitest.heavy.config.ts test/fix-directive.test.ts test/workflow-runtime-packaged.test.ts"
 gc-513-static = "npm run lint && npm run typecheck && npm run build"
 gc-513-red = "node gru-output/gc-513-blind-coverage-release/red.mjs"
->>>>>>> origin/main
 
 # #519 GitLab merge-request CI evidence. `gc-519-focused` runs the new freeze-path
 # suite (heavy: real git lanes), the binding and reader suites, and the edited
