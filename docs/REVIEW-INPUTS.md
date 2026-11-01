@@ -248,6 +248,20 @@ Authorization: Bearer <pairing token>
 }
 ```
 
+**Round-cap corrective amendment (owner ruling journal j-1200).** When a
+heist reaches the briefing-review round cap (three trailing CHANGES-NEEDED
+rounds), Gru records a push-back on the last reviewed text, dispatches that
+exact text without the `briefing_review` block, and appends one
+`effect: "material"` amendment through
+`POST /api/dispatch/amendment` that fixes that round's blocking findings. That
+amendment's `approval.reference` cites owner ruling journal j-1200. A round cap
+never escalates to the owner, except for a finding whose content says the
+owner's requested outcome cannot be met as stated: that finding cannot be
+repaired by an amendment without changing the owner's scope, so it takes the
+owner-escalation path and holds only the step it gates; a plain disagreement
+never escalates. This is the product's rule on every install, not a per-install
+choice.
+
 - `effect` is required (owner rule 1, 2026-10-08):
   - `"material"`: the approved change requires implementation. It raises the job's
     required work revision to this amendment's version, makes the delivered candidate
