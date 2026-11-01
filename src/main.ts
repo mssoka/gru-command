@@ -105,6 +105,7 @@ import type { VectorBoardView } from './vector/board.js';
 import { BriefingReviewService } from './briefing-review/service.js';
 import type { BriefingReviewBoardCounts } from './briefing-review/board.js';
 import { createVectorServer } from './vector/server.js';
+import { createOwnerApprovalService, withdrawUnhostedOwnerApprovals, type OwnerApprovalService } from './dispatch/owner-approvals.js';
 import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
 import { onboardingProbesDir } from './onboarding/proof.js';
 import { createOnboardingServer } from './onboarding/server.js';
@@ -1510,16 +1511,6 @@ async function main(): Promise<number> {
   // Automatic admission retries live in memory (owner decision 2026-10-08):
   // one pending when the service stopped escalates now instead of resuming.
   wave.escalateInterruptedAdmissionRetries();
-  // A crash between `requested` and the verdict, or a stop that could not be
-  // proven, is re-attempted once the review/child recovery seams are up.
-  void jobExecutionStop.reconcileOnBoot().then(
-    (passes) => {
-      if (passes > 0) logger.log('info', 'job execution stop boot re-proof', { passes });
-    },
-    (error: unknown) => {
-      logger.log('error', 'job execution stop boot re-proof failed', { error: String(error) });
-    },
-  );
   // Historical re-brief markers never authorize replay. Observe a bounded
   // page for genuine spent/terminal evidence or concrete Gru judgment;
   // DirectiveProgressService ticks fairly visit the remaining generations.
@@ -1756,6 +1747,24 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   briefingReviewBoardCounts = () => briefingReview.boardCounts();
+  // Owner approvals (#523): hosted where the abandon route is hosted (Silas
+  // ops), because both read the same worktrees and producer evidence. Gru
+  // proposes, the owner's Approve on the card carries out the abandonment.
+  const ownerApprovals: OwnerApprovalService | undefined = config.silas.enabled && silasSlot !== null
+    ? createOwnerApprovalService({
+        ledger,
+        notifications,
+        bus,
+        worktrees: worktreeManager,
+        workerGate: pacing.gate,
+        pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      })
+    : undefined;
+  // Not hosted (Silas ops off): an approval card an earlier boot left open
+  // would take the owner's Approve and nothing would carry it out. End what
+  // is open now, before any route can record a decision on it.
+  if (ownerApprovals === undefined) withdrawUnhostedOwnerApprovals({ ledger, log: (level, msg, fields) => logger.log(level, msg, fields) });
   const dispatchServer = createDispatchServer({
     config,
     intake,
@@ -1780,6 +1789,7 @@ async function main(): Promise<number> {
     closeout: canceledRequestCloseout,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     observeBlindTurn,
+    ...(ownerApprovals !== undefined ? { ownerApprovals } : {}),
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null
       ? {
@@ -1986,6 +1996,33 @@ async function main(): Promise<number> {
   // whose provider-wall row the hand-back resolves hydrates with a fresh
   // re-arm control rather than one bound to a resolved row.
   handBackThenStartSupervision(providerRecoverySensor, supervisorLive, (level, msg, fields) => logger.log(level, msg, fields));
+  // Issue #547: a turn a previous process left spawning/streaming has no
+  // handle here and no further events, yet every live-work fence counts it as
+  // an open worker turn. Once per boot, after the registry and supervision are
+  // up and the boot recoveries above (re-brief, child, directive) have read
+  // the ledger as they found it and started whatever they re-run, move each
+  // such row out of the live states and surface it as orphaned.
+  const hostAbsentTurns = supervisorLive.settleHostAbsentTurns();
+  if (hostAbsentTurns.examined > 0) {
+    logger.info('host-absent agent turns settled at boot', {
+      examined: hostAbsentTurns.examined,
+      live: hostAbsentTurns.live,
+      settled: hostAbsentTurns.settled.length,
+      failed: hostAbsentTurns.failed.length,
+    });
+  }
+  // A crash between `requested` and the verdict, or a stop that could not be
+  // proven, is re-attempted once the review/child recovery seams are up. It
+  // runs after the settlement above so its verdict reads a ghost turn as the
+  // settled row it is, whichever parked job it visits first.
+  void jobExecutionStop.reconcileOnBoot().then(
+    (passes) => {
+      if (passes > 0) logger.log('info', 'job execution stop boot re-proof', { passes });
+    },
+    (error: unknown) => {
+      logger.log('error', 'job execution stop boot re-proof failed', { error: String(error) });
+    },
+  );
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);
@@ -2035,6 +2072,12 @@ async function main(): Promise<number> {
   // for shutdown first, so a stop during a scan aborts its origin probes.
   state.onboarding = onboarding;
   startOnboarding(onboarding, (level, msg, fields) => logger.log(level, msg, fields));
+  // Owner approvals (#523) follow the owner's decisions and finish what a
+  // crash left half done; registered for shutdown before starting.
+  if (ownerApprovals !== undefined) {
+    state.ownerApprovals = ownerApprovals;
+    ownerApprovals.start();
+  }
   // Lane slimming (#427) runs off the boot path and is never fatal.
   state.laneSlimmer = laneSlimmer;
   startLaneSlimmer(laneSlimmer, (level, msg, fields) => logger.log(level, msg, fields));

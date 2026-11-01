@@ -153,6 +153,7 @@ const PINS: Record<string, number> = {
   'assert-binned-baseline.test.ts': 3,
   'classify-baseline.test.ts': 32,
   'assert-merge-authority-baseline.test.ts': 8,
+  'assert-stale-row-red.test.ts': 8,
   'assert-notification-card-baseline.test.ts': 8,
   'assert-perkins-integration-review-baseline.test.ts': 11,
   'assert-repo-overview-baseline.test.ts': 4,
@@ -164,8 +165,10 @@ const PINS: Record<string, number> = {
   'onboarding-service.test.ts': 29,
   'onboarding-real-service.test.ts': 1,
   'onboarding-proof.test.ts': 147,
-  'redaction.test.ts': 14,
+  'redaction.test.ts': 17,
   'owner-actions.test.ts': 28,
+  'owner-approvals.test.ts': 47,
+  'owner-approval-text.test.ts': 5,
   'property-dist-catalog.test.ts': 3,
   'property-report-cli.test.ts': 6,
   'property-resolve.test.ts': 22,
@@ -194,11 +197,12 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
-  'briefing-review.test.ts': 26,
+  'briefing-review.test.ts': 32,
   'briefing-review-board.test.ts': 4,
   'briefing-review-server.test.ts': 6,
-  'blind-input-dispatch.test.ts': 27,
-  'blind-input.test.ts': 34,
+  'blind-coverage-release.test.ts': 15,
+  'blind-input-dispatch.test.ts': 28,
+  'blind-input.test.ts': 63,
   'blind-observer-service.test.ts': 2,
   'blind-review.test.ts': 18,
   'bmad-legacy-retirement.test.ts': 5,
@@ -230,8 +234,8 @@ const PINS: Record<string, number> = {
   'config-env.test.ts': 25,
   'config-generate.test.ts': 27,
   'config.test.ts': 89,
-  'creation-continuation-custody.test.ts': 40,
-  'creation-continuation.test.ts': 16,
+  'creation-continuation-custody.test.ts': 42,
+  'creation-continuation.test.ts': 18,
   'decisions-backtest.test.ts': 20,
   'decisions-cli.test.ts': 8,
   'decisions-deadline.test.ts': 28,
@@ -244,12 +248,14 @@ const PINS: Record<string, number> = {
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 80,
   'docs-contracts.test.ts': 6,
+  'directive-own-run-fence.test.ts': 11,
   'directive-producer-inspection.test.ts': 2,
-  'directive-retirement.test.ts': 110,
+  'directive-retirement.test.ts': 117,
   'directive-pi-1x-entries.test.ts': 32,
   'directive-retry-history.test.ts': 41,
   'directive-transcript-bounds.test.ts': 35,
   'fix-directive.test.ts': 60,
+  'ghost-agent-boot.test.ts': 5,
   'github-poll.test.ts': 45,
   'gitlab-mr-read.test.ts': 27,
   'gru-cli.test.ts': 12,
@@ -274,9 +280,10 @@ const PINS: Record<string, number> = {
   'lane-provenance.test.ts': 22,
   'cleanup-repair.test.ts': 41,
   'disk-budget.test.ts': 39,
-  'ledger-api.test.ts': 102,
-  'ledger-pipeline.test.ts': 22,
-  'ledger-db.test.ts': 13,
+  'ledger-api.test.ts': 104,
+  'ledger-api-records-command.test.ts': 1,
+  'ledger-pipeline.test.ts': 25,
+  'ledger-db.test.ts': 15,
   'ledger-job-parent.test.ts': 5,
   'lessons-bible.test.ts': 109,
   'line-safe.test.ts': 2,
@@ -293,7 +300,7 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 8,
   'managed-repositories-runtime.test.ts': 4,
   'native-tools-parity.test.ts': 2,
-  'notification-decisions.test.ts': 28,
+  'notification-decisions.test.ts': 29,
   'notifications.test.ts': 20,
   'pacing-admission.test.ts': 14,
   'pacing.test.ts': 40,
@@ -313,7 +320,7 @@ const PINS: Record<string, number> = {
   'perkins-review-convergence.test.ts': 59,
   'perkins-review-symlinks.test.ts': 16,
   'phase-handoffs.test.ts': 14,
-  'pipeline-server.test.ts': 12,
+  'pipeline-server.test.ts': 14,
   'report-jobs-backfill.test.ts': 17,
   'pipeline-service.test.ts': 31,
   'pi-adapter.test.ts': 299,
@@ -327,8 +334,8 @@ const PINS: Record<string, number> = {
   'provider-recovery-metadata.test.ts': 24,
   'provider-recovery-resume.test.ts': 30,
   'provider-recovery-seam.test.ts': 17,
-  'provider-recovery-sensor.test.ts': 92,
-  'restart-recovery-progress.test.ts': 235,
+  'provider-recovery-sensor.test.ts': 106,
+  'restart-recovery-progress.test.ts': 237,
   'restart-recovery-schema.test.ts': 4,
   'rebrief-recovery.test.ts': 100,
   'repo-overview.test.ts': 97,
@@ -341,7 +348,7 @@ const PINS: Record<string, number> = {
   'runtime-disposal-aggregation.test.ts': 12,
   'review-build-identity.test.ts': 9,
   'review-model-identity.test.ts': 2,
-  'review-git-environment.test.ts': 98,
+  'review-git-environment.test.ts': 100,
   'review-ci-evidence.test.ts': 37,
   'review-directory-entries.test.ts': 3,
   'review-evidence-intake.test.ts': 11,
@@ -357,7 +364,7 @@ const PINS: Record<string, number> = {
   'review-path.test.ts': 26,
   'roles-definitions.test.ts': 18,
   'roles-installed-playbook.test.ts': 7,
-  'roles-gru.test.ts': 7,
+  'roles-gru.test.ts': 10,
   'roll-cli.test.ts': 28,
   'roll-controller.test.ts': 14,
   'roll-e2e.test.ts': 1,
@@ -371,7 +378,7 @@ const PINS: Record<string, number> = {
   'runtime-positive-cessation-ownership.test.ts': 6,
   'runtime-spawn-registration.test.ts': 17,
   'service-port-guard.test.ts': 14,
-  'service-shutdown.test.ts': 15,
+  'service-shutdown.test.ts': 16,
   'silas-deterministic-seam.test.ts': 3,
   'session-store.test.ts': 85,
   'shutdown.test.ts': 8,
@@ -391,8 +398,8 @@ const PINS: Record<string, number> = {
   'specialist-dispose-bounded.test.ts': 2,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 6,
-  'supervisor.test.ts': 243,
+  'suite-shape.test.ts': 7,
+  'supervisor.test.ts': 259,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 19,
   'uploads-dir.test.ts': 6,
@@ -402,8 +409,10 @@ const PINS: Record<string, number> = {
   'verdict-publication-identity.test.ts': 18,
   'verification-build-reuse.test.ts': 32,
   'verification-evidence.test.ts': 13,
-  'verification-scheduler.test.ts': 58,
-  'verification-server.test.ts': 50,
+  'verification-scheduler.test.ts': 62,
+  'verification-server.test.ts': 59,
+  'verification-retention-store.test.ts': 7,
+  'verification-retention.test.ts': 7,
   'verify-perkins-resource.test.ts': 3,
   'wake-e2e.test.ts': 4,
   'wake-policy.test.ts': 24,
@@ -411,7 +420,7 @@ const PINS: Record<string, number> = {
   'wizard-register.test.ts': 2,
   'wizard.test.ts': 37,
   'worktree-handoff-layouts.test.ts': 20,
-  'worktree-manager.test.ts': 94,
+  'worktree-manager.test.ts': 103,
   'worktree-manifest.test.ts': 16,
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 9,
@@ -419,9 +428,10 @@ const PINS: Record<string, number> = {
   'assert-formal-verdicts-baseline.test.ts': 5,
   'publication-evidence.test.ts': 13,
   'board-runtime-truth.test.ts': 14,
-  'child-workers.test.ts': 36,
+  'child-workers.test.ts': 37,
   'creation-intent.test.ts': 5,
   'directive-markers.test.ts': 15,
+  'directive-recovery-attention.test.ts': 14,
   'escalation-identity.test.ts': 7,
   'dispatch-review-inputs.test.ts': 4,
   'durable-reconcile.test.ts': 15,
@@ -434,12 +444,12 @@ const PINS: Record<string, number> = {
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 10,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 47,
+  'verification-capture.test.ts': 53,
 
 };
 
 describe('suite shape', () => {
-  it('runs the full PR gate on the default merge-result checkout', () => {
+  it('runs every gate phase on the default merge-result checkout', () => {
     const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
     // The gate still runs on the default merge-result checkout — checkout@v6
     // with the full history as its ONLY option (so no `ref:`/head-sha
@@ -449,7 +459,54 @@ describe('suite shape', () => {
     // checkout, which a shallow fetch leaves absent.
     expect(workflow).toMatch(/- uses: actions\/checkout@v6\n\s+with:\n\s+fetch-depth: 0\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
-    expect(workflow).toContain('run: npm test');
+    // `npm test` is the single definition of green and stays that way; CI runs
+    // each of its phases directly so the heavy, worker-capped phase can be
+    // spread over runners. Every phase is unconditional — no path filter, no
+    // label, no event-type branch — so a pull request and a push to main get
+    // identical coverage.
+    expect(workflow).toContain('run: npm run test:backend -- --shard=');
+    expect(workflow).toContain('run: npm run test:backend:heavy -- --shard=');
+    expect(workflow).toContain('run: npm run test:web');
+    expect(workflow).toContain('run: npm run lint');
+    expect(workflow).toContain('run: npm run typecheck');
+    expect(workflow).toContain('run: npm run build');
+    expect(workflow).toContain('run: npx playwright test --ignore-snapshots --shard=');
+    // `main` is never cancelled or collapsed: each landed commit gets its own
+    // verdict, so a push run's concurrency group carries the commit sha. Without
+    // it GitHub keeps only one queued run per ref and silently drops the rest —
+    // which is exactly what happened while landing the backlog.
+    expect(workflow).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/u);
+    expect(workflow).toMatch(/group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.ref \}\}-\$\{\{ github\.event_name == 'push' && github\.sha \|\| 'pull' \}\}/u);
+  });
+
+  it('welds every shard matrix to the shard denominator it runs, with no gap and no duplicate', () => {
+    // The shard count appears twice per phase — as the matrix, and as the
+    // `--shard=<index>/<count>` denominator — and a mismatch silently drops
+    // test files from the gate (the matrix runs 1..N while the denominator
+    // says M). Read both from the workflow, demand they agree, and demand the
+    // index set is exactly 1..N.
+    const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
+    const sharded = [
+      /npm run test:backend -- --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
+      /npm run test:backend:heavy -- --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
+      /npx playwright test --ignore-snapshots --shard=\$\{\{ matrix\.shard \}\}\/(\d+)/u,
+    ];
+    const matrices = [...workflow.matchAll(/shard: \[([0-9, ]+)\]/gu)]
+      .map((match) => (match[1] ?? '').split(',').map((value) => Number(value.trim())));
+    expect(matrices, 'one shard matrix per sharded phase').toHaveLength(sharded.length);
+    sharded.forEach((pattern, index) => {
+      const denominator = Number(pattern.exec(workflow)?.[1]);
+      const shards = matrices[index]!;
+      expect(denominator, 'the run command declares its denominator').toBe(shards.length);
+      expect(shards, 'the matrix tiles 1..N with no gap and no duplicate').toEqual(
+        Array.from({ length: shards.length }, (_unused, offset) => offset + 1),
+      );
+    });
+    // Nothing but the failure-artifact upload may be conditional: a gated shard
+    // is a silently skipped slice of the suite.
+    expect([...workflow.matchAll(/^ +if: (.*)$/gmu)].map((match) => match[1]!.trim())).toEqual([
+      "always() && (steps.browser-e2e.outcome == 'failure' || steps.browser-e2e.outcome == 'cancelled')",
+    ]);
   });
 
   it('the cockpit scopes replace the retired slim-strip ones', () => {

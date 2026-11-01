@@ -1,6 +1,7 @@
 import type { VectorService } from './vector/service.js';
 import type { VectorRaidRunner } from './vector/runner.js';
 import type { OnboardingService } from './onboarding/service.js';
+import type { OwnerApprovalService } from './dispatch/owner-approvals.js';
 import type { ReportLaneSlimmer } from './worktrees/slimming.js';
 import type { ExpiryService } from './maintenance/expiry.js';
 import type { RepoMoveReconciler } from './maintenance/repo-moves.js';
@@ -56,6 +57,8 @@ export interface ServiceShutdownState {
   vectorRaids?: Pick<VectorRaidRunner, 'stop'>;
   /** Onboarding (#427): its event follow-through and reconcile stop, and in-flight origin probes abort. */
   onboarding?: Pick<OnboardingService, 'stop'>;
+  /** Owner approvals (#523): its decision follow-through and reconcile stop. */
+  ownerApprovals?: Pick<OwnerApprovalService, 'stop'>;
   /** Lane slimming (#427): its event follow-through and reconcile stop,
    * and the shutdown waits for a slim pass that is running. */
   laneSlimmer?: Pick<ReportLaneSlimmer, 'stop'>;
@@ -263,6 +266,13 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           state.onboarding.stop();
         } catch (error) {
           logger.error('onboarding stop failed', { error: String(error) });
+        }
+      }
+      if (state.ownerApprovals !== undefined) {
+        try {
+          state.ownerApprovals.stop();
+        } catch (error) {
+          logger.error('owner approvals stop failed', { error: String(error) });
         }
       }
       if (state.laneSlimmer !== undefined) {

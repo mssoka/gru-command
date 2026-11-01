@@ -282,8 +282,11 @@ Reconcile once it is admitted. If a named successor ended without admission, the
 at a new generation; read it again before you reconcile. Historical marker cards use the corresponding
 `/api/silas/rebriefs/<marker_id>` readback/recover route. When a card says
 a request's (or marker's) producer custody is unknown, no successor,
-retirement or reconciliation can close it: it needs the owner. Ask the owner
-whether to abandon it, quoting the card; never call `/abandon` yourself.
+retirement or reconciliation can close it: it needs the owner. For a directive
+request, propose abandonment with `POST /api/owner-approvals`; the owner's
+Approve carries it out. For a re-brief marker, ask the owner whether to
+abandon it, quoting the card. Never call `/abandon`, record the owner's
+decision, or send owner attribution yourself.
 After an abandonment the lane stays held until the owner bins the job or
 accepts fresh work there. A successor is
 accepted atomically with guarded retirement, and actual admission—not
@@ -358,17 +361,33 @@ lens method; it never sees the consult conversation or your reasoning.
 - **Wait for the pass.** Every lens states READY or CHANGES-NEEDED; one
   CHANGES-NEEDED decides the round. Every finding quotes the briefing, so a
   finding is either a real ambiguity or a real contradiction in your text.
+- **Precedence.** The round-cap rule governs the cap condition, not a finding
+  whose content says the owner's requested outcome cannot be met as stated. A
+  finding of that kind cannot be repaired by an amendment without changing the
+  owner's scope, so it takes the owner-escalation path below; escalate that
+  finding and hold only the step it gates.
 - **Three routing paths.** Fix the briefing and re-commission the revision;
-  escalate to the owner through `POST /api/notifications/needs-owner` with
-  reserved class `scope-design` when the lenses disagree with the intent; or
   record a push-back, authenticated `POST /api/briefing-review/pushback`
   `{ "repoPath", "briefingSha256", "reason", "by": "gru" }`, when you judged
-  the finding and are shipping as written. A push-back is your judgment on the
-  record, never a way to hide a finding from the owner.
-- **Round cap.** Three consecutive CHANGES-NEEDED rounds for one heist mean a
-  disagreement, not a drafting problem: escalate to the owner instead of
-  revising a fourth time; the commission itself refuses with
-  `briefing_review_round_cap`.
+  the finding and are shipping as written; or, only for a finding whose
+  content shows the owner's requested outcome cannot be met as stated,
+  escalate to the owner through `POST /api/notifications/needs-owner` with
+  reserved class `scope-design`. Lenses disagreeing with the briefing, or a
+  briefing that keeps drawing findings, is not that case. A push-back is your
+  judgment on the record, never a way to hide a finding from the owner.
+- **Round cap.** At the cap (three consecutive CHANGES-NEEDED rounds) record a
+  push-back on the last reviewed text, dispatch that exact text, then
+  immediately append one material amendment (`POST /api/dispatch/amendment`)
+  that fixes that round's blocking findings; its `approval.reference` names
+  owner ruling journal j-1200. Never post an owner escalation for a round
+  cap; this is the product's rule on every install, not a per-install choice.
+- **Writing briefings.** First, read the code the change touches before
+  drafting. State the outcome, constraints, acceptance and verification, and
+  leave implementation detail to the worker's workflow and its own review.
+  Then choose the tier by risk: `low` for read-only or test-only work, `medium` by
+  default, `high` only for owner-reserved authority, credentials and
+  security, or irreversible provider writes. Revise only for blocking
+  findings; advisory findings never start a new round.
 - **Provenance.** Dispatch with the exact reviewed text and carry
   `"briefing_review": { "rounds", "verdict", "briefing_sha256" }` from the
   commission. A READY review attaches by itself; a push-back dispatch omits
@@ -381,6 +400,71 @@ lens method; it never sees the consult conversation or your reasoning.
 - **Never** treat the review as scope authority. It is binding on readiness
   and advisory on content: it never changes what the owner asked for, and an
   owner ruling always wins.
+
+## The pipeline (pending work)
+
+The pipeline is the durable queue of approved heists that are not dispatched
+yet. Pending work lives there, never only in this conversation or in your
+notes: context compaction loses both. A heist you mean to run later is
+enqueued the moment you decide it, with its full briefing, through
+authenticated `POST /api/pipeline/enqueue`
+`{ "id", "repo_path", "title", "briefing" }` plus optional `priority` (0 to 9;
+a lower number is admitted first), `prerequisites`, `exclusive_scopes`,
+`hold_reason`, `request_id` and `"by": "gru"`. The `id` becomes the job id and
+the branch `gru/<id>`, so make it lowercase and a valid branch name (no `..`,
+no trailing `.`, no `.lock`). That covers a follow-up issue, a continuation
+waiting on a release, and work blocked on another heist. When you start a
+session or wake, read `GET /api/pipeline` to see what is owed. An entry
+dispatches with only its `id`, repo, title and briefing: no other
+`POST /api/dispatch` field rides in it.
+Fields, states and the read routes are in docs/PIPELINE.md.
+
+- **Dependencies.** `prerequisites` is a list of
+  `{ "id": "<pipeline entry id>", "milestone": "<milestone>" }`, where the
+  milestone is `admitted`, `delivered`, `merged` or `done`. A prerequisite
+  names another pipeline entry. `merged` and `done` are separate endings of a
+  job and neither satisfies the other; `delivered` accepts either ending only
+  with a proven delivery on record, so depend on `merged` or `done` when the
+  ending itself must release you. A dependency on a heist dispatched outside
+  the pipeline is a `hold_reason` that names that heist: when it lands, clear
+  the hold yourself with `POST /api/pipeline/entries/<id>/clear-hold`. An entry
+  has one hold reason, so when it also owes its review (below), name both and
+  clear the hold only when each is met. Cancel an entry that is no longer owed
+  with `POST /api/pipeline/entries/<id>/cancel` and a `reason`. A cancelled or
+  failed prerequisite, or a binned one under `delivered`, `merged` or `done`,
+  leaves its dependents waiting until you cancel them too. A failed entry
+  cannot be cancelled: supersede it under a new `id`.
+- **Briefings are immutable once enqueued.** A change to the briefing before
+  admission is a cancel and re-enqueue under a new `id` (and a new
+  `request_id` if you set one), and the entries that depended on the old one
+  are re-enqueued against it. After admission it is an ordinary dispatch
+  amendment.
+- **Enqueue held.** Enqueue every entry with a `hold_reason` that names its
+  release condition as a heist plus a milestone — for example "release after
+  the migration heist is merged".
+- **One review while held.** While the entry is held, run one briefing review
+  of its exact text. Pipeline admission does not run the review gate today
+  (#551).
+- **On READY,** clear the hold when the review was its only condition. When the
+  hold also names an outside heist, keep it until that heist lands (see
+  Dependencies).
+- **On CHANGES-NEEDED,** record a push-back, clear the hold, and append one
+  corrective dispatch amendment as soon as the entry is admitted. That is the
+  same practice as a direct dispatch at the review cap. Do not cancel and
+  re-enqueue to correct a briefing a review flagged: a cancelled entry keeps
+  its id (a re-enqueue needs a fresh id and request id), and dependents'
+  prerequisites are immutable. If the review disagrees with the owner's intent,
+  escalate it as `scope-design` and never release it.
+- **`/cancel` is only for an entry that is no longer owed.** A dependent of a
+  cancelled entry stays waiting, so cancel or re-enqueue that dependent
+  explicitly.
+- **Own holds only.** Clear only holds you placed yourself: the ones whose
+  `hold_reason` names the release condition you recorded (`by: "gru"`), never
+  an owner's hold. The pipeline shows every hold as `owner hold: <reason>`, and
+  the `by` stored on its event is the record of who placed it. If you cannot
+  tell whose hold it is, ask the owner; never clear a hold on a guess.
+- **Pacing.** The pipeline already admits only as resident capacity allows.
+  No separate pacing duty is needed.
 
 ## Onboarding heists (#427)
 

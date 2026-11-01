@@ -226,7 +226,7 @@ describe('board client', () => {
       discussion: false,
     } as const;
 
-    await expect(client.decideNotification('decision-1', 'approve', expectedDecision)).rejects.toMatchObject({
+    await expect(client.decideNotification('decision-1', 'approve', expectedDecision, 'gru.owner-escalation')).rejects.toMatchObject({
       path: '/api/notifications/decision-1/decision',
       status: 409,
       code: 'decision_recorded',
@@ -240,6 +240,35 @@ describe('board client', () => {
         body: JSON.stringify({ optionId: 'approve', by: 'web', expectedDecision }),
       }),
     );
+  });
+
+  it('records the owner as the decider only for the owner-reserved abandonment card (#523)', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ error: 'decision_refused', code: 'decision_recorded', detail: 'recorded elsewhere' }),
+        { status: 409 },
+      ),
+    ) as unknown as typeof fetch;
+    client = new BoardClient(
+      { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+    const expectedDecision = {
+      question: 'Abandon directive request req-1 as outcome-unknown?',
+      context: 'Request req-1 on job job-1 (dispatching). Reason: custody unknown',
+      recommendation: null,
+      reservedClass: 'destructive',
+      whyNotDelegable: 'Abandonment is owner-reserved.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'Closes the request as outcome-unknown.' }],
+      discussion: false,
+    } as const;
+    for (const [id, kind] of [['abandon-1', 'owner-approval.directive-abandon'], ['escalation-1', 'gru.owner-escalation'],
+      ['prefixed-1', 'owner-approval.directive-abandon.other']] as const) {
+      await expect(client.decideNotification(id, 'approve', expectedDecision, kind)).rejects.toMatchObject({ status: 409 });
+    }
+    const bodies = vi.mocked(fetchImpl).mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { readonly by?: unknown });
+    // Exactly one kind is the owner's; a lookalike keeps the web actor.
+    expect(bodies.map((body) => body.by)).toEqual(['owner', 'web', 'web']);
   });
 
   it('posts an authenticated decision recheck and rejects malformed status replies', async () => {

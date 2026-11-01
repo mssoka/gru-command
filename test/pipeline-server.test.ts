@@ -1,11 +1,13 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi } from '../src/ledger/api.js';
+import { requireArtifactJobId } from '../src/artifacts/context.js';
+import { LedgerApi, requireSafeRecordId } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig } from '../src/config.js';
 import { PipelineService, type PipelineDispatchPort } from '../src/dispatch/pipeline.js';
@@ -253,6 +255,141 @@ describe('pipeline HTTP surface', () => {
     });
     // The live row keeps its honest current state.
     expect(h.ledger.getPipelineEntry('pipe-http-a')?.holdReason).toBe('owner deciding');
+  });
+
+  it('posts the enqueue fields docs/PIPELINE.md and roles/gru.md document, and the route reads every one', async () => {
+    const root = join(import.meta.dirname, '..');
+    const doc = readFileSync(join(root, 'docs', 'PIPELINE.md'), 'utf-8');
+    const table = doc.slice(doc.indexOf('### Enqueue'), doc.indexOf('### Reading'));
+    const documented = [...table.matchAll(/^\| `([a-z_]+)` \|/gmu)].map((match) => match[1]);
+    const documentedRequired = [...table.matchAll(/^\| `([a-z_]+)` \| yes \|/gmu)].map((match) => match[1]);
+    const body: Record<string, unknown> = {
+      id: 'doc-a',
+      repo_path: '/tmp/demo',
+      title: 'Documented entry',
+      briefing: 'Execute the documented entry',
+      request_id: 'doc-req',
+      priority: 2,
+      prerequisites: [{ id: 'doc-dep', milestone: 'done' }],
+      exclusive_scopes: ['doc-scope'],
+      hold_reason: 'doc hold',
+      by: 'gru',
+    };
+    // A field added to or dropped from the documented table fails here, so the
+    // body below always matches the doc.
+    expect([...documented].sort()).toEqual(Object.keys(body).sort());
+    // The Required column is the route's own: each required field is refused when
+    // missing, and the entry is accepted with only those.
+    expect([...documentedRequired].sort()).toEqual(['briefing', 'id', 'repo_path', 'title']);
+    // The role names the same fields (its sentence is what Gru copies).
+    const role = readFileSync(join(root, 'roles', 'gru.md'), 'utf-8').replace(/\s+/gu, ' ');
+    expect(role).toContain('`{ "id", "repo_path", "title", "briefing" }`');
+    for (const optional of ['priority', 'prerequisites', 'exclusive_scopes', 'hold_reason', 'request_id']) {
+      expect(role).toContain(`\`${optional}\``);
+    }
+    expect(role).toContain('`"by": "gru"`');
+
+    const h = await boot({ available: 0 });
+    const accepted = await api(h, 'POST', '/api/pipeline/enqueue', body);
+    expect(accepted.status).toBe(201);
+    expect(accepted.body).toMatchObject({ entryId: 'doc-a', requestId: 'doc-req', priority: 2, held: true, state: 'waiting' });
+    expect(h.ledger.getPipelineEntry('doc-a')).toMatchObject({
+      repoPath: '/tmp/demo',
+      title: 'Documented entry',
+      briefing: 'Execute the documented entry',
+      requestId: 'doc-req',
+      priority: 2,
+      prerequisites: [{ id: 'doc-dep', milestone: 'done' }],
+      exclusiveScopes: ['doc-scope'],
+      holdReason: 'doc hold',
+    });
+    // The documented readback shape: the stored record plus the live view.
+    const read = await api(h, 'GET', '/api/pipeline/entries/doc-a');
+    expect(Object.keys(read.body).sort()).toEqual(['entry', 'live_reason', 'live_state']);
+    expect(read.body.live_reason).toBe('owner hold: doc hold');
+    // `by` is recorded on the event of the call that carried it, enqueue and the three mutations.
+    const byOf = (kind: string): unknown => (h.ledger.latestEventOfKind(kind)?.payload as Record<string, unknown> | undefined)?.by;
+    expect(byOf('pipeline.enqueued')).toBe('gru');
+    await api(h, 'POST', '/api/pipeline/entries/doc-a/clear-hold', { reason: 'released', by: 'gru' });
+    expect(byOf('pipeline.hold-cleared')).toBe('gru');
+    await api(h, 'POST', '/api/pipeline/entries/doc-a/hold', { reason: 'held again', by: 'gru' });
+    expect(byOf('pipeline.held')).toBe('gru');
+    await api(h, 'POST', '/api/pipeline/entries/doc-a/cancel', { reason: 'withdrawn', by: 'gru' });
+    expect(byOf('pipeline.cancelled')).toBe('gru');
+    // Only the required fields are needed; dropping any one is a 400.
+    const minimal = { id: 'doc-min', repo_path: '/tmp/demo', title: 'Minimal', briefing: 'Execute the minimal entry' };
+    for (const field of Object.keys(minimal)) {
+      const { [field]: _dropped, ...without } = minimal as Record<string, string>;
+      const refused = await api(h, 'POST', '/api/pipeline/enqueue', without);
+      expect(refused.status, `without ${field}`).toBe(400);
+      expect(String(refused.body.detail), `without ${field}`).toContain(`${field} must be a non-empty string`);
+    }
+    expect((await api(h, 'POST', '/api/pipeline/enqueue', minimal)).status).toBe(201);
+  });
+
+  // A characterization test: these refusals already hold on the base, and the test pins
+  // what docs/PIPELINE.md says about them so a change to either side shows up.
+  it('answers the refusals docs/PIPELINE.md documents: unknown ids, self and cyclic prerequisites, request reuse, burned ids', async () => {
+    const h = await boot({ available: 0 });
+    // An unknown entry is a 404 on the read and a 400 on the three mutations.
+    expect((await api(h, 'GET', '/api/pipeline/entries/doc-ghost')).status).toBe(404);
+    for (const action of ['hold', 'clear-hold', 'cancel']) {
+      const refused = await api(h, 'POST', `/api/pipeline/entries/doc-ghost/${action}`, { reason: 'r' });
+      expect(refused.status, action).toBe(400);
+      expect(String(refused.body.detail), action).toContain('not found');
+    }
+    // A self prerequisite is a 400; a cycle is a 409.
+    const self = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-self', prerequisites: [{ id: 'doc-self', milestone: 'done' }] });
+    expect(self.status).toBe(400);
+    const first = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-x', prerequisites: [{ id: 'doc-y', milestone: 'done' }] });
+    expect(first.status).toBe(201);
+    const cyclic = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-y', prerequisites: [{ id: 'doc-x', milestone: 'done' }] });
+    expect(cyclic.status).toBe(409);
+    // A dependency on a job dispatched outside the pipeline is accepted and waits as
+    // "not enqueued", even after that job has finished.
+    h.ledger.addJob({ id: 'job-outside', repo: 'demo', title: 'Outside', briefing: 'dispatched directly' });
+    h.ledger.setJobStatus('job-outside', 'working');
+    h.ledger.setJobStatus('job-outside', 'done');
+    const outside = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-out', prerequisites: [{ id: 'job-outside', milestone: 'done' }] });
+    expect(outside.status).toBe(201);
+    const list = await api(h, 'GET', '/api/pipeline');
+    const outsideRow = (list.body.entries as Record<string, unknown>[]).find((row) => row.id === 'doc-out');
+    expect(outsideRow).toMatchObject({ state: 'waiting', reason: 'waiting for job-outside — not enqueued' });
+    // A correction under a new id but the old explicit request id is a 409, and a
+    // cancelled entry's id stays reserved.
+    await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-r1', request_id: 'doc-request' });
+    const reused = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-r2', request_id: 'doc-request' });
+    expect(reused.status).toBe(409);
+    expect((await api(h, 'POST', '/api/pipeline/entries/doc-r1/cancel', { reason: 'withdrawn' })).status).toBe(200);
+    const burned = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'doc-r1', request_id: 'doc-again' });
+    expect(burned.status).toBe(409);
+    // Enqueue accepts an uppercase id that admission refuses (docs/PIPELINE.md "Enqueue"
+    // and "Admission"): when one of the two rules changes, the doc and the role change with it.
+    const uppercase = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id: 'Fix-Login' });
+    expect(uppercase.status).toBe(201);
+    expect(h.ledger.getPipelineEntry('Fix-Login')?.id).toBe('Fix-Login');
+    expect(() => requireSafeRecordId('Fix-Login', 'pipeline entry id')).not.toThrow();
+    expect(() => requireArtifactJobId('Fix-Login')).toThrow();
+    expect(() => requireArtifactJobId('fix-login')).not.toThrow();
+    // The exact ids `.` and `..` are refused at enqueue (docs/PIPELINE.md "Enqueue").
+    for (const id of ['.', '..']) {
+      const refused = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id });
+      expect(refused.status, id).toBe(400);
+      expect(() => requireSafeRecordId(id, 'pipeline entry id'), id).toThrow();
+      expect(h.ledger.getPipelineEntry(id), id).toBeNull();
+    }
+    // Ids that pass both checks but that git refuses as the branch gru/<id> are accepted
+    // at enqueue and fail only when the lane is created (docs/PIPELINE.md "Enqueue"
+    // and "Admission").
+    for (const id of ['a..b', 'x.lock', 'x.']) {
+      const accepted = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, id });
+      expect(accepted.status, id).toBe(201);
+      expect(h.ledger.getPipelineEntry(id)?.id, id).toBe(id);
+      expect(() => requireSafeRecordId(id, 'pipeline entry id'), id).not.toThrow();
+      expect(() => requireArtifactJobId(id), id).not.toThrow();
+      expect(() => execFileSync('git', ['check-ref-format', '--branch', `gru/${id}`], { stdio: 'ignore' }), id).toThrow();
+    }
+    expect(() => execFileSync('git', ['check-ref-format', '--branch', 'gru/fix-login'], { stdio: 'ignore' })).not.toThrow();
   });
 
   it('answers 503 when the pipeline surface is not hosted', async () => {

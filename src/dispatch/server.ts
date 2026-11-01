@@ -102,6 +102,10 @@ export interface DispatchServerOptions {
   readonly childWorkers?: ChildWorkerService;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
+  /** Owner approvals (#523): the service behind /api/owner-approvals*, hosted
+   * where Silas ops are. The server authenticates; the service owns the rest.
+   * Absent = /api/owner-approvals* answers 503. */
+  readonly ownerApprovals?: { handle(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> };
   /** Durable pipeline queue surface (approved j-239/j-1064); absent =
    * /api/pipeline/* answers 503 (queue not hosted in this build). */
   readonly pipeline?: PipelineService;
@@ -550,6 +554,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
+    if (path === '/api/owner-approvals' || path.startsWith('/api/owner-approvals/')) {
+      if (!authed(req, res)) return true;
+      const approvals = options.ownerApprovals;
+      if (approvals === undefined) {
+        json(res, 503, { error: 'owner_approvals_not_hosted', detail: 'owner approvals are not hosted on this service' });
+        return true;
+      }
+      return approvals.handle(req, res, path);
+    }
     const property = /^\/api\/jobs\/([^/]+)\/property-campaigns(?:\/([^/]+)(?:\/(execute|repair|retain))?)?$/u.exec(path);
     if (property !== null) {
       if (!authed(req, res)) return true;
@@ -1376,6 +1389,46 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         return true;
       }
       json(res, 200, options.dispatch.blindCoverage(jobId) as unknown as Record<string, unknown>);
+      return true;
+    }
+    // Issue #513: the commissioner releases the same-target coverage a
+    // delivered blind report holds, so a corrected review can be commissioned.
+    // One audited event on the job and nothing else; every refusal is a named
+    // answer that writes no event.
+    const blindCoverageReleaseMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/blind-coverage\/release$/.exec(path);
+    if (req.method === 'POST' && blindCoverageReleaseMatch !== null) {
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(blindCoverageReleaseMatch[1] ?? '');
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch (error) {
+        json(res, 400, {
+          error: 'invalid_request',
+          detail: error instanceof Error ? error.message : String(error),
+          correction: 'Send a JSON object {"reason":"<1-500 characters>","by":"gru"}.',
+        });
+        return true;
+      }
+      try {
+        const released = options.dispatch.releaseBlindCoverage(jobId, { reason: body['reason'], by: body['by'] });
+        json(res, 200, {
+          job_id: jobId,
+          idempotent: released.idempotent,
+          event: { seq: released.event.seq, ts: released.event.ts, kind: released.event.kind, payload: released.event.payload },
+          coverage: released.coverage,
+        });
+      } catch (error) {
+        if (error instanceof BlindInputRefusal) {
+          json(res, error.status, { error: error.code, detail: error.message, correction: error.correction, ...error.details });
+          return true;
+        }
+        throw error;
+      }
       return true;
     }
     if (req.method === 'POST' && path === '/api/dispatch/blind-access') {
@@ -2603,7 +2656,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
       const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
-      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && path !== '/api/briefing-review' && !path.startsWith('/api/briefing-review/') && !isDisposition) {
+      const isOwnerApprovals = path === '/api/owner-approvals' || path.startsWith('/api/owner-approvals/');
+      if (!isProperty && !isOwnerApprovals && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && path !== '/api/briefing-review' && !path.startsWith('/api/briefing-review/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
