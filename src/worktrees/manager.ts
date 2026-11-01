@@ -675,6 +675,11 @@ export interface WorktreeManagerOptions {
   /** How long an exited job branch-creation Git child's pipes are still
    * read for their own close, the producer's settlement (default 10 min). */
   readonly creationCloseWindowMs?: number;
+  /** How long a branch-ref `git update-ref --stdin` child that has confirmed
+   * `commit` is waited on for its own close (default 30 s). Every other wait
+   * on that child — before the commit, and after each termination signal —
+   * stays 1 s. */
+  readonly committedRefCloseMs?: number;
   /** Fetch budget for origin base resolution (default 30 s) — a network
    * op degrades to the declared local fallback, it never hangs the lane. */
   readonly fetchTimeoutMs?: number;
@@ -3852,10 +3857,10 @@ export class WorktreeManager {
         };
       });
     };
-    const waitForStop = async (): Promise<boolean> => {
+    const waitForStop = async (timeoutMs: number): Promise<boolean> => {
       if (closed) return true;
       return new Promise<boolean>((done) => {
-        const timer = setTimeout(() => done(false), stopTimeoutMs);
+        const timer = setTimeout(() => done(false), timeoutMs);
         void stopped.then(() => { clearTimeout(timer); done(true); });
       });
     };
@@ -3900,16 +3905,20 @@ export class WorktreeManager {
     } finally {
       try { child.stdin.end(committed ? '' : 'abort\n'); }
       catch (error) { fail(transactionError(String(error))); }
-      if (!await waitForStop()) {
-        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} did not close within 1000ms`);
+      // A confirmed commit has already changed the ref; the child is then only
+      // finishing, and under load that can take longer than the abort path's
+      // second. Only this first wait gets the committed bound.
+      const closeBoundMs = committed ? this.opts.committedRefCloseMs ?? 30_000 : stopTimeoutMs;
+      if (!await waitForStop(closeBoundMs)) {
+        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} did not close within ${closeBoundMs}ms`);
         // Signal only the ChildProcess we spawned, never a group, discovered
         // PID or ref lock. An exited child may just have inherited pipes open.
         if (!exited && child.pid !== undefined) {
           try { child.kill('SIGTERM'); } catch (error) { fail(transactionError(String(error))); }
         }
-        if (!await waitForStop() && !exited && child.pid !== undefined) {
+        if (!await waitForStop(stopTimeoutMs) && !exited && child.pid !== undefined) {
           try { child.kill('SIGKILL'); } catch (error) { fail(transactionError(String(error))); }
-          await waitForStop();
+          await waitForStop(stopTimeoutMs);
         }
       }
       child.stdin.destroy();
