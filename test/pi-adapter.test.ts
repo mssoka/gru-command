@@ -7058,6 +7058,88 @@ it('P30 default pinned SDK parallel-safe read batch preserves exact accepted anc
   } finally { release(); await f.cleanup(); }
 });
 
+/** The directive turn's persisted native rows, for the SDK normal-form cases (#571). */
+function sdkNativeRows(file: string) {
+  return readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as {
+    message?: { role?: string; toolCallId?: string; isError?: boolean; content?: readonly { type?: string; text?: string }[] };
+  });
+}
+
+it('A1 a read with optional nulls and its batch sibling reach their effects', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCalls: [
+      { id: 'normalised-read', name: 'read', args: { path: 'brief.txt', offset: null, limit: null } },
+      { id: 'normalised-bash', name: 'bash', args: { command: 'echo ok', timeout: 60 } },
+    ] },
+    { deltas: ['both normalised calls completed'] },
+  ]);
+  try {
+    writeFileSync(join(f.scene.lane.path, 'brief.txt'), 'the brief the directive accepted');
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const results = sdkNativeRows(row.nativeTarget!.sessionFile).filter((entry) => entry.message?.role === 'toolResult');
+    expect(results.map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([
+      ['normalised-read', false], ['normalised-bash', false],
+    ]);
+    expect(results.find((entry) => entry.message?.toolCallId === 'normalised-read')?.message?.content)
+      .toEqual([{ type: 'text', text: 'the brief the directive accepted' }]);
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
+    expect(row.state).toBe('settled');
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true });
+  } finally { await f.cleanup(); }
+});
+
+it('A2 a coerced primitive reaches its directive effect', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'coerced-timeout', name: 'bash', args: { command: 'printf coerced > coerced-effect.txt', timeout: '60' } } },
+    { deltas: ['the coerced call completed'] },
+  ]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(readFileSync(join(f.scene.lane.path, 'coerced-effect.txt'), 'utf8')).toBe('coerced');
+    const results = sdkNativeRows(row.nativeTarget!.sessionFile).filter((entry) => entry.message?.role === 'toolResult');
+    expect(results.map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([['coerced-timeout', false]]);
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
+    expect(row.state).toBe('settled');
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity)).toMatchObject({ state: 'terminal', ok: true });
+  } finally { await f.cleanup(); }
+});
+
+it('A3 a rewrite committed before the adapter snapshot is still refused', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'rewritten-before-snapshot', name: 'bash', args: { command: 'printf approved > approved-effect.txt' } } },
+    { deltas: ['the rewritten call was refused'] },
+  ], (session) => {
+    const adapterHook = session.agent.beforeToolCall!;
+    // Installed AFTER the adapter's own hook, so it runs first: the rewrite is
+    // already committed to the validated args when the adapter snapshots them.
+    session.agent.beforeToolCall = async (input, signal) => {
+      if (input.toolCall.id === 'rewritten-before-snapshot') (input.args as { command: string }).command = 'printf unapproved > unapproved-effect.txt';
+      return adapterHook(input, signal);
+    };
+  });
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    expect(existsSync(join(f.scene.lane.path, 'unapproved-effect.txt'))).toBe(false);
+    expect(existsSync(join(f.scene.lane.path, 'approved-effect.txt'))).toBe(false);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row.state).toBe('admitted');
+    const results = sdkNativeRows(row.nativeTarget!.sessionFile).filter((entry) => entry.message?.role === 'toolResult');
+    expect(results.map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([['rewritten-before-snapshot', true]]);
+    expect(results[0]!.message?.content).toEqual([{ type: 'text', text: 'effective native tool arguments differ from the exact persisted intent' }]);
+    const journal = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { state: string; toolCallId?: string });
+    expect(journal.filter((receipt) => receipt.state === 'completed')).toEqual([]);
+    expect(journal.some((receipt) => receipt.state === 'guard-refused' && receipt.toolCallId === 'rewritten-before-snapshot')).toBe(true);
+  } finally { await f.cleanup(); }
+});
+
 /** A real SDK directive whose bash command fails (`exit 3`) settles like any
  * other: the failure is ordinary work, whatever the minion does next. */
 async function assertSdkFailedCommandIsOrdinary(turns: readonly StubTurn[], results: readonly (readonly [string, boolean])[]) {

@@ -324,7 +324,7 @@ const PINS: Record<string, number> = {
   'pipeline-server.test.ts': 14,
   'report-jobs-backfill.test.ts': 17,
   'pipeline-service.test.ts': 31,
-  'pi-adapter.test.ts': 299,
+  'pi-adapter.test.ts': 302,
   'pi-gemini-thinking-level.test.ts': 1,
   'pr-creation-policy.test.ts': 5,
   'prebootstrap-patch.test.ts': 46,
