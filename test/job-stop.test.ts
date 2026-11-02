@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus, type BusEvent } from '../src/events/bus.js';
 import {
   JobExecutionStop,
+  jobStopFailedNotice,
   jobStopResidue,
   jobStopUnprovenNotice,
   watchParkedJobs,
@@ -13,6 +14,7 @@ import {
 import { DispatchService } from '../src/dispatch/service.js';
 import { LedgerApi, type ChildWorkerRecord } from '../src/ledger/api.js';
 import { ownerAttentionFor } from '../src/notifications/attention.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -562,6 +564,30 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
+  // The failure path (#570 P0): the old title carried `job-<id>` and the
+  // boundary refused it, so the throw was swallowed and no card was ever
+  // written. The fixed plain title posts, and the id is evidence in detail.
+  it('posts the stop-failure notice through the owner boundary with the job id in detail', () => {
+    const f = fixture();
+    try {
+      const notifications = new NotificationCenter({ ledger: f.ledger, bus: new EventBus({}) });
+      const notice = jobStopFailedNotice(JOB, new Error('ledger unavailable'));
+      const { record } = notifications.openIncident({
+        kind: `job-stop-unproven:${JOB}`,
+        routing: 'needs-owner',
+        severity: 'error',
+        title: notice.title,
+        detail: notice.detail,
+        dedupe: 'active',
+      });
+      expect(record.title).toBe('A parked job could not be stopped');
+      expect(record.routing).toBe('needs-owner');
+      expect(record.detail).toContain(`Job ${JOB}: the stop pass failed: ledger unavailable`);
+    } finally {
+      f.close();
+    }
+  });
+
   // The owner notice is user-visible (AGENTS.md): the residue an owner reads
   // and the way out of the hold are pinned here, not only in `main.ts`.
   it('tells the owner what an unproven stop means and how the hold lifts', async () => {
@@ -569,9 +595,9 @@ describe('job execution stop (issue #455)', () => {
     try {
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(jobStopUnprovenNotice(outcome)).toEqual({
-        title: `Parked job ${JOB}: producer stop is unproven`,
+        title: 'A parked job could not be proven stopped',
         detail:
-          'The explicit owner hold is recorded, but the service cannot prove every producer stopped: parked before stop events existed; registry absence is not evidence. ' +
+          `Job ${JOB} is parked by your hold, but the service cannot prove everything it started has stopped: parked before stop events existed; registry absence is not evidence. ` +
           'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
           'Where nothing is running for the lane, resuming or closing the job lifts the hold; this notice settles on the next stop reconcile at boot.',
       });

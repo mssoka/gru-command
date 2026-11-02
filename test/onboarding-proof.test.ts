@@ -2402,11 +2402,12 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.runs.map((input) => [input.jobId, input.head])).toEqual([[other, H1]]);
     // A card for fixture-app is answered after the start.
     const card = h.notifications.post({
-      id: 'onboarding:fixture-app:1', kind: ONBOARDING_PROPOSAL_KIND, routing: 'needs-owner', severity: 'info', title: 'Onboard fixture-app',
+      id: 'onboarding:fixture-app:1', kind: ONBOARDING_PROPOSAL_KIND, routing: 'needs-owner', severity: 'info', title: 'Set up fixture-app for Gru Command',
       decision: {
-        question: 'Dispatch an onboarding heist for fixture-app?', context: 'A minion writes the manifest.', recommendation: 'Recommended.',
+        question: 'Set up fixture-app for Gru Command?', context: 'A minion writes the settings file.', recommendation: 'Recommended.',
+        ifNothing: 'If you do nothing, fixture-app keeps running without its settings file.',
         reservedClass: 'authority-cost', whyNotDelegable: 'It spends quota.',
-        options: [{ id: 'accept', label: 'Accept', consequence: 'Dispatched.' }, { id: 'decline', label: 'Decline', consequence: 'Recorded.' }],
+        options: [{ id: 'accept', label: 'Accept', consequence: 'Started.' }, { id: 'decline', label: 'Decline', consequence: 'Recorded.' }],
         discussion: false,
       },
     });

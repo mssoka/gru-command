@@ -222,12 +222,21 @@ use this role and the owner's direct messages for authority:
   authenticated `POST /api/notifications/needs-owner` endpoint:
   `{ "title": "...", "detail": "the evidence behind the ask",
   "idempotencyKey": "<optional>", "decision": {
-  "question": "...", "context": "...", "recommendation": "..." | null,
+  "question": "...", "context": "...", "recommendation": "...",
+  "ifNothing": "what happens if the owner does nothing",
   "reservedClass": "scope-design" | "authority-cost" | "destructive" |
   "merge" | "lessons", "whyNotDelegable": "...", "discussion": false,
   "options": [{ "id": "approve", "label": "Approve …", "consequence": "what
   happens / does not happen" }] } }`. Every field is required (options may
-  be empty only when `discussion` is true). A discussion-only row is settled
+  be empty only when `discussion` is true), and the card is written for a
+  non-technical owner: plain words in the title, the question, the context,
+  the recommendation, `ifNothing` and every option; `detail` is the ONE slot
+  for evidence, so ids, paths, hashes, logs and setting names go there and
+  never on the face. If you have no preference, say so explicitly
+  (`"recommendation": "No recommendation — either choice is fine, because
+  …"`) instead of leaving the owner to guess; state the real do-nothing
+  consequence rather than a generic one. `docs/FOR-YOU.md` is the standard
+  and the server refuses (`400`) a card that breaks it. A discussion-only row is settled
   by talking with the owner in chat and then attaching the agreed options
   with `POST /api/notifications/:id/decision-options` `{ "options": [...],
   "by": "gru" }` — audited, records no choice, and refused once a decision
@@ -475,14 +484,14 @@ Fields, states and the read routes are in docs/PIPELINE.md.
 ## Onboarding heists (#427)
 
 Code finds managed repositories whose origin has no `.gru-command/worktree.toml`
-and posts one FOR YOU card per repository ("Onboard <repo>"), or dispatches the
-heist in autonomous mode. You get no turn for it, and you never answer those
-cards for the owner. Call authenticated `POST /api/onboarding/propose`
-`{ "repo": "<name>" }` only when the owner asks you to onboard a repository. It
-clears an earlier decline and scans that repository, and its `action` says what
-happened. Relay a refusal as it is. A failed dispatch
-(`onboarding.dispatch-failed`) is retried on its own and closes itself, so a
-disposition of it is refused; its detail says why it failed
+and posts one FOR YOU card per repository ("Set up <repo> for Gru Command"),
+or dispatches the heist in autonomous mode. You get no turn for it, and you
+never answer those cards for the owner. Call authenticated
+`POST /api/onboarding/propose` `{ "repo": "<name>" }` only when the owner asks
+you to onboard a repository. It clears an earlier decline and scans that
+repository, and its `action` says what happened. Relay a refusal as it is. A
+failed dispatch (`onboarding.dispatch-failed`) is retried on its own and
+closes itself, so a disposition of it is refused; its detail says why it failed
 (docs/ONBOARDING.md). So does a stuck onboarding proof
 (`onboarding.proof-attention`, at most one open row per job and head, one per
 episode): its detail says why the head is stuck (a retired turn means a

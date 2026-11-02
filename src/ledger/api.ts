@@ -68,6 +68,7 @@ import {
   type NotificationDecision,
   type NotificationDecisionOption,
 } from './notification-decision.js';
+import { assertOwnerCardLanguage } from '../notifications/owner-language.js';
 import {
   canonicalIsoTimestamp,
   categoryKey,
@@ -6402,12 +6403,20 @@ export class LedgerApi {
 
   /** Replace an OPEN notification's detail (and, when given, title) in place — id, acknowledgement
    * and routing unchanged (a long-running incident refreshing its latest
-   * cause). A resolved or missing row is left as-is and returned (or null). */
+   * cause). A resolved or missing row is left as-is and returned (or null).
+   *
+   * A `needs-owner` row's replacement TITLE is owner-facing text, so it is
+   * checked here (issue #570): refreshing what the owner reads can never
+   * smuggle machine text onto the face. `detail` is the evidence slot and
+   * stays verbatim. */
   updateNotificationDetail(id: string, detail: string, title?: string): NotificationRecord | null {
     return this.transaction(() => {
       const current = this.getNotification(id);
       const nextTitle = title ?? current?.title;
       if (current === null || current.resolvedAt !== null || (current.detail === detail && current.title === nextTitle)) return current;
+      if (current.routing === 'needs-owner' && nextTitle !== undefined && nextTitle !== current.title) {
+        assertOwnerCardLanguage(current.kind, nextTitle, current.decision);
+      }
       this.db.prepare('UPDATE notifications SET detail = ?, title = ? WHERE id = ?').run(detail, nextTitle ?? current.title, id);
       this.appendEvent({ kind: 'notification.updated', agentId: current.agentId, payload: { id } });
       return this.getNotification(id);

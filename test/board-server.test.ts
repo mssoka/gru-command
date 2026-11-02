@@ -30,6 +30,23 @@ import { surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js'
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
+/** The typed owner escalation both HTTP and legacy-adoption cases post (#570). */
+function ownerMergeDecision() {
+  return {
+    question: 'Approve the external merge?',
+    context: 'The merge needs an owner-controlled integration route.',
+    recommendation: 'Approve it.',
+    ifNothing: 'If you do nothing, nothing merges and the pull request stays open.',
+    reservedClass: 'merge' as const,
+    whyNotDelegable: 'All merges remain owner-performed.',
+    options: [
+      { id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' },
+      { id: 'keep', label: 'Keep it parked', consequence: 'Nothing changes.' },
+    ],
+    discussion: false as const,
+  };
+}
+
 const cleanupDirs: string[] = [];
 afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
@@ -513,19 +530,13 @@ describe('board server — HTTP API', () => {
     for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }, { title: 'Owner call', detail: 'Approve external merge' }]) {
       expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
     }
+    // A complete typed decision whose face breaks the plain-language standard
+    // is a 400, not a stored card: the boundary refuses it before write (#570).
+    const breakerFace = { ...ownerMergeDecision(), question: 'Gru breaker is open; authorized re-arm required' };
+    expect((await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge', decision: breakerFace })))
+      .toMatchObject({ status: 400, body: { error: 'bad_request' } });
     const before = api.countPendingActionRequiredIncludingReceipts();
-    const decision = {
-      question: 'Approve the external merge?',
-      context: 'PR256 needs an owner-controlled integration route.',
-      recommendation: 'Approve it.',
-      reservedClass: 'merge',
-      whyNotDelegable: 'All merges remain owner-performed.',
-      options: [
-        { id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' },
-        { id: 'keep', label: 'Keep it parked', consequence: 'Nothing changes.' },
-      ],
-      discussion: false,
-    };
+    const decision = ownerMergeDecision();
     const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge', decision });
     expect(created).toMatchObject({
       status: 201,
@@ -610,15 +621,7 @@ describe('board server — HTTP API', () => {
     const path = '/api/notifications/needs-owner';
     const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
     const start = count();
-    const decision = {
-      question: 'Approve the external merge?',
-      context: 'The merge needs an owner-controlled integration route.',
-      recommendation: 'Approve it.',
-      reservedClass: 'merge',
-      whyNotDelegable: 'All merges remain owner-performed.',
-      options: [{ id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' }],
-      discussion: false,
-    };
+    const decision = ownerMergeDecision();
     const body = { title: 'Retry call', detail: 'Approve merge', idempotencyKey: 'esc-1', decision };
     const first = await postJson(port, path, 'board-test-token', body);
     const retry = await postJson(port, path, 'board-test-token', body);
@@ -654,15 +657,7 @@ describe('board server — HTTP API', () => {
   it('an identical replay onto a pre-upgrade bare owner row upgrades it in place; a closed legacy row is a typed conflict (#395)', async () => {
     const { api, port } = harness;
     const path = '/api/notifications/needs-owner';
-    const decision = {
-      question: 'Approve the external merge?',
-      context: 'The merge needs an owner-controlled integration route.',
-      recommendation: 'Approve it.',
-      reservedClass: 'merge',
-      whyNotDelegable: 'All merges remain owner-performed.',
-      options: [{ id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' }],
-      discussion: false,
-    };
+    const decision = ownerMergeDecision();
     // A row written before typed decisions were required: decision null.
     const legacy = (key: string) => api.recordNotification({
       id: `owner-escalation:${key}`, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error',
@@ -674,10 +669,10 @@ describe('board server — HTTP API', () => {
     const body = { title: 'Legacy call', detail: 'Approve merge', idempotencyKey: 'legacy-open', decision };
     const adopted = await postJson(port, path, 'board-test-token', body);
     expect(adopted).toMatchObject({ status: 200, body: { id: 'owner-escalation:legacy-open', decision: { question: 'Approve the external merge?' } } });
-    expect(api.getNotification('owner-escalation:legacy-open')?.decision?.options.map((option) => option.id)).toEqual(['approve']);
+    expect(api.getNotification('owner-escalation:legacy-open')?.decision?.options.map((option) => option.id)).toEqual(['approve', 'keep']);
     expect(count()).toBe(start); // the ONE existing item, never a second
     expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toMatchObject([
-      { payload: { id: 'owner-escalation:legacy-open', credential: 'shared-bearer', declaredActor: null, option_ids: ['approve'] } },
+      { payload: { id: 'owner-escalation:legacy-open', credential: 'shared-bearer', declaredActor: null, option_ids: ['approve', 'keep'] } },
     ]);
     // The adopted row now replays like any typed escalation.
     expect((await postJson(port, path, 'board-test-token', body)).status).toBe(200);
@@ -1464,8 +1459,8 @@ describe('board server — empty token config locks every door', () => {
         kind: 'port-squat',
         routing: 'needs-owner',
         severity: 'error',
-        title: 'Foreign process holds port 7665 (pid a1)',
-        detail: 'stop it, then restart the service',
+        title: 'Another program is using the port Gru Command needs',
+        detail: 'port 7665 is held by node (pid a1); stop it, then restart the service',
       });
       // Auth door on the notification endpoints too.
       const anon = await postJson(port, `/api/notifications/${row.id}/ack`, null, { by: 'web' });
@@ -2392,7 +2387,8 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         decision: {
           question: 'Which shape should the dashboard take?',
           context: 'The discussion has not converged on a concrete option.',
-          recommendation: null,
+          recommendation: 'No recommendation — either choice is fine, because the shapes differ only in layout.',
+          ifNothing: 'If you do nothing, the dashboard keeps its current layout.',
           reservedClass: 'scope-design',
           whyNotDelegable: 'It changes the agreed product scope.',
           options: [],
@@ -2457,9 +2453,10 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         title: 'Typed decision',
         detail: 'producer-authored options',
         decision: {
-          question: 'Q?',
-          context: 'C',
-          recommendation: null,
+          question: 'Which shape should the dashboard take?',
+          context: 'The two shapes differ only in layout.',
+          recommendation: 'Take the first shape.',
+          ifNothing: 'If you do nothing, the dashboard keeps its current layout.',
           reservedClass: 'scope-design',
           whyNotDelegable: 'W',
           options: [{ id: 'one', label: 'One', consequence: 'c' }],

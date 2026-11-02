@@ -1754,3 +1754,33 @@ gc-537-red = 'set -e; root="$PWD"; base=bbb2a1088eed37017803af8e5b3ae6c8ba3d4182
 gc-568-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/gitlab-poll.test.ts test/gitlab-mr-read.test.ts test/github-poll.test.ts test/review-ci-evidence.test.ts test/owner-actions.test.ts test/board-engine.test.ts test/silas-driver.test.ts test/silas-autopilot.test.ts test/silas-verification-debt.test.ts test/silas-deterministic-seam.test.ts test/prune-stale-dist.test.ts test/property-dist-catalog.test.ts test/docs-contracts.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts"
 gc-568-static = "npm run lint && npm run typecheck && npm run build"
 gc-568-red = "node gru-output/gc-568-gitlab-merged/red.mjs"
+
+# #570: FOR YOU cards are written for a non-technical owner. The write boundary
+# (`assertOwnerCardLanguage` in src/notifications/owner-language.ts) runs at
+# every write of owner-facing text — NotificationCenter.post/openIncident/
+# attachDecisionOptions/adoptLegacyDecision and the ledger's owner-detail
+# update — and refuses internal vocabulary (lane/heist/breaker/re-arm/quorum/
+# dispatch/gate), machine tokens (paths, hashes, `job-…`, `pid`, `refs/`,
+# `sha256`, config keys, `Error:`) and a card with no stated recommendation, no
+# "if you do nothing" line or no per-kind notice guidance. `detail` stays the
+# one evidence slot, never inspected and never promoted to the face; the wake
+# titles stop inheriting the machine card's title and the retrying/swallowing
+# producers fail forward to a fixed plain title. `gc-570-focused` runs the new
+# boundary suite, the notification/attention suites, every converted producer
+# suite, the web render suites and the suite/budget/docs pins; `gc-570-heavy`
+# is the sweep producer's real-worktree suite; `gc-570-static` is the lint +
+# typecheck + build gate plus the web compiler. `gc-570-red` overlays the FINAL
+# test/for-you-plain-language-boundary.test.ts (and the web card test's face
+# rule) on an isolated `git archive` of the branch base 5a4015d3 (node_modules
+# symlinked, approved RPC patch first): the base stores a card with internal
+# vocabulary or an identifier on its face, accepts a card with no do-nothing
+# line and no recommendation, and promotes a short owner detail to the face —
+# so every named case REDs by assertion, never by import. Both legs are
+# classified by tools/assert-for-you-plain-language-baseline.mjs, which exits 2
+# (FAILS-BEFORE CLAIM BROKEN) on a collection/setup/import failure, a missing
+# named case or a green one; the snapshot directory and the ignored pointer file
+# are preserved for inspection.
+gc-570-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/for-you-plain-language-boundary.test.ts test/notification-decisions.test.ts test/notifications.test.ts test/board-server.test.ts test/awareness.test.ts test/vector-raids.test.ts test/vector-raid-runner.test.ts test/onboarding-service.test.ts test/lane-provenance.test.ts test/owner-approvals.test.ts test/phase-handoffs.test.ts test/lessons-dream.test.ts test/intake-slicing.test.ts test/job-stop.test.ts test/decisions-shadow.test.ts test/supervisor.test.ts test/board-engine.test.ts test/roles-gru.test.ts test/docs-contracts.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/owner-band.test.ts src/lib/board-protocol.test.ts src/ui/board.test.ts src/ui/notification-card.test.ts src/ui/board-merged-attention.test.ts"
+gc-570-heavy = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/cleanup-repair.test.ts test/disk-budget.test.ts test/verdict-publication-identity.test.ts test/onboarding-proof.test.ts test/worktree-manager.test.ts"
+gc-570-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+gc-570-red = 'set -e; root="$PWD"; base=5a4015d38523462ecfb2df99b14e1a3913980d65; headrev=$(git rev-parse HEAD); prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc570-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/for-you-plain-language-boundary.test.ts "$d/test/for-you-plain-language-boundary.test.ts"; cp web/src/ui/notification-card.test.ts "$d/web/src/ui/notification-card.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "gc-570-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-570-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/boundary.json" test/for-you-plain-language-boundary.test.ts; a=$?; set -e; echo "gc-570-red boundary vitest exit=$a EXPECTED-NONZERO: the base stores a card with internal vocabulary, no do-nothing line and no recommendation"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a boundary case passed against the base"; exit 2; fi; node "$root/tools/assert-for-you-plain-language-baseline.mjs" gc-570-red "$d/boundary.json" boundary || exit 2; cp "$d/boundary.json" "$prep/gc-570-red.boundary.json"; cd "$d/web"; set +e; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/face.json" src/ui/notification-card.test.ts; b=$?; set -e; echo "gc-570-red face vitest exit=$b EXPECTED-NONZERO: the base promotes a short owner detail to the face"; if [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: the face rule passed against the base"; exit 2; fi; node "$root/tools/assert-for-you-plain-language-baseline.mjs" gc-570-red "$d/face.json" face || exit 2; cp "$d/face.json" "$prep/gc-570-red.face.json"; printf "gc-570-red base=%s head=%s dir=%s boundary=%s face=%s\n" "$base" "$headrev" "$d" "$prep/gc-570-red.boundary.json" "$prep/gc-570-red.face.json" > "$prep/gc-570-red.last-snapshot.txt"; echo "EXPECTED-NONZERO: the plain-language boundary and the face rule RED by assertion against the pre-change base"; exit 1'

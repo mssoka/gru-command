@@ -127,7 +127,9 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     expect(sliced.plan.unmapped).toEqual([]);
     expect(h.post).toHaveBeenCalledTimes(1);
     const card = h.post.mock.calls[0]![0] as { id: string; kind: string; routing: string; title: string; detail: string };
-    expect(card).toMatchObject({ id: `intake-slicing:${jobId}`, kind: INTAKE_SLICING_RESULT_KIND, routing: 'needs-owner', title: 'Sliced plan has 1 source conflict(s): cart' });
+    // The plain face (#570): the intake id is evidence, the first detail line.
+    expect(card).toMatchObject({ id: `intake-slicing:${jobId}`, kind: INTAKE_SLICING_RESULT_KIND, routing: 'needs-owner', title: 'A sliced plan has 1 source conflict(s) to settle' });
+    expect(card.detail.split('\n')[0]).toContain('Intake cart.');
     expect(card.detail.split('\n').slice(1, 3)).toEqual([
       '1 source conflict(s) and 2 other open question(s) block approval until a refinement settles them:',
       '- Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.',

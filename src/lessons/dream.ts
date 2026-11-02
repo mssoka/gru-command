@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { BibleLockReleaseError, checkPlan, describePlan, type ApplyReport, type BiblePlan, type BibleStore, type PlanReview } from './bible.js';
 import { DreamError, isLessonsSlug, ProposalError, type JournalEntry, type ProposedChapter } from './types.js';
+import { ownerNoticeWithFallback } from '../notifications/owner-language.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -750,10 +751,17 @@ export class LessonProposals {
           'a Reject writes nothing, so only that state finishes it'
         : `Restore each listed Book of Lessons file to its state before the update (plan.before in ${this.file}) ` +
           'or after it (plan.writes and plan.indexText; chapters in plan.retired deleted) — any mix of the two finishes it';
+    // Plain language (issue #570): this notice is posted from a path that
+    // swallows failures, so a refused title must never lose the stop — the
+    // fixed plain title is used instead and the refused text moves to
+    // `detail`, where evidence belongs.
     this.notifier.conflict({
       id: `lessons-proposal-conflict:${proposal.id}`,
-      title: `Your ${label} of the lesson proposal could not finish — ${detail.split(/[;(]/u)[0]!.trim()}`,
-      detail: `${detail}. Your ${label} is kept and nothing will be re-proposed. ${repair}, then press ${label} again to finish it.`,
+      ...ownerNoticeWithFallback(
+        LESSONS_PROPOSAL_CONFLICT_KIND,
+        `Your ${label} of the lesson proposal could not finish`,
+        `${detail}. Your ${label} is kept and nothing will be re-proposed. ${repair}, then press ${label} again to finish it.`,
+      ),
     });
     throw new ProposalError('conflict', `${detail}; your ${label} is kept — ${blocked === 'book' ? 'restore the book' : 'restore the dream state'}, then press ${label} again`);
   }

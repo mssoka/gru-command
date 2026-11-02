@@ -44,8 +44,17 @@ export interface NotificationDecision {
   readonly question: string;
   /** One or two sentences of context, in the producer's own words. */
   readonly context: string;
-  /** Gru's recommendation, when one exists. */
+  /** Gru's recommendation, or the explicit no-preference form
+   * (`OWNER_NO_RECOMMENDATION_PREFIX` in src/notifications/owner-language.ts).
+   * Required by the write boundary; null only survives on a row written by
+   * an older build. */
   readonly recommendation: string | null;
+  /** What happens if the owner does nothing (issue #570). Required by the
+   * write boundary — there is no automatic default, so a producer states the
+   * real consequence (OWNER_NOTHING_DEFAULT when nothing changes) — and
+   * optional when READING, so a pre-upgrade row still renders its controls
+   * with no invented line. */
+  readonly ifNothing?: string;
   /** Which reserved owner boundary this decision falls under. */
   readonly reservedClass: OwnerReservedClass;
   /** Why this cannot safely be decided by Silas/Gru. */
@@ -156,6 +165,9 @@ export function parseNotificationDecision(value: unknown): NotificationDecision 
   const question = boundedString(raw['question'], 'decision.question', 300);
   const context = boundedString(raw['context'], 'decision.context', 600, { allowNewlines: true });
   const recommendation = boundedOptionalString(raw['recommendation'], 'decision.recommendation', 300);
+  // Bounded like the recommendation; presence is the write boundary's rule
+  // (parser must keep reading legacy rows, which have no such field).
+  const ifNothing = boundedOptionalString(raw['ifNothing'], 'decision.ifNothing', 300);
   const reservedClass = raw['reservedClass'];
   if (typeof reservedClass !== 'string' || !(OWNER_RESERVED_CLASSES as readonly string[]).includes(reservedClass)) {
     throw new Error(
@@ -180,6 +192,7 @@ export function parseNotificationDecision(value: unknown): NotificationDecision 
     question,
     context,
     recommendation,
+    ...(ifNothing !== null ? { ifNothing } : {}),
     reservedClass: reservedClass as OwnerReservedClass,
     whyNotDelegable,
     options,

@@ -22,6 +22,7 @@ import { buildRaidCandidates, rankScore } from '../src/vector/candidates.js';
 import { VECTOR_EVENTS, VectorLedger, type RaidRecord } from '../src/vector/ledger.js';
 import { createVectorServer } from '../src/vector/server.js';
 import { FIX_PROPOSAL_KIND, RAID_CANDIDATES_KIND, RAID_LAUNCHED_KIND, RAID_PROPOSAL_KIND, startVectorHalves, VectorRefusal, VectorService } from '../src/vector/service.js';
+import { ownerDecisionFixture } from './helpers/owner-decision-fixture.js';
 
 /**
  * Vector's raids, planning half (#351 §1–2): config, the code-built
@@ -326,6 +327,20 @@ describe('planning and picks (#351 §2)', () => {
     expect(service.candidates().exclusions).toContainEqual({ repo: 'billing', packageDir: 'src/refunds', reason: 'a raid on it is queued or running' });
   });
 
+  it('a model-written reason with internal vocabulary still posts the card, with the reason in Details', () => {
+    const h = harness();
+    const service = h.service();
+    service.start();
+    // A reason is caller prose, so it can never make the owner's card
+    // unpostable (the reconcile would retry a refused card forever).
+    expect(() => service.pick({ picks: [pickRefunds('the lane beside the gate should be raided')], digest: null, requestedBy: 'gru' })).not.toThrow();
+    const [card] = h.rows(RAID_PROPOSAL_KIND);
+    expect(card).toBeDefined();
+    expect(card!.decision?.context).not.toContain('lane');
+    expect(card!.decision?.context).toContain('Gru’s reason and the target are in Details.');
+    expect(card!.detail).toContain('Gru\'s reason: the lane beside the gate should be raided');
+  });
+
   it('Decline is recorded and suppresses the target until its source identity changes', () => {
     const h = harness();
     const service = h.service();
@@ -356,8 +371,8 @@ describe('planning and picks (#351 §2)', () => {
 
   it('only a producer-withdrawable owner proposal can be withdrawn undecided; a decided one never is', () => {
     const h = harness();
-    const decision = { question: 'q?', context: 'c', recommendation: null, reservedClass: 'scope-design' as const, whyNotDelegable: 'w', options: [{ id: 'go', label: 'Go', consequence: 'c' }], discussion: false };
-    const escalation = h.notifications.post({ id: 'owner-esc', kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'info', title: 't', decision });
+    const decision = ownerDecisionFixture();
+    const escalation = h.notifications.post({ id: 'owner-esc', kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'info', title: 'Approve the slim contract?', decision });
     expect(() => h.ledger.withdrawOwnerProposal(escalation.id, 'stale')).toThrow(/not a producer-withdrawable owner proposal/u);
     expect(h.ledger.getNotification(escalation.id)?.resolvedAt).toBeNull();
     const service = h.service();

@@ -48,11 +48,12 @@ function ownerDecision(overrides: Partial<import('../lib/board-protocol.js').Not
     question: 'Approve the slim contract?',
     context: 'PR256 needs an owner-controlled integration route.',
     recommendation: 'Approve the slim contract.',
+    ifNothing: 'If you do nothing, nothing changes and the scope stays as it is.',
     reservedClass: 'scope-design',
     whyNotDelegable: 'It changes the agreed product scope.',
     options: [
-      { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the slim lane.' },
-      { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked.' },
+      { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru starts the slim plan.' },
+      { id: 'keep', label: 'Keep the current approach', consequence: 'Nothing changes; the work stays parked.' },
     ],
     discussion: false,
     ...overrides,
@@ -453,8 +454,15 @@ describe('board view resolved-notification rendering', () => {
     expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('1');
     const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
     expect(sections[0]?.querySelector('.board-notification__title')?.textContent).toContain('owner-stop');
-    // Owner notices carry their manual-step guidance and NO generic Ack.
-    expect(sections[0]?.querySelector('.board-notification__guidance')?.textContent).toContain('Stop the foreign process yourself');
+    // Owner notices carry their structured guidance (why / do-nothing / step)
+    // and NO generic Ack (#570).
+    const guidance = sections[0]?.querySelector('.board-notification__guidance')?.textContent ?? '';
+    expect(guidance).toContain('Why you’re seeing this: Another program is using the port');
+    // Rendered bare (#570): the stored line already opens with the phrase,
+    // so the full sentence appears once.
+    expect(guidance).toContain('If you do nothing, the app stays unable to use its port and this notice stays until the port is free.');
+    expect(guidance).not.toContain('If you do nothing: If you do nothing');
+    expect(guidance).toContain('What to do: Stop the program named in Details');
     expect(sections[0]?.querySelector('.board-notification__ack')).toBeNull();
     expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
     // The feed row's explicit receipt control remains.
@@ -3034,6 +3042,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Approve the slim contract?');
     expect(band.textContent).toContain('Gru recommends');
     expect(band.textContent).toContain('Why this needs you');
+    // The do-nothing line is a full sentence, never "If you do nothing: If you
+    // do nothing, …" (#570).
+    expect(band.querySelector('.board-notification__if-nothing')?.textContent).toBe(
+      'If you do nothing, nothing changes and the scope stays as it is.',
+    );
     button.click();
     const busy = band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!;
     // The submission state is re-rendered from BoardView (shared by both
@@ -4347,7 +4360,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       const client = stubClient();
       const view = new BoardView(() => {}, client);
       const machine = notification('closed-machine', { agentId: 'minion-closed' });
-      const owner = notification('owner-stop', { routing: 'needs-owner', agentId: 'minion-closed' });
+      const owner = notification('owner-stop', { routing: 'needs-owner', kind: 'port-squat', agentId: 'minion-closed' });
       view.render(snapshot({
         jobs: [baseJob({ id: 'closed', status, rounds: [] })],
         agents: [agent('minion-closed', { role: 'minion', jobId: 'closed' })],
@@ -5248,6 +5261,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
         question: 'Which plan should continue?',
         context: 'The discussion is being converted into a recordable choice.',
         recommendation: 'Review the current choices.',
+        ifNothing: 'If you do nothing, nothing is chosen and the plan stays as it is.',
         reservedClass: 'scope-design',
         whyNotDelegable: 'Only the owner may select the plan.',
         options: [],

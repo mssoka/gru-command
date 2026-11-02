@@ -200,9 +200,10 @@ export class IntakeSlicingService {
       kind: INTAKE_SLICING_RESULT_KIND,
       routing: 'needs-owner',
       severity: 'info',
-      title: conflicts.length > 0 ? `Sliced plan has ${conflicts.length} source conflict(s): ${result.intakeId}` : `Sliced plan ready for review: ${result.intakeId}`,
+      // Plain language (issue #570): the intake and request ids are evidence.
+      title: conflicts.length > 0 ? `A sliced plan has ${conflicts.length} source conflict(s) to settle` : 'A sliced plan is ready for your review',
       detail: [
-        `Planning minion ${jobId} sliced request ${result.previousRequestId ?? ''} into ${result.plan.heists.length} heist(s) as request ${result.requestId} (revision ${result.revisionId}).`,
+        `Intake ${result.intakeId}. Planning minion ${jobId} sliced request ${result.previousRequestId ?? ''} into ${result.plan.heists.length} heist(s) as request ${result.requestId} (revision ${result.revisionId}).`,
         open.length === 0 ? 'It has no open questions.' : `${conflicts.length} source conflict(s) and ${rest.length} other open question(s) block approval until a refinement settles them:`,
         ...listed.slice(0, 20).map((question) => `- ${question}`),
         ...(listed.length > 20 ? [`- …and ${listed.length - 20} more in the proposal.`] : []),

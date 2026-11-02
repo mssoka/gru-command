@@ -219,42 +219,58 @@ describe('owner-band row model', () => {
 });
 
 describe('owner-notice guidance — honest scope per kind, never parsed prose', () => {
+  /** Every notice kind states why, the do-nothing outcome and the manual step
+   * (issue #570) — a notice never carries one opaque sentence. */
+  const expectComplete = (kind: string): { readonly whyAsked: string; readonly ifNothing: string; readonly howTo: string } => {
+    const guidance = ownerNoticeGuidance(kind);
+    expect(guidance, kind).not.toBeNull();
+    const complete = guidance as { whyAsked: string; ifNothing: string; howTo: string };
+    expect(complete.whyAsked.length, kind).toBeGreaterThan(0);
+    expect(complete.ifNothing, kind).toContain('If you do nothing');
+    expect(complete.howTo.length, kind).toBeGreaterThan(0);
+    return complete;
+  };
+
   it('port squats name the manual external step and the evidence that clears it', () => {
-    expect(ownerNoticeGuidance('port-squat')).toContain('Stop the foreign process yourself');
-    expect(ownerNoticeGuidance('port-squat')).toContain('clears on a successful bind');
-    expect(ownerNoticeGuidance('roll-port-squat')).toContain('Stop the foreign process yourself');
+    const squat = expectComplete('port-squat');
+    expect(squat.howTo).toContain('Stop the program named in Details');
+    expect(squat.ifNothing).toContain('stays unable to use its port');
+    expect(expectComplete('roll-port-squat').howTo).toContain('run the update again');
   });
 
   it('degraded decisions and enforce-gate notices name their distinct remediation', () => {
-    const degraded = ownerNoticeGuidance('decisions.degraded.timeout');
-    expect(degraded).toContain('Fix the decision-provider credential');
-    expect(degraded).toContain('clears when the decision service recovers');
-    const enforceGate = ownerNoticeGuidance('decisions.enforce-gate.triage');
-    expect(enforceGate).toContain('passing backtest evidence');
-    expect(enforceGate).toContain('retry the gated surface');
-    expect(enforceGate).not.toContain('credential');
+    const degraded = expectComplete('decisions.degraded.timeout');
+    expect(degraded.howTo).toContain('Fix the credential or setting named in Details');
+    expect(degraded.howTo).toContain('clears when the helper answers again');
+    const enforceGate = expectComplete('decisions.enforce-gate.triage');
+    expect(enforceGate.howTo).toContain('passing backtest evidence');
+    expect(enforceGate.howTo).not.toContain('credential');
   });
 
   it('the Perkins App bundle notice names the install step and the clearing evidence (#444)', () => {
-    const guidance = ownerNoticeGuidance('perkins-app-bundle-missing');
-    expect(guidance).toContain('Install the Perkins GitHub App bundle');
-    expect(guidance).toContain('restart the service');
-    expect(guidance).toContain('clears at the first boot that resolves the bundle');
-    expect(guidance).toContain('GitLab-only instance is unaffected');
-    expect(guidance).not.toContain('Ack');
-    expect(guidance).not.toContain('No in-app action is supported');
+    const guidance = expectComplete('perkins-app-bundle-missing');
+    expect(guidance.howTo).toContain('Install the Perkins GitHub App bundle');
+    expect(guidance.howTo).toContain('restart the service');
+    expect(guidance.howTo).toContain('clears at the first start that resolves it');
+    expect(guidance.ifNothing).toContain('GitLab merge requests are unaffected');
+    expect(guidance.howTo).not.toContain('Ack');
   });
 
   it('sweep confirmations and blocked wakes name the manual step', () => {
-    expect(ownerNoticeGuidance('worktree-sweep-paused')).toContain('Confirm nothing live is rooted');
-    expect(ownerNoticeGuidance('worktree-sweep-paused:lane-a:pause-1')).toContain('the notice clears when that worktree is swept');
-    expect(ownerNoticeGuidance('gru.wake-blocked.n1')).toContain('Restart the service');
-    expect(ownerNoticeGuidance('gru.wake-blocked-mailbox.incident')).toContain('Restart the service');
-    expect(ownerNoticeGuidance('gru.wake-failed-escalation.job')).toContain('Restart the service');
+    expect(expectComplete('worktree-sweep-paused:lane-a:pause-1').howTo).toContain('complete the cleanup');
+    expect(expectComplete('gru.wake-blocked.n1').howTo).toContain('Restart the service');
+    expect(expectComplete('gru.wake-blocked-mailbox.incident').howTo).toContain('Restart the service');
+    expect(expectComplete('gru.wake-failed-escalation.job').howTo).toContain('Restart the service');
   });
 
-  it('unknown kinds get the generic honest line (no fabricated semantics, no fake control)', () => {
-    expect(ownerNoticeGuidance('something.brand.new')).toContain('No in-app action is supported');
+  it('an informational notice says nothing is asked of you', () => {
+    const legacy = expectComplete('worktree-sweep-paused');
+    expect(legacy.whyAsked).toContain('Nothing is asked of you');
+    expect(legacy.howTo).toContain('Gru verifies the folder state');
+  });
+
+  it('an unregistered kind has no guidance at all — never a fabricated generic line', () => {
+    expect(ownerNoticeGuidance('something.brand.new')).toBeNull();
   });
 });
 

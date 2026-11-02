@@ -73,24 +73,28 @@ const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as cons
 const OWNER_DECIDER = 'owner';
 
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._-]{1,128}$/u;
-const REASON_EXCERPT_CHARS = 200;
 const ERROR_MESSAGE_CHARS = 300;
 const BODY_LIMIT_BYTES = 64 * 1024;
 
 const DENY_CONSEQUENCE_DIRECTIVE = 'Nothing runs. The request stays as it is.';
-const DENY_CONSEQUENCE_REBRIEF = 'Nothing runs. The marker generation stays as it is.';
-const DENY_CONSEQUENCE_RESOLUTION = 'Nothing is recorded. The recovery subject stays exactly as it is.';
+const DENY_CONSEQUENCE_REBRIEF = 'Nothing runs. The re-brief stays as it is.';
+const DENY_CONSEQUENCE_RESOLUTION = 'Nothing is recorded. The recovery item stays exactly as it is.';
 const DENY_CONSEQUENCE_STOP = 'Nothing is settled. The stop stays exactly as it is.';
-const WHY_NOT_DELEGABLE_DIRECTIVE = 'Abandonment is owner-reserved: only the owner may close a request whose producer custody is unknown.';
-const APPROVE_CONSEQUENCE_DIRECTIVE = 'Closes the request as outcome-unknown. Nothing is replayed. No completion, no-effect or cessation is recorded. ' +
-  "The job's status is unchanged. The lane stays held until the job is binned or fresh owner-accepted work is admitted there.";
-const WHY_NOT_DELEGABLE_REBRIEF = 'Re-brief abandonment is owner-reserved: only the owner may close a marker generation whose producer custody is unknown.';
-const APPROVE_CONSEQUENCE_REBRIEF = 'Deletes the marker generation as outcome-unknown. Nothing is replayed. No completion, no-effect or cessation is recorded. ' +
-  "The job's status is unchanged. The lane stays held until the job is binned or fresh owner-accepted work is admitted there.";
-const WHY_NOT_DELEGABLE_RESOLUTION = 'The ruling is owner-reserved: it records the owner\'s own narrow permission for a preserved recovery subject, which no automation may grant.';
-const APPROVE_CONSEQUENCE_RESOLUTION = 'Records the ruling only. No stop is released, nothing is unparked, no notification is Acked, no work is executed, and no cessation, effect or completion is claimed.';
-const WHY_NOT_DELEGABLE_STOP = 'Confirming the governing stop is owner-reserved: only the owner may affirm that this exact ruling resolves the stop it was written for.';
-const APPROVE_CONSEQUENCE_STOP = 'Settles only this governing stop with a confirmation receipt. Parking, other holds, cards and work execution are unchanged; nothing is unparked or Acked.';
+const WHY_NOT_DELEGABLE_DIRECTIVE = 'Only the owner may close a request when the app cannot prove what became of it.';
+const APPROVE_CONSEQUENCE_DIRECTIVE = 'Closes the request as never-proved. Nothing is re-run and no completion is recorded. ' +
+  'The job keeps its status, and its workspace stays held until the job is closed or new approved work is admitted there.';
+const WHY_NOT_DELEGABLE_REBRIEF = 'Only you may close a re-brief when the app cannot prove what became of it.';
+const APPROVE_CONSEQUENCE_REBRIEF = 'Closes the re-brief as never-proved. Nothing is replayed and no completion is recorded. ' +
+  'The job keeps its status, and its workspace stays held until the job is closed or new approved work is admitted there.';
+const WHY_NOT_DELEGABLE_RESOLUTION = 'Only you may grant this permission; no automation can give it for you.';
+const APPROVE_CONSEQUENCE_RESOLUTION = 'Records your permission only. Nothing is restarted, unparked, acknowledged or completed, and no work is run.';
+const WHY_NOT_DELEGABLE_STOP = 'Only you may confirm this stop; no automation can confirm it for you.';
+const APPROVE_CONSEQUENCE_STOP = 'Confirms only this stop. Other holds, cards and work are unchanged, and nothing is unparked or acknowledged.';
+const RECOMMENDATION_NONE = 'No recommendation — either choice is fine, because only you can weigh the risk against the work.';
+const IF_NOTHING_DIRECTIVE = 'If you do nothing, the request stays exactly as it is: nothing is closed and nothing is re-run.';
+const IF_NOTHING_REBRIEF = 'If you do nothing, the re-brief stays exactly as it is: nothing is closed and nothing is replayed.';
+const IF_NOTHING_RESOLUTION = 'If you do nothing, nothing changes: the recovery item stays as it is and no permission is recorded.';
+const IF_NOTHING_STOP = 'If you do nothing, the stop stays exactly as it is and nothing is confirmed.';
 
 /** The steps a crash can follow; the test seam names them. */
 export const OWNER_APPROVAL_STEPS = [
@@ -363,9 +367,6 @@ function options(approveConsequence: string, denyConsequence: string): readonly 
   ];
 }
 
-function excerpt(reason: string): string {
-  return [...reason].slice(0, REASON_EXCERPT_CHARS).join('');
-}
 
 /** The recovery fences, one per line: the owner must see the exact generation,
  * plan, epoch and head the ruling is bound to, not a summary. */
@@ -510,7 +511,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
     card(record) {
       const subject = ownerApprovalSubject(record, 'directive');
       return {
-        title: `Abandon directive request ${subject.id}?`,
+        title: 'A directive may never have finished — give up on it?',
         detail: [
           `Gru proposes abandoning directive request ${subject.id} as outcome-unknown (approval ${record.id}).`,
           `Reason: ${record.reason}`,
@@ -522,12 +523,13 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
           'If any of them changed by the time you approve, nothing is run.',
         ].join('\n'),
         decision: {
-          question: `Abandon directive request ${subject.id} as outcome-unknown?`,
-          context: `Request ${subject.id} on job ${subject.fences.jobId} (${subject.fences.state}). Reason: ${excerpt(record.reason)}`,
-          recommendation: null,
+          question: 'Give up on this directive?',
+          context: 'Gru cannot tell whether this directive finished what it started. Gru’s reason is in Details.',
+          recommendation: RECOMMENDATION_NONE,
           reservedClass: 'destructive',
           whyNotDelegable: WHY_NOT_DELEGABLE_DIRECTIVE,
           options: options(APPROVE_CONSEQUENCE_DIRECTIVE, DENY_CONSEQUENCE_DIRECTIVE),
+          ifNothing: IF_NOTHING_DIRECTIVE,
           discussion: false,
         },
       };
@@ -597,7 +599,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
     card(record) {
       const subject = ownerApprovalSubject(record, 'rebrief-marker');
       return {
-        title: `Abandon re-brief marker ${subject.id}?`,
+        title: 'A re-brief may never have finished — give up on it?',
         detail: [
           `Gru proposes abandoning re-brief marker ${subject.id} as outcome-unknown (approval ${record.id}).`,
           `Reason: ${record.reason}`,
@@ -608,12 +610,13 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
           'If any of them changed, or the marker is no longer pending, nothing is run.',
         ].join('\n'),
         decision: {
-          question: `Abandon re-brief marker ${subject.id} as outcome-unknown?`,
-          context: `Marker ${subject.id} on job ${subject.fences.jobId}. Reason: ${excerpt(record.reason)}`,
-          recommendation: null,
+          question: 'Give up on this re-brief?',
+          context: 'Gru cannot tell whether this re-brief finished what it started. Gru’s reason is in Details.',
+          recommendation: RECOMMENDATION_NONE,
           reservedClass: 'destructive',
           whyNotDelegable: WHY_NOT_DELEGABLE_REBRIEF,
           options: options(APPROVE_CONSEQUENCE_REBRIEF, DENY_CONSEQUENCE_REBRIEF),
+          ifNothing: IF_NOTHING_REBRIEF,
           discussion: false,
         },
       };
@@ -680,7 +683,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
       const what = `${subject.fences.contract.kind} ${subject.id}`;
       const stop = kind === 'recovery-owner-stop';
       return {
-        title: `${stop ? 'Confirm the governing stop for' : 'Record the owner ruling for'} ${what}?`,
+        title: stop ? 'Confirm this stop is final?' : 'Record your permission for this recovery?',
         detail: [
           `Gru proposes ${stop ? 'confirming the governing stop of' : 'recording the owner ruling for'} ${what} (approval ${record.id}).`,
           `Reason: ${record.reason}`,
@@ -695,15 +698,16 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
             : 'Recording the ruling executes nothing: no stop is released, nothing is unparked, no notification is Acked, no work runs.',
         ].join('\n'),
         decision: {
-          question: stop
-            ? `Confirm the governing stop of ${what} and settle it?`
-            : `Record your ruling on the recovery of ${what}?`,
-          context: `${what} on job ${subject.fences.jobId} (epoch ${String(subject.fences.contract.expectedEpoch)}, head ${subject.fences.contract.expectedHead.slice(0, 12)}). Reason: ${excerpt(record.reason)}`,
-          recommendation: null,
+          question: stop ? 'Confirm this stop?' : 'Allow the recovery to go ahead?',
+          context: stop
+            ? 'Gru needs you to confirm the stop it already recorded. Details show exactly which stop this covers.'
+            : 'Gru needs your permission before it can act on a preserved recovery item. Details show exactly what this covers.',
+          recommendation: 'No recommendation — either choice is fine, because this changes nothing by itself.',
           reservedClass: 'destructive',
           whyNotDelegable: stop ? WHY_NOT_DELEGABLE_STOP : WHY_NOT_DELEGABLE_RESOLUTION,
           options: options(stop ? APPROVE_CONSEQUENCE_STOP : APPROVE_CONSEQUENCE_RESOLUTION,
             stop ? DENY_CONSEQUENCE_STOP : DENY_CONSEQUENCE_RESOLUTION),
+          ifNothing: stop ? IF_NOTHING_STOP : IF_NOTHING_RESOLUTION,
           discussion: false,
         },
       };

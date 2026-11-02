@@ -7,6 +7,7 @@ import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { ownerDecisionFixture } from './helpers/owner-decision-fixture.js';
 import { DEFAULT_DECISIONS_CONFIG } from '../src/config.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
@@ -137,8 +138,8 @@ describe('notification center — durable log + receipts + acks', () => {
       kind: 'port-squat',
       routing: 'needs-owner',
       severity: 'error',
-      title: 'Foreign process holds port 7665 (pid 123)',
-      detail: 'stop it, then restart the service',
+      title: 'Another program is using the port Gru Command needs',
+      detail: 'port 7665 is held by node (pid 123); stop it, then restart the service',
     });
     // Owner-required notices never enter the machine callback.
     expect(rig.actionRequired.map((n) => n.id)).not.toContain(row.id);
@@ -363,18 +364,7 @@ describe('notification center — durable log + receipts + acks', () => {
       severity: 'error',
       title: 'Approve the slim contract?',
       detail: 'full evidence',
-      decision: {
-        question: 'Approve the slim contract?',
-        context: 'PR256 needs an owner-controlled integration route.',
-        recommendation: 'Approve the slim contract.',
-        reservedClass: 'scope-design',
-        whyNotDelegable: 'Changes the agreed product scope.',
-        options: [
-          { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the slim lane.' },
-          { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked.' },
-        ],
-        discussion: false,
-      },
+      decision: ownerDecisionFixture(),
     });
     expect(escalation.routing).toBe('needs-owner');
     expect(escalation.decision?.reservedClass).toBe('scope-design');

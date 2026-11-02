@@ -30,7 +30,7 @@
 export type OwnerAttention = 'owner-required' | 'owner-allowed' | 'owner-forbidden';
 
 /** Kinds that are always owner-facing, exact match. */
-const OWNER_REQUIRED_KINDS: readonly string[] = [
+export const OWNER_REQUIRED_KINDS: readonly string[] = [
   'lessons.proposal',
   'lessons.proposal-conflict',
   'gru.owner-escalation',
@@ -81,7 +81,7 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
  * including the worktree-scoped `worktree-sweep-paused:<id>:<pause>` form). */
-const OWNER_REQUIRED_PREFIXES: readonly string[] = [
+export const OWNER_REQUIRED_PREFIXES: readonly string[] = [
   'gru.wake-blocked.',
   // Job-scoped unproven producer stop (issue #455): one owner incident per
   // job, reused across boot re-proofs and resolved when a later pass proves it.
@@ -95,11 +95,11 @@ const OWNER_REQUIRED_PREFIXES: readonly string[] = [
 ];
 
 /** Kinds whose producer decides between owner attention and passive feed. */
-const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
+export const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
 
 /** Kinds that only ever route `needs-owner` with a typed reserved
  * decision attached (validated at the write boundary). */
-const DECISION_REQUIRED_KINDS: readonly string[] = [
+export const DECISION_REQUIRED_KINDS: readonly string[] = [
   'gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal', 'worktree.preserve-expiry', 'worktree.repo-mismatch',
   'disk.reclaim-proposal', 'owner-approval.directive-abandon', 'owner-approval.rebrief-abandon',
   'owner-approval.recovery-owner-resolution', 'owner-approval.recovery-owner-stop',

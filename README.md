@@ -469,6 +469,7 @@ Full reference (provider profiles including TypeSafe direct and a local `/v1/sys
 | [OPERATIONS.md](docs/OPERATIONS.md) | running it: services, emergency console, forensics, backups |
 | [CHAT.md](docs/CHAT.md) | the single-Gru chat socket protocol + reconnect contract |
 | [BOARD.md](docs/BOARD.md) | the live board dashboard + transcripts |
+| [FOR-YOU.md](docs/FOR-YOU.md) | the FOR YOU card standard: plain words for a non-technical owner |
 | [LEDGER.md](docs/LEDGER.md) | the SQLite ledger of record |
 | [FLOW.md](docs/FLOW.md) | the dispatch flow: briefing → lanes → review waves |
 | [WORKTREES.md](docs/WORKTREES.md) | the worktree manager (preserve-first sweeps) |

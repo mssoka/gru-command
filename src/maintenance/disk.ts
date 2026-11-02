@@ -342,6 +342,15 @@ function diskName(read: Pick<VolumeRead, 'names' | 'path'>, watched: number): st
   return watched > 1 ? `the ${read.names.join(' and ')} disk (${read.path})` : 'the disk';
 }
 
+/** The same disk named for the owner face: no path and no internal folder
+ * label (`lanes`, `data_dir`). The path and labels are evidence and stay in
+ * `detail` and the queue note. */
+function ownerDiskName(read: Pick<VolumeRead, 'names'>, watched: number): string {
+  if (watched <= 1) return 'the disk';
+  const labels = read.names.map((name) => name === 'lanes' ? 'the work area' : name === 'data_dir' ? 'the data folder' : 'a watched folder');
+  return `the disk holding ${labels.join(' and ')}`;
+}
+
 const capitalized = (text: string): string => `${text.slice(0, 1).toUpperCase()}${text.slice(1)}`;
 
 // ------------------------------------------------------------------
@@ -1922,18 +1931,34 @@ export class DiskService {
       title: `Free about ${diskSize(total)} of disk space`,
       detail: lines.join('\n'),
       decision: parseNotificationDecision({
+        // Plain language (issue #570): the numbers stay on the face; the data
+        // folder and the setting names stay in `detail`.
         question: `Free about ${diskSize(total)} of disk space in the ${String(steps.length)} lossless step${steps.length === 1 ? '' : 's'} listed?`,
-        context: condition,
-        recommendation: 'Recommended: each step loses nothing (lane work is saved first, review verdicts stay in the ledger, a slim lane restores before its next turn).',
+        context: this.ownerConditionText(usage, reads),
+        recommendation: 'Freeing the space in lossless steps. Work that is still needed is saved first, review verdicts stay in the history, and a slimmed workspace restores before its next turn.',
         reservedClass: 'authority-cost',
-        whyNotDelegable: 'reclaim_mode = "proposed": GC frees disk space only with your Accept ([worktrees] reclaim_mode in config.toml).',
+        whyNotDelegable: 'Freeing space happens only when you accept: the disk budget is set to ask you first.',
         options: [
-          { id: 'accept', label: 'Accept: free the space', consequence: 'GC runs the listed steps in order and stops once it is under its budget and the floor.' },
+          { id: 'accept', label: 'Accept: free the space', consequence: 'GC runs the listed steps in order and stops once it is under its budget and back above the floor.' },
           { id: 'decline', label: 'Decline: change nothing', consequence: `Nothing is freed. GC asks again once its usage grows by another ${diskSize(this.regrowth())}.` },
         ],
+        ifNothing: 'If you do nothing, nothing is freed and the disk keeps filling; this request stays open until you answer.',
         discussion: false,
       }),
     };
+  }
+
+  /** The same condition in the owner's words: no data path, no setting
+   * names — those live in `detail` (issue #570). */
+  private ownerConditionText(usage: DiskUsage | null, reads: readonly VolumeRead[]): string {
+    const parts: string[] = [];
+    if (usage !== null && this.budgetBytes > 0 && usage.totalBytes > this.budgetBytes) {
+      parts.push(`Gru Command is using ${diskSize(usage.totalBytes)} of its ${diskSize(this.budgetBytes)} disk budget.`);
+    }
+    for (const read of this.opts.floor.belowFloor(reads)) {
+      parts.push(`${capitalized(ownerDiskName(read, reads.length))} has ${diskSizeDown(read.space!.freeBytes)} free, below the ${diskSize(this.floorBytes)} it needs; new jobs wait until there is room.`);
+    }
+    return parts.join(' ');
   }
 
   /** Over budget, under the floor, or both, in numbers (a free space

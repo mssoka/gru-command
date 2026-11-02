@@ -2560,6 +2560,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/notifications/attention.js",
   "dist/notifications/center.js",
   "dist/notifications/legacy-owner.js",
+  "dist/notifications/owner-language.js",
   "dist/onboarding/briefing.js",
   "dist/onboarding/consent.js",
   "dist/onboarding/ledger.js",

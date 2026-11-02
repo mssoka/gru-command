@@ -5,6 +5,7 @@ import type { DecisionService } from '../decisions/types.js';
 import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import { eventTriageRouting } from '../decisions/effects.js';
 import { requiresTypedDecision, resolveNotificationRouting } from './attention.js';
+import { assertOwnerCardLanguage, assertOwnerDecisionLanguage, assertOwnerOptionsLanguage } from './owner-language.js';
 import {
   parseNotificationDecision,
   type NotificationDecision,
@@ -143,7 +144,12 @@ export class NotificationCenter {
    * kinds always ring the owner; a `needs-owner` request for any other
    * unregistered/machine kind is routed to Gru's machine queue instead
    * and logged — routine recovery can never quietly occupy FOR YOU, and
-   * an unrecognized stop is triaged by Gru rather than dropped. */
+   * an unrecognized stop is triaged by Gru rather than dropped.
+   *
+   * Plain language (issue #570): once the effective routing is known to be
+   * `needs-owner`, the owner-facing text is checked at this boundary — a
+   * card the owner cannot read is refused at its producer, never stored
+   * and shown. */
   post(input: {
     id?: string;
     kind: string;
@@ -183,6 +189,7 @@ export class NotificationCenter {
       const existing = this.ledger.getNotification(input.id);
       if (existing !== null) return existing;
     }
+    this.assertOwnerLanguage(input.kind, input.title, decision, resolved.routing);
     const record = this.ledger.recordNotification({
       ...input,
       id: input.id ?? randomUUID(),
@@ -225,6 +232,10 @@ export class NotificationCenter {
     const created = (record: NotificationRecord) => ({ record, created: true });
     const reused = (record: NotificationRecord) => ({ record, created: false });
     const effective = resolveNotificationRouting(input.kind, input.routing).routing;
+    // Same boundary as post(): the dedupe path never stores new owner text
+    // unchecked, so a re-post of a stale non-compliant incident is refused
+    // at the producer that would have written it.
+    this.assertOwnerLanguage(input.kind, input.title, decision, effective);
     const existing = this.ledger.findNotificationByKind(
       input.kind,
       input.dedupe === 'all' ? 'any' : input.dedupe,
@@ -287,18 +298,31 @@ export class NotificationCenter {
   }
 
   /** Attach agreed options to a discussion-only decision (see
-   * LedgerApi.updateNotificationDecisionOptions). */
+   * LedgerApi.updateNotificationDecisionOptions). Only the incoming options
+   * are new owner text: the stored question/recommendation may predate the
+   * standard (a pre-upgrade discussion row), and re-validating it would
+   * make the documented bridge unusable on the rows it exists for. */
   attachDecisionOptions(id: string, options: readonly NotificationDecisionOption[], by: string): NotificationRecord | null {
+    const current = this.ledger.getNotification(id);
+    if (current !== null && current.routing === 'needs-owner' && current.decision !== null) {
+      assertOwnerOptionsLanguage(options);
+    }
     return this.ledger.updateNotificationDecisionOptions(id, options, by);
   }
 
   /** A pre-upgrade owner row adopts a replayed typed decision (see
-   * LedgerApi.adoptLegacyOwnerDecision, #395). */
+   * LedgerApi.adoptLegacyOwnerDecision, #395). The incoming decision is new
+   * owner text and is checked; the row's stored title is not rewritten by
+   * the adoption and may predate the standard. */
   adoptLegacyDecision(
     id: string,
     decision: NotificationDecision,
     provenance: NotificationProvenance,
   ): NotificationRecord | null {
+    const current = this.ledger.getNotification(id);
+    if (current !== null && current.routing === 'needs-owner') {
+      assertOwnerDecisionLanguage(decision);
+    }
     return this.ledger.adoptLegacyOwnerDecision(id, decision, provenance);
   }
 
@@ -337,6 +361,19 @@ export class NotificationCenter {
   /** Human ack; returns the row (null when unknown). */
   ack(id: string, by: string): NotificationRecord | null {
     return this.ledger.ackNotification(id, by);
+  }
+
+  /** The owner-language boundary (issue #570): applied to every write of
+   * owner-facing text, but only once the effective routing is
+   * `needs-owner` — a machine or feed row may carry machine text. */
+  private assertOwnerLanguage(
+    kind: string,
+    title: string,
+    decision: NotificationDecision | null,
+    routing: NotificationRouting,
+  ): void {
+    if (routing !== 'needs-owner') return;
+    assertOwnerCardLanguage(kind, title, decision);
   }
 
   /** Bus derivation: board-worthy events become durable rows, once. */

@@ -85,6 +85,7 @@ import {
 } from '../lib/board-signals.js';
 import {
   decidedOptionLabel,
+  isNoRecommendation,
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
@@ -2686,8 +2687,13 @@ export class BoardView {
     const detail = item.detail === null || item.detail === '' ? null : item.detail;
     const decision = item.decision ?? null;
     const shortDetail = detail !== null && detail.length <= DETAIL_FACE_LIMIT && !detail.includes('\n');
+    // The face is guidance and choices only (issue #570): an owner row never
+    // promotes its short detail to the face, because that slot belongs to the
+    // typed context and evidence stays behind Details — a one-line log line
+    // with an id is exactly what the standard keeps off the face.
+    const detailOnFace = decision === null && shortDetail && item.routing !== 'needs-owner';
     if (decision !== null) card.append(el('div', 'board-notification__context', decision.context));
-    else if (shortDetail && detail !== null) card.append(el('div', 'board-notification__context', detail));
+    else if (detailOnFace && detail !== null) card.append(el('div', 'board-notification__context', detail));
     const submission = this.decisionSubmissions.get(item.id) ?? null;
     if (decision !== null) {
       card.append(this.decisionBlock(item, decision, submission, bandVisible, !receipt && item.routing === 'needs-owner'));
@@ -2716,9 +2722,20 @@ export class BoardView {
         );
       }
     } else if (item.routing === 'needs-owner' && !receipt && item.resolvedAt === null) {
-      // Owner-only notice: the action is outside the app; say so plainly
-      // and offer no fake control.
-      card.append(el('div', 'board-notification__guidance', ownerNoticeGuidance(item.kind)));
+      // Owner-only notice: why it is here, what happens if the owner does
+      // nothing, and the manual step — structured, and no fake control.
+      const guidance = ownerNoticeGuidance(item.kind);
+      if (guidance !== null) {
+        const box = el('div', 'board-notification__guidance');
+        box.append(
+          el('div', 'board-notification__guidance-why', `Why you’re seeing this: ${guidance.whyAsked}`),
+          // The stored line already opens with "If you do nothing, …"; the
+          // static label would say it twice on every notice (#570).
+          el('div', 'board-notification__guidance-nothing', guidance.ifNothing),
+          el('div', 'board-notification__guidance-how', `What to do: ${guidance.howTo}`),
+        );
+        card.append(box);
+      }
     }
     // What the card was closed with (#523): the follow-through's result, or a
     // producer's withdrawal, on the card itself and not only in the audit
@@ -2727,7 +2744,7 @@ export class BoardView {
       ? item.resolutionDetail
       : null;
     if (resolution !== null) card.append(el('div', 'board-notification__result', `Result: ${resolution}`));
-    if (detail !== null && !(decision === null && shortDetail)) {
+    if (detail !== null && !detailOnFace) {
       card.append(this.detailsDisclosure(item.id, item.kind, detail, bandVisible));
     }
     // A feed row earns a receipt-style "Mark seen" only where an ack has
@@ -2793,7 +2810,17 @@ export class BoardView {
     const block = el('section', 'board-notification__decision');
     block.append(el('div', 'board-notification__question', decision.question));
     if (decision.recommendation !== null) {
-      block.append(el('div', 'board-notification__recommendation', `Gru recommends: ${decision.recommendation}`));
+      // A producer with no preference states that form explicitly; it is not
+      // dressed up as a recommendation (#570).
+      block.append(
+        el(
+          'div',
+          'board-notification__recommendation',
+          isNoRecommendation(decision.recommendation)
+            ? decision.recommendation
+            : `Gru recommends: ${decision.recommendation}`,
+        ),
+      );
     }
     block.append(el('div', 'board-notification__why', `Why this needs you: ${decision.whyNotDelegable}`));
     const decided = item.decidedAt !== null && item.decidedAt !== undefined;
@@ -2867,6 +2894,13 @@ export class BoardView {
         options.append(optionNode);
       }
       block.append(options);
+    }
+    // What happens if the owner does nothing (#570). A pre-upgrade row has no
+    // line and gets none invented.
+    const ifNothing = decision.ifNothing ?? null;
+    if (ifNothing !== null && ifNothing !== '') {
+      // Rendered bare: every producer line already reads "If you do nothing, …".
+      block.append(el('div', 'board-notification__if-nothing', ifNothing));
     }
     return block;
   }

@@ -130,6 +130,10 @@ export const onboardingProofDirectiveId = (jobId: string, head: string, attempt:
 /** Who decided a card on the installer's behalf (consent standing in for Accept). */
 const CONSENT_DECIDER = 'installer-consent';
 
+/** How the owner-facing decision names the settings file: plain words, with
+ * the file's own path kept for `detail` (issue #570). */
+const MANIFEST_HINT = ' (what jobs run before and after their work, and what may be cleaned up)';
+
 const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as const;
 
 /** A refusal Gru can relay, by name. */
@@ -590,19 +594,23 @@ export class OnboardingService {
   }
 
   private decision(repo: string): NotificationDecision {
+    // Plain language (issue #570): the settings file's path and the mode name
+    // are evidence, so they stay in `detail`.
     return parseNotificationDecision({
-      question: `Dispatch an onboarding heist for ${shown(repo)}?`,
+      question: `Set up ${shown(repo)} for Gru Command?`,
       context: [
-        `A minion reads ${shown(repo)}'s CI, build files and README, writes ${MANIFEST_PATH} (setup, verify and reclaim) and opens a PR titled "${onboardingTitle(shown(repo))}".`,
-        'The PR changes no other file. Normal review applies, and merging it stays your call.',
+        `Right now nothing in ${shown(repo)} has the settings file Gru Command reads, so jobs there get no setup and verification has no command to run.`,
+        `A minion would read the repository's CI, build files and README, write that one settings file${MANIFEST_HINT} and open a pull request titled "${onboardingTitle(shown(repo))}".`,
+        'The pull request changes no other file. Normal review applies, and merging it stays your call.',
       ].join('\n'),
-      recommendation: 'Recommended: until it has a manifest, lanes in this repository run no setup and verification has no command.',
+      recommendation: `Setting it up now. Until ${shown(repo)} has that settings file, its jobs get no setup and verification has no command.`,
       reservedClass: 'authority-cost',
-      whyNotDelegable: 'onboarding mode = "proposed": an onboarding heist spends quota and opens a PR on your repository only with your Accept.',
+      whyNotDelegable: 'Setting a repository up spends quota and opens a pull request on your repository, so the app does it only when you accept.',
       options: [
-        { id: 'accept', label: 'Accept: dispatch the onboarding heist', consequence: 'Gru dispatches it through the normal path; the PR waits for review and your merge.' },
+        { id: 'accept', label: 'Accept: set the repository up', consequence: 'Gru starts it through the normal path; the pull request waits for review and your merge.' },
         { id: 'decline', label: 'Decline', consequence: `Recorded. ${shown(repo)} is not proposed again until you ask Gru to propose it.` },
       ],
+      ifNothing: `If you do nothing, ${shown(repo)} keeps running without that settings file: its jobs get no setup and verification has no command.`,
       discussion: false,
     });
   }
@@ -614,7 +622,7 @@ export class OnboardingService {
       kind: ONBOARDING_PROPOSAL_KIND,
       routing: 'needs-owner',
       severity: 'info',
-      title: `Onboard ${shown(repo)}`,
+      title: `Set up ${shown(repo)} for Gru Command`,
       detail: [
         `origin/${probe.defaultBranch} at ${probe.headSha.slice(0, 12)} has no ${MANIFEST_PATH}.`,
         `Without it, GC lanes in ${shown(repo)} get no setup, verification has no command, and GC cannot tell which folders it may regenerate.`,

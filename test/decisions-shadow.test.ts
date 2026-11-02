@@ -363,7 +363,7 @@ describe('the enforce gate (issue #223)', () => {
       kind: `decisions.enforce-gate.${surface}`,
       routing: 'needs-owner',
       severity: 'error',
-      title: `Decision enforce gate blocked for ${surface}`,
+      title: 'A safety check is holding up a decision',
       detail: 'no recorded backtest evidence yet',
       dedupe: 'active',
     });
@@ -374,7 +374,7 @@ describe('the enforce gate (issue #223)', () => {
       kind: `decisions.enforce-gate.${surface}-extra`,
       routing: 'needs-owner',
       severity: 'error',
-      title: `Decision enforce gate blocked for ${surface}-extra`,
+      title: 'A safety check is holding up a decision',
       detail: 'a different surface, still gated',
       dedupe: 'active',
     });

@@ -70,7 +70,7 @@ import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
-import { JobExecutionStop, jobStopUnprovenNotice, watchParkedJobs } from './dispatch/job-stop.js';
+import { JobExecutionStop, jobStopFailedNotice, jobStopUnprovenNotice, watchParkedJobs } from './dispatch/job-stop.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
@@ -170,10 +170,10 @@ function reportForeignListener(
     kind: 'port-squat',
     routing: 'needs-owner',
     severity: 'error',
-    title: `Foreign process holds port ${port} (pid ${foreign.pid})`,
+    title: 'Another program is using the port Gru Command needs',
     detail:
-      `${foreign.command === '' ? 'unknown command' : foreign.command} (pid ${foreign.pid}) ` +
-      `owns ${dialHost(config.server.host)}:${port} ` +
+      `Port ${port} is held by ${foreign.command === '' ? 'an unknown command' : foreign.command} (pid ${foreign.pid}), ` +
+      `which owns ${dialHost(config.server.host)}:${port} ` +
       `${when === 'before' ? 'before this service could bind it' : 'while this service bound the same port'} ` +
       '— loopback clients would reach the squatter. Stop it, then restart the service.',
   });
@@ -1574,12 +1574,8 @@ async function main(): Promise<number> {
     bus,
     stop: jobExecutionStop,
     notifyFailed: (jobId, error) => {
-      openJobStopIncident(
-        jobId,
-        `Parked job ${jobId}: producer stop failed`,
-        `The explicit owner hold is recorded, but the stop pass itself failed: ${String(error)}. ` +
-          'Live producers may remain; inspect the job before resuming.',
-      );
+      const notice = jobStopFailedNotice(jobId, error);
+      openJobStopIncident(jobId, notice.title, notice.detail);
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1990,9 +1986,9 @@ async function main(): Promise<number> {
         kind: 'roll-port-squat',
         routing: 'needs-owner',
         severity: 'error',
-        title: `Roll refused: port ${config.server.port} is held by a foreign process (pid ${owner.pid})`,
+        title: 'Update refused: another program is using the port',
         detail:
-          `${owner.command === '' ? 'unknown command' : owner.command} (pid ${owner.pid}) owns ` +
+          `Port ${config.server.port} is held by ${owner.command === '' ? 'an unknown command' : owner.command} (pid ${owner.pid}), which owns ` +
           `${dialHost(config.server.host)}:${config.server.port}, so the post-roll /health check would ` +
           'read the squatter. Kill it and re-run the roll.',
       });

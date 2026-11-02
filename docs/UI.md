@@ -343,7 +343,16 @@ owner-only notices (no fake Ack) and evidence-bound ready PRs/MRs
 (`OPEN PR` / `OPEN MR`, external https link only, the row carrying the
 exact approved head, `CI green at that head`, and `observed <age> ago`) —
 see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
-readiness rule. It reads as the attention card (cockpit rework): under
+readiness rule. Owner-facing copy follows [FOR-YOU.md](./FOR-YOU.md): the
+question card's face is guidance and choices only — never the short
+`detail` — it carries the typed context, Gru's recommendation ("Gru
+recommends: …", or the explicit no-recommendation form rendered without
+that prefix) and the producer's full "If you do nothing, …" sentence after
+the options (rendered bare, never doubled with a label), and a notice
+renders "why you're seeing this / if you do nothing / what to do" from the
+central per-kind guidance (no generic sentence). It reads as the attention
+card
+(cockpit rework): under
 its `FOR YOU · N pending` heading, `2 things need you`, then one line about
 Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
 is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing

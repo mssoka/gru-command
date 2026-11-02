@@ -1286,6 +1286,24 @@ describe('disk budget, proposed (#427 PR 3)', () => {
     expect(open(h, DISK_FULL_KIND)).toEqual([]);
   });
 
+  it('on two disks the owner context names the disk in owner words; neither the path nor the folder label reaches it', async () => {
+    const h = harness();
+    await laneOf(h, 'job-old', 'done');
+    h.device = (path) => (path.startsWith(h.lanesRoot) ? 'disk-lanes' : 'disk-data');
+    h.space = (path) => (path.startsWith(h.lanesRoot)
+      ? { freeBytes: 6 * GIB, totalBytes: 50 * GIB }
+      : { freeBytes: 100 * GIB, totalBytes: 500 * GIB });
+    const { disk } = service(h, { budgetGb: 30, floorGb: 10, mode: 'proposed' });
+    disk.start();
+    await disk.idle();
+    const [card] = open(h, DISK_RECLAIM_KIND);
+    expect(card).toBeDefined();
+    expect(card!.decision?.context).toContain('The disk holding the work area has 6.0 GB free');
+    expect(card!.decision?.context).not.toContain(h.lanesRoot);
+    expect(card!.decision?.context).not.toContain('lanes');
+    expect(card!.detail).toContain(`The lanes disk (${h.lanesRoot}) has 6.0 GB free`);
+  });
+
   it('a card never lists a slim that slim() refuses for good: a lane whose restore came back incomplete, or a reclaim folder a [[copy]] destination lies under', async () => {
     const h = harness();
     const t0 = Date.now();

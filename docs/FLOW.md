@@ -703,7 +703,10 @@ verification budget.
   this repository, the `perkins-int*-baseline*` scopes in
   `.gru-command/worktree.toml`) that checks out the uncorrected base, runs
   only the named regressions with `--reporter=json`, and hands the report to
-  a classifier (`tools/assert-perkins-integration-review-baseline.mjs`).
+  a classifier (`tools/assert-perkins-integration-review-baseline.mjs`); the
+  `gc-570-*` scopes and
+  `tools/assert-for-you-plain-language-baseline.mjs` are another such leg
+  (#570).
   The classifier accepts a RED only when every named regression failed by
   its OWN assertion — the failure's first line is the matcher failure or
   rejects/resolves report, raised in a test file — and anything else
