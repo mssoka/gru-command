@@ -262,13 +262,17 @@ describe('board client', () => {
       options: [{ id: 'approve', label: 'Approve', consequence: 'Closes the request as outcome-unknown.' }],
       discussion: false,
     } as const;
-    for (const [id, kind] of [['abandon-1', 'owner-approval.directive-abandon'], ['escalation-1', 'gru.owner-escalation'],
+    for (const [id, kind] of [['abandon-1', 'owner-approval.directive-abandon'],
+      ['rebrief-1', 'owner-approval.rebrief-abandon'],
+      ['ruling-1', 'owner-approval.recovery-owner-resolution'],
+      ['stop-1', 'owner-approval.recovery-owner-stop'],
+      ['escalation-1', 'gru.owner-escalation'],
       ['prefixed-1', 'owner-approval.directive-abandon.other']] as const) {
       await expect(client.decideNotification(id, 'approve', expectedDecision, kind)).rejects.toMatchObject({ status: 409 });
     }
     const bodies = vi.mocked(fetchImpl).mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { readonly by?: unknown });
-    // Exactly one kind is the owner's; a lookalike keeps the web actor.
-    expect(bodies.map((body) => body.by)).toEqual(['owner', 'web', 'web']);
+    // Exactly the owner-reserved action kinds are the owner's; a lookalike keeps the web actor.
+    expect(bodies.map((body) => body.by)).toEqual(['owner', 'owner', 'owner', 'owner', 'web', 'web']);
   });
 
   it('posts an authenticated decision recheck and rejects malformed status replies', async () => {

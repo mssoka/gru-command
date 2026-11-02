@@ -591,28 +591,61 @@ now). Each abandonment sees the other control as live and refuses: it is
 an owner-escalation dead end that no route here closes; the owner must bin
 the job.
 
-### Owner approval of abandonment
+### Owner approval of owner-reserved actions
 
-The owner should not run a terminal script to abandon a request. Gru
-proposes the abandonment; the owner's Approve on one FOR YOU card makes the
-service carry out the native owner abandonment above, with fresh fences, and
-the same card closes with what actually happened. Scope: one action, abandon
-one live directive request as outcome-unknown, card kind
-`owner-approval.directive-abandon`. Re-brief marker abandonment is not part
-of it; it still uses `POST /api/silas/rebriefs/{marker_id}/abandon`.
+The owner should not run a terminal script to record an owner-reserved
+decision. Gru proposes the action; the owner's Approve on one FOR YOU card
+makes the service carry out the same guarded route an owner's own request
+calls, with fresh fences, and the same card closes with what actually
+happened. Four actions, one mechanism:
+
+| kind | card kind | the Approve |
+|---|---|---|
+| `directive-abandon` (#523) | `owner-approval.directive-abandon` | abandons one live directive request as outcome-unknown |
+| `rebrief-abandon` (#565) | `owner-approval.rebrief-abandon` | abandons one pending re-brief marker generation as outcome-unknown |
+| `recovery-owner-resolution` (#565) | `owner-approval.recovery-owner-resolution` | records the owner's narrow ruling on one recovery subject |
+| `recovery-owner-stop` (#565) | `owner-approval.recovery-owner-stop` | confirms and settles the governing stop of an already-recorded ruling |
+
+The two recovery kinds are never chained. A stop confirmation is proposable
+only when a ruling already exists, and its fence is that ruling's own
+fingerprint, so confirming a stop never records a ruling; no card carries
+both actions. A recorded recovery ruling and a stop confirmation execute
+nothing: they release no stop, unpark nothing, Ack nothing and run no work.
 
 Two routes, both authenticated with the bearer. Absent a hosted service
-(Silas ops off) both answer `503 owner_approvals_not_hosted`.
+(Silas ops off) both answer `503 owner_approvals_not_hosted`. Every proposal
+names its target exactly, and each kind's body is its own:
 
 ```json
 POST /api/owner-approvals
-{
-  "kind": "directive-abandon",
-  "request_id": "<request_id>",
+{ "kind": "directive-abandon", "request_id": "<request_id>",
   "reason": "original producer identity and journal are missing",
-  "by": "gru",
-  "idempotency_key": "abandon-<request_id>-1"
-}
+  "by": "gru", "idempotency_key": "abandon-<request_id>-1" }
+
+{ "kind": "rebrief-abandon", "marker_id": "<marker_id>",
+  "reason": "original producer identity and journal are missing",
+  "by": "gru", "idempotency_key": "abandon-<marker_id>-1" }
+
+{ "kind": "recovery-owner-resolution", "recovery_kind": "directive", "subject_id": "<request_id>",
+  "resolution_id": "<stable unused identity>",
+  "expected_transfer_event_seq": 123, "expected_transfer_fingerprint": "<readback>",
+  "expected_subject_sha256": "<readback>", "expected_target_generation": 2,
+  "expected_target_plan_revision": 1, "expected_lineage_sha256": "<fresh readback>",
+  "expected_epoch": 120, "expected_head": "<current original-lane HEAD>",
+  "expected_work_revision": 1, "expected_contract_sha256": "<current approved contract>",
+  "reason": "explicit narrow permission for this exact subject/current scope/governing stop",
+  "by": "gru", "idempotency_key": "ruling-<subject_id>-1" }
+
+{ "kind": "recovery-owner-stop", "recovery_kind": "directive", "subject_id": "<request_id>",
+  "resolution_id": "<the recorded ruling's identity>",
+  "expected_resolution_fingerprint": "<the recorded ruling's fingerprint>",
+  "expected_transfer_event_seq": 123, "expected_transfer_fingerprint": "<readback>",
+  "expected_subject_sha256": "<readback>", "expected_target_generation": 2,
+  "expected_target_plan_revision": 1, "expected_lineage_sha256": "<fresh readback>",
+  "expected_epoch": 120, "expected_head": "<current original-lane HEAD>",
+  "expected_work_revision": 1, "expected_contract_sha256": "<current approved contract>",
+  "reason": "the owner affirms this exact ruling settles the governing stop",
+  "by": "gru", "idempotency_key": "confirm-<subject_id>-1" }
 ```
 
 `reason` is 1-500 characters, not blank, with no control character other
@@ -620,36 +653,53 @@ than tab and newline: no C0 control, no DEL, no C1 control such as U+0085,
 and also no line or paragraph separator (U+2028, U+2029) and no bidi
 embedding, override or isolate character (U+202A-U+202E, U+2066-U+2069),
 which would reorder what the owner reads on the card. `idempotency_key` is 1-128 characters of `A-Z a-z 0-9 . _ -`.
-`by` must be `gru`. The service checks that the request exists and is live
-(`dispatching` or `admitted`), reads the four fences the Approve is bound to
-(`job_id`, `state`, `payload_hash` and the recovery-debt generation, or null),
-writes the record, and posts the card. Answers: `201 {approval}` on create;
-`200 {approval}` for a repeat of the same key with the same body (checked
-first); `409 owner_approval_key_conflict` for the same key with a different
-body; `409 owner_approval_pending` when the request already has an approval
-that has not ended; `409 owner_approval_not_live` for an abandoned, retired,
-settled or failed request; `404 owner_approval_unknown_request`; `400` for
-malformed input or any `by` other than `gru`; `401` without the bearer. A
-card that cannot be posted ends the record `refused` with `card-post-failed`.
+`by` must be `gru`. The service checks that the subject exists and owes the
+action, reads the fences the Approve is bound to, writes the record, and
+posts the card. A directive request owes the action while it is live
+(`dispatching` or `admitted`) and its fences are `job_id`, `state`,
+`payload_hash` and the recovery-debt generation (or null); a marker
+generation owes it while its markers are pending and its fences are
+`job_id`, `payload_hash` and its recovery-debt generation (or null); a
+recovery subject owes it while the write path's own checks hold, and its
+fences are the ten-field contract above. The recovery `resolution_id` is
+minted here, once, and never per attempt: a re-mint would record a second
+ruling. Answers: `201 {approval}` on create; `200 {approval}` for a repeat
+of the same key with the same body (checked first); `409
+owner_approval_key_conflict` for the same key with a different body; `409
+owner_approval_pending` when the subject already has an approval that has not
+ended; `409 owner_approval_not_live` for a subject that ended or whose
+fences no longer hold; `404 owner_approval_unknown_request` /
+`owner_approval_unknown_marker` / `owner_approval_unknown_subject` for an
+unknown target; `400` for malformed input or any `by` other than `gru`; `401`
+without the bearer. A card that cannot be posted ends the record `refused`
+with `card-post-failed`.
 
 ```
 GET /api/owner-approvals/{id}
 ```
 
-returns the approval (`404` for an unknown id): `id`, `kind`, `request_id`,
-`job_id`, `state`, `attempts`, `fences` (`job_id`, `state`, `payload_hash`,
-`debt_generation`), `reason`, `notification_id`, `history` (`state`, `at`,
-`detail` for each `owner-approval.<state>` event) and `outcome`
-(`abandonment_event_seq`, or `refusal` with its `code` and `blockers`). The
-`approval` of a POST is exactly this body.
+returns the approval (`404` for an unknown id): `id`, `kind`, `subject`
+(`kind` — `directive`, `rebrief-marker` or `recovery` —, `id`, and the
+recovery subject's own `recovery_kind`), `request_id` (the directive
+subject's id; null for every other subject), `job_id`, `state`, `attempts`,
+`fences` (`job_id`, `state`, `payload_hash`, `debt_generation` — null where
+the subject does not carry them), `contract` (the ten-field recovery
+contract; null for an abandonment), `resolution_id`,
+`expected_resolution_fingerprint`, `reason`, `notification_id`, `history`
+(`state`, `at`, `detail` for each `owner-approval.<state>` event) and
+`outcome` (`audit_event_seq`, the seq of the event that carried the action
+out, or `refusal` with its `code` and `blockers`). The `approval` of a POST
+is exactly this body.
 
 **States.** `proposed` (the card is posted and unanswered), `approved` (the
-owner said yes; the fences are not yet re-read), `executing` (the
-abandonment is being carried out), then one of four that end it:
-`succeeded`, `denied`, `refused`, `withdrawn`. A request has at most one
-approval that has not ended. Every state change is one ledger transaction
-that appends an `owner-approval.<state>` event (a failed attempt appends
-`owner-approval.attempt-failed`).
+owner said yes; the fences are not yet re-read), `executing` (the action is
+being carried out), then one of four that end it: `succeeded`, `denied`,
+`refused`, `withdrawn`. A subject has at most one approval that has not
+ended. Every state change is one ledger transaction that appends an
+`owner-approval.<state>` event (a failed attempt appends
+`owner-approval.attempt-failed`); every one of those events carries the
+record's `subject_kind` and `subject_id` (and `request_id` only for the
+directive kind), so a reader never has to guess what an approval was about.
 
 **The decision.** The card's Approve and Deny each record one decision on
 the board (`POST /api/notifications/{id}/decision`, with the card's
@@ -658,60 +708,76 @@ the board (`POST /api/notifications/{id}/decision`, with the card's
 whose decider is exactly `owner` is acted on; anything else (`web`, `gru`,
 `Gru`, `silas`, ` owner`, none) is refused as `decider-not-owner` and
 nothing runs. Deny ends the record `denied`. Approve moves it to `approved`;
-the service then reads the fences again, in order: a request already
-abandoned by another route is refused `abandoned-elsewhere`; any other fence
-that changed is refused `stale-fence`, its blockers reading `<field>:
-expected <x>, actual <y>`; otherwise the record becomes `executing` and the
-abandonment above is called as `by: "owner"` with the stored expectations
-and the reason prefixed `[owner-approval <id>] `. The ledger's own rules are
-unchanged: a producer known to be live refuses `live_work`, and a request
-whose cessation the service can verify refuses `retirement_available`
-(retire it instead). A success ends the record `succeeded` with the
-abandonment event's seq. Any other error counts one attempt (the `attempts`
+the service then reads the fences again, in order: a subject the action can
+no longer apply to is refused `abandoned-elsewhere` (the abandonment kinds)
+or `recorded-elsewhere` (a recovery ruling already recorded under this
+identity); any other fence that changed is refused `stale-fence`, its
+blockers reading `<field>: expected <x>, actual <y>` (a recovery fence that
+no longer holds carries the write path's own checkpoint message as its single
+blocker); otherwise the record becomes `executing` and the same route an
+owner's own request calls is invoked with `by: "owner"`, the stored
+expectations and the reason prefixed `[owner-approval <id>] `:
+`abandonLiveDirectiveFromRoute`, `abandonPendingRebriefFromRoute`, or
+`recoveryOwnerActionFromRoute` (the record's ruling, or its stop
+confirmation). The guards are unchanged: a producer known to be live refuses
+`live_work`, a request whose cessation the service can verify refuses
+`retirement_available` (retire it instead), and a stale recovery contract
+refuses by its own named checkpoint. A success ends the record `succeeded`
+with the audit event's seq. Any other error counts one attempt (the `attempts`
 column is durable) and leaves the record `executing` for the next reconcile;
 the third ends it `refused` as `execution-error`, its message redacted of
-credentials and cut to 300 characters.
+credentials and cut to 300 characters. A refused fence is never an execution
+error: `DirectiveCheckpointError` and a vanished subject end the record
+`stale-fence` at once, with no wasted attempt.
 
 **Refusal codes.** The service gives `card-post-failed`, `decider-not-owner`,
-`abandoned-elsewhere`, `stale-fence` and `execution-error`. A ledger refusal
-keeps its own code and the blockers it carries (possibly none): the
-abandonment raises `live_work`, `retirement_available`, `request_mismatch`,
-`directive_not_live` and `terminal_receipt_present`; the retirement-only
+`abandoned-elsewhere`, `recorded-elsewhere`, `stale-fence` and
+`execution-error`. A ledger refusal keeps its own code and the blockers it
+carries (possibly none): the abandonment raises `live_work`,
+`retirement_available`, `request_mismatch`, `directive_not_live` and
+`terminal_receipt_present`; the retirement-only
 codes `retire_conflict`, `admission_evidence_incomplete`, `stale_head`,
 `stale_generation`, `stale_authority`, `lane_unavailable` and
 `incomplete_context` would pass through the same way. `refusal` is `{code,
 blockers}`.
 
 **The card.** Every ended record resolves its card with the result:
-`Abandoned as outcome-unknown (abandonment event seq <n>).`, `Denied by the
-owner; nothing was run.`, or `Not run: <code>` followed by the blockers, one
-per line (`retirement_available` adds `Ordinary retirement is available;
-Gru retires it instead.`). The result is stored on the card's own row
+`Abandoned as outcome-unknown (abandonment event seq <n>).` for a directive
+request, `Re-brief marker abandoned as outcome-unknown (abandonment event seq
+<n>).` for a marker generation, `Ruling recorded (event seq <n>). Nothing was
+released, unparked, Acked or executed.` and `Governing stop confirmed and
+settled (event seq <n>). Parking, other holds and cards are unchanged.`, or
+`Denied by the owner; nothing was run.`, or `Not run: <code>` followed by the
+blockers, one per line (`retirement_available` adds `Ordinary retirement is
+available; Gru retires it instead.`). The result is stored on the card's own row
 (`notifications.resolution_detail`, migration 36) and the board renders it on
 the card as `Result: …`, one line per blocker, not only in the
 `notification.resolved` audit event. A resolved card leaves the FOR YOU band
 (as every producer's does) and is read in the bell's feed; the board keeps an
 owner card in its snapshot for 24 hours after it resolves (the newest 20), so
 its result stays readable however many notifications arrived since it was
-posted. If the request ends some other way (retired,
-settled, abandoned) before the owner answers, the next reconcile withdraws
+posted. If the subject ends some other way (a request retired, settled or
+abandoned; a marker cleared or settled; a recovery contract that no longer
+holds) before the owner answers, the next reconcile withdraws
 the undecided card and ends the record `withdrawn`; a decision that landed
 first is carried out instead.
 
 **Crash safety.** A restart's reconcile finishes what a crash left: it posts
 a missing card, processes a decided card whose record is still `proposed`,
 re-reads the fences of an `approved` record, and, for an `executing` record,
-settles from an abandonment recorded after its `executing` event (its own,
-by the reason prefix, is `succeeded`; any other is `abandoned-elsewhere`) or
+settles from the action's own audit recorded after its `executing` event (its
+own, by the reason prefix for an abandonment or by its resolution identity for
+a ruling and a confirmation, is `succeeded`; any other is
+`abandoned-elsewhere`) or
 else re-reads the fences and runs it. It resolves the card of any ended
 record that still has one open. A card the reconcile cannot post for good (for
 example a request id long enough to break the card's own length bounds) ends
 the record `refused` as `card-post-failed`, as at proposal time, so the
-request is never left with a record that waits for a card that cannot exist;
+subject is never left with a record that waits for a card that cannot exist;
 a card the store could not take only because it was busy or locked keeps the
 record `proposed` and is posted again on the next reconcile (the proposal
 classifies the same way and answers `201` with the record still `proposed`).
-The abandonment never runs twice.
+The action never runs twice.
 
 **When the service is not hosted.** Approval cards need the service hosted:
 it runs only where Silas ops are on (`[silas] enabled = true`); with them off
@@ -722,7 +788,7 @@ detail starts with it), so no Approve is ever recorded on a card that nothing
 would carry out. A decided, `approved` or `executing` record is left alone: the
 owner already answered, or the operation is under way and may already have
 run, and the next boot that hosts the service processes it as it always does
-(its reconcile reads the decision and the abandonment audit; the abandonment
+(its reconcile reads the decision and the action's audit; the action
 never runs twice).
 
 **Attribution.** The same caller-declared model as `/abandon`: one shared

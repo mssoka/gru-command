@@ -858,7 +858,7 @@ keeps NULL: its identity is unknown, so it never matches by its masked
 text; its process is asked about again and a registry row of that kind is
 left to the sweep's reap. The digest is a column, never an event field.
 
-### Owner approvals of abandonment (#523)
+### Owner approvals of owner-reserved actions (#523, #565)
 
 Migration 35 (`owner-approvals`) is additive: no existing table changes.
 `owner_approvals` holds one row per proposal: `id` (`oa-<uuid>`), `kind`
@@ -868,14 +868,31 @@ row's `job_id`), `reason`, `idempotency_key` (unique), `body_fingerprint`
 (sha256 of kind, request, reason and `by`), `notification_id`
 (`owner-approval:<id>`, unique), `state` (`proposed`, `approved`,
 `executing`, `succeeded`, `denied`, `refused`, `withdrawn`), `attempts`,
-`executing_seq`, `abandonment_event_seq`, `refusal_code`,
+`executing_seq`, `abandonment_event_seq` (the seq of the event that carried
+the action out), `refusal_code`,
 `refusal_blockers` (JSON) and timestamps. A partial unique index allows at
 most one row per request in `proposed`, `approved` or `executing`. Every
 state change is one transaction that appends an `owner-approval.<state>`
 event (a failed attempt appends `owner-approval.attempt-failed`), so a
-restart's reconcile finishes what a crash left and the native abandonment
+restart's reconcile finishes what a crash left and the native action
 never runs twice. The service is `src/dispatch/owner-approvals.ts`; see
-[DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment).
+[DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-approval-of-owner-reserved-actions).
+
+Migration 39 (`owner-approvals-subject-kind`) rebuilds that table (SQLite
+cannot widen a CHECK in place, so the table is rebuilt as in migration 30)
+for the other owner-reserved actions: `kind` widens to `directive-abandon`,
+`rebrief-abandon`, `recovery-owner-resolution` and `recovery-owner-stop`, the
+target moves to `subject_kind` (`directive`, `rebrief-marker`, `recovery`)
+plus `subject_id` with `request_id` kept for the directive subject only,
+`fence_state` becomes nullable (only a live directive has a state),
+`fence_contract_json` keeps the recovery kinds' ten-field contract,
+`resolution_id` and `expected_resolution_fingerprint` carry the recovery
+identity, and one CHECK keeps every kind's subject and fence columns
+consistent with it. Every row written before the migration is a directive
+abandonment, and the `INSERT…SELECT` maps it to exactly that. The one-active
+index is re-keyed from `request_id` to `(subject_kind, subject_id)`, so a
+marker generation and a recovery subject fence exactly as a request does, and
+`idx_owner_approvals_job` is preserved.
 
 Migration 36 (`notification-resolution-detail`) adds the nullable
 `notifications.resolution_detail`: the result a follow-through

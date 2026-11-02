@@ -96,23 +96,24 @@ describe('owner approval - the text that sends Gru and the owner to the new rout
     expect(terminalCard.detail).toContain('/retire when the service can verify cessation');
   });
 
-  it('roles/gru.md routes a directive request to the proposal and keeps the re-brief marker instruction', () => {
+  it('roles/gru.md routes each owner-reserved action to a proposal and keeps the owner barrier', () => {
     const source = read('roles', 'gru.md').replace(/\s+/gu, ' ');
     expect(source).toContain('For a directive request, propose abandonment with `POST /api/owner-approvals`; the owner\'s Approve carries it out.');
-    expect(source).toContain('For a re-brief marker, ask the owner whether to abandon it, quoting the card.');
+    expect(source).toContain('For a re-brief marker, propose its abandonment the same way with `kind: "rebrief-abandon"` and its `marker_id`.');
+    expect(source).toContain('propose `recovery-owner-resolution` or `recovery-owner-stop` with the exact fences your readback gives');
     expect(source).toContain('Never call `/abandon`, record the owner\'s decision, or send owner attribution yourself.');
   });
 
   it('docs/DIRECTIVE-RECOVERY.md documents both routes, every state and every refusal code', () => {
     const doc = read('docs', 'DIRECTIVE-RECOVERY.md');
-    expect(doc).toContain('### Owner approval of abandonment');
+    expect(doc).toContain('### Owner approval of owner-reserved actions');
     expect(doc).toContain('POST /api/owner-approvals');
     expect(doc).toContain('GET /api/owner-approvals/{id}');
     expect(doc).toContain('POST /api/silas/directives/{request_id}/abandon');
     for (const state of ['proposed', 'approved', 'executing', 'succeeded', 'denied', 'refused', 'withdrawn']) {
       expect(doc, state).toContain(state);
     }
-    for (const code of ['card-post-failed', 'decider-not-owner', 'abandoned-elsewhere', 'stale-fence', 'execution-error',
+    for (const code of ['card-post-failed', 'decider-not-owner', 'abandoned-elsewhere', 'recorded-elsewhere', 'stale-fence', 'execution-error',
       'retirement_available', 'live_work', 'directive_not_live', 'request_mismatch', 'terminal_receipt_present']) {
       expect(doc, code).toContain(code);
     }
@@ -133,10 +134,28 @@ describe('owner approval - the text that sends Gru and the owner to the new rout
     expect(doc).toContain('owner_approvals_not_hosted');
   });
 
+  it('docs/DIRECTIVE-RECOVERY.md names every kind, its body field and the stop rule', () => {
+    const doc = read('docs', 'DIRECTIVE-RECOVERY.md').replace(/\s+/gu, ' ');
+    for (const kind of ['directive-abandon', 'rebrief-abandon', 'recovery-owner-resolution', 'recovery-owner-stop']) {
+      expect(doc, kind).toContain(kind);
+      expect(doc, kind).toContain(`owner-approval.${kind}`);
+    }
+    // Each kind names its own target field, and the recovery kinds their contract.
+    for (const field of ['request_id', 'marker_id', 'recovery_kind', 'subject_id', 'resolution_id',
+      'expected_resolution_fingerprint', 'expected_transfer_fingerprint', 'expected_lineage_sha256',
+      'expected_work_revision', 'expected_contract_sha256']) {
+      expect(doc, field).toContain(field);
+    }
+    // The two recovery kinds are never chained and execute nothing.
+    expect(doc).toContain('A stop confirmation is proposable only when a ruling already exists');
+    expect(doc).toContain('confirming a stop never records a ruling');
+    expect(doc).toContain('A recorded recovery ruling and a stop confirmation execute nothing');
+  });
+
   it('docs/OPERATIONS.md points the unknown-custody sentence at the owner-approval section', () => {
     const operations = read('docs', 'OPERATIONS.md').replace(/\s+/gu, ' ');
     expect(operations).toContain('POST /api/owner-approvals');
-    expect(operations).toContain('DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment');
+    expect(operations).toContain('DIRECTIVE-RECOVERY.md#owner-approval-of-owner-reserved-actions');
     expect(operations).toContain('DIRECTIVE-RECOVERY.md#owner-abandonment-unknown-custody');
   });
 });
