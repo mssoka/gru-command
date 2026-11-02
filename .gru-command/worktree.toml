@@ -1625,6 +1625,7 @@ gc-583-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-583-static = "npm run lint && npm run typecheck && npm run build"
 gc-583-heavy = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-e2e.test.ts"
 gc-583-red = 'set -e; root="$PWD"; base=64d645c25da087eebeab974a8e497876d4780b04; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc583-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/interrupted-dispatch.test.ts "$d/test/interrupted-dispatch.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-583-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-583-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/interrupted-dispatch.test.ts -t "B1: a boot pass blocks a working job that crashed before its lane row"; a=$?; set -e; echo "gc-583-red vitest exit=$a EXPECTED-NONZERO: the base leaves the lane-less interrupted dispatch working"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-583 B1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-583 "$d/results.json" "interrupted dispatch without a lane (issue #583) B1: a boot pass blocks a working job that crashed before its lane row" || exit 2; echo "EXPECTED-NONZERO: B1 REDs by assertion against the pre-change base"; exit 1'
+
 # #551: pipeline admission runs Nefario's briefing-review gate. The service
 # gains a record-nothing `evaluateDispatch` (the HTTP route keeps
 # `admitDispatch` untouched), migration 38 adds a nullable `defer_reason`, the
@@ -1649,3 +1650,33 @@ gc-551-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-551-static = "npm run lint && npm run typecheck && npm run build"
 gc-551-heavy = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/briefing-review-server.test.ts test/creation-continuation.test.ts"
 gc-551-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2; headrev=$(git rev-parse HEAD); prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc551-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/pipeline-service.test.ts "$d/test/pipeline-service.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-551-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-551-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/pipeline-service.test.ts -t "A1: a READY review admits through the pipeline and dispatches with its provenance"; a=$?; set -e; echo "gc-551-red vitest exit=$a EXPECTED-NONZERO: the base pipeline never consults the gate"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-551 A1 passed against the base"; exit 2; fi; cp "$d/results.json" "$prep/gc-551-red.results.json"; set +e; node "$root/tools/assert-named-red-baseline.mjs" gc-551 "$prep/gc-551-red.results.json" "pipeline admission — the briefing-review gate (#551) A1: a READY review admits through the pipeline and dispatches with its provenance (#551)" > "$prep/gc-551-red.classifier.txt" 2>&1; c=$?; set -e; cat "$prep/gc-551-red.classifier.txt"; printf "gc-551-red base=%s head=%s dir=%s results=%s classifier=%s\n" "$base" "$headrev" "$d" "$prep/gc-551-red.results.json" "$prep/gc-551-red.classifier.txt" > "$prep/gc-551-red.last-snapshot.txt"; if [ "$c" -ne 0 ]; then exit 2; fi; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change base"; exit 1'
+# #571: the pi directive guard refuses the SDK's own normal form of a tool
+# call. The `beforeToolCall` override snapshotted the SDK's validated args and
+# compared them with the raw model arguments, so a `read` carrying
+# `{offset: null, limit: null}` (optional nulls dropped by
+# `validateToolArguments`) or a `bash` with `timeout: "60"` (Value.Convert)
+# threw `effective native tool arguments differ from the exact persisted intent`
+# on its first effect under a live directive. The guard now re-derives the form
+# the SDK hands it (`prepareArguments` -> `validateToolArguments`) and keeps
+# every other limb; because that derivation trusts `prepareArguments`, the
+# accepted authority manifest binds each tool's `prepareArguments` too, so an
+# outer hook that rewrites it mid-batch is refused (A4). `gc-571-focused` runs
+# the edited adapter suite with the
+# registry pins and the neighbouring directive suites (the heavy files are its
+# own `--config vitest.heavy.config.ts` leg, so the fast segment stays inside
+# the fast budget; run `gc-571-static` first — one scheduled-verification case
+# executes the built dist/verify/capture-cli.js helper and the heavy
+# restart-recovery suite imports dist/runtime/pi-adapter.js); `gc-571-static`
+# is the lint + typecheck + build gate;
+# `gc-571-red` overlays the FINAL test/pi-adapter.test.ts on an isolated
+# `git archive` of the branch base aafefcff (node_modules symlinked, approved
+# RPC patch first) and runs A1 by literal title: the base compares the raw
+# model arguments, so the seeded `read` is refused and the sibling bash is
+# fenced — the case REDs by assertion, never by import. The Vitest JSON report
+# is classified by tools/assert-named-red-baseline.mjs (a collection/setup/
+# import failure, or a missing/green A1 case, exits 2); the vitest exit is
+# echoed intact and the snapshot directory and ignored pointer file are
+# preserved for inspection.
+gc-571-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-adapter.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/directive-own-run-fence.test.ts test/fix-directive.test.ts test/restart-recovery-progress.test.ts"
+gc-571-static = "npm run lint && npm run typecheck && npm run build"
+gc-571-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc571-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/pi-adapter.test.ts "$d/test/pi-adapter.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-571-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-571-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/pi-adapter.test.ts -t "A1 a read with optional nulls and its batch sibling reach their effects"; a=$?; set -e; echo "gc-571-red vitest exit=$a EXPECTED-NONZERO: the base compares the persisted call with the raw model arguments"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-571 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-571 "$d/results.json" "A1 a read with optional nulls and its batch sibling reach their effects" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change guard"; exit 1'

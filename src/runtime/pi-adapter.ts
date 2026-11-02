@@ -11,7 +11,7 @@ import {
   SettingsManager,
 } from '@earendil-works/pi-coding-agent';
 import type { InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
-import { contentText, getCurrentSystemMessage, getCurrentSystemPrompt, type Api, type Model, type ThinkingLevel } from '@earendil-works/pi-ai';
+import { contentText, getCurrentSystemMessage, getCurrentSystemPrompt, validateToolArguments, type Api, type Model, type ThinkingLevel } from '@earendil-works/pi-ai';
 import { realpathSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -1100,6 +1100,9 @@ export class PiRuntime implements AgentRuntime {
           return createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.systemPrompt,
             toolExecution: session.agent.toolExecution,
             tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters,
+              // The guard re-derives the SDK's normal form through this function, so the
+              // accepted setup must bind it like the executor it prepares for.
+              prepareArguments: tool.prepareArguments === undefined ? null : tool.prepareArguments.toString(),
               executionMode: tool.executionMode ?? null, guarded: directiveExecutorOrigins.has(tool.execute),
               implementation: (directiveExecutorOrigins.get(tool.execute) ?? tool.execute).toString(),
               implementationRef: executableId(directiveExecutorOrigins.get(tool.execute) ?? tool.execute) })).sort((a, b) => a.name.localeCompare(b.name)),
@@ -1394,10 +1397,30 @@ export class PiAgentHandle implements AgentHandle {
         const args = directive === undefined ? input.args : structuredClone(input.args);
         const invocation = directive === undefined ? input.toolCall : structuredClone(input.toolCall);
         const assistantMessage = directive === undefined ? input.assistantMessage : structuredClone(input.assistantMessage);
+        const toolFor = (name: string): SdkTool | undefined => (input.context.tools ?? []).find((candidate) => candidate.name === name);
+        const expectedArguments = (call: typeof invocation): unknown => {
+          const tool = toolFor(call.name);
+          // A hook outside this one handed over a context this directive's tool
+          // setup does not name: the refusal is the authority failure it is, not
+          // a weaker lookup miss ahead of it.
+          if (tool === undefined) throw new DirectiveCheckpointError('effective native executor authority differs from its accepted tool setup');
+          // The SDK hands this hook its own normal form of the persisted call
+          // (agent-loop: prepareToolCallArguments -> validateToolArguments: optional
+          // nulls dropped, primitives coerced). Re-derive that form; the raw model
+          // JSON is not an identity. prepareArguments may rewrite what it is given,
+          // so it gets a copy: the persisted call stays the reference the other
+          // limbs and the intent journal compare.
+          const prepared = tool.prepareArguments === undefined ? call
+            : { ...call, arguments: tool.prepareArguments(structuredClone(call.arguments)) as typeof call.arguments };
+          return validateToolArguments(tool, prepared);
+        };
         const check = (effectiveArgs: unknown = input.args, effectSignal = signal): void => {
           if (directive === undefined) return;
           this.assertDirectiveExecutionAuthority(directive, effectSignal);
-          if (!isDeepStrictEqual(input.args, args) || !isDeepStrictEqual(effectiveArgs, args) || !isDeepStrictEqual(args, invocation.arguments) ||
+          // The third limb still fences a hook installed outside this one that
+          // rewrites input.args before this snapshot: the args it handed over no
+          // longer match the normal form of the persisted call.
+          if (!isDeepStrictEqual(input.args, args) || !isDeepStrictEqual(effectiveArgs, args) || !isDeepStrictEqual(args, expectedArguments(invocation)) ||
               !isDeepStrictEqual(input.toolCall, invocation) || !isDeepStrictEqual(input.assistantMessage, assistantMessage)) {
             throw new DirectiveCheckpointError('effective native tool arguments differ from the exact persisted intent');
           }
