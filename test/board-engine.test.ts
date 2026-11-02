@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine, type BoardSnapshot } from '../src/board/engine.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -727,11 +727,11 @@ describe('board engine — liveness-first rail and job trackers', () => {
 });
 
 describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
-  function fresh(): { api: LedgerApi; bus: EventBus; engine: BoardEngine } {
+  function fresh(now?: () => number): { api: LedgerApi; bus: EventBus; engine: BoardEngine } {
     const db = new LedgerDb(tmpDir());
     const bus = new EventBus();
     const api = new LedgerApi(db.handle, { bus });
-    return { api, bus, engine: new BoardEngine({ ledger: api, bus }) };
+    return { api, bus, engine: new BoardEngine({ ledger: api, bus, now }) };
   }
 
   const SHA = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
@@ -819,9 +819,14 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(rows.map((row) => `${row.jobId}:${row.provider}`)).toEqual(['job-a:gitlab', 'job-b:github']);
   });
 
-  it('drops the GitLab row when the MR is merged or closed after the approval', () => {
+  it('drops the GitLab row when the MR is merged after the approval', () => {
     const { api, engine } = fresh();
     stageReadyGitLabMrJob(api, 'job-gl-merged', SHA, { state: 'merged', mergeable: 'unknown' });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when the MR is closed without a merge', () => {
+    const { api, engine } = fresh();
     stageReadyGitLabMrJob(api, 'job-gl-closed', SHA, { state: 'closed', mergeable: 'unknown' });
     expect(engine.snapshot().ownerPrs).toEqual([]);
   });
@@ -832,9 +837,14 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(engine.snapshot().ownerPrs).toEqual([]);
   });
 
-  it('drops the GitLab row when there is no head pipeline or the pipeline ran at an older head', () => {
+  it('drops the GitLab row when the MR has no head pipeline', () => {
     const { api, engine } = fresh();
     stageReadyGitLabMrJob(api, 'job-gl-no-pipeline', SHA, { head_pipeline: null });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when the pipeline ran at an older head', () => {
+    const { api, engine } = fresh();
     stageReadyGitLabMrJob(api, 'job-gl-old-pipeline', SHA, {
       head_pipeline: { id: 4243, sha: 'ffff0000aaaa1111bbbb2222cccc3333dddd4444', status: 'success', source: 'merge_request_event', web_url: null },
     });
@@ -853,16 +863,13 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
   });
 
   it('drops the GitLab row once the observation is older than the 24h evidence bound', () => {
-    const { api, engine } = fresh();
+    let now = Date.now();
+    const { api, engine } = fresh(() => now);
     stageReadyGitLabMrJob(api, 'job-gl-stale');
-    // No GitLab poll exists: the newest read ages out instead of certifying forever.
-    vi.useFakeTimers({ toFake: ['Date'] });
-    try {
-      vi.setSystemTime(new Date(Date.now() + 24 * 60 * 60 * 1000 + 60_000));
-      expect(engine.snapshot().ownerPrs).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    // No GitLab poll exists: the newest read ages out instead of certifying
+    // forever. The bound comes from the engine's clock seam, not `Date.now()`.
+    now += 24 * 60 * 60 * 1000 + 60_000;
+    expect(engine.snapshot().ownerPrs).toEqual([]);
   });
 
   it('ships one ownerPrs row for the exact-head ready job (stable id, job order)', () => {

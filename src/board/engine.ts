@@ -1038,7 +1038,7 @@ export class BoardEngine {
           const version = acceptance?.version;
           if (typeof version !== 'number' || version < revision.required) return null;
         }
-        return ownerReadyPr(job, readOwnerEvidence(this.ledger, job, Date.now()));
+        return ownerReadyPr(job, readOwnerEvidence(this.ledger, job, this.now()));
       })
       .filter((row): row is OwnerPrView => row !== null)
       .sort((left, right) => left.jobId.localeCompare(right.jobId));

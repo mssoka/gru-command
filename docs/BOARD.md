@@ -165,10 +165,10 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   round `verdict-posted` / `approved` with its frozen `targetRef` equal
   to that sha. A merge request is read once per review round and nothing
   polls it, so its evidence must be younger than 24 hours (the row shows
-  the observation age); older evidence, a newer failed read, a link on a
-  host this service does not support for GitLab, or an MR
-  merged/closed/re-run after the last read renders no row until the next
-  round re-reads. Anything
+  the observation age); older evidence, a newer failed read, or a link on
+  a host this service does not support for GitLab renders no row, while a
+  merge, close, or pipeline re-run after the last read stays invisible
+  until the next round reads again or the record ages out. Anything
   missing, stale, moved, dirty, blocked, pending/failed, or
   changes-requested renders no row (fail closed — no heuristic).
   Known limitation (deliberate): GitHub-native review approvals beyond

@@ -339,8 +339,9 @@ sight).
 A permanent **FOR YOU** owner band (owner approval 2026-09-28;
 decision-inbox release 2026-10-11) sits
 ABOVE the job bands — typed owner decisions with recorded choices,
-owner-only notices (no fake Ack) and evidence-bound ready PRs
-(OPEN PR, external https link only) —
+owner-only notices (no fake Ack) and evidence-bound ready PRs/MRs
+(`OPEN PR` / `OPEN MR`, external https link only, the row carrying the
+exact approved head, `CI green at that head`, and `observed <age> ago`) —
 see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
 readiness rule. It reads as the attention card (cockpit rework): under
 its `FOR YOU · N pending` heading, `2 things need you`, then one line about

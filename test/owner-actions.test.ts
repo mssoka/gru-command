@@ -99,8 +99,8 @@ describe('owner-action projection — fail-closed readiness gate', () => {
     });
   });
 
-  // Register each case explicitly: the full-suite shape guard must pin all
-  // 28 cases, not just one registration site hidden inside a loop.
+  // Register each case explicitly: the full-suite shape guard must pin every
+  // case, not just one registration site hidden inside a loop.
   it('renders NO ready row when: job is not in-review (hold)', () => {
     expect(ownerReadyPr(job({ status: 'blocked' }), evidence())).toBeNull();
   });
@@ -129,7 +129,10 @@ describe('owner-action projection — fail-closed readiness gate', () => {
   });
 
   it('renders NO ready row when: PR already merged', () => {
-    expect(ownerReadyPr(job(), evidence({ merged: true, prOpen: false }))).toBeNull();
+    // `prOpen:true` isolates the `merged` limb: the closed and never-observed
+    // cases below withhold at `!open`, so dropping `if (evidence.merged)`
+    // would leave only this case red.
+    expect(ownerReadyPr(job(), evidence({ merged: true, prOpen: true }))).toBeNull();
   });
 
   it('renders NO ready row when: PR closed without merging', () => {
