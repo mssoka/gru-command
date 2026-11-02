@@ -539,39 +539,53 @@ admission evidence leaves the phase `awaiting` (never a fabricated
 success). Migration 12 is additive; nothing here changes owner stops,
 merge/deploy/restart policy or any callers' notification semantics.
 
-**Interrupted initial dispatch (issue #560).** A crash between the
-dispatch handoff and the first spawn left a job `working` with nothing
-owing it: the in-process failure handler never ran, the pipeline's
-interrupted-startup check needs an `admitting` entry a plain
-`POST /api/dispatch` never creates, and Silas's stall detector excludes
-initial dispatch. `reconcileInterruptedDispatches`
+**Interrupted initial dispatch (issue #560).** Once the job lane row
+exists, a crash between the dispatch handoff and the first spawn leaves
+the job `working` with nothing owing it: the in-process failure handler
+never ran, the pipeline's interrupted-startup check needs an `admitting`
+entry a plain `POST /api/dispatch` never creates, and Silas's stall
+detector excludes initial dispatch. `reconcileInterruptedDispatches`
 ([`src/dispatch/interrupted-dispatch.ts`](../src/dispatch/interrupted-dispatch.ts))
-is the witness, and it runs both at boot and inside the bounded durable
-pass. Candidate shape (`listInterruptedDispatchCandidates`, plus the
-single-row `hasLiveJobLane`): `working`, a `job.handoff` event, no
+is the witness for that part of the window, and it runs both at boot and
+inside the bounded durable pass. Candidate shape
+(`listInterruptedDispatchCandidates`, plus the single-row
+`hasLiveJobLane`): `working`, a `job.handoff` event, no
 `job.minion-spawned` event, no top-level `minion` agent row, and an
 **active** job lane — `paused` means a sweep or release paused on live
 processes, so it is never a candidate. The service then re-checks what
 SQL cannot see: an in-memory dispatch admission, a continuation lane
-owner, an open provider wait, a pipeline entry still `admitting`, and an
-unsettled verification run. A candidate that survives every guard is
-noted first (`no worker ever started; resolve the interrupted dispatch
-and re-arm` — the same obligation wording the pipeline writes) and then
-moved to `blocked`, with ONE `dispatch.interrupted.<jobId>`
+owner, an open provider wait, and an unsettled verification run; it
+declines while a pipeline entry is still `admitting` (it reads the entry,
+it does not ignore pipeline work). A candidate that survives every guard
+is noted first (`no worker ever started; resolve the interrupted
+dispatch and re-arm` — it shares the pipeline note's `no worker ever
+started` obligation wording), then the card is posted, and then the job
+is moved to `blocked`, with ONE `dispatch.interrupted.<jobId>`
 `action-required` card deduped `active`: one card per job until it is
 resolved, and a fresh interruption after a resolve posts a new one. The
 pass never dispatches, sweeps, bins or mutates a worktree.
 
+**Known limitation (follow-up).** The witness needs the job lane row. A
+crash after `working` and the handoff but before `registerWorktree`
+(including the disk-floor wait, which can be the longest part of the
+window) still leaves the job `working` with no candidate row, and nothing
+else observes it: the pipeline's own check needs an `admitting` entry and
+Silas's stall detector excludes initial dispatch by design. That half is
+a recorded gap, not a covered one; a boot-only lane-less candidate class
+is the planned follow-up (a fresh process holds no admission, so it
+cannot race a live dispatch).
+
 Note-first is load-bearing. The whole guard block and the write run in
 one synchronous turn (no `await` in that module), so a concurrent
 dispatch cannot take its admission or create its lane between them; and
-because the note lands before the status, a lost status write leaves the
-row a candidate the next pass retries with the obligation already
-recorded — a repeated identical note rather than a silent block. There is
-deliberately no durable cursor: the candidate set is the crash leftover,
-not a multi-page population, and a persistently failing row must keep
-being retried from the head instead of being rotated past like the
-phase-handoff scans above.
+because the note lands before the card and the status, a lost status
+write leaves the row a candidate the next pass retries with the
+obligation already recorded and the same deduped card — a repeated
+identical note rather than a silent block. There is deliberately no
+durable cursor: one bounded query (`limit` default 200) reads the crash
+leftover, not a multi-page population, and a row that cannot be written
+keeps its place at the head so the next pass retries it instead of
+rotating past it like the phase-handoff scans above.
 
 ### Bounded reconcile cursors (migration 13, PR136 r4 repair)
 

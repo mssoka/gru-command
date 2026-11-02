@@ -103,7 +103,8 @@ export interface DurableReconcileReport extends Record<string, unknown> {
   /** Issue #560: initial dispatches interrupted before their first minion,
    * surfaced as blocked with one action-required card each. */
   readonly interruptedDispatches: InterruptedDispatchReport;
-  /** Rows examined across all passes and windows. */
+  /** Rows examined across all passes and windows (including the interrupted
+   * dispatch candidates this report carries separately). */
   readonly examined: number;
   /** Durable transitions this pass completed (settlements, hand-backs,
    * publications, stale-intent closes). */
@@ -176,7 +177,13 @@ export function reconcileDurableWork(
     handbacks,
     reports,
     interruptedDispatches,
-    examined: directives.examined + phases.examined + handbacks.deliveries + handbacks.cards + reports.examined,
+    examined:
+      directives.examined +
+      phases.examined +
+      handbacks.deliveries +
+      handbacks.cards +
+      reports.examined +
+      interruptedDispatches.examined,
     advanced:
       directives.completed +
       phases.completed +

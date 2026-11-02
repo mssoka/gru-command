@@ -45,13 +45,15 @@ function boot(): Harness {
 
 /** The crash shape #560 reports on: the job row, the recorded handoff, the
  * move to `working`, an ACTIVE job lane (created before the spawn) and its
- * bootstrap marker — and no agent, no spawn event, ever. */
+ * bootstrap marker — and no agent, no spawn event, ever. Production names
+ * the lane with the job id (`worktrees/manager.ts` `registerWorktree`), so
+ * the fixture does too; a job-id-keyed guard must not silently miss it. */
 function seedInterruptedDispatch(h: Harness, id: string, title = `job ${id}`): string {
   h.ledger.addJob({ id, repo: 'demo', title, briefing: 'b' });
   h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId: id, payload: { repo: 'demo', repoPath: '/tmp/demo' } });
   h.ledger.setJobStatus(id, 'working');
   h.ledger.registerWorktree({
-    id: `lane-${id}`,
+    id,
     kind: 'job',
     repoPath: '/tmp/demo',
     repoName: 'demo',
@@ -59,7 +61,7 @@ function seedInterruptedDispatch(h: Harness, id: string, title = `job ${id}`): s
     sha: 'a'.repeat(40),
     jobId: id,
   });
-  h.ledger.appendCustomEvent({ kind: 'worktree.bootstrapped', jobId: id, payload: { id: `lane-${id}` } });
+  h.ledger.appendCustomEvent({ kind: 'worktree.bootstrapped', jobId: id, payload: { id } });
   return id;
 }
 
@@ -212,14 +214,14 @@ describe('interrupted initial dispatch (issue #560)', () => {
   it('A2: a swept lane is never a candidate', () => {
     const h = boot();
     const jobId = seedInterruptedDispatch(h, 'job-swept');
-    h.ledger.setWorktreeStatus(`lane-${jobId}`, 'swept');
+    h.ledger.setWorktreeStatus(jobId, 'swept');
     expectExcludedBySql(h, jobId);
   });
 
   it('A2: a paused lane is never a candidate (live processes, not an interruption)', () => {
     const h = boot();
     const jobId = seedInterruptedDispatch(h, 'job-paused');
-    h.ledger.setWorktreeStatus(`lane-${jobId}`, 'paused');
+    h.ledger.setWorktreeStatus(jobId, 'paused');
     expectExcludedBySql(h, jobId);
   });
 
@@ -327,12 +329,14 @@ describe('interrupted initial dispatch (issue #560)', () => {
     }
   });
 
-  it('pages through the candidates under a limit and never duplicates a card', async () => {
+  it('bounds one pass to the limit, resumes from the head, and never duplicates a card', async () => {
     const h = boot();
     const jobIds = ['job-page-a', 'job-page-b', 'job-page-c'].map((id) => seedInterruptedDispatch(h, id));
     const { reconcileInterruptedDispatches } = await import('../src/dispatch/interrupted-dispatch.js');
     const deps = { ledger: h.ledger, notifications: h.notifications };
 
+    // ONE bounded query per pass (no cursor): blocked rows leave the set, so
+    // the next pass reaches the tail from the head.
     const first = reconcileInterruptedDispatches(deps, { limit: 2 });
     expect(first.examined).toBe(2);
     expect(first.blocked).toHaveLength(2);
@@ -363,5 +367,32 @@ describe('interrupted initial dispatch (issue #560)', () => {
     const retried = runPass(h);
     expect(retried.interruptedDispatches?.blocked).toEqual([jobId]);
     expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+  });
+
+  it('reports a status write that throws after the note as failed, and retries it next pass', () => {
+    const h = boot();
+    const jobId = seedInterruptedDispatch(h, 'job-status-throw');
+    const status = vi.spyOn(h.ledger, 'setJobStatus').mockImplementation(() => {
+      throw new Error('status write lost');
+    });
+    try {
+      const report = runPass(h);
+      // The card is already posted (note → card → status), and the row is
+      // still `working`, so the next pass can retry it as the log promises.
+      expect(report.interruptedDispatches?.failed).toBe(1);
+      expect(report.failures).toBe(1);
+      expect(report.ok).toBe(false);
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+      expect(candidateIds(h)).toContain(jobId);
+      expect(h.ledger.getJob(jobId)?.note).toContain('no worker ever started');
+      expect(cards(h, jobId)).toHaveLength(1);
+    } finally {
+      status.mockRestore();
+    }
+    const retried = runPass(h);
+    expect(retried.interruptedDispatches?.blocked).toEqual([jobId]);
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+    // The deduped card was never posted twice.
+    expect(cards(h, jobId)).toHaveLength(1);
   });
 });

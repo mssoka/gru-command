@@ -1516,7 +1516,8 @@ gc-569-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec
 # #560 (#503 P2): an initial dispatch interrupted between its recorded handoff
 # and its first minion surfaces as blocked (durable note + one action-required
 # card) instead of hanging in `working`. `gc-560-focused` runs the new suite
-# with the registry pins and the suites that own the touched seams;
+# with the registry pins (`prune-stale-dist`), the docs contracts and the
+# suites that own the touched seams;
 # `gc-560-static` is the lint + typecheck + build gate; `gc-560-heavy` builds
 # and re-runs the dispatch end-to-end suite (boot wiring). `gc-560-red` overlays
 # the FINAL test/interrupted-dispatch.test.ts on an isolated `git archive` of the
@@ -1528,7 +1529,7 @@ gc-569-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec
 # collection/setup/import failure or a missing/green A1 case exits 2); the vitest
 # exit is echoed intact and the snapshot directory and ignored pointer file are
 # preserved for inspection.
-gc-560-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/interrupted-dispatch.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/ledger-api.test.ts test/pipeline-service.test.ts test/durable-reconcile.test.ts"
+gc-560-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/interrupted-dispatch.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/ledger-api.test.ts test/pipeline-service.test.ts test/durable-reconcile.test.ts test/prune-stale-dist.test.ts test/docs-contracts.test.ts"
 gc-560-static = "npm run lint && npm run typecheck && npm run build"
 gc-560-heavy = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-e2e.test.ts"
 gc-560-red = 'set -e; root="$PWD"; base=a12aaadc8f6c2e2b2750233b2063a906a28df6f6; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc560-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/interrupted-dispatch.test.ts "$d/test/interrupted-dispatch.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-560-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-560-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/interrupted-dispatch.test.ts -t "A1: blocks an initial dispatch interrupted before any minion, once, and leaves the lane alone"; a=$?; set -e; echo "gc-560-red vitest exit=$a EXPECTED-NONZERO: the base leaves the interrupted dispatch working"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-560 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-560 "$d/results.json" "interrupted initial dispatch (issue #560) A1: blocks an initial dispatch interrupted before any minion, once, and leaves the lane alone" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change base"; exit 1'

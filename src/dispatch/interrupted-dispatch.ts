@@ -5,18 +5,15 @@ import type { FollowThroughNotifications } from './obligations.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/** The durable note every interrupted initial dispatch carries. The wording
- * matches the pipeline's `surfaceInterruptedStartup` obligation, so an
- * operator who has resolved one already knows this one. */
+/** The durable note every interrupted initial dispatch carries. It shares the
+ * pipeline's `no worker ever started` obligation wording (the phrase an
+ * operator already knows), not its full sentence. */
 export const INTERRUPTED_DISPATCH_NOTE =
   'dispatched before any minion started — no worker ever started; resolve the interrupted dispatch and re-arm';
 
-/** Candidates examined per page. A crash in the dispatch window is rare, so
- * one small page covers a boot; the page loop is the bound, not a cursor. */
-const PAGE_SIZE = 100;
-/** Hard page cap: an unbounded pass would let a large damaged ledger hold the
- * boot sequence. Whatever is left is examined on the next trigger. */
-const MAX_PAGES = 5;
+/** Candidates ONE pass examines. A crash in the dispatch window is rare, so a
+ * single bounded query covers a boot; the query is the bound, not a cursor. */
+const DEFAULT_LIMIT = 200;
 /**
  * The facts ONE candidate is judged on, each read by the caller from the
  * durable record. Kept as a plain data shape so the layer-2 decision is pure
@@ -91,7 +88,6 @@ export interface InterruptedDispatchDeps {
   readonly ledger: Pick<
     LedgerApi,
     | 'listInterruptedDispatchCandidates'
-    | 'jobRowid'
     | 'getJob'
     | 'hasLiveJobLane'
     | 'listJobAdmissions'
@@ -109,13 +105,13 @@ export interface InterruptedDispatchDeps {
 }
 
 export interface InterruptedDispatchReport {
-  /** Candidates the pre-filter returned. */
+  /** Candidates the bounded query returned. */
   readonly examined: number;
-  /** Jobs this pass surfaced as blocked (status + note + one card). */
+  /** Jobs this pass surfaced as blocked (note + one card + status). */
   readonly blocked: readonly string[];
   /** Candidates a guard excluded, each entry naming the guard's reason. */
   readonly skipped: readonly string[];
-  /** Candidates whose writes threw (retried on the next pass). */
+  /** Candidates whose reads or writes threw (retried on the next pass). */
   readonly failed: number;
 }
 
@@ -123,14 +119,19 @@ export interface InterruptedDispatchReport {
  * Surface an initial dispatch interrupted between its recorded handoff and
  * its first minion (issue #560, #503 P2).
  *
- * A crash inside the dispatch window — after `job.handoff` + `working`, after
- * the job lane exists, and before any minion spawned — leaves the job
+ * Once the job lane row exists, a crash inside the dispatch window — after
+ * `job.handoff` + `working` and before any minion spawned — leaves the job
  * `working` forever: the in-process failure handler never runs, the
  * pipeline's `surfaceInterruptedStartup` needs an `admitting` entry a plain
  * `POST /api/dispatch` never has, and Silas's stall detector excludes
  * initial dispatch. This pass is the missing witness: it blocks such a lane
  * with a durable note and ONE action-required card, so recovery is owed
  * visibly instead of hanging.
+ *
+ * KNOWN LIMITATION: the lane row is the candidate's proof of life. A crash
+ * after `working` and the handoff but before `registerWorktree` (including
+ * the disk-floor wait) has no lane row, so this pass cannot see it — that
+ * half of the window is a follow-up, not a claim of this module.
  *
  * SYNCHRONY IS LOAD-BEARING. Every ledger call here is synchronous, so the
  * guard block and the write that follows it run in one JavaScript turn: a
@@ -145,26 +146,19 @@ export function reconcileInterruptedDispatches(
   deps: InterruptedDispatchDeps,
   opts: { readonly limit?: number } = {},
 ): InterruptedDispatchReport {
-  // `limit` caps the CANDIDATES one pass examines (a page loop may read
-  // several pages to reach it); the rest is left to the next trigger.
-  const limit = opts.limit ?? PAGE_SIZE * MAX_PAGES;
+  // `limit` caps the candidates ONE pass examines; the rest is left to the
+  // next trigger, which re-reads from the head (a blocked row leaves the set,
+  // so the pass makes progress without a durable cursor).
+  const limit = opts.limit ?? DEFAULT_LIMIT;
+  const candidates = deps.ledger.listInterruptedDispatchCandidates(limit);
   const blocked: string[] = [];
   const skipped: string[] = [];
-  let examined = 0;
   let failed = 0;
-  let cursor: number | null = null;
 
-  for (let page = 0; page < MAX_PAGES; page += 1) {
-    const remaining = limit - examined;
-    if (remaining <= 0) break;
-    const pageSize = Math.min(remaining, PAGE_SIZE);
-    const candidates = deps.ledger.listInterruptedDispatchCandidates(
-      pageSize,
-      cursor === null ? {} : { cursor },
-    );
-    if (candidates.length === 0) break;
-    for (const candidate of candidates) {
-      examined += 1;
+  for (const candidate of candidates) {
+    // A read throw is a failed candidate, never a failed pass: the boot call
+    // runs before services start, so one unreadable row must not abort it.
+    try {
       // Layer 1 already proved the status; re-read costs one row and keeps
       // the write below anchored on the row the facts were read from.
       const job = deps.ledger.getJob(candidate.id);
@@ -187,42 +181,35 @@ export function reconcileInterruptedDispatches(
         skipped.push(`${job.id}: ${verdict.reason ?? 'not an interrupted dispatch'}`);
         continue;
       }
-      try {
-        // The note lands FIRST: a status write lost to a crash leaves the job
-        // a candidate, so the next pass retries with the obligation already
-        // recorded (a repeated identical note, never a silent block).
-        deps.ledger.noteJob(job.id, INTERRUPTED_DISPATCH_NOTE);
-        deps.ledger.setJobStatus(job.id, 'blocked');
-        deps.notifications.postIncident({
-          kind: `dispatch.interrupted.${job.id}`,
-          routing: 'action-required',
-          severity: 'error',
-          title: `Interrupted dispatch: ${job.title}`.slice(0, 200),
-          // 'active': one card per job until it is resolved; a resolve
-          // followed by a fresh interruption posts a new one.
-          detail: (
-            `${job.id} — the job was committed and its lane exists, but no minion ever started; ` +
-            'it is blocked for recovery (never re-dispatched) and the interrupted dispatch must be ' +
-            'resolved before the lane is re-armed.'
-          ).slice(0, 1000),
-          dedupe: 'active',
-        });
-        blocked.push(job.id);
-      } catch (error) {
-        failed += 1;
-        deps.log?.('error', 'interrupted dispatch could not be surfaced — retried on the next pass', {
-          job: job.id,
-          error: String(error).slice(0, 300),
-        });
-      }
+      // The note lands FIRST and the card SECOND: a status write lost to a
+      // crash leaves the job a candidate, so the next pass retries with the
+      // obligation already recorded and the same deduped card (a repeated
+      // identical note, never a silent block).
+      deps.ledger.noteJob(job.id, INTERRUPTED_DISPATCH_NOTE);
+      deps.notifications.postIncident({
+        kind: `dispatch.interrupted.${job.id}`,
+        routing: 'action-required',
+        severity: 'error',
+        title: `Interrupted dispatch: ${job.title}`.slice(0, 200),
+        // 'active': one card per job until it is resolved; a resolve
+        // followed by a fresh interruption posts a new one.
+        detail: (
+          `${job.id} — the job was committed and its lane exists, but no minion ever started; ` +
+          'it is blocked for recovery (never re-dispatched) and the interrupted dispatch must be ' +
+          'resolved before the lane is re-armed.'
+        ).slice(0, 1000),
+        dedupe: 'active',
+      });
+      deps.ledger.setJobStatus(job.id, 'blocked');
+      blocked.push(job.id);
+    } catch (error) {
+      failed += 1;
+      deps.log?.('error', 'interrupted dispatch could not be surfaced — retried on the next pass', {
+        job: candidate.id,
+        error: String(error).slice(0, 300),
+      });
     }
-    if (candidates.length < pageSize) break;
-    const last = candidates[candidates.length - 1];
-    // Keyset paging on the rowid the query orders by; a row that failed to
-    // write is behind this cursor, so its retry happens on the next pass.
-    cursor = last === undefined ? null : deps.ledger.jobRowid(last.id);
-    if (cursor === null) break;
   }
 
-  return { examined, blocked, skipped, failed };
+  return { examined: candidates.length, blocked, skipped, failed };
 }

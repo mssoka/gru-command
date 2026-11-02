@@ -1405,18 +1405,27 @@ async function main(): Promise<number> {
   // with Silas disabled are covered too. Boot order caveat: this runs BEFORE
   // `runBootDirectiveRecovery` and `bootProviderRecovery`; the reconciler's
   // ownership guards (live admission, continuation lane owner, open provider
-  // waits, verification) are what keep it from pre-empting them.
-  const interruptedDispatches = reconcileInterruptedDispatches({
-    ledger,
-    notifications,
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
-  if (interruptedDispatches.examined > 0) {
-    logger.info('interrupted dispatch reconciliation', {
-      examined: interruptedDispatches.examined,
-      blocked: interruptedDispatches.blocked,
-      skipped: interruptedDispatches.skipped,
-      failed: interruptedDispatches.failed,
+  // waits, verification) are what keep it from pre-empting them. The pass
+  // records a per-candidate read failure in its own `failed` channel, but the
+  // boot call itself is guarded: a ledger error here must never abort the
+  // service before any of its recovery paths run.
+  try {
+    const interruptedDispatches = reconcileInterruptedDispatches({
+      ledger,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    if (interruptedDispatches.examined > 0) {
+      logger.info('interrupted dispatch reconciliation', {
+        examined: interruptedDispatches.examined,
+        blocked: interruptedDispatches.blocked,
+        skipped: interruptedDispatches.skipped,
+        failed: interruptedDispatches.failed,
+      });
+    }
+  } catch (error) {
+    logger.log('error', 'interrupted dispatch reconciliation failed at boot — continuing', {
+      error: String(error).slice(0, 300),
     });
   }
   const wave = createServiceReviewWave({ registry, options: {
