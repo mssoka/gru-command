@@ -83,8 +83,15 @@ export const CAPTURE_RESPONSE_TIMEOUT_CODE = 'ERESPONSETIMEOUT';
  * Default bound on ONE capture's total wait for a terminal frame (#554): the
  * shipped `[verify]` defaults, `lock_wait_timeout_ms` (900,000) +
  * `run_timeout_ms` (1,800,000), plus a 120,000 ms margin. The helper never
- * reads the service's configured limits; an operator whose service uses
- * larger bounds passes `--wait-budget-ms` explicitly.
+ * reads the service's configured limits, and the scheduler's queue wait is not
+ * capped by that pair: `lock_wait_timeout_ms` is only its floor, and a request
+ * queued behind a restored (or otherwise clockless) holder is bounded by that
+ * holder's stale cap, `2 × run_timeout_ms` — 3,600,000 ms at the shipped
+ * defaults, more on a raised config — so such a wait can outrun this budget.
+ * The helper then reports `unknown` (an honest receipt naming the request id
+ * and the reconcile path) while the service still holds the request; an
+ * operator passing `--wait-budget-ms` must cover the adversarial bound, not
+ * the documented pairing.
  */
 export const CAPTURE_WAIT_BUDGET_MS = 2_820_000;
 /** Pause between a headers-timeout re-submit and the next one (#554): a burst

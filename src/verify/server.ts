@@ -140,7 +140,9 @@ const MAX_BODY_BYTES = 64 * 1024;
 /**
  * Transport heartbeat cadence (idle-stream keepalive incident, 2026-10-09).
  *
- * A queued slot wait can legitimately last `lock_wait_timeout_ms` (900 s)
+ * A queued slot wait can legitimately last `lock_wait_timeout_ms` (900 s) as a
+ * FLOOR, or longer while the runs ahead of it are still inside their own
+ * bounds (one `run_timeout_ms` plus its kill grace — issue #537),
  * and a quiet producer can be silent for minutes, while a streaming HTTP
  * client's default body-idle timeout is 300 s (Node 22 / undici built-in
  * `bodyTimeout`): the observer saw queued and quiet-running `/api/verify`

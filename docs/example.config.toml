@@ -239,7 +239,7 @@ enabled = true
 # Declared commands live in the repo at .gru-command/worktree.toml ([verify]).
 max_concurrent = 1                # concurrent runs; further requests queue FIFO
 worker_budget = 0                 # total test workers across runs; 0 = auto (cores - 2)
-lock_wait_timeout_ms = 900000     # queued request past this fails loud (never a silent hang)
+lock_wait_timeout_ms = 900000     # queued request: FLOOR of its wait (a longer run ahead waits longer)
 run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process group
 
 # [briefing_review]               # Nefario, the pre-dispatch briefing review (docs/BRIEFING-REVIEW.md)

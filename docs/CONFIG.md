@@ -657,9 +657,10 @@ max_concurrent_children = 2
 # across lanes/repos. It governs only verification commands submitted
 # through that API — it does not set AI-agent/reviewer counts and does
 # not govern arbitrary commands run directly outside it. Requests
-# beyond max_concurrent queue FIFO, a queued request past
-# lock_wait_timeout_ms fails loud, a holder whose pid is dead is
-# released, and every run is recorded for review evidence.
+# beyond max_concurrent queue FIFO and wait at least
+# lock_wait_timeout_ms, longer when the runs ahead of them can still be
+# running; only a request that outlasts both fails loud. A holder whose
+# pid is dead is released, and every run is recorded for review evidence.
 # Maximum simultaneous verification commands; 1 serializes runs and
 # later requests queue FIFO. Not a per-command test-worker count.
 max_concurrent = 1
@@ -671,8 +672,11 @@ max_concurrent = 1
 # each run (vitest pool env vars + GRU_VERIFY_*); it is not an OS CPU
 # quota and reserves no cores.
 worker_budget = 0
-# Deadline for a queued request waiting for a slot, in milliseconds;
-# 900000 = 15 minutes. Expiry fails that queued request loud without
+# Minimum wait for a queued request before it may give up, in
+# milliseconds; 900000 = 15 minutes. The wait is the LATER of this floor
+# and the bounds of the runs ahead of it (run_timeout_ms + kill grace),
+# so a request is never failed while the work it waits for could still
+# end. Expiry fails that queued request loud without
 # starting it; the current holder is not terminated.
 lock_wait_timeout_ms = 900000
 # Execution deadline after a run starts (queue wait excluded), in

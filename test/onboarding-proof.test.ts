@@ -178,7 +178,7 @@ interface ProofLane {
 /** A managed repository whose onboarding lane (a real linked worktree, as
  * GC's lanes are) committed `manifest`; a real verification server owns
  * the global budget. */
-async function proofLane(manifest: string, opts: { readonly lockWaitTimeoutMs?: number; readonly files?: Readonly<Record<string, string>> } = {}): Promise<ProofLane> {
+async function proofLane(manifest: string, opts: { readonly lockWaitTimeoutMs?: number; readonly runTimeoutMs?: number; readonly files?: Readonly<Record<string, string>> } = {}): Promise<ProofLane> {
   const repo = makeFixtureRepo('fixture-app');
   repos.push(repo);
   repo.commitFile('.gitignore', 'build/\n');
@@ -193,7 +193,7 @@ async function proofLane(manifest: string, opts: { readonly lockWaitTimeoutMs?: 
   const home = temp('gru-onboarding-proof-home-');
   writeFileSync(join(home, 'config.toml'), [
     '[auth]', 'token = "onboarding-proof-token"', '[verify]', 'max_concurrent = 1', 'worker_budget = 2',
-    `lock_wait_timeout_ms = ${String(opts.lockWaitTimeoutMs ?? 5_000)}`, 'run_timeout_ms = 20000', '',
+    `lock_wait_timeout_ms = ${String(opts.lockWaitTimeoutMs ?? 5_000)}`, `run_timeout_ms = ${String(opts.runTimeoutMs ?? 20_000)}`, '',
   ].join('\n'));
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const { ledger } = bootLedger();
@@ -499,7 +499,10 @@ describe('the proof (real checkout, setup and leased verify)', () => {
   });
 
   it('Budget busy: the slot wait times out — deferred, and no verification.* event is recorded for the proof scope', async () => {
-    const lane = await proofLane('[verify]\nfull = "echo tests passed"\n', { lockWaitTimeoutMs: 200 });
+    // Issue #537: the wait is the later of the 200 ms floor and the holder's
+    // own bound. The holder never starts a run clock, so its bound is the
+    // stale cap (2 × 60 ms = 120 ms) and the floor still ends the wait.
+    const lane = await proofLane('[verify]\nfull = "echo tests passed"\n', { lockWaitTimeoutMs: 200, runTimeoutMs: 60 });
     const budget = lane.server.budget();
     const held = await budget.acquire({ jobId: 'other-job', scope: 'full', command: 'npm test', cwd: lane.repo.path });
     try {
@@ -1335,10 +1338,14 @@ describe('the proof (real checkout, setup and leased verify)', () => {
 });
 
 /** A verification config whose data dir holds the scheduler's state. */
-function verifyConfig(): ReturnType<typeof loadConfig> {
+function verifyConfig(opts: { readonly runTimeoutMs?: number } = {}): ReturnType<typeof loadConfig> {
   const home = temp('gru-onboarding-proof-home-');
   writeFileSync(join(home, 'config.toml'), [
-    '[auth]', 'token = "onboarding-proof-token"', '[verify]', 'max_concurrent = 1', 'worker_budget = 1', 'lock_wait_timeout_ms = 1000', '',
+    '[auth]', 'token = "onboarding-proof-token"', '[verify]', 'max_concurrent = 1', 'worker_budget = 1', 'lock_wait_timeout_ms = 1000',
+    // Issue #537: the scheduler's stale cap is 2 × run_timeout_ms, so a holder
+    // without a run clock is bounded by this value. Explicit, never a shipped
+    // default; the queue-wait case below shrinks it under its 1 s floor.
+    `run_timeout_ms = ${String(opts.runTimeoutMs ?? 1_800_000)}`, '',
   ].join('\n'));
   return loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
 }
@@ -1451,7 +1458,7 @@ describe('the proof\'s budget slot across a restart', () => {
   });
 
   it('a verify whose leader died while a member of its process group lives keeps its slot through a restart and a later acquire; the boot judge ends that group once a member is confirmed the proof\'s (rooted in its checkout), and only then releases the slot', async () => {
-    const config = verifyConfig();
+    const config = verifyConfig({ runTimeoutMs: 400 });
     const probes = join(temp('gru-onboarding-proof-svc-'), 'onboarding-probes');
     const checkout = join(probes, `${JOB}-${H1.slice(0, 12)}`);
     mkdirSync(checkout, { recursive: true });
@@ -1465,7 +1472,9 @@ describe('the proof\'s budget slot across a restart', () => {
     const server = createVerificationServer({ config, ledger, worktrees: new InMemoryWorktreePort(temp('gru-onboarding-proof-wt-'), ledger) });
     closers.push(() => server.dispose());
     expect(server.view()).toMatchObject({ lockInUse: true });
-    // A later acquire judges the slot again and keeps it: it waits, and times out.
+    // A later acquire judges the slot again and keeps it: it waits, and times
+    // out at its 1 s floor (issue #537: the restored holder has no run clock,
+    // so its own bound is the 2 × 400 ms stale cap the sweep judges it by).
     await expect(server.budget().acquire({ jobId: 'heist-later', scope: 'full', command: 'npm test', cwd: config.dataDir })).rejects.toBeInstanceOf(VerificationLockTimeoutError);
     expect(server.view()).toMatchObject({ lockInUse: true });
     expect(alive(member)).toBe(true);

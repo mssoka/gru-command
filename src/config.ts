@@ -578,8 +578,9 @@ export interface VerifyConfig {
   readonly maxConcurrent: number;
   /** Total concurrent test workers across runs; 0 = auto (cores - 2). */
   readonly workerBudget: number;
-  /** How long a queued request may wait before failing loud (never a silent
-   * hang) — the timeout lands on the lane and in the ledger. */
+  /** Minimum wait for a queued request before failing loud (never a silent
+   * hang): the wait is the LATER of this floor and the bounds of the runs
+   * ahead of it — the timeout lands on the lane and in the ledger. */
   readonly lockWaitTimeoutMs: number;
   /** Wall-clock cap per run; the process group is terminated on expiry. */
   readonly runTimeoutMs: number;

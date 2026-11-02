@@ -1681,6 +1681,32 @@ gc-571-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-571-static = "npm run lint && npm run typecheck && npm run build"
 gc-571-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc571-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/pi-adapter.test.ts "$d/test/pi-adapter.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-571-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-571-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/pi-adapter.test.ts -t "A1 a read with optional nulls and its batch sibling reach their effects"; a=$?; set -e; echo "gc-571-red vitest exit=$a EXPECTED-NONZERO: the base compares the persisted call with the raw model arguments"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-571 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-571 "$d/results.json" "A1 a read with optional nulls and its batch sibling reach their effects" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change guard"; exit 1'
 
+# #537: a queued verification request is never timed out just because the
+# bound ahead of it is longer than `lock_wait_timeout_ms`. The scheduler now
+# derives each waiter's deadline from the bounds of the holders ahead (their
+# run clock + kill grace + drain margin, or the stale cap when the clock never
+# starts), keeps `lock_wait_timeout_ms` as the FLOOR, and re-arms every
+# unsettled waiter when a slot is granted or a holder's run clock starts; the
+# shipped defaults are unchanged. This is the scheduler half only: short-scope
+# latency still needs priority/reserved slots (#537 follow-up) and the
+# worker-side ~590 s helper wrapper lives outside this repo. `gc-537-focused`
+# runs the suites that own the touched seams — the scheduler, the server's
+# lock-timeout frame, the onboarding proof's budget wait, and the generated
+# `[verify]` config reference with the docs drift guard — split into its fast
+# and heavy phases so neither exceeds its budget; `gc-537-static` is the lint +
+# typecheck + build gate; `gc-537-red` overlays the FINAL
+# test/verification-scheduler.test.ts on an isolated `git archive` of the
+# branch base bbb2a108 (node_modules symlinked, approved RPC patch first) and
+# runs A1 by literal title: the base arms one fixed 900 s timer at queue time,
+# so the queued request is failed at the floor and the case REDs by assertion,
+# never by import. The Vitest JSON report is classified by
+# tools/assert-named-red-baseline.mjs (a collection/setup/import failure, or a
+# missing/green A1 case, exits 2); the vitest exit is echoed intact and the
+# snapshot directory and ignored pointer file are preserved for inspection.
+gc-537-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-scheduler.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts test/onboarding-proof.test.ts"
+gc-537-static = "npm run lint && npm run typecheck && npm run build"
+gc-537-red = 'set -e; root="$PWD"; base=bbb2a1088eed37017803af8e5b3ae6c8ba3d4182; headrev=$(git rev-parse HEAD); prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc537-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/verification-scheduler.test.ts "$d/test/verification-scheduler.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-537-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-537-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-scheduler.test.ts -t "A1 \(#537\)"; a=$?; set -e; echo "gc-537-red vitest exit=$a EXPECTED-NONZERO: the base arms one fixed lock-wait timer at queue time"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-537 A1 passed against the base"; exit 2; fi; cp "$d/results.json" "$prep/gc-537-red.results.json"; set +e; node "$root/tools/assert-named-red-baseline.mjs" gc-537 "$prep/gc-537-red.results.json" "verification scheduler — global budget A1 (#537): a queued request behind a bound longer than the floor is never timed out at the floor, and is granted when the holder releases" > "$prep/gc-537-red.classifier.txt" 2>&1; c=$?; set -e; cat "$prep/gc-537-red.classifier.txt"; printf "gc-537-red base=%s head=%s dir=%s results=%s classifier=%s\n" "$base" "$headrev" "$d" "$prep/gc-537-red.results.json" "$prep/gc-537-red.classifier.txt" > "$prep/gc-537-red.last-snapshot.txt"; if [ "$c" -ne 0 ]; then exit 2; fi; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change scheduler"; exit 1'
+
 # #568 Silas observes merged GitLab merge requests. The GitLab signal poll
 # reads every tracked lane's merge request once per `[silas] poll_interval_ms`
 # tick through the #519 reader (now carrying the merge commit), applies the

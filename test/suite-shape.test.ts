@@ -411,7 +411,7 @@ const PINS: Record<string, number> = {
   'verdict-publication-identity.test.ts': 18,
   'verification-build-reuse.test.ts': 32,
   'verification-evidence.test.ts': 13,
-  'verification-scheduler.test.ts': 71,
+  'verification-scheduler.test.ts': 74,
   'verification-server.test.ts': 60,
   'verification-retention-store.test.ts': 7,
   'verification-retention.test.ts': 7,
