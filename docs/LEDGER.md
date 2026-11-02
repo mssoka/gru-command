@@ -539,6 +539,40 @@ admission evidence leaves the phase `awaiting` (never a fabricated
 success). Migration 12 is additive; nothing here changes owner stops,
 merge/deploy/restart policy or any callers' notification semantics.
 
+**Interrupted initial dispatch (issue #560).** A crash between the
+dispatch handoff and the first spawn left a job `working` with nothing
+owing it: the in-process failure handler never ran, the pipeline's
+interrupted-startup check needs an `admitting` entry a plain
+`POST /api/dispatch` never creates, and Silas's stall detector excludes
+initial dispatch. `reconcileInterruptedDispatches`
+([`src/dispatch/interrupted-dispatch.ts`](../src/dispatch/interrupted-dispatch.ts))
+is the witness, and it runs both at boot and inside the bounded durable
+pass. Candidate shape (`listInterruptedDispatchCandidates`, plus the
+single-row `hasLiveJobLane`): `working`, a `job.handoff` event, no
+`job.minion-spawned` event, no top-level `minion` agent row, and an
+**active** job lane — `paused` means a sweep or release paused on live
+processes, so it is never a candidate. The service then re-checks what
+SQL cannot see: an in-memory dispatch admission, a continuation lane
+owner, an open provider wait, a pipeline entry still `admitting`, and an
+unsettled verification run. A candidate that survives every guard is
+noted first (`no worker ever started; resolve the interrupted dispatch
+and re-arm` — the same obligation wording the pipeline writes) and then
+moved to `blocked`, with ONE `dispatch.interrupted.<jobId>`
+`action-required` card deduped `active`: one card per job until it is
+resolved, and a fresh interruption after a resolve posts a new one. The
+pass never dispatches, sweeps, bins or mutates a worktree.
+
+Note-first is load-bearing. The whole guard block and the write run in
+one synchronous turn (no `await` in that module), so a concurrent
+dispatch cannot take its admission or create its lane between them; and
+because the note lands before the status, a lost status write leaves the
+row a candidate the next pass retries with the obligation already
+recorded — a repeated identical note rather than a silent block. There is
+deliberately no durable cursor: the candidate set is the crash leftover,
+not a multi-page population, and a persistently failing row must keep
+being retried from the head instead of being rotated past like the
+phase-handoff scans above.
+
 ### Bounded reconcile cursors (migration 13, PR136 r4 repair)
 
 One tiny durable table backs fair bounded reconciliation:

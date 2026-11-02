@@ -13,6 +13,10 @@ import { REPORT_BACKFILL_EVENT } from '../ledger/obligations.js';
 import { BRIEFING_REVIEW_OBLIGATION_ACTION, BRIEFING_REVIEW_VERDICT } from '../briefing-review/events.js';
 import { BRIEFING_REVIEW_JOB_PREFIX } from '../briefing-review/types.js';
 import { settleDirectivesFromEvidence, type DirectiveEvidenceReport } from './rebrief-recovery.js';
+import {
+  reconcileInterruptedDispatches,
+  type InterruptedDispatchReport,
+} from './interrupted-dispatch.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -49,7 +53,10 @@ const REPORT_SUPERSEDE_DEFERRED_EVENT = 'report.supersede-deferred';
  *     lost to a crash window;
  *  4. report-type jobs whose review target provably merged or moved past
  *     the reviewed head (issue #220 auto-supersede — the commissioner's
- *     owed disposition retires with its target).
+ *     owed disposition retires with its target);
+ *  5. initial dispatches interrupted between their recorded handoff and
+ *     their first minion (issue #560) — blocked with a durable note and one
+ *     action-required card, never re-dispatched and never swept.
  *
  * It never dispatches a worker, never awaits a worker's terminal result,
  * never rings the owner, never creates a second Silas session and never
@@ -93,6 +100,9 @@ export interface DurableReconcileReport extends Record<string, unknown> {
   readonly handbacks: UnmarkedReconcileReport;
   /** Issue #220: report-job auto-supersede (merged target / moved head). */
   readonly reports: ReportClosureReport;
+  /** Issue #560: initial dispatches interrupted before their first minion,
+   * surfaced as blocked with one action-required card each. */
+  readonly interruptedDispatches: InterruptedDispatchReport;
   /** Rows examined across all passes and windows. */
   readonly examined: number;
   /** Durable transitions this pass completed (settlements, hand-backs,
@@ -152,13 +162,20 @@ export function reconcileDurableWork(
     pageSize: budget.reportLimit ?? 200,
     ...(budget.reportMaxPages !== undefined ? { maxPages: budget.reportMaxPages } : {}),
   });
-  const failures = directives.failed + phases.failed + handbacks.failed + reports.failed;
+  const interruptedDispatches = reconcileInterruptedDispatches({
+    ledger: deps.ledger,
+    notifications: deps.notifications,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  const failures =
+    directives.failed + phases.failed + handbacks.failed + reports.failed + interruptedDispatches.failed;
   return {
     ok: failures === 0,
     directives,
     phases,
     handbacks,
     reports,
+    interruptedDispatches,
     examined: directives.examined + phases.examined + handbacks.deliveries + handbacks.cards + reports.examined,
     advanced:
       directives.completed +
@@ -169,7 +186,8 @@ export function reconcileDurableWork(
       handbacks.published +
       reports.superseded +
       reports.opened +
-      reports.published,
+      reports.published +
+      interruptedDispatches.blocked.length,
     failures,
   };
 }

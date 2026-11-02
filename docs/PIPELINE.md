@@ -268,7 +268,11 @@ then marks the entry `admitted`. A failed dispatch never duplicates work:
   handoff write), the pipeline's interrupted-startup check blocks the job,
   notes it, and posts one `pipeline.adopted-without-worker` notification
   (`action-required`). The pipeline never posts that card for a job the
-  dispatch service already blocked;
+  dispatch service already blocked. A dispatch started outside the pipeline
+  never gets this check at all, so the same interruption is covered by the
+  dispatch reconciler (see [LEDGER.md](./LEDGER.md), "Interrupted initial
+  dispatch"): the same note wording and its own `action-required` card, from
+  a pass that knows nothing about pipeline entries;
 - a claim left over from a crash is reconciled at boot: a committed job
   carrying this entry's exact briefing and repository is adopted; any other
   committed job leaves the entry waiting (and the later attempt follows the

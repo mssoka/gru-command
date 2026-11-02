@@ -42,6 +42,7 @@ import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
+import { reconcileInterruptedDispatches } from './dispatch/interrupted-dispatch.js';
 import { binningCloseoutRoute, CanceledRequestCloseout, runBootDirectiveRecovery } from './dispatch/canceled-request-closeout.js';
 import { DirectiveProgressService, executeAcceptedDirective } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, bootProviderRecovery, establishProviderWait, handBackThenStartSupervision } from './provider-recovery/sensor.js';
@@ -1394,6 +1395,28 @@ async function main(): Promise<number> {
       examined: pipelineRecovery.examined,
       adopted: pipelineRecovery.adopted,
       requeued: pipelineRecovery.requeued,
+    });
+  }
+  // Issue #560 (#503 P2): an initial dispatch interrupted between its
+  // recorded handoff and its first minion leaves the job `working` forever —
+  // the in-process handler never runs and the pipeline's own interrupted-
+  // startup check needs an `admitting` entry a plain POST /api/dispatch never
+  // has. Runs here, right after the pipeline's claim recovery, so installs
+  // with Silas disabled are covered too. Boot order caveat: this runs BEFORE
+  // `runBootDirectiveRecovery` and `bootProviderRecovery`; the reconciler's
+  // ownership guards (live admission, continuation lane owner, open provider
+  // waits, verification) are what keep it from pre-empting them.
+  const interruptedDispatches = reconcileInterruptedDispatches({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (interruptedDispatches.examined > 0) {
+    logger.info('interrupted dispatch reconciliation', {
+      examined: interruptedDispatches.examined,
+      blocked: interruptedDispatches.blocked,
+      skipped: interruptedDispatches.skipped,
+      failed: interruptedDispatches.failed,
     });
   }
   const wave = createServiceReviewWave({ registry, options: {
