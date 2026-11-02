@@ -22,7 +22,9 @@ import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendm
 import { redactCreationTokens } from '../worktrees/creation-intent.js';
 import type { DirectiveRegistry } from './fix-directive.js';
 import { closeoutIntentView, type CanceledRequestCloseout } from './canceled-request-closeout.js';
-import { abandonLiveDirectiveFromRoute, abandonPendingRebriefFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
+import { abandonLiveDirectiveFromRoute, abandonPendingRebriefFromRoute, isOwnerDecision, OWNER_CONFIRMATION_REQUIRED,
+  OwnerDecisionRequiredError, recoveryOwnerActionFromRoute, recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute,
+  resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
@@ -208,13 +210,11 @@ function retirementContextFields(body: Record<string, unknown>, row: DirectiveRe
     expectedContractSha256: contractSha256 };
 }
 
-/** Owner attribution, as the owner-resolution route requires it: the shared
+/** Owner attribution, as every owner-reserved route requires it: the shared
  * bearer is not identity, so the owner says so explicitly. */
 function ownerConfirmed(body: Record<string, unknown>): boolean {
-  return body['by'] === 'owner' && body['confirm_intent'] === true;
+  return isOwnerDecision({ by: body['by'], confirmIntent: body['confirm_intent'] });
 }
-
-const OWNER_CONFIRMATION_REQUIRED = 'explicit owner attribution and confirm_intent=true are required; shared bearer attribution is not verified identity';
 
 /** The recorded retirement facts every retired-row readback carries, so a
  * lost-response retry rebuilds the exact intent from any of them. */
@@ -2052,8 +2052,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const ops = silasOpsOr503(res);
       if (ops === null) return true;
       const body = await readBody(req);
-      if (body['by'] !== 'owner' || body['confirm_intent'] !== true) {
-        json(res, 400, { error: 'bad_request', detail: 'explicit owner attribution and confirm_intent=true are required; shared bearer attribution is not verified identity' });
+      // The owner barrier, the consumed-identity replay and the lane/HEAD
+      // freshness read live in `recoveryOwnerActionFromRoute`, which the
+      // owner-approval service's executor calls with the card's own decision
+      // attribution: one guard for the route and the card.
+      const attribution = { by: body['by'], confirmIntent: body['confirm_intent'] };
+      if (!isOwnerDecision(attribution)) {
+        json(res, 400, { error: 'bad_request', detail: OWNER_CONFIRMATION_REQUIRED });
         return true;
       }
       const number = (key: string): number => {
@@ -2069,23 +2074,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           expectedTargetPlanRevision: number('expected_target_plan_revision'), expectedLineageSha256: strField(body, 'expected_lineage_sha256'),
           expectedEpoch: number('expected_epoch'), expectedHead: strField(body, 'expected_head'), expectedWorkRevision: number('expected_work_revision'),
           expectedContractSha256: strField(body, 'expected_contract_sha256'), reason: strField(body, 'reason') };
-        // Consumed identity replay is ledger-only: a later HEAD/stop cannot
-        // rewrite or re-execute the original explicit owner action.
-        const priorPermission = options.ledger.recoveryOwnerResolution(input.kind, input.subjectId, input.resolutionId);
-        const priorConfirmation = options.ledger.recoveryOwnerReadback(input.kind, input.subjectId).confirmation;
-        const confirmationIdentity = (priorConfirmation?.payload as { resolution_id?: unknown } | undefined)?.resolution_id;
-        const consumed = ownerResolution[3] === 'confirm-stop' ? confirmationIdentity === input.resolutionId : priorPermission !== null;
-        if (!consumed) {
-          const subject = options.ledger.recoverySubject(input.kind, input.subjectId);
-          const lanes = ops.worktrees.listWorktrees({ jobId: subject.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
-          if (lanes.length !== 1 || resolveGitCommit(lanes[0]!.path, 'HEAD') !== input.expectedHead) throw new DirectiveCheckpointError('owner action original lane/HEAD is stale or unavailable');
-        }
-        const outcome = ownerResolution[3] === 'confirm-stop'
-          ? options.ledger.confirmRecoveryOwnerStop(input, strField(body, 'expected_resolution_fingerprint'))
-          : options.ledger.recordRecoveryOwnerResolution(input);
+        const outcome = recoveryOwnerActionFromRoute({ ledger: options.ledger, worktrees: ops.worktrees, attribution, action: input,
+          expectedResolutionFingerprint: ownerResolution[3] === 'confirm-stop' ? strField(body, 'expected_resolution_fingerprint') : null });
         json(res, 200, { event_seq: outcome.event.seq, idempotent: outcome.idempotent, receipt: outcome.event,
           note: 'recorded explicit owner action only — job parking, notification Ack, other holds and work execution are unchanged' });
       } catch (error) {
+        if (error instanceof OwnerDecisionRequiredError) { json(res, 400, { error: 'bad_request', detail: error.message }); return true; }
         if (!(error instanceof DirectiveCheckpointError || error instanceof DirectiveRetirementError)) throw error;
         json(res, 409, { error: 'owner_resolution_refused', detail: error.message });
       }

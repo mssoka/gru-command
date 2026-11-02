@@ -283,7 +283,7 @@ describe('graceful shutdown', () => {
         expect(card, jobId).not.toBeNull();
         // The card names the owner's exit without teaching the owner's own
         // request body: the shared bearer makes that body the barrier.
-        expect(card?.detail ?? '').toContain('ask the owner whether to abandon them');
+        expect(card?.detail ?? '').toContain('ask the owner whether to abandon them by proposing `kind: "rebrief-abandon"` with its `marker_id` to POST /api/owner-approvals');
         expect(card?.detail ?? '').not.toContain('confirm_intent');
       }
       verifyDb.close();

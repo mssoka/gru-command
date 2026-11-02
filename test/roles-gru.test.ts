@@ -311,10 +311,11 @@ describe('gru role definition', () => {
     expect(ROLE_DEFINITIONS.gru.cwd).toBe('workspace_root');
   });
 
-  it('routes directive abandonment through the owner-approval proposal and keeps the re-brief marker ask (#523)', () => {
+  it('routes every owner-reserved action through the owner-approval proposal and keeps the owner barrier (#523, #565)', () => {
     const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
     expect(gru).toContain('For a directive request, propose abandonment with `POST /api/owner-approvals`; the owner\'s Approve carries it out.');
-    expect(gru).toContain('For a re-brief marker, ask the owner whether to abandon it, quoting the card.');
+    expect(gru).toContain('For a re-brief marker, propose its abandonment the same way with `kind: "rebrief-abandon"` and its `marker_id`.');
+    expect(gru).toContain('propose `recovery-owner-resolution` or `recovery-owner-stop` with the exact fences your readback gives');
     expect(gru).toContain('Never call `/abandon`, record the owner\'s decision, or send owner attribution yourself.');
   });
 

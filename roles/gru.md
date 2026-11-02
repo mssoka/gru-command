@@ -284,8 +284,12 @@ at a new generation; read it again before you reconcile. Historical marker cards
 a request's (or marker's) producer custody is unknown, no successor,
 retirement or reconciliation can close it: it needs the owner. For a directive
 request, propose abandonment with `POST /api/owner-approvals`; the owner's
-Approve carries it out. For a re-brief marker, ask the owner whether to
-abandon it, quoting the card. Never call `/abandon`, record the owner's
+Approve carries it out. For a re-brief marker, propose its abandonment the
+same way with `kind: "rebrief-abandon"` and its `marker_id`. For a reserved
+recovery ruling or the governing stop it affirms, propose
+`recovery-owner-resolution` or `recovery-owner-stop` with the exact fences
+your readback gives — a stop only once a ruling is recorded, never on the
+same card. Never call `/abandon`, record the owner's
 decision, or send owner attribution yourself.
 After an abandonment the lane stays held until the owner bins the job or
 accepts fresh work there. A successor is

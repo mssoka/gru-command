@@ -1351,4 +1351,78 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'pipeline-defer-reason',
     sql: 'ALTER TABLE pipeline_entries ADD COLUMN defer_reason TEXT;',
   },
+  {
+    // #565: owner approvals of every owner-reserved action, not only the
+    // directive abandonment. The row becomes subject-generic: `subject_kind`
+    // (`directive`, `rebrief-marker` or `recovery`) plus `subject_id` name
+    // what the Approve is bound to, `request_id` is the directive subject's
+    // id only (a re-brief marker and a recovery subject are not directive
+    // requests), the recovery kinds keep their ten-fence contract in
+    // `fence_contract_json` with `resolution_id` and — for a stop — the
+    // ruling's own `expected_resolution_fingerprint`, and `fence_state`
+    // applies only to a live directive. SQLite cannot widen a CHECK in place,
+    // so the table is rebuilt as in migration 30; every row written before
+    // this migration is a directive abandonment, and the mapping keeps it
+    // one. The one-active-record index is re-keyed from `request_id` to
+    // `(subject_kind, subject_id)` so a re-brief marker and a recovery
+    // subject fence exactly as a directive request does. LANDING COLLISION
+    // (same convention as migrations 10-38): renumber ONLY this never-applied
+    // migration if main lands id 39 first.
+    id: 39,
+    name: 'owner-approvals-subject-kind',
+    sql: `
+      CREATE TABLE owner_approvals_new (
+        id                            TEXT PRIMARY KEY,
+        kind                          TEXT NOT NULL CHECK (kind IN ('directive-abandon','rebrief-abandon','recovery-owner-resolution','recovery-owner-stop')),
+        subject_kind                  TEXT NOT NULL CHECK (subject_kind IN ('directive','rebrief-marker','recovery')),
+        subject_id                    TEXT NOT NULL,
+        request_id                    TEXT REFERENCES pending_directives(request_id),
+        job_id                        TEXT NOT NULL REFERENCES jobs(id),
+        fence_state                   TEXT CHECK (fence_state IS NULL OR fence_state IN ('dispatching','admitted')),
+        fence_payload_hash            TEXT,
+        fence_debt_generation         INTEGER,
+        fence_contract_json           TEXT,
+        resolution_id                 TEXT,
+        expected_resolution_fingerprint TEXT,
+        reason                        TEXT NOT NULL,
+        idempotency_key               TEXT NOT NULL UNIQUE,
+        body_fingerprint              TEXT NOT NULL,
+        notification_id               TEXT NOT NULL UNIQUE,
+        state                         TEXT NOT NULL CHECK (state IN ('proposed','approved','executing','succeeded','denied','refused','withdrawn')),
+        attempts                      INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        executing_seq                 INTEGER,
+        abandonment_event_seq         INTEGER,
+        refusal_code                  TEXT,
+        refusal_blockers              TEXT,
+        created_at                    TEXT NOT NULL,
+        updated_at                    TEXT NOT NULL,
+        CHECK (
+          (kind = 'directive-abandon' AND subject_kind = 'directive' AND request_id = subject_id
+             AND fence_state IS NOT NULL AND fence_payload_hash IS NOT NULL AND fence_contract_json IS NULL
+             AND resolution_id IS NULL AND expected_resolution_fingerprint IS NULL)
+          OR (kind = 'rebrief-abandon' AND subject_kind = 'rebrief-marker' AND request_id IS NULL
+             AND fence_state IS NULL AND fence_payload_hash IS NOT NULL AND fence_contract_json IS NULL
+             AND resolution_id IS NULL AND expected_resolution_fingerprint IS NULL)
+          OR (kind = 'recovery-owner-resolution' AND subject_kind = 'recovery' AND request_id IS NULL
+             AND fence_state IS NULL AND fence_payload_hash IS NULL AND fence_contract_json IS NOT NULL
+             AND resolution_id IS NOT NULL AND expected_resolution_fingerprint IS NULL)
+          OR (kind = 'recovery-owner-stop' AND subject_kind = 'recovery' AND request_id IS NULL
+             AND fence_state IS NULL AND fence_payload_hash IS NULL AND fence_contract_json IS NOT NULL
+             AND resolution_id IS NOT NULL AND expected_resolution_fingerprint IS NOT NULL)
+        )
+      );
+      INSERT INTO owner_approvals_new (id, kind, subject_kind, subject_id, request_id, job_id, fence_state,
+          fence_payload_hash, fence_debt_generation, fence_contract_json, resolution_id, expected_resolution_fingerprint,
+          reason, idempotency_key, body_fingerprint, notification_id, state, attempts, executing_seq,
+          abandonment_event_seq, refusal_code, refusal_blockers, created_at, updated_at)
+        SELECT id, kind, 'directive', request_id, request_id, job_id, fence_state, fence_payload_hash,
+          fence_debt_generation, NULL, NULL, NULL, reason, idempotency_key, body_fingerprint, notification_id,
+          state, attempts, executing_seq, abandonment_event_seq, refusal_code, refusal_blockers, created_at, updated_at
+        FROM owner_approvals;
+      DROP TABLE owner_approvals;
+      ALTER TABLE owner_approvals_new RENAME TO owner_approvals;
+      CREATE UNIQUE INDEX idx_owner_approvals_active ON owner_approvals(subject_kind, subject_id) WHERE state IN ('proposed','approved','executing');
+      CREATE INDEX idx_owner_approvals_job ON owner_approvals(job_id);
+    `,
+  },
 ];
