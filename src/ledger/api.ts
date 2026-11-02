@@ -8341,7 +8341,7 @@ export class LedgerApi {
     this.openReportHandbackLineage(jobId, deliveredSeq);
   }
 
-  /** One job's rowid (keyset pagination anchor). */
+  /** One job's rowid (the report-closure scans' keyset pagination anchor). */
   jobRowid(id: string): number | null {
     const row = this.db.prepare('SELECT rowid AS _rowid FROM jobs WHERE id = ?').get(id) as Row | undefined;
     return row === undefined ? null : Number(row._rowid);
@@ -8388,6 +8388,47 @@ export class LedgerApi {
       )
       .all(...REPORT_DELIVERABLES, ...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
     return rows.map((row) => this.jobFromRow(row));
+  }
+
+  /** Issue #560: `working` jobs whose initial dispatch was interrupted
+   * between its recorded handoff and its first minion — a handoff and an
+   * ACTIVE job lane, with neither a top-level minion agent nor a
+   * `job.minion-spawned` event. `paused` lanes are excluded: a pause means
+   * a sweep or release paused on live processes, never an interrupted
+   * dispatch. The reconciler re-checks the ownership guards the SQL cannot
+   * see (live admission, continuation lane owner, provider waits, the
+   * pipeline's own claim, verification); this pre-filter exists to keep the
+   * pass off the general `working` population. ONE bounded query: there is no
+   * durable cursor, because a blocked row leaves the set and a row that
+   * cannot be written keeps its place at the head, so the next pass retries
+   * it instead of rotating past it. */
+  listInterruptedDispatchCandidates(limit = 200): readonly JobRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listInterruptedDispatchCandidates requires a positive integer limit, got ${String(limit)}`);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT j.* FROM jobs j
+          WHERE j.status = 'working'
+            AND EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.kind = 'job.handoff')
+            AND NOT EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.kind = 'job.minion-spawned')
+            AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.job_id = j.id AND a.role = 'minion' AND a.parentage = 'top-level')
+            AND EXISTS (SELECT 1 FROM worktrees w WHERE w.job_id = j.id AND w.kind = 'job' AND w.status = 'active')
+          ORDER BY j.rowid LIMIT ?`,
+      )
+      .all(limit) as Row[];
+    return rows.map((row) => this.jobFromRow(row));
+  }
+
+  /** Whether this job owns a live job lane (`active` only — a `paused` lane
+   * was paused on live processes and a `swept` one holds none). One indexed
+   * row via `idx_worktrees_job`; never `listWorktrees`, which maps the whole
+   * table before filtering. */
+  hasLiveJobLane(jobId: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS live FROM worktrees WHERE job_id = ? AND kind = 'job' AND status = 'active' LIMIT 1")
+      .get(jobId) as Row | undefined;
+    return row !== undefined;
   }
 
   /** The job that owns a PR url — the merge/head signals land THERE, and
