@@ -4,7 +4,6 @@ import {
   GITLAB_MR_OBSERVED_EVENT,
   GITLAB_MR_READ_FAILED_EVENT,
   readGitLabMrObservation,
-  type GitLabMrObservation,
 } from '../review-inputs/ci-evidence.js';
 import { applyMergedLane, type MergeMapOutcome } from './github-poll.js';
 import { parseGitLabMrLink, type RepoRemote } from './review-path.js';
@@ -37,10 +36,13 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * `gitlab.mr-observed` only when its record tuple (host, project, iid, state,
  * head sha, head pipeline id and status, merge commit sha, mergeability)
  * differs from the newest recorded observation, when that observation is older
- * than `GITLAB_EVIDENCE_MAX_AGE_MS` (an idle lane must not age out of the
- * board's owner readiness while the poll is succeeding), or when the newest
+ * than `GITLAB_EVIDENCE_MAX_AGE_MS` (so an idle lane does not stay aged out of
+ * the board's owner readiness while the poll is succeeding), or when the newest
  * `gitlab.*` event is a read failure (a success always supersedes one). A run
- * of the same failure records one event, never one per tick.
+ * of the same failure records one event, never one per tick. THE MERGE IS NOT
+ * RECORD-GATED: the merge decision is taken from the facts the read returned,
+ * so a lane whose newest observation already reports `merged` (a review
+ * round's read, or an append a restart left unapplied) still closes.
  *
  * The token never leaves the lane's own host: a job's link is read only when
  * it is a supported GitLab merge request AND names the origin remote of the
@@ -67,8 +69,10 @@ export const GITLAB_POLL_TICK_DEADLINE_MS = 30_000;
 
 /** How old a recorded GitLab observation may be and still certify the board's
  * owner readiness. The poll re-records an unchanged observation once it is
- * older than this, so a lane that is simply idle never ages out while the
- * poll is succeeding. Duration, never escalation: the row stops rendering. */
+ * older than this, so a lane that is simply idle does not stay aged out while
+ * the poll is succeeding — the refresh lands at the next tick, so up to one
+ * poll interval past the bound the row is withheld. Duration, never
+ * escalation: the row stops rendering. */
 export const GITLAB_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /** Job statuses whose merge request is still worth observing. Terminal lanes
@@ -143,22 +147,25 @@ type GitLabLaneSkip = 'unsupported-host' | 'origin-mismatch';
  * case-insensitively with its port, project path case-insensitively (the
  * verdict poster's comparison), iid exactly. A disagreement never merges a
  * lane. */
-function sameIdentity(link: GitLabMrReadRequest, facts: GitLabMrObservation): boolean {
+function sameIdentity(
+  link: GitLabMrReadRequest,
+  facts: Pick<GitLabMrObservedFacts, 'host' | 'project' | 'mr_iid'>,
+): boolean {
   return normalizedHost(link.host) === normalizedHost(facts.host)
     && link.project.toLowerCase() === facts.project.toLowerCase()
-    && link.iid === facts.iid;
+    && link.iid === facts.mr_iid;
 }
 
 /** The merge-map payload of a GitLab merge: the merge request's identity, the
  * canonical URL and the head/merge commits. */
-function mergePayload(facts: GitLabMrObservation, url: string): Record<string, unknown> {
+function mergePayload(facts: GitLabMrObservedFacts, url: string): Record<string, unknown> {
   return {
     host: facts.host,
     project: facts.project,
-    mr_iid: facts.iid,
+    mr_iid: facts.mr_iid,
     url,
-    sha: facts.headSha,
-    merge_commit_sha: facts.mergeCommitSha,
+    sha: facts.head_sha,
+    merge_commit_sha: facts.merge_commit_sha,
   };
 }
 
@@ -279,8 +286,12 @@ export class GitLabSignalPoll {
       const previousTuple = previousObservation === null ? null : recordedTuple(previousObservation);
       const recordedAt = previousObservation === null ? null : Date.parse(previousObservation.ts);
       // Held in an object: the gates are consulted inside the reader, and the
-      // poll reads the failure back for its rate-limit backoff.
-      const read: { failure: GitLabMrReadFailure | null } = { failure: null };
+      // poll reads the failure back for its rate-limit backoff and the facts
+      // back for the merge decision (recorded or not).
+      const read: { failure: GitLabMrReadFailure | null; facts: GitLabMrObservedFacts | null } = {
+        failure: null,
+        facts: null,
+      };
       reads += 1;
       const recorded = await recordGitLabMrRead({
         ledger: this.ledger,
@@ -290,6 +301,7 @@ export class GitLabSignalPoll {
         ...(this.deps !== undefined ? { deps: this.deps } : {}),
         origin: () => lane.origin,
         recordObservation: (facts) => {
+          read.facts = facts;
           // A live success supersedes a recorded failure: otherwise one
           // transient error would keep the board's row withheld until the
           // observation aged out.
@@ -313,12 +325,14 @@ export class GitLabSignalPoll {
         });
         break;
       }
-      if (recorded === null || recorded.event.kind !== GITLAB_MR_OBSERVED_EVENT) continue;
-      observed += 1;
-      const facts = readGitLabMrObservation(recorded.event.payload);
-      // A payload this poll could not read back is not evidence: never merge
-      // on it. Nor does an answer naming another project, iid or host merge
-      // this lane (the next tick re-reads).
+      if (recorded !== null && recorded.event.kind === GITLAB_MR_OBSERVED_EVENT) observed += 1;
+      // The merge is decided from THIS read's facts, never from whether this
+      // tick recorded them: a review round may have recorded the same merged
+      // observation already, and the merge map's terminal no-op and binned
+      // one-receipt guard make re-deciding it idempotent. A failed read has no
+      // facts. An answer naming another project, iid or host never merges this
+      // lane (the next tick re-reads).
+      const facts = read.facts;
       if (facts === null || facts.state !== 'merged' || !sameIdentity(lane.link, facts)) continue;
       const outcome: MergeMapOutcome = applyMergedLane({
         ledger: this.ledger,
@@ -328,8 +342,8 @@ export class GitLabSignalPoll {
         payload: mergePayload(facts, lane.url),
         logFields: {
           unknown: { job: lane.jobId },
-          applied: { job: lane.jobId, host: facts.host, project: facts.project, mr_iid: facts.iid },
-          refused: { job: lane.jobId, host: facts.host, project: facts.project, mr_iid: facts.iid },
+          applied: { job: lane.jobId, host: facts.host, project: facts.project, mr_iid: facts.mr_iid },
+          refused: { job: lane.jobId, host: facts.host, project: facts.project, mr_iid: facts.mr_iid },
         },
         logText: {
           unknown: 'gitlab poll: merged MR for an unknown job',

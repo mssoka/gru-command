@@ -2652,7 +2652,7 @@ export class SilasDriver {
     const gitlab = this.opts.gitlabPoll;
     if ((github === undefined && gitlab === undefined) || this.disposed) return;
     if (this.pollInFlight) {
-      this.log('info', 'github signal poll still running — tick skipped', {});
+      this.log('info', 'signal poll still running — tick skipped', {});
       return;
     }
     this.pollInFlight = true;

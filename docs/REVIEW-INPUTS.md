@@ -147,7 +147,9 @@ signal poll recorded it — and requires it to be younger than 24 hours
 (`GITLAB_EVIDENCE_MAX_AGE_MS`). A newer failed read withholds, exactly as rule 1
 below refuses an older success. The signal poll keeps that record current: it
 re-records an unchanged observation once the newest one is that old, so a lane
-the poll is succeeding on never ages out, while a poll that stopped (or a
+the poll is succeeding on does not stay aged out — the refresh lands at the
+next tick, so the row can be withheld for up to one interval past the bound —
+while a poll that stopped (or a
 recorded read failure) does withhold. That bound is evidence freshness, never
 escalation. The honest residual is narrower than "no GitLab poll": the poll
 records observations, not provider signals. A merge moves the lane to `merged`

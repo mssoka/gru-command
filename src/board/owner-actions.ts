@@ -34,8 +34,10 @@
  * GitLab freshness: the GitLab signal poll (#568) reads a live lane's merge
  * request once per `[silas] poll_interval_ms` tick and re-records an
  * unchanged observation once it is older than `GITLAB_EVIDENCE_MAX_AGE_MS`,
- * so a lane the poll is succeeding on never ages out while a poll that stopped
- * (or a recorded read failure) does withhold the row. That bound is evidence
+ * so a lane the poll is succeeding on does not stay aged out (the refresh
+ * lands at the next tick, so the row can be withheld for up to one interval
+ * past the bound), while a poll that stopped (or a recorded read failure)
+ * does withhold the row. That bound is evidence
  * freshness, not owner escalation: the row simply stops rendering, and the
  * next read retires it. A newer `gitlab.mr-read-failed` supersedes an older
  * observation, exactly as the freeze-time binding refuses to fall back to an

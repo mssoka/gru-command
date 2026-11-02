@@ -238,6 +238,65 @@ describe('gitlab signal poll tick', () => {
     expect(api.getJob('job-replay')?.status).toBe('merged');
   });
 
+  it('A2: a mergeable-only change at the same head records a second observation', async () => {
+    const api = makeLedger();
+    addLane(api, 'job-mergeable');
+    // GitLab has not computed detailed_merge_status yet: mergeability unknown.
+    let body = mrBody({ detailed_merge_status: undefined });
+    const { fetch } = fetchDouble(() => json(body));
+    const poll = makePoll({ ledger: api, fetch });
+
+    expect(await poll.pollOnce()).toMatchObject({ tracked: 1, reads: 1, observed: 1, merged: 0 });
+    const first = api.latestJobEvent('job-mergeable', GITLAB_MR_OBSERVED_EVENT);
+    expect(first?.payload).toMatchObject({ mergeable: 'unknown', state: 'opened', head_sha: TARGET });
+
+    // Same state, head and head pipeline; only mergeability moves to clean.
+    body = mrBody();
+    const second = await poll.pollOnce();
+    expect(second).toEqual({ tracked: 1, reads: 1, observed: 1, merged: 0, deadlineExceeded: false, rateLimited: false });
+    expect(count(api, 'job-mergeable', GITLAB_MR_OBSERVED_EVENT)).toBe(2);
+    const newest = api.latestJobEvent('job-mergeable', GITLAB_MR_OBSERVED_EVENT);
+    expect(newest?.payload).toMatchObject({ mergeable: 'clean', state: 'opened', head_sha: TARGET });
+
+    // The clean tuple then dedupes as usual.
+    expect((await poll.pollOnce()).observed).toBe(0);
+    expect(count(api, 'job-mergeable', GITLAB_MR_OBSERVED_EVENT)).toBe(2);
+  });
+
+  it('A2: a merged observation an earlier read recorded still closes the lane on the next tick, once', async () => {
+    const api = makeLedger();
+    addLane(api, 'job-round-merged');
+    // A review round (round-scoped) recorded this exact observation while the
+    // lane was still live, so the poll's identical read is not re-recorded.
+    api.appendCustomEvent({
+      kind: GITLAB_MR_OBSERVED_EVENT,
+      jobId: 'job-round-merged',
+      roundId: 'round-1',
+      payload: {
+        host: HOST, project: PROJECT, mr_iid: MR_IID, state: 'merged',
+        head_sha: TARGET, head_pipeline: null, merge_commit_sha: MERGE_SHA,
+        mergeable: 'clean', round_id: 'round-1',
+      },
+    });
+    const { fetch } = fetchDouble(() => json(mergedBody()));
+    const poll = makePoll({ ledger: api, fetch });
+
+    const first = await poll.pollOnce();
+    expect(first).toEqual({
+      tracked: 1, reads: 1, observed: 0, merged: 1, deadlineExceeded: false, rateLimited: false,
+    });
+    expect(api.getJob('job-round-merged')?.status).toBe('merged');
+    const merged = jobEvents(api, 'job-round-merged', GITLAB_MR_MERGED_EVENT);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.payload).toMatchObject({ applied: true, mr_iid: MR_IID, merge_commit_sha: MERGE_SHA });
+    expect(count(api, 'job-round-merged', GITLAB_MR_OBSERVED_EVENT)).toBe(1);
+
+    const second = await poll.pollOnce();
+    expect(second).toEqual({ tracked: 0, reads: 0, observed: 0, merged: 0, deadlineExceeded: false, rateLimited: false });
+    expect(count(api, 'job-round-merged', GITLAB_MR_MERGED_EVENT)).toBe(1);
+    expect(count(api, 'job-round-merged', GITLAB_MR_OBSERVED_EVENT)).toBe(1);
+  });
+
   it('A2: an idle lane observation is re-recorded once it ages, not once per tick', async () => {
     const api = makeLedger();
     addLane(api, 'job-idle');
@@ -356,6 +415,38 @@ describe('gitlab signal poll tick', () => {
     expect(logs.every((entry) => entry.level === 'warn')).toBe(true);
     await poll.pollOnce();
     expect(logs).toHaveLength(3);
+  });
+
+  it('A5: a lane with no resolvable origin is never read, records nothing, and logs its skip once', async () => {
+    const api = makeLedger();
+    // No worktree row for this job: there is no origin to bind the link to.
+    api.addJob({ id: 'job-no-lane', repo: 'fixture-app', title: 't-job-no-lane', briefing: 'b' });
+    api.setJobStatus('job-no-lane', 'working');
+    api.setJobPr('job-no-lane', MR_URL);
+    const logs: LogEntry[] = [];
+    const { calls, fetch } = fetchDouble(() => json(mergedBody()));
+    const poll = makePoll({ ledger: api, fetch, logs });
+
+    const result = await poll.pollOnce();
+    expect(result).toEqual({ tracked: 0, reads: 0, observed: 0, merged: 0, deadlineExceeded: false, rateLimited: false });
+    expect(calls).toEqual([]);
+    expect(gitlabKinds(api, 'job-no-lane')).toEqual([]);
+    expect(api.getJob('job-no-lane')?.status).toBe('working');
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      level: 'warn',
+      msg: 'gitlab poll: merge request link is not the lane origin; not read',
+      fields: {
+        job: 'job-no-lane',
+        host: HOST,
+        project: PROJECT,
+        mr_iid: MR_IID,
+        reason: expect.stringContaining('no resolvable origin remote'),
+      },
+    });
+    // one deduped line per skipped lane, never one per tick
+    await poll.pollOnce();
+    expect(logs).toHaveLength(1);
   });
 
   it('A5: a response that names another project, iid or host never merges the lane', async () => {

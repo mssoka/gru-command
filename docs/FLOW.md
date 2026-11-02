@@ -975,8 +975,9 @@ the judgment; the dispatch surface is the mechanical hand.
   round's own freeze read makes), and only what CHANGED is recorded.
   The newest observation is the cursor: an unchanged one is not
   re-recorded (so a restart double-applies nothing) until it is 24 hours
-  old, when the poll re-records it so an idle lane does not age out of
-  the board's FOR YOU band; a run of the same failed read records one
+  old, when the next tick re-records it so an idle lane does not stay out
+  of the board's FOR YOU band (the row can be withheld for up to one poll
+  interval past the bound); a run of the same failed read records one
   `gitlab.mr-read-failed`, and a later successful read supersedes it.
   A merged MR walks the SAME merge map as the GitHub arm — `in-review`
   (when the hop is legal) → `merged` plus one `gitlab.mr-merged` event,

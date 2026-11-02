@@ -257,7 +257,7 @@ const PINS: Record<string, number> = {
   'fix-directive.test.ts': 60,
   'ghost-agent-boot.test.ts': 5,
   'github-poll.test.ts': 45,
-  'gitlab-poll.test.ts': 14,
+  'gitlab-poll.test.ts': 17,
   'gitlab-mr-read.test.ts': 31,
   'gru-cli.test.ts': 12,
   'gru-mailbox.test.ts': 39,
