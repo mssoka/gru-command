@@ -885,11 +885,13 @@ you. [VECTOR.md](./VECTOR.md) describes the whole flow.
 
 - **`raid_mode`** decides what happens when Gru picks a package to raid.
   - **`"proposed"` (default).** Say Gru picks `billing-api/src/refunds` because
-    twelve commits landed there since its last raid. You get one FOR YOU card:
-    "Launch Vector's raid on billing-api/src/refunds?", with Gru's reason, the
-    budget and the ranking signals. Accept queues the raid for Silas. Decline
-    is recorded, and that package is not proposed again until its code
-    changes. If the code changes before you answer, the card is withdrawn.
+    twelve commits landed there since its last raid. You get one FOR YOU card,
+    "Vector raid proposed: billing-api/src/refunds", whose question is "Let
+    Vector attack billing-api/src/refunds?", with the budget and the ranking
+    signals on the face and Gru's reason in Details. Accept queues the raid
+    for Silas. Decline is recorded, and that package is not proposed again
+    until its code changes. If the code changes before you answer, the card
+    is withdrawn.
   - **`"autonomous"`.** Say Gru makes the same pick overnight. The raid
     launches straight away and waits in Silas's queue until no heist work is
     waiting. You see "Vector raid launched: billing-api/src/refunds" in the
@@ -900,8 +902,9 @@ you. [VECTOR.md](./VECTOR.md) describes the whole flow.
   counterexample that a fresh replay confirmed.
   - **`"proposed"` (default).** Say the raid finds that a refund of `-1`
     cents comes back negative, and a fresh replay reproduces it. You get one
-    FOR YOU card: "Dispatch a fix heist for Vector's break-in on
-    billing-api/src/refunds?". It shows the invariant, the counterexample and
+    FOR YOU card, "Vector broke in: billing-api/src/refunds", whose question is
+    "Send a minion to fix what Vector broke in billing-api/src/refunds?". It
+    shows the invariant, the counterexample and
     the replay seed, and its Details hold the frozen contract, the shrink path
     and the receipts. Only Accept makes Gru dispatch the fix heist. Decline is
     recorded, and the same requirement and invariant is not proposed again
@@ -927,11 +930,11 @@ lanes get no setup and no verify command. [ONBOARDING.md](./ONBOARDING.md)
 describes the whole flow.
 
 - **`"proposed"` (default).** Say `swift-app`'s origin `main` has no manifest.
-  At start you get one FOR YOU card, "Onboard swift-app". Accept dispatches a
-  heist whose minion reads the repository's CI, build files and README and opens
-  "Onboard swift-app to GC". Decline is remembered: swift-app is not proposed
-  again until you ask Gru to propose it. A restart while the card waits posts
-  no second card.
+  At start you get one FOR YOU card, "Set up swift-app for Gru Command". Accept
+  dispatches a heist whose minion reads the repository's CI, build files and
+  README and opens "Onboard swift-app to GC". Decline is remembered:
+  swift-app is not proposed again until you ask Gru to propose it. A restart
+  while the card waits posts no second card.
 - **`"autonomous"`.** The same scan dispatches the heist straight away. You see
   "Onboarding heist dispatched: swift-app" in the board's activity, not in FOR
   YOU. Only a repository's first onboarding heist starts this way. If it ends

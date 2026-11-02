@@ -458,7 +458,10 @@ describe('board view resolved-notification rendering', () => {
     // and NO generic Ack (#570).
     const guidance = sections[0]?.querySelector('.board-notification__guidance')?.textContent ?? '';
     expect(guidance).toContain('Why you’re seeing this: Another program is using the port');
-    expect(guidance).toContain('If you do nothing:');
+    // Rendered bare (#570): the stored line already opens with the phrase,
+    // so the full sentence appears once.
+    expect(guidance).toContain('If you do nothing, the app stays unable to use its port and this notice stays until the port is free.');
+    expect(guidance).not.toContain('If you do nothing: If you do nothing');
     expect(guidance).toContain('What to do: Stop the program named in Details');
     expect(sections[0]?.querySelector('.board-notification__ack')).toBeNull();
     expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
@@ -3039,6 +3042,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Approve the slim contract?');
     expect(band.textContent).toContain('Gru recommends');
     expect(band.textContent).toContain('Why this needs you');
+    // The do-nothing line is a full sentence, never "If you do nothing: If you
+    // do nothing, …" (#570).
+    expect(band.querySelector('.board-notification__if-nothing')?.textContent).toBe(
+      'If you do nothing, nothing changes and the scope stays as it is.',
+    );
     button.click();
     const busy = band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!;
     // The submission state is re-rendered from BoardView (shared by both

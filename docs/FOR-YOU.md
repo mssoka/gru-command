@@ -63,12 +63,21 @@ before this standard renders its choices with no invented do-nothing line.
 `detail` is the **evidence slot**. It is never checked and is shown verbatim
 behind the card's "Details" disclosure. Identifiers, paths, hashes, logs,
 resolved commands, settings names and raw errors belong there and nowhere
-else. On a `needs-owner` row the face is guidance and choices only: a short
-`detail` is never promoted to the face.
+else. On a `needs-owner` row the card face is guidance and choices only: a
+short `detail` is never promoted to it.
+
+Three other surfaces read `detail` and are named so they are not mistaken
+for the decision face: the arrival toast and the browser notification body
+carry the row's `detail`; the Book of Lessons proposal row renders its
+proposal summary line; and a card's `Result:` line shows the producer's own
+resolution text. They are evidence readers, not the owner's question, and
+this boundary does not inspect them.
 
 ## Refused vocabulary
 
-Word-boundary matches, case-insensitive, on every owner-facing string:
+Word-boundary matches, case-insensitive, on every owner-facing string, with
+the plural refused as the same word (`lanes`, `heists`, `breakers`, `gates`,
+`dispatches`):
 
 - `lane`, `heist`, `breaker`, `re-arm`, `quorum`, `dispatch`, `gate` — say
   what the owner gets instead ("saved workspace", "work", "safety stop",
@@ -100,8 +109,11 @@ routing is `needs-owner`:
 
 1. `NotificationCenter.post`
 2. `NotificationCenter.openIncident` (the dedupe path too)
-3. `NotificationCenter.attachDecisionOptions`
-4. `NotificationCenter.adoptLegacyDecision`
+3. `NotificationCenter.attachDecisionOptions` — the incoming option labels
+   and consequences only; a pre-upgrade discussion row's stored question and
+   recommendation are not re-judged
+4. `NotificationCenter.adoptLegacyDecision` — the incoming decision; the
+   row's stored legacy title is not rewritten, so it is not re-judged
 5. `LedgerApi.updateNotificationDetail` when the row's effective routing is
    `needs-owner` and the title changes
 

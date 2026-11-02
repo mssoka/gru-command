@@ -12,9 +12,18 @@ import {
   serializeNotificationDecision,
   type NotificationDecision,
 } from '../src/ledger/notification-decision.js';
-import { ownerAttentionFor, producerFollowsDecisionThrough, requiresTypedDecision, resolveNotificationRouting } from '../src/notifications/attention.js';
+import {
+  DECISION_REQUIRED_KINDS,
+  OWNER_ALLOWED_PREFIXES,
+  OWNER_REQUIRED_KINDS,
+  OWNER_REQUIRED_PREFIXES,
+  ownerAttentionFor,
+  producerFollowsDecisionThrough,
+  requiresTypedDecision,
+  resolveNotificationRouting,
+} from '../src/notifications/attention.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import { assertOwnerFacingText, OWNER_NOTHING_DEFAULT } from '../src/notifications/owner-language.js';
+import { assertOwnerFacingText, OWNER_NOTHING_DEFAULT, ownerNoticeGuidance } from '../src/notifications/owner-language.js';
 import { reconcileLegacyOwnerAttention } from '../src/notifications/legacy-owner.js';
 
 /** Test callers run in-process, with no paired credential. */
@@ -249,6 +258,48 @@ describe('the owner-language boundary covers every write of owner-facing text (#
     expect(rig.api.listNotifications({ limit: 10 })).toHaveLength(0);
   });
 
+  it('every registered owner kind that can post a notice has its guidance pinned by the registry', () => {
+    const noticeKinds = [
+      ...OWNER_REQUIRED_KINDS.filter((kind) => !DECISION_REQUIRED_KINDS.includes(kind)),
+      ...OWNER_REQUIRED_PREFIXES.map((prefix) => `${prefix}example`),
+      ...OWNER_ALLOWED_PREFIXES.map((prefix) => `${prefix}example`),
+    ];
+    for (const kind of noticeKinds) {
+      expect(ownerNoticeGuidance(kind), kind).not.toBeNull();
+    }
+  });
+
+  it('attachDecisionOptions settles a pre-upgrade discussion row by validating only the incoming options', () => {
+    const rig = boot();
+    const legacy: NotificationDecision = {
+      question: 'Which plan should continue?',
+      context: 'Talked through in chat.',
+      recommendation: null,
+      reservedClass: 'scope-design',
+      whyNotDelegable: 'Only the owner may select the plan.',
+      options: [],
+      discussion: true,
+    };
+    const id = rig.api.recordNotification({
+      id: 'legacy-discussion',
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Which plan should continue?',
+      detail: 'Talked through in chat.',
+      decision: legacy,
+    }).id;
+    expect(() =>
+      rig.center.attachDecisionOptions(id, [{ id: 'go', label: 'Go', consequence: 'Gru re-arms the lane.' }], 'gru'),
+    ).toThrow(/internal vocabulary/u);
+    const attached = rig.center.attachDecisionOptions(
+      id,
+      [{ id: 'go', label: 'Go ahead', consequence: 'Gru starts the agreed work and reports back.' }],
+      'gru',
+    );
+    expect(attached?.decision?.options.map((option) => option.id)).toEqual(['go']);
+  });
+
   it('attachDecisionOptions refuses agreed options written as machinery, and attaches plain ones', () => {
     const rig = boot();
     const id = rig.center.post({
@@ -282,6 +333,23 @@ describe('the owner-language boundary covers every write of owner-facing text (#
     expect(adopted?.decision?.question).toBe('Approve the slim contract?');
   });
 
+  it('adoptLegacyDecision checks the incoming decision, not a stored title that predates the standard', () => {
+    const rig = boot();
+    // The title was written before this rule existed and is never rewritten by
+    // the adoption; refusing it would make every affected replay unreachable.
+    const id = rig.api.recordNotification({
+      id: 'legacy-title',
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Parked job job-7f3: producer stop is unproven',
+      detail: 'Evidence lives here.',
+    }).id;
+    const adopted = rig.center.adoptLegacyDecision(id, decision(), INTERNAL);
+    expect(adopted?.decision?.question).toBe('Approve the slim contract?');
+    expect(adopted?.title).toBe('Parked job job-7f3: producer stop is unproven');
+  });
+
   it('updateNotificationDetail refuses a refreshed machine title on an owner row, and leaves detail verbatim', () => {
     const rig = boot();
     const id = seedOwnerRow(rig, decision());
@@ -311,6 +379,10 @@ describe('the owner-language boundary covers every write of owner-facing text (#
     // Whole words only: a longer word that merely contains one is untouched.
     expect(passes('The plane and the gateway are late.')).toBe(true);
     for (const text of ['unblock lane 7', 'the heist is queued', 'check the /srv/gru/state folder', 'refs/heads/main moved', 'sha256 differs', 'Error: boom', '[worktrees] reclaim_mode = "proposed"', 'MANIFEST_PATH is missing']) {
+      expect(passes(text), text).toBe(false);
+    }
+    // The plural is the same internal word, not a different one.
+    for (const text of ['Two lanes were re-run.', 'The heists are queued.', 'Two breakers tripped.', 'Both gates failed.', 'Three dispatches are waiting.']) {
       expect(passes(text), text).toBe(false);
     }
   });

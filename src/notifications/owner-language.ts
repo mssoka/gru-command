@@ -26,8 +26,7 @@
  * See docs/FOR-YOU.md for the written standard.
  */
 
-import { ownerAttentionFor } from './attention.js';
-import type { NotificationDecision } from '../ledger/notification-decision.js';
+import type { NotificationDecision, NotificationDecisionOption } from '../ledger/notification-decision.js';
 
 /** Words a minion uses about its own machinery. Bare matches only, so
  * "plane", "gateway" and repo names that merely contain one are untouched. */
@@ -95,7 +94,9 @@ function refusal(field: string, what: string, token: string, instead: string): E
 export function assertOwnerFacingText(field: string, text: string): void {
   for (const term of OWNER_BANNED_TERMS) {
     // `-` is literal outside a character class, so the term needs no escape.
-    const match = new RegExp(`\\b${term}\\b`, 'iu').exec(text);
+    // The plural is the same internal word (`lanes`, `heists`, `breakers`,
+    // `gates`, `dispatches`) and is refused with it.
+    const match = new RegExp(`\\b${term}(?:s|es)?\\b`, 'iu').exec(text);
     if (match !== null) {
       throw refusal(field, 'internal vocabulary', match[0], 'is internal vocabulary; say what the owner gets instead');
     }
@@ -139,6 +140,31 @@ function assertIfNothing(ifNothing: string | null | undefined): void {
   }
 }
 
+/** The owner-facing text and required fields of a typed decision, without
+ * its row's stored title. Every write of a typed decision validates this;
+ * the title is validated separately where the producer writes it, so a
+ * pre-upgrade row's stored title is never re-judged by a later adoption. */
+export function assertOwnerDecisionLanguage(decision: NotificationDecision): void {
+  assertOwnerFacingText('decision.question', decision.question);
+  assertOwnerFacingText('decision.context', decision.context);
+  assertRecommendation(decision.recommendation);
+  assertOwnerFacingText('decision.recommendation', decision.recommendation ?? '');
+  assertOwnerFacingText('decision.whyNotDelegable', decision.whyNotDelegable);
+  assertIfNothing(decision.ifNothing);
+  assertOwnerFacingText('decision.ifNothing', decision.ifNothing ?? '');
+  assertOwnerOptionsLanguage(decision.options);
+}
+
+/** Validate one batch of owner-facing options (labels and consequences).
+ * The discussion bridge uses this on the incoming options only: the stored
+ * legacy question and recommendation are not re-validated. */
+export function assertOwnerOptionsLanguage(options: readonly NotificationDecisionOption[]): void {
+  for (const option of options) {
+    assertOwnerFacingText(`decision option "${option.id}" label`, option.label);
+    assertOwnerFacingText(`decision option "${option.id}" consequence`, option.consequence);
+  }
+}
+
 /**
  * The write boundary for owner-facing card text. Runs at every write of
  * owner-facing text (see the call sites named in docs/FOR-YOU.md) once the
@@ -167,17 +193,7 @@ export function assertOwnerCardLanguage(
     }
     return;
   }
-  assertOwnerFacingText('decision.question', decision.question);
-  assertOwnerFacingText('decision.context', decision.context);
-  assertRecommendation(decision.recommendation);
-  assertOwnerFacingText('decision.recommendation', decision.recommendation ?? '');
-  assertOwnerFacingText('decision.whyNotDelegable', decision.whyNotDelegable);
-  assertIfNothing(decision.ifNothing);
-  assertOwnerFacingText('decision.ifNothing', decision.ifNothing ?? '');
-  for (const option of decision.options) {
-    assertOwnerFacingText(`decision option "${option.id}" label`, option.label);
-    assertOwnerFacingText(`decision option "${option.id}" consequence`, option.consequence);
-  }
+  assertOwnerDecisionLanguage(decision);
 }
 
 /**
@@ -381,8 +397,3 @@ export function ownerNoticeGuidance(kind: string): OwnerNoticeGuidance | null {
   return null;
 }
 
-/** True when the kind can reach the owner surface (registered owner
- * attention) — the set the guidance table has to cover. */
-export function isOwnerFacingKind(kind: string): boolean {
-  return ownerAttentionFor(kind) !== 'owner-forbidden';
-}

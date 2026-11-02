@@ -511,13 +511,14 @@ test.describe('board (E6)', () => {
     const unreadBefore = Number(await bell.getAttribute('data-unread'));
     const decision = {
       question: 'Approve the external merge route?',
-      context: 'The lane needs an owner-controlled integration route before anything moves.',
+      context: 'The pull request needs an owner-controlled integration route before anything moves.',
       recommendation: 'Approve it; keep the unrelated repair separate.',
+      ifNothing: 'If you do nothing, nothing merges and the pull request stays open.',
       reservedClass: 'merge',
       whyNotDelegable: 'Every final merge stays owner-performed.',
       options: [
         { id: 'approve', label: 'Approve the merge route', consequence: 'Gru prepares the owner-controlled merge.' },
-        { id: 'keep', label: 'Keep the lane parked', consequence: 'Nothing is re-armed.' },
+        { id: 'keep', label: 'Keep the pull request open', consequence: 'Nothing changes.' },
       ],
       discussion: false,
     };
@@ -665,7 +666,7 @@ test('Settings recheck shows real degraded → recovered Jev state and resolved 
     await page.locator('.gru-modal__close').click();
     await expect(page.locator('.gru-modal')).toHaveCount(0);
     await page.locator('#notification-bell').click();
-    const incident = page.locator('.board-notification', { hasText: 'Jev degraded' }).first();
+    const incident = page.locator('.board-notification', { hasText: 'The optional decision helper is not responding' }).first();
     await expect(incident).toContainText('resolved');
     await expect(incident.locator('.board-notification__ack')).toHaveCount(0);
   } finally {
@@ -710,11 +711,11 @@ test('missing-key enabled startup is durable degraded: a browser connected AFTER
     // browser that connected after startup (no CLI-only error, no phantom
     // receipt). The panel lives inside #board-view — open it from the bell.
     await page.locator('#notification-bell').click();
-    const degraded = page.locator('.board-notification', { hasText: 'Jev degraded' }).first();
+    const degraded = page.locator('.board-notification', { hasText: 'The optional decision helper is not responding' }).first();
     await expect(degraded).toBeVisible();
     // Owner-only notice: the manual remediation is named, and no generic
     // Ack pretends to fix a degraded provider.
-    await expect(degraded.locator('.board-notification__guidance')).toContainText('Fix the decision-provider credential');
+    await expect(degraded.locator('.board-notification__guidance')).toContainText('Fix the credential or setting named in Details');
     await expect(degraded.locator('.board-notification__ack')).toHaveCount(0);
   } finally {
     await service.stop();

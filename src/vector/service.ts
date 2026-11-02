@@ -414,7 +414,7 @@ export class VectorService {
       // `detail` — the evidence slot.
       question: `Let Vector attack ${targetName(raid.target)}?`,
       context: [
-        `Vector attacks a target on purpose to find ways to break it. Gru picked this one: ${raid.reason}`,
+        'Vector attacks a target on purpose to find ways to break it. Gru picked this one; Gru’s reason and the target are in Details.',
         `It may spend up to ${String(v.maxRounds)} attacks, ${String(v.maxRuns)} sandboxed runs and about ${String(Math.round(v.maxRaidMs / 60_000))} minutes.`,
         `Why now: ${String(s.commitsSinceLastRaid)} commits since the last attack, ${String(s.perkinsFindings)} review findings and ${String(s.escapedRegressions)} earlier break-ins.`,
         'An attack changes nothing in your repository, and finding nothing never means the code is safe.',

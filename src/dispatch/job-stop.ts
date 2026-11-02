@@ -126,6 +126,17 @@ export function jobStopUnprovenNotice(outcome: JobStopOutcome): { readonly title
   };
 }
 
+/** The owner-facing notice for a stop pass that failed outright (the
+ * `watchParkedJobs` failure path, not an unproven verdict). The title is
+ * fixed plain language; the job id and the raw error are evidence and stay
+ * in `detail`, where the boundary never reads them. */
+export function jobStopFailedNotice(jobId: string, error: unknown): { readonly title: string; readonly detail: string } {
+  return {
+    title: 'A parked job could not be stopped',
+    detail: `Job ${jobId}: the stop pass failed: ${describe(error)}. Live producers may remain; inspect the job before resuming.`,
+  };
+}
+
 /**
  * Physical producer stop for an explicit owner hold (issue #455).
  *

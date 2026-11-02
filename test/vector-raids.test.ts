@@ -327,6 +327,20 @@ describe('planning and picks (#351 §2)', () => {
     expect(service.candidates().exclusions).toContainEqual({ repo: 'billing', packageDir: 'src/refunds', reason: 'a raid on it is queued or running' });
   });
 
+  it('a model-written reason with internal vocabulary still posts the card, with the reason in Details', () => {
+    const h = harness();
+    const service = h.service();
+    service.start();
+    // A reason is caller prose, so it can never make the owner's card
+    // unpostable (the reconcile would retry a refused card forever).
+    expect(() => service.pick({ picks: [pickRefunds('the lane beside the gate should be raided')], digest: null, requestedBy: 'gru' })).not.toThrow();
+    const [card] = h.rows(RAID_PROPOSAL_KIND);
+    expect(card).toBeDefined();
+    expect(card!.decision?.context).not.toContain('lane');
+    expect(card!.decision?.context).toContain('Gru’s reason and the target are in Details.');
+    expect(card!.detail).toContain('Gru\'s reason: the lane beside the gate should be raided');
+  });
+
   it('Decline is recorded and suppresses the target until its source identity changes', () => {
     const h = harness();
     const service = h.service();

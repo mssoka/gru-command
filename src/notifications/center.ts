@@ -5,7 +5,7 @@ import type { DecisionService } from '../decisions/types.js';
 import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import { eventTriageRouting } from '../decisions/effects.js';
 import { requiresTypedDecision, resolveNotificationRouting } from './attention.js';
-import { assertOwnerCardLanguage } from './owner-language.js';
+import { assertOwnerCardLanguage, assertOwnerDecisionLanguage, assertOwnerOptionsLanguage } from './owner-language.js';
 import {
   parseNotificationDecision,
   type NotificationDecision,
@@ -298,17 +298,22 @@ export class NotificationCenter {
   }
 
   /** Attach agreed options to a discussion-only decision (see
-   * LedgerApi.updateNotificationDecisionOptions). */
+   * LedgerApi.updateNotificationDecisionOptions). Only the incoming options
+   * are new owner text: the stored question/recommendation may predate the
+   * standard (a pre-upgrade discussion row), and re-validating it would
+   * make the documented bridge unusable on the rows it exists for. */
   attachDecisionOptions(id: string, options: readonly NotificationDecisionOption[], by: string): NotificationRecord | null {
     const current = this.ledger.getNotification(id);
     if (current !== null && current.routing === 'needs-owner' && current.decision !== null) {
-      assertOwnerCardLanguage(current.kind, current.title, { ...current.decision, options });
+      assertOwnerOptionsLanguage(options);
     }
     return this.ledger.updateNotificationDecisionOptions(id, options, by);
   }
 
   /** A pre-upgrade owner row adopts a replayed typed decision (see
-   * LedgerApi.adoptLegacyOwnerDecision, #395). */
+   * LedgerApi.adoptLegacyOwnerDecision, #395). The incoming decision is new
+   * owner text and is checked; the row's stored title is not rewritten by
+   * the adoption and may predate the standard. */
   adoptLegacyDecision(
     id: string,
     decision: NotificationDecision,
@@ -316,7 +321,7 @@ export class NotificationCenter {
   ): NotificationRecord | null {
     const current = this.ledger.getNotification(id);
     if (current !== null && current.routing === 'needs-owner') {
-      assertOwnerCardLanguage(current.kind, current.title, decision);
+      assertOwnerDecisionLanguage(decision);
     }
     return this.ledger.adoptLegacyOwnerDecision(id, decision, provenance);
   }

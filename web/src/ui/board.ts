@@ -2729,7 +2729,9 @@ export class BoardView {
         const box = el('div', 'board-notification__guidance');
         box.append(
           el('div', 'board-notification__guidance-why', `Why you’re seeing this: ${guidance.whyAsked}`),
-          el('div', 'board-notification__guidance-nothing', `If you do nothing: ${guidance.ifNothing}`),
+          // The stored line already opens with "If you do nothing, …"; the
+          // static label would say it twice on every notice (#570).
+          el('div', 'board-notification__guidance-nothing', guidance.ifNothing),
           el('div', 'board-notification__guidance-how', `What to do: ${guidance.howTo}`),
         );
         card.append(box);
@@ -2897,7 +2899,8 @@ export class BoardView {
     // line and gets none invented.
     const ifNothing = decision.ifNothing ?? null;
     if (ifNothing !== null && ifNothing !== '') {
-      block.append(el('div', 'board-notification__if-nothing', `If you do nothing: ${ifNothing}`));
+      // Rendered bare: every producer line already reads "If you do nothing, …".
+      block.append(el('div', 'board-notification__if-nothing', ifNothing));
     }
     return block;
   }

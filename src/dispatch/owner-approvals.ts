@@ -59,7 +59,6 @@ const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as cons
 const OWNER_DECIDER = 'owner';
 
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._-]{1,128}$/u;
-const REASON_EXCERPT_CHARS = 200;
 const ERROR_MESSAGE_CHARS = 300;
 const BODY_LIMIT_BYTES = 64 * 1024;
 
@@ -234,14 +233,16 @@ export function isTransientCardPostFailure(error: unknown): boolean {
     (typeof failed?.message === 'string' && /database (?:table )?is (?:locked|busy)/iu.test(failed.message));
 }
 
-/** The card's decision for a record, built from its stored facts alone. */
-function cardDecision(record: OwnerApprovalRecord): NotificationDecision {
-  // Plain language (issue #570): the request id, the job id and the bound
-  // facts are evidence, so they stay in the card's `detail`.
-  const reason = [...record.reason].slice(0, REASON_EXCERPT_CHARS).join('');
+/** The card's decision. It names no record fact: the request id, the fences
+ * and Gru's reason are evidence in `detail`. */
+function cardDecision(): NotificationDecision {
+  // Plain language (issue #570): the request id, the job id, the bound facts
+  // and Gru's reason are evidence, so they stay in the card's `detail`. The
+  // reason is caller prose (a minion often writes it) and must never be able
+  // to make the card unpostable.
   return {
     question: 'Give up on this directive?',
-    context: `Gru cannot tell whether this directive finished what it started. Gru's reason: ${reason}`,
+    context: 'Gru cannot tell whether this directive finished what it started. Gru’s reason is in Details.',
     recommendation: 'No recommendation — either choice is fine, because only you can weigh re-running a request that may already have taken effect against leaving one that may never run again.',
     reservedClass: 'destructive',
     whyNotDelegable: WHY_NOT_DELEGABLE,
@@ -525,7 +526,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
       severity: 'error',
       title: 'A directive may never have finished — give up on it?',
       detail: cardDetail(record),
-      decision: cardDecision(record),
+      decision: cardDecision(),
     });
   };
 

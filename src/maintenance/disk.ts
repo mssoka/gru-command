@@ -342,6 +342,15 @@ function diskName(read: Pick<VolumeRead, 'names' | 'path'>, watched: number): st
   return watched > 1 ? `the ${read.names.join(' and ')} disk (${read.path})` : 'the disk';
 }
 
+/** The same disk named for the owner face: no path and no internal folder
+ * label (`lanes`, `data_dir`). The path and labels are evidence and stay in
+ * `detail` and the queue note. */
+function ownerDiskName(read: Pick<VolumeRead, 'names'>, watched: number): string {
+  if (watched <= 1) return 'the disk';
+  const labels = read.names.map((name) => name === 'lanes' ? 'the work area' : name === 'data_dir' ? 'the data folder' : 'a watched folder');
+  return `the disk holding ${labels.join(' and ')}`;
+}
+
 const capitalized = (text: string): string => `${text.slice(0, 1).toUpperCase()}${text.slice(1)}`;
 
 // ------------------------------------------------------------------
@@ -1947,7 +1956,7 @@ export class DiskService {
       parts.push(`Gru Command is using ${diskSize(usage.totalBytes)} of its ${diskSize(this.budgetBytes)} disk budget.`);
     }
     for (const read of this.opts.floor.belowFloor(reads)) {
-      parts.push(`${capitalized(diskName(read, reads.length))} has ${diskSizeDown(read.space!.freeBytes)} free, below the ${diskSize(this.floorBytes)} it needs; new jobs wait until there is room.`);
+      parts.push(`${capitalized(ownerDiskName(read, reads.length))} has ${diskSizeDown(read.space!.freeBytes)} free, below the ${diskSize(this.floorBytes)} it needs; new jobs wait until there is room.`);
     }
     return parts.join(' ');
   }

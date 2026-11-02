@@ -193,7 +193,8 @@ describe('readable notification card — fixed long-content contract', () => {
     const guidance = band.querySelector('.board-notification__guidance');
     expect(guidance).not.toBeNull();
     expect(guidance?.textContent ?? '').toContain('What to do: Stop the program named in Details');
-    expect(guidance?.textContent ?? '').toContain('If you do nothing:');
+    expect(guidance?.textContent ?? '').toContain('If you do nothing, the app stays unable to use its port and this notice stays until the port is free.');
+    expect(guidance?.textContent ?? '').not.toContain('If you do nothing: If you do nothing');
     expect(band.querySelector('.board-notification__ack')).toBeNull();
     expect(band.querySelector('.board-owner__ack')).toBeNull();
   });

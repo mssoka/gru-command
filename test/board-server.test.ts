@@ -530,6 +530,11 @@ describe('board server — HTTP API', () => {
     for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }, { title: 'Owner call', detail: 'Approve external merge' }]) {
       expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
     }
+    // A complete typed decision whose face breaks the plain-language standard
+    // is a 400, not a stored card: the boundary refuses it before write (#570).
+    const breakerFace = { ...ownerMergeDecision(), question: 'Gru breaker is open; authorized re-arm required' };
+    expect((await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge', decision: breakerFace })))
+      .toMatchObject({ status: 400, body: { error: 'bad_request' } });
     const before = api.countPendingActionRequiredIncludingReceipts();
     const decision = ownerMergeDecision();
     const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge', decision });

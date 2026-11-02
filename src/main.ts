@@ -70,7 +70,7 @@ import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
-import { JobExecutionStop, jobStopUnprovenNotice, watchParkedJobs } from './dispatch/job-stop.js';
+import { JobExecutionStop, jobStopFailedNotice, jobStopUnprovenNotice, watchParkedJobs } from './dispatch/job-stop.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
@@ -1574,12 +1574,8 @@ async function main(): Promise<number> {
     bus,
     stop: jobExecutionStop,
     notifyFailed: (jobId, error) => {
-      openJobStopIncident(
-        jobId,
-        `Parked job ${jobId}: producer stop failed`,
-        `The explicit owner hold is recorded, but the stop pass itself failed: ${String(error)}. ` +
-          'Live producers may remain; inspect the job before resuming.',
-      );
+      const notice = jobStopFailedNotice(jobId, error);
+      openJobStopIncident(jobId, notice.title, notice.detail);
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });

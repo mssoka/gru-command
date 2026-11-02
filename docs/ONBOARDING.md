@@ -53,7 +53,7 @@ status (merged, done or binned), and when Gru calls the propose route.
 ([CONFIG.md](./CONFIG.md#onboarding-proposed-autonomous-or-off)):
 
 - **`"proposed"` (default).** Each repository gets one FOR YOU card,
-  "Onboard &lt;repo&gt;". There is no Gru turn: code posts the card.
+  "Set up &lt;repo&gt; for Gru Command". There is no Gru turn: code posts the card.
   - **Accept** dispatches the heist. If origin got a manifest in the meantime,
     nothing is dispatched and the card says why.
   - **Decline** is remembered.
