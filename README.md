@@ -152,7 +152,11 @@ GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
    (mechanical checks → fyi, judgment checks → action-required), and CI
    green records the review-gate signal event (`github.ci-green`). The
    per-tick call budget caps usage at 3 000 of the authenticated
-   5 000 requests/hour GitHub budget. Webhooks remain a possible future
+   5 000 requests/hour GitHub budget. The same interval also drives the
+   GitLab merge-request poll: one read per tracked merge request per tick
+   through `GITLAB_TOKEN` (falling back to `GL_TOKEN`), bounded by a 30 s
+   per-tick wall clock rather than a call cap; `0` disables both polls.
+   Webhooks remain a possible future
    option and are not built.
 
    Verify the same data by hand:

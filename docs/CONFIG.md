@@ -493,6 +493,11 @@ unchanged_rewake_ms = 21600000
 # records the review-gate signal event). 0 disables the poll; requires
 # an authenticated `gh` (see README Prerequisites). Rate-limit headroom:
 # calls are capped per tick — at most 3000 of the authenticated 5000/h.
+# The same interval also drives the GitLab merge-request poll: one read
+# per tracked merge request per tick via `GITLAB_TOKEN` (or `GL_TOKEN`),
+# bounded by wall clock (30 s per tick), never by a call count. 0
+# disables both polls; without either token each GitLab lane records a
+# token-missing read failure and its FOR YOU row stays withheld.
 poll_interval_ms = 60000
 stall_threshold_ms = 1800000
 directive_at = 2
