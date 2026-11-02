@@ -101,6 +101,8 @@ describe('owner approval - the text that sends Gru and the owner to the new rout
     expect(source).toContain('For a directive request, propose abandonment with `POST /api/owner-approvals`; the owner\'s Approve carries it out.');
     expect(source).toContain('For a re-brief marker, propose its abandonment the same way with `kind: "rebrief-abandon"` and its `marker_id`.');
     expect(source).toContain('propose `recovery-owner-resolution` or `recovery-owner-stop` with the exact fences your readback gives');
+    // The ordering rule: a stop is never chained onto the card that records the ruling.
+    expect(source).toContain('a stop only once a ruling is recorded, never on the same card');
     expect(source).toContain('Never call `/abandon`, record the owner\'s decision, or send owner attribution yourself.');
   });
 
@@ -150,6 +152,8 @@ describe('owner approval - the text that sends Gru and the owner to the new rout
     expect(doc).toContain('A stop confirmation is proposable only when a ruling already exists');
     expect(doc).toContain('confirming a stop never records a ruling');
     expect(doc).toContain('A recorded recovery ruling and a stop confirmation execute nothing');
+    // ...and the owner-route section names the card as its one service-driven caller.
+    expect(doc).toContain('the only service-driven path is the owner\'s own Approve on an owner-approval card');
   });
 
   it('docs/OPERATIONS.md points the unknown-custody sentence at the owner-approval section', () => {

@@ -47,6 +47,7 @@ import { redactCredentials } from '../src/redaction.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { historicalLiveRequest, seededLiveRequest } from './helpers/directive-fixtures.js';
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
@@ -408,22 +409,40 @@ function rebriefAbandonmentEvents(h: Harness): readonly { readonly seq: number; 
 const RECOVERY_REASON = 'explicit narrow owner permission for this exact current approved scope and recorded governing stop';
 
 /** A recovery subject behind a real reserved owner stop: one live directive
- * request, its unknown-effect debt, the parked job, the suspended
- * owner-decision target, and Gru's recorded transfer that makes that exact
- * stop the owner's to rule on. Mirrors `ownerFixture` in
- * `test/directive-retirement.test.ts`, on the ledger and the real routes. */
-async function recoveryOwnerFixture(h: Harness, repo: FixtureRepo, tag: string): Promise<{
+ * request (or one pending re-brief marker generation), its unknown-effect
+ * debt, the parked job, the suspended owner-decision target, and Gru's
+ * recorded transfer that makes that exact stop the owner's to rule on.
+ * Mirrors `ownerFixture` in `test/directive-retirement.test.ts`, on the ledger
+ * and the real routes, for both recovery subject kinds. */
+async function recoveryOwnerFixture(h: Harness, repo: FixtureRepo, tag: string, kind: 'directive' | 'rebrief' = 'directive'): Promise<{
+  readonly kind: 'directive' | 'rebrief';
   readonly jobId: string;
   readonly subjectId: string;
   readonly lane: WorktreeLane;
   readonly targetId: string;
   readonly ownerStopCardId: string;
+  /** The old `by: "owner"` route base of this subject kind. */
+  readonly routePath: string;
   readonly action: (overrides?: Record<string, unknown>) => Promise<Record<string, unknown>>;
 }> {
   const jobId = `job-rule-${tag}`;
-  const subjectId = `req-rule-${tag}`;
-  const { lane } = await seededLiveRequest(h, repo, jobId, subjectId);
-  const debt = h.ledger.openDirectiveRecoveryDebt(subjectId, 'unknown original effects');
+  const originalId = `req-rule-${tag}`;
+  const { lane } = await seededLiveRequest(h, repo, jobId, originalId);
+  let subjectId = originalId;
+  let payloadHash = h.ledger.getDirective(originalId)?.payloadHash;
+  if (kind === 'rebrief') {
+    h.ledger.failDirective({ requestId: originalId, reason: 'fixture never dispatched' });
+    const markers = h.ledger.beginPendingRebrief({ jobId, note: 'historical unresolved', briefing: 'original approved scope' });
+    await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: lane.path, dataDir: h.dir, agentId: `${jobId}-original-minion` });
+    const marker = h.ledger.listPendingRebriefs({ jobId }).find((row) => row.kind === 'silas.rebrief');
+    if (marker === undefined) throw new Error(`no re-brief marker for ${jobId}`);
+    subjectId = marker.id;
+    payloadHash = marker.payloadHash;
+  }
+  const routePath = `/api/silas/${kind === 'directive' ? 'directives' : 'rebriefs'}/${subjectId}`;
+  const debt = kind === 'directive'
+    ? h.ledger.openDirectiveRecoveryDebt(subjectId, 'unknown original effects')
+    : h.ledger.openRebriefRecoveryDebt(subjectId, 'unknown original effects');
   h.ledger.setJobStatus(jobId, 'parked');
   const governingStop = h.ledger.latestJobEvent(jobId, 'job.status');
   if (governingStop === null) throw new Error(`no governing stop event for ${jobId}`);
@@ -433,24 +452,25 @@ async function recoveryOwnerFixture(h: Harness, repo: FixtureRepo, tag: string):
   h.ledger.suspendObligation(target.id, 'real reserved owner stop suspended while parked');
   const ownerStop = h.notifications.postIncident({ kind: `owner-budget.${jobId}`, routing: 'needs-owner', severity: 'error',
     title: 'real reserved owner budget decision', detail: 'owner action required', dedupe: 'active' });
-  const transferred = await call(h.port, 'POST', `/api/silas/directives/${subjectId}/recover`, {
-    by: 'gru', expected_generation: debt.generation, expected_payload_hash: h.ledger.getDirective(subjectId)?.payloadHash,
+  const transferred = await call(h.port, 'POST', `${routePath}/recover`, {
+    by: 'gru', expected_generation: debt.generation, expected_payload_hash: payloadHash,
     expected_head: resolveGitCommit(lane.path, 'HEAD'), expected_epoch: h.ledger.directiveRecoveryEpoch(jobId),
     expected_work_revision: h.ledger.directiveCurrentAuthority(jobId).workRevision,
     expected_contract_sha256: h.ledger.directiveCurrentAuthority(jobId).contractSha256,
+    ...(kind === 'rebrief' ? { expected_receipt_evidence_sha256: h.ledger.rebriefReceiptEvidence(subjectId).sha256 } : {}),
     reason: 'reserved owner stop governs the exact preserved recovery subject',
     decision: { kind: 'owner-decision', obligation_id: target.id },
   });
   expect(transferred.status, JSON.stringify(transferred.json)).toBe(200);
   const action = async (overrides: Record<string, unknown> = {}): Promise<Record<string, unknown>> => {
-    const readback = await call(h.port, 'GET', `/api/silas/directives/${subjectId}`);
+    const readback = await call(h.port, 'GET', routePath);
     expect(readback.status).toBe(200);
     const view = field<ReturnType<LedgerApi['recoveryOwnerReadback']>>(readback.json, 'recovery_owner');
     const transfer = view.transfer;
     if (transfer?.ownerTransfer == null) throw new Error('the fixture transfer did not record an owner target');
     const authority = h.ledger.directiveCurrentAuthority(jobId);
     return {
-      recovery_kind: 'directive',
+      recovery_kind: kind,
       subject_id: subjectId,
       expected_transfer_event_seq: transfer.eventSeq,
       expected_transfer_fingerprint: transfer.fingerprint,
@@ -465,7 +485,7 @@ async function recoveryOwnerFixture(h: Harness, repo: FixtureRepo, tag: string):
       ...overrides,
     };
   };
-  return { jobId, subjectId, lane, targetId: target.id, ownerStopCardId: ownerStop.id, action };
+  return { kind, jobId, subjectId, lane, targetId: target.id, ownerStopCardId: ownerStop.id, routePath, action };
 }
 
 function recoveryProposalBody(
@@ -479,8 +499,8 @@ function recoveryProposalBody(
 }
 
 /** The one recorded ruling of a recovery subject, by its stable identity. */
-function recordedRuling(h: Harness, subjectId: string, resolutionId: string): { readonly seq: number; readonly fingerprint: string; readonly reason: unknown } | null {
-  const event = h.ledger.recoveryOwnerResolution('directive', subjectId, resolutionId);
+function recordedRuling(h: Harness, kind: 'directive' | 'rebrief', subjectId: string, resolutionId: string): { readonly seq: number; readonly fingerprint: string; readonly reason: unknown } | null {
+  const event = h.ledger.recoveryOwnerResolution(kind, subjectId, resolutionId);
   if (event === null) return null;
   const payload = event.payload as { readonly fingerprint?: unknown; readonly reason?: unknown };
   if (typeof payload.fingerprint !== 'string') throw new Error('the recorded ruling carries no fingerprint');
@@ -1905,7 +1925,7 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     }
     await decide(h, card.id, 'approve', 'owner');
 
-    const ruling = recordedRuling(h, fixture.subjectId, resolutionId);
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId);
     expect(ruling).not.toBeNull();
     const record = h.ledger.getOwnerApproval(id)!;
     expect(record.state).toBe('succeeded');
@@ -1938,7 +1958,7 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     const approval = createdApproval(created);
     const card = approvalCard(h, field<string>(approval, 'notification_id'));
     expect((await decide(h, card.id, 'deny', 'owner')).status).toBe(200);
-    expect(recordedRuling(h, fixture.subjectId, resolutionId)).toBeNull();
+    expect(recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)).toBeNull();
     expect(countEvents(h, 'ruling.recorded')).toBe(0);
     expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('denied');
     expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
@@ -2004,7 +2024,7 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     const card = approvalCard(h, field<string>(approval, 'notification_id'));
     await decide(h, card.id, 'approve', 'owner');
     expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('executing');
-    expect(recordedRuling(h, fixture.subjectId, resolutionId)).toBeNull();
+    expect(recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)).toBeNull();
 
     const restarted = h.restart();
     restarted.reconcile();
@@ -2012,7 +2032,7 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     const record = h.ledger.getOwnerApproval(field<string>(approval, 'id'))!;
     expect(record.state).toBe('succeeded');
     expect(countEvents(h, 'ruling.recorded')).toBe(1);
-    expect(record.auditEventSeq).toBe(recordedRuling(h, fixture.subjectId, resolutionId)?.seq);
+    expect(record.auditEventSeq).toBe(recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)?.seq);
     expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
   });
 
@@ -2036,7 +2056,7 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     expect(rulingCreated.status, JSON.stringify(rulingCreated.json)).toBe(201);
     const rulingApproval = createdApproval(rulingCreated);
     await decide(h, approvalCard(h, field<string>(rulingApproval, 'notification_id')).id, 'approve', 'owner');
-    const ruling = recordedRuling(h, fixture.subjectId, resolutionId)!;
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
     expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
 
     const stopCreated = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-stop',
@@ -2062,6 +2082,13 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     expect(confirmed.attempts).toBe(0);
     expect(resolutionDetail(h, stopCard.id))
       .toBe(`Governing stop confirmed and settled (event seq ${String(confirmed.auditEventSeq)}). Parking, other holds and cards are unchanged.`);
+    // One card, no second: a reconcile appends nothing and posts no new card.
+    const seqs = h.ledger.listEvents({ limit: 1_000 }).map((event) => event.seq);
+    const once = h.restart();
+    once.reconcile();
+    once.reconcile();
+    expect(h.ledger.listEvents({ limit: 1_000 }).map((event) => event.seq)).toEqual(seqs);
+    expect(approvalCards(h)).toHaveLength(2);
   });
 
   it('refuses a stop whose stored contract moved as stale-fence, and never settles an unconfirmed stop', async () => {
@@ -2075,7 +2102,7 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     expect(rulingCreated.status, JSON.stringify(rulingCreated.json)).toBe(201);
     const rulingApproval = createdApproval(rulingCreated);
     await decide(h, approvalCard(h, field<string>(rulingApproval, 'notification_id')).id, 'approve', 'owner');
-    const ruling = recordedRuling(h, fixture.subjectId, resolutionId)!;
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
 
     // A stop fenced on a fingerprint that is not the recorded one cannot be proposed at all.
     const wrong = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-stop',
@@ -2098,5 +2125,211 @@ describe('owner approval — the recovery kinds never chain and execute nothing'
     expect(record.refusal?.code).toBe('stale-fence');
     expect(countEvents(h, 'silas.recovery-owner-stop-confirmed')).toBe(0);
     expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
+  });
+
+  it('a crash at executing-written confirms the governing stop exactly once', async () => {
+    const repo = makeFixtureRepo('oa-rule-stop-crash');
+    cleanupRepos.push(repo);
+    const h = await boot({ crashAt: ['executing-written'] });
+    const fixture = await recoveryOwnerFixture(h, repo, 'stop-crash');
+    const resolutionId = 'owner-ruling-stop-crash';
+    // The ruling is already recorded (the old route, so the crash stays on the stop):
+    // the stop's own never-twice proof reads the confirmation, not the ruling.
+    const recorded = await call(h.port, 'POST', `${fixture.routePath}/owner-resolution`,
+      { ...(await fixture.action()), by: 'owner', confirm_intent: true, resolution_id: resolutionId, reason: RECOVERY_REASON });
+    expect(recorded.status, JSON.stringify(recorded.json)).toBe(200);
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
+
+    const created = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-stop',
+      await fixture.action(), resolutionId, { expected_resolution_fingerprint: ruling.fingerprint }));
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const approval = createdApproval(created);
+    const stopCard = approvalCard(h, field<string>(approval, 'notification_id'));
+    await decide(h, stopCard.id, 'approve', 'owner');
+    // The crash lost the execution, not the decision, and confirmed nothing.
+    expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('executing');
+    expect(countEvents(h, 'silas.recovery-owner-stop-confirmed')).toBe(0);
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
+
+    const restarted = h.restart();
+    restarted.reconcile();
+    restarted.reconcile();
+    const record = h.ledger.getOwnerApproval(field<string>(approval, 'id'))!;
+    expect(record.state).toBe('succeeded');
+    expect(record.attempts).toBe(0);
+    const confirmations = eventsOfKind(h, 'silas.recovery-owner-stop-confirmed');
+    expect(confirmations).toHaveLength(1);
+    expect(confirmations[0]!.payload).toMatchObject({ by: 'owner', subject_kind: fixture.kind,
+      subject_id: fixture.subjectId, resolution_id: resolutionId, ruling_event_seq: ruling.seq });
+    expect(record.auditEventSeq).toBe(confirmations[0]!.seq);
+    expect(countEvents(h, 'ruling.recorded')).toBe(1);
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('settled');
+  });
+
+  it('a Deny of the governing stop settles nothing', async () => {
+    const repo = makeFixtureRepo('oa-rule-stop-deny');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const fixture = await recoveryOwnerFixture(h, repo, 'stop-deny');
+    const resolutionId = 'owner-ruling-stop-deny';
+    const action = await fixture.action();
+    const rulingCreated = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-resolution', action, resolutionId));
+    expect(rulingCreated.status, JSON.stringify(rulingCreated.json)).toBe(201);
+    const rulingApproval = createdApproval(rulingCreated);
+    await decide(h, approvalCard(h, field<string>(rulingApproval, 'notification_id')).id, 'approve', 'owner');
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
+
+    const created = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-stop',
+      await fixture.action(), resolutionId, { expected_resolution_fingerprint: ruling.fingerprint }));
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const approval = createdApproval(created);
+    const stopCard = approvalCard(h, field<string>(approval, 'notification_id'));
+    expect((await decide(h, stopCard.id, 'deny', 'owner')).status).toBe(200);
+
+    // Nothing ran: the governing stop is still suspended and the ruling is untouched.
+    expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('denied');
+    expect(countEvents(h, 'silas.recovery-owner-stop-confirmed')).toBe(0);
+    expect(countEvents(h, 'ruling.recorded')).toBe(1);
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
+    expect(h.ledger.getJob(fixture.jobId)?.status).toBe('parked');
+    expect(h.ledger.getNotification(fixture.ownerStopCardId)?.ackedAt).toBeNull();
+    expect(h.spawns).toEqual([]);
+    expect(resolutionDetail(h, stopCard.id)).toBe('Denied by the owner; nothing was run.');
+  });
+
+  it('refuses a stop confirmation decided by anyone but the owner and records nothing', async () => {
+    const repo = makeFixtureRepo('oa-rule-stop-decider');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const fixture = await recoveryOwnerFixture(h, repo, 'stop-decider');
+    const resolutionId = 'owner-ruling-stop-decider';
+    const action = await fixture.action();
+    const rulingCreated = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-resolution', action, resolutionId));
+    expect(rulingCreated.status, JSON.stringify(rulingCreated.json)).toBe(201);
+    const rulingApproval = createdApproval(rulingCreated);
+    await decide(h, approvalCard(h, field<string>(rulingApproval, 'notification_id')).id, 'approve', 'owner');
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
+
+    const created = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-stop',
+      await fixture.action(), resolutionId, { expected_resolution_fingerprint: ruling.fingerprint }));
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const approval = createdApproval(created);
+    const stopCard = approvalCard(h, field<string>(approval, 'notification_id'));
+    expect((await decide(h, stopCard.id, 'approve', 'gru')).status).toBe(200);
+    const record = h.ledger.getOwnerApproval(field<string>(approval, 'id'))!;
+    expect(record.state).toBe('refused');
+    expect(record.refusal).toEqual({ code: 'decider-not-owner', blockers: ['decided by "gru", not "owner"'] });
+    expect(countEvents(h, 'silas.recovery-owner-stop-confirmed')).toBe(0);
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
+  });
+
+  it('replays the same stop proposal and answers a second key as pending', async () => {
+    const repo = makeFixtureRepo('oa-rule-stop-replay');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const fixture = await recoveryOwnerFixture(h, repo, 'stop-replay');
+    const resolutionId = 'owner-ruling-stop-replay';
+    const action = await fixture.action();
+    const rulingCreated = await call(h.port, 'POST', '/api/owner-approvals', recoveryProposalBody('recovery-owner-resolution', action, resolutionId));
+    expect(rulingCreated.status, JSON.stringify(rulingCreated.json)).toBe(201);
+    const rulingApproval = createdApproval(rulingCreated);
+    await decide(h, approvalCard(h, field<string>(rulingApproval, 'notification_id')).id, 'approve', 'owner');
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
+
+    const body = recoveryProposalBody('recovery-owner-stop', await fixture.action(), resolutionId,
+      { expected_resolution_fingerprint: ruling.fingerprint });
+    const created = await call(h.port, 'POST', '/api/owner-approvals', body);
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const approval = createdApproval(created);
+    // The same key and the same body is the same proposal, never a second card.
+    const replayed = await call(h.port, 'POST', '/api/owner-approvals', body);
+    expect(replayed.status).toBe(200);
+    expect(createdApproval(replayed)).toMatchObject({ id: field<string>(approval, 'id'), state: 'proposed' });
+    // A different key for the same live subject is pending, never a second card.
+    const second = await call(h.port, 'POST', '/api/owner-approvals', { ...body, idempotency_key: 'a-second-stop-key' });
+    expect(second.status).toBe(409);
+    expect(field<string>(second.json, 'error')).toBe('owner_approval_pending');
+    expect(approvalCards(h)).toHaveLength(2);
+
+    await decide(h, approvalCard(h, field<string>(approval, 'notification_id')).id, 'approve', 'owner');
+    expect(h.ledger.getOwnerApproval(field<string>(approval, 'id'))?.state).toBe('succeeded');
+    expect(countEvents(h, 'silas.recovery-owner-stop-confirmed')).toBe(1);
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('settled');
+  });
+
+  it('the old by:owner routes still record the ruling and confirm the same stop', async () => {
+    const repo = makeFixtureRepo('oa-rule-stop-old-route');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const fixture = await recoveryOwnerFixture(h, repo, 'stop-old-route');
+    const resolutionId = 'owner-ruling-stop-old-route';
+    // The owner's own call, unchanged: the ruling first (the ten fences only).
+    const fences = async (): Promise<Record<string, unknown>> => {
+      const { recovery_kind: _recoveryKind, ...rest } = await fixture.action();
+      return rest;
+    };
+    const ruled = await call(h.port, 'POST', `${fixture.routePath}/owner-resolution`,
+      { ...(await fences()), by: 'owner', confirm_intent: true, resolution_id: resolutionId, reason: RECOVERY_REASON });
+    expect(ruled.status, JSON.stringify(ruled.json)).toBe(200);
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId)!;
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
+    // ...then the confirmation, fenced on that ruling's own fingerprint.
+    const confirmed = await call(h.port, 'POST', `${fixture.routePath}/owner-resolution/confirm-stop`,
+      { ...(await fences()), by: 'owner', confirm_intent: true, resolution_id: resolutionId, reason: RECOVERY_REASON,
+        expected_resolution_fingerprint: ruling.fingerprint });
+    expect(confirmed.status, JSON.stringify(confirmed.json)).toBe(200);
+    const confirmations = eventsOfKind(h, 'silas.recovery-owner-stop-confirmed');
+    expect(confirmations).toHaveLength(1);
+    expect(confirmations[0]!.payload).toMatchObject({ by: 'owner', subject_kind: fixture.kind,
+      subject_id: fixture.subjectId, resolution_id: resolutionId, ruling_event_seq: ruling.seq });
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('settled');
+    // The owner's own route is not the card mechanism: no approval, no card, no spawn.
+    expect(approvalCards(h)).toEqual([]);
+    expect(h.spawns).toEqual([]);
+  });
+
+  it('records the ruling of a re-brief recovery subject through its own card', async () => {
+    const repo = makeFixtureRepo('oa-rule-rebrief');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const fixture = await recoveryOwnerFixture(h, repo, 'rebrief-rule', 'rebrief');
+    const resolutionId = 'owner-ruling-rebrief';
+    const body = recoveryProposalBody('recovery-owner-resolution', await fixture.action(), resolutionId);
+    const created = await call(h.port, 'POST', '/api/owner-approvals', body);
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const approval = createdApproval(created);
+    const id = field<string>(approval, 'id');
+    // The contract's own kind names the subject shape, and the card prints it.
+    expect(approval).toMatchObject({ kind: 'recovery-owner-resolution', request_id: null,
+      subject: { kind: 'recovery', id: fixture.subjectId, recovery_kind: 'rebrief' } });
+    const card = approvalCard(h, field<string>(approval, 'notification_id'));
+    expect(card.kind).toBe(OWNER_APPROVAL_CARD_KIND['recovery-owner-resolution']);
+    expect(card.detail).toContain(`Gru proposes recording the owner ruling for rebrief ${fixture.subjectId} (approval ${id}).`);
+    expect(card.detail).toContain('recovery_kind: rebrief');
+    // The same key and body is the same proposal; a different key is pending.
+    const replayed = await call(h.port, 'POST', '/api/owner-approvals', body);
+    expect(replayed.status).toBe(200);
+    expect(createdApproval(replayed)).toMatchObject({ id, state: 'proposed' });
+    const second = await call(h.port, 'POST', '/api/owner-approvals', { ...body, idempotency_key: 'a-second-rebrief-ruling-key' });
+    expect(second.status).toBe(409);
+    expect(field<string>(second.json, 'error')).toBe('owner_approval_pending');
+    expect(approvalCards(h)).toHaveLength(1);
+
+    await decide(h, card.id, 'approve', 'owner');
+    // The marker identity is what the ruling was recorded under, and nothing ran.
+    const ruling = recordedRuling(h, fixture.kind, fixture.subjectId, resolutionId);
+    expect(ruling).not.toBeNull();
+    expect(countEvents(h, 'ruling.recorded')).toBe(1);
+    expect(eventsOfKind(h, 'ruling.recorded')[0]!.payload).toMatchObject({ by: 'owner', subject_kind: 'rebrief',
+      subject_id: fixture.subjectId, resolution_id: resolutionId });
+    const record = h.ledger.getOwnerApproval(id)!;
+    expect(record.state).toBe('succeeded');
+    expect(record.attempts).toBe(0);
+    expect(record.auditEventSeq).toBe(ruling!.seq);
+    expect(h.ledger.getObligation(fixture.targetId)?.state).toBe('suspended');
+    expect(h.ledger.getJob(fixture.jobId)?.status).toBe('parked');
+    expect(h.ledger.getNotification(fixture.ownerStopCardId)?.ackedAt).toBeNull();
+    expect(h.spawns).toEqual([]);
+    expect(resolutionDetail(h, card.id)).toBe(`Ruling recorded (event seq ${String(ruling!.seq)}). Nothing was released, unparked, Acked or executed.`);
   });
 });

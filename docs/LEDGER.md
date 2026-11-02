@@ -865,7 +865,8 @@ Migration 35 (`owner-approvals`) is additive: no existing table changes.
 (`directive-abandon`), `request_id`, `job_id`, the four fences read when Gru
 asked (`fence_state`, `fence_payload_hash`, `fence_debt_generation` and the
 row's `job_id`), `reason`, `idempotency_key` (unique), `body_fingerprint`
-(sha256 of kind, request, reason and `by`), `notification_id`
+(sha256 over the proposal the key belongs to: kind, target, reason and `by`,
+widened by migration 39 below), `notification_id`
 (`owner-approval:<id>`, unique), `state` (`proposed`, `approved`,
 `executing`, `succeeded`, `denied`, `refused`, `withdrawn`), `attempts`,
 `executing_seq`, `abandonment_event_seq` (the seq of the event that carried
@@ -893,6 +894,14 @@ abandonment, and the `INSERT…SELECT` maps it to exactly that. The one-active
 index is re-keyed from `request_id` to `(subject_kind, subject_id)`, so a
 marker generation and a recovery subject fence exactly as a request does, and
 `idx_owner_approvals_job` is preserved.
+
+`body_fingerprint` is re-derived over the kind, the subject kind and id, the
+recovery identity (`resolution_id` and, for a stop, the ruling's
+expected `resolution_fingerprint`), the stored ten-field contract, the reason
+and `by`. Migration 39 copies each existing row's digest unchanged, so a row
+written before it keeps the digest its proposal was answered with; a retry of
+that same proposal now answers `409 owner_approval_key_conflict` instead of
+the `200` replay a post-migration proposal gets.
 
 Migration 36 (`notification-resolution-detail`) adds the nullable
 `notifications.resolution_detail`: the result a follow-through

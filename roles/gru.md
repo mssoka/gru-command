@@ -288,7 +288,8 @@ Approve carries it out. For a re-brief marker, propose its abandonment the
 same way with `kind: "rebrief-abandon"` and its `marker_id`. For a reserved
 recovery ruling or the governing stop it affirms, propose
 `recovery-owner-resolution` or `recovery-owner-stop` with the exact fences
-your readback gives. Never call `/abandon`, record the owner's
+your readback gives — a stop only once a ruling is recorded, never on the
+same card. Never call `/abandon`, record the owner's
 decision, or send owner attribution yourself.
 After an abandonment the lane stays held until the owner bins the job or
 accepts fresh work there. A successor is

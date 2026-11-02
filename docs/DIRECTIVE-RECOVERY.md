@@ -1346,7 +1346,7 @@ A routine recovery uncertainty owes Gru a concrete executable decision. Only a *
 
 Readback `recovery_owner` exposes immutable per-subject/per-debt-generation decision history, the exact transfer target ID/generation/plan/authority/category/action, full evidence snapshot, current target, resolution/confirmation receipts, stop-lineage SHA and an explicit owner-action recipe. Consumed original-generation replay stays immutable after later decisions. Changed or generically closed targets create one new **suspended** Gru incarnation, never revive the old prompt or grant work. A genuine explicit resolution permits a separate current-fenced new incarnation only after separate job unpark; existing producer/review/verification/other owner-stop fences still apply.
 
-Permission recording is an explicitly attributed authenticated call, never invoked by Gru/service/supervisor:
+Permission recording is an explicitly attributed authenticated call, never invoked by Gru/service/supervisor on its own initiative — the only service-driven path is the owner's own Approve on an owner-approval card, which calls this same route function with the card's decision attribution (see [Owner approval of owner-reserved actions](#owner-approval-of-owner-reserved-actions)):
 
 `POST /api/silas/{directives|rebriefs}/{id}/owner-resolution`
 
