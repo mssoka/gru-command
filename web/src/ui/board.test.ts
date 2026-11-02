@@ -4186,10 +4186,22 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(row.textContent).toContain('Heist job-ready');
     expect(row.textContent).toContain('aaaa1111');
     expect(row.textContent).toContain('CI green');
+    // #527: the row names the observation it rests on, so it can age honestly.
+    expect(row.querySelector('.board-owner__meta')?.textContent).toMatch(/ · observed \S+ ago$/);
     const link = row.querySelector<HTMLAnchorElement>('.board-owner__open');
     expect(link?.href).toBe('https://github.com/example/demo/pull/7');
+    expect(link?.textContent).toBe('OPEN PR ↗');
     expect(link?.target).toBe('_blank');
     expect(link?.rel).toContain('noreferrer');
+    // #527: a GitLab merge request is labelled honestly — OPEN MR, same guards.
+    view.render(snapshot({
+      ownerPrs: [ownerPr('job-mr', { provider: 'gitlab', prUrl: 'https://gitlab.example.test/acme/platform/app/-/merge_requests/7' })],
+    }));
+    const mrRow = document.getElementById('board-owner')!.querySelector('.board-owner__row--pr')!;
+    const mrLink = mrRow.querySelector<HTMLAnchorElement>('.board-owner__open')!;
+    expect(mrLink.textContent).toBe('OPEN MR ↗');
+    expect(mrLink.title).toContain('merge request on GitLab');
+    expect(mrLink.href).toBe('https://gitlab.example.test/acme/platform/app/-/merge_requests/7');
     // Fail closed on an unsafe URL: no link is fabricated.
     view.render(snapshot({ ownerPrs: [ownerPr('bad-url', { prUrl: 'javascript:alert(1)' })] }));
     const badRow = document.getElementById('board-owner')!.querySelectorAll('.board-owner__row--pr')[0]!;

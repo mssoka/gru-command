@@ -3,6 +3,7 @@ import { redactCredentials } from '../../redaction.js';
 import {
   GITLAB_MR_OBSERVED_EVENT,
   GITLAB_MR_READ_FAILED_EVENT,
+  type ChangeMergeability,
   type GitLabMrReadErrorKind,
 } from '../../review-inputs/ci-evidence.js';
 import { isGitLabMrHost, parseGitLabMrLink, parseGitLabMrPath, type RepoRemote } from '../review-path.js';
@@ -61,6 +62,12 @@ export interface GitLabMrObservedFacts {
   readonly state: string;
   readonly head_sha: string;
   readonly head_pipeline: GitLabMrHeadPipeline | null;
+  /** Mergeability normalized here, at the ingress: GitLab's modern
+   * `detailed_merge_status` decides when present, otherwise the legacy
+   * `merge_status` + `has_conflicts` + `blocking_discussions_resolved`
+   * triple must prove it. Absence records `unknown` and is tolerated —
+   * never a read failure and never a default of clean. */
+  readonly mergeable: ChangeMergeability;
 }
 
 export interface GitLabMrReadFailure {
@@ -124,6 +131,19 @@ function statusKind(status: number): GitLabMrReadErrorKind {
   }
 }
 
+/** The response's mergeability as the one normalized value the owner gate
+ * reads. `detailed_merge_status` decides whenever GitLab sent it; the legacy
+ * triple is accepted only when all three fields prove mergeability. */
+function mergeability(response: Record<string, unknown>): ChangeMergeability {
+  const detailed = nonEmpty(response['detailed_merge_status']);
+  if (detailed !== null) return detailed === 'mergeable' ? 'clean' : 'not-clean';
+  return response['merge_status'] === 'can_be_merged' &&
+    response['has_conflicts'] === false &&
+    response['blocking_discussions_resolved'] === true
+    ? 'clean'
+    : 'unknown';
+}
+
 /** The response body as an observation, or the reason it is not one. */
 function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedFacts } | { readonly problem: string } {
   let parsed: unknown;
@@ -165,7 +185,10 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
     return { problem: `a merge request response field is longer than ${MAX_FIELD_CHARS} characters` };
   }
   return {
-    observed: { host: identity.host, project: identity.project, mr_iid: iid, state, head_sha: headSha, head_pipeline: headPipeline },
+    observed: {
+      host: identity.host, project: identity.project, mr_iid: iid, state, head_sha: headSha,
+      head_pipeline: headPipeline, mergeable: mergeability(parsed),
+    },
   };
 }
 

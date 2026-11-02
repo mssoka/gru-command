@@ -1095,11 +1095,13 @@ export class BoardView {
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
-  /** One evidence-bound ready PR: affected heist, the exact head every
-   * piece of evidence is bound to, and OPEN PR — an external link, not
-   * an in-app merge. Nothing here claims the merge happened. */
+  /** One evidence-bound ready PR/MR: affected heist, the exact head every
+   * piece of evidence is bound to, its observation age, and OPEN PR /
+   * OPEN MR — an external link, not an in-app merge. Nothing here claims
+   * the merge happened. */
   private ownerPrRow(row: OwnerPrRow): HTMLElement {
     const pr = row.pr;
+    const gitlab = pr.provider === 'gitlab';
     const node = el('article', 'board-owner__row board-owner__row--pr');
     node.append(
       el('div', 'board-owner__title', `🔀 ${pr.jobTitle}`),
@@ -1111,17 +1113,19 @@ export class BoardView {
       el(
         'div',
         'board-owner__meta lbl',
-        `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable`,
+        `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable · observed ${formatAge(pr.checkedAt)} ago`,
       ),
     );
     const href = safePrUrl(pr.prUrl);
     if (href !== null) {
-      const open = el('a', 'board-owner__open', 'OPEN PR ↗');
+      const open = el('a', 'board-owner__open', gitlab ? 'OPEN MR ↗' : 'OPEN PR ↗');
       open.href = href;
       open.target = '_blank';
       open.rel = 'noreferrer';
       open.dataset.actionId = row.actionId;
-      open.title = 'Opens the PR on GitHub — merging stays your call there';
+      open.title = gitlab
+        ? 'Opens the merge request on GitLab — merging stays your call there'
+        : 'Opens the PR on GitHub — merging stays your call there';
       node.append(open);
     } else {
       // Fail closed: an unsafe URL never becomes a link (the server

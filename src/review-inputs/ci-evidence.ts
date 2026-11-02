@@ -66,6 +66,11 @@ export const CI_BRANCH_STATE_EVENT = 'github.branch-state';
 export const GITLAB_MR_OBSERVED_EVENT = 'gitlab.mr-observed';
 export const GITLAB_MR_READ_FAILED_EVENT = 'gitlab.mr-read-failed';
 
+/** What a host proved about a change's mergeability, normalized at the
+ * ingress that recorded it. Only `clean` certifies owner readiness;
+ * `unknown` is the absence of proof, never a guess. */
+export type ChangeMergeability = 'clean' | 'not-clean' | 'unknown';
+
 /** Why a GitLab merge-request read recorded no observation. */
 export const GITLAB_MR_READ_ERROR_KINDS = [
   'token-missing', 'auth', 'permission', 'not-found', 'rate-limit', 'timeout', 'other',
@@ -500,7 +505,17 @@ const GITLAB_PIPELINE_PENDING = [
   'created', 'waiting_for_resource', 'preparing', 'pending', 'running', 'scheduled', 'manual',
 ] as const;
 
-interface GitLabHeadPipeline {
+/** The CI state one GitLab pipeline status binds to, or null for a status
+ * that maps to no result. The freeze binding and the board's owner
+ * readiness both read this ONE mapping. */
+export function gitlabPipelineCiState(status: string): 'green' | 'pending' | 'failed' | null {
+  if ((GITLAB_PIPELINE_PASSED as readonly string[]).includes(status)) return 'green';
+  if ((GITLAB_PIPELINE_FAILED as readonly string[]).includes(status)) return 'failed';
+  if ((GITLAB_PIPELINE_PENDING as readonly string[]).includes(status)) return 'pending';
+  return null;
+}
+
+export interface GitLabHeadPipeline {
   readonly id: number;
   readonly sha: string;
   readonly status: string;
@@ -508,27 +523,34 @@ interface GitLabHeadPipeline {
   readonly webUrl: string | null;
 }
 
-interface GitLabMrObservation {
+export interface GitLabMrObservation {
   readonly host: string;
   readonly project: string;
   readonly iid: number;
   readonly state: string;
   readonly headSha: string;
   readonly headPipeline: GitLabHeadPipeline | null;
+  /** The mergeability normalized and recorded by the read (#527). Absent on
+   * payloads recorded before it existed, which read as `unknown`. */
+  readonly mergeable: ChangeMergeability;
 }
 
 /** The `gitlab.mr-observed` payload, or null when it is not usable (a field
  * missing or mistyped). A null head pipeline is a valid observation. */
-function gitlabObservationFromPayload(payload: Record<string, unknown> | null): GitLabMrObservation | null {
-  if (payload === null) return null;
-  const host = clean(payload['host']);
-  const project = clean(payload['project']);
-  const iid = num(payload['mr_iid']);
-  const state = clean(payload['state']);
-  const headSha = clean(payload['head_sha']);
+export function readGitLabMrObservation(payload: unknown): GitLabMrObservation | null {
+  const fields = record(payload);
+  if (fields === null) return null;
+  const host = clean(fields['host']);
+  const project = clean(fields['project']);
+  const iid = num(fields['mr_iid']);
+  const state = clean(fields['state']);
+  const headSha = clean(fields['head_sha']);
   if (host === null || project === null || iid === null || state === null || headSha === null) return null;
-  const rawPipeline = payload['head_pipeline'];
-  if (rawPipeline === null) return { host, project, iid, state, headSha, headPipeline: null };
+  const mergeable: ChangeMergeability = fields['mergeable'] === 'clean'
+    ? 'clean'
+    : fields['mergeable'] === 'not-clean' ? 'not-clean' : 'unknown';
+  const rawPipeline = fields['head_pipeline'];
+  if (rawPipeline === null) return { host, project, iid, state, headSha, mergeable, headPipeline: null };
   const pipeline = record(rawPipeline);
   if (pipeline === null) return null;
   const id = num(pipeline['id']);
@@ -536,7 +558,7 @@ function gitlabObservationFromPayload(payload: Record<string, unknown> | null): 
   const status = clean(pipeline['status']);
   if (id === null || sha === null || status === null) return null;
   return {
-    host, project, iid, state, headSha,
+    host, project, iid, state, headSha, mergeable,
     headPipeline: { id, sha, status, source: clean(pipeline['source']), webUrl: clean(pipeline['web_url']) },
   };
 }
@@ -577,7 +599,7 @@ function renderGitLabMrEvidence(
       from,
     );
   }
-  const observed = event.kind === GITLAB_MR_OBSERVED_EVENT ? gitlabObservationFromPayload(payload) : null;
+  const observed = event.kind === GITLAB_MR_OBSERVED_EVENT ? readGitLabMrObservation(event.payload) : null;
   if (observed === null) {
     return unavailableEvidence(
       `the recorded GitLab event (${inline(event.kind)}) is not a usable merge request observation`,
@@ -626,13 +648,7 @@ function renderGitLabMrEvidence(
     );
   }
 
-  const state = (GITLAB_PIPELINE_PASSED as readonly string[]).includes(pipeline.status)
-    ? 'green'
-    : (GITLAB_PIPELINE_FAILED as readonly string[]).includes(pipeline.status)
-      ? 'failed'
-      : (GITLAB_PIPELINE_PENDING as readonly string[]).includes(pipeline.status)
-        ? 'pending'
-        : null;
+  const state = gitlabPipelineCiState(pipeline.status);
   if (state === null) {
     return unavailableEvidence(`head pipeline #${pipeline.id} has status "${pipeline.status}", which maps to no CI result`, from);
   }

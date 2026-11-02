@@ -451,12 +451,16 @@ export interface OwnerPrView {
   readonly jobId: string;
   readonly jobTitle: string;
   readonly repo: string;
-  /** https PR URL — the OPEN PR target, never an in-app merge. */
+  /** https PR/MR URL — the OPEN target, never an in-app merge. */
   readonly prUrl: string;
   /** The exact head sha every piece of evidence is bound to. */
   readonly sha: string;
-  /** ISO stamp of the branch-state observation the row rests on. */
+  /** ISO stamp of the observation the row rests on. */
   readonly checkedAt: string;
+  /** The code host the readiness evidence came from (#527): a GitHub row
+   * opens a PR, a GitLab row a merge request. Absent on pre-#527 servers,
+   * which only ever projected GitHub rows. */
+  readonly provider?: RepoProvider;
 }
 
 /** The For You notification kind for a Book of Lessons proposal (owner
@@ -1261,7 +1265,8 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
     typeof value.repo !== 'string' ||
     typeof value.prUrl !== 'string' ||
     typeof value.sha !== 'string' || value.sha === '' ||
-    typeof value.checkedAt !== 'string'
+    typeof value.checkedAt !== 'string' ||
+    !(value.provider === undefined || isRepoProvider(value.provider))
   ) {
     return false;
   }
