@@ -291,6 +291,8 @@ function boot(
   decisions?: DecisionService,
   opts: {
     wallNow?: () => number;
+    monotonicNow?: () => number;
+    suspendEvidence?: (sinceWallMs: number) => Promise<boolean>;
     log?: (level: string, msg: string, fields?: Record<string, unknown>) => void;
     rateLimitBackoff?: RateLimitBackoffPolicy | null;
     workerGate?: PacingGate;
@@ -345,6 +347,8 @@ function boot(
     notifications: center,
     ...(decisions !== undefined ? { decisions } : {}),
     ...(opts.wallNow !== undefined ? { wallNow: opts.wallNow } : {}),
+    ...(opts.monotonicNow !== undefined ? { monotonicNow: opts.monotonicNow } : {}),
+    ...(opts.suspendEvidence !== undefined ? { suspendEvidence: opts.suspendEvidence } : {}),
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.rateLimitBackoff !== undefined ? { rateLimitBackoff: opts.rateLimitBackoff } : {}),
     ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
@@ -5342,6 +5346,268 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     await sleep(60);
     expect(handle.disposed).toBe(true);
     expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
+    h.dispose();
+  });
+
+  it('A1: an agreeing clock gap is an event-loop stall, not a sleep (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const evidence = vi.fn(async () => false);
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: evidence,
+    });
+    const handle = new FakeHandle('minion', 'minion-stall', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    h.advance(1); // establish the tick baseline
+    const stalledAtWall = wallMs + 120_000;
+    wallMs += 120_000;
+    monoMs += 120_000; // both clocks advanced: the loop could not run
+    h.advance(5);
+    const hourKey = new Date(stalledAtWall).toISOString().slice(0, 13);
+    const notificationId = `supervision.loop-stall.${hourKey.replace(/[-:]/gu, '')}`;
+    await vi.waitFor(() => {
+      expect(h.api.getNotification(notificationId)).not.toBeNull();
+    }, { timeout: 5_000 });
+    const stallEvents = h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.loop-stall');
+    expect(stallEvents).toHaveLength(1);
+    expect(stallEvents[0]?.payload).toEqual({ gap_ms: 120_000, monotonic_gap_ms: 120_000 });
+    // The OS was asked, because the clocks agreed.
+    expect(evidence).toHaveBeenCalledTimes(1);
+    expect(evidence).toHaveBeenCalledWith(5_000_000);
+    // A stall is not a sleep and wakes nobody.
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.wake')).toBe(false);
+    expect(h.notificationsOfKind('supervision.wake')).toHaveLength(0);
+    const fyi = h.notificationsOfKind('supervision.loop-stall');
+    expect(fyi).toHaveLength(1);
+    expect(fyi[0]?.id).toBe(notificationId);
+    expect(fyi[0]?.routing).toBe('fyi');
+    expect(fyi[0]?.severity).toBe('info');
+    expect(fyi[0]?.title).toBe('Service event loop stalled 1 time, longest 120 s, this hour');
+    // The grace granted before the classification is real: continued silence
+    // past the window still climbs.
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
+    }, { timeout: 5_000 });
+    h.dispose();
+  });
+
+  it('A2: a disagreeing clock gap is a sleep without consulting the OS (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const evidence = vi.fn(async () => true);
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: evidence,
+    });
+    const handle = new FakeHandle('minion', 'minion-linux-wake', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    h.advance(1);
+    wallMs += 10 * 60_000; // a ten-minute Linux suspend: the monotonic clock pauses
+    monoMs += 5_000;
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.wake')).toHaveLength(1);
+    }, { timeout: 5_000 });
+    // The monotonic clock already decided: no OS read, no stall record.
+    expect(evidence).toHaveBeenCalledTimes(0);
+    const wakeEvents = h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.wake');
+    expect(wakeEvents).toHaveLength(1);
+    expect(wakeEvents[0]?.payload).toMatchObject({ gap_ms: 600_000 });
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.loop-stall')).toBe(false);
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(0);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    h.dispose();
+  });
+
+  it('A2b: agreeing clocks are a macOS sleep when the kernel proves the suspend (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const evidence = vi.fn(async () => true);
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: evidence,
+    });
+    const handle = new FakeHandle('minion', 'minion-macos-wake', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    h.advance(1);
+    wallMs += 10 * 60_000;
+    monoMs += 10 * 60_000; // macOS: performance.now() keeps counting through sleep
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.wake')).toHaveLength(1);
+    }, { timeout: 5_000 });
+    expect(evidence).toHaveBeenCalledTimes(1);
+    expect(h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.wake')).toHaveLength(1);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.loop-stall')).toBe(false);
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.wake')).toHaveLength(1);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    h.dispose();
+  });
+
+  it('A3: one FYI per clock hour carries the stall count and the longest gap (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: async () => false,
+    });
+    h.advance(1);
+    for (const gap of [120_000, 180_000, 60_000]) {
+      wallMs += gap;
+      monoMs += gap;
+      h.advance(1);
+    }
+    const hourKey = new Date(wallMs).toISOString().slice(0, 13);
+    const notificationId = `supervision.loop-stall.${hourKey.replace(/[-:]/gu, '')}`;
+    await vi.waitFor(() => {
+      expect(h.api.getNotification(notificationId)?.title)
+        .toBe('Service event loop stalled 3 times, longest 180 s, this hour');
+    }, { timeout: 5_000 });
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(1);
+    expect(h.api.getNotification(notificationId)?.detail).toContain('3 so far, longest 180 s');
+    // A fourth stall inside the hour keeps the single row and raises it.
+    wallMs += 90_000;
+    monoMs += 90_000;
+    h.advance(1);
+    await vi.waitFor(() => {
+      expect(h.api.getNotification(notificationId)?.title)
+        .toBe('Service event loop stalled 4 times, longest 180 s, this hour');
+    }, { timeout: 5_000 });
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(1);
+    // Past the hour: a second row, with the next hour's deterministic id.
+    const nextHourWall = (Math.floor(wallMs / 3_600_000) + 1) * 3_600_000 + 1_000;
+    const nextHourGap = nextHourWall - wallMs;
+    monoMs += nextHourGap;
+    wallMs = nextHourWall;
+    h.advance(1);
+    const nextKey = new Date(nextHourWall).toISOString().slice(0, 13);
+    const nextId = `supervision.loop-stall.${nextKey.replace(/[-:]/gu, '')}`;
+    await vi.waitFor(() => {
+      expect(h.api.getNotification(nextId)?.title)
+        .toBe(`Service event loop stalled 1 time, longest ${Math.round(nextHourGap / 1_000)} s, this hour`);
+    }, { timeout: 5_000 });
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(2);
+    // The earlier hour's row keeps its own count.
+    expect(h.api.getNotification(notificationId)?.title)
+      .toBe('Service event loop stalled 4 times, longest 180 s, this hour');
+    h.dispose();
+  });
+
+  it('A3 restart: a later process never lowers the stall row of the hour (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: async () => false,
+    });
+    h.advance(1);
+    wallMs += 180_000;
+    monoMs += 180_000;
+    h.advance(1);
+    const hourKey = new Date(wallMs).toISOString().slice(0, 13);
+    const notificationId = `supervision.loop-stall.${hourKey.replace(/[-:]/gu, '')}`;
+    await vi.waitFor(() => {
+      expect(h.api.getNotification(notificationId)?.title)
+        .toBe('Service event loop stalled 1 time, longest 180 s, this hour');
+    }, { timeout: 5_000 });
+    const posted = h.api.getNotification(notificationId);
+    // The process restarts in the same clock hour: its first stall finds the
+    // row a previous process posted and keeps it as it is.
+    h.supervisor.dispose();
+    const second = new Supervisor({
+      config: {
+        enabled: true,
+        turnSilenceMs: 50,
+        restartWindowMs: 600_000,
+        maxRestarts: 3,
+        restartBackoffMs: 1,
+      },
+      registry: h.registry,
+      ledger: h.api,
+      notifications: h.center,
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: async () => false,
+      tickMs: 5,
+      now: () => h.nowMs,
+    });
+    const tickSecond = (): void => {
+      (second as unknown as { tick(): void }).tick();
+    };
+    tickSecond(); // its own baseline
+    wallMs += 120_000;
+    monoMs += 120_000;
+    tickSecond();
+    await vi.waitFor(() => {
+      expect(h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.loop-stall')).toHaveLength(2);
+    }, { timeout: 5_000 });
+    const afterRestart = h.api.getNotification(notificationId);
+    expect(afterRestart?.title).toBe(posted?.title);
+    expect(afterRestart?.detail).toBe(posted?.detail);
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(1);
+    second.dispose();
+    h.dispose();
+  });
+
+  it('A4: a sub-threshold gap records nothing and asks the OS nothing (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const evidence = vi.fn(async () => true);
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: evidence,
+    });
+    h.advance(1);
+    wallMs += 20_000;
+    monoMs += 20_000; // below WAKE_GAP_MIN_MS: an ordinary slow tick
+    h.advance(1);
+    await flushMicrotasks();
+    expect(evidence).toHaveBeenCalledTimes(0);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.loop-stall')).toBe(false);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.wake')).toBe(false);
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.wake')).toHaveLength(0);
+    h.dispose();
+  });
+
+  it('A4b: an evidence reader that throws is no evidence, so the gap is a stall (#569)', async () => {
+    let wallMs = 5_000_000;
+    let monoMs = 1_000;
+    const h = boot(undefined, {
+      wallNow: () => wallMs,
+      monotonicNow: () => monoMs,
+      suspendEvidence: async () => {
+        throw new Error('sysctl exploded');
+      },
+    });
+    h.advance(1);
+    wallMs += 120_000;
+    monoMs += 120_000;
+    h.advance(1);
+    await vi.waitFor(() => {
+      expect(h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.loop-stall')).toHaveLength(1);
+    }, { timeout: 5_000 });
+    expect(h.notificationsOfKind('supervision.loop-stall')).toHaveLength(1);
+    expect(h.notificationsOfKind('supervision.wake')).toHaveLength(0);
     h.dispose();
   });
 });
