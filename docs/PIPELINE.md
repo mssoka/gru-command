@@ -54,12 +54,13 @@ read is `404 not_found` (both below).
 
 The request body is capped at 512 KiB; a larger one is rejected and the
 connection is closed, so the client sees a reset rather than a `400`. Other
-fields are ignored. Admission dispatches `job_id`, `repo_path`, `title`
-and `briefing` and nothing else, so an admitted job is dispatched as
-`POST /api/dispatch` would with only those four fields. The pipeline carries
-none of that route's optional fields (display name, deliverable, review target,
-parent job, completion handoff, pre-bootstrap patch, briefing-review
-provenance).
+fields are ignored. Admission dispatches `job_id`, `repo_path`, `title` and
+`briefing`, plus the briefing-review provenance the gate attaches when it admits
+with one, and nothing else: an admitted job is dispatched as
+`POST /api/dispatch` would with only those fields. The pipeline carries none of
+that route's other optional fields (display name, deliverable, review target,
+parent job, completion handoff, pre-bootstrap patch), and it never carries a
+caller-supplied `briefing_review` block.
 
 The receipt, `201` for a new entry and `200` for an exact replay:
 
@@ -152,7 +153,7 @@ exposes the placer. The role tells Gru to clear only the holds it placed itself.
 
 | State | Meaning |
 |---|---|
-| `waiting` | Enqueued, held, or blocked. `reason` says which. |
+| `waiting` | Enqueued, held, deferred by the briefing-review gate, or blocked. `reason` says which. |
 | `ready` | Nothing blocks it. It is admitted as soon as the shared budget has a slot; `reason` says what it is waiting for, or is null. |
 | `admitting` | The service claimed it and is dispatching it (`dispatch claim in flight`). |
 | `admitted` | Dispatched. The entry id is now the job id and the job's ordinary lifecycle takes over. The entry leaves the list. |
@@ -163,6 +164,8 @@ exposes the placer. The role tells Gru to clear only the holds it placed itself.
 entry is the first of these that applies, checked in this order:
 
 - `owner hold: <hold_reason>`;
+- the recorded briefing-review deferral, written as `<code>: <detail>` (for
+  example `briefing_review_pending: …`);
 - `dependency cycle: a → b → a`;
 - for each prerequisite in the order listed:
   - `waiting for <id> — not enqueued` (the id names no entry yet);
@@ -279,25 +282,42 @@ then marks the entry `admitted`. A failed dispatch never duplicates work:
   committed job leaves the entry waiting (and the later attempt follows the
   normal failure ladder);
 
-## The briefing-review gate is not run on admission
+## The briefing-review gate runs on admission
 
 Nefario's briefing-review gate ([BRIEFING-REVIEW.md](./BRIEFING-REVIEW.md)) runs
 inside the `POST /api/dispatch` handler, before that route creates anything.
-Pipeline admission calls the dispatch service directly and never passes through
-the handler. Today, then, an admitted entry is never held for a READY review at
-any `stage`, is never refused for a missing review, and carries no review
-provenance on its job. Making admission honour the gate is a separate change.
+Pipeline admission runs the same pure decision before it dispatches: the entry
+carries the exact briefing, title and repository, and the pipeline has no
+`briefing_review` block to claim, so only automatic attach and readiness
+refusals apply. An admitted entry passes the attached provenance into the
+dispatch service, which records `briefing.review-dispatched` on the job exactly
+as a direct dispatch does.
+
+- READY, or a recorded push-back, is dispatched with that provenance.
+- An enforced tier with no review for the exact briefing, no verdict yet, or
+  CHANGES-NEEDED stays `waiting`: the claim is released and `defer_reason`
+  names the refusal as `<code>: <detail>` (for example
+  `briefing_review_pending: …`). It is not a failed attempt: `failure_count`
+  does not move and the bounded admission ladder is not touched.
+- An advisory review (stage 1, or a low tier at `auto`) admits with no
+  provenance, and a disabled `[briefing_review]` install does too.
+
+Every pass re-evaluates a deferred entry before it picks work, and a
+`briefing.review-verdict` or `briefing.review-pushback` event schedules a pass.
+If the gate now admits, the entry's deferral is cleared and the normal pick
+dispatches it with provenance; if the refusal code changed, the reason is
+refreshed. A gate read failure is a pass failure under the bounded backoff,
+never an admission-failure count.
+
+The discipline stays Gru's: while an entry is held, review the exact briefing
+and clear the hold on READY when the review was its only condition (when the
+hold also names an outside heist, keep it until that heist lands); on
+CHANGES-NEEDED record a push-back, clear the hold, and correct the worker with
+one dispatch amendment after admission (see the role). A finding that disagrees
+with the owner's intent is escalated as `scope-design` and never released.
 A material amendment made after admission reaches the worker with the next
 directive or re-brief ([REVIEW-INPUTS.md](./REVIEW-INPUTS.md)), so the worker's
 first turn runs on the text as enqueued.
-
-Until then, the discipline is Gru's: enqueue the entry held, review the exact
-briefing while it is held, clear the hold on READY when the review was its only
-condition (when the hold also names an outside heist, keep it until that heist
-lands), and on CHANGES-NEEDED record a push-back, clear the hold, and correct
-the worker with one dispatch amendment after admission (see the role). A finding
-that disagrees with the owner's intent is escalated as `scope-design` and never
-released.
 
 ## Immutability and correction
 
@@ -321,4 +341,5 @@ correction is an ordinary dispatch amendment
 Every change appends an event: `pipeline.enqueued`, `pipeline.held`,
 `pipeline.hold-cleared`, `pipeline.cancelled`, `pipeline.state` (a `waiting` and
 `ready` flip), `pipeline.claimed`, `pipeline.admitted`, `pipeline.requeued`,
-`pipeline.reconciled` and `pipeline.failed`.
+`pipeline.reconciled`, `pipeline.deferred`, `pipeline.deferred-refreshed`,
+`pipeline.deferred-cleared` and `pipeline.failed`.

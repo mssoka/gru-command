@@ -2,13 +2,21 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { BriefingReviewService } from '../src/briefing-review/service.js';
+import { BRIEFING_REVIEW_DISPATCHED } from '../src/briefing-review/events.js';
+import type { BriefingReviewProvenance } from '../src/briefing-review/gate.js';
+import { lensJobId, type BriefingReviewLens, type BriefingReviewStage, type BriefingReviewTier } from '../src/briefing-review/types.js';
+import { DispatchService } from '../src/dispatch/service.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { PipelineCapacityView } from '../src/ledger/pipeline.js';
-import { PipelineService, type PipelineDispatchPort } from '../src/dispatch/pipeline.js';
+import { PipelineService, type PipelineDispatchPort, type PipelineServiceOptions } from '../src/dispatch/pipeline.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import type { AgentHandle } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 
 /**
  * The mechanical pipeline consumer: eligibility order, shared-capacity
@@ -19,34 +27,52 @@ import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 
 const cleanupDirs: string[] = [];
 const liveServices: PipelineService[] = [];
+const fixtures: FixtureRepo[] = [];
 afterEach(() => {
   while (liveServices.length > 0) liveServices.pop()!.dispose();
+  while (fixtures.length > 0) fixtures.pop()!.cleanup();
   while (cleanupDirs.length > 0) rmSync(cleanupDirs.pop()!, { recursive: true, force: true });
 });
 
 type DispatchMode = 'ok' | 'throw-after-job' | 'throw-before-job' | 'throw-after-handoff';
+
+/** The repo name DispatchService derives from the path: its last segment. */
+function repoOf(repoPath: string): string {
+  return repoPath.split('/').filter((segment) => segment !== '').at(-1) ?? repoPath;
+}
 
 interface Harness {
   readonly dir: string;
   readonly ledger: LedgerApi;
   readonly db: LedgerDb;
   readonly service: PipelineService;
-  readonly calls: { readonly jobId: string; readonly title: string; readonly briefing: string }[];
+  readonly calls: {
+    readonly jobId: string;
+    readonly title: string;
+    readonly briefing: string;
+    readonly briefingReview: BriefingReviewProvenance | undefined;
+  }[];
   capacity: PipelineCapacityView;
   mode: DispatchMode;
   /** When set, dispatch yields here (a delayed worktree-creation shape). */
   holdDispatch: Promise<void> | null;
 }
 
+interface BootOverrides {
+  readonly retryBackoffMs?: number;
+  readonly budget?: { acquire: (signal?: AbortSignal) => Promise<() => void> };
+  readonly ledger?: LedgerApi;
+  readonly bus?: EventBus;
+  readonly capacityFn?: () => PipelineCapacityView;
+  readonly briefingReview?: (deps: {
+    readonly ledger: LedgerApi;
+    readonly notifications: NotificationCenter;
+  }) => PipelineServiceOptions['briefingReview'];
+}
+
 function boot(
   capacity: PipelineCapacityView = { capacity: 4, occupied: 0, queued: 0, available: 4 },
-  overrides: {
-    retryBackoffMs?: number;
-    budget?: { acquire: (signal?: AbortSignal) => Promise<() => void> };
-    ledger?: LedgerApi;
-    bus?: EventBus;
-    capacityFn?: () => PipelineCapacityView;
-  } = {},
+  overrides: BootOverrides = {},
 ): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-'));
   cleanupDirs.push(dir);
@@ -63,10 +89,15 @@ function boot(
   };
   const port: PipelineDispatchPort = {
     async dispatch(input) {
-      calls.push({ jobId: input.jobId, title: input.title, briefing: input.briefing });
+      calls.push({
+        jobId: input.jobId,
+        title: input.title,
+        briefing: input.briefing,
+        briefingReview: input.briefingReview,
+      });
       if (harness.mode === 'throw-before-job') throw new Error('spawn failed before any job');
       if (harness.holdDispatch !== null) await harness.holdDispatch;
-      ledger.addJob({ id: input.jobId, repo: 'demo', title: input.title, briefing: input.briefing });
+      ledger.addJob({ id: input.jobId, repo: repoOf(input.repoPath), title: input.title, briefing: input.briefing });
       if (harness.mode === 'throw-after-job') {
         ledger.setJobStatus(input.jobId, 'working');
         ledger.setJobStatus(input.jobId, 'blocked');
@@ -85,17 +116,122 @@ function boot(
       return { settled: Promise.resolve() };
     },
   };
+  const briefingReview = overrides.briefingReview?.({ ledger, notifications });
   const service = new PipelineService({
     ledger,
     dispatch: port,
     capacity: overrides.capacityFn ?? (() => ({ ...harness.capacity })),
     ...(overrides.budget === undefined ? {} : { budget: overrides.budget }),
     ...(overrides.retryBackoffMs === undefined ? {} : { retryBackoffMs: overrides.retryBackoffMs }),
+    ...(briefingReview === undefined ? {} : { briefingReview }),
     bus,
     notifications,
   });
   liveServices.push(service);
   return Object.assign(harness, { dir, ledger, db, service });
+}
+
+interface ReviewHarness extends Harness {
+  readonly repo: FixtureRepo;
+  readonly review: BriefingReviewService;
+}
+
+const REVIEW_TITLE = 'Refunds endpoint';
+const REVIEW_BRIEFING = [
+  'Heist: add the refunds endpoint.',
+  "- GET /api/refunds returns the caller's own refunds, newest first.",
+  '- Acceptance: one test adds a refund then reads it back in the same order.',
+  '- Do not touch the payments module sources.',
+].join('\n');
+const REVIEW_SPAN = "GET /api/refunds returns the caller's own refunds";
+
+type ArmedForTest = Awaited<ReturnType<BriefingReviewService['commission']>>['body'];
+
+/** The real Nefario service over the harness ledger and a real fixture repo. */
+function reviewFixture(input: {
+  readonly ledger: LedgerApi;
+  readonly repo: FixtureRepo;
+  readonly notifications: NotificationCenter;
+  readonly enabled?: boolean;
+  readonly stage?: BriefingReviewStage;
+}): BriefingReviewService {
+  const repo = repoOf(input.repo.path);
+  return new BriefingReviewService({
+    config: { enabled: input.enabled ?? true, stage: input.stage ?? 3 },
+    ledger: input.ledger,
+    notifications: input.notifications,
+    dispatch: async (lensInput) => {
+      input.ledger.addJob({
+        id: lensInput.jobId,
+        repo,
+        title: lensInput.title,
+        briefing: lensInput.briefing,
+        deliverable: lensInput.deliverable,
+      });
+      return { settled: Promise.resolve() };
+    },
+    apiBase: () => 'http://127.0.0.1:4100',
+    headSha: () => input.repo.head(),
+  });
+}
+
+function bootWithReview(input: {
+  readonly stage?: BriefingReviewStage;
+  readonly enabled?: boolean;
+  readonly retryBackoffMs?: number;
+} = {}): ReviewHarness {
+  const repo = makeFixtureRepo('refunds-api');
+  fixtures.push(repo);
+  let review: BriefingReviewService | undefined;
+  const h = boot(undefined, {
+    ...(input.retryBackoffMs === undefined ? {} : { retryBackoffMs: input.retryBackoffMs }),
+    briefingReview: ({ ledger, notifications }) =>
+      (review = reviewFixture({ ledger, repo, notifications, enabled: input.enabled, stage: input.stage })),
+  });
+  if (review === undefined) throw new Error('review fixture was not constructed');
+  return Object.assign(h, { repo, review });
+}
+
+async function armReview(
+  review: BriefingReviewService,
+  repo: FixtureRepo,
+  options: { readonly briefing?: string; readonly tier?: BriefingReviewTier } = {},
+): Promise<ArmedForTest> {
+  const outcome = await review.commission({
+    repoPath: repo.path,
+    title: REVIEW_TITLE,
+    briefing: options.briefing ?? REVIEW_BRIEFING,
+    tier: options.tier ?? 'low',
+    justification: 'Touches the refunds API and its tests.',
+  });
+  return outcome.body;
+}
+
+function submitLens(
+  review: BriefingReviewService,
+  repo: FixtureRepo,
+  armed: ArmedForTest,
+  lens: BriefingReviewLens,
+  verdict: 'READY' | 'CHANGES-NEEDED' = 'READY',
+  findings: readonly Record<string, unknown>[] = [],
+) {
+  return review.submitResult({
+    repoPath: repo.path,
+    briefingSha256: armed.briefingSha256,
+    jobId: lensJobId(armed.reviewId, lens),
+    lens,
+    verdict,
+    findings,
+  });
+}
+
+function blockFinding(): Record<string, unknown> {
+  return {
+    code: 'refund-order',
+    severity: 'blocking',
+    evidence: REVIEW_SPAN,
+    why_it_blocks: 'The briefing never fixes the read-back order the acceptance test needs.',
+  };
 }
 
 describe('pipeline service — admission and ordering', () => {
@@ -1020,6 +1156,257 @@ describe('pipeline service — r3 blocker repairs', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('pipeline admission — the briefing-review gate (#551)', () => {
+  it('A1: a READY review admits through the pipeline and dispatches with its provenance (#551)', async () => {
+    const h = bootWithReview();
+    const armed = await armReview(h.review, h.repo);
+    for (const lens of armed.lenses) submitLens(h.review, h.repo, armed, lens as BriefingReviewLens);
+    h.service.enqueue({ id: 'pipe-review-ready', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]?.briefingReview).toMatchObject({
+      reviewId: armed.reviewId,
+      briefingSha256: armed.briefingSha256,
+      round: 1,
+      generation: 1,
+      verdict: 'READY',
+      tier: 'low',
+      pushbackReason: null,
+    });
+    expect(h.service.entry('pipe-review-ready')?.state).toBe('admitted');
+    expect(h.ledger.getJob('pipe-review-ready')).not.toBeNull();
+    h.db.close();
+  });
+
+  it('auto-attaches a recorded push-back as the dispatch provenance (#551)', async () => {
+    const h = bootWithReview();
+    const armed = await armReview(h.review, h.repo);
+    h.review.pushback({
+      repoPath: h.repo.path,
+      briefingSha256: armed.briefingSha256,
+      reason: 'owner ruled the finding out of scope',
+      by: 'gru',
+    });
+    h.service.enqueue({ id: 'pipe-review-pushed', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]?.briefingReview).toMatchObject({
+      verdict: 'PUSHED-BACK',
+      pushbackReason: 'owner ruled the finding out of scope',
+    });
+    h.db.close();
+  });
+
+  it('defers a pending enforced-tier entry without dispatching, counting a failure, or arming a retry (#551)', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = bootWithReview({ retryBackoffMs: 5_000 });
+      await armReview(h.review, h.repo, { tier: 'medium' });
+      h.service.enqueue({ id: 'pipe-pending', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+      await h.service.whenIdle();
+      const entry = h.service.entry('pipe-pending');
+      expect(entry?.state).toBe('waiting');
+      expect(entry?.deferReason).toContain('briefing_review_pending');
+      expect(entry?.failureCount).toBe(0);
+      expect(entry?.failureReason).toBeNull();
+      expect(h.calls).toHaveLength(0);
+      const claims = (): number =>
+        h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'pipeline.claimed').length;
+      expect(claims()).toBe(1);
+      // No 5-second retry poller: a gate deferral is lifted by a verdict or
+      // push-back (an external trigger), never by the bounded backoff.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(claims()).toBe(1);
+      expect(h.calls).toHaveLength(0);
+      expect(h.ledger.getJob('pipe-pending')).toBeNull();
+      h.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('appends no event when a pass re-checks an unchanged deferral (#551)', async () => {
+    const h = bootWithReview();
+    await armReview(h.review, h.repo, { tier: 'medium' });
+    h.service.enqueue({ id: 'pipe-still-pending', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-still-pending')?.deferReason).toContain('briefing_review_pending');
+    const before = h.ledger.listEvents({ limit: 500 }).length;
+    h.service.schedule();
+    await h.service.whenIdle();
+    h.service.schedule();
+    await h.service.whenIdle();
+    expect(h.ledger.listEvents({ limit: 500 }).length).toBe(before);
+    h.db.close();
+  });
+
+  it('defers a CHANGES-NEEDED enforced-tier entry as a wait, not a failure (#551)', async () => {
+    const h = bootWithReview();
+    const armed = await armReview(h.review, h.repo, { tier: 'medium' });
+    submitLens(h.review, h.repo, armed, 'stranger', 'CHANGES-NEEDED', [blockFinding()]);
+    h.service.enqueue({ id: 'pipe-changes', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    const entry = h.service.entry('pipe-changes');
+    expect(entry?.state).toBe('waiting');
+    expect(entry?.deferReason).toContain('briefing_review_not_ready');
+    expect(entry?.failureCount).toBe(0);
+    expect(h.calls).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('defers a revised briefing whose chain has an enforced review for another sha (#551)', async () => {
+    const h = bootWithReview();
+    await armReview(h.review, h.repo, {
+      tier: 'medium',
+      briefing: `${REVIEW_BRIEFING}\n- Revision 2 settles the empty-history case.`,
+    });
+    h.service.enqueue({ id: 'pipe-required', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    const entry = h.service.entry('pipe-required');
+    expect(entry?.state).toBe('waiting');
+    expect(entry?.deferReason).toContain('briefing_review_required');
+    expect(entry?.failureCount).toBe(0);
+    expect(h.calls).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('admits advisory tiers with no provenance: stage 1 and a low tier at auto (#551)', async () => {
+    const stageOne = bootWithReview({ stage: 1 });
+    await armReview(stageOne.review, stageOne.repo, { tier: 'medium' });
+    stageOne.service.enqueue({ id: 'pipe-stage-one', repoPath: stageOne.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await stageOne.service.whenIdle();
+    expect(stageOne.calls).toHaveLength(1);
+    expect(stageOne.calls[0]?.briefingReview).toBeUndefined();
+    expect(stageOne.service.entry('pipe-stage-one')?.state).toBe('admitted');
+    stageOne.db.close();
+
+    const autoLow = bootWithReview({ stage: 'auto' });
+    await armReview(autoLow.review, autoLow.repo, { tier: 'low' });
+    autoLow.service.enqueue({ id: 'pipe-auto-low', repoPath: autoLow.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await autoLow.service.whenIdle();
+    expect(autoLow.calls).toHaveLength(1);
+    expect(autoLow.calls[0]?.briefingReview).toBeUndefined();
+    expect(autoLow.service.entry('pipe-auto-low')?.state).toBe('admitted');
+    autoLow.db.close();
+  });
+
+  it('clears the deferral when the verdict lands and admits with provenance (#551)', async () => {
+    const h = bootWithReview();
+    const armed = await armReview(h.review, h.repo, { tier: 'medium' });
+    h.service.enqueue({ id: 'pipe-verdict', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-verdict')?.deferReason).toContain('briefing_review_pending');
+    for (const lens of armed.lenses) submitLens(h.review, h.repo, armed, lens as BriefingReviewLens);
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-verdict')?.state).toBe('admitted');
+    expect(h.service.entry('pipe-verdict')?.deferReason).toBeNull();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]?.briefingReview).toMatchObject({ reviewId: armed.reviewId, verdict: 'READY' });
+    expect(h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'pipeline.deferred-cleared')).toHaveLength(1);
+    h.db.close();
+  });
+
+  it('admits with no provenance when the briefing review is disabled (#551)', async () => {
+    const h = bootWithReview({ enabled: false });
+    h.service.enqueue({ id: 'pipe-disabled', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]?.briefingReview).toBeUndefined();
+    expect(h.service.entry('pipe-disabled')?.state).toBe('admitted');
+    expect(h.service.entry('pipe-disabled')?.deferReason).toBeNull();
+    h.db.close();
+  });
+
+  it('adopts an existing matching job without consulting the gate again (#551)', async () => {
+    const repo = makeFixtureRepo('refunds-api');
+    fixtures.push(repo);
+    const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-adopt-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const bus = new EventBus({});
+    const ledger = new LedgerApi(db.handle, { bus });
+    const gateCalls: unknown[] = [];
+    const h = boot(undefined, {
+      ledger,
+      bus,
+      briefingReview: () => ({
+        evaluateDispatch: (input) => {
+          gateCalls.push(input);
+          throw new Error('the gate must never run when an existing matching job is adopted');
+        },
+      }),
+    });
+    // Setup through a busless handle: no pass may claim the entry first.
+    const setup = new LedgerApi(db.handle);
+    setup.enqueuePipelineEntry({ id: 'pipe-adopt', repoPath: repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    setup.claimPipelineEntry({ id: 'pipe-adopt', holder: 'silas-pipeline' });
+    setup.addJob({ id: 'pipe-adopt', repo: 'refunds-api', title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    setup.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'pipe-adopt', payload: {} });
+    const report = h.service.reconcileAtBoot();
+    await h.service.whenIdle();
+    expect(report).toEqual({ examined: 1, adopted: 1, requeued: 0 });
+    expect(gateCalls).toHaveLength(0);
+    expect(h.service.entry('pipe-adopt')?.state).toBe('admitted');
+    expect(h.ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_DISPATCHED] })).toHaveLength(0);
+    db.close();
+    h.db.close();
+  });
+
+  it('records briefing.review-dispatched through the real DispatchService (#551)', async () => {
+    const repo = makeFixtureRepo('refunds-api');
+    fixtures.push(repo);
+    const dataDir = mkdtempSync(join(tmpdir(), 'gru-pipeline-e2e-'));
+    cleanupDirs.push(dataDir);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'gru-pipeline-e2e-lanes-'));
+    cleanupDirs.push(laneRoot);
+    const db = new LedgerDb(dataDir);
+    const bus = new EventBus({});
+    const ledger = new LedgerApi(db.handle, { bus });
+    const notifications = new NotificationCenter({ ledger, bus });
+    const worktrees = new InMemoryWorktreePort(laneRoot, ledger);
+    let spawned = 0;
+    const dispatch = new DispatchService({
+      ledger,
+      worktrees,
+      bus,
+      spawner: async () => {
+        spawned += 1;
+        return {
+          id: `e2e-minion-${String(spawned)}`,
+          role: 'minion',
+          sessionFile: null,
+          prompt: async () => {},
+        } as unknown as AgentHandle;
+      },
+    });
+    const review = reviewFixture({ ledger, repo, notifications });
+    const armed = await armReview(review, repo);
+    for (const lens of armed.lenses) submitLens(review, repo, armed, lens as BriefingReviewLens);
+    const service = new PipelineService({
+      ledger,
+      dispatch,
+      briefingReview: review,
+      capacity: () => ({ capacity: 4, occupied: 0, queued: 0, available: 4 }),
+      bus,
+      notifications,
+    });
+    liveServices.push(service);
+    service.enqueue({ id: 'pipe-e2e', repoPath: repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await vi.waitFor(() => expect(ledger.getJob('pipe-e2e')).not.toBeNull());
+    await service.whenIdle();
+    const recorded = ledger.listEventsAfter(0, { kinds: [BRIEFING_REVIEW_DISPATCHED] });
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.payload).toMatchObject({
+      job_id: 'pipe-e2e',
+      review_id: armed.reviewId,
+      briefing_sha_256: armed.briefingSha256,
+      verdict: 'READY',
+    });
+    service.dispose();
+    db.close();
   });
 });
 

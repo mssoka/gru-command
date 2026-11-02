@@ -443,8 +443,10 @@ Fields, states and the read routes are in docs/PIPELINE.md.
   release condition as a heist plus a milestone — for example "release after
   the migration heist is merged".
 - **One review while held.** While the entry is held, run one briefing review
-  of its exact text. Pipeline admission does not run the review gate today
-  (#551).
+  of its exact text. Admission runs the same gate as `POST /api/dispatch`
+  (#551): an enforced-tier entry without a READY review or push-back waits as
+  `waiting` with a `briefing_review_*: …` reason and is admitted by itself when
+  the verdict lands; a deferral is never a failed attempt.
 - **On READY,** clear the hold when the review was its only condition. When the
   hold also names an outside heist, keep it until that heist lands (see
   Dependencies).

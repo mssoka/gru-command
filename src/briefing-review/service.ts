@@ -31,6 +31,7 @@ import {
 import {
   briefingReviewGate,
   type BriefingReviewChainReview,
+  type BriefingReviewGateResult,
   type BriefingReviewProvenance,
   type BriefingReviewRequestedProvenance,
 } from './gate.js';
@@ -711,15 +712,17 @@ export class BriefingReviewService {
     };
   }
 
-  /** The dispatch gate: admits or refuses one dispatch and, for a readiness
-   * refusal at an enforced stage, records the attempt before anything is created. */
-  admitDispatch(input: {
+  /** The dispatch gate decision alone: records nothing and never throws a
+   * refusal, so a consumer that re-checks a held entry every pass does not
+   * mint a `briefing.review-refused` event per pass for a job that does not
+   * exist yet. Null means the gate is off. */
+  evaluateDispatch(input: {
     readonly jobId: string;
     readonly repoPath: string;
     readonly title: string;
     readonly briefing: string;
     readonly requested: BriefingReviewRequestedProvenance | undefined;
-  }): BriefingReviewProvenance | null {
+  }): BriefingReviewGateResult | null {
     if (!this.options.config.enabled) {
       // The stop state is the whole gate off: nothing to verify, nothing to
       // claim, nothing attached. A caller that still sends its (now stale)
@@ -758,6 +761,20 @@ export class BriefingReviewService {
       exactPushback,
       chain,
     });
+    return outcome;
+  }
+
+  /** The dispatch gate: admits or refuses one dispatch and, for a readiness
+   * refusal at an enforced stage, records the attempt before anything is created. */
+  admitDispatch(input: {
+    readonly jobId: string;
+    readonly repoPath: string;
+    readonly title: string;
+    readonly briefing: string;
+    readonly requested: BriefingReviewRequestedProvenance | undefined;
+  }): BriefingReviewProvenance | null {
+    const outcome = this.evaluateDispatch(input);
+    if (outcome === null) return null;
     if (!outcome.admitted) {
       if (outcome.refusal !== null) {
         this.ledger.appendCustomEvent({

@@ -69,9 +69,10 @@ A heist that is approved but not dispatched yet is not held in conversation: it
 is enqueued in the durable pipeline (`POST /api/pipeline/enqueue`) with its full
 briefing, and the service dispatches it when its prerequisites are met and a
 resident worker slot is free. The pipeline calls the dispatch service directly,
-not this route: it carries only the job id, repository, title and briefing, so
-none of the route's optional fields ride in an entry and the briefing-review gate
-does not run. Endpoints, states and the admission rules are in
+not this route: an entry carries only the job id, repository, title and
+briefing, and admission runs the same briefing-review gate before it dispatches,
+so an enforced-tier entry waits on its review and is dispatched with the
+attached provenance. Endpoints, states and the admission rules are in
 [PIPELINE.md](./PIPELINE.md).
 
 ## 3. Lifecycle on the board

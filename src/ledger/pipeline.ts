@@ -88,6 +88,9 @@ export interface PipelineEntryRecord {
   readonly claim: PipelineClaim | null;
   readonly failureReason: string | null;
   readonly failureCount: number;
+  /** A briefing-review gate deferral (`<code>: <detail>`), or null. It is a
+   * WAIT, never a failed attempt: `failureCount` does not move. */
+  readonly deferReason: string | null;
   /** Crash-recovery note (never a failure narrative). */
   readonly reconcileNote: string | null;
   readonly queuedAt: string;
@@ -277,15 +280,18 @@ export interface PipelineEvaluation {
   readonly reason: string | null;
 }
 
-/** An entry's wait reason that is INDEPENDENT of capacity: hold, cycle,
- * prerequisite state/milestone, exclusive scope. Null = executable now
- * (capacity permitting). */
+/** An entry's wait reason that is INDEPENDENT of capacity: hold, a recorded
+ * briefing-review deferral, cycle, prerequisite state/milestone, exclusive
+ * scope — in that order. Null = executable now (capacity permitting). */
 export function pipelineBlockingReason(
   entry: PipelineEntryRecord,
   ctx: PipelineEvaluationContext,
 ): string | null {
   if (entry.holdReason !== null && entry.holdReason !== '') {
     return `owner hold: ${entry.holdReason}`;
+  }
+  if (entry.deferReason !== null && entry.deferReason !== '') {
+    return entry.deferReason;
   }
   const byId = new Map(ctx.entries.map((candidate) => [candidate.id, candidate] as const));
   const cycle = prerequisiteCyclePath(entry, byId);

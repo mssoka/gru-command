@@ -164,7 +164,8 @@ describe('gru role definition', () => {
     expect(section).toContain('**Enqueue held.** Enqueue every entry with a `hold_reason` that names its release condition as a heist plus a milestone');
     expect(section).toContain('"release after the migration heist is merged"');
     expect(section).toContain('**One review while held.** While the entry is held, run one briefing review of its exact text');
-    expect(section).toContain('Pipeline admission does not run the review gate today (#551)');
+    expect(section).toContain('Admission runs the same gate as `POST /api/dispatch` (#551)');
+    expect(section).toContain('a deferral is never a failed attempt');
     expect(section).toContain('**On READY,** clear the hold when the review was its only condition');
     expect(section).toContain('When the hold also names an outside heist, keep it until that heist lands (see Dependencies)');
     expect(section).toContain('**On CHANGES-NEEDED,** record a push-back, clear the hold, and append one corrective dispatch amendment as soon as the entry is admitted');
@@ -198,8 +199,8 @@ describe('gru role definition', () => {
     const milestones = between('## Prerequisites and milestones', '## Priority');
     const priority = between('## Priority', '## Exclusive scopes');
     const scopes = between('## Exclusive scopes', '## Admission');
-    const admission = between('## Admission', '## The briefing-review gate is not run on admission');
-    const gate = between('## The briefing-review gate is not run on admission', '## Immutability and correction');
+    const admission = between('## Admission', '## The briefing-review gate runs on admission');
+    const gate = between('## The briefing-review gate runs on admission', '## Immutability and correction');
     // Routes the dispatch server mounts.
     for (const route of [
       'POST /api/pipeline/enqueue',
@@ -229,7 +230,7 @@ describe('gru role definition', () => {
     expect([...states.matchAll(/\| `([a-z]+)` \|/gu)].map((match) => match[1]).sort()).toEqual([...PIPELINE_STATES].sort());
     // Each state row keeps its own meaning (a row cannot swap with another).
     for (const row of [
-      '| `waiting` | Enqueued, held, or blocked.',
+      '| `waiting` | Enqueued, held, deferred by the briefing-review gate, or blocked.',
       '| `ready` | Nothing blocks it.',
       '| `admitting` | The service claimed it',
       '| `admitted` | Dispatched. The entry id is now the job id',
@@ -238,6 +239,15 @@ describe('gru role definition', () => {
     ]) {
       expect(states, `docs/PIPELINE.md state row changed: ${row}`).toContain(row);
     }
+    // The normative wait-reason order: owner hold, then a gate deferral, then
+    // cycles/prerequisites/scopes (#551).
+    expect(states).toContain('the recorded briefing-review deferral');
+    expect(states.indexOf('`owner hold: <hold_reason>`')).toBeLessThan(
+      states.indexOf('the recorded briefing-review deferral'),
+    );
+    expect(states.indexOf('the recorded briefing-review deferral')).toBeLessThan(
+      states.indexOf('`dependency cycle: a → b → a`'),
+    );
     for (const milestone of PIPELINE_MILESTONES) {
       expect(milestones, `docs/PIPELINE.md missing milestone ${milestone}`).toContain(`| \`${milestone}\` |`);
     }
@@ -260,8 +270,8 @@ describe('gru role definition', () => {
     expect(priority).toContain('A **lower number is admitted first**');
     expect(scopes).toContain('`exclusive_scopes`');
     // The gate gap and the sharp edges the role depends on.
-    expect(doc).toContain('## The briefing-review gate is not run on admission');
-    expect(doc).toContain('Making admission honour the gate is a separate change');
+    expect(doc).toContain('## The briefing-review gate runs on admission');
+    expect(doc).toContain('Pipeline admission runs the same pure decision before it dispatches');
     expect(enqueue).toContain('Uppercase is refused by the dispatch service before any job row exists');
     expect(enqueue).toContain('The id check rejects the exact ids `.` and `..`, but not a `..` inside a longer id');
     expect(enqueue).toContain('the others fail when the lane is created, after the job row exists');
@@ -282,16 +292,17 @@ describe('gru role definition', () => {
     expect(admission).toContain('The pipeline never posts that card for a job the dispatch service already blocked');
     // The gate gap's substantive claim, not only its heading and link.
     expect(gate).toContain('runs inside the `POST /api/dispatch` handler, before that route creates anything');
-    expect(gate).toContain('Pipeline admission calls the dispatch service directly and never passes through the handler.');
-    expect(gate).toContain('is never held for a READY review at any `stage`, is never refused for a missing review, and carries no review provenance on its job');
+    expect(gate).toContain('the pipeline has no `briefing_review` block to claim');
+    expect(gate).toContain('It is not a failed attempt: `failure_count` does not move');
+    expect(gate).toContain('`briefing.review-verdict` or `briefing.review-pushback` event schedules a pass');
     const flow = readFileSync(join(REPO_ROOT, 'docs', 'FLOW.md'), 'utf-8');
     const dispatchSection = flow.slice(flow.indexOf('## 2. Ops handoff (dispatch)'), flow.indexOf('## 3. Lifecycle on the board'));
     expect(dispatchSection).toContain('(./PIPELINE.md)');
-    expect(dispatchSection).toContain('the briefing-review gate\ndoes not run');
+    expect(dispatchSection).toContain('admission runs the same briefing-review gate before it dispatches');
     const briefingReview = readFileSync(join(REPO_ROOT, 'docs', 'BRIEFING-REVIEW.md'), 'utf-8');
-    expect(briefingReview).toContain('A heist admitted from the durable\npipeline never passes through it, at any stage');
+    expect(briefingReview).toContain('The gate guards `POST /api/dispatch` and pipeline admission alike.');
     expect(briefingReview).toContain(
-      '(./PIPELINE.md#the-briefing-review-gate-is-not-run-on-admission)',
+      '(./PIPELINE.md#the-briefing-review-gate-runs-on-admission)',
     );
   });
 

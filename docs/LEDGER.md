@@ -835,6 +835,14 @@ derived: `job_status` is the status at S1, and a bin intent started on a parked
 job stores the same `parked` a keep-parked one does. See
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
 
+Migration 38 (`pipeline-defer-reason`) adds the nullable
+`pipeline_entries.defer_reason`: the `briefing_review_*: <detail>` reason an
+enforced-tier entry waits on when pipeline admission runs the briefing-review
+gate (#551). It is a WAIT, not a failed attempt — `failure_count` and
+`failure_reason` stay untouched — and `pipelineBlockingReason` reports it after
+the owner hold and before prerequisites and scopes. A row written before the
+migration, or an admitted entry, reads null.
+
 ### Process identity is the raw command's digest (#534)
 
 Migration 34 (`worktree-process-command-digest`) is additive: it adds
