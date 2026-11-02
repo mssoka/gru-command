@@ -4313,7 +4313,7 @@ export class LedgerApi {
 
   latestSupervisionEvent(agentId: string): EventRecord | null {
     const row = this.db.prepare(`SELECT * FROM events WHERE agent_id = ?
-      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
+      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded', 'supervision.stop-closed') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -4388,12 +4388,78 @@ export class LedgerApi {
     });
   }
 
+  /** Whether a JOBLESS stop was closed without a restart (#561): the durable
+   * record a retried close is answered from, across restarts. */
+  hasSupervisionStopClosed(notificationId: string): boolean {
+    return this.supervisionStopClosed(notificationId) !== undefined;
+  }
+
+  /** The FIRST recorded jobless closure of this alert's stop — the binding
+   * one. A jobless stop has no job by definition, so this reader binds on the
+   * agent alone: unlike a superseded-stop closure it must NOT require a
+   * complete job, or every row this ledger writes would read as no closure
+   * (the blindness the #385 reader's `complete(agentId) && complete(jobId)`
+   * filter would impose). */
+  private supervisionStopClosed(notificationId: string): { readonly agentId: string; readonly jobId: string | null } | undefined {
+    const rows = this.db.prepare(
+      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-closed' AND json_extract(payload, '$.notification_id') = ? ORDER BY seq ASC",
+    ).all(notificationId) as Array<{ agentId: unknown; jobId: unknown }>;
+    const first = rows.find((row) => typeof row.agentId === 'string' && row.agentId.trim() !== '');
+    if (first === undefined) return undefined;
+    return {
+      agentId: first.agentId as string,
+      jobId: typeof first.jobId === 'string' && first.jobId.trim() !== '' ? first.jobId : null,
+    };
+  }
+
+  /** Records a jobless stop's closure (#561) at most ONCE per alert: the
+   * check and the append share one transaction, so no interleaving can
+   * record it twice. True when this call recorded it. A close records NO
+   * completion, no no-effect claim and no cessation evidence — the payload
+   * says so in `claims`, and the event carries no job. */
+  recordSupervisionStopClosed(input: {
+    readonly agentId: string;
+    readonly notificationId: string;
+    readonly by: string;
+    readonly reason: string;
+  }): boolean {
+    for (const [name, value] of [['agentId', input.agentId], ['notificationId', input.notificationId], ['by', input.by], ['reason', input.reason]] as const) {
+      if (typeof value !== 'string' || value.trim() === '') throw new Error(`a jobless stop closure needs a non-blank ${name}`);
+    }
+    return this.transaction(() => {
+      const prior = this.supervisionStopClosed(input.notificationId);
+      if (prior !== undefined) {
+        // The same alert closes ONE stop: a replay naming another agent is a
+        // conflict, never "already recorded".
+        if (prior.agentId !== input.agentId) {
+          throw new SupervisionStopClosureConflictError(`alert "${input.notificationId}" already closed the jobless stop of agent "${prior.agentId}" — not agent "${input.agentId}"`);
+        }
+        return false;
+      }
+      this.appendCustomEvent({
+        kind: 'supervision.stop-closed',
+        agentId: input.agentId,
+        jobId: null,
+        payload: {
+          notification_id: input.notificationId,
+          by: input.by,
+          reason: input.reason,
+          claims: 'none: no completion, no no-effect, no cessation',
+        },
+      });
+      return true;
+    });
+  }
+
   /**
    * Durable supervision stop truth for restart hydration (code review
    * 2026-10-04): the latest supervision lifecycle event per agent, kept
-   * only when that latest event is a STOP. A re-arm event clears the stop;
-   * a later re-arm-fenced event restores stop truth, so an accepted re-arm
-   * followed by asynchronous refusal remains stopped after a restart.
+   * only when that latest event is a STOP. A re-arm event clears the stop, and
+   * so does a closure — a superseded one (#385) or a jobless one closed by a
+   * Gru disposition (#561) — which is why both are in the inner MAX(seq)
+   * grouping and neither is a STOP kind below; a later re-arm-fenced event
+   * restores stop truth, so an accepted re-arm followed by asynchronous
+   * refusal remains stopped after a restart.
    */
   durableSupervisionStops(): Map<
     string,
@@ -4413,7 +4479,7 @@ export class LedgerApi {
              SELECT agent_id, MAX(seq) AS seq
                FROM events
               WHERE agent_id IS NOT NULL
-                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded')
+                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded', 'supervision.stop-closed')
               GROUP BY agent_id
            ) latest ON latest.agent_id = e.agent_id AND latest.seq = e.seq
            JOIN agents a ON a.id = e.agent_id

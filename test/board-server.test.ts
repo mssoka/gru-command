@@ -46,7 +46,11 @@ async function boot(
   overrides: Partial<{
     heartbeatMs: number;
     repoOverview: () => RepoOverviewView | null;
-    onNotificationDisposition: (id: string, detail: string) => { readonly ok: boolean; readonly reason?: string } | void;
+    onNotificationDisposition: (
+      id: string,
+      detail: string,
+      action?: 'close-stop',
+    ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean; readonly closed?: boolean; readonly reason?: string } | void;
     binningCloseout: (jobId: string, body: Record<string, unknown>) => { readonly status: number; readonly body: unknown } | null;
   }> = {},
 ): Promise<{
@@ -1900,6 +1904,9 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       expect(
         api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-refused'),
       ).toHaveLength(1);
+      // An ordinary re-arm refusal never claims a close action.
+      expect(api.listEvents({ limit: 100 }).find((event) => event.kind === 'notification.rearm-refused')?.payload)
+        .not.toHaveProperty('action');
       // The fence clears: the SAME control (no new alert, no new id) is
       // accepted and the row closes with the truthful re-arm outcome.
       refusal = null;
@@ -2494,6 +2501,151 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       ).toBe(400);
     } finally {
       await close();
+    }
+  });
+
+  it('a named close-stop action closes a jobless stopped breaker alert and answers rearm: closed (#561)', async () => {
+    const hookCalls: { id: string; detail: string; action: 'close-stop' | undefined }[] = [];
+    const { port, api, notifications, close } = await boot('board-test-token', {
+      onNotificationDisposition: (id, detail, action) => {
+        hookCalls.push({ id, detail, action });
+        if (id === 'jobless-close-refused') return { ok: false, reason: 'the stopped agent still holds a live handle or is restarting' };
+        return action === 'close-stop' ? { ok: true, rearmed: false, closed: true } : { ok: true, rearmed: true };
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'jobless-close',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped: restart ladder tripped',
+        detail: 'breaker open',
+        agentId: 'jobless-close-agent',
+      });
+      // Present-but-empty is NOT "omitted", and only one action exists: both
+      // are refused at the boundary, before the guarded hook can act.
+      for (const action of ['', 'close']) {
+        const invalid = await postJson(port, '/api/notifications/jobless-close/disposition', 'board-test-token', { detail: 'close it', action });
+        expect(invalid, action).toMatchObject({ status: 400, body: { error: 'invalid_action' } });
+      }
+      expect(await postJson(port, '/api/notifications/jobless-close/disposition', 'board-test-token', { detail: 'close it', action: 7 }))
+        .toMatchObject({ status: 400, body: { error: 'invalid_action' } });
+      expect(hookCalls).toEqual([]);
+      expect(api.getNotification('jobless-close')).toMatchObject({ resolvedAt: null, ackedAt: null });
+      // The action is action-required-only: a needs-owner row records owner
+      // follow-through and never consults the hook.
+      notifications.post({ id: 'owner-action-row', kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Port occupied', detail: 'bind refused' });
+      expect(await postJson(port, '/api/notifications/owner-action-row/disposition', 'board-test-token', { detail: 'close it', action: 'close-stop' }))
+        .toMatchObject({ status: 400, body: { error: 'invalid_action' } });
+      expect(hookCalls).toEqual([]);
+      // The close: the hook is consulted with the named action, the alert is
+      // resolved, and the answer names the closure (never a re-arm).
+      const closed = await postJson(port, '/api/notifications/jobless-close/disposition', 'board-test-token', {
+        detail: 'closed: the stop has no lane to resume',
+        action: 'close-stop',
+      });
+      expect(closed).toMatchObject({ status: 200, body: { rearm: 'closed', resolvedBy: 'gru' } });
+      expect((closed.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+      expect(hookCalls).toEqual([{ id: 'jobless-close', detail: 'closed: the stop has no lane to resume', action: 'close-stop' }]);
+      // A retried disposition on the resolved row is the idempotent record:
+      // the hook is only consulted for unresolved rows.
+      expect(await postJson(port, '/api/notifications/jobless-close/disposition', 'board-test-token', { detail: 'again', action: 'close-stop' }))
+        .toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect(hookCalls).toHaveLength(1);
+      // Without a named action the ordinary guarded re-arm is unchanged.
+      api.recordNotification({
+        id: 'ordinary-rearm',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped: restart ladder tripped',
+        detail: 'breaker open',
+        agentId: 'ordinary-rearm-agent',
+      });
+      expect(await postJson(port, '/api/notifications/ordinary-rearm/disposition', 'board-test-token', { detail: 'resume the lane' }))
+        .toMatchObject({ status: 200, body: { rearm: 'accepted' } });
+      expect(hookCalls.at(-1)).toEqual({ id: 'ordinary-rearm', detail: 'resume the lane', action: undefined });
+      // A refused close keeps the alert open and its ledger refusal names the
+      // action, so it is distinguishable from a refused re-arm.
+      api.recordNotification({
+        id: 'jobless-close-refused',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped: restart ladder tripped',
+        detail: 'breaker open',
+        agentId: 'jobless-close-refused-agent',
+      });
+      const refused = await postJson(port, '/api/notifications/jobless-close-refused/disposition', 'board-test-token', {
+        detail: 'close it',
+        action: 'close-stop',
+      });
+      expect(refused).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      expect(api.getNotification('jobless-close-refused')).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(hookCalls.at(-1)).toEqual({ id: 'jobless-close-refused', detail: 'close it', action: 'close-stop' });
+      const refusals = api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-refused');
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]!.payload).toMatchObject({ id: 'jobless-close-refused', action: 'close-stop' });
+    } finally {
+      await close();
+    }
+  });
+
+  it('the production supervisor binding carries close-stop through to a durable closure (#561)', async () => {
+    let disposition:
+      | ((notificationId: string, detail?: string, action?: 'close-stop') => ReturnType<Supervisor['onNotificationDisposed']>)
+      | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id, detail, action) => (disposition === null ? undefined : disposition(id, detail, action)),
+    });
+    let spawnCalls = 0;
+    const registry: SupervisorRegistry = {
+      onAgentEvent: () => () => {},
+      getHandle: () => null,
+      quarantineHandle: () => {},
+      spawn: async () => {
+        spawnCalls += 1;
+        throw new Error('a closed stop must never spawn');
+      },
+      disposeHandle: async () => {},
+    };
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    try {
+      // A jobless durable stop with its open control, hydrated but unadopted.
+      harness.api.registerAgent({ id: 'jobless-route-agent', role: 'minion' });
+      harness.api.appendCustomEvent({ kind: 'supervision.breaker', agentId: 'jobless-route-agent', payload: { reason: 'crash loop', restarts: 2 } });
+      const stop = harness.notifications.post({
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Crash-loop breaker tripped: agent jobless-route-agent stopped',
+        detail: 'breaker open',
+        agentId: 'jobless-route-agent',
+      });
+      supervisor.start();
+      expect(supervisor.viewFor('jobless-route-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(stop.id)}/disposition`, 'board-test-token', {
+        detail: 'closed: the stop has no lane to resume',
+        action: 'close-stop',
+      });
+      expect(response).toMatchObject({ status: 200, body: { rearm: 'closed', resolvedBy: 'gru' } });
+      expect(harness.api.getNotification(stop.id)?.resolvedAt).not.toBeNull();
+      const closed = harness.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-closed');
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.payload).toMatchObject({ notification_id: stop.id });
+      expect(supervisor.viewFor('jobless-route-agent')).toBeNull();
+      expect(spawnCalls).toBe(0);
+    } finally {
+      supervisor.dispose();
+      await harness.close();
     }
   });
 });
