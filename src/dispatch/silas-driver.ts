@@ -27,6 +27,7 @@ import type { JobAmendmentRecord, WorkRevisionState } from '../review-inputs/ame
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
+import type { GitLabPollTickResult } from './gitlab-poll.js';
 import { BRANCH_STATE_EVENT } from './github-poll.js';
 import { pendingRecoveryRows } from '../provider-recovery/sensor.js';
 import { pendingPublicationAttempt } from './publication-evidence.js';
@@ -2346,6 +2347,11 @@ export interface GitHubPollPort {
   pollOnce(): Promise<GitHubPollTickResult>;
 }
 
+/** The GitLab signal poll's single entry point (`GitLabSignalPoll` satisfies it). */
+export interface GitLabPollPort {
+  pollOnce(): Promise<GitLabPollTickResult>;
+}
+
 /** Bind the supervisor's live per-agent views to the digest's lookup. This
  * is the one seam main.ts wires; it is a factory so the binding is testable
  * without booting the service (final independent review T2). The argument
@@ -2376,6 +2382,10 @@ export interface SilasDriverOptions {
   readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   /** The fast GitHub signal poll, ticked on `[silas] poll_interval_ms`. */
   readonly githubPoll?: GitHubPollPort;
+  /** The GitLab merge-request poll, ticked on the same interval. Each poll
+   * fails and logs on its own, so one provider's throw never suppresses the
+   * other's tick. */
+  readonly gitlabPoll?: GitLabPollPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
@@ -2599,12 +2609,17 @@ export class SilasDriver {
       this.timer.unref?.();
       this.log('info', 'silas ops driver started', { sweepIntervalMs: this.opts.config.sweepIntervalMs });
     }
-    if (this.opts.githubPoll !== undefined && this.opts.config.pollIntervalMs > 0) {
+    if ((this.opts.githubPoll !== undefined || this.opts.gitlabPoll !== undefined) && this.opts.config.pollIntervalMs > 0) {
       this.pollTimer = this.setIntervalImpl(() => {
         void this.runPoll();
       }, this.opts.config.pollIntervalMs);
       this.pollTimer.unref?.();
-      this.log('info', 'silas github signal poll started', { pollIntervalMs: this.opts.config.pollIntervalMs });
+      if (this.opts.githubPoll !== undefined) {
+        this.log('info', 'silas github signal poll started', { pollIntervalMs: this.opts.config.pollIntervalMs });
+      }
+      if (this.opts.gitlabPoll !== undefined) {
+        this.log('info', 'silas gitlab signal poll started', { pollIntervalMs: this.opts.config.pollIntervalMs });
+      }
     }
   }
 
@@ -2625,33 +2640,56 @@ export class SilasDriver {
   }
 
   /**
-   * One fast-poll tick. The poll applies its mechanical mappings itself
+   * One fast-poll tick. Each poll applies its mechanical mappings itself
    * (tier 0/1 within the existing mandate); this driver only owns the timer
-   * and the loud failure surface. A tick arriving while the previous one is
+   * and the loud failure surfaces. A tick arriving while the previous one is
    * still running is skipped — the next interval re-observes from the ledger.
+   * The two providers are ticked under their own try/catch: a GitHub failure
+   * never suppresses the GitLab read, and vice versa.
    */
   private async runPoll(): Promise<void> {
-    const poll = this.opts.githubPoll;
-    if (poll === undefined || this.disposed) return;
+    const github = this.opts.githubPoll;
+    const gitlab = this.opts.gitlabPoll;
+    if ((github === undefined && gitlab === undefined) || this.disposed) return;
     if (this.pollInFlight) {
       this.log('info', 'github signal poll still running — tick skipped', {});
       return;
     }
     this.pollInFlight = true;
     try {
-      const result = await poll.pollOnce();
-      if (result.signals.length > 0) {
-        this.log('info', 'github signal poll applied signals', {
-          tracked: result.tracked,
-          observed: result.observed,
-          calls: result.calls,
-          signals: result.signals.map((signal) => signal.kind),
-        });
+      if (github !== undefined) {
+        try {
+          const result = await github.pollOnce();
+          if (result.signals.length > 0) {
+            this.log('info', 'github signal poll applied signals', {
+              tracked: result.tracked,
+              observed: result.observed,
+              calls: result.calls,
+              signals: result.signals.map((signal) => signal.kind),
+            });
+          }
+        } catch (error) {
+          // A failed poll must never take the service down: the next tick
+          // retries and the ledger dedupe cursor makes a re-observation
+          // idempotent.
+          this.log('error', 'github signal poll failed', { error: String(error).slice(0, 300) });
+        }
       }
-    } catch (error) {
-      // A failed poll must never take the service down: the next tick retries
-      // and the ledger dedupe cursor makes a re-observation idempotent.
-      this.log('error', 'github signal poll failed', { error: String(error).slice(0, 300) });
+      if (gitlab !== undefined) {
+        try {
+          const result = await gitlab.pollOnce();
+          if (result.merged > 0) {
+            this.log('info', 'gitlab signal poll applied merges', {
+              tracked: result.tracked,
+              reads: result.reads,
+              observed: result.observed,
+              merged: result.merged,
+            });
+          }
+        } catch (error) {
+          this.log('error', 'gitlab signal poll failed', { error: String(error).slice(0, 300) });
+        }
+      }
     } finally {
       this.pollInFlight = false;
     }

@@ -1,4 +1,4 @@
-import type { EventRecord, LedgerApi } from '../../ledger/api.js';
+import type { EventRecord } from '../../ledger/api.js';
 import { redactCredentials } from '../../redaction.js';
 import {
   GITLAB_MR_OBSERVED_EVENT,
@@ -17,8 +17,10 @@ import { PROBE_TIMEOUT_MS } from './fresh-head.js';
  * request the freeze head probe already makes) and records what GitLab said as
  * one durable job event: `gitlab.mr-observed` or `gitlab.mr-read-failed`.
  * `ci-evidence.ts` binds that event, and only that event, to the frozen
- * target. Nothing here polls, and nothing is read for a job whose link is not
- * a GitLab merge request on a host `isGitLabRemote` accepts.
+ * target. The same reader is the GitLab signal poll's one read (#568): the
+ * poll passes `roundId: null` and its own record-on-change gates, so a poll
+ * observation is never bindable to a round. Nothing is read for a job whose
+ * link is not a GitLab merge request on a host `isGitLabRemote` accepts.
  *
  * The link must also name the lane's own origin (host and project, as the
  * verdict poster requires): a minion-reported link to another project or host
@@ -62,6 +64,11 @@ export interface GitLabMrObservedFacts {
   readonly state: string;
   readonly head_sha: string;
   readonly head_pipeline: GitLabMrHeadPipeline | null;
+  /** The commit GitLab created when it merged, or null. Null is the honest
+   * value for an unmerged request (GitLab sends `null`), and it is what an
+   * empty or missing field records: the poll's dedupe reads it, the CI
+   * binding never consults it. */
+  readonly merge_commit_sha: string | null;
   /** Mergeability normalized here, at the ingress: GitLab's modern
    * `detailed_merge_status` decides when present, otherwise the legacy
    * `merge_status` + `has_conflicts` + `blocking_discussions_resolved`
@@ -180,14 +187,18 @@ function parseMergeRequest(body: string): { readonly observed: GitLabMrObservedF
     }
     headPipeline = { id, sha, status, source: nonEmpty(rawPipeline['source']), web_url: nonEmpty(rawPipeline['web_url']) };
   }
-  const fields = [state, headSha, webUrl, headPipeline?.sha, headPipeline?.status, headPipeline?.source, headPipeline?.web_url];
+  const mergeCommitSha = nonEmpty(parsed['merge_commit_sha']);
+  const fields = [
+    state, headSha, webUrl, mergeCommitSha,
+    headPipeline?.sha, headPipeline?.status, headPipeline?.source, headPipeline?.web_url,
+  ];
   if (fields.some((field) => typeof field === 'string' && field.length > MAX_FIELD_CHARS)) {
     return { problem: `a merge request response field is longer than ${MAX_FIELD_CHARS} characters` };
   }
   return {
     observed: {
       host: identity.host, project: identity.project, mr_iid: iid, state, head_sha: headSha,
-      head_pipeline: headPipeline, mergeable: mergeability(parsed),
+      head_pipeline: headPipeline, merge_commit_sha: mergeCommitSha, mergeable: mergeability(parsed),
     },
   };
 }
@@ -244,16 +255,27 @@ export async function readGitLabMr(request: GitLabMrReadRequest, deps: GitLabMrR
 
 type Log = (level: 'info' | 'warn', msg: string, fields?: Record<string, unknown>) => void;
 
+/** The one ledger write a read makes: the append, with the round it belongs to
+ * (null for a poll observation no round may bind). `LedgerApi` satisfies it. */
+export interface GitLabMrReadLedger {
+  appendCustomEvent(fields: {
+    kind: string;
+    jobId?: string | null;
+    roundId?: string | null;
+    payload?: unknown;
+  }): EventRecord;
+}
+
 /** A host as a URL parser writes it: lower-case, without the default https
  * port (the link's host has already been through one; an origin may spell it). */
-function normalizedHost(host: string): string {
+export function normalizedHost(host: string): string {
   return host.toLowerCase().replace(/:443$/u, '');
 }
 
 /** Why a link does not name the lane's origin, or null when it does. Host (with
  * its port) and project path compare case-insensitively, as the verdict poster
  * compares them. */
-function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): string | null {
+export function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): string | null {
   if (origin === null) {
     return `the merge request link names ${link.host}/${link.project}, but this lane has no resolvable origin remote to bind it to; no request was made`;
   }
@@ -263,25 +285,36 @@ function originMismatch(link: GitLabMrReadRequest, origin: RepoRemote | null): s
 }
 
 /**
- * The one read a round makes. Returns null — no request, no event — unless
- * the job's PR link is a GitLab merge request on an accepted host. Otherwise
- * appends exactly one `gitlab.mr-observed` / `gitlab.mr-read-failed` event
- * to the job (tagged with the round) and returns it with the link identity
- * the binding compares the response against. A link that does not name the
- * lane's `origin` makes no request and records an `other` failure saying so.
- * A read cancelled by `signal` (the setup was cancelled while the request was
- * in flight) records its `other` failure like any other: the caller is
- * already unwinding.
+ * The one read of a job's merge request. Returns null — no request, no event —
+ * unless the job's PR link is a GitLab merge request on an accepted host.
+ * Otherwise appends exactly one `gitlab.mr-observed` / `gitlab.mr-read-failed`
+ * event to the job and returns it with the link identity the binding compares
+ * the response against. `roundId` is the reading round for a freeze read and
+ * null for a poll observation (which no round may ever bind). The optional
+ * gates let the poll record on change: a declined read records nothing and
+ * returns null.
+ *
+ * A link that does not name the lane's `origin` makes no request and records
+ * an `other` failure saying so. A read cancelled by `signal` (the setup was
+ * cancelled while the request was in flight) records its `other` failure like
+ * any other: the caller is already unwinding.
  */
 export async function recordGitLabMrRead(input: {
-  readonly ledger: Pick<LedgerApi, 'appendCustomEvent'>;
+  readonly ledger: GitLabMrReadLedger;
   readonly jobId: string;
-  readonly roundId: string;
+  readonly roundId: string | null;
   readonly prUrl: string | null;
   readonly deps?: GitLabMrReadDeps;
   readonly signal?: AbortSignal;
   /** The lane's origin remote, looked up only for a link that would be read. */
   readonly origin: () => RepoRemote | null;
+  /** Record-on-change gate for a successful read (the poll's dedupe, consulted
+   * with the observation before anything is appended). Omitted, every
+   * observation is recorded. */
+  readonly recordObservation?: (observed: GitLabMrObservedFacts) => boolean;
+  /** Record gate for a failed read (the poll suppresses a repeated failure of
+   * the same kind). Omitted, every failure is recorded. */
+  readonly recordFailure?: (failure: GitLabMrReadFailure) => boolean;
   readonly log?: Log;
 }): Promise<{ readonly event: EventRecord; readonly link: GitLabMrReadRequest } | null> {
   const parsed = input.prUrl === null ? null : parseGitLabMrLink(input.prUrl);
@@ -294,6 +327,10 @@ export async function recordGitLabMrRead(input: {
         failure: { host: link.host, project: link.project, mr_iid: link.iid, error_kind: 'other', detail: safeDetail(mismatch, null) },
       }
     : await readGitLabMr(link, input.signal === undefined ? input.deps : { ...input.deps, signal: input.signal });
+  const records = outcome.ok
+    ? input.recordObservation === undefined || input.recordObservation(outcome.observed)
+    : input.recordFailure === undefined || input.recordFailure(outcome.failure);
+  if (!records) return null;
   const event = outcome.ok
     ? input.ledger.appendCustomEvent({
         kind: GITLAB_MR_OBSERVED_EVENT,

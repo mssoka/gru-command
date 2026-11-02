@@ -54,6 +54,7 @@ import {
 } from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
+import { GitLabSignalPoll } from './dispatch/gitlab-poll.js';
 import { GitLabRepoOverviewApi } from './repos/gitlab-overview.js';
 import { GhRepoOverviewApi } from './repos/overview.js';
 import { DefaultBranchCiWatch } from './repos/default-branch-ci.js';
@@ -2257,6 +2258,14 @@ async function main(): Promise<number> {
         ledger,
         notifications,
         api: new GhCliApi(),
+        resolveRemote: resolveLaneRemote,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      }),
+      // The GitLab merge-request poll (#568) rides the same interval and the
+      // same lane-origin resolver: one read per tracked merge request per
+      // tick, no token off the lane's own host, and the shared merge map.
+      gitlabPoll: new GitLabSignalPoll({
+        ledger,
         resolveRemote: resolveLaneRemote,
         log: (level, msg, fields) => logger.log(level, msg, fields),
       }),

@@ -276,6 +276,7 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
       host: HOST, project: PROJECT, mr_iid: IID, state: 'opened', head_sha: world.target,
       head_pipeline: { id: PIPELINE_ID, sha: world.target, status: 'running', source: 'merge_request_event', web_url: PIPELINE_URL },
       mergeable: 'clean',
+      merge_commit_sha: null,
       round_id: frozen.roundId,
     });
     expect(frozen.ci).toMatchObject({ state: 'pending', failures: [], reason: null });
