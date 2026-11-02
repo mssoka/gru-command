@@ -42,7 +42,7 @@ import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
-import { reconcileInterruptedDispatches } from './dispatch/interrupted-dispatch.js';
+import { reconcileInterruptedDispatches, reconcileInterruptedLaneLessDispatches } from './dispatch/interrupted-dispatch.js';
 import { binningCloseoutRoute, CanceledRequestCloseout, runBootDirectiveRecovery } from './dispatch/canceled-request-closeout.js';
 import { DirectiveProgressService, executeAcceptedDirective } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, bootProviderRecovery, establishProviderWait, handBackThenStartSupervision } from './provider-recovery/sensor.js';
@@ -1402,12 +1402,14 @@ async function main(): Promise<number> {
   // the in-process handler never runs and the pipeline's own interrupted-
   // startup check needs an `admitting` entry a plain POST /api/dispatch never
   // has. Runs here, right after the pipeline's claim recovery, so installs
-  // with Silas disabled are covered too. Boot order caveat: this runs BEFORE
-  // `runBootDirectiveRecovery` and `bootProviderRecovery`; the reconciler's
-  // ownership guards (live admission, continuation lane owner, open provider
-  // waits, verification) are what keep it from pre-empting them. The pass
-  // records a per-candidate read failure in its own `failed` channel, but the
-  // boot call itself is guarded: a ledger error here must never abort the
+  // with Silas disabled are covered too. Issue #583 runs the lane-less half
+  // of the same window right after it (see the second call). Boot order
+  // caveat: both run BEFORE `runBootDirectiveRecovery` and
+  // `bootProviderRecovery`; the reconcilers' ownership guards (live
+  // admission, continuation lane owner, open provider waits, verification)
+  // are what keep them from pre-empting them. Each pass records a
+  // per-candidate read failure in its own `failed` channel, but the boot
+  // calls themselves are guarded: a ledger error here must never abort the
   // service before any of its recovery paths run.
   try {
     const interruptedDispatches = reconcileInterruptedDispatches({
@@ -1422,6 +1424,24 @@ async function main(): Promise<number> {
         blocked: interruptedDispatches.blocked,
         skipped: interruptedDispatches.skipped,
         failed: interruptedDispatches.failed,
+      });
+    }
+    // Issue #583: the same window one step earlier — the dispatch died before
+    // its lane row, initial or continuation. BOOT-ONLY: this runs before the
+    // HTTP listener exists and assumes one service process per `data_dir`;
+    // a live pass cannot tell this shape from a dispatch in flight.
+    const interruptedLaneLessDispatches = reconcileInterruptedLaneLessDispatches({
+      ledger,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    if (interruptedLaneLessDispatches.examined > 0) {
+      logger.info('interrupted lane-less dispatch reconciliation', {
+        examined: interruptedLaneLessDispatches.examined,
+        truncated: interruptedLaneLessDispatches.truncated,
+        blocked: interruptedLaneLessDispatches.blocked,
+        skipped: interruptedLaneLessDispatches.skipped,
+        failed: interruptedLaneLessDispatches.failed,
       });
     }
   } catch (error) {
