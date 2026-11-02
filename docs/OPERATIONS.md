@@ -456,6 +456,23 @@ never recorded). It adds `409 request_closeout_refused` /
 longer than 500 characters is refused first, whatever the job
 ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523)).
 
+Such a request has two ways to finish (#564), and only the owner's hold
+decides which:
+
+- **bin** — the `{"status":"binned"}` request above: the job is discarded
+  because the work is canceled.
+- **keep parked** — `POST /api/silas/directives/<request-id>/closeout`
+  `{reason}` (Silas ops, like `/retire`): the request is retired, its debt is
+  closed and its card resolved, and the job stays `parked` with its hold in
+  place — nothing is discarded and the readback shows the job unchanged. It
+  requires the job to be parked (`409 job_not_parked` otherwise), is refused
+  `409 request_closeout_mode_conflict` while a closeout of the other mode is
+  active, and stops (`409 request_closeout_stopped`, blocker
+  `code: "gate_duty"`) on a current gate duty: resolve the duty — that is
+  what the gate protects — and the next pass finishes the closeout. Park is
+  still a hold, not a cancel: a later fresh request on that job needs the
+  owner like any other.
+
 There is no unbin: a mistaken bin is corrected by recording the honest
 next action as a NEW lane/job, never by rewriting the closed record.
 

@@ -774,11 +774,24 @@ Migration 33 (`request-closeouts`) is additive: no existing table changes.
 `superseded`), `superseded_reason` (`job-status`, `request-state`,
 `later-work`, `control-event`), `requested_by` (`gru` or `unattributed`),
 `reason`, `blockers` (JSON) and `blocker_fingerprint` (the sha256 of the sorted
-blocker codes and details), and timestamps. `UNIQUE (request_id, generation)`;
+blocker codes and details), `mode` (see migration 37) and timestamps.
+`UNIQUE (request_id, generation)`;
 a partial unique index allows at most one `open` or `stopped` row per request.
-Events: `silas.closeout-intent`, `silas.closeout-stopped`,
-`silas.closeout-superseded` and `silas.closeout-complete` (each carries
-`by: "canceled-request-closeout"`). See
+Events: `silas.closeout-intent` (payload `closeout_id`, `request_id`,
+`generation`, `payload_hash`, `job_status`, `mode`, `requested_by`, `reason`,
+`by`), `silas.closeout-stopped`, `silas.closeout-superseded` and
+`silas.closeout-complete` (each carries `by: "canceled-request-closeout"`; the
+keep-parked S3' adds `mode: "keep-parked"` to its completion because it writes
+no job status to read the variant from). See
+[DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
+
+Migration 37 (`request-closeout-mode`) is additive and defaulted (#564):
+`request_closeouts.mode TEXT NOT NULL DEFAULT 'bin' CHECK (mode IN
+('bin','keep-parked'))` records which S3 the intent owes — `bin` bins the job,
+`keep-parked` settles only the request's recovery obligation and leaves the job
+parked. Every intent written before it is a `bin` intent. The column cannot be
+derived: `job_status` is the status at S1, and a bin intent started on a parked
+job stores the same `parked` a keep-parked one does. See
 [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523).
 
 ### Process identity is the raw command's digest (#534)

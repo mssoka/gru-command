@@ -90,9 +90,11 @@ export interface DispatchServerOptions {
   readonly workerGate?: PacingGate;
   /** Supervisor's fresh queued/backoff producer ownership for retirement. */
   readonly pendingProducerBlockers: DirectiveProgressDeps['pendingProducerBlockers'];
-  /** Canceled-request closeout (#523): the directive readback names the path
-   * a binning request would take. Absent = the readback omits `closeout`. */
-  readonly closeout?: Pick<CanceledRequestCloseout, 'describe'>;
+  /** Canceled-request closeout (#523, #564): the directive readback names the
+   * path a binning request would take, and the keep-parked closeout route
+   * drives one request's closeout without binning. Absent = the readback omits
+   * `closeout` and `POST /api/silas/directives/{request}/closeout` answers 503. */
+  readonly closeout?: Pick<CanceledRequestCloseout, 'describe' | 'requestBinning'>;
   /** Provider pacing: bounded settlement of an automatic rate-limit retry
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */
@@ -237,10 +239,10 @@ function retirementReadback(record: DirectiveRequestRecord): Record<string, unkn
 
 /** The canceled-request closeout member of the directive readback: the path
  * a binning request takes for this request's job, whether the closeout would
- * proceed, why not, and the latest intent. */
+ * proceed, why not, the current intent's mode and the latest intent. */
 function closeoutReadback(closeout: Pick<CanceledRequestCloseout, 'describe'>, requestId: string): Record<string, unknown> {
-  const { path, eligible, blockers, intent } = closeout.describe(requestId);
-  return { path, eligible, blockers, intent: intent === null ? null : closeoutIntentView(intent) };
+  const { path, eligible, blockers, mode, intent } = closeout.describe(requestId);
+  return { path, eligible, blockers, mode, intent: intent === null ? null : closeoutIntentView(intent) };
 }
 
 function abandonmentReadback(record: DirectiveRequestRecord): Record<string, unknown> {
@@ -2289,6 +2291,33 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           'control ownership closed after server-verified writer cessation — no delivery and no no-effect outcome is claimed; ' +
           'the work remains unfinished and lane continuation requires a fresh authorized request',
       });
+      return true;
+    }
+    // A canceled request's debt settled while its job stays parked (#564):
+    // the same closeout, with S3' instead of the bin. The path names the
+    // request, so the job comes from the row; the closeout itself adds no
+    // authority and evaluates the same `/retire` guard set.
+    const directiveCloseout = /^\/api\/silas\/directives\/([^/]+)\/closeout$/.exec(path);
+    if (req.method === 'POST' && directiveCloseout !== null) {
+      if (!authed(req, res)) return true;
+      if (silasOpsOr503(res) === null) return true;
+      const closeout = options.closeout;
+      if (closeout === undefined) {
+        json(res, 503, { error: 'closeout_not_hosted', detail: 'the canceled-request closeout is not hosted on this service' });
+        return true;
+      }
+      const requestId = decodeURIComponent(directiveCloseout[1] ?? '');
+      const record = options.ledger.getDirective(requestId);
+      if (record === null) {
+        json(res, 404, { error: 'not_found', detail: `no directive request "${requestId}"` });
+        return true;
+      }
+      const body = await readBody(req);
+      // `reason` is validated by the closeout's own rule (400 `invalid_reason`),
+      // exactly as a binning request's is: one spelling of the refusal.
+      const result = closeout.requestBinning(record.jobId, { reason: body['reason'], by: body['by'] }, { mode: 'keep-parked', requestId });
+      json(res, result?.status ?? 409, result?.body ?? { error: 'request_closeout_not_applicable',
+        detail: `job "${record.jobId}" has no deferred request to close out while it stays parked — read GET /api/silas/directives/${requestId}` });
       return true;
     }
     // Owner abandonment of a live request whose custody is unknown: the

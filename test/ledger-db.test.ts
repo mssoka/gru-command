@@ -146,7 +146,7 @@ describe('ledger db + migration runner', () => {
     expect(upgraded.handle.prepare("SELECT id, name FROM schema_migrations WHERE id = 33").get()).toEqual({ id: 33, name: 'request-closeouts' });
     const columns = upgraded.handle.prepare('PRAGMA table_info(request_closeouts)').all().map((row) => row['name']);
     expect(columns).toEqual(['closeout_id', 'job_id', 'request_id', 'generation', 'payload_hash', 'job_status', 'intent_seq', 'state',
-      'superseded_reason', 'requested_by', 'reason', 'blockers', 'blocker_fingerprint', 'created_at', 'updated_at']);
+      'superseded_reason', 'requested_by', 'reason', 'blockers', 'blocker_fingerprint', 'created_at', 'updated_at', 'mode']);
     const insert = upgraded.handle.prepare(`INSERT INTO request_closeouts
       (closeout_id, job_id, request_id, generation, payload_hash, job_status, intent_seq, state, requested_by, created_at, updated_at)
       VALUES (?, 'j', 'req', ?, 'h', 'working', 1, ?, 'gru', 't', 't')`);
@@ -160,6 +160,37 @@ describe('ledger db + migration runner', () => {
     expect(() => insert.run('c4', 3, 'paused')).toThrow(/CHECK constraint/u);
     expect(() => upgraded.handle.prepare("UPDATE request_closeouts SET superseded_reason = 'whim' WHERE closeout_id = 'c2'").run()).toThrow(/CHECK constraint/u);
     expect(() => upgraded.handle.prepare("UPDATE request_closeouts SET requested_by = 'owner' WHERE closeout_id = 'c2'").run()).toThrow(/CHECK constraint/u);
+    expect(upgraded.handle.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    upgraded.close();
+  });
+
+  it('adds the keep-parked closeout mode, defaulting every intent written before it to bin (#564)', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 36) });
+    old.handle.prepare("INSERT INTO jobs (id, repo, title, status, created_at, updated_at) VALUES ('j', 'r', 'closeout job', 'parked', 't', 't')").run();
+    old.handle.prepare(`INSERT INTO pending_directives (request_id, job_id, payload, payload_hash, state, baseline_seq, attempts, created_at, updated_at)
+      VALUES ('req', 'j', 'p', 'h', 'dispatching', 0, 0, 't', 't')`).run();
+    old.handle.prepare(`INSERT INTO request_closeouts
+      (closeout_id, job_id, request_id, generation, payload_hash, job_status, intent_seq, state, superseded_reason, requested_by, created_at, updated_at)
+      VALUES ('c-old', 'j', 'req', 1, 'h', 'parked', 1, 'superseded', 'job-status', 'gru', 't', 't')`).run();
+    expect(old.handle.prepare('PRAGMA table_info(request_closeouts)').all().map((row) => row['name'])).not.toContain('mode');
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    expect(upgraded.handle.prepare('SELECT id, name FROM schema_migrations WHERE id = 37').get()).toEqual({ id: 37, name: 'request-closeout-mode' });
+    // An intent written before the migration is a bin intent: the default fills it.
+    expect(upgraded.handle.prepare('SELECT closeout_id, mode FROM request_closeouts').all()).toEqual([{ closeout_id: 'c-old', mode: 'bin' }]);
+    const insert = upgraded.handle.prepare(`INSERT INTO request_closeouts
+      (closeout_id, job_id, request_id, generation, payload_hash, job_status, intent_seq, state, requested_by, created_at, updated_at, mode)
+      VALUES (?, 'j', 'req', ?, 'h', 'parked', 1, 'open', 'gru', 't', 't', ?)`);
+    // The mode is a closed vocabulary; a row without one is a bin intent.
+    expect(() => insert.run('c-bogus', 2, 'unpark')).toThrow(/CHECK constraint/u);
+    insert.run('c-keep', 2, 'keep-parked');
+    expect(new LedgerApi(upgraded.handle).getCloseout('c-keep')?.mode).toBe('keep-parked');
+    upgraded.handle.prepare("UPDATE request_closeouts SET state = 'complete' WHERE closeout_id = 'c-keep'").run();
+    upgraded.handle.prepare(`INSERT INTO request_closeouts
+      (closeout_id, job_id, request_id, generation, payload_hash, job_status, intent_seq, state, requested_by, created_at, updated_at)
+      VALUES ('c-default', 'j', 'req', 3, 'h', 'parked', 1, 'open', 'gru', 't', 't')`).run();
+    expect(upgraded.handle.prepare("SELECT mode FROM request_closeouts WHERE closeout_id = 'c-default'").get()).toEqual({ mode: 'bin' });
     expect(upgraded.handle.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     upgraded.close();
   });

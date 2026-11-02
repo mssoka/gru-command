@@ -1322,4 +1322,20 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_notifications_resolved_at ON notifications(resolved_at) WHERE resolved_at IS NOT NULL;
     `,
   },
+  {
+    // #564 (#503 P7): a closeout that leaves the job parked. The intent row
+    // now records which S3 it owes — `bin` (the #523 closeout: bin the job,
+    // close obligations `job-terminal`/`binned`) or `keep-parked` (settle only
+    // this request's recovery obligation, resolve its card, leave the hold in
+    // place). The row's `job_status` cannot stand in: a bin intent started on
+    // a parked job stores the same `parked`. Additive and defaulted, so every
+    // intent written before this migration reads as `bin`.
+    // LANDING COLLISION (same convention as migrations 10-36): renumber ONLY
+    // this never-applied migration if main lands id 37 first.
+    id: 37,
+    name: 'request-closeout-mode',
+    sql: `
+      ALTER TABLE request_closeouts ADD COLUMN mode TEXT NOT NULL DEFAULT 'bin' CHECK (mode IN ('bin','keep-parked'));
+    `,
+  },
 ];

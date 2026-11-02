@@ -1554,3 +1554,24 @@ gc-560-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test
 gc-560-static = "npm run lint && npm run typecheck && npm run build"
 gc-560-heavy = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-e2e.test.ts"
 gc-560-red = 'set -e; root="$PWD"; base=a12aaadc8f6c2e2b2750233b2063a906a28df6f6; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc560-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/interrupted-dispatch.test.ts "$d/test/interrupted-dispatch.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-560-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-560-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/interrupted-dispatch.test.ts -t "A1: blocks an initial dispatch interrupted before any minion, once, and leaves the lane alone"; a=$?; set -e; echo "gc-560-red vitest exit=$a EXPECTED-NONZERO: the base leaves the interrupted dispatch working"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-560 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-560 "$d/results.json" "interrupted initial dispatch (issue #560) A1: blocks an initial dispatch interrupted before any minion, once, and leaves the lane alone" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change base"; exit 1'
+# #564 (#503 P7) closes a canceled request's debt while the job stays parked:
+# the intent row gains a durable `mode` (migration 37), `requestBinning` gains a
+# mode with a parked-only precondition and a cross-mode refusal, `drive()`
+# branches S3 on it (`completeCloseoutKeepParked` settles this request's debt
+# `cancelled`, resolves the card, completes — no job status, no job-terminal
+# settlement, no claim), the readback carries the mode, and `POST
+# /api/silas/directives/{request}/closeout` drives it. `gc-564-focused` runs the
+# heavy closeout suite, the ledger-db/ledger-api seams, the schema pins and the
+# suite/budget pins; `gc-564-static` is the lint + typecheck + build gate;
+# `gc-564-red` overlays the FINAL test/canceled-request-closeout.test.ts on an
+# isolated `git archive` of the branch base 0e8a899b (node_modules symlinked,
+# approved RPC patch first) and runs A1 by name: the base's `requestBinning`
+# ignores the extra `mode` request and bins the job, so the `parked` assertion
+# REDs behaviourally — never by import (no new symbol is imported). The Vitest
+# JSON report is classified by tools/assert-named-red-baseline.mjs (a
+# collection/setup/import failure, or a missing/green A1 case, exits 2); the
+# vitest exit is echoed intact and the snapshot directory and ignored pointer
+# file are preserved for inspection.
+gc-564-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/canceled-request-closeout.test.ts && npx vitest run test/ledger-db.test.ts test/ledger-api.test.ts test/restart-recovery-schema.test.ts test/board-server.test.ts test/directive-retirement.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+gc-564-static = "npm run lint && npm run typecheck && npm run build"
+gc-564-red = 'set -e; root="$PWD"; base=0e8a899b25e61a123792dafc2d0a084208d540a3; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc564-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/canceled-request-closeout.test.ts "$d/test/canceled-request-closeout.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-564-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-564-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --config vitest.heavy.config.ts --reporter=json --outputFile="$d/results.json" test/canceled-request-closeout.test.ts -t "A1. a parked job: the request is retired and its debt closed, and the job stays parked with its hold in place"; a=$?; set -e; echo "gc-564-red vitest exit=$a EXPECTED-NONZERO: the base ignores the requested mode and bins the job"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-564 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-564 "$d/results.json" "canceled-request closeout — keep parked (#564) A1. a parked job: the request is retired and its debt closed, and the job stays parked with its hold in place" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change base"; exit 1'

@@ -388,6 +388,22 @@ authority: nothing new is asked of the owner, nothing is ever written
 marker, no live request, an already-binned job) takes today's path and gets
 today's response.
 
+The closeout has two modes. The binning request above is mode `bin`: its last
+step bins the job. A request-scoped `POST
+/api/silas/directives/<request>/closeout` `{"reason"}` asks for mode
+`keep-parked`: the same S1 and S2, then S3' — settle this request's recovery
+obligation, resolve its card, complete the intent, and leave the job exactly as
+parked as it was. The mode is stored on the intent
+(`request_closeouts.mode`, migration 37) because a resume replays from the row
+alone and the row's `job_status` cannot tell the two apart: a bin intent
+started on a parked job stores the same `parked`. `keep-parked` requires
+`job.status == "parked"` — the hold is the premise of the mode — and is
+otherwise refused `409 job_not_parked` before anything is written. An active
+intent of a **different** mode is never resumed: the request is refused `409
+request_closeout_mode_conflict` with `{active_mode, closeout_id}`, so a binning
+request cannot quietly complete a keep-parked intent (dropping the discard) and
+a keep-parked request cannot bin.
+
 The closeout runs the same guards `/retire` runs for that request — the
 route-level lane, supervisor-ownership and pace-queue checks, then the
 ledger's `retirementPreflight` (live ownership, completed native work, a
@@ -407,6 +423,23 @@ stays the S3 race refusal. Three durable steps, each one transaction:
    `job-terminal`/`binned`), resolves the request's
    `silas.directive-unreconciled.<request>` card (a resolve, never an Ack),
    completes the intent and appends `silas.closeout-complete`.
+
+S3' (mode `keep-parked`) writes no job status. It settles **this request's**
+recovery obligation with the same `{kind: "cancelled"}` close an owner
+abandonment uses (no active obligation means nothing to settle), then resolves
+the card, then completes the intent with a `silas.closeout-complete` payload
+that names `mode: "keep-parked"`. Settlement comes before the card because
+retirement deliberately leaves the card while a debt incarnation is active. It
+claims no completion, no no-effect and no cessation, releases no hold, and
+touches no other obligation. The one refusal left after preflight is a current
+gate duty on that debt: `settleObligation` accepts only the duty's own
+completion or a matching terminal status, so S3' stops (`409
+request_closeout_stopped`, one blocker `code: "gate_duty"` naming the duty) and
+writes nothing. That blocker is stable on purpose: a repeat and every
+deterministic pass write nothing until the duty is resolved, and resolving it
+lets the next pass finish the closeout. Binning is not an exit while the intent
+is active — a binning request is refused `request_closeout_mode_conflict`,
+which names the active mode and closeout instead of dropping the discard.
 
 It never claims a dispatch, spawns or prompts. Before S2 and before S3 the
 intent is revalidated against fixed identities: **P1** the job status is the
@@ -452,17 +485,33 @@ Responses of the closeout path (body `reason` ≤ 500 characters, optional
 - `409 request_closeout_stopped` — `{error, blockers}`: a race stopped the
   intent after S1.
 - `409 request_closeout_superseded` — `{error, superseded_reason}`.
+- `409 request_closeout_mode_conflict` — `{error, active_mode, closeout_id}`:
+  an active intent of the other mode owns the job; it is never resumed.
+- `409 job_not_parked` — `{error, detail}`: a `keep-parked` request for a job
+  that is not parked.
+
+The keep-parked route (`POST /api/silas/directives/<request>/closeout`) sits
+beside `/retire` under `silasOps` (a 503 when Silas ops are not hosted) and
+resolves the job from the request row: `404` for an unknown request, `400
+invalid_reason` by the closeout's own rule, the same `200` (the job object —
+still `parked` — plus `closeout`) and the same `409`s, plus `409
+request_closeout_not_applicable` when the job has no deferred request to close
+out. With Silas off, boot and a repeated request remain the drivers.
 
 `GET /api/silas/directives/<request>` carries
-`closeout: {path, eligible, blockers, intent}`: `path` is the job's — `closeout`
-when the job meets the eligibility rule (or an `open`/`stopped` intent keeps it
-on the closeout path, its blockers then being the step it waits on: after S2 the
-live work binning would meet, and `intent_stale` when its basis no longer holds)
-and `binning` otherwise; `eligible` is true when the path is `closeout` and the
-same evaluation finds no blockers, and `intent` is this request's latest intent
-row or null. No
+`closeout: {path, eligible, blockers, mode, intent}`: `path` is the job's —
+`closeout` when the job meets the eligibility rule (or an `open`/`stopped`
+intent keeps it on the closeout path, its blockers then being the step it waits
+on: after S2 the live work binning would meet, or the gate duty a keep-parked
+S3' refuses, and `intent_stale` when its basis no longer holds) and `binning`
+otherwise; `eligible` is true when the path is `closeout` and the same
+evaluation finds no blockers; `mode` is the current intent's mode (`bin` or
+`keep-parked`, null when the request has no intent); and `intent` is this
+request's latest intent row or null. No
 directive-recovery hold is released on the now-terminal job: a hold on a
-terminal job is already inert.
+terminal job is already inert. A keep-parked closeout leaves the parked hold
+itself in place, so a later fresh request on that job still needs the owner:
+directive authority refuses a parked job exactly as before.
 
 ### Owner abandonment (unknown custody)
 

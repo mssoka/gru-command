@@ -3875,7 +3875,7 @@ describe('canceled-request closeout readback (#523)', () => {
       (await call(h.port, 'GET', `/api/silas/directives/${encodeURIComponent(requestId)}`, undefined, TOKEN)).json as { closeout: Record<string, unknown> };
     // A live request that was never deferred: the plain binning path.
     await seededLiveRequest(h, repo, 'job-live', 'req-live');
-    expect((await readback('req-live')).closeout).toEqual({ path: 'binning', eligible: false, blockers: [], intent: null });
+    expect((await readback('req-live')).closeout).toEqual({ path: 'binning', eligible: false, blockers: [], mode: null, intent: null });
     // A deferred request: the closeout path.
     seedJob(h, 'job-rb');
     await seedLane(h, repo, 'job-rb');
@@ -3883,7 +3883,7 @@ describe('canceled-request closeout readback (#523)', () => {
     expect(h.ledger.claimDirectiveDispatch('req-rb')).toBe(true);
     const start = h.ledger.latestJobEventByRequestId('job-rb', 'silas.directive-dispatch-started', 'req-rb')!;
     h.ledger.recordDirectiveDispatchDeferral(h.ledger.directiveTurnIdentity('req-rb'), start.seq, 'a supervised producer held the lane');
-    expect((await readback('req-rb')).closeout).toEqual({ path: 'closeout', eligible: true, blockers: [], intent: null });
+    expect((await readback('req-rb')).closeout).toEqual({ path: 'closeout', eligible: true, blockers: [], mode: null, intent: null });
     supervised = ['restart retry scheduled'];
     const blocked = (await readback('req-rb')).closeout;
     expect(blocked).toMatchObject({ path: 'closeout', eligible: false, blockers: [{ code: 'live_work', detail: 'restart retry scheduled' }], intent: null });
@@ -3894,12 +3894,53 @@ describe('canceled-request closeout readback (#523)', () => {
     const done = h.closeout!.requestBinning('job-rb', { status: 'binned', by: 'gru', reason: 'canceled' });
     expect(done?.status).toBe(200);
     const after = (await readback('req-rb')).closeout;
-    expect(after).toMatchObject({ path: 'binning', eligible: false, blockers: [],
-      intent: { state: 'complete', generation: 1, requested_by: 'gru', reason: 'canceled', request_id: 'req-rb', job_id: 'job-rb' } });
+    expect(after).toMatchObject({ path: 'binning', eligible: false, blockers: [], mode: 'bin',
+      intent: { state: 'complete', generation: 1, mode: 'bin', requested_by: 'gru', reason: 'canceled', request_id: 'req-rb', job_id: 'job-rb' } });
     const retired = (await call(h.port, 'GET', '/api/silas/directives/req-rb', undefined, TOKEN)).json;
     expect(field<string>(retired, 'state')).toBe('retired');
     expect(field<string>(retired, 'retired_by')).toBe('canceled-request-closeout');
     expect(field<string>(retired, 'retire_reason')).toContain('canceled');
+  });
+
+  it('POST /api/silas/directives/{request}/closeout closes the request out and leaves the job parked (#564)', async () => {
+    const repo = makeFixtureRepo('route-keep-parked'); cleanupRepos.push(repo);
+    const h = await boot({ closeout: true });
+    seedJob(h, 'job-kp');
+    await seedLane(h, repo, 'job-kp');
+    h.ledger.beginRebriefIntent({ jobId: 'job-kp', note: 'redo the work', holder: 'silas-ops', requestId: 'req-kp' });
+    expect(h.ledger.claimDirectiveDispatch('req-kp')).toBe(true);
+    const start = h.ledger.latestJobEventByRequestId('job-kp', 'silas.directive-dispatch-started', 'req-kp')!;
+    h.ledger.recordDirectiveDispatchDeferral(h.ledger.directiveTurnIdentity('req-kp'), start.seq, 'a supervised producer held the lane');
+    const route = '/api/silas/directives/req-kp/closeout';
+    // The hold is the premise of the mode: a working job is refused and nothing is written.
+    const seq = h.ledger.latestEventSeq();
+    const notParked = await call(h.port, 'POST', route, { reason: 'discard' }, TOKEN);
+    expect(notParked.status).toBe(409);
+    expect(notParked.json).toMatchObject({ error: 'job_not_parked' });
+    expect(h.ledger.latestEventSeq()).toBe(seq);
+    expect(h.ledger.latestCloseoutForJob('job-kp')).toBeNull();
+    h.ledger.setJobStatus('job-kp', 'parked');
+    // The closeout's own rule, not a bare field throw.
+    const tooLong = await call(h.port, 'POST', route, { reason: 'x'.repeat(501) }, TOKEN);
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.json).toMatchObject({ error: 'invalid_reason' });
+    const done = await call(h.port, 'POST', route, { reason: 'discard: the heist is canceled', by: 'gru' }, TOKEN);
+    expect(done.status).toBe(200);
+    expect(done.json).toMatchObject({ id: 'job-kp', status: 'parked', closeout: { state: 'complete', generation: 1 } });
+    expect(h.ledger.getDirective('req-kp')).toMatchObject({ state: 'retired', retiredBy: 'canceled-request-closeout' });
+    expect(h.ledger.getJob('job-kp')?.status).toBe('parked');
+    expect(h.ledger.listJobEvents('job-kp').filter((event) => event.kind === 'job.status' && (event.payload as { to?: unknown }).to === 'binned')).toEqual([]);
+    // The readback names the variant; the repeat is the same member and no new event.
+    const readback = (await call(h.port, 'GET', '/api/silas/directives/req-kp', undefined, TOKEN)).json as { closeout: Record<string, unknown> };
+    expect(readback.closeout).toMatchObject({ path: 'binning', eligible: false, mode: 'keep-parked',
+      intent: { state: 'complete', generation: 1, mode: 'keep-parked', job_status: 'parked' } });
+    const settled = h.ledger.latestEventSeq();
+    const again = await call(h.port, 'POST', route, { reason: 'discard: the heist is canceled' }, TOKEN);
+    expect(again.status).toBe(200);
+    expect(again.json).toMatchObject({ closeout: { state: 'complete', generation: 1 } });
+    expect(h.ledger.latestEventSeq()).toBe(settled);
+    // An unknown request is a 404; the route only ever names a request.
+    expect((await call(h.port, 'POST', '/api/silas/directives/req-gone/closeout', { reason: 'discard' }, TOKEN)).status).toBe(404);
   });
 
   it('the readback omits the closeout member when the service is not passed to createDispatchServer', async () => {
