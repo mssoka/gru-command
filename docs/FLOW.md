@@ -487,10 +487,21 @@ verification budget.
   A repo that declares no verify command gets a loud 409 — no guessed
   command, ever.
 - **The scheduler owns concurrency.** At most `[verify] max_concurrent`
-  runs (default 1) run at once; further requests queue FIFO. A request
-  that waits past `lock_wait_timeout_ms` (default 15 min) fails LOUD: the
-  lane receives a typed `error` frame and the ledger a
-  `verification.lock-timeout` record — nothing hangs silently.
+  runs (default 1) run at once; further requests queue FIFO. A queued
+  request's wait is bounded by `lock_wait_timeout_ms` (default 15 min) as
+  a **floor** and by the bounds of the runs ahead of it (each holder's
+  `run_timeout_ms` plus its kill grace, re-derived whenever a run is
+  admitted ahead of it or its run clock starts — issue #537), so a
+  request is never failed while the work it waits for could still end.
+  Outlasting both fails LOUD: the lane receives a typed `error` frame and
+  the ledger a `verification.lock-timeout` record — nothing hangs
+  silently, and the holder is never killed. Residual (issue #537): this
+  bounds the wait, it does not shorten it — a short scope still runs only
+  once the `full` ahead of it releases (that needs priority or a reserved
+  slot), and the worker-side capture-helper wrapper's own ~590 s bound
+  lives outside this service. Either way the same-head dirty-at-spawn
+  window (a run queues at a pinned head while the worker keeps editing) is
+  recorded, never refused — only a moved head is refused.
 - **Identical submissions are single-flight, never duplicate producers**
   (issue #159). Same job + lane + scope + head + command shares ONE run:
   the duplicate stream gets an `attached` frame naming the run and then
@@ -612,7 +623,8 @@ verification budget.
   (an already-running attach has no `queued`/`started`; a terminal
   attach gets `attached` → `completed`). While the body would otherwise
   be silent —
-  a queued slot wait (up to `lock_wait_timeout_ms`), or a producer that
+  a queued slot wait (up to `lock_wait_timeout_ms`, or the longer bound of
+  the runs ahead of it), or a producer that
   has not written yet — the surface emits application-level `ping`
   frames (default every 15 s, worst-case gap 2 × cadence ≈ 30 s) so a
   streaming client's default 300 s HTTP body-idle timeout does not
@@ -1432,6 +1444,6 @@ or an outside shell to avoid waiting out the drain bound.
 # the machine's one global test budget.
 # max_concurrent = 1               # concurrent runs; further requests queue FIFO
 # worker_budget = 0                # total test workers across runs; 0 = auto (cores - 2)
-# lock_wait_timeout_ms = 900000    # queued request past this fails loud
+# lock_wait_timeout_ms = 900000    # queued request: FLOOR of its wait (a longer run ahead waits longer)
 # run_timeout_ms = 1800000         # per-run wall clock; expiry kills the process group
 ```

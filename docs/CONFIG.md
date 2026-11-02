@@ -666,8 +666,11 @@ max_concurrent = 1
 # each run (vitest pool env vars + GRU_VERIFY_*); it is not an OS CPU
 # quota and reserves no cores.
 worker_budget = 0
-# Deadline for a queued request waiting for a slot, in milliseconds;
-# 900000 = 15 minutes. Expiry fails that queued request loud without
+# Minimum wait for a queued request before it may give up, in
+# milliseconds; 900000 = 15 minutes. The wait is the LATER of this floor
+# and the bounds of the runs ahead of it (run_timeout_ms + kill grace),
+# so a request is never failed while the work it waits for could still
+# end. Expiry fails that queued request loud without
 # starting it; the current holder is not terminated.
 lock_wait_timeout_ms = 900000
 # Execution deadline after a run starts (queue wait excluded), in

@@ -35,8 +35,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *    enforced by the run wrapper's environment;
  *  - the active holder set is persisted (`<storageDir>/scheduler.json`)
  *    with the runner pid, so a restart releases holders whose pid is dead;
- *  - a queued request that waits past `lockWaitTimeoutMs` fails LOUD with
- *    a typed error + a `verification.lock-timeout` ledger record;
+ *  - a queued request's wait is bounded by `lockWaitTimeoutMs` as a FLOOR
+ *    and by the bounds of the holders ahead of it (issue #537): it fails
+ *    LOUD with a typed error + a `verification.lock-timeout` ledger record
+ *    only when it outlasts both;
  *  - each run is wall-clock bounded; expiry terminates the whole process
  *    group (shell + workers) with SIGTERM, then SIGKILL.
  *
@@ -521,6 +523,11 @@ interface ActiveSlot {
   cancellation: { readonly by: string; readonly reason: string } | null;
   /** Client request identities bound to this holder. */
   requestIds: readonly string[];
+  /** The instant this holder can no longer legitimately be running, which a
+   * queued request derives its own deadline from (issue #537): the run's wall
+   * clock plus its kill grace and drain margin once its clock starts, else the
+   * stale cap the sweep judges a clockless holder by. */
+  boundUntil: number;
 }
 
 interface Waiter {
@@ -531,6 +538,10 @@ interface Waiter {
   resolve(lease: VerificationLease): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout | null;
+  /** The absolute instant this request gives up: `lock_wait_timeout_ms` from
+   * its queue time, or the furthest bound of the slots ahead of it, whichever
+   * is later. Re-derived whenever the work ahead changes (issue #537). */
+  deadlineAt: number;
   /** Settled by grant, timeout, sink failure, or dispose — never twice. */
   settled: boolean;
 }
@@ -610,6 +621,13 @@ const CANCEL_SIGTERM_GRACE_MS = 1_000;
 const CANCEL_BOUND_MAX_MS = 4_500;
 /** Cadence of the process-group cessation probe while a cancel waits. */
 const GROUP_PROBE_INTERVAL_MS = 20;
+/** Margin a holder carries past its run clock (issue #537): the wall clock is
+ * bounded by `runTimeoutMs`, its process group is then killed (SIGTERM, then
+ * SIGKILL after `killGraceMs`), and the slot is released only once the run
+ * has drained and recorded its outcome. A queued request derives its deadline
+ * from that whole span, so the margin keeps the derived deadline strictly
+ * BEHIND the release instead of racing it by the drain's own length. */
+const DRAIN_MARGIN_MS = 5_000;
 
 function normalizeRequestId(value: string | undefined): string | null {
   if (value === undefined) return null;
@@ -1106,6 +1124,9 @@ export class VerificationScheduler {
         lastChild: null,
         cancellation: null,
         requestIds: slot.request_ids ?? [],
+        // A restored holder's clock never started in this process: its bound
+        // is the stale cap that decides its own release (issue #537).
+        boundUntil: this.boundWithoutClock(slot.granted_at),
       });
     }
     this.reconcileStale();
@@ -1213,6 +1234,7 @@ export class VerificationScheduler {
         lastChild: null,
         cancellation: null,
         requestIds: spec.requestId === undefined ? [] : [spec.requestId],
+        boundUntil: this.boundWithoutClock(lease.grantedAt),
       });
       try {
         await sink({ type: 'queued', runId, position: 0, active, limit: this.concurrencyLimit });
@@ -1239,37 +1261,10 @@ export class VerificationScheduler {
       resolve: resolveWaiter,
       reject: rejectWaiter,
       timer: null,
+      deadlineAt: this.waiterDeadline(queuedAt),
       settled: false,
     };
-    const timeoutMs = this.opts.limits.lockWaitTimeoutMs;
-    if (timeoutMs > 0) {
-      waiter.timer = setTimeout(() => {
-        if (waiter.settled) return; // granted or dropped while this timer was due
-        this.dropWaiter(waiter);
-        const waitMs = this.now() - queuedAt;
-        this.safeRecord({
-          kind: 'verification.lock-timeout',
-          jobId: spec.jobId,
-          payload: {
-            run_id: runId,
-            request_id: spec.requestId ?? null,
-            scope: spec.scope,
-            command: spec.command,
-            head: spec.head ?? null,
-            wait_ms: waitMs,
-            active: this.slots.size,
-            queued: this.waiters.length,
-          },
-        });
-        this.log('warn', 'verification lock wait timed out', {
-          run: runId,
-          job: spec.jobId,
-          wait_ms: waitMs,
-        });
-        rejectWaiter(new VerificationLockTimeoutError(waitMs, this.slots.size, this.waiters.length));
-      }, timeoutMs);
-      waiter.timer.unref?.();
-    }
+    this.armWaiter(waiter);
     this.waiters.push(waiter);
     try {
       await sink({
@@ -2232,6 +2227,86 @@ export class VerificationScheduler {
     if (index >= 0) this.waiters.splice(index, 1);
   }
 
+  /** The bound of a slot whose run clock never started — a restored holder, or
+   * a lease held without a run: the stale cap the sweep releases it at, so a
+   * queued request never outlasts work that cannot legitimately still run. */
+  private boundWithoutClock(grantedAt: number): number {
+    return grantedAt + this.staleMaxAgeMs;
+  }
+
+  /**
+   * The absolute instant a queued request gives up (issue #537): its
+   * `lockWaitTimeoutMs` floor measured from its own queue time, or the
+   * furthest bound of the slots ahead of it, whichever is later. Only the
+   * first `concurrencyLimit` slots can be released before this waiter is
+   * granted (`this.slots` is insertion-ordered and every grant goes through
+   * {@link pump}), so those are the ones its deadline must outlast.
+   */
+  private waiterDeadline(queuedAt: number): number {
+    const floor = queuedAt + this.opts.limits.lockWaitTimeoutMs;
+    let bound = 0;
+    let ahead = 0;
+    for (const slot of this.slots.values()) {
+      if (ahead >= this.concurrencyLimit) break;
+      ahead += 1;
+      if (slot.boundUntil > bound) bound = slot.boundUntil;
+    }
+    return Math.max(floor, bound);
+  }
+
+  /** Arm (or re-arm) one waiter's deadline timer. The old handle is cleared
+   * before the new one is assigned so a re-arm never leaks a live timer, the
+   * delay is the REMAINING absolute time, and the handle is always unref'd: a
+   * queue wait never keeps the process alive. */
+  private armWaiter(waiter: Waiter): void {
+    if (waiter.timer !== null) {
+      clearTimeout(waiter.timer);
+      waiter.timer = null;
+    }
+    waiter.timer = setTimeout(() => { this.expireWaiter(waiter); }, Math.max(0, waiter.deadlineAt - this.now()));
+    waiter.timer.unref?.();
+  }
+
+  /** Re-derive every still-queued request's deadline — the work ahead changed
+   * because a slot was granted or a holder's run clock started — and re-arm
+   * its timer to the remaining time (issue #537). */
+  private rearmWaiters(): void {
+    for (const waiter of this.waiters) {
+      if (waiter.settled) continue;
+      waiter.deadlineAt = this.waiterDeadline(waiter.queuedAt);
+      this.armWaiter(waiter);
+    }
+  }
+
+  /** The waiting request's deadline passed: drop it and fail it LOUD with the
+   * typed error and the `verification.lock-timeout` record. The holder is
+   * untouched — a queue wait never kills the run ahead of it. */
+  private expireWaiter(waiter: Waiter): void {
+    if (waiter.settled) return; // granted or dropped while this timer was due
+    this.dropWaiter(waiter);
+    const waitMs = this.now() - waiter.queuedAt;
+    this.safeRecord({
+      kind: 'verification.lock-timeout',
+      jobId: waiter.spec.jobId,
+      payload: {
+        run_id: waiter.runId,
+        request_id: waiter.spec.requestId ?? null,
+        scope: waiter.spec.scope,
+        command: waiter.spec.command,
+        head: waiter.spec.head ?? null,
+        wait_ms: waitMs,
+        active: this.slots.size,
+        queued: this.waiters.length,
+      },
+    });
+    this.log('warn', 'verification lock wait timed out', {
+      run: waiter.runId,
+      job: waiter.spec.jobId,
+      wait_ms: waitMs,
+    });
+    waiter.reject(new VerificationLockTimeoutError(waitMs, this.slots.size, this.waiters.length));
+  }
+
   /** Cancel ONE in-flight attempt and report its own cessation evidence.
    * A second cancel joins the run (`cancellation` is already set) instead of
    * signalling it again; it still waits for the same settlement. */
@@ -2327,8 +2402,12 @@ export class VerificationScheduler {
         lastChild: null,
         cancellation: null,
         requestIds: waiter.spec.requestId === undefined ? [] : [waiter.spec.requestId],
+        boundUntil: this.boundWithoutClock(lease.grantedAt),
       });
       waiter.resolve(lease);
+      // The fresh holder is now one of the slots the requests behind it must
+      // outlast: re-derive their deadlines once per grant (issue #537).
+      this.rearmWaiters();
     }
   }
 
@@ -2409,6 +2488,12 @@ export class VerificationScheduler {
       clockStarted = true;
       startedAt = this.now();
       queuedMs = startedAt - lease.queuedAt;
+      // The span this holder may still occupy the slot, which every queued
+      // request derives its deadline from (issue #537): the run's wall clock,
+      // the kill grace that ends its process group, and the drain margin the
+      // release needs after that.
+      slot.boundUntil = startedAt + this.opts.limits.runTimeoutMs + this.killGraceMs + DRAIN_MARGIN_MS;
+      this.rearmWaiters();
       // ONE unchanged wall-clock bound includes reuse output, without
       // manufacturing a physical started receipt before any child exists.
       timeoutTimer = setTimeout(() => {

@@ -592,9 +592,16 @@ describe('POST /api/verify', () => {
   });
 
   it('surfaces a lock-wait timeout as a loud error frame plus a ledger record', async () => {
-    const harness = await boot({ lockWaitTimeoutMs: 150, maxConcurrent: 1 });
+    // Issue #537: a queued request's deadline is the later of the floor and the
+    // bounds of the holders ahead, so a healthy holder is always released
+    // first. The case that still fails LOUD is a holder STUCK past its own
+    // bound: the injected clock jumps past the `slow` run's wall clock, kill
+    // grace and drain margin, leaving the 150 ms floor as the deadline.
+    let clock = Date.now();
+    const harness = await boot({ lockWaitTimeoutMs: 150, maxConcurrent: 1, now: () => clock });
     const first = call(harness.port, { job_id: harness.jobId, scope: 'slow' });
     await waitFor(() => harness.ledger.latestJobEvent(harness.jobId, 'verification.started') !== null);
+    clock += 60_000; // far past run_timeout_ms (20 s) + kill grace + drain margin
     const second = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
     expect(second.status).toBe(200);
     const error = second.frames.find((frame) => frame.type === 'error');
