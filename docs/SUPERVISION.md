@@ -380,6 +380,45 @@ replays, so the disposition **closes the stop** instead of re-arming it:
 - Any other fence (an active park, a hold, a live producer, a live handle or
   restart, an unreadable authority) still refuses with the debt retained.
 
+**Jobless stops close without a restart (#561, #503 P4).** A stopped breaker
+whose agent has NO job can never take the superseded closure above (that
+needs a captured job authority) and a re-arm would spawn a replacement that
+has no lane and no directive authority. Such a stop is CLOSED instead, by
+naming the action on the same disposition:
+
+```
+POST /api/notifications/:id/disposition
+{"detail": "closed: the stop has no lane to resume", "action": "close-stop"}
+```
+
+- No restart, no completion, no cessation. A `supervision.stop-closed` event
+  records the closure: `notification_id`, `by` (who disposed the alert,
+  `gru`), `reason` (string) and `claims` (`none: no completion, no no-effect,
+  no cessation`). The event carries no job (`job_id` is NULL) and is the
+  durable record a retried disposition is answered from.
+- The stop is retired in-process and durably alike — its record, its
+  backoff/retry/admission waits and its restore maps — so the lane no longer
+  reads as stopped and a restart never re-hydrates the stop or re-raises its
+  alert. Every retirement step runs (a failing one is logged as an error) and
+  the ledger records the closure at most once per alert, atomically.
+- The response says `rearm: closed`; a retry answers `closed` again from the
+  durable event (a restart included). A retried disposition on an
+  already-RESOLVED row is instead the ordinary idempotent record
+  (`rearm: not_applicable`): the guarded hook is only consulted for
+  unresolved rows.
+- Refusals, with the alert left open and its debt retained: an open provider
+  recovery still owns the stop (`an open provider recovery owns this stop`),
+  the agent still holds a live handle or is restarting, and a JOB-BOUND stop
+  keeps its own re-arm path (`a job-bound stop keeps its own re-arm path`).
+  An action with nothing bound is refused by name (`no stopped breaker is
+  bound to this alert`), never answered as a bare record; a failed write
+  refuses and changes nothing.
+- The action is action-required-only: on a `needs-owner` row it is a `400`.
+  Every other value — including an empty one — is `400 invalid_action`, so a
+  malformed action can never silently re-arm. On a supervisor that is off
+  the disposition is a pure record (`rearm: not_applicable`) and no closure
+  is recorded.
+
 **Watchdog config** (`[supervision]` in `config.toml`):
 
 | Key | Default | Meaning |

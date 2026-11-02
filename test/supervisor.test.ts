@@ -7907,6 +7907,298 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       rig.close();
     }
   });
+
+  /** A JOBLESS stopped breaker as a DURABLE stop the supervisor hydrates but
+   * never adopts (the #503 P4 case: a re-arm can only loop on the unadopted
+   * refusal, and the #385 closure needs a job). The open alert is posted
+   * BEFORE start() so the hydration's open-control fallback binds it. */
+  function restoredJoblessStop(agentId: string): {
+    readonly api: LedgerApi;
+    readonly center: NotificationCenter;
+    readonly registry: FakeRegistry;
+    readonly supervisor: Supervisor;
+    readonly stop: NotificationRecord;
+    readonly close: () => void;
+  } {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const registry = new FakeRegistry();
+    api.registerAgent({ id: agentId, role: 'minion' });
+    api.appendCustomEvent({ kind: 'supervision.breaker', agentId, payload: { reason: 'crash loop', restarts: 2 } });
+    const stop = center.post({
+      kind: 'supervision.breaker',
+      routing: 'action-required',
+      severity: 'error',
+      title: `Crash-loop breaker tripped: agent ${agentId} stopped`,
+      detail: 'breaker open',
+      agentId,
+    });
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 1, restartBackoffMs: 1 },
+      registry,
+      ledger: api,
+      notifications: center,
+      tickMs: 5,
+    });
+    supervisor.start();
+    return { api, center, registry, supervisor, stop, close: () => { supervisor.dispose(); db.close(); } };
+  }
+
+  /** The parts of a closed stop's record the #385 cleanup list cancels, plus
+   * the guard fields the close refuses on. */
+  function adoptedJoblessStop(agentId: string): {
+    readonly rig: Harness;
+    readonly record: RetirableRecord & {
+      handle: FakeHandle | null;
+      inRestart: boolean;
+      pendingRearmFenceAlert: { reason: string } | null;
+    };
+    readonly stop: NotificationRecord;
+  } {
+    const rig = boot(undefined, { restartBackoffMs: 1_000 });
+    rig.api.registerAgent({ id: agentId, role: 'minion' });
+    rig.registry.adopt(new FakeHandle('minion', agentId, null));
+    const internals = rig.supervisor as unknown as {
+      agents: Map<string, unknown>;
+      tripBreaker(agent: unknown): void;
+    };
+    const agent = internals.agents.get(agentId);
+    if (agent === undefined) throw new Error(`missing test agent ${agentId}`);
+    internals.tripBreaker(agent);
+    const stop = rig.api.listNotifications({ limit: 30 }).find((row) => row.kind === 'supervision.breaker');
+    if (stop === undefined) throw new Error(`breaker stop for ${agentId} was not posted`);
+    return { rig, record: agent as RetirableRecord & { handle: FakeHandle | null; inRestart: boolean; pendingRearmFenceAlert: { reason: string } | null }, stop };
+  }
+
+  const closedStops = (api: LedgerApi) => api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-closed');
+
+  it('A1 #561: a restored, unadopted jobless stop closes without a restart, and the lane stops reading as stopped', async () => {
+    const rig = restoredJoblessStop('jobless-restored-agent');
+    try {
+      // The durable stop is real and its alert is the bound control.
+      expect(rig.supervisor.viewFor('jobless-restored-agent')).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'crash loop' });
+      // An ordinary disposition cannot re-arm an unadopted stop: it looped on
+      // this refusal before the close action existed.
+      expect(rig.supervisor.onNotificationDisposed(rig.stop.id)).toEqual({
+        ok: false,
+        reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption',
+      });
+      expect(closedStops(rig.api)).toHaveLength(0);
+      expect(rig.supervisor.onNotificationDisposed(rig.stop.id, { closeStop: true })).toEqual({ ok: true, rearmed: false, closed: true });
+      await flushMicrotasks();
+      // Closed, not restarted: no spawn, no re-arm, no cessation or completion.
+      expect(rig.registry.spawnCalls).toHaveLength(0);
+      const events = rig.api.listEvents({ limit: 200 });
+      expect(events.filter((event) => event.kind === 'supervision.rearmed' || event.kind === 'supervision.restart')).toEqual([]);
+      expect(events.filter((event) => event.kind === 'supervision.breaker')).toHaveLength(1);
+      // Exactly one durable closure, with its claim line and no job.
+      const closed = closedStops(rig.api);
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.jobId).toBeNull();
+      expect(closed[0]!.agentId).toBe('jobless-restored-agent');
+      expect(closed[0]!.payload).toMatchObject({
+        notification_id: rig.stop.id,
+        by: 'gru',
+        reason: expect.stringContaining('no restart, no completion, no cessation'),
+        claims: 'none: no completion, no no-effect, no cessation',
+      });
+      expect(rig.api.hasSupervisionStopClosed(rig.stop.id)).toBe(true);
+      // The board rail reads the same truth: the stop is gone, in-process and
+      // durably alike.
+      expect(rig.supervisor.viewFor('jobless-restored-agent')).toBeNull();
+      expect(rig.api.durableSupervisionStops().has('jobless-restored-agent')).toBe(false);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('A2 #561: an adopted jobless stop closes, refuses while the agent is live or restarting, and cancels everything it owned', async () => {
+    const { rig, record, stop } = adoptedJoblessStop('jobless-adopted-agent');
+    try {
+      const live = new FakeHandle('minion', 'jobless-adopted-agent', null);
+      record.handle = live;
+      expect(rig.supervisor.onNotificationDisposed(stop.id, { closeStop: true }))
+        .toEqual({ ok: false, reason: 'the stopped agent still holds a live handle or is restarting' });
+      record.handle = null;
+      record.inRestart = true;
+      expect(rig.supervisor.onNotificationDisposed(stop.id, { closeStop: true }))
+        .toEqual({ ok: false, reason: 'the stopped agent still holds a live handle or is restarting' });
+      record.inRestart = false;
+      expect(closedStops(rig.api)).toHaveLength(0);
+      expect(rig.supervisor.viewFor('jobless-adopted-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      // Every control the stopped record could still own is armed, so the
+      // retirement provably cancels it (the same list the #385 closure runs).
+      const armed = armRetirable(record);
+      record.pendingRearmFenceAlert = { reason: 'fenced alert post failed' };
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      expect(rig.supervisor.onNotificationDisposed(stop.id, { closeStop: true })).toEqual({ ok: true, rearmed: false, closed: true });
+      armed.expectCancelled();
+      expect(record.pendingRearmFenceAlert).toBeNull();
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+      expect(closedStops(rig.api)).toHaveLength(1);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
+      // Retired: no view, no durable stop, and no late control re-post.
+      expect(rig.supervisor.viewFor('jobless-adopted-agent')).toBeNull();
+      expect(rig.api.durableSupervisionStops().has('jobless-adopted-agent')).toBe(false);
+      const alertsBefore = rig.api.listNotifications({ limit: 100 }).length;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+      expect(armed.timerFired()).toBe(false);
+      expect(rig.api.listNotifications({ limit: 100 })).toHaveLength(alertsBefore);
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+    } finally {
+      rig.dispose();
+    }
+  });
+
+  it('A3 #561: a replayed close appends nothing, answers from the ledger, and a fresh supervisor never re-hydrates the stop', () => {
+    const rig = restoredJoblessStop('jobless-replay-agent');
+    let restored: Supervisor | null = null;
+    try {
+      expect(rig.supervisor.onNotificationDisposed(rig.stop.id, { closeStop: true })).toEqual({ ok: true, rearmed: false, closed: true });
+      expect(closedStops(rig.api)).toHaveLength(1);
+      // A second close, and a plain disposition, report the same closure from
+      // the durable event — never a bare record, never a second append.
+      expect(rig.supervisor.onNotificationDisposed(rig.stop.id, { closeStop: true })).toEqual({ ok: true, rearmed: false, closed: true });
+      expect(rig.supervisor.onNotificationDisposed(rig.stop.id)).toEqual({ ok: true, rearmed: false, closed: true });
+      expect(closedStops(rig.api)).toHaveLength(1);
+      // The ledger's once-only record is atomic on its own.
+      expect(rig.api.recordSupervisionStopClosed({ agentId: 'jobless-replay-agent', notificationId: rig.stop.id, by: 'gru', reason: 'again' })).toBe(false);
+      expect(closedStops(rig.api)).toHaveLength(1);
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 1, restartBackoffMs: 1 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+      });
+      restored.start();
+      expect(restored.viewFor('jobless-replay-agent')).toBeNull();
+      expect(restored.onNotificationDisposed(rig.stop.id, { closeStop: true })).toEqual({ ok: true, rearmed: false, closed: true });
+      expect(closedStops(rig.api)).toHaveLength(1);
+      expect(rig.registry.spawnCalls).toHaveLength(0);
+    } finally {
+      restored?.dispose();
+      rig.close();
+    }
+  });
+
+  it('A4 #561: an ordinary disposition still re-arms and spawns; a job-bound stop refuses the close and keeps #385', async () => {
+    // Jobless, adopted: the ordinary disposition spawns a replacement (the
+    // behaviour the close action exists to avoid).
+    const jobless = adoptedJoblessStop('jobless-rearm-agent');
+    const bound = tripBreaker();
+    try {
+      jobless.rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'jobless-rearmed', null);
+      expect(jobless.rig.supervisor.onNotificationDisposed(jobless.stop.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(jobless.rig.supervisor.viewFor('jobless-rearmed')?.state).toBe('watching'));
+      expect(jobless.rig.registry.spawnCalls).toHaveLength(1);
+      expect(closedStops(jobless.rig.api)).toEqual([]);
+      // A job-bound stop keeps its own path: the close is refused by name and
+      // the stop survives with its control.
+      await vi.waitFor(() => expect(bound.supervisor.viewFor(bound.handle.id)?.state).toBe('stopped'));
+      const boundStop = bound.api.listNotifications({ limit: 30 }).find((row) => row.kind === 'supervision.breaker')!;
+      const refused = bound.supervisor.onNotificationDisposed(boundStop.id, { closeStop: true });
+      expect(refused).toEqual({ ok: false, reason: 'a job-bound stop keeps its own re-arm path — dispose this alert to re-arm the lane' });
+      expect(closedStops(bound.api)).toEqual([]);
+      expect(bound.supervisor.viewFor(bound.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+      // #385 keeps its precedence: a superseded stop closes as superseded even
+      // when the close action is named.
+      const stopId = await supersededStop(bound);
+      expect(bound.supervisor.onNotificationDisposed(stopId, { closeStop: true })).toEqual({ ok: true, rearmed: false, superseded: true });
+      expect(closedStops(bound.api)).toEqual([]);
+    } finally {
+      jobless.rig.dispose();
+      bound.close();
+    }
+  });
+
+  it('A4 #561: an open provider recovery still owns a jobless stop, so the close refuses and nothing is recorded', () => {
+    const { rig, stop } = adoptedJoblessStop('jobless-provider-agent');
+    try {
+      const wait = rig.api.recordProviderWait({
+        id: 'jobless-provider-wait',
+        routeKey: 'zai-coding-cn/glm-5.3@fp1',
+        provider: 'zai-coding-cn',
+        model: 'glm-5.3',
+        endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
+        credentialFingerprint: 'fp1',
+        waiterKind: 'job-minion',
+        jobId: null,
+        agentId: 'jobless-provider-agent',
+        slotId: null,
+        sessionFile: null,
+        continuation: null,
+        jobStatusAtEstablishment: null,
+        lineageKey: null,
+        incidentId: 'supervision.provider-wall.jobless-provider-agent.quota_wall',
+        incidentGeneration: 1,
+        reasonClass: 'temporary-recoverable:429',
+      });
+      expect(rig.supervisor.onNotificationDisposed(stop.id, { closeStop: true }))
+        .toEqual({ ok: false, reason: 'an open provider recovery owns this stop' });
+      expect(closedStops(rig.api)).toEqual([]);
+      expect(rig.supervisor.viewFor('jobless-provider-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(rig.api.openProviderWaitForAgent('jobless-provider-agent')?.id).toBe(wait.id);
+      expect(rig.registry.spawnCalls).toHaveLength(0);
+    } finally {
+      rig.dispose();
+    }
+  });
+
+  it('a close with no stopped breaker bound is refused by name, never a silent pure record #561', () => {
+    const h = boot();
+    try {
+      h.api.recordNotification({
+        id: 'unbound-close-alert',
+        kind: 'supervision.hang',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Already resumed lane',
+        detail: 'no stopped breaker is bound here',
+      });
+      expect(h.supervisor.onNotificationDisposed('unbound-close-alert', { closeStop: true }))
+        .toEqual({ ok: false, reason: 'no stopped breaker is bound to this alert' });
+      expect(closedStops(h.api)).toEqual([]);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a jobless-stop closure needs real ids and one agent per alert #561', () => {
+    const h = boot();
+    try {
+      expect(() => h.api.recordSupervisionStopClosed({ agentId: ' ', notificationId: 'n', by: 'gru', reason: 'r' })).toThrow('a jobless stop closure needs a non-blank agentId');
+      expect(() => h.api.recordSupervisionStopClosed({ agentId: 'a', notificationId: '', by: 'gru', reason: 'r' })).toThrow('a jobless stop closure needs a non-blank notificationId');
+      expect(() => h.api.recordSupervisionStopClosed({ agentId: 'a', notificationId: 'n', by: ' ', reason: 'r' })).toThrow('a jobless stop closure needs a non-blank by');
+      expect(() => h.api.recordSupervisionStopClosed({ agentId: 'a', notificationId: 'n', by: 'gru', reason: '' })).toThrow('a jobless stop closure needs a non-blank reason');
+      expect(closedStops(h.api)).toEqual([]);
+      // One alert closes ONE stop: a replay naming another agent conflicts.
+      expect(h.api.recordSupervisionStopClosed({ agentId: 'a', notificationId: 'once', by: 'gru', reason: 'closed' })).toBe(true);
+      expect(h.api.recordSupervisionStopClosed({ agentId: 'a', notificationId: 'once', by: 'gru', reason: 'closed' })).toBe(false);
+      expect(() => h.api.recordSupervisionStopClosed({ agentId: 'b', notificationId: 'once', by: 'gru', reason: 'closed' }))
+        .toThrow(SupervisionStopClosureConflictError);
+      expect(h.api.hasSupervisionStopClosed('once')).toBe(true);
+      expect(h.api.hasSupervisionStopClosed('never')).toBe(false);
+      // A row naming no agent (never written by this ledger) is no closure.
+      h.api.appendCustomEvent({ kind: 'supervision.stop-closed', payload: { notification_id: 'legacy' } });
+      expect(h.api.hasSupervisionStopClosed('legacy')).toBe(false);
+      expect(h.api.recordSupervisionStopClosed({ agentId: 'a', notificationId: 'legacy', by: 'gru', reason: 'closed' })).toBe(true);
+      // The agent-less row above plus the two closures: the incomplete row is
+      // an event, never a closure.
+      expect(closedStops(h.api)).toHaveLength(3);
+      expect(closedStops(h.api).filter((event) => event.agentId !== null)).toHaveLength(2);
+      // It is a supervision lifecycle event, but never a durable stop.
+      expect(h.api.latestSupervisionEvent('a')?.kind).toBe('supervision.stop-closed');
+      expect(h.api.durableSupervisionStops().has('a')).toBe(false);
+    } finally {
+      h.dispose();
+    }
+  });
 });
 
 describe('restart cleanup journal conservative replay (GH-280)', () => {
