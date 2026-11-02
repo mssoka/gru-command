@@ -8487,6 +8487,45 @@ export class LedgerApi {
     return rows.map((row) => this.jobFromRow(row));
   }
 
+  /** Issue #583: `working` jobs whose dispatch was interrupted BEFORE its
+   * lane row — the initial dispatch, or the continuation that likewise only
+   * registers its lane at the end of `createRetainedJobWorktree`. Same
+   * clauses as `listInterruptedDispatchCandidates` except the lane: the job
+   * owns NO worktree row at all (any kind, any status), so the class is
+   * disjoint from the lane-required one and a `paused` (live processes) or
+   * `swept` (retained) lane is never claimed here. ANY agent row also
+   * excludes the job — the continuation fence's own "job-owned agent"
+   * notion, which strictly shrinks the set beyond the top-level minion
+   * clause above. Bounded and cursorless for the same reason as its
+   * lane-required sibling.
+   *
+   * BOOT-ONLY. A live pass must never use this query: from the dispatch's
+   * `working` write until `beginJobAdmission` every dispatch is
+   * admission-less (`service.ts`), so a running dispatch legitimately holds
+   * this exact durable shape until its lane row lands. Only a fresh process
+   * — which holds no in-memory admission — can tell the crash from the live
+   * window, and only while one service process owns the `data_dir`. */
+  listInterruptedLaneLessDispatchCandidates(limit = 200): readonly JobRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(
+        `listInterruptedLaneLessDispatchCandidates requires a positive integer limit, got ${String(limit)}`,
+      );
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT j.* FROM jobs j
+          WHERE j.status = 'working'
+            AND EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.kind = 'job.handoff')
+            AND NOT EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.kind = 'job.minion-spawned')
+            AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.job_id = j.id AND a.role = 'minion' AND a.parentage = 'top-level')
+            AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.job_id = j.id)
+            AND NOT EXISTS (SELECT 1 FROM worktrees w WHERE w.job_id = j.id)
+          ORDER BY j.rowid LIMIT ?`,
+      )
+      .all(limit) as Row[];
+    return rows.map((row) => this.jobFromRow(row));
+  }
+
   /** Whether this job owns a live job lane (`active` only — a `paused` lane
    * was paused on live processes and a `swept` one holds none). One indexed
    * row via `idx_worktrees_job`; never `listWorktrees`, which maps the whole
@@ -8495,6 +8534,15 @@ export class LedgerApi {
     const row = this.db
       .prepare("SELECT 1 AS live FROM worktrees WHERE job_id = ? AND kind = 'job' AND status = 'active' LIMIT 1")
       .get(jobId) as Row | undefined;
+    return row !== undefined;
+  }
+
+  /** Whether this job owns ANY worktree row (`kind` and `status` ignored).
+   * The boot-only lane-less reconciler uses it to prove the interrupted
+   * dispatch never reached a lane (issue #583); the lane-required class owns
+   * every job whose lane exists. One indexed row. */
+  hasAnyJobLane(jobId: string): boolean {
+    const row = this.db.prepare('SELECT 1 AS present FROM worktrees WHERE job_id = ? LIMIT 1').get(jobId) as Row | undefined;
     return row !== undefined;
   }
 

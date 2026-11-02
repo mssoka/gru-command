@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,7 +7,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { JobStatus } from '../src/ledger/states.js';
-import { createDurableReconcileHook } from '../src/dispatch/durable-reconcile.js';
+import { createDurableReconcileHook, createProductionDeterministicPass } from '../src/dispatch/durable-reconcile.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 
 /**
@@ -120,6 +121,52 @@ async function expectSkippedByService(h: Harness, jobId: string, reason: string)
   expect(skip).toContain(reason);
   expect(h.ledger.getJob(jobId)?.status).toBe('working');
   expect(cards(h, jobId)).toHaveLength(0);
+}
+
+/** The lane-less crash shape of issue #583: the job row, the recorded
+ * handoff and the move to `working` — the process died before
+ * `registerWorktree`, so there is no lane row and no worker. Durably
+ * identical for an initial dispatch and a continuation. */
+function seedLaneLessInterruptedDispatch(h: Harness, id: string, title = `job ${id}`): string {
+  h.ledger.addJob({ id, repo: 'demo', title, briefing: 'b' });
+  h.ledger.appendCustomEvent({ kind: 'job.handoff', jobId: id, payload: { repo: 'demo', repoPath: '/tmp/demo' } });
+  h.ledger.setJobStatus(id, 'working');
+  return id;
+}
+
+/** The report shape the boot lane-less pass returns. Declared locally (not
+ * imported from the changed module) so the file still collects on the
+ * pre-change base. */
+interface LaneLessReport {
+  readonly examined: number;
+  readonly truncated: boolean;
+  readonly blocked: readonly string[];
+  readonly skipped: readonly string[];
+  readonly failed: number;
+}
+
+/** The boot pass's discriminated result: `absent` means the pre-change base
+ * has no lane-less pass at all. Tests assert `kind` and only then read the
+ * optional report, so a missing export fails by assertion — never by a
+ * TypeError from dereferencing `undefined`. */
+interface BootPassRun {
+  readonly kind: 'absent' | 'ran';
+  readonly report?: LaneLessReport;
+}
+
+/** The EXACT boot entry point main.ts wires (issue #583), reached by dynamic
+ * import: the base has no such export, so this helper returns `absent`. */
+async function runBootPass(h: Harness, opts: { readonly limit?: number } = {}): Promise<BootPassRun> {
+  const module = (await import('../src/dispatch/interrupted-dispatch.js')) as unknown as Record<string, unknown>;
+  const pass = module['reconcileInterruptedLaneLessDispatches'];
+  if (typeof pass !== 'function') return { kind: 'absent' };
+  const report = (
+    pass as (
+      deps: { readonly ledger: LedgerApi; readonly notifications: NotificationCenter },
+      options: { readonly limit?: number },
+    ) => LaneLessReport
+  )({ ledger: h.ledger, notifications: h.notifications }, opts);
+  return { kind: 'ran', report };
 }
 
 describe('interrupted initial dispatch (issue #560)', () => {
@@ -397,5 +444,344 @@ describe('interrupted initial dispatch (issue #560)', () => {
     expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
     // The deduped card was never posted twice.
     expect(cards(h, jobId)).toHaveLength(1);
+  });
+});
+
+/**
+ * Issue #583 (#503 P2): the OTHER half of the same window. A dispatch
+ * interrupted BEFORE its lane row — initial or continuation — has no
+ * candidate for the lane-required pass, and a live pass could not tell it
+ * from a dispatch still starting, so the witness is a boot-only pass. These
+ * cases drive the boot entry point through a dynamic import: the base has no
+ * such export, and B1's first assertion is ledger-level, so the pre-change
+ * base REDs by assertion, never by a TypeError.
+ */
+describe('interrupted dispatch without a lane (issue #583)', () => {
+  it('B1: a boot pass blocks a working job that crashed before its lane row', async () => {
+    const h = boot();
+    const jobId = seedLaneLessInterruptedDispatch(h, 'job-no-lane', 'Fix the lane-less thing');
+
+    const run = await runBootPass(h);
+
+    // FIRST assertion is ledger-level on purpose: against the pre-change
+    // base the row is still `working`, so this REDs as an AssertionError
+    // (`expected 'working' to be 'blocked'`) — never as a TypeError from
+    // dereferencing a pass the base does not export.
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+    expect(run.kind).toBe('ran');
+    const job = h.ledger.getJob(jobId);
+    expect(job?.note).toContain('no worker ever started');
+    // The class is the whole interrupted window: initial OR continuation.
+    expect(job?.note).toContain('initial or continuation');
+    const card = h.ledger.findNotificationByKind(`dispatch.interrupted.${jobId}`, 'any');
+    expect(card?.routing).toBe('action-required');
+    expect(card?.title).toContain('Fix the lane-less thing');
+    expect(card?.detail).toContain(jobId);
+    expect(card?.detail).toContain('never reached a lane');
+    expect(run.report?.blocked).toEqual([jobId]);
+
+    // Nothing touched the worktree table, and no worker evidence appeared.
+    expect(h.ledger.listWorktrees({ jobId })).toEqual([]);
+    expect(h.ledger.latestJobEvent(jobId, 'job.minion-spawned')).toBeNull();
+    expect(h.ledger.listEvents({ limit: 200 }).filter((event) => event.kind === 'worktree.status')).toHaveLength(0);
+
+    // A second boot adds no card, no note and no status write.
+    const eventsBefore = h.ledger.listEvents({ limit: 200 }).length;
+    const second = await runBootPass(h);
+    expect(second.report?.examined).toBe(0);
+    expect(second.report?.blocked).toEqual([]);
+    expect(h.ledger.listEvents({ limit: 200 }).length).toBe(eventsBefore);
+    expect(cards(h, jobId)).toHaveLength(1);
+  });
+
+  it('B2: the live deterministic pass never sees a lane-less dispatch (the SQL excludes it, not a guard)', () => {
+    const h = boot();
+    const jobId = seedLaneLessInterruptedDispatch(h, 'job-no-lane-live');
+    // The EXACT production deterministic pass main.ts wires for the Silas
+    // trigger: the lane-less class must not be reachable from it at all.
+    const report = createProductionDeterministicPass({
+      ledger: h.ledger,
+      notifications: h.notifications,
+      getWave: () => undefined,
+    })({ trigger: 'sweep', wakeInFlight: false }) as unknown as PassReport;
+
+    // Call-site isolation: the candidate set itself excludes the shape, so
+    // no service guard is even consulted — a live dispatch at the same
+    // durable shape is never blocked.
+    expect(report.interruptedDispatches?.examined).toBe(0);
+    expect(report.interruptedDispatches?.blocked).toEqual([]);
+    expect(h.ledger.getJob(jobId)?.status).toBe('working');
+    expect(h.ledger.getJob(jobId)?.note).toBeNull();
+    expect(cards(h, jobId)).toHaveLength(0);
+  });
+
+  it('B3: a paused or a swept lane keeps the job out of the lane-less candidate set', async () => {
+    const h = boot();
+    const paused = seedLaneLessInterruptedDispatch(h, 'job-no-lane-paused');
+    h.ledger.registerWorktree({
+      id: paused,
+      kind: 'job',
+      repoPath: '/tmp/demo',
+      repoName: 'demo',
+      path: `/tmp/demo-${paused}`,
+      sha: 'a'.repeat(40),
+      jobId: paused,
+    });
+    h.ledger.setWorktreeStatus(paused, 'paused');
+    const swept = seedLaneLessInterruptedDispatch(h, 'job-no-lane-swept');
+    h.ledger.registerWorktree({
+      id: swept,
+      kind: 'job',
+      repoPath: '/tmp/demo',
+      repoName: 'demo',
+      path: `/tmp/demo-${swept}`,
+      sha: 'a'.repeat(40),
+      jobId: swept,
+    });
+    h.ledger.setWorktreeStatus(swept, 'swept');
+
+    const run = await runBootPass(h);
+
+    // ANY worktree row excludes the job, so neither a live-process pause nor
+    // a retained sweep is ever claimed by the lane-less class.
+    expect(run.kind).toBe('ran');
+    expect(run.report?.examined).toBe(0);
+    expect(run.report?.blocked).toEqual([]);
+    for (const jobId of [paused, swept]) {
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+      expect(cards(h, jobId)).toHaveLength(0);
+    }
+  });
+
+  it('B4: a top-level minion, a spawn event or any agent row keeps the job out', async () => {
+    const h = boot();
+    const topLevel = seedLaneLessInterruptedDispatch(h, 'job-no-lane-top');
+    h.ledger.registerAgent({ id: 'agent-lane-less-top', role: 'minion', jobId: topLevel, parentage: 'top-level' });
+    const spawned = seedLaneLessInterruptedDispatch(h, 'job-no-lane-spawned');
+    h.ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: spawned, payload: {} });
+    // A child row is not a started worker, but it IS a job-owned agent: the
+    // continuation fence's own notion, which the broad agent clause excludes.
+    const child = seedLaneLessInterruptedDispatch(h, 'job-no-lane-child');
+    h.ledger.registerAgent({ id: 'agent-lane-less-child', role: 'minion', jobId: child, parentage: 'child' });
+
+    const run = await runBootPass(h);
+
+    expect(run.kind).toBe('ran');
+    expect(run.report?.examined).toBe(0);
+    expect(run.report?.blocked).toEqual([]);
+    for (const jobId of [topLevel, spawned, child]) {
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+      expect(cards(h, jobId)).toHaveLength(0);
+    }
+  });
+
+  it('B5: the service guards skip a re-brief, a provider wait, an unsettled verification and the pipeline claim', async () => {
+    const h = boot();
+    const rebrief = seedLaneLessInterruptedDispatch(h, 'job-no-lane-rebrief');
+    h.ledger.beginPendingRebrief({ jobId: rebrief, note: 'same blocker; try differently', briefing: 'the original contract' });
+    const provider = seedLaneLessInterruptedDispatch(h, 'job-no-lane-provider');
+    h.ledger.recordProviderWait({
+      id: 'wait-lane-less',
+      routeKey: 'route-lane-less',
+      provider: 'p',
+      model: 'm',
+      endpoint: 'e',
+      credentialFingerprint: 'fp',
+      waiterKind: 'job-minion',
+      jobId: provider,
+      agentId: null,
+      slotId: null,
+      sessionFile: null,
+      continuation: null,
+      jobStatusAtEstablishment: 'working',
+      lineageKey: null,
+      incidentId: 'incident-lane-less',
+      incidentGeneration: 1,
+      reasonClass: 'temporary-limit',
+    });
+    const verifying = seedLaneLessInterruptedDispatch(h, 'job-no-lane-verifying');
+    h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: verifying, payload: { run_id: 'run-lane-less' } });
+    // The pipeline claims its entry BEFORE awaiting dispatch and finalizes
+    // only after it returns, so an `admitting` entry is the boot-time fence
+    // for a pipeline-owned dispatch in exactly this window.
+    h.ledger.enqueuePipelineEntry({ id: 'job-no-lane-pipelined', repoPath: '/tmp/demo', title: 't', briefing: 'b' });
+    h.ledger.claimPipelineEntry({ id: 'job-no-lane-pipelined', holder: 'silas-pipeline' });
+    const pipelined = seedLaneLessInterruptedDispatch(h, 'job-no-lane-pipelined');
+
+    const run = await runBootPass(h);
+
+    expect(run.kind).toBe('ran');
+    expect(run.report?.examined).toBe(4);
+    expect(run.report?.blocked).toEqual([]);
+    const skipped = run.report?.skipped ?? [];
+    expect(skipped).toHaveLength(4);
+    const reasonFor = (jobId: string) => skipped.find((entry) => entry.startsWith(`${jobId}: `));
+    expect(reasonFor(rebrief)).toContain('pending re-brief that owns the lane');
+    expect(reasonFor(provider)).toContain('open provider wait');
+    expect(reasonFor(verifying)).toContain('unsettled verification run');
+    expect(reasonFor(pipelined)).toContain('the pipeline owns this dispatch');
+    for (const jobId of [rebrief, provider, verifying, pipelined]) {
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+      expect(cards(h, jobId)).toHaveLength(0);
+    }
+  });
+
+  it('B6: the pure lane-less verdict blocks the crash facts and names every single-fact exclusion', async () => {
+    const module = (await import('../src/dispatch/interrupted-dispatch.js')) as unknown as Record<string, unknown>;
+    const exported = module['interruptedDispatchWithoutLaneVerdict'];
+    expect(typeof exported, 'interruptedDispatchWithoutLaneVerdict is exported').toBe('function');
+    interface Evidence {
+      readonly status: JobStatus;
+      readonly workerStarted: boolean;
+      readonly handoff: boolean;
+      readonly laneRowPresent: boolean;
+      readonly admissions: readonly string[];
+      readonly laneOwner: string | null;
+      readonly openProviderWaits: number;
+      readonly pipelineAdmitting: boolean;
+      readonly unsettledVerification: boolean;
+    }
+    const verdictOf = exported as (evidence: Evidence) => { readonly block: boolean; readonly reason: string | null };
+    const crash: Evidence = {
+      status: 'working',
+      workerStarted: false,
+      handoff: true,
+      laneRowPresent: false,
+      admissions: [],
+      laneOwner: null,
+      openProviderWaits: 0,
+      pipelineAdmitting: false,
+      unsettledVerification: false,
+    };
+    expect(verdictOf(crash)).toEqual({ block: true, reason: null });
+
+    const flips: readonly (readonly [Partial<Evidence>, string])[] = [
+      [{ status: 'blocked' }, 'not working'],
+      [{ admissions: ['initial dispatch'] }, 'in-flight dispatch admission'],
+      [{ laneRowPresent: true }, 'a worktree row exists'],
+      [{ workerStarted: true }, 'a minion started'],
+      [{ handoff: false }, 'no job.handoff event'],
+      [{ laneOwner: 'job "x" has a live directive request' }, 'live directive request'],
+      [{ openProviderWaits: 1 }, 'open provider wait'],
+      [{ pipelineAdmitting: true }, 'the pipeline owns this dispatch'],
+      [{ unsettledVerification: true }, 'unsettled verification run'],
+    ];
+    for (const [flip, reason] of flips) {
+      const verdict = verdictOf({ ...crash, ...flip });
+      expect(verdict.block, `one flipped fact must not block: ${reason}`).toBe(false);
+      expect(verdict.reason).toContain(reason);
+    }
+  });
+
+  it('B7: a status write that throws after note and card fails once and retries with one card', async () => {
+    const h = boot();
+    const jobId = seedLaneLessInterruptedDispatch(h, 'job-no-lane-status-throw');
+    const status = vi.spyOn(h.ledger, 'setJobStatus').mockImplementation(() => {
+      throw new Error('status write lost');
+    });
+    try {
+      const run = await runBootPass(h);
+      expect(run.kind).toBe('ran');
+      expect(run.report?.failed).toBe(1);
+      expect(run.report?.blocked).toEqual([]);
+      // Note and card already landed; the row is still a candidate.
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+      expect(h.ledger.getJob(jobId)?.note).toContain('no worker ever started');
+      expect(cards(h, jobId)).toHaveLength(1);
+    } finally {
+      status.mockRestore();
+    }
+    const retried = await runBootPass(h);
+    expect(retried.report?.blocked).toEqual([jobId]);
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+    // The deduped card was never posted twice.
+    expect(cards(h, jobId)).toHaveLength(1);
+  });
+
+  it('B8: a lane row that lands between two boot passes keeps the job out for good', async () => {
+    const h = boot();
+    const jobId = seedLaneLessInterruptedDispatch(h, 'job-no-lane-later');
+    const first = await runBootPass(h);
+    expect(first.kind).toBe('ran');
+    expect(first.report?.blocked).toEqual([jobId]);
+
+    // Re-armed, and this time the dispatch reaches its lane row: the job
+    // leaves the lane-less class (the lane-required pass owns it now).
+    h.ledger.setJobStatus(jobId, 'working');
+    h.ledger.registerWorktree({
+      id: jobId,
+      kind: 'job',
+      repoPath: '/tmp/demo',
+      repoName: 'demo',
+      path: `/tmp/demo-${jobId}`,
+      sha: 'a'.repeat(40),
+      jobId,
+    });
+    const second = await runBootPass(h);
+    expect(second.kind).toBe('ran');
+    expect(second.report?.examined).toBe(0);
+    expect(second.report?.blocked).toEqual([]);
+    expect(h.ledger.getJob(jobId)?.status).toBe('working');
+    expect(cards(h, jobId)).toHaveLength(1);
+  });
+
+  it('B9: the continuation shape — an unresolved creation-continuation request, no lane — is blocked once', async () => {
+    const h = boot();
+    const jobId = 'job-no-lane-continuation';
+    // The continuation's own repo path must resolve for the request to be
+    // accepted; the job records the path's leaf as its repository.
+    const repoRoot = mkdtempSync(join(tmpdir(), 'gru-continuation-repo-'));
+    cleanupDirs.push(repoRoot);
+    const handoffRepoPath = join(repoRoot, 'demo');
+    mkdirSync(handoffRepoPath);
+    h.ledger.addJob({ id: jobId, repo: 'demo', title: 'Continue the interrupted thing', briefing: 'b' });
+    const handoff = h.ledger.appendCustomEvent({
+      kind: 'job.handoff',
+      jobId,
+      payload: { repo: 'demo', repoPath: handoffRepoPath },
+    });
+    // A continuation is accepted only against a blocked, workerless lane; it
+    // writes no second handoff and sets `working` itself.
+    h.ledger.setJobStatus(jobId, 'blocked');
+    const branch = `gru/${jobId}`;
+    const baseSha = 'a'.repeat(40);
+    const tokenSha256 = 'b'.repeat(64);
+    const settlement = h.ledger.recordCreationProducerSettlement({
+      jobId,
+      branch,
+      sha: baseSha,
+      tokenSha256,
+      pid: 4242,
+      exitCode: 0,
+      signal: null,
+    });
+    const accepted = h.ledger.acceptCreationContinuation({
+      jobId,
+      requestId: 'req-583-continuation',
+      payloadSha256: createHash('sha256').update('continuation payload').digest('hex'),
+      handoffSeq: handoff.seq,
+      briefingSha256: createHash('sha256').update('b', 'utf8').digest('hex'),
+      handoffRepoPath,
+      repoPath: realpathSync(handoffRepoPath),
+      branch,
+      baseSha,
+      baseSource: 'local-head-fallback',
+      producerSettlementSeq: settlement.seq,
+      receiptTokenSha256: tokenSha256,
+    });
+    expect(accepted.timeline.state).toBe('accepted');
+    // The continuation dispatch starts and dies before its lane row.
+    h.ledger.setJobStatus(jobId, 'working');
+
+    const run = await runBootPass(h);
+
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+    expect(run.kind).toBe('ran');
+    expect(run.report?.blocked).toEqual([jobId]);
+    expect(h.ledger.getJob(jobId)?.note).toContain('initial or continuation');
+    expect(cards(h, jobId)).toHaveLength(1);
+    // The pass never touches worktrees, and the request stays unresolved.
+    expect(h.ledger.listWorktrees({ jobId })).toEqual([]);
+    expect(h.ledger.getCreationContinuation(jobId, 'req-583-continuation')?.state).toBe('accepted');
   });
 });

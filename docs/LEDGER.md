@@ -566,15 +566,53 @@ is moved to `blocked`, with ONE `dispatch.interrupted.<jobId>`
 resolved, and a fresh interruption after a resolve posts a new one. The
 pass never dispatches, sweeps, bins or mutates a worktree.
 
-**Known limitation (follow-up).** The witness needs the job lane row. A
-crash after `working` and the handoff but before `registerWorktree`
-(including the disk-floor wait, which can be the longest part of the
-window) still leaves the job `working` with no candidate row, and nothing
-else observes it: the pipeline's own check needs an `admitting` entry and
-Silas's stall detector excludes initial dispatch by design. That half is
-a recorded gap, not a covered one; a boot-only lane-less candidate class
-is the planned follow-up (a fresh process holds no admission, so it
-cannot race a live dispatch).
+**Interrupted dispatch before the lane row (issue #583).** The witness
+above needs the job lane row. A crash after `working` and the handoff but
+before `registerWorktree` (the disk-floor wait included, and it can be the
+longest part of the window) has none, and nothing else observes it: the
+pipeline's own check needs an `admitting` entry and Silas's stall detector
+excludes initial dispatch by design.
+`reconcileInterruptedLaneLessDispatches` is the witness for that half, and
+it is **boot-only**. The class is "an interrupted dispatch that never
+reached the lane row — initial or **continuation**": a continuation writes
+no second handoff (`service.ts:835-839`), sets `working`, and registers its
+lane only at the end of `createRetainedJobWorktree`, so its crash is
+durably identical to the initial one (the in-memory admission dies with the
+process) and neither the note nor the card may narrow the class to a first
+dispatch. Candidate shape (`listInterruptedLaneLessDispatchCandidates`,
+plus the single-row `hasAnyJobLane`): the lane-required query's clauses
+except the lane — the job owns **no worktree row at all** (any kind, any
+status, so `paused`/`swept` stay out and the two classes are disjoint), and
+**no agent row of any role or parentage** (the continuation fence's own
+"job-owned agent" notion, `api.ts:2107`). The service guards are the same,
+and a survivor gets the same note → card → status order and the same
+`dispatch.interrupted.<jobId>` `action-required` card deduped `active` —
+one card per job across both halves of the window. The pass never creates,
+repairs, sweeps or rolls back a worktree.
+
+Two premises make the boot-only call safe, and both are load-bearing. It
+runs **before the HTTP listener exists**, so no `POST /api/dispatch` can be
+in flight; and **exactly one service process owns a `data_dir`**, because
+the dispatch admission is process-local (`activeJobAdmissions`,
+`api.ts:5727`) and a second process starting mid-dispatch would block that
+live dispatch. No durable pre-admission marker exists to fence this, and an
+age guard would be unsound because the floor wait can legitimately be long.
+
+The class has three named limitations. A crash inside `createJobWorktree`
+can leave a retained creation receipt, branch or locked checkout with **no
+ledger row**; the pass deliberately only owes the visible card. Ordinary
+re-creation reconciles that custody (`reconcileInterruptedCreation` adopts
+or abandons a receipt-owned orphan), but under `requireRetained` a receipt
+is a refusal (`manager.ts:3637`) and a pre-bootstrap-patch lane refuses any
+prior receipt (`manager.ts:1857-1859`), so a half-created lane **may need
+operator cleanup before a continuation is accepted**. A job parked in the
+disk-floor FIFO loses its turn on restart (the wait is in memory) and is now
+blocked rather than silently re-queued, and a pipeline-requeued orphan is
+surfaced as the card above rather than silently adopted. An unresolved
+`job.creation-continuation` request (`accepted`/`queued`) also keeps the
+continuation fence with no abandon route today (only `POST`/`GET
+/api/dispatch/creation-continuation`), so re-arming a continued job may
+need operator action.
 
 Note-first is load-bearing. The whole guard block and the write run in
 one synchronous turn (no `await` in that module), so a concurrent
