@@ -860,7 +860,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 if (outcome !== undefined && outcome.ok === false) {
                   ledger.appendCustomEvent({
                     kind: 'notification.rearm-refused',
-                    payload: { id, reason: outcome.reason ?? 'refused' },
+                    payload: { id, reason: outcome.reason ?? 'refused', ...(closeStop ? { action: 'close-stop' } : {}) },
                   });
                   json(res, 409, {
                     error: 'rearm_refused',

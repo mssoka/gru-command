@@ -7912,7 +7912,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
    * never adopts (the #503 P4 case: a re-arm can only loop on the unadopted
    * refusal, and the #385 closure needs a job). The open alert is posted
    * BEFORE start() so the hydration's open-control fallback binds it. */
-  function restoredJoblessStop(agentId: string): {
+  function restoredJoblessStop(agentId: string, options: { readonly adoptHandle?: boolean } = {}): {
     readonly api: LedgerApi;
     readonly center: NotificationCenter;
     readonly registry: FakeRegistry;
@@ -7927,6 +7927,9 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     const center = new NotificationCenter({ ledger: api, bus });
     const registry = new FakeRegistry();
     api.registerAgent({ id: agentId, role: 'minion' });
+    // Adopted BEFORE the supervisor exists: a handle with no supervised
+    // record, the state the restored close must refuse.
+    if (options.adoptHandle === true) registry.adopt(new FakeHandle('minion', agentId, null));
     api.appendCustomEvent({ kind: 'supervision.breaker', agentId, payload: { reason: 'crash loop', restarts: 2 } });
     const stop = center.post({
       kind: 'supervision.breaker',
@@ -7993,6 +7996,9 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(rig.registry.spawnCalls).toHaveLength(0);
       const events = rig.api.listEvents({ limit: 200 });
       expect(events.filter((event) => event.kind === 'supervision.rearmed' || event.kind === 'supervision.restart')).toEqual([]);
+      // No completion or cessation receipt either: the closure claims none.
+      expect(events.filter((event) =>
+        event.kind === 'job.delivered' || event.kind === 'job.status' || /completion|cessation/u.test(event.kind))).toEqual([]);
       expect(events.filter((event) => event.kind === 'supervision.breaker')).toHaveLength(1);
       // Exactly one durable closure, with its claim line and no job.
       const closed = closedStops(rig.api);
@@ -8010,6 +8016,27 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       // durably alike.
       expect(rig.supervisor.viewFor('jobless-restored-agent')).toBeNull();
       expect(rig.api.durableSupervisionStops().has('jobless-restored-agent')).toBe(false);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('A1b #561: a restored jobless stop with a live registry handle refuses the close and records nothing', async () => {
+    const rig = restoredJoblessStop('jobless-handle-restored', { adoptHandle: true });
+    try {
+      // A handle the supervisor never adopted may still be a live process, so
+      // the close must refuse exactly like the adopted live-handle path.
+      expect(rig.registry.getHandle('jobless-handle-restored')).not.toBeNull();
+      expect(rig.supervisor.viewFor('jobless-handle-restored')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(rig.supervisor.onNotificationDisposed(rig.stop.id, { closeStop: true }))
+        .toEqual({ ok: false, reason: 'the stopped agent still holds a live handle or is restarting' });
+      // Nothing was recorded or retired: no closure, the stop is still
+      // durable, and its alert is still open.
+      expect(closedStops(rig.api)).toHaveLength(0);
+      expect(rig.api.hasSupervisionStopClosed(rig.stop.id)).toBe(false);
+      expect(rig.supervisor.viewFor('jobless-handle-restored')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(rig.api.durableSupervisionStops().has('jobless-handle-restored')).toBe(true);
+      expect(rig.api.getNotification(rig.stop.id)?.resolvedAt).toBeNull();
     } finally {
       rig.close();
     }

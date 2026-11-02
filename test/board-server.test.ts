@@ -1904,6 +1904,9 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       expect(
         api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-refused'),
       ).toHaveLength(1);
+      // An ordinary re-arm refusal never claims a close action.
+      expect(api.listEvents({ limit: 100 }).find((event) => event.kind === 'notification.rearm-refused')?.payload)
+        .not.toHaveProperty('action');
       // The fence clears: the SAME control (no new alert, no new id) is
       // accepted and the row closes with the truthful re-arm outcome.
       refusal = null;
@@ -2506,6 +2509,7 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     const { port, api, notifications, close } = await boot('board-test-token', {
       onNotificationDisposition: (id, detail, action) => {
         hookCalls.push({ id, detail, action });
+        if (id === 'jobless-close-refused') return { ok: false, reason: 'the stopped agent still holds a live handle or is restarting' };
         return action === 'close-stop' ? { ok: true, rearmed: false, closed: true } : { ok: true, rearmed: true };
       },
     });
@@ -2562,6 +2566,27 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       expect(await postJson(port, '/api/notifications/ordinary-rearm/disposition', 'board-test-token', { detail: 'resume the lane' }))
         .toMatchObject({ status: 200, body: { rearm: 'accepted' } });
       expect(hookCalls.at(-1)).toEqual({ id: 'ordinary-rearm', detail: 'resume the lane', action: undefined });
+      // A refused close keeps the alert open and its ledger refusal names the
+      // action, so it is distinguishable from a refused re-arm.
+      api.recordNotification({
+        id: 'jobless-close-refused',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped: restart ladder tripped',
+        detail: 'breaker open',
+        agentId: 'jobless-close-refused-agent',
+      });
+      const refused = await postJson(port, '/api/notifications/jobless-close-refused/disposition', 'board-test-token', {
+        detail: 'close it',
+        action: 'close-stop',
+      });
+      expect(refused).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      expect(api.getNotification('jobless-close-refused')).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(hookCalls.at(-1)).toEqual({ id: 'jobless-close-refused', detail: 'close it', action: 'close-stop' });
+      const refusals = api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-refused');
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]!.payload).toMatchObject({ id: 'jobless-close-refused', action: 'close-stop' });
     } finally {
       await close();
     }

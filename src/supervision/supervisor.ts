@@ -3853,6 +3853,11 @@ export class Supervisor {
       // may retire it. Retry against the live record.
       return { kind: 'refused', reason: 'the stopped agent has a live supervision record again — retry the disposition' };
     }
+    if (this.registry.getHandle(agentId) !== null) {
+      // A handle this process never adopted still names a live process: the
+      // stop's durable truth is not enough to prove the lane is idle.
+      return { kind: 'refused', reason: LIVE_AGENT_CLOSE_REFUSAL };
+    }
     if (this.restoredStops.get(agentId)?.breakerOpen !== true) {
       return { kind: 'no_target', reason: NO_JOBLESS_STOP_CLOSE_REFUSAL };
     }
