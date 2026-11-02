@@ -16,6 +16,7 @@ import type { TranscriptService } from '../transcripts/service.js';
 import { BOARD_WS_PATH, parseBoardClientFrame, type BoardServerFrame } from './frames.js';
 import type { BoardEngine } from './engine.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
+import type { NotificationDispositionAction } from '../supervision/supervisor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -54,11 +55,15 @@ export interface BoardServerOptions {
    * consulted BEFORE any disposition is recorded. The supervisor returns a
    * typed outcome; a refusal (or a throw) leaves the alert and its
    * retryable recovery debt intact instead of consuming the only control,
-   * and `rearmed: false` honestly reports that no stopped lane matched. */
+   * and `rearmed: false` honestly reports that no stopped lane matched.
+   * `action` names an OPTIONAL disposition action (#561): the only one is
+   * `close-stop`, which closes a jobless stopped breaker's alert instead of
+   * forcing a re-arm's restart. */
   readonly onNotificationDisposition?: (
     id: string,
     detail: string,
-  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean; readonly reason?: string } | void;
+    action?: NotificationDispositionAction,
+  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean; readonly closed?: boolean; readonly reason?: string } | void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -800,6 +805,20 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               json(res, 400, { error: 'bad_request', detail: `actor "${declaredActor}" cannot produce a Gru disposition; omit actor or declare "gru"` });
               return;
             }
+            // A named disposition ACTION (#561). Present-but-empty is NEVER
+            // "omitted": optStrField maps '' → undefined, which would
+            // silently re-arm the stop the caller asked to close. The only
+            // supported action is the jobless close.
+            const closeStop = body['action'] === 'close-stop';
+            if ('action' in body && !closeStop) {
+              json(res, 400, {
+                error: 'invalid_action',
+                detail: body['action'] === ''
+                  ? 'action must not be empty when present — the only action is "close-stop"'
+                  : `action ${JSON.stringify(body['action'])} is not supported — the only action is "close-stop"`,
+              });
+              return;
+            }
             const target = ledger.getNotification(id);
             const closer = target === null ? null : producerResolvedBy(target.kind);
             if (target !== null && closer !== null) {
@@ -814,12 +833,19 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // its follow-through record; an UNDECIDED owner row is refused
             // (resolution never silences an unanswered question).
             const ownerFollowThrough = target !== null && target.routing === 'needs-owner';
+            // The #561 close action is action-required-only: it answers a
+            // machine alert, while a needs-owner row records the owner
+            // decision's follow-through and never consults the hook.
+            if (closeStop && ownerFollowThrough) {
+              json(res, 400, { error: 'invalid_action', detail: 'action "close-stop" applies to action-required machine alerts only — a needs-owner row records owner follow-through' });
+              return;
+            }
             // Machine attention: the re-arm is a GUARDED action, so the
             // supervisor's typed outcome is consulted BEFORE anything is
             // recorded. A refused or failed re-arm returns an honest
             // outcome and keeps the alert open with its retryable debt —
             // settlement is never reported before the control accepts it.
-            let rearm: 'accepted' | 'not_applicable' | 'superseded' = 'not_applicable';
+            let rearm: 'accepted' | 'not_applicable' | 'superseded' | 'closed' = 'not_applicable';
             // A disposition the ledger would refuse is refused BEFORE the
             // supervisor acts on it (#385), open or already resolved: never a
             // closed stop beside an alert left open.
@@ -830,11 +856,11 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             }
             if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
               try {
-                const outcome = onNotificationDisposition(id, detail);
+                const outcome = onNotificationDisposition(id, detail, closeStop ? 'close-stop' : undefined);
                 if (outcome !== undefined && outcome.ok === false) {
                   ledger.appendCustomEvent({
                     kind: 'notification.rearm-refused',
-                    payload: { id, reason: outcome.reason ?? 'refused' },
+                    payload: { id, reason: outcome.reason ?? 'refused', ...(closeStop ? { action: 'close-stop' } : {}) },
                   });
                   json(res, 409, {
                     error: 'rearm_refused',
@@ -847,9 +873,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 // stopped breaker matched this alert (pure record);
                 // `superseded` means the stop closed WITHOUT a restart because
                 // its captured turn was superseded (#385) — the lane needs a
-                // fresh re-brief or directive to continue.
+                // fresh re-brief or directive to continue; `closed` means the
+                // jobless stop was closed WITHOUT a restart by the named
+                // close action (#561) — no completion, no cessation.
                 if (outcome !== undefined) {
-                  rearm = outcome.superseded === true ? 'superseded' : outcome.rearmed === false ? 'not_applicable' : 'accepted';
+                  rearm = outcome.superseded === true ? 'superseded'
+                    : outcome.closed === true ? 'closed'
+                      : outcome.rearmed === false ? 'not_applicable' : 'accepted';
                 }
               } catch (error) {
                 // Bounded on code points, as the disposal reason is; recorded

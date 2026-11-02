@@ -1233,7 +1233,10 @@ After acting on an `action-required` row Gru calls the authenticated
 and UNDECIDED `needs-owner` rows (a decided owner row resolves its
 follow-through through the same route, below). Disposing an open `supervision.breaker` alert is also the
 supported re-arm control for the stopped lane (same guarded
-recovery-authority fence as the historical ack). The authenticated `/ack`
+recovery-authority fence as the historical ack). A jobless stop can instead
+be closed with `action: "close-stop"`, which records the closure without a
+restart (no completion, no cessation) and keeps the alert open when the stop
+is live or job-bound. The authenticated `/ack`
 API itself refuses machine rows, not just the web UI. Both open machine
 alerts and owner stops remain in their
 board bands regardless of newer feed traffic.

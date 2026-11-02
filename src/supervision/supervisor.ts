@@ -498,6 +498,32 @@ export interface HostAbsentTurnSettlement {
   readonly failed: readonly string[];
 }
 
+/** The typed answer a machine disposition gets from the supervisor: the
+ * guarded control accepted it (`rearmed`), it closed the stop WITHOUT a
+ * restart (#385 superseded, #561 closed), it was a pure record, or it was
+ * refused with a reason that leaves the alert and its debt intact. */
+type NotificationDispositionOutcome =
+  | { readonly ok: true; readonly rearmed: boolean; readonly superseded?: true; readonly closed?: true }
+  | { readonly ok: false; readonly reason: string };
+
+/** What a jobless-close request found and did (#561): closed, nothing bound
+ * to the alert, a stop that keeps its own job path, or a refused guard. */
+type JoblessStopClosure =
+  | { readonly kind: 'closed' }
+  | { readonly kind: 'no_target'; readonly reason: string }
+  | { readonly kind: 'job_bound'; readonly reason: string }
+  | { readonly kind: 'refused'; readonly reason: string };
+
+/** The named refusals of the #561 close action. */
+const NO_JOBLESS_STOP_CLOSE_REFUSAL = 'no stopped breaker is bound to this alert';
+const JOB_BOUND_CLOSE_REFUSAL = 'a job-bound stop keeps its own re-arm path — dispose this alert to re-arm the lane';
+const PROVIDER_WAIT_CLOSE_REFUSAL = 'an open provider recovery owns this stop';
+const LIVE_AGENT_CLOSE_REFUSAL = 'the stopped agent still holds a live handle or is restarting';
+
+/** The disposition action a caller may name (#561): the only supported one is
+ * the close of a jobless stopped breaker's alert. */
+export type NotificationDispositionAction = 'close-stop';
+
 export class Supervisor {
   private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
@@ -3654,11 +3680,14 @@ export class Supervisor {
    * same guarded route as the historical ack, never a privilege bypass.
    * Returns a typed outcome: the caller records the disposition ONLY when
    * the guarded control accepted it, so a fence refusal leaves the alert
-   * and its retryable debt intact. */
+   * and its retryable debt intact. A caller may name the `close-stop` action
+   * (#561): a stopped breaker with no job is CLOSED — retired without a
+   * restart — instead of forcing the re-arm's spawn. */
   onNotificationDisposed(
     notificationId: string,
-  ): { ok: true; rearmed: boolean; superseded?: true } | { ok: false; reason: string } {
-    return this.reArmFromNotification(notificationId);
+    options?: { readonly closeStop?: boolean },
+  ): NotificationDispositionOutcome {
+    return this.reArmFromNotification(notificationId, options);
   }
 
   /** #385 (owner decision 2026-10-15: close as superseded): a stopped lane's
@@ -3761,6 +3790,153 @@ export class Supervisor {
       job_id: closure.jobId,
       notification_id: notificationId,
     });
+  }
+
+  /** #561 (owner decision, #503 P4): a stopped breaker with NO job cannot take
+   * the #385 superseded closure (that needs a captured job authority) and a
+   * re-arm would spawn a replacement handle that has no lane and no directive
+   * authority. Gru's named `close-stop` disposition therefore CLOSES the stop
+   * instead: the alert is answered honestly, the stop is retired in-process
+   * and durably, and nothing is spawned. This is not a completion, a no-effect
+   * claim or a cessation — the payload says so — and a job-bound stop keeps
+   * its own re-arm path.
+   *
+   * The closure is recorded FIRST (a failed write throws nothing away), then
+   * the record and every control it owns are retired: each cleanup step runs
+   * whatever an earlier one did (a failure is logged as an error, never
+   * rethrown). The ledger records the closure at most once per alert. */
+  private closeJoblessBreaker(agent: SupervisedAgent, notificationId: string): JoblessStopClosure {
+    let jobId: string | null;
+    try {
+      jobId = agent.pendingRecovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
+      if (jobId !== null) return { kind: 'job_bound', reason: JOB_BOUND_CLOSE_REFUSAL };
+      if (this.ledger.openProviderWaitForAgent(agent.agentId) !== null) return { kind: 'refused', reason: PROVIDER_WAIT_CLOSE_REFUSAL };
+    } catch (error) {
+      // An unread stop is never closed: the alert keeps its control.
+      return { kind: 'refused', reason: `jobless stop closure could not be verified: ${failureText(error)}` };
+    }
+    if (agent.handle !== null || agent.inRestart) return { kind: 'refused', reason: LIVE_AGENT_CLOSE_REFUSAL };
+    let recorded: boolean;
+    try {
+      recorded = this.recordJoblessStopClosure(agent.agentId, notificationId);
+    } catch (error) {
+      // Nothing changed: the stop keeps its control and its debt.
+      return { kind: 'refused', reason: `jobless stop closure could not be recorded: ${failureText(error)}` };
+    }
+    const cleanup: readonly (readonly [string, () => void])[] = [
+      ['backoff timer', () => {
+        const timer = agent.backoffTimer;
+        agent.backoffTimer = null;
+        if (timer !== null) clearTimeout(timer);
+      }],
+      ['rate-limit retry', () => { this.clearRateLimitRetry(agent, 'superseded'); }],
+      ['recovery admission', () => { this.clearRecoveryAdmission(agent); }],
+      ['pending re-arm fence alert', () => { agent.pendingRearmFenceAlert = null; }],
+    ];
+    this.retireClosedStop(agent.agentId, cleanup);
+    this.log('info', recorded
+      ? 'jobless breaker stop closed by disposition — nothing was restarted'
+      : 'jobless breaker stop already closed — its live record is retired', {
+      agent_id: agent.agentId,
+      notification_id: notificationId,
+    });
+    return { kind: 'closed' };
+  }
+
+  /** The same closure for a RESTORED stop this process never adopted: there is
+   * no live record, so only the durable stop truth and its bound control are
+   * retired — and the durable event keeps the next hydration from restoring
+   * the stop (and re-raising its alert) again. */
+  private closeRestoredJoblessBreaker(agentId: string, notificationId: string): JoblessStopClosure {
+    if (this.agents.has(agentId)) {
+      // The record appeared since the alert was bound: only the adopted path
+      // may retire it. Retry against the live record.
+      return { kind: 'refused', reason: 'the stopped agent has a live supervision record again — retry the disposition' };
+    }
+    if (this.registry.getHandle(agentId) !== null) {
+      // A handle this process never adopted still names a live process: the
+      // stop's durable truth is not enough to prove the lane is idle.
+      return { kind: 'refused', reason: LIVE_AGENT_CLOSE_REFUSAL };
+    }
+    if (this.restoredStops.get(agentId)?.breakerOpen !== true) {
+      return { kind: 'no_target', reason: NO_JOBLESS_STOP_CLOSE_REFUSAL };
+    }
+    try {
+      if ((this.ledger.getAgent(agentId)?.jobId ?? null) !== null) return { kind: 'job_bound', reason: JOB_BOUND_CLOSE_REFUSAL };
+      if (this.ledger.openProviderWaitForAgent(agentId) !== null) return { kind: 'refused', reason: PROVIDER_WAIT_CLOSE_REFUSAL };
+    } catch (error) {
+      return { kind: 'refused', reason: `jobless stop closure could not be verified: ${failureText(error)}` };
+    }
+    let recorded: boolean;
+    try {
+      recorded = this.recordJoblessStopClosure(agentId, notificationId);
+    } catch (error) {
+      return { kind: 'refused', reason: `jobless stop closure could not be recorded: ${failureText(error)}` };
+    }
+    this.retireClosedStop(agentId, []);
+    this.log('info', recorded
+      ? 'restored jobless breaker stop closed by disposition — nothing was restarted'
+      : 'restored jobless breaker stop already closed — its control is retired', {
+      agent_id: agentId,
+      notification_id: notificationId,
+    });
+    return { kind: 'closed' };
+  }
+
+  /** Record the durable jobless closure of one alert (at most once, in the
+   * ledger). Throws when it cannot be recorded, so the caller refuses and the
+   * stop keeps its control. */
+  private recordJoblessStopClosure(agentId: string, notificationId: string): boolean {
+    return this.ledger.recordSupervisionStopClosed({
+      agentId,
+      notificationId,
+      by: 'gru',
+      reason: 'stop closed by a Gru disposition: the stop has no job, so no captured turn could replay — no restart, no completion, no cessation',
+    });
+  }
+
+  /** Retire a CLOSED stop: run its cleanup (each step in its own guard — the
+   * closure is already durable, so a failure is logged, never rethrown), then
+   * drop the live record and both restore maps whatever happened, so no tick
+   * path can re-post the alert for a closed stop. */
+  private retireClosedStop(agentId: string, cleanup: readonly (readonly [string, () => void])[]): void {
+    try {
+      for (const [step, run] of cleanup) {
+        try {
+          run();
+        } catch (error) {
+          this.log('error', 'closed stop retirement cleanup step failed — the closure stands', { agent_id: agentId, step, error: failureText(error) });
+        }
+      }
+    } finally {
+      this.agents.delete(agentId);
+      this.restoredStops.delete(agentId);
+      this.restoredRearmControls.delete(agentId);
+    }
+  }
+
+  /** The disposition answer a close decision maps to: closed = the stop was
+   * CLOSED without a restart; a refusal names why the alert stays open. */
+  private closureOutcome(closure: JoblessStopClosure, notificationId: string): NotificationDispositionOutcome {
+    if (closure.kind === 'closed') return { ok: true, rearmed: false, closed: true };
+    this.log('info', 'jobless stop closure refused — the alert stays open', {
+      notification_id: notificationId,
+      kind: closure.kind,
+      reason: closure.reason,
+    });
+    return { ok: false, reason: closure.reason };
+  }
+
+  /** The durable closure a close request with nothing bound is answered from
+   * (a retry appends nothing), or null when this alert closed no stop. A
+   * failed read refuses so the retry asks again instead of reporting a close
+   * that may not exist. */
+  private closedStopReplay(notificationId: string): { ok: true; rearmed: false; closed: true } | { ok: false; reason: string } | null {
+    try {
+      return this.ledger.hasSupervisionStopClosed(notificationId) ? { ok: true, rearmed: false, closed: true } : null;
+    } catch (error) {
+      return { ok: false, reason: `stop closure lookup failed — retry the disposition: ${failureText(error)}` };
+    }
   }
 
   /** The fences a NOTIFICATION-DRIVEN re-arm must re-prove (never a new
@@ -3982,7 +4158,8 @@ export class Supervisor {
 
   private reArmFromNotification(
     notificationId: string,
-  ): { ok: true; rearmed: boolean; superseded?: true } | { ok: false; reason: string } {
+    options?: { readonly closeStop?: boolean },
+  ): NotificationDispositionOutcome {
     // Off = acks are pure records, still labelled with a recorded closure.
     if (this.disposed || !this.cfg.enabled) return this.recordedClosureOutcome(notificationId, 'pure');
     for (const agent of this.agents.values()) {
@@ -3997,6 +4174,9 @@ export class Supervisor {
         }
         return { ok: true, rearmed: false, superseded: true };
       }
+      // #561: a stop with no job can never satisfy the #385 capture, and a
+      // re-arm would spawn. The named close action retires it instead.
+      if (options?.closeStop === true) return this.closureOutcome(this.closeJoblessBreaker(agent, notificationId), notificationId);
       const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
       if (refusal !== null) {
         this.log('info', 'breaker re-arm refused by the recovery authority fence', {
@@ -4017,6 +4197,20 @@ export class Supervisor {
       void this.completeRearm(agent, notificationId);
       return { ok: true, rearmed: true };
     }
+    // #561: a restored stop whose record this process never adopted has no
+    // live record to retire, but its durable stop and its bound control are
+    // both here — the close retires them (and the durable event keeps a
+    // restart from re-hydrating the stop).
+    if (options?.closeStop === true) {
+      const restored = [...this.restoredRearmControls.entries()]
+        .find(([, control]) => control.notificationId === notificationId);
+      if (restored !== undefined) return this.closureOutcome(this.closeRestoredJoblessBreaker(restored[0], notificationId), notificationId);
+      // A retried close answers from the durable record (a second close
+      // appends nothing); a close with nothing bound is refused by name,
+      // never answered as a bare record that silently closed nothing.
+      const replay = this.closedStopReplay(notificationId);
+      return replay ?? { ok: false, reason: NO_JOBLESS_STOP_CLOSE_REFUSAL };
+    }
     // A durable stop can outlive its runtime handle. Do not consume its only
     // retry control while the agent has not yet been adopted.
     for (const [agentId, control] of this.restoredRearmControls) {
@@ -4029,20 +4223,26 @@ export class Supervisor {
       }
     }
     // No stopped breaker is bound to this alert: the disposition is a pure
-    // record — or the retry of a stop already closed as superseded, which
-    // reports that same outcome from the durable record (restarts included).
-    // An accepted outcome never claims a re-arm that did not happen.
+    // record — or the retry of a stop already closed (as superseded or as a
+    // jobless stop), which reports that same outcome from the durable record
+    // (restarts included). An accepted outcome never claims a re-arm that did
+    // not happen.
     return this.recordedClosureOutcome(notificationId, 'refuse');
   }
 
-  /** The outcome of a disposition no live stop answers: superseded when the
-   * ledger recorded this alert's closure, else a pure record. When the
-   * lookup fails, a breaker alert (whose answer it could change) refuses so
-   * the retry asks again; any other alert — or a supervisor that is off
-   * (`onFailure: 'pure'`) — stays a pure record. */
-  private recordedClosureOutcome(notificationId: string, onFailure: 'refuse' | 'pure'): { ok: true; rearmed: false; superseded?: true } | { ok: false; reason: string } {
+  /** The outcome of a disposition no live stop answers: the closure the
+   * ledger recorded for this alert (superseded, or closed #561), else a pure
+   * record. When the lookup fails, a breaker alert (whose answer it could
+   * change) refuses so the retry asks again; any other alert — or a supervisor
+   * that is off (`onFailure: 'pure'`) — stays a pure record. */
+  private recordedClosureOutcome(notificationId: string, onFailure: 'refuse' | 'pure'): { ok: true; rearmed: false; superseded?: true; closed?: true } | { ok: false; reason: string } {
     try {
-      return this.ledger.hasSupervisionStopSuperseded(notificationId) ? { ok: true, rearmed: false, superseded: true } : { ok: true, rearmed: false };
+      if (this.ledger.hasSupervisionStopSuperseded(notificationId)) return { ok: true, rearmed: false, superseded: true };
+      // #561: a retried disposition on a closed jobless stop reports that
+      // closure too, answered from the same durable record.
+      return this.ledger.hasSupervisionStopClosed(notificationId)
+        ? { ok: true, rearmed: false, closed: true }
+        : { ok: true, rearmed: false };
     } catch (error) {
       const failure = failureText(error);
       // Whether the alert is a breaker decides whether the lost answer
