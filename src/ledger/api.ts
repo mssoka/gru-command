@@ -193,19 +193,22 @@ import {
   OWNER_APPROVAL_MAX_ATTEMPTS,
   ownerApprovalEventKind,
   ownerApprovalFingerprint,
-  selectActiveOwnerApprovalForRequest,
+  ownerApprovalProposalIdentity,
+  OWNER_APPROVAL_SUBJECT_OF_KIND,
+  selectActiveOwnerApprovalForSubject,
   selectActiveOwnerApprovalIds,
   selectEndedOwnerApprovalIdsWithOpenCard,
   selectOwnerApproval,
   selectOwnerApprovalByKey,
   selectOwnerApprovalByNotification,
   updateOwnerApproval,
-  type OwnerApprovalFences,
   type OwnerApprovalHistoryEntry,
-  type OwnerApprovalKind,
   type OwnerApprovalOutcome,
   type OwnerApprovalProposal,
+  type OwnerApprovalProposalInput,
   type OwnerApprovalRecord,
+  type OwnerApprovalSubject,
+  type RecoveryOwnerContract,
 } from './owner-approvals.js';
 
 const VERIFICATION_KIND = 'verification.completed';
@@ -220,14 +223,20 @@ export { DirectiveRetirementError } from './directives.js';
 export type { CloseoutBlocker, CloseoutIntent, CloseoutMode, CloseoutState, CloseoutSupersededReason } from './closeouts.js';
 export { CloseoutPendingError, TerminalLiveWorkError } from './closeouts.js';
 export type {
-  OwnerApprovalFences,
+  DirectiveAbandonFences,
   OwnerApprovalHistoryEntry,
   OwnerApprovalKind,
   OwnerApprovalOutcome,
   OwnerApprovalProposal,
+  OwnerApprovalProposalInput,
   OwnerApprovalRecord,
   OwnerApprovalRefusal,
   OwnerApprovalState,
+  OwnerApprovalSubject,
+  OwnerApprovalSubjectKind,
+  RebriefAbandonFences,
+  RecoveryOwnerContract,
+  RecoveryOwnerFences,
 } from './owner-approvals.js';
 export type {
   DecisionActor,
@@ -2291,11 +2300,17 @@ export class LedgerApi {
   /** The newest job event of one kind whose top-level payload `field`
    * equals `value` — answered over the job's COMPLETE record, so unrelated
    * traffic (even of the same kind) can never push it out of a window. */
-  latestJobEventByPayloadField(jobId: string, kind: string, field: string, value: string): EventRecord | null {
+  latestJobEventByPayloadField(
+    jobId: string,
+    kind: string,
+    field: string,
+    value: string,
+    opts: { sinceSeq?: number } = {},
+  ): EventRecord | null {
     if (!/^[a-z][a-z0-9_]*$/u.test(field)) throw new Error(`latestJobEventByPayloadField: "${field}" is not a plain snake_case payload field`);
     const row = this.db
-      .prepare(`SELECT * FROM events WHERE job_id = ? AND kind = ? AND json_extract(payload, ?) = ? ORDER BY seq DESC LIMIT 1`)
-      .get(jobId, kind, `$.${field}`, value) as Row | undefined;
+      .prepare(`SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq > ? AND json_extract(payload, ?) = ? ORDER BY seq DESC LIMIT 1`)
+      .get(jobId, kind, opts.sinceSeq ?? -1, `$.${field}`, value) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -10995,12 +11010,14 @@ export class LedgerApi {
   }
 
   // ------------------------------------------------------------------
-  // Owner approvals (#523)
+  // Owner approvals (#523, #565)
   //
   // Gru proposes one owner-reserved action; the owner's Approve on the
   // proposal's card makes the service carry it out. Every state change is one
   // transaction that appends an `owner-approval.<state>` event; at most one
-  // non-terminal record exists per request.
+  // non-terminal record exists per subject. The record is subject-generic:
+  // its `subject_kind` and `subject_id` name the fenced target, and the
+  // recovery kinds keep the exact contract they were read at.
   // ------------------------------------------------------------------
 
   getOwnerApproval(id: string): OwnerApprovalRecord | null {
@@ -11012,9 +11029,9 @@ export class LedgerApi {
     return selectOwnerApprovalByNotification(this.db, notificationId);
   }
 
-  /** The request's `proposed`, `approved` or `executing` record, if any. */
-  activeOwnerApprovalForRequest(requestId: string): OwnerApprovalRecord | null {
-    return selectActiveOwnerApprovalForRequest(this.db, requestId);
+  /** The subject's `proposed`, `approved` or `executing` record, if any. */
+  activeOwnerApprovalForSubject(subjectKind: OwnerApprovalSubject['kind'], subjectId: string): OwnerApprovalRecord | null {
+    return selectActiveOwnerApprovalForSubject(this.db, subjectKind, subjectId);
   }
 
   /** The id of every non-terminal record, oldest first. */
@@ -11040,43 +11057,148 @@ export class LedgerApi {
    * request's job, its state as readers name it, its payload hash and its
    * recovery-debt generation (null when it owes none). Null for an unknown
    * request. */
-  ownerApprovalFenceReadback(requestId: string): { readonly jobId: string; readonly state: string; readonly payloadHash: string; readonly debtGeneration: number | null } | null {
+  ownerApprovalDirectiveFenceReadback(requestId: string): { readonly jobId: string; readonly state: string; readonly payloadHash: string; readonly debtGeneration: number | null } | null {
     const row = this.getDirective(requestId);
     if (row === null) return null;
     return { jobId: row.jobId, state: directiveStateName(row), payloadHash: row.payloadHash,
       debtGeneration: this.recoveryObligation(row.jobId, 'directive', row.requestId)?.generation ?? null };
   }
 
-  /** Record a proposal: the replay of an idempotency key first, then the
-   * request (it exists and is live), then the one-open-record rule. Nothing
-   * is written unless a record is created. */
-  proposeOwnerApproval(input: {
-    readonly kind: OwnerApprovalKind;
-    readonly requestId: string;
+  /** The facts a re-brief marker abandonment is bound to, as they are now:
+   * the generation's job, payload hash and recovery-debt generation. Null
+   * once the marker is no longer pending (abandoned, cleared or settled). */
+  ownerApprovalRebriefFenceReadback(markerId: string): { readonly jobId: string; readonly payloadHash: string; readonly debtGeneration: number | null } | null {
+    const marker = this.listPendingRebriefs().find((row) => row.id === markerId);
+    if (marker === undefined) return null;
+    return { jobId: marker.jobId, payloadHash: marker.payloadHash,
+      debtGeneration: this.recoveryObligation(marker.jobId, 'rebrief', marker.id)?.generation ?? null };
+  }
+
+  /** The owner approval's fresh view of a recovery subject: what its own
+   * resolution identity already recorded, and whether the stored contract
+   * still holds. Never throws for an unknown or stale subject — the caller
+   * names the refusal. `refusal` is the write path's own checkpoint message
+   * (`validateRecoveryOwnerAction`), so the proposal, the revalidation before
+   * an Approve runs and the write itself judge alike. */
+  ownerApprovalRecoveryFence(input: {
+    readonly kind: RecoverySubjectKind;
+    readonly subjectId: string;
+    readonly resolutionId: string;
     readonly reason: string;
-    readonly idempotencyKey: string;
-  }): OwnerApprovalProposal {
+    readonly contract: RecoveryOwnerContract;
+  }): {
+    readonly jobId: string | null;
+    readonly resolutionEventSeq: number | null;
+    readonly confirmationEventSeq: number | null;
+    readonly resolutionFingerprint: string | null;
+    readonly refusal: string | null;
+  } {
+    let jobId: string;
+    try {
+      jobId = this.recoverySubject(input.kind, input.subjectId).jobId;
+    } catch (error) {
+      if (error instanceof RecordNotFound) return { jobId: null, resolutionEventSeq: null, confirmationEventSeq: null, resolutionFingerprint: null, refusal: null };
+      throw error;
+    }
+    const resolution = this.recoveryOwnerResolution(input.kind, input.subjectId, input.resolutionId);
+    const confirmationRow = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.recovery-owner-stop-confirmed'
+      AND json_extract(payload, '$.subject_kind') = ? AND json_extract(payload, '$.subject_id') = ?
+      AND json_extract(payload, '$.resolution_id') = ? ORDER BY seq DESC LIMIT 1`)
+      .get(input.kind, input.subjectId, input.resolutionId) as Row | undefined;
+    const resolutionFingerprintRaw = (resolution?.payload as { fingerprint?: unknown } | null)?.fingerprint;
+    let refusal: string | null = null;
+    try {
+      this.validateRecoveryOwnerAction({ ...input.contract, subjectId: input.subjectId,
+        resolutionId: input.resolutionId, reason: input.reason });
+    } catch (error) {
+      if (!(error instanceof DirectiveCheckpointError)) throw error;
+      refusal = error.message;
+    }
+    return { jobId, resolutionEventSeq: resolution?.seq ?? null, confirmationEventSeq: confirmationRow === undefined ? null : Number(confirmationRow['seq']),
+      resolutionFingerprint: typeof resolutionFingerprintRaw === 'string' ? resolutionFingerprintRaw : null, refusal };
+  }
+
+  /** The recovery subject an approval body names: its job and record subject,
+   * or why the owner cannot be asked about it. */
+  private ownerApprovalRecoveryTarget(input: Extract<OwnerApprovalProposalInput, { readonly kind: 'recovery-owner-resolution' | 'recovery-owner-stop' }>): 
+    | { readonly kind: 'resolved'; readonly subject: OwnerApprovalSubject; readonly jobId: string }
+    | { readonly kind: 'unknown_subject' }
+    | { readonly kind: 'not_live'; readonly state: string; readonly detail: string } {
+    const fence = this.ownerApprovalRecoveryFence({ kind: input.contract.kind, subjectId: input.subjectId,
+      resolutionId: input.resolutionId, reason: input.reason, contract: input.contract });
+    if (fence.jobId === null) return { kind: 'unknown_subject' };
+    if (fence.refusal !== null) return { kind: 'not_live', state: 'stale', detail: fence.refusal };
+    if (input.kind === 'recovery-owner-stop' && fence.resolutionFingerprint !== input.expectedResolutionFingerprint) {
+      return { kind: 'not_live', state: 'unruled',
+        detail: `resolution "${input.resolutionId}" has no recorded ruling with fingerprint ${input.expectedResolutionFingerprint} — record the ruling first` };
+    }
+    if (input.kind === 'recovery-owner-resolution' && fence.resolutionEventSeq !== null) {
+      return { kind: 'not_live', state: 'recorded',
+        detail: `resolution "${input.resolutionId}" is already recorded (event seq ${String(fence.resolutionEventSeq)})` };
+    }
+    return { kind: 'resolved', jobId: fence.jobId,
+      subject: { kind: 'recovery', id: input.subjectId, fences: { jobId: fence.jobId, contract: input.contract },
+        resolutionId: input.resolutionId,
+        expectedResolutionFingerprint: input.kind === 'recovery-owner-stop' ? input.expectedResolutionFingerprint : null } };
+  }
+
+  /** Record a proposal: the replay of an idempotency key first, then the
+   * subject (it exists, owes the action and its fences hold), then the
+   * one-open-record rule. Nothing is written unless a record is created. */
+  proposeOwnerApproval(input: OwnerApprovalProposalInput): OwnerApprovalProposal {
     return this.transaction((): OwnerApprovalProposal => {
-      const fingerprint = ownerApprovalFingerprint(input.kind, input.requestId, input.reason);
+      const fingerprint = ownerApprovalFingerprint(ownerApprovalProposalIdentity(input));
       const keyed = selectOwnerApprovalByKey(this.db, input.idempotencyKey);
       if (keyed !== null) return { kind: keyed.bodyFingerprint === fingerprint ? 'replayed' : 'key_conflict', approval: keyed };
-      const row = this.getDirective(input.requestId);
-      if (row === null) return { kind: 'unknown_request' };
-      if (row.state !== 'dispatching' && row.state !== 'admitted') return { kind: 'not_live', state: directiveStateName(row) };
-      const active = selectActiveOwnerApprovalForRequest(this.db, input.requestId);
+      let subject: OwnerApprovalSubject;
+      switch (input.kind) {
+        case 'directive-abandon': {
+          const row = this.getDirective(input.requestId);
+          if (row === null) return { kind: 'unknown_subject' };
+          if (row.state !== 'dispatching' && row.state !== 'admitted') return { kind: 'not_live', state: directiveStateName(row), detail: null };
+          subject = { kind: 'directive', id: row.requestId, fences: { jobId: row.jobId, state: row.state, payloadHash: row.payloadHash,
+            debtGeneration: this.recoveryObligation(row.jobId, 'directive', row.requestId)?.generation ?? null } };
+          break;
+        }
+        case 'rebrief-abandon': {
+          const marker = this.listPendingRebriefs().find((row) => row.id === input.markerId);
+          if (marker === undefined) return { kind: 'unknown_subject' };
+          subject = { kind: 'rebrief-marker', id: marker.id, fences: { jobId: marker.jobId, payloadHash: marker.payloadHash,
+            debtGeneration: this.recoveryObligation(marker.jobId, 'rebrief', marker.id)?.generation ?? null } };
+          break;
+        }
+        case 'recovery-owner-resolution':
+        case 'recovery-owner-stop': {
+          const target = this.ownerApprovalRecoveryTarget(input);
+          if (target.kind !== 'resolved') return target;
+          subject = target.subject;
+          break;
+        }
+      }
+      const active = selectActiveOwnerApprovalForSubject(this.db, OWNER_APPROVAL_SUBJECT_OF_KIND[input.kind], subject.id);
       if (active !== null) return { kind: 'pending', approval: active };
-      const fences: OwnerApprovalFences = { jobId: row.jobId, state: row.state, payloadHash: row.payloadHash,
-        debtGeneration: this.recoveryObligation(row.jobId, 'directive', row.requestId)?.generation ?? null };
       const id = `oa-${randomUUID()}`;
       const notificationId = `owner-approval:${id}`;
       const ts = nowIso();
-      insertOwnerApproval(this.db, { id, kind: input.kind, requestId: input.requestId, fences, reason: input.reason,
+      insertOwnerApproval(this.db, { id, kind: input.kind, subject, reason: input.reason,
         idempotencyKey: input.idempotencyKey, bodyFingerprint: fingerprint, notificationId, createdAt: ts, updatedAt: ts });
-      this.appendEvent({ kind: ownerApprovalEventKind('proposed'), jobId: row.jobId,
-        payload: { id, approval_kind: input.kind, request_id: input.requestId, notification_id: notificationId,
-          card_kind: OWNER_APPROVAL_CARD_KIND[input.kind], fences, detail: 'proposed by gru' } });
+      this.appendEvent({ kind: ownerApprovalEventKind('proposed'), jobId: subject.fences.jobId,
+        payload: { id, approval_kind: input.kind, subject_kind: subject.kind, subject_id: subject.id,
+          ...(subject.kind === 'directive' ? { request_id: subject.id } : {}),
+          ...(subject.kind === 'recovery' ? { resolution_id: subject.resolutionId,
+            expected_resolution_fingerprint: subject.expectedResolutionFingerprint } : {}),
+          notification_id: notificationId, card_kind: OWNER_APPROVAL_CARD_KIND[input.kind], fences: subject.fences,
+          detail: 'proposed by gru' } });
       return { kind: 'created', approval: selectOwnerApproval(this.db, id) as OwnerApprovalRecord };
     });
+  }
+
+  /** The payload every `owner-approval.*` event of a record carries: its own
+   * id, the subject it is about, and `request_id` only for the directive kind
+   * (no other subject is a directive request). */
+  private ownerApprovalEventPayload(record: OwnerApprovalRecord): Record<string, unknown> {
+    return { id: record.id, subject_kind: record.subject.kind, subject_id: record.subject.id,
+      ...(record.subject.kind === 'directive' ? { request_id: record.subject.id } : {}) };
   }
 
   private ownerApprovalOrThrow(id: string, from: readonly OwnerApprovalRecord['state'][], to: string): OwnerApprovalRecord {
@@ -11094,18 +11216,18 @@ export class LedgerApi {
       const current = this.ownerApprovalOrThrow(id, ['proposed'], 'approved');
       updateOwnerApproval(this.db, id, { state: 'approved', updatedAt: nowIso() });
       this.appendEvent({ kind: ownerApprovalEventKind('approved'), jobId: current.jobId,
-        payload: { id, request_id: current.requestId, detail } });
+        payload: { ...this.ownerApprovalEventPayload(current), detail } });
       return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
     });
   }
 
   /** The fences held: `approved` → `executing`, remembering the event's seq
-   * so an abandonment can be told apart as before or after it. */
+   * so the action's own audit can be told apart as before or after it. */
   beginOwnerApprovalExecution(id: string, detail: string): OwnerApprovalRecord {
     return this.transaction(() => {
       const current = this.ownerApprovalOrThrow(id, ['approved'], 'executing');
       const event = this.appendEvent({ kind: ownerApprovalEventKind('executing'), jobId: current.jobId,
-        payload: { id, request_id: current.requestId, detail } });
+        payload: { ...this.ownerApprovalEventPayload(current), detail } });
       updateOwnerApproval(this.db, id, { state: 'executing', executingSeq: event.seq, updatedAt: nowIso() });
       return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
     });
@@ -11118,13 +11240,13 @@ export class LedgerApi {
       const current = this.ownerApprovalOrThrow(id, OWNER_APPROVAL_ENDINGS[outcome.state], outcome.state);
       updateOwnerApproval(this.db, id, {
         state: outcome.state,
-        ...(outcome.state === 'succeeded' ? { abandonmentEventSeq: outcome.abandonmentEventSeq } : {}),
+        ...(outcome.state === 'succeeded' ? { auditEventSeq: outcome.auditEventSeq } : {}),
         ...(outcome.state === 'refused' ? { refusal: outcome.refusal } : {}),
         updatedAt: nowIso(),
       });
       this.appendEvent({ kind: ownerApprovalEventKind(outcome.state), jobId: current.jobId,
-        payload: { id, request_id: current.requestId, detail: outcome.detail,
-          ...(outcome.state === 'succeeded' ? { abandonment_event_seq: outcome.abandonmentEventSeq } : {}),
+        payload: { ...this.ownerApprovalEventPayload(current), detail: outcome.detail,
+          ...(outcome.state === 'succeeded' ? { audit_event_seq: outcome.auditEventSeq } : {}),
           ...(outcome.state === 'refused' ? { code: outcome.refusal.code, blockers: outcome.refusal.blockers } : {}) } });
       return selectOwnerApproval(this.db, id) as OwnerApprovalRecord;
     });
@@ -11139,7 +11261,7 @@ export class LedgerApi {
       const attempts = current.attempts + 1;
       updateOwnerApproval(this.db, id, { state: 'executing', attempts, updatedAt: nowIso() });
       this.appendEvent({ kind: ownerApprovalEventKind('attempt-failed'), jobId: current.jobId,
-        payload: { id, request_id: current.requestId, attempt: attempts, detail: message } });
+        payload: { ...this.ownerApprovalEventPayload(current), attempt: attempts, detail: message } });
       if (attempts >= OWNER_APPROVAL_MAX_ATTEMPTS) {
         return this.endOwnerApproval(id, { state: 'refused', refusal: { code: 'execution-error', blockers: [message] },
           detail: `Not run: execution-error after ${String(attempts)} attempts` });

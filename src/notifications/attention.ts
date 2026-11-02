@@ -70,9 +70,13 @@ export const OWNER_REQUIRED_KINDS: readonly string[] = [
   // steps GC would take to get under its budget or above the floor in FOR
   // YOU for Accept or Decline.
   'disk.reclaim-proposal',
-  // Owner approval of abandoning one directive request (#523): Gru proposes,
-  // the owner's Approve makes the server carry out the abandonment.
+  // Owner approval of an owner-reserved action (#523, #565): Gru proposes,
+  // the owner's Approve makes the server carry out the abandonment, record the
+  // recovery ruling or confirm the governing stop.
   'owner-approval.directive-abandon',
+  'owner-approval.rebrief-abandon',
+  'owner-approval.recovery-owner-resolution',
+  'owner-approval.recovery-owner-stop',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
@@ -97,7 +101,8 @@ export const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.']
  * decision attached (validated at the write boundary). */
 export const DECISION_REQUIRED_KINDS: readonly string[] = [
   'gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal', 'worktree.preserve-expiry', 'worktree.repo-mismatch',
-  'disk.reclaim-proposal', 'owner-approval.directive-abandon',
+  'disk.reclaim-proposal', 'owner-approval.directive-abandon', 'owner-approval.rebrief-abandon',
+  'owner-approval.recovery-owner-resolution', 'owner-approval.recovery-owner-stop',
 ];
 
 /** Typed owner decisions whose PRODUCER service executes the recorded
@@ -115,6 +120,9 @@ const PRODUCER_FOLLOWED_DECISION_KINDS: readonly string[] = [
   'worktree.repo-mismatch',
   'disk.reclaim-proposal',
   'owner-approval.directive-abandon',
+  'owner-approval.rebrief-abandon',
+  'owner-approval.recovery-owner-resolution',
+  'owner-approval.recovery-owner-stop',
 ];
 const PRODUCER_FOLLOWED_DECISION_PREFIXES: readonly string[] = ['worktree-sweep-paused:'];
 

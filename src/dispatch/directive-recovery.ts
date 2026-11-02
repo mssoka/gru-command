@@ -19,7 +19,7 @@
  * service.
  */
 
-import { RecordNotFound, type LedgerApi } from '../ledger/api.js';
+import { RecordNotFound, type EventRecord, type LedgerApi } from '../ledger/api.js';
 import {
   DirectiveRetirementError,
   type DIRECTIVE_RETIREMENT_CONTEXT,
@@ -27,6 +27,8 @@ import {
   type DirectiveRetirementIntent,
   type LiveDirectiveState,
 } from '../ledger/directives.js';
+import type { RecoveryOwnerActionInput } from '../ledger/recovery-owner.js';
+import { DirectiveCheckpointError } from '../runtime/directive-checkpoint.js';
 import type { PacingGate } from '../runtime/pacing.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -234,6 +236,74 @@ export function abandonPendingRebriefFromRoute(input: {
   const evidence = marker === undefined ? { lane: { unavailable: 'marker is no longer pending' }, routeBlockers: [] } : abandonmentRouteEvidence(input, marker.jobId);
   return input.ledger.abandonPendingRebrief({ markerId: input.markerId, expectedJobId: input.expected.jobId,
     expectedPayloadHash: input.expected.payloadHash, ...evidence, reason: input.reason, by: input.by });
+}
+
+/** The one sentence every owner-reserved route gives when the caller did not
+ * carry the owner's own explicit decision: the shared bearer is not verified
+ * identity, so `by` and `confirm_intent` are the whole barrier. */
+export const OWNER_CONFIRMATION_REQUIRED = 'explicit owner attribution and confirm_intent=true are required; shared bearer attribution is not verified identity';
+
+/** The decision attribution an owner-reserved action carries: the owner's
+ * exact `by` and their explicit `confirm_intent`. Read from a request body or
+ * taken from the card the owner typed on; never inferred. */
+export interface OwnerDecisionAttribution {
+  readonly by: unknown;
+  readonly confirmIntent: unknown;
+}
+
+/** Thrown when an owner-reserved route or execution carries anything but the
+ * owner's explicit confirmed decision. */
+export class OwnerDecisionRequiredError extends Error {
+  constructor() {
+    super(OWNER_CONFIRMATION_REQUIRED);
+    this.name = 'OwnerDecisionRequiredError';
+  }
+}
+
+/** Whether the attribution is the owner's explicit confirmed decision. */
+export function isOwnerDecision(attribution: OwnerDecisionAttribution): boolean {
+  return attribution.by === 'owner' && attribution.confirmIntent === true;
+}
+
+export function assertOwnerDecision(attribution: OwnerDecisionAttribution): void {
+  if (!isOwnerDecision(attribution)) throw new OwnerDecisionRequiredError();
+}
+
+/** The owner-reserved recovery action, exactly as the HTTP route evaluates
+ * it: the owner's explicit confirmed decision, the consumed-identity replay
+ * (which is ledger-only — a later HEAD cannot rewrite a recorded owner
+ * action), the original lane/HEAD freshness read for a fresh one, then the
+ * ledger transaction. The route and the owner-approval service's executor
+ * both call this, so the card's Approve feeds the same guards an owner's own
+ * request does, and nothing here is relaxed for it. `expectedResolutionFingerprint`
+ * non-null means the stop confirmation; null means the ruling. */
+export function recoveryOwnerActionFromRoute(input: {
+  readonly ledger: Pick<LedgerApi,
+    | 'recoverySubject' | 'recoveryOwnerResolution' | 'recoveryOwnerReadback'
+    | 'recordRecoveryOwnerResolution' | 'confirmRecoveryOwnerStop'>;
+  readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
+  readonly attribution: OwnerDecisionAttribution;
+  readonly action: RecoveryOwnerActionInput;
+  readonly expectedResolutionFingerprint: string | null;
+}): { readonly event: EventRecord; readonly idempotent: boolean } {
+  assertOwnerDecision(input.attribution);
+  const { action } = input;
+  const priorPermission = input.ledger.recoveryOwnerResolution(action.kind, action.subjectId, action.resolutionId);
+  const priorConfirmation = input.ledger.recoveryOwnerReadback(action.kind, action.subjectId).confirmation;
+  const confirmationIdentity = (priorConfirmation?.payload as { resolution_id?: unknown } | undefined)?.resolution_id;
+  const consumed = input.expectedResolutionFingerprint !== null
+    ? confirmationIdentity === action.resolutionId
+    : priorPermission !== null;
+  if (!consumed) {
+    const subject = input.ledger.recoverySubject(action.kind, action.subjectId);
+    const lanes = input.worktrees.listWorktrees({ jobId: subject.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+    if (lanes.length !== 1 || resolveGitCommit(lanes[0]!.path, 'HEAD') !== action.expectedHead) {
+      throw new DirectiveCheckpointError('owner action original lane/HEAD is stale or unavailable');
+    }
+  }
+  return input.expectedResolutionFingerprint !== null
+    ? input.ledger.confirmRecoveryOwnerStop(action, input.expectedResolutionFingerprint)
+    : input.ledger.recordRecoveryOwnerResolution(action);
 }
 
 /** Concrete Gru judgment. The same cessation predicates as retirement

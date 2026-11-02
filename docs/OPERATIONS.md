@@ -416,9 +416,10 @@ or automatic binning — the write itself is the ordinary status surface):
   `unproven`) nor in an active closeout: a working lane's run is that lane's
   own evidence, not the owner's to discard. A live directive or re-brief marker
   whose producer custody the service cannot establish is closed by the
-  owner's abandonment, never by binning: for a directive request Gru proposes
-  it with `POST /api/owner-approvals` and the owner's Approve on the card
-  carries it out ([Owner approval of abandonment](./DIRECTIVE-RECOVERY.md#owner-approval-of-abandonment)),
+  owner's abandonment, never by binning: for a directive request or a pending
+  re-brief marker Gru proposes it with `POST /api/owner-approvals` and the
+  owner's Approve on the card
+  carries it out ([Owner approval of owner-reserved actions](./DIRECTIVE-RECOVERY.md#owner-approval-of-owner-reserved-actions)),
   which makes the terminal call (`by: "owner"`, `confirm_intent: true`; Gru
   never calls it) on the server; it refuses while any producer is known to
   run ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#owner-abandonment-unknown-custody)). A `working` label alone is not proof of a live
