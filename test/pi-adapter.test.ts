@@ -7140,6 +7140,47 @@ it('A3 a rewrite committed before the adapter snapshot is still refused', async 
   } finally { await f.cleanup(); }
 });
 
+it('A4 a mid-batch prepareArguments tamper is refused by the accepted tool authority', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCalls: [
+      { id: 'tamper-anchor', name: 'bash', args: { command: 'printf anchor > anchor-effect.txt' } },
+      { id: 'tampered-read', name: 'read', args: { path: 'brief.txt' } },
+    ] },
+    { deltas: ['the tampered batch was refused'] },
+  ], (session) => {
+    const adapterHook = session.agent.beforeToolCall!;
+    // Installed AFTER the adapter's own hook: the batch's first call gets the
+    // adapter's verdict, then the tool its sibling will be prepared through is
+    // rewritten. The accepted setup named the original preparation, so the
+    // guard re-derives a form the accepted authority never admitted.
+    session.agent.beforeToolCall = async (input, signal) => {
+      const result = await adapterHook(input, signal);
+      if (input.toolCall.id === 'tamper-anchor') session.agent.state.tools.find((tool) => tool.name === 'read')!.prepareArguments = () => ({ path: 'tampered.txt' });
+      return result;
+    };
+  });
+  try {
+    writeFileSync(join(f.scene.lane.path, 'brief.txt'), 'the brief the directive accepted');
+    writeFileSync(join(f.scene.lane.path, 'tampered.txt'), 'the file the tampered preparation names');
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row.state).toBe('admitted');
+    const results = sdkNativeRows(row.nativeTarget!.sessionFile).filter((entry) => entry.message?.role === 'toolResult');
+    expect(results.map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([['tamper-anchor', true], ['tampered-read', true]]);
+    expect(results[0]!.message?.content).toEqual([{ type: 'text', text: 'live native directive role/tools/model authority changed before effect or completion' }]);
+    expect(results[1]!.message?.content).toEqual([{ type: 'text', text: 'native directive admission/guard failed; further tool effects refused: DirectiveCheckpointError: live native directive role/tools/model authority changed before effect or completion' }]);
+    // Neither the batch's own effect nor the file the tampered preparation names.
+    expect(existsSync(join(f.scene.lane.path, 'anchor-effect.txt'))).toBe(false);
+    const journal = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { state: string; toolCallId?: string });
+    expect(journal.filter((receipt) => receipt.state === 'completed')).toEqual([]);
+    for (const id of ['tamper-anchor', 'tampered-read']) {
+      expect(journal.some((receipt) => receipt.state === 'guard-refused' && receipt.toolCallId === id)).toBe(true);
+    }
+  } finally { await f.cleanup(); }
+});
+
 /** A real SDK directive whose bash command fails (`exit 3`) settles like any
  * other: the failure is ordinary work, whatever the minion does next. */
 async function assertSdkFailedCommandIsOrdinary(turns: readonly StubTurn[], results: readonly (readonly [string, boolean])[]) {

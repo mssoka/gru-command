@@ -1633,7 +1633,10 @@ gc-583-red = 'set -e; root="$PWD"; base=64d645c25da087eebeab974a8e497876d4780b04
 # threw `effective native tool arguments differ from the exact persisted intent`
 # on its first effect under a live directive. The guard now re-derives the form
 # the SDK hands it (`prepareArguments` -> `validateToolArguments`) and keeps
-# every other limb. `gc-571-focused` runs the edited adapter suite with the
+# every other limb; because that derivation trusts `prepareArguments`, the
+# accepted authority manifest binds each tool's `prepareArguments` too, so an
+# outer hook that rewrites it mid-batch is refused (A4). `gc-571-focused` runs
+# the edited adapter suite with the
 # registry pins and the neighbouring directive suites (the heavy files are its
 # own `--config vitest.heavy.config.ts` leg, so the fast segment stays inside
 # the fast budget; run `gc-571-static` first — one scheduled-verification case

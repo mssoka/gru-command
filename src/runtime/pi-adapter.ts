@@ -1100,6 +1100,9 @@ export class PiRuntime implements AgentRuntime {
           return createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.systemPrompt,
             toolExecution: session.agent.toolExecution,
             tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters,
+              // The guard re-derives the SDK's normal form through this function, so the
+              // accepted setup must bind it like the executor it prepares for.
+              prepareArguments: tool.prepareArguments === undefined ? null : tool.prepareArguments.toString(),
               executionMode: tool.executionMode ?? null, guarded: directiveExecutorOrigins.has(tool.execute),
               implementation: (directiveExecutorOrigins.get(tool.execute) ?? tool.execute).toString(),
               implementationRef: executableId(directiveExecutorOrigins.get(tool.execute) ?? tool.execute) })).sort((a, b) => a.name.localeCompare(b.name)),
@@ -1397,7 +1400,10 @@ export class PiAgentHandle implements AgentHandle {
         const toolFor = (name: string): SdkTool | undefined => (input.context.tools ?? []).find((candidate) => candidate.name === name);
         const expectedArguments = (call: typeof invocation): unknown => {
           const tool = toolFor(call.name);
-          if (tool === undefined) throw new DirectiveCheckpointError('native directive names a tool no longer in the live tool setup');
+          // A hook outside this one handed over a context this directive's tool
+          // setup does not name: the refusal is the authority failure it is, not
+          // a weaker lookup miss ahead of it.
+          if (tool === undefined) throw new DirectiveCheckpointError('effective native executor authority differs from its accepted tool setup');
           // The SDK hands this hook its own normal form of the persisted call
           // (agent-loop: prepareToolCallArguments -> validateToolArguments: optional
           // nulls dropped, primitives coerced). Re-derive that form; the raw model
