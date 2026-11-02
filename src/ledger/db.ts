@@ -1338,4 +1338,17 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE request_closeouts ADD COLUMN mode TEXT NOT NULL DEFAULT 'bin' CHECK (mode IN ('bin','keep-parked'));
     `,
   },
+  {
+    // #551: the briefing-review gate now runs on pipeline admission. A refused
+    // readiness check is a WAIT, not a failed attempt, so the entry keeps its
+    // accepted brief and records the exact gate refusal here
+    // (`<code>: <detail>`) instead of spending a bounded admission failure.
+    // The column is nullable: every row written before this migration (and
+    // every entry the gate admits) has no deferral.
+    // LANDING COLLISION (same convention as migrations 10-37): renumber ONLY
+    // this never-applied migration if main lands id 38 first.
+    id: 38,
+    name: 'pipeline-defer-reason',
+    sql: 'ALTER TABLE pipeline_entries ADD COLUMN defer_reason TEXT;',
+  },
 ];

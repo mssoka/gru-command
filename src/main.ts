@@ -1358,6 +1358,21 @@ async function main(): Promise<number> {
   // late — otherwise a restarted blind reviewer that reads prohibited
   // material keeps qualifying coverage.
   supervisorLive.setObserveBlindTurn(observeBlindTurn);
+  // Nefario, the pre-dispatch briefing review (GH-505): a Gru-side, zero-
+  // context review of the exact briefing before POST /api/dispatch. Lens jobs
+  // ride the normal dispatch path; the cockpit block is late-bound below.
+  // Constructed BEFORE the pipeline: admission runs the same gate, and a lazy
+  // getter would throw in the TDZ during boot reconciliation or silently
+  // fail open. Its `dispatcher` dependency is live here.
+  const briefingReview = new BriefingReviewService({
+    config: config.briefingReview,
+    ledger,
+    notifications,
+    dispatch: (input) => dispatcher.dispatch(input),
+    apiBase: () => config.server.port === 0 ? null : `http://${dialHost(config.server.host)}:${String(config.server.port)}`,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  briefingReviewBoardCounts = () => briefingReview.boardCounts();
   // The durable queue's mechanical consumer: one shared-budget-aware
   // reconsider pass over the ledger-backed pipeline, triggered by enqueue,
   // bus transitions and runtime capacity events. No timer, no second
@@ -1365,6 +1380,7 @@ async function main(): Promise<number> {
   pipeline = new PipelineService({
     ledger,
     dispatch: dispatcher,
+    briefingReview,
     capacity: () => {
       const snapshot = registry.residencySnapshot();
       return {
@@ -1798,18 +1814,6 @@ async function main(): Promise<number> {
       ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
     }, input.requestId);
   };
-  // Nefario, the pre-dispatch briefing review (GH-505): a Gru-side, zero-
-  // context review of the exact briefing before POST /api/dispatch. Lens jobs
-  // ride the normal dispatch path; the cockpit block is late-bound above.
-  const briefingReview = new BriefingReviewService({
-    config: config.briefingReview,
-    ledger,
-    notifications,
-    dispatch: (input) => dispatcher.dispatch(input),
-    apiBase: () => config.server.port === 0 ? null : `http://${dialHost(config.server.host)}:${String(config.server.port)}`,
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
-  briefingReviewBoardCounts = () => briefingReview.boardCounts();
   // Owner approvals (#523): hosted where the abandon route is hosted (Silas
   // ops), because both read the same worktrees and producer evidence. Gru
   // proposes, the owner's Approve on the card carries out the abandonment.

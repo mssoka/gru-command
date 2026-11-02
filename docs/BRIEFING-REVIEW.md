@@ -208,9 +208,21 @@ immediately, low is advisory. Set `stage = 1` (advisory), `2` (high only) or
 `3` (force high + medium) to override the tier-derived policy. Before a flip,
 in-flight reviews at the newly enforced tier are revised or pushed back.
 
-The gate guards `POST /api/dispatch` only. A heist admitted from the durable
-pipeline never passes through it, at any stage
-([PIPELINE.md](./PIPELINE.md#the-briefing-review-gate-is-not-run-on-admission)).
+The gate guards `POST /api/dispatch` and pipeline admission alike. A pipeline
+entry is dispatched with the exact reviewed briefing, title and repository and
+carries no `briefing_review` block to claim, so only automatic attach and
+readiness refusals apply: a deferred entry waits as `waiting` with its
+`briefing_review_*: …` reason and is admitted by itself when its verdict lands
+([PIPELINE.md](./PIPELINE.md#the-briefing-review-gate-runs-on-admission)).
+
+Auto-attach keys on the exact `reviewId` (`sha256(briefing \0 repoPath)`), not on
+the title: an entry carrying the reviewed briefing attaches to that review
+whatever it is titled, and a pending or CHANGES-NEEDED review still defers it.
+Only the enforced-tier chain fallback and the round cap key on
+`sha256(repoPath \0 title)`, so a *revised* briefing enqueued under a title no
+review in the chain shares sees an empty chain and is admitted with no
+provenance instead of `briefing_review_required`. The HTTP route has the same
+blind spot; the role canon carries the title obligation.
 
 ## Lens sessions
 

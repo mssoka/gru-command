@@ -26,6 +26,8 @@ function assertShape(db: LedgerDb): void {
   expect(columns).toEqual(expect.arrayContaining(['request_kind', 'source_context', 'authority_epoch', 'contract_snapshot',
     'contract_sha256', 'dispatch_started_at', 'native_target', 'native_binding', 'recovery_checkpoint', 'recovery_decision']));
   const objects = db.handle.prepare("SELECT name FROM sqlite_schema WHERE type IN ('table','index')").all().map((row) => row['name']);
+  const pipelineColumns = db.handle.prepare('PRAGMA table_info(pipeline_entries)').all().map((row) => row['name']);
+  expect(pipelineColumns).toEqual(expect.arrayContaining(['defer_reason']));
   expect(objects).toEqual(expect.arrayContaining(['gru_mailbox', 'intake_reviews', 'intake_review_heads', 'intake_one_approval',
     'idx_intake_reviews_scope', 'idx_pipeline_enqueued_entry', 'rebrief_recovery_decisions', 'directive_recovery_generation',
     'rebrief_recovery_generation', 'recovery_owner_resolution_identity', 'recovery_owner_confirmation_identity',
@@ -38,8 +40,8 @@ function assertShape(db: LedgerDb): void {
 
 describe('GH286 approved integration schema', () => {
   it('preserves every landed migration and the exact original native SQL with unique contiguous ids through28', () => {
-    expect(MIGRATIONS.map(({ id }) => id)).toEqual(Array.from({ length: 37 }, (_, index) => index + 1));
-    expect(new Set(MIGRATIONS.map(({ id }) => id)).size).toBe(37);
+    expect(MIGRATIONS.map(({ id }) => id)).toEqual(Array.from({ length: 38 }, (_, index) => index + 1));
+    expect(new Set(MIGRATIONS.map(({ id }) => id)).size).toBe(38);
     expect(hash(JSON.stringify(MIGRATIONS.slice(0, 27)))).toBe('3771e4175b5a3080bdff216886e4cc00722083af185eddec184f15f5281400d2');
     expect(MIGRATIONS[27]).toMatchObject({ id: 28, name: 'directive-native-progress' });
     expect(MIGRATIONS[28]).toMatchObject({ id: 29, name: 'notification-owner-decisions' });
@@ -51,6 +53,7 @@ describe('GH286 approved integration schema', () => {
     expect(MIGRATIONS[34]).toMatchObject({ id: 35, name: 'owner-approvals' });
     expect(MIGRATIONS[35]).toMatchObject({ id: 36, name: 'notification-resolution-detail' });
     expect(MIGRATIONS[36]).toMatchObject({ id: 37, name: 'request-closeout-mode' });
+    expect(MIGRATIONS[37]).toMatchObject({ id: 38, name: 'pipeline-defer-reason' });
     // A landed table rebuild is immutable: its exact SQL is pinned (#464).
     expect(hash(MIGRATIONS[29]!.sql)).toBe('c565137621d2940683321d684c746a2a5fef27690f15340c38248f3378e9d1c8');
     expect(hash(MIGRATIONS[30]!.sql)).toBe('2a8faa5918ef35a11fecee2464363f39eb2471059352536670ad66cb0ff4b9de');

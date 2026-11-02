@@ -148,6 +148,33 @@ describe('pipeline HTTP surface', () => {
     expect((await api(h, 'GET', '/api/pipeline/entries/pipe-ghost')).status).toBe(404);
   });
 
+  it('reports a briefing-review deferral as the live wait reason (#551)', async () => {
+    const h = await boot({ available: 0 });
+    await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
+    await h.service.whenIdle();
+    h.ledger.claimPipelineEntry({ id: 'pipe-http-a', holder: 'test' });
+    h.ledger.releasePipelineClaim({
+      id: 'pipe-http-a',
+      reason: 'review pending',
+      outcome: 'deferred',
+      deferReason: 'briefing_review_pending: review r1 has no verdict yet',
+    });
+    const list = await api(h, 'GET', '/api/pipeline');
+    expect((list.body.entries as Record<string, unknown>[])[0]).toMatchObject({
+      id: 'pipe-http-a',
+      state: 'waiting',
+      reason: 'briefing_review_pending: review r1 has no verdict yet',
+    });
+    const entry = await api(h, 'GET', '/api/pipeline/entries/pipe-http-a');
+    expect(entry.body).toMatchObject({
+      live_state: 'waiting',
+      live_reason: 'briefing_review_pending: review r1 has no verdict yet',
+    });
+    expect((entry.body.entry as Record<string, unknown>).deferReason).toBe(
+      'briefing_review_pending: review r1 has no verdict yet',
+    );
+  });
+
   it('holds, releases and cancels through explicit authenticated mutations', async () => {
     const h = await boot({ available: 0 });
     await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
@@ -409,6 +436,12 @@ describe('pipeline production wiring contract', () => {
     const { readFileSync } = await import('node:fs');
     const main = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf-8');
     expect(main).toContain('new PipelineService({');
+    // The admission gate is the SAME BriefingReviewService the HTTP route
+    // uses, and it is constructed first: a lazy getter would throw in the TDZ
+    // during boot reconciliation or silently fail open (#551).
+    expect(main).toContain('new BriefingReviewService({');
+    expect(main.indexOf('new BriefingReviewService')).toBeLessThan(main.indexOf('new PipelineService'));
+    expect(main).toContain('briefingReview,\n    capacity:');
     // The dispatch server hosts the real service instance.
     expect(main).toMatch(/pipeline(?:\s*=|\s*,)/u);
     // The board engine reads the same service's view (server-computed

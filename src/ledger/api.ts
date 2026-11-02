@@ -12385,7 +12385,9 @@ export class LedgerApi {
       }
       const ts = nowIso();
       this.db
-        .prepare("UPDATE pipeline_entries SET state = 'admitted', job_id = ?, admitted_at = ?, updated_at = ? WHERE id = ?")
+        .prepare(
+          "UPDATE pipeline_entries SET state = 'admitted', job_id = ?, admitted_at = ?, defer_reason = NULL, updated_at = ? WHERE id = ?",
+        )
         .run(input.jobId, ts, ts, input.id);
       this.appendEvent({ kind: 'pipeline.admitted', payload: { entry_id: input.id, job_id: input.jobId } });
       return this.getPipelineEntry(input.id) as PipelineEntryRecord;
@@ -12394,14 +12396,23 @@ export class LedgerApi {
 
   /** Resolve an admitting claim without an admission. `requeue` counts a
    * failed attempt (returns to waiting); `failed` is the bounded terminal
-   * outcome; `reconciled` is the crash path (no failure counted). */
+   * outcome; `reconciled` is the crash path (no failure counted); `deferred`
+   * is the briefing-review gate's wait (no failure counted, reason durable). */
   releasePipelineClaim(input: {
     id: string;
     reason: string;
-    outcome: 'requeue' | 'failed' | 'reconciled';
+    outcome: 'requeue' | 'failed' | 'reconciled' | 'deferred';
     note?: string | null;
+    /** Required with outcome `deferred`: `<code>: <detail>`. */
+    deferReason?: string;
   }): PipelineEntryRecord {
     if (input.reason.trim() === '') throw new Error('pipeline claim release requires a reason');
+    if (input.outcome === 'deferred' && (input.deferReason === undefined || input.deferReason.trim() === '')) {
+      throw new Error('a deferred pipeline claim release requires the gate defer reason');
+    }
+    if (input.outcome !== 'deferred' && input.deferReason !== undefined) {
+      throw new Error('only a deferred pipeline claim release carries a defer reason');
+    }
     return this.transaction(() => {
       const row = this.getPipelineEntry(input.id);
       if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
@@ -12434,6 +12445,14 @@ export class LedgerApi {
               WHERE id = ?`,
           )
           .run(input.reason, input.note ?? null, ts, input.id);
+      } else if (input.outcome === 'deferred') {
+        this.db
+          .prepare(
+            `UPDATE pipeline_entries
+                SET state = 'waiting', defer_reason = ?, claim = NULL, updated_at = ?
+              WHERE id = ?`,
+          )
+          .run(input.deferReason ?? null, ts, input.id);
       } else {
         this.db
           .prepare(
@@ -12449,8 +12468,56 @@ export class LedgerApi {
             ? 'pipeline.failed'
             : input.outcome === 'requeue'
               ? 'pipeline.requeued'
-              : 'pipeline.reconciled',
-        payload: { entry_id: input.id, reason: input.reason, ...(input.note != null ? { note: input.note } : {}) },
+              : input.outcome === 'deferred'
+                ? 'pipeline.deferred'
+                : 'pipeline.reconciled',
+        payload: {
+          entry_id: input.id,
+          reason: input.reason,
+          ...(input.note != null ? { note: input.note } : {}),
+          ...(input.deferReason != null ? { defer_reason: input.deferReason } : {}),
+        },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Clear a briefing-review deferral once the gate admits the entry (the
+   * starvation fix: a deferred entry must not wait for an unrelated trigger).
+   * State stays `waiting`; an already-cleared row is a no-op. */
+  clearPipelineDeferReason(input: { id: string }): PipelineEntryRecord {
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.deferReason === null) return row; // idempotent
+      if (row.state !== 'waiting' && row.state !== 'ready') {
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — only a waiting/ready deferral can be cleared`);
+      }
+      const ts = nowIso();
+      this.db.prepare('UPDATE pipeline_entries SET defer_reason = NULL, updated_at = ? WHERE id = ?').run(ts, input.id);
+      this.appendEvent({ kind: 'pipeline.deferred-cleared', payload: { entry_id: input.id } });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Replace a deferral whose gate REFUSAL CODE changed (a pending review
+   * that later records CHANGES-NEEDED). Same state, same attempt count. */
+  refreshPipelineDeferReason(input: { id: string; reason: string }): PipelineEntryRecord {
+    if (input.reason.trim() === '') throw new Error('a pipeline deferral refresh requires a reason');
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.deferReason === null) {
+        throw new Error(`pipeline entry "${input.id}" has no deferral to refresh`);
+      }
+      if (row.state !== 'waiting' && row.state !== 'ready') {
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — only a waiting/ready deferral can be refreshed`);
+      }
+      const ts = nowIso();
+      this.db.prepare('UPDATE pipeline_entries SET defer_reason = ?, updated_at = ? WHERE id = ?').run(input.reason, ts, input.id);
+      this.appendEvent({
+        kind: 'pipeline.deferred-refreshed',
+        payload: { entry_id: input.id, reason: input.reason },
       });
       return this.getPipelineEntry(input.id) as PipelineEntryRecord;
     });
@@ -12649,6 +12716,7 @@ export class LedgerApi {
       claim: parsePipelineClaim(nstr(row.claim)),
       failureReason: nstr(row.failure_reason),
       failureCount: Number(row.failure_count),
+      deferReason: nstr(row.defer_reason),
       reconcileNote: nstr(row.reconcile_note),
       queuedAt: str(row.queued_at),
       claimedAt: nstr(row.claimed_at),

@@ -232,6 +232,59 @@ describe('pipeline ledger — claims and admission', () => {
     db.close();
   });
 
+  it('a deferred release records the gate wait without counting a failure (#551)', () => {
+    const { db, ledger } = boot();
+    enqueue(ledger, 'pipe-a');
+    ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
+    const deferred = ledger.releasePipelineClaim({
+      id: 'pipe-a',
+      reason: 'review pending',
+      outcome: 'deferred',
+      deferReason: 'briefing_review_pending: review r1 has no verdict yet',
+    });
+    expect(deferred.state).toBe('waiting');
+    expect(deferred.deferReason).toBe('briefing_review_pending: review r1 has no verdict yet');
+    expect(deferred.failureCount).toBe(0);
+    expect(deferred.failureReason).toBeNull();
+    expect(deferred.claim).toBeNull();
+    expect(ledger.listEvents({ limit: 10 }).filter((event) => event.kind === 'pipeline.deferred')).toHaveLength(1);
+    // The reason is mandatory and never rides a non-deferred release.
+    expect(() => ledger.releasePipelineClaim({ id: 'pipe-a', reason: 'no reason', outcome: 'deferred' })).toThrow(/defer reason/u);
+    expect(() =>
+      ledger.releasePipelineClaim({ id: 'pipe-a', reason: 'wrong outcome', outcome: 'reconciled', deferReason: 'x: y' }),
+    ).toThrow(/only a deferred/u);
+    db.close();
+  });
+
+  it('clears a deferral when the gate admits and refreshes a changed refusal code (#551)', () => {
+    const { db, ledger } = boot();
+    enqueue(ledger, 'pipe-a');
+    ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
+    ledger.releasePipelineClaim({
+      id: 'pipe-a',
+      reason: 'review pending',
+      outcome: 'deferred',
+      deferReason: 'briefing_review_pending: no verdict yet',
+    });
+    const refreshed = ledger.refreshPipelineDeferReason({
+      id: 'pipe-a',
+      reason: 'briefing_review_not_ready: review r1 holds CHANGES-NEEDED',
+    });
+    expect(refreshed.state).toBe('waiting');
+    expect(refreshed.deferReason).toContain('briefing_review_not_ready');
+    expect(refreshed.failureCount).toBe(0);
+    expect(ledger.listEvents({ limit: 10 }).filter((event) => event.kind === 'pipeline.deferred-refreshed')).toHaveLength(1);
+    const cleared = ledger.clearPipelineDeferReason({ id: 'pipe-a' });
+    expect(cleared.state).toBe('waiting');
+    expect(cleared.deferReason).toBeNull();
+    expect(ledger.listEvents({ limit: 10 }).filter((event) => event.kind === 'pipeline.deferred-cleared')).toHaveLength(1);
+    // A second clear is a no-op: no event, no state change.
+    ledger.clearPipelineDeferReason({ id: 'pipe-a' });
+    expect(ledger.listEvents({ limit: 10 }).filter((event) => event.kind === 'pipeline.deferred-cleared')).toHaveLength(1);
+    expect(() => ledger.refreshPipelineDeferReason({ id: 'pipe-a', reason: 'x: y' })).toThrow(/no deferral to refresh/u);
+    db.close();
+  });
+
   it('cancels waiting work with a durable reason and refuses to resurrect it', () => {
     const { db, ledger } = boot();
     enqueue(ledger, 'pipe-a');
@@ -298,6 +351,26 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     expect(reasonOf('pipe-unmet')).toBe('waiting for pipe-dep to be delivered (now waiting)');
     expect(reasonOf('pipe-cyc-a')).toContain('dependency cycle');
     expect(reasonOf('pipe-cyc-a')).toContain('pipe-cyc-a');
+    db.close();
+  });
+
+  it('an owner hold outranks a deferral, which outranks prerequisites and scopes (#551)', () => {
+    const { db, ledger } = boot();
+    enqueue(ledger, 'pipe-wait', { prerequisites: [{ id: 'pipe-ghost', milestone: 'merged' }] });
+    ledger.claimPipelineEntry({ id: 'pipe-wait', holder: 'silas' });
+    ledger.releasePipelineClaim({
+      id: 'pipe-wait',
+      reason: 'review pending',
+      outcome: 'deferred',
+      deferReason: 'briefing_review_pending: no verdict yet',
+    });
+    const reasonOf = (id: string): string | null =>
+      ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === id)?.reason ?? null;
+    expect(reasonOf('pipe-wait')).toBe('briefing_review_pending: no verdict yet');
+    ledger.holdPipelineEntry({ id: 'pipe-wait', reason: 'owner deciding' });
+    expect(reasonOf('pipe-wait')).toBe('owner hold: owner deciding');
+    ledger.clearPipelineHold({ id: 'pipe-wait' });
+    expect(reasonOf('pipe-wait')).toBe('briefing_review_pending: no verdict yet');
     db.close();
   });
 

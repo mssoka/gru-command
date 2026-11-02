@@ -1,4 +1,5 @@
 import type { LogLevel } from '../logger.js';
+import type { BriefingReviewGateResult, BriefingReviewProvenance, BriefingReviewRequestedProvenance } from '../briefing-review/gate.js';
 import type { EventBus } from '../events/bus.js';
 import type { LedgerApi } from '../ledger/api.js';
 import {
@@ -52,12 +53,30 @@ export interface PipelineDispatchPort {
     readonly repoPath: string;
     readonly title: string;
     readonly briefing: string;
+    /** The gate's attached provenance; omitted for an advisory admission. */
+    readonly briefingReview?: BriefingReviewProvenance;
   }): Promise<{ readonly settled: Promise<unknown> }>;
+}
+
+/** The briefing-review gate seam: the pure decision only (records nothing),
+ * so a deferral can be re-evaluated every pass without minting an event per
+ * pass. `BriefingReviewService` satisfies it structurally. */
+export interface PipelineBriefingReviewGatePort {
+  evaluateDispatch(input: {
+    readonly jobId: string;
+    readonly repoPath: string;
+    readonly title: string;
+    readonly briefing: string;
+    readonly requested: BriefingReviewRequestedProvenance | undefined;
+  }): BriefingReviewGateResult | null;
 }
 
 export interface PipelineServiceOptions {
   readonly ledger: LedgerApi;
   readonly dispatch: PipelineDispatchPort;
+  /** The same gate `POST /api/dispatch` runs, before any dispatch side effect.
+   * Absent means the gate is not wired (a deferral cannot exist then). */
+  readonly briefingReview?: PipelineBriefingReviewGatePort;
   /** The shared resident budget's live state — the ONLY capacity
    * authority; never a queue-local counter. */
   readonly capacity: () => PipelineCapacityView;
@@ -127,13 +146,31 @@ const MAX_CONSECUTIVE_FINALIZE_FAILURES = 3;
 
 /** Reconsideration triggers are EXTERNAL facts — exactly the inputs the
  * evaluator reads. New accepted work (pipeline.enqueued), a deliberate
- * owner hold release (pipeline.hold-cleared) and every job.* transition
- * (status, delivery, worker start) can change eligibility. The consumer's
- * own bookkeeping (claim/requeue/state/…) and transitive notification
- * events carry no new information — re-triggering on them would spin
- * bounded admission retries back-to-back through an outage. */
+ * owner hold release (pipeline.hold-cleared), every job.* transition
+ * (status, delivery, worker start) and a Nefario verdict or push-back (the
+ * facts that can lift a briefing-review deferral) can change eligibility.
+ * The consumer's own bookkeeping (claim/defer/state/…) and transitive
+ * notification events carry no new information — re-triggering on them
+ * would spin bounded admission retries back-to-back through an outage. */
 function isExternalTrigger(kind: string): boolean {
-  return kind.startsWith('job.') || kind === 'pipeline.enqueued' || kind === 'pipeline.hold-cleared';
+  return (
+    kind.startsWith('job.') ||
+    kind === 'pipeline.enqueued' ||
+    kind === 'pipeline.hold-cleared' ||
+    kind === 'briefing.review-verdict' ||
+    kind === 'briefing.review-pushback'
+  );
+}
+
+/** The durable gate deferral: `<code>: <detail>`, bounded like a hold reason. */
+function deferralReason(gate: Extract<BriefingReviewGateResult, { admitted: false }>): string {
+  return `${gate.error.code}: ${gate.error.message}`.slice(0, 1000);
+}
+
+/** The refusal code at the head of a stored deferral (see `deferralReason`). */
+function deferralCode(deferReason: string): string {
+  const separator = deferReason.indexOf(':');
+  return separator === -1 ? deferReason : deferReason.slice(0, separator);
 }
 
 export class PipelineService {
@@ -438,6 +475,13 @@ export class PipelineService {
    * room. Every step re-reads durable state (a claim changes scope
    * holders), so no stale context can double-admit a scope. */
   private async reconsiderOnce(): Promise<void> {
+    // A gate deferral is cleared by the FACT that admitted it (a verdict, a
+    // push-back, a config flip), never by a timer and never by another
+    // entry's admission. Re-check every deferred entry before normalization
+    // and the pick: admitted → clear (the normal pick then dispatches with
+    // provenance); a changed refusal code → refresh; unchanged → write
+    // nothing, so an idle deferred queue appends no events per pass.
+    this.reEvaluateDeferrals();
     const before = this.opts.ledger.listPipelineEntries();
     for (const entry of before) {
       if (entry.state !== 'waiting' && entry.state !== 'ready') continue;
@@ -490,12 +534,66 @@ export class PipelineService {
         this.armRetry();
         return;
       }
+      // A gate deferral is NOT a failed attempt and is never polled: the
+      // verdict/push-back that can lift it is an external trigger. Carry on
+      // with the next eligible entry; this one now carries a blocking reason.
+      if (outcome === 'deferred') continue;
     }
   }
 
-  private async admit(entry: PipelineEntryRecord): Promise<'admitted' | 'adopted' | 'requeued' | 'failed'> {
+  /** Re-check every durable gate deferral against the live review record. */
+  private reEvaluateDeferrals(): void {
+    for (const entry of this.opts.ledger.listPipelineEntries({ states: ['waiting', 'ready'] })) {
+      const stored = entry.deferReason;
+      if (stored === null) continue;
+      if (this.opts.briefingReview === undefined) {
+        throw new Error(
+          `pipeline entry "${entry.id}" carries a briefing-review deferral but no gate is wired — ` +
+            'construct BriefingReviewService and pass it to PipelineService before the queue runs',
+        );
+      }
+      const gate = this.evaluateGate(entry);
+      if (gate === null || gate.admitted) {
+        this.opts.ledger.clearPipelineDeferReason({ id: entry.id });
+        continue;
+      }
+      if (deferralCode(stored) !== gate.error.code) {
+        this.opts.ledger.refreshPipelineDeferReason({ id: entry.id, reason: deferralReason(gate) });
+      }
+    }
+  }
+
+  private evaluateGate(entry: PipelineEntryRecord): BriefingReviewGateResult | null {
+    return (
+      this.opts.briefingReview?.evaluateDispatch({
+        jobId: entry.id,
+        repoPath: entry.repoPath,
+        title: entry.title,
+        briefing: entry.briefing,
+        requested: undefined,
+      }) ?? null
+    );
+  }
+
+  private async admit(
+    entry: PipelineEntryRecord,
+  ): Promise<'admitted' | 'adopted' | 'requeued' | 'failed' | 'deferred'> {
     this.inFlightAdmissions.add(entry.id);
     try {
+      // The gate decision runs BEFORE and OUTSIDE the dispatch try: nothing
+      // has been created yet, a refusal is a wait (never a failure count),
+      // and a gate read failure is a pass failure under the bounded backoff.
+      const gate = this.evaluateGate(entry);
+      if (gate !== null && !gate.admitted) {
+        this.opts.ledger.releasePipelineClaim({
+          id: entry.id,
+          reason: gate.error.message,
+          outcome: 'deferred',
+          deferReason: deferralReason(gate),
+        });
+        return 'deferred';
+      }
+      const provenance = gate?.provenance ?? undefined;
       let settled: Promise<unknown>;
       try {
         const outcome = await this.opts.dispatch.dispatch({
@@ -503,6 +601,7 @@ export class PipelineService {
           repoPath: entry.repoPath,
           title: entry.title,
           briefing: entry.briefing,
+          ...(provenance === undefined ? {} : { briefingReview: provenance }),
         });
         settled = outcome.settled;
         // Observe the background settlement IMMEDIATELY (Perkins r2
