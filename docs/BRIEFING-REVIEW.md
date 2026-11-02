@@ -215,10 +215,14 @@ readiness refusals apply: a deferred entry waits as `waiting` with its
 `briefing_review_*: …` reason and is admitted by itself when its verdict lands
 ([PIPELINE.md](./PIPELINE.md#the-briefing-review-gate-runs-on-admission)).
 
-Both auto-attach and the enforced-tier chain fallback key the chain on
-`sha256(repoPath \0 title)`: an entry titled differently from its commissioned
-review sees an empty chain and is admitted. The HTTP route has the same blind
-spot; the role canon carries the title obligation.
+Auto-attach keys on the exact `reviewId` (`sha256(briefing \0 repoPath)`), not on
+the title: an entry carrying the reviewed briefing attaches to that review
+whatever it is titled, and a pending or CHANGES-NEEDED review still defers it.
+Only the enforced-tier chain fallback and the round cap key on
+`sha256(repoPath \0 title)`, so a *revised* briefing enqueued under a title no
+review in the chain shares sees an empty chain and is admitted with no
+provenance instead of `briefing_review_required`. The HTTP route has the same
+blind spot; the role canon carries the title obligation.
 
 ## Lens sessions
 

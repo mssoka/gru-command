@@ -245,11 +245,11 @@ dispatched directly holds none.
 ## Admission
 
 The service reconsiders the queue when something that can change eligibility
-happens: an enqueue, a cleared hold, any job transition, a resident worker slot
-freeing up or being taken, and once at boot. There is no polling timer. In that
-pass it takes the first eligible entry in the order above and admits it
-only when the shared resident worker budget has a free slot and no older
-resident admission is queued ahead of it. The budget stays the one capacity
+happens: an enqueue, a cleared hold, a Nefario verdict or push-back, any job
+transition, a resident worker slot freeing up or being taken, and once at
+boot. There is no polling timer. In that pass it takes the first eligible entry
+in the order above and admits it only when the shared resident worker budget
+has a free slot and no older resident admission is queued ahead of it. The budget stays the one capacity
 authority; the pipeline keeps no counter of its own. When eligible work waits
 on a full budget, the pipeline registers its demand with the budget so the
 budget's own idle-minion reclaim can serve it.

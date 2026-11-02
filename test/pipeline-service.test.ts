@@ -1309,6 +1309,34 @@ describe('pipeline admission — the briefing-review gate (#551)', () => {
     h.db.close();
   });
 
+  it('refreshes a pending deferral in place when a lens lands CHANGES-NEEDED (#551)', async () => {
+    const h = bootWithReview();
+    const armed = await armReview(h.review, h.repo, { tier: 'medium' });
+    h.service.enqueue({ id: 'pipe-refresh', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-refresh')?.deferReason).toContain('briefing_review_pending');
+    const refreshes = (): number =>
+      h.ledger.listEvents({ limit: 500 }).filter((event) => event.kind === 'pipeline.deferred-refreshed').length;
+    expect(refreshes()).toBe(0);
+    // One lens's blocking finding decides the review: the same pass that the
+    // verdict event schedules rewrites the wait's refusal code in place.
+    submitLens(h.review, h.repo, armed, 'stranger', 'CHANGES-NEEDED', [blockFinding()]);
+    await h.service.whenIdle();
+    const refreshed = h.service.entry('pipe-refresh');
+    expect(refreshed?.state).toBe('waiting');
+    expect(refreshed?.deferReason).toContain('briefing_review_not_ready');
+    expect(refreshed?.failureCount).toBe(0);
+    expect(h.calls).toHaveLength(0);
+    expect(refreshes()).toBe(1);
+    // The next pass reads the same code: no write and no duplicate event.
+    h.service.schedule();
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-refresh')?.deferReason).toContain('briefing_review_not_ready');
+    expect(refreshes()).toBe(1);
+    expect(h.calls).toHaveLength(0);
+    h.db.close();
+  });
+
   it('admits with no provenance when the briefing review is disabled (#551)', async () => {
     const h = bootWithReview({ enabled: false });
     h.service.enqueue({ id: 'pipe-disabled', repoPath: h.repo.path, title: REVIEW_TITLE, briefing: REVIEW_BRIEFING });
