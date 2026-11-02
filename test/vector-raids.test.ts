@@ -22,6 +22,7 @@ import { buildRaidCandidates, rankScore } from '../src/vector/candidates.js';
 import { VECTOR_EVENTS, VectorLedger, type RaidRecord } from '../src/vector/ledger.js';
 import { createVectorServer } from '../src/vector/server.js';
 import { FIX_PROPOSAL_KIND, RAID_CANDIDATES_KIND, RAID_LAUNCHED_KIND, RAID_PROPOSAL_KIND, startVectorHalves, VectorRefusal, VectorService } from '../src/vector/service.js';
+import { ownerDecisionFixture } from './helpers/owner-decision-fixture.js';
 
 /**
  * Vector's raids, planning half (#351 §1–2): config, the code-built
@@ -356,8 +357,8 @@ describe('planning and picks (#351 §2)', () => {
 
   it('only a producer-withdrawable owner proposal can be withdrawn undecided; a decided one never is', () => {
     const h = harness();
-    const decision = { question: 'q?', context: 'c', recommendation: null, reservedClass: 'scope-design' as const, whyNotDelegable: 'w', options: [{ id: 'go', label: 'Go', consequence: 'c' }], discussion: false };
-    const escalation = h.notifications.post({ id: 'owner-esc', kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'info', title: 't', decision });
+    const decision = ownerDecisionFixture();
+    const escalation = h.notifications.post({ id: 'owner-esc', kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'info', title: 'Approve the slim contract?', decision });
     expect(() => h.ledger.withdrawOwnerProposal(escalation.id, 'stale')).toThrow(/not a producer-withdrawable owner proposal/u);
     expect(h.ledger.getNotification(escalation.id)?.resolvedAt).toBeNull();
     const service = h.service();

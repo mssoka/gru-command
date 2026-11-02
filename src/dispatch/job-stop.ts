@@ -117,9 +117,10 @@ export function jobStopResidue(outcome: JobStopOutcome): readonly string[] {
  * reads is the same text the durable event records. */
 export function jobStopUnprovenNotice(outcome: JobStopOutcome): { readonly title: string; readonly detail: string } {
   return {
-    title: `Parked job ${outcome.jobId}: producer stop is unproven`,
+    // Plain language (issue #570): the job id and the residue live in `detail`.
+    title: 'A parked job could not be proven stopped',
     detail:
-      `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
+      `Job ${outcome.jobId} is parked by your hold, but the service cannot prove everything it started has stopped: ${jobStopResidue(outcome).join('; ')}. ` +
       'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
       'Where nothing is running for the lane, resuming or closing the job lifts the hold; this notice settles on the next stop reconcile at boot.',
   };

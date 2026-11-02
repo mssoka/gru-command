@@ -221,7 +221,7 @@ export function reportVerdictPublicationIdentity(input: VerdictPublicationBootRe
       kind: PERKINS_APP_BUNDLE_MISSING_KIND,
       routing: 'needs-owner',
       severity: 'error',
-      title: 'Perkins App bundle missing — github.com review verdicts cannot post',
+      title: 'Review verdicts cannot be posted on GitHub pull requests',
       detail: `${identity.gap.detail}\n\n${identity.gap.remediation}\n\n` +
         'Scope: github.com verdict delivery. GitLab merge-request notes are unaffected, so an instance that reviews only GitLab remotes can acknowledge this notice.',
       dedupe: 'active',

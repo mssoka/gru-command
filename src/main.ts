@@ -170,10 +170,10 @@ function reportForeignListener(
     kind: 'port-squat',
     routing: 'needs-owner',
     severity: 'error',
-    title: `Foreign process holds port ${port} (pid ${foreign.pid})`,
+    title: 'Another program is using the port Gru Command needs',
     detail:
-      `${foreign.command === '' ? 'unknown command' : foreign.command} (pid ${foreign.pid}) ` +
-      `owns ${dialHost(config.server.host)}:${port} ` +
+      `Port ${port} is held by ${foreign.command === '' ? 'an unknown command' : foreign.command} (pid ${foreign.pid}), ` +
+      `which owns ${dialHost(config.server.host)}:${port} ` +
       `${when === 'before' ? 'before this service could bind it' : 'while this service bound the same port'} ` +
       '— loopback clients would reach the squatter. Stop it, then restart the service.',
   });
@@ -1990,9 +1990,9 @@ async function main(): Promise<number> {
         kind: 'roll-port-squat',
         routing: 'needs-owner',
         severity: 'error',
-        title: `Roll refused: port ${config.server.port} is held by a foreign process (pid ${owner.pid})`,
+        title: 'Update refused: another program is using the port',
         detail:
-          `${owner.command === '' ? 'unknown command' : owner.command} (pid ${owner.pid}) owns ` +
+          `Port ${config.server.port} is held by ${owner.command === '' ? 'an unknown command' : owner.command} (pid ${owner.pid}), which owns ` +
           `${dialHost(config.server.host)}:${config.server.port}, so the post-roll /health check would ` +
           'read the squatter. Kill it and re-run the roll.',
       });

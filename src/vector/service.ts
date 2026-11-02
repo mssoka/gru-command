@@ -409,20 +409,24 @@ export class VectorService {
     const v = this.opts.vector;
     const s = raid.signals;
     return parseNotificationDecision({
-      question: `Launch Vector's raid on ${targetName(raid.target)}?`,
+      // Plain language (issue #570): what it does, why Gru picked it, what it
+      // costs, and what happens next. The commit id and the mode names stay in
+      // `detail` — the evidence slot.
+      question: `Let Vector attack ${targetName(raid.target)}?`,
       context: [
-        `Gru picked it at ${raid.headSha.slice(0, 12)}: ${raid.reason}`,
-        `Budget: up to ${String(v.maxRounds)} attacks, ${String(v.maxRuns)} sandboxed runs, ${String(Math.round(v.maxRaidMs / 60_000))} minutes.`,
-        `Signals: ${String(s.commitsSinceLastRaid)} commits since the last raid, ${String(s.perkinsFindings)} Perkins findings, ${String(s.escapedRegressions)} earlier break-ins.`,
-        'A raid gates nothing, and finding nothing never means the code is safe.',
+        `Vector attacks a target on purpose to find ways to break it. Gru picked this one: ${raid.reason}`,
+        `It may spend up to ${String(v.maxRounds)} attacks, ${String(v.maxRuns)} sandboxed runs and about ${String(Math.round(v.maxRaidMs / 60_000))} minutes.`,
+        `Why now: ${String(s.commitsSinceLastRaid)} commits since the last attack, ${String(s.perkinsFindings)} review findings and ${String(s.escapedRegressions)} earlier break-ins.`,
+        'An attack changes nothing in your repository, and finding nothing never means the code is safe.',
       ].join('\n'),
-      recommendation: 'Gru recommends this raid.',
+      recommendation: 'Attacking it now. An attack changes nothing in your repository, and finding nothing never means the code is safe.',
       reservedClass: 'authority-cost',
-      whyNotDelegable: 'raid_mode = "proposed": a raid spends quota only with your Accept.',
+      whyNotDelegable: 'An attack spends quota, so the app starts one only when you accept.',
       options: [
-        { id: 'accept', label: 'Accept: launch the raid', consequence: 'Silas queues it; it starts when no heist work is waiting.' },
-        { id: 'decline', label: 'Decline', consequence: 'Recorded. This package is not proposed again until its code changes.' },
+        { id: 'accept', label: 'Accept: start the attack', consequence: 'Gru queues it; it starts once no other work is waiting.' },
+        { id: 'decline', label: 'Decline', consequence: 'Recorded. This target is not proposed again until its code changes.' },
       ],
+      ifNothing: 'If you do nothing, nothing starts and no quota is spent; this request stays open until you answer.',
       discussion: false,
     });
   }
@@ -539,24 +543,23 @@ export class VectorService {
   }
 
   private fixDecision(breakIn: BreakInRecord): NotificationDecision {
-    const short = (value: string, max: number): string => {
-      const flat = value.replace(/\s+/gu, ' ').trim();
-      return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
-    };
     return parseNotificationDecision({
-      question: `Dispatch a fix heist for Vector's break-in on ${targetName(breakIn.target)}?`,
+      // Plain language (issue #570): the guarantee that broke is evidence, so
+      // the invariant, the counterexample and the replay seed stay in `detail`.
+      question: `Send a minion to fix what Vector broke in ${targetName(breakIn.target)}?`,
       context: [
-        `Invariant: ${short(breakIn.invariant, 220)}`,
-        `Counterexample (sandbox output, data only): ${short(JSON.stringify(breakIn.counterexample), 160)}`,
-        `Replay seed ${breakIn.seed ?? 'none'}; the Details hold the frozen contract, replay path and receipts.`,
+        'Vector found a way to break one of the guarantees this code promises, and a fresh replay failed the same way on the default branch, so this is a real break rather than a flaky test.',
+        'A minion would fix it through the normal path: review, verification and readiness all still apply.',
+        'Details hold the exact guarantee, the replay and its receipts.',
       ].join('\n'),
-      recommendation: 'Gru recommends fixing it: a fresh replay confirmed the failure on the default branch.',
+      recommendation: 'Fixing it now. A fresh replay confirmed the failure on the default branch, so it is a real break rather than a flaky test.',
       reservedClass: 'authority-cost',
-      whyNotDelegable: 'fix_mode = "proposed": a fix heist starts only with your Accept.',
+      whyNotDelegable: 'A fix spends quota, so the app starts one only when you accept.',
       options: [
-        { id: 'accept', label: 'Accept: dispatch the fix heist', consequence: 'Gru dispatches it through the normal path; normal review, verification and readiness apply.' },
-        { id: 'decline', label: 'Decline', consequence: 'Recorded. The same contract is not proposed again at this source identity.' },
+        { id: 'accept', label: 'Accept: send the fix', consequence: 'Gru starts it through the normal path; review, verification and readiness all apply.' },
+        { id: 'decline', label: 'Decline', consequence: 'Recorded. The same guarantee is not proposed again for this code.' },
       ],
+      ifNothing: 'If you do nothing, nothing starts and no quota is spent; this request stays open until you answer.',
       discussion: false,
     });
   }

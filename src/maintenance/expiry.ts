@@ -680,13 +680,14 @@ export function preserveExpiryCard(id: string, work: ExpiredWork): {
     decision: parseNotificationDecision({
       question: `Delete the ${counted} GC kept from finished jobs in ${work.repoName}?`,
       context: `They hold minion work saved when lanes were released, from jobs that ended at least ${String(PRESERVE_EXPIRY_MS / DAY_MS)} days ago (about ${size(total)}). The details list each one and how to restore it.`,
-      recommendation: null,
+      recommendation: 'No recommendation — either choice is fine, because keeping the saved work costs disk space and deleting it loses work only you can judge worth keeping.',
       reservedClass: 'destructive',
       whyNotDelegable: 'Deleting saved work loses it for good, and anything that loses data stays the owner\'s call (owner ruling 2026-10-16).',
       options: [
         { id: 'accept', label: 'Accept: delete them', consequence: 'GC deletes exactly what this card lists and nothing else.' },
         { id: 'decline', label: 'Decline: keep them', consequence: `Nothing is deleted. GC asks again in ${String(PRESERVE_REPROPOSE_MS / DAY_MS)} days.` },
       ],
+      ifNothing: `If you do nothing, nothing is deleted and GC asks again in ${String(PRESERVE_REPROPOSE_MS / DAY_MS)} days.`,
       discussion: false,
     }),
   };

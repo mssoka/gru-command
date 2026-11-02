@@ -3104,8 +3104,9 @@ export class Supervisor {
           kind: 'supervision.restart-cleanup-unconfirmed',
           routing: 'needs-owner',
           severity: 'error',
-          title: `Superseded minion ${spawned.id}: cleanup is unconfirmed`,
-          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused automatic recovery, but cleanup is unconfirmed: ${cleanupError}. ` +
+          // Plain language (issue #570): the worker and job ids are evidence.
+          title: 'An old worker could not be confirmed cleaned up',
+          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused automatic recovery, but its cleanup is unconfirmed: ${cleanupError}. ` +
             'Producer ownership remains unknown. Only the original native owner can persist acknowledgment and positive cessation proof. ' +
             'If that owner is lost in a hard crash, proof is unavailable: ACK, restart and successor cleanup cannot release custody. ' +
             (superseded

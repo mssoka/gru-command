@@ -12,6 +12,7 @@ import { isJobTerminal } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { DecisionRecord, EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
 import { producerFollowsDecisionThrough } from '../notifications/attention.js';
+import { ownerNoticeWithFallback } from '../notifications/owner-language.js';
 import {
   incidentBasisOf,
   incidentKeyOf,
@@ -1545,13 +1546,19 @@ export class GruAwareness {
         const incidentKind = kind;
         const open = this.ledger.findNotificationByKindAndRouting(incidentKind, 'needs-owner', 'unacked');
         if (open === null) {
+          // Plain language (issue #570): the title is Gru's own sentence, never
+          // the machine card's title; the source card's text moves to `detail`.
+          // This producer retries, so a refused title must not lose the stop.
           const posted = this.ledger.recordNotification({
             id: existing === null ? escalationId : this.nextEscalationId(escalationId),
             kind,
             routing: 'needs-owner',
             severity: 'error',
-            title: `Gru wake blocked: ${row.title}`,
-            detail: `${mailbox ? 'Mailbox delivery' : 'Notification'} ${row.id} could not reach Gru (${reason}). Restart the service to recover chat safely; the machine alert remains pending for retry.`,
+            ...ownerNoticeWithFallback(
+              mailbox ? 'gru.wake-blocked-mailbox.' : 'gru.wake-blocked.',
+              'Gru could not be woken for an alert',
+              `Alert "${row.title}". ${mailbox ? 'Mailbox delivery' : 'Notification'} ${row.id} could not reach Gru (${reason}). Restart the service to recover chat safely; the machine alert remains pending for retry.`,
+            ),
           });
           try { this.onFollowUpPosted(posted); } catch (error) {
             this.log('error', 'gru blocked-wake chat notice failed', { notification_id: id, error: String(error) });
@@ -1626,15 +1633,21 @@ export class GruAwareness {
       // UNCAPPED exact-kind lookup (same reason as the blocked-wake path).
       const open = this.ledger.findNotificationByKindAndRouting(kind, 'needs-owner', 'unacked');
       if (open === null) {
+        // Plain language (issue #570): Gru's own sentence instead of the
+        // machine card's title, which moves to `detail` with the rest of the
+        // evidence. Fail-forward: this retrying path never loses the stop.
         const posted = this.ledger.recordNotification({
           id: existing === null ? escalationId : this.nextEscalationId(escalationId),
           kind,
           routing: 'needs-owner',
           severity: 'error',
-          title: `Gru wake turn failed repeatedly: ${representative.title}`,
-          detail:
-            `Autonomous wake retries (${WAKE_FAILURE_RETRIES}) for incident ${incidentKey} failed on notification(s) ${idList}; ` +
-            `last error: ${detail}. The machine alert remains open — this stop replaces the autonomous path until you act.`,
+          ...ownerNoticeWithFallback(
+            'gru.wake-failed-escalation.',
+            'Gru could not act on an alert',
+            `Alert "${representative.title}". ` +
+              `Autonomous wake retries (${WAKE_FAILURE_RETRIES}) for incident ${incidentKey} failed on notification(s) ${idList}; ` +
+              `last error: ${detail}. The machine alert remains open — this stop replaces the autonomous path until you act.`,
+          ),
         });
         try { this.onFollowUpPosted(posted); } catch (error) {
           this.log('error', 'gru failed-wake chat notice failed', { notification_ids: ids, error: String(error) });

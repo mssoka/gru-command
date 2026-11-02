@@ -765,7 +765,9 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
     expect(ownerAttentionFor(REPO_MISMATCH_KIND)).toBe('owner-required');
     expect(requiresTypedDecision(REPO_MISMATCH_KIND)).toBe(true);
     expect(cards.every((card) => card.routing === 'needs-owner' && card.decision?.reservedClass === 'destructive')).toBe(true);
-    const cardOf = (laneId: string): NotificationRecord => cards.find((card) => card.title.startsWith(`Lane ${laneId} `))!;
+    // The face names the repository, not the workspace (#570); the card's id
+    // still carries the lane it is about.
+    const cardOf = (laneId: string): NotificationRecord => cards.find((card) => card.id.startsWith(`worktree-repo-mismatch:${laneId}:`))!;
     expect(cardOf('job-kept').detail).toContain('shares no root commit');
     expect(h.ledger.getWorktree('job-kept')?.repoPath).toBe(app);
 
@@ -934,7 +936,7 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
     const manager = h.manager({ enumerateProcesses: (tree) => (tree === busy.path ? rooted : []) });
     const reconciler = new RepoMoveReconciler({ worktrees: manager, ledger: h.ledger, bus: h.bus, notifications: h.notifications, workspaceRoot: after, managedRepos: ['app'], log: (level, msg, fields) => { h.logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); } });
     expect(reconciler.check().map((outcome) => outcome.status)).toEqual(['mismatch', 'mismatch']);
-    const cardOf = (laneId: string): NotificationRecord => openCards(h, REPO_MISMATCH_KIND).find((card) => card.title.startsWith(`Lane ${laneId} `))!;
+    const cardOf = (laneId: string): NotificationRecord => openCards(h, REPO_MISMATCH_KIND).find((card) => card.id.startsWith(`worktree-repo-mismatch:${laneId}:`))!;
     const busyCard = cardOf('job-busy').id;
     const backCard = cardOf('job-back').id;
     h.ledger.setWorktreeStatus('job-busy', 'paused', 'paused over a live dev server');

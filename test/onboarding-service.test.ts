@@ -167,14 +167,14 @@ async function decide(h: Harness, service: OnboardingService, id: string, option
 }
 
 describe('onboarding scan and cards (#427)', () => {
-  it('Missing: one "Onboard swift-app" card; Accept dispatches the heist through the normal path and closes the card', async () => {
+  it('Missing: one "Set up swift-app for Gru Command" card; Accept dispatches the heist through the normal path and closes the card', async () => {
     const h = harness();
     const repo = h.repo('swift-app');
     const service = await started(h.service());
     const cards = h.rows(ONBOARDING_PROPOSAL_KIND);
     expect(cards).toHaveLength(1);
     const card = cards[0]!;
-    expect(card).toMatchObject({ title: 'Onboard swift-app', routing: 'needs-owner', resolvedAt: null });
+    expect(card).toMatchObject({ title: 'Set up swift-app for Gru Command', routing: 'needs-owner', resolvedAt: null });
     expect(card.detail).toContain('origin/main');
     expect(card.decision?.options.map((option) => option.id)).toEqual(['accept', 'decline']);
     expect(card.decision?.reservedClass).toBe('authority-cost');
@@ -329,7 +329,7 @@ describe('onboarding scan and cards (#427)', () => {
     h.ledger.setJobStatus('onboard-api', 'done');
     await service.idle();
     expect(h.dispatched).toHaveLength(2);
-    expect(h.rows(ONBOARDING_PROPOSAL_KIND)).toEqual([expect.objectContaining({ title: 'Onboard api', resolvedAt: null })]);
+    expect(h.rows(ONBOARDING_PROPOSAL_KIND)).toEqual([expect.objectContaining({ title: 'Set up api for Gru Command', resolvedAt: null })]);
   });
 });
 
@@ -479,14 +479,14 @@ describe('failure rows, stale cards and follow-through (#427)', () => {
     h.repo('docs');
     const first = await started(h.service());
     first.stop();
-    h.notifications.decide(cardTitled(h, 'Onboard api').id, 'accept', 'owner');
-    h.notifications.decide(cardTitled(h, 'Onboard docs').id, 'accept', 'owner');
+    h.notifications.decide(cardTitled(h, 'Set up api for Gru Command').id, 'accept', 'owner');
+    h.notifications.decide(cardTitled(h, 'Set up docs for Gru Command').id, 'accept', 'owner');
     expect(await h.service({ managed: [] }).scan(['docs'])).toEqual([expect.objectContaining({ action: 'none', detail: 'not a managed repository' })]);
-    expect(h.ledger.getNotification(cardTitled(h, 'Onboard docs').id)?.resolvedAt).not.toBeNull();
+    expect(h.ledger.getNotification(cardTitled(h, 'Set up docs for Gru Command').id)?.resolvedAt).not.toBeNull();
     await started(h.service({ managed: [] }));
-    expect(h.ledger.getNotification(cardTitled(h, 'Onboard web').id)).toMatchObject({ resolvedBy: 'producer-withdrawn', decidedOption: null });
-    expect(h.ledger.getNotification(cardTitled(h, 'Onboard api').id)).toMatchObject({ decidedOption: 'accept' });
-    expect(h.ledger.getNotification(cardTitled(h, 'Onboard api').id)?.resolvedAt).not.toBeNull();
+    expect(h.ledger.getNotification(cardTitled(h, 'Set up web for Gru Command').id)).toMatchObject({ resolvedBy: 'producer-withdrawn', decidedOption: null });
+    expect(h.ledger.getNotification(cardTitled(h, 'Set up api for Gru Command').id)).toMatchObject({ decidedOption: 'accept' });
+    expect(h.ledger.getNotification(cardTitled(h, 'Set up api for Gru Command').id)?.resolvedAt).not.toBeNull();
     expect(h.dispatched).toEqual([]);
   });
 
@@ -496,10 +496,10 @@ describe('failure rows, stale cards and follow-through (#427)', () => {
     h.repo('api');
     const first = await started(h.service());
     first.stop();
-    h.notifications.decide(cardTitled(h, 'Onboard api').id, 'accept', 'owner');
+    h.notifications.decide(cardTitled(h, 'Set up api for Gru Command').id, 'accept', 'owner');
     await started(h.service({ mode: 'off' }));
-    expect(h.ledger.getNotification(cardTitled(h, 'Onboard web').id)).toMatchObject({ resolvedBy: 'producer-withdrawn', decidedOption: null });
-    expect(h.ledger.getNotification(cardTitled(h, 'Onboard api').id)?.resolvedAt).not.toBeNull();
+    expect(h.ledger.getNotification(cardTitled(h, 'Set up web for Gru Command').id)).toMatchObject({ resolvedBy: 'producer-withdrawn', decidedOption: null });
+    expect(h.ledger.getNotification(cardTitled(h, 'Set up api for Gru Command').id)?.resolvedAt).not.toBeNull();
     expect(h.rows(ONBOARDING_PROPOSAL_KIND).filter((row) => row.resolvedAt === null)).toEqual([]);
     expect(h.dispatched).toEqual([]);
   });

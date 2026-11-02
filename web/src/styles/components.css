@@ -3623,9 +3623,16 @@ a.repo-row__name:hover {
 .board-notification__decided,
 .board-notification__result,
 .board-notification__guidance,
+.board-notification__if-nothing,
 .board-notification__discuss {
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+/* Owner notice guidance (#570): why it is here, the do-nothing line, the step. */
+.board-notification__guidance {
+  display: grid;
+  gap: 2px;
 }
 
 /* The result a follow-through closed the card with: one line per blocker. */
@@ -3648,6 +3655,7 @@ a.repo-row__name:hover {
 .board-notification__decided,
 .board-notification__result,
 .board-notification__guidance,
+.board-notification__if-nothing,
 .board-notification__discuss,
 .board-notification__option-consequence,
 .board-notification__option-error {

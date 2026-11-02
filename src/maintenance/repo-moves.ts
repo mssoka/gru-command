@@ -247,14 +247,14 @@ export class RepoMoveReconciler {
       kind: REPO_MISMATCH_KIND,
       routing: 'needs-owner',
       severity: 'info',
-      title: `Lane ${lane.id} (${lane.repoName}): its repository is not there`,
+      title: `A saved workspace of ${lane.repoName} needs your decision`,
       detail: [
         `Lane ${lane.id} (job ${lane.jobId ?? 'none'}) at ${lane.path} was made in ${lane.repoPath}, which no longer holds that repository.`,
         `The managed repository ${lane.repoName} now resolves to ${candidate}, which is a different repository: ${reason}.`,
         'GC reconnects a lane only to the same repository (a shared root commit, and the same origin when both have one), so it cannot reconnect this one.',
         `If the repository moved somewhere else, point workspace_root at its new parent folder and restart the service: GC then reconnects the lane itself.`,
       ].join('\n'),
-      decision: repoMismatchDecision(lane.id, lane.path, lane.repoName, candidate),
+      decision: repoMismatchDecision(lane.repoName),
     });
   }
 
@@ -304,17 +304,20 @@ function laneOfCard(id: string): string | null {
   return id.startsWith(prefix) && hash > prefix.length ? id.slice(prefix.length, hash) : null;
 }
 
-function repoMismatchDecision(laneId: string, path: string, repoName: string, candidate: string): NotificationDecision {
+function repoMismatchDecision(repoName: string): NotificationDecision {
+  // Plain language (issue #570): the workspace id, the folder and the name
+  // the repository resolves to are evidence, so they stay in `detail`.
   return parseNotificationDecision({
-    question: `Discard lane ${laneId}? Its repository ${repoName} now resolves to a different repository.`,
-    context: `The lane's folder ${path} may hold uncommitted work. GC cannot reconnect it to ${candidate}, which is not the repository it was made in.`,
-    recommendation: null,
+    question: `Discard the saved workspace from ${repoName}?`,
+    context: 'The folder this workspace lives in may hold uncommitted work, and the app cannot reconnect it: the place that held this repository now holds a different one. Details name the folder and the repository it found.',
+    recommendation: 'No recommendation — either choice is fine, because keeping the workspace changes nothing and discarding it can lose work that exists nowhere else.',
     reservedClass: 'destructive',
-    whyNotDelegable: 'Discarding a lane deletes work no other copy may hold, and anything that loses data stays the owner\'s call (owner ruling 2026-10-16).',
+    whyNotDelegable: 'Discarding a saved workspace deletes work no other copy may hold, and anything that loses data stays the owner\'s call (owner ruling 2026-10-16).',
     options: [
-      { id: 'accept', label: 'Accept: discard the lane', consequence: `GC deletes ${path} with whatever it holds and marks the lane released, unless the lane reaches its repository again by then.` },
-      { id: 'decline', label: 'Decline: keep the lane', consequence: `Nothing is deleted. GC does not ask again while ${repoName} resolves to ${candidate}; moving the repository back, or pointing workspace_root at it, lets GC reconnect the lane.` },
+      { id: 'accept', label: 'Accept: discard the saved workspace', consequence: 'The app deletes that folder with whatever it holds and marks the workspace released, unless it reaches its repository again by then.' },
+      { id: 'decline', label: 'Decline: keep the saved workspace', consequence: `Nothing is deleted. The app does not ask again while ${repoName} points elsewhere; moving the repository back, or pointing the workspace folder at it, lets the app reconnect the workspace itself.` },
     ],
+    ifNothing: 'If you do nothing, nothing is deleted: the saved workspace stays and this request stays open.',
     discussion: false,
   });
 }

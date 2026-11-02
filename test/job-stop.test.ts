@@ -569,9 +569,9 @@ describe('job execution stop (issue #455)', () => {
     try {
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(jobStopUnprovenNotice(outcome)).toEqual({
-        title: `Parked job ${JOB}: producer stop is unproven`,
+        title: 'A parked job could not be proven stopped',
         detail:
-          'The explicit owner hold is recorded, but the service cannot prove every producer stopped: parked before stop events existed; registry absence is not evidence. ' +
+          `Job ${JOB} is parked by your hold, but the service cannot prove everything it started has stopped: parked before stop events existed; registry absence is not evidence. ` +
           'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles. ' +
           'Where nothing is running for the lane, resuming or closing the job lifts the hold; this notice settles on the next stop reconcile at boot.',
       });

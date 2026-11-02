@@ -222,12 +222,21 @@ use this role and the owner's direct messages for authority:
   authenticated `POST /api/notifications/needs-owner` endpoint:
   `{ "title": "...", "detail": "the evidence behind the ask",
   "idempotencyKey": "<optional>", "decision": {
-  "question": "...", "context": "...", "recommendation": "..." | null,
+  "question": "...", "context": "...", "recommendation": "...",
+  "ifNothing": "what happens if the owner does nothing",
   "reservedClass": "scope-design" | "authority-cost" | "destructive" |
   "merge" | "lessons", "whyNotDelegable": "...", "discussion": false,
   "options": [{ "id": "approve", "label": "Approve …", "consequence": "what
   happens / does not happen" }] } }`. Every field is required (options may
-  be empty only when `discussion` is true). A discussion-only row is settled
+  be empty only when `discussion` is true), and the card is written for a
+  non-technical owner: plain words in the title, the question, the context,
+  the recommendation, `ifNothing` and every option; `detail` is the ONE slot
+  for evidence, so ids, paths, hashes, logs and setting names go there and
+  never on the face. If you have no preference, say so explicitly
+  (`"recommendation": "No recommendation — either choice is fine, because
+  …"`) instead of leaving the owner to guess; state the real do-nothing
+  consequence rather than a generic one. `docs/FOR-YOU.md` is the standard
+  and the server refuses (`400`) a card that breaks it. A discussion-only row is settled
   by talking with the owner in chat and then attaching the agreed options
   with `POST /api/notifications/:id/decision-options` `{ "options": [...],
   "by": "gru" }` — audited, records no choice, and refused once a decision

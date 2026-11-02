@@ -15,6 +15,7 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { ownerDecisionFixture } from './helpers/owner-decision-fixture.js';
 
 /**
  * Explicit phase-completion handoffs (pr136-chief-handoff). Deterministic:
@@ -654,15 +655,12 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
       severity: 'error',
       title: 'owner stop',
       detail: 'owner-controlled',
-      decision: {
+      decision: ownerDecisionFixture({
         question: 'Keep the owner hold?',
-        context: 'A parked lane is held for the owner.',
-        recommendation: null,
-        reservedClass: 'authority-cost',
+        context: 'A parked job is held until you release it.',
         whyNotDelegable: 'Only the owner releases this hold.',
-        options: [{ id: 'keep', label: 'Keep the hold', consequence: 'The lane stays parked.' }],
-        discussion: false,
-      },
+        options: [{ id: 'keep', label: 'Keep the hold', consequence: 'The job stays parked.' }],
+      }),
     });
     h.ledger.beginPhaseHandoff({
       jobId: 'job-ph-park',

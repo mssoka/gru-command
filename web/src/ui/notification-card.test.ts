@@ -146,6 +146,35 @@ describe('readable notification card — fixed long-content contract', () => {
     expect(band.querySelector('.board-notification__ack')).toBeNull();
   });
 
+  it('an owner notice never promotes its short detail to the face and keeps it behind Details', () => {
+    // Owner-facing copy is guidance and choices (#570): a short single-line
+    // detail is still evidence, so the base's "short detail becomes the face
+    // context" rule must not apply to an owner row. The id and the path below
+    // are exactly what the standard keeps off the face.
+    const shortDetail = 'Blocked by job-7f3 on /srv/gru/state — retry after the restart.';
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot([
+        notification({
+          id: 'notice-short',
+          kind: 'port-squat',
+          routing: 'needs-owner',
+          severity: 'error',
+          title: 'Another program is using the port Gru Command needs',
+          detail: shortDetail,
+        }),
+      ]),
+    );
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-notification__context')).toBeNull();
+    const card = band.querySelector<HTMLElement>('[data-notification-id="notice-short"]')!;
+    const details = card.querySelector<HTMLElement>('.board-notification__details')!;
+    const face = [...card.children].filter((child) => child !== details).map((child) => child.textContent).join(' ');
+    expect(face).not.toContain('job-7f3');
+    expect(details.textContent ?? '').toContain(shortDetail);
+    expect(band.querySelector('.board-notification__guidance')).not.toBeNull();
+  });
+
   it('an owner notice explains the manual step instead of inventing a control', () => {
     const view = new BoardView(() => {});
     view.render(
@@ -163,7 +192,8 @@ describe('readable notification card — fixed long-content contract', () => {
     const band = document.getElementById('board-owner')!;
     const guidance = band.querySelector('.board-notification__guidance');
     expect(guidance).not.toBeNull();
-    expect(guidance?.textContent ?? '').toContain('Stop the foreign process yourself');
+    expect(guidance?.textContent ?? '').toContain('What to do: Stop the program named in Details');
+    expect(guidance?.textContent ?? '').toContain('If you do nothing:');
     expect(band.querySelector('.board-notification__ack')).toBeNull();
     expect(band.querySelector('.board-owner__ack')).toBeNull();
   });

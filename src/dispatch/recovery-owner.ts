@@ -15,7 +15,8 @@ export function surfaceRecoveryOwnerTransfer(
   const route = kind === 'directive' ? 'directives' : 'rebriefs';
   deps.notifications.postIncident({ kind: `silas.recovery-owner-transfer.${kind}.${subjectId}.${transfer.generation}`,
     routing: 'needs-owner', severity: 'error', dedupe: 'active',
-    title: `Reserved owner decision: recovery ${subjectId} (job ${transfer.subject.jobId})`,
+    // Plain language (issue #570): the ids, generations and hashes stay in `detail`.
+    title: 'A recovery is waiting for your answer',
     detail: `Exact recovery generation ${transfer.generation}, subject ${transfer.subject.snapshotSha256}, transfer event ${view.transfer!.eventSeq} ` +
       `is assigned to real job-wide owner obligation ${transfer.target.id}, generation ${transfer.target.generation}, plan ${transfer.target.planRevision}: ` +
       `${transfer.target.nextAction.kind === 'owner-decision' ? transfer.target.nextAction.decision : ''}. ` +

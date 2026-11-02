@@ -230,6 +230,10 @@ The `notifications` table is the durable notification log (SPEC ruling
 (`fyi` | `action-required` | `needs-owner`), `severity` (`info` |
 `error`), `title`, `detail`, `agent_id`, plus typed owner-decision
 metadata and a recorded decision (`decision_json`, `decided_at/by/option`).
+`decision_json` also carries `ifNothing` — what happens if the owner does
+nothing (issue #570): required when a card is written, optional when read so
+a pre-upgrade row still renders. No new column: the standard lives inside
+the existing decision body ([FOR-YOU.md](./FOR-YOU.md)).
 `shown_at`/`shown_by` are display receipts (one per surface, idempotent);
 `acked_at`/`acked_by` is the feed/notice clearance. Every mutation appends
 a `notification.created` / `notification.shown` / `notification.acked` /

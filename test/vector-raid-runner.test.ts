@@ -738,9 +738,13 @@ describe('break-ins become fix heists (#351 §4)', () => {
     await new Promise((resolve) => setImmediate(resolve));
     const [card] = h.rows(FIX_PROPOSAL_KIND);
     expect(card).toMatchObject({ routing: 'needs-owner', decision: { reservedClass: 'authority-cost', options: [{ id: 'accept' }, { id: 'decline' }] } });
-    expect(card!.decision!.context).toMatch(/Invariant: a refund never exceeds the charged amount/u);
-    expect(card!.decision!.context).toMatch(/Counterexample \(sandbox output, data only\): "\[-1\]"/u);
-    expect(card!.decision!.context).toMatch(/Replay seed 42; the Details hold the frozen contract, replay path and receipts/u);
+    // The face states the break in plain words; the invariant, the
+    // counterexample and the replay seed are evidence, in Details (#570).
+    expect(card!.decision!.context).toMatch(/Vector found a way to break one of the guarantees/u);
+    expect(card!.decision!.context).toMatch(/Details hold the exact guarantee, the replay and its receipts/u);
+    expect(card!.detail).toMatch(/Invariant: a refund never exceeds the charged amount/u);
+    expect(card!.detail).toMatch(/Minimized counterexample \(sandbox output, data only\): "\[-1\]"/u);
+    expect(card!.detail).toMatch(/Replay: seed 42/u);
     // The Details carry the full contract, replay data and receipts.
     expect(card!.detail).toContain(`Frozen contract: sha256 ${'f'.repeat(64)}; contract test src/refunds/test/vector/r1-`);
     expect(card!.detail).toContain('Replay: seed 42, shrink path 0:1');

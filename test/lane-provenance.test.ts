@@ -318,13 +318,15 @@ describe('the owner\'s card for a paused sweep', () => {
     try {
       const card = sweepPausedCard(h.lane, details);
       expect(sweepPausedSummary(details)).toBe('Google Chrome Helper ×3 + agent-browser + vite');
-      expect(card.title).toBe('Worktree sweep paused: 5 processes still running in repo');
+      expect(card.title).toBe('Cleanup paused: 5 processes still running in repo');
       expect(card.detail).toContain('- agent-browser ×1 (pid 65215; started 2026-10-23T03:10:12Z; working directory /lanes/repo/job-b): carries no lane token');
       expect(card.detail).toContain('- Google Chrome Helper ×3 (pids 79503, 79510, 79511; started 2026-10-23T03:10:00Z to 2026-10-23T03:12:00Z;');
       expect(card.detail).toContain('GC could not read its environment');
       expect(card.decision.context).toContain('started 2026-10-23T03:10:00Z to 2026-10-23T03:13:00Z');
+      // The face names the processes; the ids, folders and reasons are evidence.
+      expect(card.decision.context).toContain('Details list each one\'s process id, start time, working folder');
       expect(card.detail).toContain('carries the token of lane job-c');
-      expect(card.decision.options).toEqual([expect.objectContaining({ id: STOP_AND_SWEEP_OPTION, label: 'Stop these 5 processes and finish the sweep' })]);
+      expect(card.decision.options).toEqual([expect.objectContaining({ id: STOP_AND_SWEEP_OPTION, label: 'Stop these 5 processes and finish the cleanup' })]);
       expect(card.decision.reservedClass).toBe('destructive');
     } finally { h.db.close(); }
   });
@@ -335,7 +337,8 @@ describe('the owner\'s card for a paused sweep', () => {
       const card = sweepPausedCard(h.lane, [paused(1, 'node', 'no-token', '2026-10-23T03:10:00Z'), paused(2, 'node', 'this-lane', '2026-10-23T03:11:00Z')]);
       expect(card.detail).toContain('- node ×1 (pid 1; started 2026-10-23T03:10:00Z; working directory /lanes/repo/job-b): carries no lane token');
       expect(card.detail).toContain('- node ×1 (pid 2; started 2026-10-23T03:11:00Z; working directory /lanes/repo/job-b): carries this lane\'s token, but a session GC runs in the lane was still busy');
-      expect(card.decision.whyNotDelegable).toContain('in use by a busy session');
+      expect(card.decision.whyNotDelegable).toContain('no session there is busy');
+      expect(card.decision.ifNothing).toBe('If you do nothing, the cleanup stays paused and nothing in that folder is removed.');
     } finally { h.db.close(); }
   });
 
@@ -430,7 +433,7 @@ describe('the owner\'s card for a paused sweep', () => {
       h.notifications.decide(card.id, STOP_AND_SWEEP_OPTION, 'owner');
       follower.start();
       await vi.waitFor(() => expect(h.ledger.getNotification(card.id)?.resolvedAt).not.toBeNull());
-      expect(resolution(h, card.id)).toMatchObject({ detail: 'lane job-b was swept after the answer "Stop these 5 processes and finish the sweep"', owner_decision: STOP_AND_SWEEP_OPTION });
+      expect(resolution(h, card.id)).toMatchObject({ detail: 'lane job-b was swept after the answer "Stop these 5 processes and finish the cleanup"', owner_decision: STOP_AND_SWEEP_OPTION });
     } finally { follower.stop(); h.db.close(); }
   });
 
@@ -477,7 +480,7 @@ describe('the owner\'s card for a paused sweep', () => {
       follower.start();
       await follower.follow();
       const waiting = `worktree-sweep-answer-waiting:${card.id}`;
-      expect(h.ledger.getNotification(waiting)?.detail).toContain('answered "Stop these 5 processes and finish the sweep"');
+      expect(h.ledger.getNotification(waiting)?.detail).toContain('answered "Stop these 5 processes and finish the cleanup"');
       // The lane was swept, and its sweep's settlement of the cards was lost
       // (a crash between the two): the next pass closes the card, and the row.
       h.ledger.setWorktreeStatus('job-b', 'swept');

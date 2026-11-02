@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BlankProvenanceCredentialError, LedgerApi, NotificationDecisionRefusal } from '../src/ledger/api.js';
+import { ownerDecisionFixture } from './helpers/owner-decision-fixture.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
   parseNotificationDecision,
@@ -13,6 +14,7 @@ import {
 } from '../src/ledger/notification-decision.js';
 import { ownerAttentionFor, producerFollowsDecisionThrough, requiresTypedDecision, resolveNotificationRouting } from '../src/notifications/attention.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { assertOwnerFacingText, OWNER_NOTHING_DEFAULT } from '../src/notifications/owner-language.js';
 import { reconcileLegacyOwnerAttention } from '../src/notifications/legacy-owner.js';
 
 /** Test callers run in-process, with no paired credential. */
@@ -52,21 +54,7 @@ function boot(): { api: LedgerApi; bus: EventBus; center: NotificationCenter; ne
   return { api, bus, center, needsOwner, actionRequired };
 }
 
-function decision(overrides: Partial<NotificationDecision> = {}): NotificationDecision {
-  return {
-    question: 'Approve the slim contract?',
-    context: 'PR256 needs an owner-controlled integration route before anything moves.',
-    recommendation: 'Approve the slim contract.',
-    reservedClass: 'scope-design',
-    whyNotDelegable: 'It changes the agreed product scope, which is the owner’s call.',
-    options: [
-      { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the slim lane and reports back.' },
-      { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked; nothing is re-armed.' },
-    ],
-    discussion: false,
-    ...overrides,
-  };
-}
+const decision = ownerDecisionFixture;
 
 describe('owner attention registry (Silas → Gru → owner)', () => {
   it('classifies registered owner kinds, allowed kinds and machine/unknown kinds', () => {
@@ -227,6 +215,104 @@ describe('write-boundary decision validation (center, not just the helper)', () 
       }),
     ).toThrow(/discussion must be a boolean/);
     expect(rig.api.listNotifications({ limit: 10 })).toHaveLength(0);
+  });
+});
+
+describe('the owner-language boundary covers every write of owner-facing text (#570)', () => {
+  /** A row seeded before the standard, so an update/adoption path is exercised
+   * against a row the boundary did not create. */
+  function seedOwnerRow(rig: ReturnType<typeof boot>, decisionValue: NotificationDecision | null): string {
+    return rig.api.recordNotification({
+      id: 'owner-language-seed',
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Approve the slim contract?',
+      detail: 'Evidence lives here.',
+      ...(decisionValue !== null ? { decision: decisionValue } : {}),
+    }).id;
+  }
+
+  it('openIncident refuses the same copy post does, and stores nothing', () => {
+    const rig = boot();
+    expect(() =>
+      rig.center.openIncident({
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Approve the slim contract?',
+        detail: 'evidence',
+        dedupe: 'unacked',
+        decision: decision({ question: 'Gru breaker is open; authorized re-arm required' }),
+      }),
+    ).toThrow(/internal vocabulary/u);
+    expect(rig.api.listNotifications({ limit: 10 })).toHaveLength(0);
+  });
+
+  it('attachDecisionOptions refuses agreed options written as machinery, and attaches plain ones', () => {
+    const rig = boot();
+    const id = rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Which shape should continue?',
+      detail: 'Talked through in chat.',
+      // The documented default is honest here: no answer changes nothing, and
+      // the request stays open. The boundary accepts it (it is owner language).
+      decision: decision({ options: [], discussion: true, ifNothing: OWNER_NOTHING_DEFAULT }),
+    }).id;
+    expect(() =>
+      rig.center.attachDecisionOptions(id, [{ id: 'go', label: 'Go', consequence: 'Gru re-arms the lane.' }], 'gru'),
+    ).toThrow(/internal vocabulary/u);
+    expect(rig.api.getNotification(id)?.decision?.options).toEqual([]);
+    const attached = rig.center.attachDecisionOptions(
+      id,
+      [{ id: 'go', label: 'Go ahead', consequence: 'Gru starts the agreed work and reports back.' }],
+      'gru',
+    );
+    expect(attached?.decision?.options.map((option) => option.id)).toEqual(['go']);
+  });
+
+  it('adoptLegacyDecision refuses a decision that breaks the standard, and adopts a plain one', () => {
+    const rig = boot();
+    const id = seedOwnerRow(rig, null);
+    expect(() => rig.center.adoptLegacyDecision(id, decision({ context: 'See /srv/gru/state/run.json.' }), INTERNAL)).toThrow(/detail/u);
+    expect(rig.api.getNotification(id)?.decision).toBeNull();
+    const adopted = rig.center.adoptLegacyDecision(id, decision(), INTERNAL);
+    expect(adopted?.decision?.question).toBe('Approve the slim contract?');
+  });
+
+  it('updateNotificationDetail refuses a refreshed machine title on an owner row, and leaves detail verbatim', () => {
+    const rig = boot();
+    const id = seedOwnerRow(rig, decision());
+    expect(() => rig.api.updateNotificationDetail(id, 'new evidence', 'Parked job job-7f3: producer stop is unproven')).toThrow(/internal job id/u);
+    expect(rig.api.getNotification(id)?.title).toBe('Approve the slim contract?');
+    // The evidence slot is never checked: the same text is fine in `detail`.
+    const refreshed = rig.api.updateNotificationDetail(id, 'the stop for job-7f3 is unproven (pid 12)', 'Approve the slim contract?');
+    expect(refreshed?.detail).toBe('the stop for job-7f3 is unproven (pid 12)');
+    // A machine row's own title is its producer's business, not the owner's.
+    const machine = rig.api.recordNotification({ id: 'machine', kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'slow', detail: 'd' });
+    expect(rig.api.updateNotificationDetail(machine.id, 'd2', 'Breaker tripped on lane-1')?.title).toBe('Breaker tripped on lane-1');
+  });
+
+  it('matches whole words and allows the subjects a plain sentence needs', () => {
+    const passes = (text: string): boolean => {
+      try {
+        assertOwnerFacingText('probe', text);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    // Repo slugs, PR/MR numbers, durations and versions are the subject, not noise.
+    for (const text of ['Open mssoka/gru-command.', 'PR256 and MR 12 are ready.', 'GC asks again in 30 days.', 'It frees about 4.0 GB of a 30 GB budget.', 'Version 1.0.2 is running.']) {
+      expect(passes(text), text).toBe(true);
+    }
+    // Whole words only: a longer word that merely contains one is untouched.
+    expect(passes('The plane and the gateway are late.')).toBe(true);
+    for (const text of ['unblock lane 7', 'the heist is queued', 'check the /srv/gru/state folder', 'refs/heads/main moved', 'sha256 differs', 'Error: boom', '[worktrees] reclaim_mode = "proposed"', 'MANIFEST_PATH is missing']) {
+      expect(passes(text), text).toBe(false);
+    }
   });
 });
 
@@ -596,7 +682,7 @@ describe('settlement paths for owner-only notices', () => {
       kind: 'decisions.enforce-gate.triage',
       routing: 'needs-owner',
       severity: 'error',
-      title: 'Decision enforce gate blocked for triage',
+      title: 'A safety check is holding up a decision',
       detail: 'missing backtest evidence',
       dedupe: 'active',
     });
@@ -719,7 +805,7 @@ describe('legacy owner-attention reconciliation', () => {
       kind: 'worktree-sweep-paused:lane-x:pause-1',
       routing: 'needs-owner',
       severity: 'info',
-      title: 'Worktree sweep paused: lane-x',
+      title: 'Cleanup paused: two processes still running',
       detail: 'scoped',
     });
     const report = reconcileLegacyOwnerAttention({ ledger: rig.api });
@@ -731,8 +817,8 @@ describe('legacy owner-attention reconciliation', () => {
 
   it('resolves an EXACT kind without bleeding into a lookalike prefix', () => {
     const rig = boot();
-    const triage = rig.center.post({ kind: 'decisions.enforce-gate.triage', routing: 'needs-owner', severity: 'error', title: 'Triage gate' });
-    const extra = rig.center.post({ kind: 'decisions.enforce-gate.triage-extra', routing: 'needs-owner', severity: 'error', title: 'Triage-extra gate' });
+    const triage = rig.center.post({ kind: 'decisions.enforce-gate.triage', routing: 'needs-owner', severity: 'error', title: 'A safety check is holding up a decision' });
+    const extra = rig.center.post({ kind: 'decisions.enforce-gate.triage-extra', routing: 'needs-owner', severity: 'error', title: 'A safety check is holding up a decision' });
     const resolved = rig.center.resolveExactKind('decisions.enforce-gate.triage', 'enforce-gate-passed');
     expect(resolved.map((row) => row.id)).toEqual([triage.id]);
     expect(rig.api.getNotification(extra.id)?.resolvedAt).toBeNull();

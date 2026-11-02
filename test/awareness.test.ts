@@ -147,13 +147,13 @@ describe('gru awareness — passive injection', () => {
 
   it('passive mode carries owner-only stops in every user turn without autonomously waking', () => {
     const rig = boot({ wakeMode: 'never' });
-    const stop = rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Owner re-arm required' });
+    const stop = rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'The port needs a human' });
     expect(rig.woke).toHaveLength(0);
     const first = rig.awareness.prepare();
-    expect(first?.text).toContain('Owner re-arm required');
+    expect(first?.text).toContain('The port needs a human');
     expect(first?.notificationIds).toContain(stop.id);
     rig.awareness.commit(first!);
-    expect(rig.awareness.prepare()?.text).toContain('Owner re-arm required');
+    expect(rig.awareness.prepare()?.text).toContain('The port needs a human');
     rig.notifications.ack(stop.id, 'owner');
     expect(rig.awareness.prepare()).toBeNull();
   });
@@ -1043,13 +1043,14 @@ describe('gru awareness — wake policy', () => {
 describe('gru awareness — owner decisions open a follow-through wake (issue #506)', () => {
   const ownerDecision = {
     question: 'Merge the ready pull request?',
-    context: 'The exact head carries final native Perkins READY.',
+    context: 'The exact head carries the final native review verdict READY.',
     recommendation: 'Merge it.',
+    ifNothing: 'If you do nothing, nothing merges and the work stays parked.',
     reservedClass: 'merge',
     whyNotDelegable: 'Every final PR merge is the owner’s call.',
     options: [
       { id: 'merge', label: 'Merge the PR', consequence: 'The PR merges and its loop closes.' },
-      { id: 'hold', label: 'Hold the PR', consequence: 'Nothing merges; the lane stays open.' },
+      { id: 'hold', label: 'Hold the PR', consequence: 'Nothing merges; the work stays parked.' },
     ],
     discussion: false,
   } as const;
@@ -2339,7 +2340,10 @@ describe('gru awareness — wake rework (issue #219)', () => {
       // One escalation per INCIDENT: the stop is keyed by the incident
       // key, not the notification id.
       expect(escalations[0]?.id).toBe('gru-wake-failed:github.ci-failed_j-1_abc');
-      expect(escalations[0]?.title).toContain(row.title);
+      // The face is Gru's own sentence (#570); the machine card's title is
+      // evidence and lives in detail with its id.
+      expect(escalations[0]?.title).toBe('Gru could not act on an alert');
+      expect(escalations[0]?.detail).toContain(row.title);
       expect(escalations[0]?.detail).toContain(row.id);
       expect(api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'failed', notification_id: row.id });
       // The escalation never re-arms the autonomous path.
@@ -2875,7 +2879,9 @@ describe('GH-305 awareness repair regressions', () => {
       r.awareness.noteWakeBlocked('native compaction recovery requires owner restart');
       const ownerRows = r.api.listNotifications({ routing: 'needs-owner' });
       expect(ownerRows).toHaveLength(1);
-      expect(ownerRows[0]).toMatchObject({ title: 'Gru wake blocked: j', detail: expect.stringContaining('native compaction recovery requires owner restart'), ackedAt: null, resolvedAt: null });
+      // The plain face (#570); the blocked card's own title and the raw reason
+      // are evidence, kept in detail.
+      expect(ownerRows[0]).toMatchObject({ title: 'Gru could not be woken for an alert', detail: expect.stringContaining('native compaction recovery requires owner restart'), ackedAt: null, resolvedAt: null });
       expect(ownerRows[0]!.id).not.toContain('\u0000');
       expect(ownerRows[0]!.kind).not.toContain('\u0000');
       expect(notice).toHaveBeenCalledTimes(1);

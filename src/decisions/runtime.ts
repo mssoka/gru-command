@@ -463,7 +463,9 @@ export class DecisionRuntime implements DecisionService {
             kind: `decisions.enforce-gate.${error.surface}`,
             routing: 'needs-owner',
             severity: 'error',
-            title: `Decision enforce gate blocked for ${error.surface}`,
+            // Plain language (issue #570): the surface and the raw error stay
+            // in `detail` — the owner reads what is blocked and what to do.
+            title: 'A safety check is holding up a decision',
             detail: error.message,
             dedupe: 'active',
           });
@@ -854,7 +856,9 @@ export class DecisionRuntime implements DecisionService {
       // wake either way.
       routing: ownerAction ? 'needs-owner' : 'fyi',
       severity: 'error',
-      title: 'Jev degraded — deterministic fallback active',
+      // Plain language (issue #570): the owner reads what stopped working and
+      // what to do; the reason code and the remediation stay in `detail`.
+      title: 'The optional decision helper is not responding',
       detail: ownerAction
         ? `${reason}. ${OWNER_REMEDIATIONS[reason] ?? 'Run the local credentials command if needed, then use Recheck'}; Gru Command remains usable.`
         : `${reason}. Every acting Jev surface is in shadow, so behavior is unchanged; Gru Command rechecks automatically on a bounded backoff. No action needed.`,

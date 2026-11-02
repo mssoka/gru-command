@@ -22,35 +22,23 @@
  * grouping, no bulk actions, and never an action derived from prose.
  */
 
+import { OWNER_NO_RECOMMENDATION_PREFIX, ownerNoticeGuidance, type OwnerNoticeGuidance } from '../../../src/notifications/owner-language.js';
 import { LESSONS_PROPOSAL_KIND, type BoardSnapshot, type NotificationDecisionView, type NotificationView, type OwnerPrView } from './board-protocol.js';
 
-/** What the owner must actually do for a notice-only kind — static copy,
+/** What the owner must actually do for a notice-only kind — structured copy,
  * never parsed out of notification prose (prose is display data, not
- * execution authority). A notice carries no in-app control. */
-export function ownerNoticeGuidance(kind: string): string {
-  if (kind === 'port-squat' || kind === 'roll-port-squat') {
-    return 'Stop the foreign process yourself, then restart the service. This notice clears on a successful bind.';
-  }
-  if (kind.startsWith('decisions.enforce-gate.')) {
-    return 'Repair or produce passing backtest evidence for this gate, then retry the gated surface.';
-  }
-  if (kind.startsWith('decisions.degraded.')) {
-    return 'Fix the decision-provider credential or configuration, then use Recheck. This notice clears when the decision service recovers.';
-  }
-  if (kind === 'perkins-app-bundle-missing') {
-    return 'Install the Perkins GitHub App bundle in the instance dir (README Prerequisites) and restart the service — github.com verdicts publish as the App identity. The notice clears at the first boot that resolves the bundle, or when [review] is disabled; a GitLab-only instance is unaffected.';
-  }
-  if (kind === 'worktree-sweep-paused' || kind.startsWith('worktree-sweep-paused:')) {
-    return 'Confirm nothing live is rooted in the listed worktree. The sweep stays paused until an operator deliberately completes it; the notice clears when that worktree is swept.';
-  }
-  if (
-    kind.startsWith('gru.wake-blocked.') ||
-    kind.startsWith('gru.wake-blocked-mailbox.') ||
-    kind.startsWith('gru.wake-failed-escalation.')
-  ) {
-    return 'Restart the service to recover chat safely. The machine alert remains pending for retry.';
-  }
-  return 'No in-app action is supported for this notice; it stays visible until its producer resolves it.';
+ * execution authority). The table lives beside the server-side write
+ * boundary (src/notifications/owner-language.ts) so the same words the card
+ * renders are the words the boundary requires; a notice carries no in-app
+ * control. */
+export { ownerNoticeGuidance };
+export type { OwnerNoticeGuidance };
+
+/** True for the explicit no-preference form, which the card renders without
+ * the "Gru recommends:" prefix (a producer with no preference says so — it
+ * never dresses that up as a recommendation). */
+export function isNoRecommendation(recommendation: string): boolean {
+  return recommendation.startsWith(OWNER_NO_RECOMMENDATION_PREFIX);
 }
 
 export interface OwnerDecisionRow {
@@ -66,7 +54,7 @@ export interface OwnerNoticeRow {
   readonly actionId: string;
   readonly ts: string;
   readonly notification: NotificationView;
-  readonly guidance: string;
+  readonly guidance: OwnerNoticeGuidance | null;
 }
 
 export interface OwnerPrRow {
@@ -122,7 +110,9 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
       continue;
     }
     // A needs-owner row without a typed decision is an owner notice (the
-    // action is outside the app) — it never grows an invented control.
+    // action is outside the app) — it never grows an invented control. A row
+    // whose kind predates its guidance entry renders no guidance at all
+    // rather than a generic sentence (the write boundary refuses new ones).
     rows.push({
       kind: 'notice',
       actionId: `owner-notice:${notification.id}`,

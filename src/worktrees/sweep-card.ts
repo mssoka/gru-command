@@ -104,18 +104,21 @@ export function sweepPausedCard(worktree: WorktreeRecord, details: readonly Paus
     ...groupBy(details, (detail) => `${detail.name}\n${reasonOf(detail)}`).map(groupLine),
     'The sweep stays paused, and nothing in the lane is removed, until they are stopped.',
   ].join('\n');
+  // Plain language (issue #570): the workspace id, its folder, the process
+  // ids and the start times are evidence, so they stay in `detail`.
   const decision = parseNotificationDecision({
-    question: bounded(`Stop the ${processes} still running in lane ${worktree.id} and finish its sweep?`, 300),
-    context: bounded(`Still running in ${worktree.path}, started ${startedSpan(details)}: ${summary}. The details list each one's pids, start time, working directory, and why GC did not stop it.`, 600),
-    recommendation: null,
+    question: bounded(`Stop the ${processes} still running in this workspace and finish its cleanup?`, 300),
+    context: bounded(`Still running, started ${startedSpan(details)}: ${summary}. Details list each one's process id, start time, working folder, and why the app did not stop it itself.`, 600),
+    recommendation: 'No recommendation — either choice is fine, because one of these may be your own editor or terminal, so only you can say whether stopping them costs you anything.',
     reservedClass: 'destructive',
-    whyNotDelegable: 'GC stops a process without you only when it carries this lane\'s token and no session of the lane is busy. For these it cannot prove that: one may be your editor or terminal, another lane\'s, or in use by a busy session, so stopping them is your call.',
+    whyNotDelegable: 'The app stops a process on its own only when it can prove the process belongs to this workspace and no session there is busy. For these it cannot prove that, so stopping them is your call.',
     options: [{
       id: STOP_AND_SWEEP_OPTION,
-      label: bounded(`Stop these ${processes} and finish the sweep`, 120),
-      consequence: `GC sends SIGTERM, then SIGKILL after a grace, to exactly the ${processes} listed, then finishes the sweep. A process that appears later is not touched: it gets its own card.`,
+      label: bounded(`Stop these ${processes} and finish the cleanup`, 120),
+      consequence: `The app asks exactly the ${processes} listed to stop, forces the ones that do not after a short grace, then finishes the cleanup. A process that starts later is not touched: it gets its own card.`,
     }],
+    ifNothing: 'If you do nothing, the cleanup stays paused and nothing in that folder is removed.',
     discussion: false,
   });
-  return { title: `Worktree sweep paused: ${processes} still running in ${worktree.repoName}`, detail, decision };
+  return { title: `Cleanup paused: ${processes} still running in ${worktree.repoName}`, detail, decision };
 }

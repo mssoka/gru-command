@@ -805,13 +805,16 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
   it('a card the reconcile cannot post ends the record refused card-post-failed, so the request can be proposed again', async () => {
     const repo = makeFixtureRepo('oa-repost-fails');
     cleanupRepos.push(repo);
-    // A request id long enough to break the card's own 300/600-character bounds.
+    // A request id long enough to break the idempotency key's own bound.
     const requestId = `req-${'long-'.repeat(140)}`;
     expect(requestId.length).toBeGreaterThan(600);
     const h = await boot({ crashAt: ['record-written'] });
     await historicalLiveRequest(h, repo, 'job-c9', requestId);
     // The idempotency key is bounded to 128 characters, the request id is not.
-    const keyed = { idempotency_key: 'key-long-request-id' };
+    // The card's face is checked too (#570), so a reason written in internal
+    // vocabulary is a card that can never be posted — the record ends refused
+    // instead of retrying forever.
+    const keyed = { idempotency_key: 'key-long-request-id', reason: 'the lane vanished mid-run' };
     expect((await propose(h, requestId, keyed)).status).toBe(400);
     const [id] = h.ledger.listActiveOwnerApprovalIds();
     expect(h.ledger.getOwnerApproval(id!)).toMatchObject({ state: 'proposed' });
@@ -828,7 +831,7 @@ describe('owner approval — crash windows finish on reconcile, never twice', ()
     expect(h.ledger.listActiveOwnerApprovalIds()).toEqual([]);
     expect(approvalCards(h)).toEqual([]);
     // Not wedged: a new proposal is not answered owner_approval_pending.
-    const again = await propose(h, requestId, { idempotency_key: 'key-long-second-try' });
+    const again = await propose(h, requestId, { idempotency_key: 'key-long-second-try', reason: 'the lane vanished mid-run' });
     expect(again.status).toBe(201);
     expect(createdApproval(again)).toMatchObject({ state: 'refused', outcome: { refusal: { code: 'card-post-failed' } } });
     expect(abandonmentEvents(h)).toEqual([]);
@@ -1319,24 +1322,27 @@ describe('owner approval — the card the owner answers', () => {
       kind: DIRECTIVE_ABANDON_CARD_KIND,
       routing: 'needs-owner',
       severity: 'error',
-      title: 'Abandon directive request req-f1?',
+      title: 'A directive may never have finished — give up on it?',
       agentId: null,
       decidedAt: null,
       resolvedAt: null,
     });
     expect(card.decision).toMatchObject({
-      question: 'Abandon directive request req-f1 as outcome-unknown?',
-      recommendation: null,
+      question: 'Give up on this directive?',
+      recommendation: expect.stringMatching(/^No recommendation — either choice is fine/u),
+      ifNothing: 'If you do nothing, the request stays exactly as it is: nothing is closed and nothing is re-run.',
       reservedClass: 'destructive',
-      whyNotDelegable: 'Abandonment is owner-reserved: only the owner may close a request whose producer custody is unknown.',
+      whyNotDelegable: 'Only the owner may close a request when the app cannot prove what became of it.',
       discussion: false,
     });
-    expect(card.decision?.context).toBe(`Request req-f1 on job job-f1 (dispatching). Reason: ${reason.slice(0, 200)}`);
+    // The ids, the state and the bound facts are evidence (#570): the face
+    // states the reason in the owner's words.
+    expect(card.decision?.context).toBe(`Gru cannot tell whether this directive finished what it started. Gru's reason: ${reason.slice(0, 200)}`);
     expect([...card.decision!.context].length).toBeLessThanOrEqual(600);
     expect(card.decision?.options.map((option) => option.id)).toEqual(['approve', 'deny']);
     expect(card.decision?.options[0]).toEqual({ id: 'approve', label: 'Approve',
-      consequence: 'Closes the request as outcome-unknown. Nothing is replayed. No completion, no-effect or cessation is recorded. ' +
-        "The job's status is unchanged. The lane stays held until the job is binned or fresh owner-accepted work is admitted there." });
+      consequence: 'Closes the request as never-proved. Nothing is re-run and no completion is recorded. ' +
+        "The job keeps its status, and its workspace stays held until the job is closed or new approved work is admitted there." });
     expect(card.decision?.options[1]).toEqual({ id: 'deny', label: 'Deny', consequence: 'Nothing runs. The request stays as it is.' });
     for (const option of card.decision!.options) expect([...option.consequence].length).toBeLessThanOrEqual(400);
     expect(card.detail).toContain(`Reason: ${reason}`);

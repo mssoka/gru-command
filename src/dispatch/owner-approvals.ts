@@ -63,9 +63,9 @@ const REASON_EXCERPT_CHARS = 200;
 const ERROR_MESSAGE_CHARS = 300;
 const BODY_LIMIT_BYTES = 64 * 1024;
 
-const WHY_NOT_DELEGABLE = 'Abandonment is owner-reserved: only the owner may close a request whose producer custody is unknown.';
-const APPROVE_CONSEQUENCE = 'Closes the request as outcome-unknown. Nothing is replayed. No completion, no-effect or cessation is recorded. ' +
-  "The job's status is unchanged. The lane stays held until the job is binned or fresh owner-accepted work is admitted there.";
+const WHY_NOT_DELEGABLE = 'Only the owner may close a request when the app cannot prove what became of it.';
+const APPROVE_CONSEQUENCE = 'Closes the request as never-proved. Nothing is re-run and no completion is recorded. ' +
+  "The job keeps its status, and its workspace stays held until the job is closed or new approved work is admitted there.";
 const DENY_CONSEQUENCE = 'Nothing runs. The request stays as it is.';
 
 /** The steps a crash can follow; the test seam names them. */
@@ -236,17 +236,20 @@ export function isTransientCardPostFailure(error: unknown): boolean {
 
 /** The card's decision for a record, built from its stored facts alone. */
 function cardDecision(record: OwnerApprovalRecord): NotificationDecision {
-  const prefix = `Request ${record.requestId} on job ${record.jobId} (${record.fences.state}). Reason: `;
+  // Plain language (issue #570): the request id, the job id and the bound
+  // facts are evidence, so they stay in the card's `detail`.
+  const reason = [...record.reason].slice(0, REASON_EXCERPT_CHARS).join('');
   return {
-    question: `Abandon directive request ${record.requestId} as outcome-unknown?`,
-    context: `${prefix}${[...record.reason].slice(0, REASON_EXCERPT_CHARS).join('')}`,
-    recommendation: null,
+    question: 'Give up on this directive?',
+    context: `Gru cannot tell whether this directive finished what it started. Gru's reason: ${reason}`,
+    recommendation: 'No recommendation — either choice is fine, because only you can weigh re-running a request that may already have taken effect against leaving one that may never run again.',
     reservedClass: 'destructive',
     whyNotDelegable: WHY_NOT_DELEGABLE,
     options: [
       { id: 'approve', label: 'Approve', consequence: APPROVE_CONSEQUENCE },
       { id: 'deny', label: 'Deny', consequence: DENY_CONSEQUENCE },
     ],
+    ifNothing: 'If you do nothing, the request stays exactly as it is: nothing is closed and nothing is re-run.',
     discussion: false,
   };
 }
@@ -520,7 +523,7 @@ export function createOwnerApprovalService(deps: OwnerApprovalServiceDeps): Owne
       kind: DIRECTIVE_ABANDON_CARD_KIND,
       routing: 'needs-owner',
       severity: 'error',
-      title: `Abandon directive request ${record.requestId}?`,
+      title: 'A directive may never have finished — give up on it?',
       detail: cardDetail(record),
       decision: cardDecision(record),
     });

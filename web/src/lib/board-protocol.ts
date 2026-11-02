@@ -167,6 +167,9 @@ export interface NotificationDecisionView {
   readonly question: string;
   readonly context: string;
   readonly recommendation: string | null;
+  /** What happens if the owner does nothing (absent on pre-upgrade rows; a
+   * card with no line invents none). */
+  readonly ifNothing?: string | null;
   readonly reservedClass: string;
   readonly whyNotDelegable: string;
   readonly options: readonly NotificationDecisionOptionView[];
@@ -179,6 +182,7 @@ export function isNotificationDecisionView(value: unknown): value is Notificatio
     typeof value.question === 'string' &&
     typeof value.context === 'string' &&
     (value.recommendation === null || typeof value.recommendation === 'string') &&
+    (value.ifNothing === undefined || value.ifNothing === null || typeof value.ifNothing === 'string') &&
     typeof value.reservedClass === 'string' &&
     typeof value.whyNotDelegable === 'string' &&
     typeof value.discussion === 'boolean' &&
