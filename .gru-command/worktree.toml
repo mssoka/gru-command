@@ -1341,15 +1341,16 @@ custody-red = 'set -e; root="$PWD"; base=ccd6337fb629f3fc69bea725d06873733b36318
 # heavy restart suite and the R14 native inspector read dist/), then runs the
 # owner-approval suites, the routes the mechanism reuses (retirement, board,
 # notification decisions, shutdown), the schema/suite/roles pins, the heavy
-# restart suite and the web client's owner actor; `gc-565-static` is the lint +
-# typecheck + build gate; `gc-565-red` proves a converted action's case fails BY
-# ASSERTION on the base 5a4015d3 — the FINAL test file over a `git archive` of
-# the base, node_modules symlinked, approved RPC patch first, the JSON report
-# classified by tools/assert-named-red-baseline.mjs (a collection/setup/import
-# failure, a green case or a missing title exits 2), and a non-zero exit by
-# design. The file imports only modules the base exports, so it collects there;
-# the case fails at its first assertion, the proposal's own status.
-gc-565-focused = "npm run build && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/directive-retirement.test.ts test/roles-gru.test.ts test/board-engine.test.ts test/notification-decisions.test.ts test/restart-recovery-schema.test.ts test/ledger-db.test.ts test/ledger-api.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/service-shutdown.test.ts && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-client.test.ts src/lib/board-protocol.test.ts src/ui/board.test.ts"
+# restart and shutdown suites and the web client's owner actor; `gc-565-static`
+# is the lint + typecheck + build gate; `gc-565-red` proves a converted action's
+# case fails BY ASSERTION on the base 5a4015d3 — the FINAL test file over a
+# `git archive` of the base, node_modules symlinked, approved RPC patch first,
+# the JSON report classified by tools/assert-named-red-baseline.mjs (a
+# collection/setup/import failure, a green case or a missing title exits 2), and
+# a non-zero exit by design. The file imports only modules the base exports, so
+# it collects there; the case fails at its first assertion, the proposal's own
+# status.
+gc-565-focused = "npm run build && npx vitest run test/owner-approvals.test.ts test/owner-approval-text.test.ts test/directive-retirement.test.ts test/roles-gru.test.ts test/board-engine.test.ts test/notification-decisions.test.ts test/restart-recovery-schema.test.ts test/ledger-db.test.ts test/ledger-api.test.ts test/suite-shape.test.ts test/test-budgets.test.ts test/service-shutdown.test.ts && npx vitest run --config vitest.heavy.config.ts test/restart-recovery-progress.test.ts test/shutdown.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-client.test.ts src/lib/board-protocol.test.ts src/ui/board.test.ts"
 gc-565-static = "npm run lint && npm run typecheck && npm run build"
 gc-565-red = 'set -e; root="$PWD"; base=5a4015d38523462ecfb2df99b14e1a3913980d65; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc565-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/owner-approvals.test.ts > "$d/test/owner-approvals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-565-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-565-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/owner-approvals.test.ts -t "abandons the marker generation once and closes the card with what happened"; a=$?; set -e; echo "gc-565-red vitest exit=$a EXPECTED-NONZERO: the base has no re-brief approval kind, so the converted action cannot be proposed"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: the re-brief approval case passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-565 "$d/results.json" "owner approval — re-brief marker abandonment abandons the marker generation once and closes the card with what happened" || exit 2; echo "EXPECTED-NONZERO: the re-brief marker abandonment case REDs by behavioral assertion on the base"; exit 1'
 # #523 owner approval of abandonment: the service, its ledger table, the
