@@ -80,7 +80,7 @@ const DENY_CONSEQUENCE_DIRECTIVE = 'Nothing runs. The request stays as it is.';
 const DENY_CONSEQUENCE_REBRIEF = 'Nothing runs. The re-brief stays as it is.';
 const DENY_CONSEQUENCE_RESOLUTION = 'Nothing is recorded. The recovery item stays exactly as it is.';
 const DENY_CONSEQUENCE_STOP = 'Nothing is settled. The stop stays exactly as it is.';
-const WHY_NOT_DELEGABLE_DIRECTIVE = 'Only you may close a request when the app cannot prove what became of it.';
+const WHY_NOT_DELEGABLE_DIRECTIVE = 'Only the owner may close a request when the app cannot prove what became of it.';
 const APPROVE_CONSEQUENCE_DIRECTIVE = 'Closes the request as never-proved. Nothing is re-run and no completion is recorded. ' +
   'The job keeps its status, and its workspace stays held until the job is closed or new approved work is admitted there.';
 const WHY_NOT_DELEGABLE_REBRIEF = 'Only you may close a re-brief when the app cannot prove what became of it.';
