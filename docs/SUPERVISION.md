@@ -178,10 +178,11 @@ bound.
 **A clock gap is not a hang, but sleep and an event-loop stall are told
 apart.** A watchdog tick separated from the previous one by a gap beyond
 the tick cadence is not hang evidence: nothing could run. The supervisor
-reads two clocks. When the wall clock advanced by the gap and the
-monotonic clock did not (a Linux suspend pauses `CLOCK_MONOTONIC`), the
-machine slept. When both advanced by the gap — a macOS sleep, where every
-Node clock keeps counting through sleep, or an event-loop stall — the OS
+reads two clocks. When the clocks disagree by at least the wake threshold,
+the machine slept (a Linux suspend pauses `CLOCK_MONOTONIC` while the wall
+clock keeps counting). When they disagree by less than the threshold — a
+macOS sleep, where every Node clock keeps counting through sleep, or an
+event-loop stall — the OS
 settles it: the macOS kernel's last wake (`kern.waketime`, read within one
 second) after the previous tick proves a suspend. Both cases grant every
 open turn a fresh silence window **once, before the classification**, so

@@ -1447,7 +1447,8 @@ export class Supervisor {
     this.lastTickWallAt = wall;
     this.lastTickMonotonicAt = mono;
     if (previousWall === null || previousMono === null) return;
-    // Clamped at 0: a backwards clock is never stall (or sleep) evidence.
+    // Clamped at 0: a backwards clock is never evidence of a gap, so it can
+    // neither claim a stall nor fake the disagreement that means a suspend.
     const wallGap = Math.max(0, wall - previousWall);
     const monotonicGap = Math.max(0, mono - previousMono);
     const threshold = Math.max(this.tickMs * 4, WAKE_GAP_MIN_MS);

@@ -5567,6 +5567,34 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.dispose();
   });
 
+  it('A2c: a below-threshold clock disagreement is classified by evidence, not by the sleep rule (#569)', async () => {
+    // A sleep plus a short stall (wall 40 s, monotonic 15 s) disagrees by 25 s:
+    // not enough to call it a suspend, so the evidence decides either way.
+    for (const suspended of [true, false] as const) {
+      let wallMs = 5_000_000;
+      let monoMs = 1_000;
+      const h = boot(undefined, {
+        wallNow: () => wallMs,
+        monotonicNow: () => monoMs,
+        suspendEvidence: async () => suspended,
+      });
+      const handle = new FakeHandle('minion', `minion-mixed-${String(suspended)}`, null);
+      h.registry.adopt(handle);
+      hang(handle);
+      h.advance(1);
+      wallMs += 40_000;
+      monoMs += 15_000;
+      h.advance(1);
+      const expected = suspended ? 'supervision.wake' : 'supervision.loop-stall';
+      const other = suspended ? 'supervision.loop-stall' : 'supervision.wake';
+      await vi.waitFor(() => {
+        expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === expected)).toBe(true);
+      }, { timeout: 5_000 });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === other)).toBe(false);
+      h.dispose();
+    }
+  });
+
   it('A4: a sub-threshold gap records nothing and asks the OS nothing (#569)', async () => {
     let wallMs = 5_000_000;
     let monoMs = 1_000;
