@@ -175,12 +175,28 @@ tool round, directly after the user entry or on another compaction, and a
 compaction after the terminal followed by a prompt that is not durably
 bound.
 
-**Sleep/wake is not a hang.** A watchdog tick separated from the
-previous one by a wall-clock gap beyond the tick cadence means the
-machine was suspended; every open turn gets a fresh silence window, a
-`supervision.wake` ledger event records the gap, and an FYI notification
-names the affected lanes (job, branch, phase). Nothing is restarted on
-wake.
+**A clock gap is not a hang, but sleep and an event-loop stall are told
+apart.** A watchdog tick separated from the previous one by a gap beyond
+the tick cadence is not hang evidence: nothing could run. The supervisor
+reads two clocks. When the clocks disagree by at least the wake threshold,
+the machine slept (a Linux suspend pauses `CLOCK_MONOTONIC` while the wall
+clock keeps counting). When they disagree by less than the threshold — a
+macOS sleep, where every Node clock keeps counting through sleep, or an
+event-loop stall — the OS
+settles it: the macOS kernel's last wake (`kern.waketime`, read within one
+second) after the previous tick proves a suspend. Both cases grant every
+open turn a fresh silence window **once, before the classification**, so
+the evidence lookup never delays recovery and nothing is restarted. A
+sleep then records a `supervision.wake` ledger event and an FYI naming the
+affected lanes (job, branch, phase). A stall — no suspend evidence, on any
+OS, and unreadable evidence reads as none — records a
+`supervision.loop-stall` event (`gap_ms`, `monotonic_gap_ms`) and one FYI
+per clock hour, id `supervision.loop-stall.<YYYYMMDDThh>`, titled `Service
+event loop stalled N times, longest X s, this hour`. The count only rises
+inside the process that created the row, a row a previous process posted
+for the same hour is never lowered after a restart, and a resolved row
+keeps the count it had. A gap whose clocks disagree by less than the
+threshold is classified by evidence, not by the sleep rule.
 
 **Interrupted turns are resumed, never silently orphaned.** Before a
 restart rung (or a wall stop / breaker trip) kills an open turn, the

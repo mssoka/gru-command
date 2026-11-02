@@ -2638,6 +2638,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/runtime/spawn-registration.js",
   "dist/runtime/disposal-observation.js",
   "dist/runtime/stream-json.js",
+  "dist/runtime/suspend-evidence.js",
   "dist/runtime/tool-heartbeat.js",
   "dist/runtime/types.js",
   "dist/runtime/worker-errors.js",

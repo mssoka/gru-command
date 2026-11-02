@@ -24,6 +24,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 const { parseKernWaketime, readKernWaketime } = await import('../src/dispatch/perkins-review/artifacts.js');
+const { readSuspendedSince } = await import('../src/runtime/suspend-evidence.js');
 
 describe('macOS kernel wake reader at its subprocess boundary', () => {
   it('runs /usr/sbin/sysctl by absolute path with the bound and SIGKILL, and its answer parses', async () => {
@@ -33,5 +34,36 @@ describe('macOS kernel wake reader at its subprocess boundary', () => {
     ]);
     expect(parseKernWaketime(output)).toBe(1_790_944_289_208);
     expect(typeof promisify).toBe('function');
+  });
+});
+
+describe('suspend evidence decision (#569)', () => {
+  const darwin = (output: string) => ({ platform: 'darwin' as const, readWake: async () => output });
+  const wake = '{ sec = 1790944289, usec = 208542 }\n';
+
+  it('proves a macOS suspend when the kernel last wake is after the gap start', async () => {
+    expect(await readSuspendedSince(1_000, darwin(wake))).toBe(true);
+  });
+
+  it('is no suspend when the kernel last wake is at or before the gap start', async () => {
+    expect(await readSuspendedSince(1_790_944_289_208, darwin(wake))).toBe(false);
+    expect(await readSuspendedSince(1_790_944_289_209, darwin(wake))).toBe(false);
+  });
+
+  it('never asks the OS off macOS: the monotonic clock decides there', async () => {
+    const before = calls.length;
+    let asked = 0;
+    const suspended = await readSuspendedSince(0, {
+      platform: 'linux',
+      readWake: async () => { asked += 1; return wake; },
+    });
+    expect(suspended).toBe(false);
+    expect(asked).toBe(0);
+    expect(calls).toHaveLength(before);
+  });
+
+  it('reads unreadable or malformed evidence as no suspend', async () => {
+    expect(await readSuspendedSince(0, { platform: 'darwin', readWake: async () => { throw new Error('missing'); } })).toBe(false);
+    expect(await readSuspendedSince(0, darwin('not a waketime'))).toBe(false);
   });
 });

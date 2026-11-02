@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 import { repositoryGitEnv } from '../../git-env.js';
+import { parseKernWaketime, readKernWaketime, SUSPEND_EVIDENCE_TIMEOUT_MS } from '../../runtime/suspend-evidence.js';
 import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
 import {
   freezeEvidenceAttachments,
@@ -19,6 +20,12 @@ import {
   type FrozenEvidenceRuntimeAttachment,
   type ReviewEvidenceRequest,
 } from '../../review-inputs/evidence.js';
+
+/** The macOS kernel-wake reader and its parser live in the neutral
+ * `runtime/suspend-evidence` module, which the supervisor's clock-gap
+ * classification reads too (#569); re-exported here so every admission call
+ * site and test keeps importing the evidence from the probe it serves. */
+export { parseKernWaketime, readKernWaketime };
 
 const GIT_MAX_BUFFER = 128 * 1024 * 1024;
 export const FROZEN_DIFF_MAX_BYTES = 8 * 1024 * 1024;
@@ -1521,8 +1528,9 @@ export interface AdmissionProbeSeams {
  * decision 2026-10-07, round 3: a separate, bounded allowance — the probe's
  * own budget is usually what the suspend spent, so the evidence cannot be
  * made to fit inside it). Git never gets a renewed budget without positive
- * evidence. */
-export const SUSPEND_EVIDENCE_ALLOWANCE_MS = 1_000;
+ * evidence. One constant with the shared reader: the supervisor's clock-gap
+ * classification (#569) spends the same allowance. */
+export const SUSPEND_EVIDENCE_ALLOWANCE_MS = SUSPEND_EVIDENCE_TIMEOUT_MS;
 
 /** Whole milliseconds left for the next git step, or null once the budget
  * is spent. execFile rejects a fractional timeout (ERR_OUT_OF_RANGE), and
@@ -1538,13 +1546,6 @@ export function remainingTimeoutMs(deadline: number, now: number): number | null
  * anything it spawned can hold admission open or overlap a retry. */
 export const defaultProbeExec = (repoPath: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<string> =>
   runOwnedGit(repoPath, args, timeoutMs, PROBE_MAX_OUTPUT_BYTES, signal);
-
-/** `sysctl -n kern.waketime` by absolute path — the service's PATH need
- * not include /usr/sbin. */
-export const readKernWaketime = async (timeoutMs: number): Promise<string> =>
-  (await execFileAsPromised('/usr/sbin/sysctl', ['-n', 'kern.waketime'], {
-    encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL',
-  })).stdout;
 
 /** Linux CLOCK_BOOTTIME in ms from `/proc/uptime` text (its first field,
  * seconds, keeps counting through suspend, unlike Node's CLOCK_MONOTONIC).
@@ -1564,12 +1565,6 @@ async function bootClockMs(io: SuspendEvidenceIo, now: () => number, deadline?: 
   } catch {
     return null;
   }
-}
-
-/** Parse `sysctl -n kern.waketime` ("{ sec = 1790944289, usec = 208542 } …"). */
-export function parseKernWaketime(output: string): number | null {
-  const match = /sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/u.exec(output);
-  return match === null ? null : Number(match[1]) * 1000 + Math.floor(Number(match[2]) / 1000);
 }
 
 const OS_EVIDENCE: SuspendEvidenceIo = {

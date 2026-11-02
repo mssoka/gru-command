@@ -92,15 +92,17 @@ describe('prune-stale-dist', () => {
     // closeout (dist/dispatch/canceled-request-closeout.js and its ledger
     // persistence, dist/ledger/closeouts.js); #519 the GitLab merge-request
     // read behind a native round's CI evidence
-    // (dist/dispatch/perkins-review/gitlab-mr-read.js). #521 replaced the installed
+    // (dist/dispatch/perkins-review/gitlab-mr-read.js); and #569 the shared OS
+    // suspend evidence the supervisor's clock-gap classification and the
+    // admission probe both read (dist/runtime/suspend-evidence.js). #521 replaced the installed
     // part with the pi 1.4 closure (pi-coding-agent and pi-ai 1.4.0 with
     // their pi-agent-core, pi-mcp, pi-codemode, pi-tui and pi-telemetry
     // packages): 151 catalogued names (142 of them ship executable files; the
     // rest are peers, optionals and type-only packages), from which the 0.85.1
     // shrinkwrap's esbuild, clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5304);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5305);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('711db6484fc3ca302221863da3e103e66904422585010add48b4a539193cc80b');
+      .toBe('dcd1cb41190bcc5b3e156f49c98624434491c39b86651c487e4d2c494db3cbd1');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

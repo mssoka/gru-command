@@ -35,6 +35,7 @@ import { surfaceDirectiveRecovery } from '../dispatch/directive-progress.js';
 import { observeDisposalSettlement } from '../runtime/disposal-observation.js';
 import { classifyProviderRejection } from '../provider-recovery/classify.js';
 import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDebt } from './restart-cleanup.js';
+import { readSuspendedSince } from '../runtime/suspend-evidence.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -98,9 +99,13 @@ export interface SupervisorRegistry {
  *   runtimes emit long-tool heartbeats (tool_update) and expose a
  *   live-process probe; supervision consults both and fails toward NOT
  *   killing a live process.
- * - A wall-clock gap between watchdog ticks means the machine slept:
- *   silence accrued while nothing could run, so every open turn gets a
- *   fresh window instead of a restart.
+ * - A wall-clock gap between watchdog ticks beyond the tick cadence is not
+ *   hang evidence: silence accrued while nothing could run. When the clocks
+ *   disagree (a Linux suspend pauses the monotonic clock) the machine slept;
+ *   when they agree it is either a macOS sleep (every Node clock keeps
+ *   counting there) or a stalled event loop, and the OS decides. Either way
+ *   every open turn gets a fresh window before the classification; only a
+ *   stall leaves a `supervision.loop-stall` record and an hourly FYI.
  * - A restart that kills an open turn snapshots the pending prompt and
  *   re-delivers it on the resumed session; when no snapshot is possible
  *   it posts a durable action-required recoverable-lane note.
@@ -112,9 +117,9 @@ export interface SupervisorRegistry {
 
 export type SupervisionState = 'watching' | 'restarting' | 'stopped';
 
-/** A tick gap at least this large (beyond jitter) means the process or
- * the whole machine was suspended — silence accrued while NOTHING could
- * run, so it is not hang evidence. */
+/** A tick gap at least this large (beyond jitter) is not hang evidence:
+ * silence accrued while NOTHING could run. The clocks' disagreement then
+ * says whether the machine slept or this process's event loop stalled. */
 const WAKE_GAP_MIN_MS = 30_000;
 
 /** Per-agent supervision view (board + /health). */
@@ -440,6 +445,15 @@ export interface SupervisorOptions {
   /** Test seam: wall clock used only for sleep/wake gap detection
    * (default Date.now; the `now` seam is free to be a fake clock). */
   readonly wallNow?: () => number;
+  /** Test seam: monotonic clock (default performance.now). A Linux
+   * (CLOCK_MONOTONIC) clock stops across OS suspend while the wall clock
+   * keeps counting; a macOS one keeps counting too (see suspendEvidence). */
+  readonly monotonicNow?: () => number;
+  /** Test seam: OS evidence that the machine suspended after `sinceWallMs`
+   * (the previous tick's wall clock). Default: the macOS kernel last-wake;
+   * false where the monotonic clock already decides (Linux) and when the
+   * evidence is unreadable. */
+  readonly suspendEvidence?: (sinceWallMs: number) => Promise<boolean>;
   /** Resolved rate-limit automatic retry policy (owner heist 2026-09-29);
    * null/omitted = feature off — the failure keeps its current ladder
    * behavior (stop for provider walls, nothing for other in-band errors). */
@@ -495,6 +509,8 @@ export class Supervisor {
   private readonly log: Log;
   private readonly now: () => number;
   private readonly wallNow: () => number;
+  private readonly monotonicNow: () => number;
+  private readonly suspendEvidence: (sinceWallMs: number) => Promise<boolean>;
   private readonly rateLimitBackoff: RateLimitBackoffPolicy | null;
   private readonly workerGate: PacingGate | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -535,6 +551,13 @@ export class Supervisor {
   private ticker: ReturnType<typeof setInterval> | null = null;
   /** Wall-clock of the previous watchdog tick (sleep/wake detection). */
   private lastTickWallAt: number | null = null;
+  /** Monotonic clock of the previous watchdog tick (gap classification). */
+  private lastTickMonotonicAt: number | null = null;
+  /** Serial chain of the evidence lookups a tick gap starts: one OS read at
+   * a time, and a rejection can never escape as an unhandled one. */
+  private gapClassification: Promise<void> = Promise.resolve();
+  /** The clock hour this process is aggregating stalls for (the hourly FYI). */
+  private stallHour: { key: string; notificationId: string; count: number; longestMs: number; owned: boolean } | null = null;
   private disposed = false;
   /** The boot settlement of a previous process's open turns ran (once per process). */
   private hostAbsentSettled = false;
@@ -550,6 +573,8 @@ export class Supervisor {
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? Date.now;
     this.wallNow = opts.wallNow ?? Date.now;
+    this.monotonicNow = opts.monotonicNow ?? (() => performance.now());
+    this.suspendEvidence = opts.suspendEvidence ?? readSuspendedSince;
     this.rateLimitBackoff = opts.rateLimitBackoff ?? null;
     this.workerGate = opts.workerGate;
     this.sleep = opts.sleep ?? defaultSleep;
@@ -1402,19 +1427,59 @@ export class Supervisor {
   }
 
   /**
-   * Sleep/wake (E7 follow-up): a watchdog tick separated from the previous
-   * one by a wall-clock gap far beyond the tick cadence means the process
-   * was suspended — laptop lid closed, system sleep. Silence accrued while
-   * NOTHING could run, so it is not hang evidence: grant every open turn a
-   * fresh silence window and leave a durable lane signal, never a restart.
+   * Clock gaps (E7 follow-up, #569): a watchdog tick separated from the
+   * previous one by a gap far beyond the tick cadence is not hang evidence —
+   * silence accrued while NOTHING could run. The two clocks say which case
+   * it was: a Linux suspend pauses the monotonic clock, so a disagreeing wall
+   * clock is a system sleep; agreeing clocks are either a macOS sleep (every
+   * Node clock keeps counting there) or a stalled event loop, and the OS
+   * evidence decides. The grace for open turns is granted ONCE, before the
+   * classification, so the evidence lookup never delays recovery; it only
+   * decides the record: a durable `supervision.wake` lane signal for a
+   * sleep, a `supervision.loop-stall` record and the hourly stall FYI for a
+   * stall. Nothing here restarts an open turn.
    */
   private detectWake(now: number): void {
     const wall = this.wallNow();
-    const previous = this.lastTickWallAt;
+    const mono = this.monotonicNow();
+    const previousWall = this.lastTickWallAt;
+    const previousMono = this.lastTickMonotonicAt;
     this.lastTickWallAt = wall;
-    if (previous === null) return;
-    const gap = wall - previous;
-    if (gap < Math.max(this.tickMs * 4, WAKE_GAP_MIN_MS)) return;
+    this.lastTickMonotonicAt = mono;
+    if (previousWall === null || previousMono === null) return;
+    // Clamped at 0: a backwards clock is never evidence of a gap, so it can
+    // neither claim a stall nor fake the disagreement that means a suspend.
+    const wallGap = Math.max(0, wall - previousWall);
+    const monotonicGap = Math.max(0, mono - previousMono);
+    const threshold = Math.max(this.tickMs * 4, WAKE_GAP_MIN_MS);
+    if (wallGap < threshold) return;
+    const affected = this.grantWakeGrace(now);
+    // `>=` keeps the base behaviour at an exact threshold gap: the clocks
+    // disagreeing by the whole gap means the monotonic clock never advanced
+    // through it, which is a suspend, not a stall.
+    if (wallGap - monotonicGap >= threshold) {
+      this.recordSleep(wallGap, affected);
+      return;
+    }
+    this.gapClassification = this.gapClassification
+      .then(async () => {
+        if (this.disposed) return;
+        let suspended = false;
+        try {
+          suspended = await this.suspendEvidence(previousWall);
+        } catch {
+          suspended = false; // no evidence is a stall: a stall is visible, a sleep is not
+        }
+        if (this.disposed) return;
+        if (suspended) this.recordSleep(wallGap, affected);
+        else this.recordStall(wall, wallGap, monotonicGap);
+      })
+      .catch((error) => this.log('warn', 'clock-gap classification failed', { error: String(error) }));
+  }
+
+  /** Fresh silence window for every open turn after a gap that could not run
+   * the work: silence across it is not hang evidence. */
+  private grantWakeGrace(now: number): SupervisedAgent[] {
     const affected: SupervisedAgent[] = [];
     for (const agent of this.agents.values()) {
       if (agent.handle === null || agent.state !== 'watching') continue;
@@ -1423,12 +1488,19 @@ export class Supervisor {
       agent.activityGeneration += 1;
       affected.push(agent);
     }
+    return affected;
+  }
+
+  /** The machine slept across the gap: one log, one ledger event and one FYI
+   * naming the lanes. The grace already ran in detectWake — running it again
+   * here would reset the silence clock twice for one sleep. */
+  private recordSleep(gapMs: number, affected: readonly SupervisedAgent[]): void {
     this.log('warn', 'wall-clock gap detected (system sleep) — silence grace granted, no restarts', {
-      gap_ms: gap,
+      gap_ms: gapMs,
       agents: affected.map((agent) => agent.agentId),
     });
     this.recordEvent('supervision.wake', null, {
-      gap_ms: gap,
+      gap_ms: gapMs,
       agents: affected.map((agent) => agent.agentId),
     });
     if (affected.length > 0) {
@@ -1445,6 +1517,76 @@ export class Supervisor {
       } catch (error) {
         this.log('warn', 'wake lane signal could not be posted', { error: String(error) });
       }
+    }
+  }
+
+  /** This process's own work could not run across the gap: the machine did
+   * not sleep, so the silence is real and the service owes itself a record.
+   * The grace already ran — an open turn is not restarted for a gap nothing
+   * could observe. */
+  private recordStall(wallMs: number, gapMs: number, monotonicGapMs: number): void {
+    this.log('warn', 'event-loop stall detected', {
+      gap_ms: gapMs,
+      monotonic_gap_ms: monotonicGapMs,
+    });
+    this.recordEvent('supervision.loop-stall', null, {
+      gap_ms: gapMs,
+      monotonic_gap_ms: monotonicGapMs,
+    });
+    this.postStallFyi(wallMs, gapMs);
+  }
+
+  /**
+   * One FYI per clock hour, updated in place: a lane is not told about each
+   * stall separately, and the row is postable regardless of open turns
+   * because a stall is service-wide. The deterministic id makes the hour's
+   * row restart-safe: a row this process created is raised to the latest
+   * count and longest gap, a row a previous process created this hour is
+   * never lowered, and a row the owner already resolved keeps its count.
+   */
+  private postStallFyi(wallMs: number, gapMs: number): void {
+    const key = new Date(wallMs).toISOString().slice(0, 13);
+    if (this.stallHour === null || this.stallHour.key !== key) {
+      this.stallHour = {
+        key,
+        notificationId: `supervision.loop-stall.${key.replace(/[-:]/gu, '')}`,
+        count: 0,
+        longestMs: 0,
+        owned: false,
+      };
+    }
+    const hour = this.stallHour;
+    hour.count += 1;
+    hour.longestMs = Math.max(hour.longestMs, gapMs);
+    const title =
+      `Service event loop stalled ${hour.count} time${hour.count === 1 ? '' : 's'}, ` +
+      `longest ${Math.round(hour.longestMs / 1_000)} s, this hour`;
+    const detail =
+      `The service could not run its own work for ${Math.round(gapMs / 1_000)} s and kept no ` +
+      'clock disagreement longer than that, so the machine did not sleep: its event loop was ' +
+      'blocked. Open turns got a fresh silence window and were not restarted. This row aggregates ' +
+      'every event-loop stall of this clock hour — ' +
+      `${hour.count} so far, longest ${Math.round(hour.longestMs / 1_000)} s.`;
+    try {
+      const existed = this.ledger.getNotification(hour.notificationId) !== null;
+      if (!existed) {
+        this.notifications.post({
+          id: hour.notificationId,
+          kind: 'supervision.loop-stall',
+          routing: 'fyi',
+          severity: 'info',
+          title,
+          detail,
+        });
+        hour.owned = true;
+        return;
+      }
+      // Another process posted this hour's row: its counts are at least as
+      // high as this process's, so it is left exactly as it is.
+      if (!hour.owned) return;
+      this.ledger.updateNotificationDetail(hour.notificationId, detail, title);
+    } catch (error) {
+      this.log('warn', 'event-loop stall FYI could not be posted', { error: String(error) });
     }
   }
 
