@@ -902,14 +902,19 @@ describe('verification scheduler — global budget', () => {
     const pid = (records.find((record) => record.kind === 'verification.process-started')?.payload as { pid?: number })
       ?.pid as number;
     expect(groupAlive(pid)).toBe(true);
-    // The premise the base lacks: a per-job cancel seam at all. This is the
-    // assertion the fail-before leg REDs on.
-    expect(typeof scheduler.cancelJob).toBe('function');
 
-    const first = await scheduler.cancelJob('job-cancel', { by: 'owner', reason: 'lane parked' });
-    expect(first.state).toBe('stopped');
-    expect(first.runs).toHaveLength(1);
-    expect(first.runs[0]).toMatchObject({ state: 'stopped', detail: null });
+    // Two callers at once: the second joins the first — nothing is
+    // re-signalled, no second terminal lands.
+    const [first, joined] = await Promise.all([
+      scheduler.cancelJob('job-cancel', { by: 'owner', reason: 'lane parked' }),
+      scheduler.cancelJob('job-cancel', { by: 'owner', reason: 'lane parked' }),
+    ]);
+    for (const verdict of [first, joined]) {
+      expect(verdict.state).toBe('stopped');
+      expect(verdict.runs).toHaveLength(1);
+      expect(verdict.runs[0]).toMatchObject({ state: 'stopped', detail: null });
+      expect(verdict.detail).toBeNull();
+    }
 
     const outcome = await run;
     expect(outcome.ok).toBe(false);
@@ -931,10 +936,12 @@ describe('verification scheduler — global budget', () => {
     // A cancel is never verification evidence: nothing claims the suite passed.
     expect(records.some((record) => record.kind === 'verification.completed')).toBe(false);
 
-    // A second cancel joins: nothing is re-signalled and no second terminal lands.
+    // Once the run settled, a later cancel holds nothing: it claims nothing
+    // and writes no second terminal.
     expect(await scheduler.cancelJob('job-cancel', { by: 'owner', reason: 'lane parked' })).toEqual({
-      state: 'stopped',
+      state: 'unproven',
       runs: [],
+      detail: 'the scheduler holds no run it can prove gone',
     });
     expect(records.filter((record) => record.kind === 'verification.cancelled')).toHaveLength(1);
   });
@@ -1049,18 +1056,20 @@ describe('verification scheduler — global budget', () => {
     await holder.catch(() => {});
   });
 
-  it('a cancel that holds nothing reports stopped, and a disposed scheduler never claims one', async () => {
+  it('a cancel that holds nothing claims nothing, and a disposed scheduler never claims one', async () => {
     const { scheduler, records } = makeScheduler();
     scheduler.start();
-    // No ledger read: the scheduler holds nothing, so it claims nothing.
+    // No ledger read: the scheduler holds nothing, so it never claims a stop.
     expect(await scheduler.cancelJob('job-not-held', { by: 'owner', reason: 'lane parked' })).toEqual({
-      state: 'stopped',
+      state: 'unproven',
       runs: [],
+      detail: 'the scheduler holds no run it can prove gone',
     });
     await scheduler.dispose();
     expect(await scheduler.cancelJob('job-not-held', { by: 'owner', reason: 'lane parked' })).toEqual({
       state: 'unproven',
       runs: [],
+      detail: 'the verification scheduler is shutting down — it holds no run it can prove gone',
     });
     expect(records.some((record) => record.kind === 'verification.cancelled')).toBe(false);
   });

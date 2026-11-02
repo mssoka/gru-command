@@ -258,10 +258,23 @@ export interface VerificationCancelRunOutcome {
   readonly detail: string | null;
 }
 
-/** The job-level answer: `stopped` only when EVERY run it holds is stopped. */
+/** The job-level answer: `stopped` only when EVERY run it holds is stopped.
+ * `detail` is the owner-facing reason the verdict is `unproven` — the
+ * unproven runs' own details joined, or the reason the scheduler holds no
+ * run it can prove gone — and `null` for a `stopped` verdict. */
 export interface VerificationCancelJobOutcome {
   readonly state: 'stopped' | 'unproven';
   readonly runs: readonly VerificationCancelRunOutcome[];
+  readonly detail: string | null;
+}
+
+/** The stop pass's owner-facing reason: every unproven run's own detail,
+ * joined; `null` when every run the cancel answered for is proven gone. */
+function unprovenCancelDetail(runs: readonly VerificationCancelRunOutcome[]): string | null {
+  const details = runs.flatMap((run) =>
+    run.state === 'unproven' && run.detail !== null ? [run.detail] : [],
+  );
+  return details.length === 0 ? null : details.join('; ');
 }
 
 /**
@@ -583,6 +596,13 @@ const PERSISTED_TAIL_CHARS = 512;
  * soon as the group is gone, so only a resistant group spends this window —
  * and a pass cut short leaves its `requested` record for the next boot. */
 const CANCEL_SETTLE_MARGIN_MS = 2_000;
+/** Hard ceiling on a per-job cancel's whole TERM→KILL ladder plus its settle
+ * wait (issue #559), whichever of that and one kill grace is smaller. It sits
+ * under `JOB_STOP_JOIN_WAIT_MS` (5 s, `src/shutdown-budget.ts`) so the
+ * shutdown join always outlives the stop pass it awaits: a pass that outlasts
+ * the join leaves its `requested` record for the next boot's re-proof instead
+ * of running underneath a disposed scheduler. */
+const CANCEL_BOUND_MAX_MS = 4_500;
 /** Cadence of the process-group cessation probe while a cancel waits. */
 const GROUP_PROBE_INTERVAL_MS = 20;
 
@@ -944,27 +964,36 @@ export class VerificationScheduler {
    * The verdict is evidence, never intent: a run is `stopped` only when its
    * process group is proven gone (`kill(-pgid, 0)`, the timeout path's own
    * rule — a shell's exit is never proof its descendants died). A group that
-   * survives the SIGKILL, or a settle that outlasts the bound, is `unproven`
-   * with the live group named, and the run's record stays unsettled so a
-   * stop/bin verdict still refuses. A holder an earlier process minted is
-   * never signalled and never claimed: this process holds no authority over
-   * it. The scheduler has no ledger and reads none — a run this process does
-   * not hold is answered by holding nothing.
+   * survives the bound, or a settle that outlasts it, is `unproven` with the
+   * reason named, and the run's record stays unsettled so a stop/bin verdict
+   * still refuses. A holder this process does not own — one an earlier
+   * process minted, or a slot no in-flight attempt backs — is never
+   * signalled and never claimed, so it too is `unproven` with its own reason.
+   * The scheduler has no ledger and reads none: a run it does not hold is
+   * answered by holding nothing, which is never a claim that the run stopped.
    */
   async cancelJob(
     jobId: string,
     input: { readonly by: string; readonly reason: string },
   ): Promise<VerificationCancelJobOutcome> {
-    if (this.disposed) return { state: 'unproven', runs: [] };
+    if (this.disposed) {
+      return {
+        state: 'unproven',
+        runs: [],
+        detail: 'the verification scheduler is shutting down — it holds no run it can prove gone',
+      };
+    }
     const cancellation = { by: input.by, reason: input.reason };
     const attempts = [...this.attempts.values()].filter(
       (attempt) => attempt.spec.jobId === jobId && attempt.outcome === null,
     );
     const slots = [...this.slots.values()].filter((slot) => slot.lease.jobId === jobId);
     // Nothing held here: the scheduler cannot and must not read the ledger to
-    // find a run it never owned, so it makes no claim about one.
-    if (attempts.length === 0 && slots.length === 0) return { state: 'stopped', runs: [] };
-    const deadline = Date.now() + this.killGraceMs + CANCEL_SETTLE_MARGIN_MS;
+    // find a run it never owned, so it makes no claim about one — and holding
+    // nothing is never proof that a run stopped.
+    if (attempts.length === 0 && slots.length === 0) {
+      return { state: 'unproven', runs: [], detail: 'the scheduler holds no run it can prove gone' };
+    }
     const runs: VerificationCancelRunOutcome[] = [];
     const attemptRunIds = new Set(attempts.map((attempt) => attempt.runId));
     for (const slot of slots) {
@@ -972,13 +1001,36 @@ export class VerificationScheduler {
       runs.push({
         runId: slot.lease.runId,
         state: 'unproven',
-        detail:
-          'the run was started by an earlier process — this one holds no signal for its process group, so its stop is unproven',
+        detail: slot.owned
+          ? 'the run is granted but holds no in-flight attempt here — the scheduler holds no signal it can prove gone'
+          : 'the run was started by an earlier process — this one holds no signal for its process group, so its stop is unproven',
       });
     }
-    for (const attempt of attempts) runs.push(await this.cancelAttempt(attempt, cancellation, deadline));
+    // Each attempt gets its OWN bound and they run together: one job can hold
+    // several scopes, and a resistant group must not starve the next run.
+    runs.push(...(await Promise.all(
+      attempts.map((attempt) => this.cancelAttempt(attempt, cancellation, this.cancelDeadline())),
+    )));
     const state = runs.every((run) => run.state === 'stopped') ? 'stopped' : 'unproven';
-    return { state, runs };
+    return { state, runs, detail: unprovenCancelDetail(runs) };
+  }
+
+  /** One attempt's whole cancel bound: its TERM→KILL ladder and settle wait
+   * together stay under {@link CANCEL_BOUND_MAX_MS} and thus under the
+   * shutdown join that awaits the pass. */
+  private cancelDeadline(): number {
+    return Date.now() + Math.min(this.killGraceMs + CANCEL_SETTLE_MARGIN_MS, CANCEL_BOUND_MAX_MS);
+  }
+
+  /** What is left of a cancel bound; never negative. */
+  private cancelWaitMs(deadline: number): number {
+    return Math.max(0, deadline - Date.now());
+  }
+
+  /** One kill-grace phase, clamped to what is left of the cancel bound: a
+   * resistant group can never spend more than the bound even here. */
+  private cancelGraceMs(deadline: number): number {
+    return Math.min(this.killGraceMs, this.cancelWaitMs(deadline));
   }
 
   /** Load persisted holders, release stale ones, start the sweep. Idempotent. */
@@ -1597,7 +1649,9 @@ export class VerificationScheduler {
       // A run still readying its lane (#427) stops readying it.
       attempt.cancel.abort();
       // An already-produced childless terminal outcome is not a no-start.
-      if (!attempt.started && attempt.outcome === null) this.settleNoStart(attempt);
+      // A run the owner already cancelled settles on its own terminal —
+      // `verification.cancelled` — never as a second shutdown `no-start`.
+      if (!attempt.started && attempt.outcome === null && attempt.cancellation === null) this.settleNoStart(attempt);
     }
     for (const waiter of this.waiters.splice(0)) {
       waiter.settled = true;
@@ -2194,23 +2248,26 @@ export class VerificationScheduler {
         waiter.reject(new VerificationCancelledError(cancellation.by, cancellation.reason));
       }
       const target = slot?.child ?? slot?.lastChild ?? null;
-      if (target !== null) {
+      // An absent group grants no authority over a reused number (the timeout
+      // path's own rule): signal only a group this run holds a child for or
+      // the probe shows alive.
+      if (target !== null && (slot?.child != null || processGroupAlive(target))) {
         signalGroup(target, 'SIGTERM');
-        if (!(await this.waitForGroupGone(target, this.killGraceMs))) {
+        if (!(await this.waitForGroupGone(target, this.cancelGraceMs(deadline)))) {
           // Shell exit is not group cessation: a TERM-resistant descendant
           // outlives its shell (the timeout path's own rule).
           signalGroup(target, 'SIGKILL');
-          await this.waitForGroupGone(target, this.killGraceMs);
+          await this.waitForGroupGone(target, this.cancelGraceMs(deadline));
         }
       }
     }
-    const settled = await settledWithin(attempt.promise, Math.max(0, deadline - Date.now()));
+    const settled = await settledWithin(attempt.promise, this.cancelWaitMs(deadline));
     // The proof is read AFTER the run settled, from the run's LAST group:
     // `execute()` holds its own terminal write until the same fact, so this
     // verdict and the recorded `process_group_gone` agree. A second cancel
     // joins here (it signals nothing) and reads the same proof.
     const lastChild = slot?.lastChild ?? null;
-    const gone = await this.waitForGroupGone(lastChild, Math.max(0, deadline - Date.now()));
+    const gone = await this.waitForGroupGone(lastChild, this.cancelWaitMs(deadline));
     if (settled && gone) return { runId: attempt.runId, state: 'stopped', detail: null };
     return {
       runId: attempt.runId,

@@ -513,6 +513,20 @@ verification budget.
   so history eviction and crash/restart never turn a completed or
   interrupted identity into `unknown`: it reports its terminal state and
   refuses a rerun — a re-verification mints a NEW request id.
+- **A stopping or binning lane ends its run on request.**
+  `POST /api/verify/cancel {job_id, by, reason}` is the same per-job cancel
+  the stop pass uses: a queued wait is dropped, a run still readying its lane
+  never spawns, and a running one gets SIGTERM to its whole process group
+  and then SIGKILL after the kill grace. The answer is evidence, never
+  intent — `stopped` only when `kill(-pgid, 0)` proves the group gone;
+  `unproven`, with the reason, for a group that survives the bound, a
+  settle that outlasts it, a holder this process cannot signal, or nothing
+  held at all. The run is recorded once as `verification.cancelled` (never
+  `verification.completed`), and only a proven-gone row settles it for the
+  stop and bin gates. The route accepts a lane whose latest stop pass is
+  `requested`/`unproven`, a lane with an active closeout intent, or a
+  `binned` lane: 401/503 through the ops token, 400 on a missing field, 404
+  `job_not_found`, 409 `not_stopping` for a working lane's own run.
 - **Capture is exclusive and receipted.** The shipped capture helper
   (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
   unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF

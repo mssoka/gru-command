@@ -211,9 +211,9 @@ describe('job execution stop (issue #455)', () => {
         f.ledger.appendCustomEvent({
           kind: 'verification.cancelled',
           jobId,
-          payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, by, reason, process_group_gone: 1 },
+          payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, by, reason, process_group_gone: true },
         });
-        return { state: 'stopped' };
+        return { state: 'stopped', detail: null };
       },
     });
     try {
@@ -230,7 +230,35 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
-  it('keeps an unproven cancel as residue naming the live process group', async () => {
+  it('a proven-gone verification is its own proven stop target', async () => {
+    // The #559 lane: a parked job whose ONLY live producer is a scheduled
+    // verification (no agent handle, no child, no review round). The cancel
+    // proves the run's process group gone, so the pass has a proven target
+    // and must record `stopped` — registry absence is not what settles it.
+    const f = fixture({
+      cancelVerification: async ({ jobId, by, reason }) => {
+        f.ledger.appendCustomEvent({
+          kind: 'verification.cancelled',
+          jobId,
+          payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, by, reason, process_group_gone: true },
+        });
+        return { state: 'stopped', detail: null };
+      },
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('stopped');
+      expect(outcome.outstanding).toEqual([]);
+      expect(jobStopResidue(outcome)).toEqual([]);
+      expect(f.ledger.hasUnsettledVerificationRun(JOB)).toBe(false);
+      expect(eventStates(f.ledger)).toEqual(['requested', 'stopped']);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('keeps an unproven cancel as residue carrying the scheduler\'s own reason', async () => {
     const f = fixture({
       agents: [{ id: 'minion-5', state: 'streaming' }],
       handles: new Map([['minion-5', fakeHandle('minion-5', 'ceased')]]),
@@ -241,19 +269,47 @@ describe('job execution stop (issue #455)', () => {
           jobId,
           payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, process_group_gone: false },
         });
-        return { state: 'unproven' };
+        return { state: 'unproven', detail: "run run-open's process group 4242 is still alive after SIGTERM and SIGKILL" };
       },
     });
     try {
       f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(outcome.state).toBe('unproven');
+      // The scheduler's reason reaches the owner, never a generic claim about
+      // a process group this host may not even hold.
       expect(outcome.outstanding).toEqual([
-        'a scheduled verification was cancelled but its process group is still alive',
+        "run run-open's process group 4242 is still alive after SIGTERM and SIGKILL",
       ]);
+      expect(jobStopResidue(outcome).join(' ')).toMatch(/process group 4242 is still alive/u);
       // The unproven cancel settles nothing: the run still holds the lane.
       expect(f.ledger.hasUnsettledVerificationRun(JOB)).toBe(true);
       expect(eventStates(f.ledger)).toEqual(['requested', 'unproven']);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('carries a foreign-holder reason into the residue instead of claiming the group is alive', async () => {
+    // A restored holder was never signalled: the residue must say so, not
+    // repeat a claim this process never made.
+    const f = fixture({
+      agents: [{ id: 'minion-5', state: 'streaming' }],
+      handles: new Map([['minion-5', fakeHandle('minion-5', 'ceased')]]),
+      cancelVerification: async () => ({
+        state: 'unproven',
+        detail: 'the run was started by an earlier process — this one holds no signal for its process group, so its stop is unproven',
+      }),
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.outstanding).toEqual([
+        'the run was started by an earlier process — this one holds no signal for its process group, so its stop is unproven',
+      ]);
+      expect(jobStopResidue(outcome).join(' ')).toMatch(/started by an earlier process/u);
+      expect(jobStopResidue(outcome).join(' ')).not.toMatch(/process group is still alive/u);
     } finally {
       f.close();
     }

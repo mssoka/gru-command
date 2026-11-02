@@ -84,7 +84,7 @@ export interface JobStopDeps {
     readonly jobId: string;
     readonly by: string;
     readonly reason: string;
-  }) => Promise<{ readonly state: 'stopped' | 'unproven'; readonly detail?: string }>;
+  }) => Promise<{ readonly state: 'stopped' | 'unproven'; readonly detail?: string | null }>;
   /** Called once for every unproven pass, including boot re-proofs. */
   readonly notifyUnproven?: (outcome: JobStopOutcome) => void;
   /** Called when a later pass proves the stop (or the owner resumed):
@@ -353,19 +353,19 @@ export class JobExecutionStop {
       reviews.state === 'stopped' &&
       (reviews.roundIds.length > 0 ||
         (ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0) > fence);
-    const provenTargets =
-      agents.filter((agent) => agent.state === 'stopped').length +
-      children.filter((child) => child.state === 'stopped').length +
-      (reviewProven ? 1 : 0);
 
     // A verification the job holds is the job's producer too (issue #559):
     // stop it, then re-read the predicate — a cancel whose process group is
     // proven gone settles the run, and only that proof drops the residue.
-    // An unproven cancel (a live group, a bound-out settle) stays residue.
+    // An unproven cancel (a live group, a bound-out settle, a holder this
+    // process cannot signal) stays residue with the scheduler's own reason.
     const outstanding: string[] = [];
+    // A proven-gone cancel IS a proven stop target: the run was a live
+    // producer, so a pass that proves it gone must not settle on absence.
+    let verificationProven = false;
     let unsettledVerification = ledger.hasUnsettledVerificationRun(input.jobId);
     if (unsettledVerification && this.deps.cancelVerification !== undefined) {
-      let verdict: { readonly state: 'stopped' | 'unproven'; readonly detail?: string };
+      let verdict: { readonly state: 'stopped' | 'unproven'; readonly detail?: string | null };
       try {
         verdict = await this.deps.cancelVerification({ jobId: input.jobId, by: input.by, reason: input.reason });
       } catch (error) {
@@ -380,10 +380,17 @@ export class JobExecutionStop {
         outstanding.push(
           'a scheduled verification was cancelled, but its run is still recorded as unsettled — it may still run',
         );
+      } else {
+        verificationProven = true;
       }
     } else if (unsettledVerification) {
       outstanding.push('an unsettled verification run remains — it may finish; no per-job scheduler stop exists');
     }
+    const provenTargets =
+      agents.filter((agent) => agent.state === 'stopped').length +
+      children.filter((child) => child.state === 'stopped').length +
+      (reviewProven ? 1 : 0) +
+      (verificationProven ? 1 : 0);
     const admissions = ledger.listJobAdmissions(input.jobId);
     if (admissions.length > 0) {
       outstanding.push(`in-flight producer admission(s) remain: ${admissions.join(', ')}`);

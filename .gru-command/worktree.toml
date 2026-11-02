@@ -1522,13 +1522,15 @@ gc-569-red = 'set -e; root="$PWD"; base=191fff12c6309be7225d91c077181058a34609ec
 # stop pass, the suite pin and the budget policy; the heavy verification-server
 # route case is its own `--config vitest.heavy.config.ts` leg; `gc-559-static`
 # is the lint + typecheck + build gate; `gc-559-red` overlays the FINAL
-# test/verification-scheduler.test.ts on an isolated `git archive` of the
-# issue's named base (a12aaadc, the recorded merge base) and runs A1 by name:
-# the base has no per-job cancel seam at all, so A1 REDs by assertion on that
-# premise. The Vitest JSON report is classified by
-# tools/assert-named-red-baseline.mjs (a collection/setup/import failure, or a
-# missing/green A1 case, exits 2); the vitest exit is echoed intact and the
-# snapshot directory and ignored pointer file are preserved for inspection.
+# test/job-stop.test.ts on an isolated `git archive` of the issue's named base
+# (a12aaadc, the recorded merge base) and runs the behavioural case by name:
+# on the base the `cancelVerification` dep is ignored, so the pass leaves the
+# run as residue and records `unproven` where the test expects `stopped` — a
+# plain AssertionError about the verdict, not an API-existence check. The
+# Vitest JSON report is classified by tools/assert-named-red-baseline.mjs (a
+# collection/setup/import failure, or a missing/green case, exits 2); the
+# vitest exit is echoed intact and the snapshot directory and ignored pointer
+# file are preserved for inspection.
 gc-559-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-scheduler.test.ts test/job-stop.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts"
 gc-559-static = "npm run lint && npm run typecheck && npm run build"
-gc-559-red = 'set -e; root="$PWD"; base=a12aaadc8f6c2e2b2750233b2063a906a28df6f6; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc559-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/verification-scheduler.test.ts "$d/test/verification-scheduler.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-559-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-559-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-scheduler.test.ts -t "A1 cancels a running job verification"; a=$?; set -e; echo "gc-559-red vitest exit=$a EXPECTED-NONZERO: the base has no per-job verification cancel"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-559 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-559 "$d/results.json" "verification scheduler — global budget A1 cancels a running job verification: one cancelled terminal, the group proven gone, the slot released" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change scheduler"; exit 1'
+gc-559-red = 'set -e; root="$PWD"; base=a12aaadc8f6c2e2b2750233b2063a906a28df6f6; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc559-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/job-stop.test.ts "$d/test/job-stop.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-559-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-559-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/job-stop.test.ts -t "a proven-gone verification is its own proven stop target"; a=$?; set -e; echo "gc-559-red vitest exit=$a EXPECTED-NONZERO: the base records unproven and keeps the run as residue"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-559 proven-target case passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-559 "$d/results.json" "job execution stop (issue #455) a proven-gone verification is its own proven stop target" || exit 2; echo "EXPECTED-NONZERO: the proven-target verdict REDs by assertion against the pre-change stop pass"; exit 1'

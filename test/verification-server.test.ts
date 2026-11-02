@@ -2159,7 +2159,7 @@ describe('POST /api/verify/cancel (issue #559)', () => {
 
     // A parked lane whose stop pass is requested (or unproven) is exactly the
     // state a live verification blocks: the surface accepts and reports what
-    // the scheduler holds — here, nothing.
+    // the scheduler holds — here, nothing, so it claims no stop.
     harness.ledger.setJobStatus(harness.jobId, 'parked');
     harness.ledger.appendCustomEvent({
       kind: 'job.execution-stop',
@@ -2168,7 +2168,11 @@ describe('POST /api/verify/cancel (issue #559)', () => {
     });
     const accepted = await cancelCall(harness.port, body);
     expect(accepted.status).toBe(200);
-    expect(accepted.json).toEqual({ state: 'stopped', runs: [] });
+    expect(accepted.json).toEqual({
+      state: 'unproven',
+      runs: [],
+      detail: 'the scheduler holds no run it can prove gone',
+    });
     await harness.close();
   });
 });
