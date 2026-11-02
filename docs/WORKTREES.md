@@ -1043,9 +1043,11 @@ is handed back (the wait is `recovered-pending` again,
 /api/verify` restores the job's lanes once its run holds a verification
 slot and before its command spawns: restores share the verification budget
 (`max_concurrent`), and the run's slot keeps the job busy, so no slim can
-delete again before the command runs. A cancelled run (the verification
-service stops) ends the restore's setup, never spawns its command (a
-`verification.no-start`) and releases the slot. A client that disconnects
+delete again before the command runs. A cancelled run ends the restore's
+setup, never spawns its command and releases the slot: a shutdown records a
+`verification.no-start`, while a per-job cancel (`POST
+/api/verify/cancel`, the stop pass's own seam) records
+`verification.cancelled` with `started: false`. A client that disconnects
 does not cancel a run (other streams may share it, and a reconnect
 reconciles by request id), so it does not end a restore either.
 

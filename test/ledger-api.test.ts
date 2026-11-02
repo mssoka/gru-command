@@ -265,6 +265,39 @@ describe('completed verification history pagination (j-1594)', () => {
   });
 });
 
+describe('per-job verification cancel settlement (issue #559)', () => {
+  it('settles a cancelled run only for the boolean process_group_gone the scheduler writes', () => {
+    // The scheduler records `process_group_gone: true` (a JSON boolean); the
+    // SQL predicate must treat JSON true as proof and false as none, so an
+    // unproven cancel keeps the run unsettled and every live-work gate
+    // refuses over it.
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-cancel-settle-'));
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'cancel-settle', repo: 'fixture', title: 'cancel settlement' });
+      api.appendCustomEvent({ kind: 'verification.requested', jobId: 'cancel-settle', payload: { run_id: 'run-gone' } });
+      api.appendCustomEvent({
+        kind: 'verification.cancelled',
+        jobId: 'cancel-settle',
+        payload: { run_id: 'run-gone', cancelled: true, started: true, ok: false, process_group_gone: true },
+      });
+      expect(api.hasUnsettledVerificationRun('cancel-settle')).toBe(false);
+
+      api.appendCustomEvent({ kind: 'verification.requested', jobId: 'cancel-settle', payload: { run_id: 'run-alive' } });
+      api.appendCustomEvent({
+        kind: 'verification.cancelled',
+        jobId: 'cancel-settle',
+        payload: { run_id: 'run-alive', cancelled: true, started: true, ok: false, process_group_gone: false },
+      });
+      expect(api.hasUnsettledVerificationRun('cancel-settle')).toBe(true);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('ledger api — the record of state', () => {
   let api: LedgerApi;
   let bus: EventBus;

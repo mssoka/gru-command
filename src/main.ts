@@ -1516,6 +1516,20 @@ async function main(): Promise<number> {
     notifyResolved: (jobId) => {
       notifications.resolveExactKind(jobStopIncident(jobId), 'job-service-stop');
     },
+    // Issue #559: the stop pass cancels the job's scheduled verification
+    // through the verification service. `state.verify` is read lazily and is
+    // safe to: the service is assigned far below, before this stop pass can
+    // ever run (the boot re-proof waits for the review/child recovery seams,
+    // and the bus-driven passes follow `service.start()`), so a pass always
+    // sees the real server. A thunk keeps the construction order honest, and
+    // carries the scheduler's OWN reason for an unproven verdict through to
+    // the residue — a live group, a bound-out settle, a holder this process
+    // cannot signal — instead of replacing it with a guess.
+    cancelVerification: async (input) => {
+      if (state.verify === undefined) return { state: 'unproven', detail: 'no verification service is wired' };
+      const outcome = await state.verify.cancelJob(input.jobId, { by: input.by, reason: input.reason });
+      return { state: outcome.state, detail: outcome.detail };
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.jobExecutionStop = jobExecutionStop;

@@ -80,10 +80,11 @@ export interface VerificationRunHooks {
    * spawns (a slim lane's restore): it runs inside the run's budget, and
    * the slot covers it, so the job shows a run the whole time. Its signal
    * is the run's: aborted when the run is cancelled (the scheduler is
-   * disposed; a client that disconnects does not cancel a run, which other
-   * streams may share), so the step ends, the run never spawns and the slot
-   * is released. It should not reject; a rejection is logged and the run
-   * still spawns. */
+   * disposed, or the job's verification is cancelled by
+   * {@link VerificationScheduler.cancelJob}; a client that disconnects does
+   * not cancel a run, which other streams may share), so the step ends, the
+   * run never spawns and the slot is released. It should not reject; a
+   * rejection is logged and the run still spawns. */
   readonly beforeSpawn?: (signal: AbortSignal) => Promise<void>;
 }
 
@@ -232,6 +233,48 @@ export class VerificationDisposedError extends Error {
     super('verification scheduler is shutting down — no new runs are accepted');
     this.name = 'VerificationDisposedError';
   }
+}
+
+/** Raised for a run {@link VerificationScheduler.cancelJob} ended on a job's
+ * behalf (issue #559). Distinct from {@link VerificationDisposedError}: an
+ * owner cancel is not a shutdown, and the scheduler records it as
+ * `verification.cancelled` — never as a shutdown `verification.no-start`. */
+export class VerificationCancelledError extends Error {
+  readonly code = 'verification_cancelled';
+  constructor(
+    readonly by: string,
+    readonly reason: string,
+  ) {
+    super(`verification run cancelled by ${by}: ${reason}`);
+    this.name = 'VerificationCancelledError';
+  }
+}
+
+/** What {@link VerificationScheduler.cancelJob} reports for one run: `stopped`
+ * only on process-group absence, `unproven` with the live group named. */
+export interface VerificationCancelRunOutcome {
+  readonly runId: string;
+  readonly state: 'stopped' | 'unproven';
+  readonly detail: string | null;
+}
+
+/** The job-level answer: `stopped` only when EVERY run it holds is stopped.
+ * `detail` is the owner-facing reason the verdict is `unproven` — the
+ * unproven runs' own details joined, or the reason the scheduler holds no
+ * run it can prove gone — and `null` for a `stopped` verdict. */
+export interface VerificationCancelJobOutcome {
+  readonly state: 'stopped' | 'unproven';
+  readonly runs: readonly VerificationCancelRunOutcome[];
+  readonly detail: string | null;
+}
+
+/** The stop pass's owner-facing reason: every unproven run's own detail,
+ * joined; `null` when every run the cancel answered for is proven gone. */
+function unprovenCancelDetail(runs: readonly VerificationCancelRunOutcome[]): string | null {
+  const details = runs.flatMap((run) =>
+    run.state === 'unproven' && run.detail !== null ? [run.detail] : [],
+  );
+  return details.length === 0 ? null : details.join('; ');
 }
 
 /**
@@ -437,8 +480,12 @@ interface Attempt {
   lease: VerificationLease | null;
   /** The submission's {@link VerificationRunHooks.beforeSpawn}. */
   readonly beforeSpawn: ((signal: AbortSignal) => Promise<void>) | null;
-  /** The run's cancellation, aborted by {@link VerificationScheduler.dispose}. */
+  /** The run's cancellation, aborted by {@link VerificationScheduler.dispose}
+   * and by {@link VerificationScheduler.cancelJob}. */
   readonly cancel: AbortController;
+  /** Who cancelled this run (issue #559), set ONCE: a second cancel joins the
+   * run instead of signalling it again. Null until then. */
+  cancellation: { readonly by: string; readonly reason: string } | null;
 }
 
 /** Terminal request_id evidence kept (bounded) for reconnect reconciliation. */
@@ -464,6 +511,14 @@ interface ActiveSlot {
   /** The bound pid leads its own process group (judged by the group). */
   leadsGroup: boolean;
   child: ChildProcess | null;
+  /** The step child this slot last spawned, kept after it exited: a cancel
+   * (issue #559) proves cessation from ITS process group, which outlives the
+   * `child` field the exit detaches. */
+  lastChild: ChildProcess | null;
+  /** The job's cancellation (issue #559), set ONCE by
+   * {@link VerificationScheduler.cancelJob}; read by `execute()` to end the
+   * run and record `verification.cancelled`. */
+  cancellation: { readonly by: string; readonly reason: string } | null;
   /** Client request identities bound to this holder. */
   requestIds: readonly string[];
 }
@@ -506,6 +561,15 @@ export interface VerificationSchedulerOptions {
   readonly killGraceMs?: number;
   /** How long dispose() waits for active children to exit. */
   readonly disposeGraceMs?: number;
+  /**
+   * Test seam for {@link VerificationScheduler.cancelJob}'s cessation proof:
+   * when set, it answers whether the cancelled run's process group is still
+   * alive INSTEAD of the real `kill(-pgid, 0)` probe. A real group cannot be
+   * kept alive on purpose, so the honest `unproven`-after-SIGKILL branch is
+   * only deterministically reachable through this hook (issue #559). It is
+   * never consulted by the run-timeout path or by dispose().
+   */
+  readonly cancellationProbe?: () => boolean;
   readonly now?: () => number;
   /**
    * Narrow build reuse (issue #318). Default: enabled with the default
@@ -525,6 +589,27 @@ const OUTPUT_TAIL_MAX_BYTES = 4 * 1024;
 const MAX_REQUEST_HISTORY = 64;
 /** The output tail retained in a persisted request record (bounded state file). */
 const PERSISTED_TAIL_CHARS = 512;
+/** The margin one kill grace carries into the waits around it (issue #559):
+ * the cancel bound is `killGraceMs + this`, capped by
+ * {@link CANCEL_BOUND_MAX_MS}, and `execute()` gives its cancelled terminal
+ * this margin on top of the grace before it records a group it could not
+ * prove gone. */
+const CANCEL_SETTLE_MARGIN_MS = 2_000;
+/** The cancel's own SIGTERM grace (issue #559). The run-timeout grace
+ * (`killGraceMs`, 5 s in production) is longer than the whole cancel bound, so
+ * a cancel that waited it out would leave the SIGKILL proof no window at all:
+ * a group gets this long to exit on TERM, and the rest of the bound proves it
+ * gone. */
+const CANCEL_SIGTERM_GRACE_MS = 1_000;
+/** Hard ceiling on one attempt's whole cancel — TERM grace, SIGKILL and the
+ * proof wait together (issue #559). It sits under `JOB_STOP_JOIN_WAIT_MS`
+ * (5 s, `src/shutdown-budget.ts`) so the shutdown join always outlives the
+ * cancel it awaits: a pass cut short leaves its `requested` record for the
+ * next boot's re-proof instead of running underneath a disposed scheduler.
+ * The rest of the stop pass (review supersession) is not bounded by this. */
+const CANCEL_BOUND_MAX_MS = 4_500;
+/** Cadence of the process-group cessation probe while a cancel waits. */
+const GROUP_PROBE_INTERVAL_MS = 20;
 
 function normalizeRequestId(value: string | undefined): string | null {
   if (value === undefined) return null;
@@ -739,6 +824,22 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+/** Await `promise` for at most `ms`; false when it is still open. The bound's
+ * timer is cleared (and unref'd) so a wait nobody needs never keeps the
+ * process alive or leaks past its answer. */
+async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), late]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export class VerificationScheduler {
   private readonly opts: VerificationSchedulerOptions;
   private readonly log: Log;
@@ -768,6 +869,9 @@ export class VerificationScheduler {
   private started = false;
   private disposed = false;
   private readonly noStartSettled = new Set<string>();
+  /** Run ids whose ONE `verification.cancelled` terminal is already written
+   * (issue #559): a second terminal would permanently fence the run. */
+  private readonly cancelledSettled = new Set<string>();
   private readonly pendingNoStart = new Map<string, VerificationRecord>();
   private readonly publishingNoStart = new Set<string>();
   private readonly buildRecords = new BuildRecords();
@@ -856,6 +960,87 @@ export class VerificationScheduler {
       [...this.attempts.values()].some((attempt) => attempt.spec.jobId === jobId);
   }
 
+  /**
+   * Stop the job's scheduled verification (issue #559): abort a queued
+   * wait, end a readying run before its command spawns, and SIGTERM →
+   * (cancel grace) → SIGKILL a running one, ending the run as exactly ONE
+   * `verification.cancelled` record.
+   *
+   * The verdict is evidence, never intent: a run is `stopped` only when its
+   * process group is proven gone (`kill(-pgid, 0)`, the timeout path's own
+   * rule — a shell's exit is never proof its descendants died), and a group
+   * that survives the bound is `unproven` with the reason named, its record
+   * left unsettled so a stop/bin verdict still refuses. The run's own
+   * settlement is never the verdict: a proven-dead group is `stopped` even
+   * while its shell is still draining. A holder this process does not own —
+   * one an earlier process minted, or a slot no in-flight attempt backs — is
+   * never signalled and never claimed, so it too is `unproven` with its own
+   * reason.
+   * The scheduler has no ledger and reads none: a run it does not hold is
+   * answered by holding nothing, which is never a claim that the run stopped.
+   */
+  async cancelJob(
+    jobId: string,
+    input: { readonly by: string; readonly reason: string },
+  ): Promise<VerificationCancelJobOutcome> {
+    if (this.disposed) {
+      return {
+        state: 'unproven',
+        runs: [],
+        detail: 'the verification scheduler is shutting down — it holds no run it can prove gone',
+      };
+    }
+    const cancellation = { by: input.by, reason: input.reason };
+    const attempts = [...this.attempts.values()].filter(
+      (attempt) => attempt.spec.jobId === jobId && attempt.outcome === null,
+    );
+    const slots = [...this.slots.values()].filter((slot) => slot.lease.jobId === jobId);
+    // Nothing held here: the scheduler cannot and must not read the ledger to
+    // find a run it never owned, so it makes no claim about one — and holding
+    // nothing is never proof that a run stopped.
+    if (attempts.length === 0 && slots.length === 0) {
+      return { state: 'unproven', runs: [], detail: 'the scheduler holds no run it can prove gone' };
+    }
+    const runs: VerificationCancelRunOutcome[] = [];
+    const attemptRunIds = new Set(attempts.map((attempt) => attempt.runId));
+    for (const slot of slots) {
+      if (attemptRunIds.has(slot.lease.runId)) continue;
+      runs.push({
+        runId: slot.lease.runId,
+        state: 'unproven',
+        detail: slot.owned
+          ? 'the run is granted but holds no in-flight attempt here — the scheduler holds no signal it can prove gone'
+          : 'the run was started by an earlier process — this one holds no signal for its process group, so its stop is unproven',
+      });
+    }
+    // Each attempt gets its OWN bound and they run together: one job can hold
+    // several scopes, and a resistant group must not starve the next run.
+    runs.push(...(await Promise.all(
+      attempts.map((attempt) => this.cancelAttempt(attempt, cancellation, this.cancelDeadline())),
+    )));
+    const state = runs.every((run) => run.state === 'stopped') ? 'stopped' : 'unproven';
+    return { state, runs, detail: unprovenCancelDetail(runs) };
+  }
+
+  /** One attempt's whole cancel bound: its TERM phase, its SIGKILL and the
+   * group-absence proof together stay under {@link CANCEL_BOUND_MAX_MS} and
+   * thus under the shutdown join that awaits the pass. */
+  private cancelDeadline(): number {
+    return Date.now() + Math.min(this.killGraceMs + CANCEL_SETTLE_MARGIN_MS, CANCEL_BOUND_MAX_MS);
+  }
+
+  /** What is left of a cancel bound; never negative. */
+  private cancelWaitMs(deadline: number): number {
+    return Math.max(0, deadline - Date.now());
+  }
+
+  /** The TERM phase: the cancel's own short grace, never the run-timeout one
+   * and never more than what is left of the bound — SIGKILL must always have
+   * a proof window. */
+  private cancelTermGraceMs(deadline: number): number {
+    return Math.min(CANCEL_SIGTERM_GRACE_MS, this.killGraceMs, this.cancelWaitMs(deadline));
+  }
+
   /** Load persisted holders, release stale ones, start the sweep. Idempotent. */
   start(): void {
     if (this.started) return;
@@ -918,6 +1103,8 @@ export class VerificationScheduler {
         leadsGroup: slot.process_group === true,
         owned: false,
         child: null,
+        lastChild: null,
+        cancellation: null,
         requestIds: slot.request_ids ?? [],
       });
     }
@@ -1023,6 +1210,8 @@ export class VerificationScheduler {
         processCommand: null,
         leadsGroup: false,
         child: null,
+        lastChild: null,
+        cancellation: null,
         requestIds: spec.requestId === undefined ? [] : [spec.requestId],
       });
       try {
@@ -1468,7 +1657,9 @@ export class VerificationScheduler {
       // A run still readying its lane (#427) stops readying it.
       attempt.cancel.abort();
       // An already-produced childless terminal outcome is not a no-start.
-      if (!attempt.started && attempt.outcome === null) this.settleNoStart(attempt);
+      // A run the owner already cancelled settles on its own terminal —
+      // `verification.cancelled` — never as a second shutdown `no-start`.
+      if (!attempt.started && attempt.outcome === null && attempt.cancellation === null) this.settleNoStart(attempt);
     }
     for (const waiter of this.waiters.splice(0)) {
       waiter.settled = true;
@@ -1538,6 +1729,7 @@ export class VerificationScheduler {
       lease: null,
       beforeSpawn: hooks.beforeSpawn ?? null,
       cancel: new AbortController(),
+      cancellation: null,
     };
   }
 
@@ -1727,8 +1919,14 @@ export class VerificationScheduler {
         }
       }
       // A run cancelled or disposed while it readied its lane never spawns
-      // (#427): it settles as a no-start.
-      if (attempt.cancel.signal.aborted || this.disposed) throw new VerificationDisposedError();
+      // (#427). The provenance decides the error: an owner cancel is not a
+      // shutdown, and the catch below records the kind each one earns.
+      if (attempt.cancel.signal.aborted || this.disposed) {
+        const cancellation = attempt.cancellation;
+        throw cancellation === null
+          ? new VerificationDisposedError()
+          : new VerificationCancelledError(cancellation.by, cancellation.reason);
+      }
       const outcome = await this.execute(lease, (frame) => {
         if (frame.type === 'started') attempt.started = true;
         return this.broadcast(attempt, frame);
@@ -1743,7 +1941,19 @@ export class VerificationScheduler {
       attempt.resolve(outcome);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      if ((failure instanceof VerificationDisposedError || failure instanceof VerificationSpawnFailedError) && !attempt.started) this.settleNoStart(attempt, failure);
+      // A per-job cancel that ended the run before its command spawned
+      // records its ONE terminal here: never a shutdown `verification.no-start`
+      // (wrong provenance), never a second terminal for an already-settled run.
+      // Its request history is a typed, retryable admission failure — never a
+      // `verification_failed` that reads as evidence about the suite.
+      if (failure instanceof VerificationCancelledError && !attempt.started) {
+        this.settleCancelledBeforeSpawn(attempt, failure);
+        this.rememberHistory(attempt, {
+          state: 'admission-failed',
+          outcome: null,
+          error: { code: failure.code, detail: failure.message },
+        });
+      } else if ((failure instanceof VerificationDisposedError || failure instanceof VerificationSpawnFailedError) && !attempt.started) this.settleNoStart(attempt, failure);
       else this.rememberHistory(attempt, {
         state: failure instanceof VerificationLockTimeoutError ? 'admission-failed' : null,
         outcome: null,
@@ -1776,6 +1986,34 @@ export class VerificationScheduler {
       cwd: attempt.spec.cwd, head: attempt.head, started: false, reason: failure.code, error: failure.message,
     } });
     this.retryNoStart();
+  }
+
+  /** A per-job cancel that ended an attempt before its command spawned
+   * records the run's ONE terminal (issue #559): `verification.cancelled` with
+   * no `verification.started` before it and `process_group_gone: true` —
+   * nothing was spawned, so nothing survives. It never writes
+   * `verification.completed` (a cancel is an answer to the run, never
+   * evidence the suite passed) and never a second terminal for the same run. */
+  private settleCancelledBeforeSpawn(attempt: Attempt, failure: VerificationCancelledError): void {
+    if (attempt.started || this.cancelledSettled.has(attempt.runId)) return;
+    this.cancelledSettled.add(attempt.runId);
+    this.safeRecord({
+      kind: 'verification.cancelled',
+      jobId: attempt.spec.jobId,
+      payload: {
+        run_id: attempt.runId,
+        request_ids: [...attempt.requestIds],
+        scope: attempt.spec.scope,
+        command: attempt.spec.command,
+        cwd: attempt.spec.cwd,
+        head: attempt.head,
+        started: false,
+        cancelled: true,
+        by: failure.by,
+        reason: failure.reason,
+        process_group_gone: true,
+      },
+    });
   }
 
   private retryNoStart(): void {
@@ -1994,6 +2232,84 @@ export class VerificationScheduler {
     if (index >= 0) this.waiters.splice(index, 1);
   }
 
+  /** Cancel ONE in-flight attempt and report its own cessation evidence.
+   * A second cancel joins the run (`cancellation` is already set) instead of
+   * signalling it again; it still waits for the same settlement. */
+  private async cancelAttempt(
+    attempt: Attempt,
+    cancellation: { readonly by: string; readonly reason: string },
+    deadline: number,
+  ): Promise<VerificationCancelRunOutcome> {
+    // The slot object outlives its map entry, so its last spawned child is the
+    // run's group even after the release below.
+    const slot = this.slots.get(attempt.runId);
+    if (attempt.cancellation === null) {
+      attempt.cancellation = cancellation;
+      // Ends a `beforeSpawn` restore and makes the pre-spawn check choose
+      // VerificationCancelledError over a shutdown refusal.
+      attempt.cancel.abort();
+      if (slot !== undefined) slot.cancellation = cancellation;
+      // A queued wait has no child to signal: drop it so it never reaches a
+      // spawn and never records a lock-wait timeout of its own.
+      for (const waiter of this.waiters.filter((queued) => queued.runId === attempt.runId)) {
+        this.dropWaiter(waiter);
+        waiter.reject(new VerificationCancelledError(cancellation.by, cancellation.reason));
+      }
+      const target = slot?.child ?? slot?.lastChild ?? null;
+      // An absent group grants no authority over a reused number (the timeout
+      // path's own rule): signal only a group this run holds a child for or
+      // the probe shows alive.
+      if (target !== null && (slot?.child != null || processGroupAlive(target))) {
+        signalGroup(target, 'SIGTERM');
+        // Shell exit is not group cessation: a TERM-resistant descendant
+        // outlives its shell (the timeout path's own rule).
+        if (!(await this.waitForGroupGone(target, this.cancelTermGraceMs(deadline)))) {
+          signalGroup(target, 'SIGKILL');
+        }
+      }
+    }
+    // The verdict is the run's LAST group's absence — `kill(-pgid, 0)` over the
+    // final child, so it still holds after the exit detached `child` — and
+    // never the attempt's settlement: a killed group whose shell is still
+    // draining is proven stopped. A second cancel joins here (it signals
+    // nothing) and reads the same proof. `execute()` waits for this same fact
+    // before writing the run's terminal, so verdict and record agree.
+    const lastChild = slot?.lastChild ?? null;
+    const gone = await this.waitForGroupGone(lastChild, this.cancelWaitMs(deadline));
+    if (!gone) {
+      return {
+        runId: attempt.runId,
+        state: 'unproven',
+        detail: `run ${attempt.runId}'s process group ${String(lastChild?.pid ?? 'unknown')} is still alive after SIGTERM and SIGKILL`,
+      };
+    }
+    // Proven gone: what is left of the bound is only for the run's own
+    // `verification.cancelled` terminal (the stop pass re-reads the ledger),
+    // so a drain slower than the bound can no longer un-prove a dead group.
+    await settledWithin(attempt.promise, this.cancelWaitMs(deadline));
+    return { runId: attempt.runId, state: 'stopped', detail: null };
+  }
+
+  /** Wait up to `ms` for the run's process group to be proven gone. No child
+   * means nothing was spawned: cessation is already proven. */
+  private async waitForGroupGone(child: ChildProcess | null, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      if (this.groupGone(child)) return true;
+      if (Date.now() >= deadline) return false;
+      await delay(Math.min(GROUP_PROBE_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  /** True when the child's whole process group is proven absent. The
+   * `cancellationProbe` seam substitutes a test's answer for the real probe
+   * (a live group cannot be manufactured on purpose). */
+  private groupGone(child: ChildProcess | null): boolean {
+    if (child === null) return true;
+    if (this.opts.cancellationProbe !== undefined) return !this.opts.cancellationProbe();
+    return !processGroupAlive(child);
+  }
+
   /** Grant FIFO waiters while capacity remains. */
   private pump(): void {
     while (!this.disposed && this.waiters.length > 0 && this.slots.size < this.concurrencyLimit) {
@@ -2008,6 +2324,8 @@ export class VerificationScheduler {
         processCommand: null,
         leadsGroup: false,
         child: null,
+        lastChild: null,
+        cancellation: null,
         requestIds: waiter.spec.requestId === undefined ? [] : [waiter.spec.requestId],
       });
       waiter.resolve(lease);
@@ -2022,6 +2340,12 @@ export class VerificationScheduler {
     const git = readGitState(lease.cwd);
     const slot = this.slots.get(lease.runId);
     if (this.disposed || slot === undefined) throw new VerificationDisposedError(); // disposed between grant and spawn
+    // A per-job cancel that landed before any command existed ends the run
+    // here — ahead of the head_changed check, so a cancel is never recorded
+    // as a completed (failed) run. The catch records its cancelled terminal.
+    if (slot.cancellation !== null) {
+      throw new VerificationCancelledError(slot.cancellation.by, slot.cancellation.reason);
+    }
     // Exact-head evidence: a queue wait can span a push. Running the new
     // head under the old submission would silently verify the wrong
     // revision, so fail honestly instead (no spawn, no false PASS).
@@ -2172,6 +2496,7 @@ export class VerificationScheduler {
         child.once('exit', (code: number | null, exitSignal: NodeJS.Signals | null) => { stepExit = code; stepSignal = exitSignal; resolveExit(); });
       });
       current = child;
+      slot.lastChild = child;
       slot.pid = child.pid ?? null;
       slot.child = child;
       // Real child existence precedes every callback/started-frame await;
@@ -2280,8 +2605,17 @@ export class VerificationScheduler {
           reuseRefusal: null,
           ...extra,
         });
-        if (halted || timedOut || this.disposed) {
-          if (!halted && this.disposed && runError === null) runError = new VerificationDisposedError();
+        // A per-job cancel (issue #559) and a shutdown both stop the NEXT
+        // step from spawning; the cause decides the run's provenance — an
+        // owner cancel is never recorded as a shutdown refusal.
+        // Re-read through the map: the pre-spawn check above proved the run
+        // was not cancelled THEN, and a cancel can land between steps.
+        const cancelled = this.slots.get(lease.runId)?.cancellation ?? null;
+        if (halted || timedOut || cancelled !== null || this.disposed) {
+          if (!halted && runError === null) {
+            if (cancelled !== null) runError = new VerificationCancelledError(cancelled.by, cancelled.reason);
+            else if (this.disposed) runError = new VerificationDisposedError();
+          }
           halted = true;
           if (planned) checks.push(check('not-run'));
           continue;
@@ -2346,6 +2680,14 @@ export class VerificationScheduler {
     // original run/request as no-start while reuse output was awaited.
     // Preserve that refusal rather than publish/remember a completed run.
     if (this.disposed && !startedEmitted) throw new VerificationDisposedError();
+    // A cancel owns the verdict once it lands: a step that exited 0 while the
+    // cancel was being delivered is a cancelled run, never a pass. A timeout
+    // and a cancel that coincide record the cancel and `timed_out: true`.
+    const cancellation = this.slots.get(lease.runId)?.cancellation ?? null;
+    if (cancellation !== null) {
+      if (runError === null) runError = new VerificationCancelledError(cancellation.by, cancellation.reason);
+      halted = true;
+    }
     const durationMs = clockStarted ? this.now() - startedAt : 0;
     const ok = !halted && !timedOut && runError === null;
     const outcome: VerificationOutcome = {
@@ -2369,6 +2711,32 @@ export class VerificationScheduler {
       error: runError === null ? null : String(runError),
       ...(planned ? { checks } : {}),
     };
+    if (cancellation !== null) {
+      // The record's cessation proof IS the stop verdict's: wait (bounded) for
+      // the group the cancel signalled to be proven gone, so a row never
+      // claims a still-live group as gone. A group that survives keeps the run
+      // unsettled, which is what refuses a stop/bin verdict over it.
+      const processGroupGone = await this.waitForGroupGone(
+        slot.lastChild,
+        this.killGraceMs + CANCEL_SETTLE_MARGIN_MS,
+      );
+      this.cancelledSettled.add(lease.runId);
+      this.safeRecord({
+        kind: 'verification.cancelled',
+        jobId: lease.jobId,
+        payload: {
+          ...outcomePayload(outcome),
+          cancelled: true,
+          by: cancellation.by,
+          reason: cancellation.reason,
+          head: lease.head,
+          started: true,
+          process_group_gone: processGroupGone,
+          timed_out: outcome.timedOut,
+        },
+      });
+      return outcome;
+    }
     this.safeRecord({
       kind: 'verification.completed',
       jobId: lease.jobId,

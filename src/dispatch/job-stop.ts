@@ -76,6 +76,15 @@ export interface JobStopDeps {
   readonly children: Pick<ChildWorkerService, 'cancel'> | null;
   /** The review service, when the service hosts it. */
   readonly reviews: Pick<WaveRunner, 'supersedeReviews'> | null;
+  /** Issue #559: stop the job's scheduled verification through the
+   * scheduler's per-job seam, and say whether its process group is proven
+   * gone. Absent: a run this pass cannot reach stays the residue today's text
+   * names, and is never reported stopped. */
+  readonly cancelVerification?: (input: {
+    readonly jobId: string;
+    readonly by: string;
+    readonly reason: string;
+  }) => Promise<{ readonly state: 'stopped' | 'unproven'; readonly detail?: string | null }>;
   /** Called once for every unproven pass, including boot re-proofs. */
   readonly notifyUnproven?: (outcome: JobStopOutcome) => void;
   /** Called when a later pass proves the stop (or the owner resumed):
@@ -344,19 +353,52 @@ export class JobExecutionStop {
       reviews.state === 'stopped' &&
       (reviews.roundIds.length > 0 ||
         (ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0) > fence);
+
+    // A verification the job holds is the job's producer too (issue #559):
+    // stop it, then re-read the predicate — a cancel whose process group is
+    // proven gone settles the run, and only that proof drops the residue.
+    // An unproven cancel (a live group, a holder this process cannot signal)
+    // stays residue with the scheduler's own reason.
+    const outstanding: string[] = [];
+    let unsettledVerification = ledger.hasUnsettledVerificationRun(input.jobId);
+    if (unsettledVerification && this.deps.cancelVerification !== undefined) {
+      let verdict: { readonly state: 'stopped' | 'unproven'; readonly detail?: string | null };
+      try {
+        verdict = await this.deps.cancelVerification({ jobId: input.jobId, by: input.by, reason: input.reason });
+      } catch (error) {
+        verdict = { state: 'unproven', detail: `the verification cancel failed: ${describe(error)}` };
+      }
+      unsettledVerification = ledger.hasUnsettledVerificationRun(input.jobId);
+      if (verdict.state === 'unproven') {
+        outstanding.push(verdict.detail ?? 'a scheduled verification is still unproven');
+      } else if (unsettledVerification) {
+        outstanding.push(
+          'a scheduled verification was cancelled, but its run is still recorded as unsettled — it may still run',
+        );
+      }
+    } else if (unsettledVerification) {
+      outstanding.push(
+        'an unsettled verification run remains — it may finish; this service hosts no per-job verification stop',
+      );
+    }
+    // A proven-gone cancel IS a proven stop target — the run was a live
+    // producer — and the proof is the LEDGER row, never this pass's verdict:
+    // the pass that cancels writes `verification.cancelled` and a later pass
+    // (the boot re-proof) reads it back, so the lane is not left concluding
+    // that absence proves nothing. Like `reviewProven`, only a row written
+    // after the hold's fence proves THIS hold, and a `process_group_gone:
+    // false` row is an unproven cancel: neither a target nor a residue.
+    const verificationProven = !unsettledVerification &&
+      ledger
+        .listJobEventsByKinds(input.jobId, ['verification.cancelled'])
+        .some((event) =>
+          (event.payload as { readonly process_group_gone?: unknown } | null)?.process_group_gone === true &&
+          event.seq > fence);
     const provenTargets =
       agents.filter((agent) => agent.state === 'stopped').length +
       children.filter((child) => child.state === 'stopped').length +
-      (reviewProven ? 1 : 0);
-
-    // A pre-existing verification cannot be interrupted through the
-    // scheduler's per-job surface; an in-flight admission is pre-spawn
-    // work this pass does not own. Both are named, never hidden behind a
-    // `stopped` verdict.
-    const outstanding: string[] = [];
-    if (ledger.hasUnsettledVerificationRun(input.jobId)) {
-      outstanding.push('an unsettled verification run remains — it may finish; no per-job scheduler stop exists');
-    }
+      (reviewProven ? 1 : 0) +
+      (verificationProven ? 1 : 0);
     const admissions = ledger.listJobAdmissions(input.jobId);
     if (admissions.length > 0) {
       outstanding.push(`in-flight producer admission(s) remain: ${admissions.join(', ')}`);

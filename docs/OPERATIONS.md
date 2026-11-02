@@ -265,14 +265,42 @@ producer stopped, so the service answers the two facts separately.
   a claim about when the feature shipped. A lane with no live producer can
   still be held: resuming or closing the job lifts the hold, and the
   notice and its incident settle on the next stop reconcile at boot.
+- **A scheduled verification is cancelled, not left to chance.** A job's
+  in-flight verification is a producer like any other (issue #559): when the
+  job stops, the pass asks the verification scheduler to end it — a queued
+  wait is dropped, a run still readying its lane never spawns, and a running
+  one gets SIGTERM to its whole process group, then SIGKILL after the
+  cancel's own short grace (a second, not the run-timeout grace). The cancel
+  — TERM grace, SIGKILL and the group-absence proof together — is bounded
+  under the shutdown join, so the cancel is never still running underneath a
+  disposed scheduler (the rest of the pass, review supersession, is not
+  bounded).
+  The verdict is evidence, never intent: the run counts as stopped only when
+  `kill(-pgid, 0)` shows no member of that group left, so a TERM-resistant
+  descendant is killed and a group that survives the bound keeps the stop
+  `unproven` — with the scheduler's own reason (the live group it observed)
+  as the residue text; the run's own drain is never the proof, so a killed
+  group whose shell has not finished reaping still counts as stopped. A run
+  this process does not own (a holder an earlier process minted, or a slot no
+  in-flight attempt backs) is never signalled: it is reported `unproven`
+  with that reason, never as a live group this process claimed to see. A
+  proven-gone cancel is itself a proven stop target, so a lane whose only
+  live producer was its verification still reaches `stopped` — and the
+  proof is the `verification.cancelled` row, not the pass that wrote it, so
+  the next pass (the boot re-proof) reads it back instead of concluding that
+  registry absence proves nothing. The run is recorded once as
+  `verification.cancelled` — never as `verification.completed`, because a
+  cancelled run is not evidence that the suite passed — and never as a
+  shutdown `verification.no-start`.
 - **An unproven stop is named, never fabricated.** A failed dispose, a
   ledger open turn the runtime no longer holds, an unsettled verification
   run or an in-flight producer admission leaves `state: "unproven"` with the
   exact residue in the event, and opens one `needs-owner`
   `job-stop-unproven:<jobId>` incident (reused across boot re-proofs and
-  resolved when a later pass proves the stop). A
-  pre-existing verification is never reported stopped merely because the
-  job is parked; it may still finish.
+  resolved when a later pass proves the stop). A verification that could not
+  be proven gone keeps the scheduler's own residue text — a named live
+  process group, or a holder this process holds no signal for — and the run
+  stays unsettled, so the lane stays held.
 - **Stopping is not closing.** The job stays parked until the owner moves it
   back to a working status. The stop record and the hold are separate rows,
   so a later reader can tell an administrative hold from a proven producer
@@ -377,7 +405,16 @@ or automatic binning — the write itself is the ordinary status surface):
   status or event mutation. A historical claimed wait does not hold the
   lane after its runtime attempt settles. Stop live work through its own
   authorized surfaces first — the board keeps showing the live producer and
-  the worktree stays on the record. A live directive or re-brief marker
+  the worktree stays on the record. A scheduled verification is one of those
+  surfaces: `POST /api/verify/cancel {job_id, by, reason}` — the same
+  per-job cancel the stop pass runs — ends the job's queued or running run.
+  A run whose process group is PROVEN gone settles as
+  `verification.cancelled`, so the bin's own live-work transaction no longer
+  refuses over it; a cancel the service could not prove leaves that refusal
+  standing — a bin never rides an unproven stop. The route refuses a lane
+  that is neither being stopped (its latest stop pass is `requested` or
+  `unproven`) nor in an active closeout: a working lane's run is that lane's
+  own evidence, not the owner's to discard. A live directive or re-brief marker
   whose producer custody the service cannot establish is closed by the
   owner's abandonment, never by binning: for a directive request Gru proposes
   it with `POST /api/owner-approvals` and the owner's Approve on the card

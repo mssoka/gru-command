@@ -1128,7 +1128,9 @@ export class BoardEngine {
   }
 
   /** The newest recorded verification wait that its own scope has not
-   * answered (a newer same-scope completion/request retires it). */
+   * answered (a newer same-scope completion/request retires it; so does a
+   * newer `verification.cancelled` — a stopped run answers the wait without
+   * being evidence about the suite, issue #559). */
   private verificationWaitProjection(): string | null {
     const timeout = this.ledger.latestEventOfKinds(['verification.lock-timeout']);
     if (timeout === null || timeout.jobId === null) return null;
@@ -1139,6 +1141,7 @@ export class BoardEngine {
     const scopeLabel = typeof scope === 'string' && scope !== '' ? scope : null;
     const scoped = this.ledger.latestJobEventsByPayloadScope(timeout.jobId, [
       'verification.completed',
+      'verification.cancelled',
       'verification.lock-timeout',
       'verification.requested',
     ]);

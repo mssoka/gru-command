@@ -2121,3 +2121,58 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     await harness.close();
   });
 });
+
+async function cancelCall(
+  port: number,
+  body: unknown,
+  opts: { method?: string; token?: string | null } = {},
+): Promise<{ status: number; json: unknown }> {
+  const res = await fetch(`http://127.0.0.1:${port}/api/verify/cancel`, {
+    method: opts.method ?? 'POST',
+    headers: {
+      ...(opts.token === null ? {} : { authorization: `Bearer ${opts.token ?? TOKEN}` }),
+      'content-type': 'application/json',
+    },
+    ...(opts.method === 'GET' ? {} : { body: JSON.stringify(body) }),
+  });
+  const text = await res.text();
+  return { status: res.status, json: text === '' ? null : JSON.parse(text) };
+}
+
+describe('POST /api/verify/cancel (issue #559)', () => {
+  it('A4 cancels only a stopping, binning or closing-out lane\'s verification', async () => {
+    const harness = await boot();
+    const body = { job_id: harness.jobId, by: 'owner', reason: 'lane parked' };
+
+    // 401 without a pairing token, 400 without every field, 405 for the wrong method.
+    expect((await cancelCall(harness.port, body, { token: null })).status).toBe(401);
+    expect((await cancelCall(harness.port, { job_id: harness.jobId })).status).toBe(400);
+    expect((await cancelCall(harness.port, body, { method: 'GET' })).status).toBe(405);
+    // 404 for a job the ledger does not know.
+    expect((await cancelCall(harness.port, { ...body, job_id: 'job-absent' })).status).toBe(404);
+
+    // A working lane's run is that lane's own evidence: never cancelled here.
+    const working = await cancelCall(harness.port, body);
+    expect(working.status).toBe(409);
+    expect(working.json).toMatchObject({ error: 'not_stopping', status: 'working' });
+    expect(harness.ledger.listJobEvents(harness.jobId).some((event) => event.kind === 'verification.cancelled')).toBe(false);
+
+    // A parked lane whose stop pass is requested (or unproven) is exactly the
+    // state a live verification blocks: the surface accepts and reports what
+    // the scheduler holds — here, nothing, so it claims no stop.
+    harness.ledger.setJobStatus(harness.jobId, 'parked');
+    harness.ledger.appendCustomEvent({
+      kind: 'job.execution-stop',
+      jobId: harness.jobId,
+      payload: { state: 'unproven', by: 'service:park', reason: 'hold' },
+    });
+    const accepted = await cancelCall(harness.port, body);
+    expect(accepted.status).toBe(200);
+    expect(accepted.json).toEqual({
+      state: 'unproven',
+      runs: [],
+      detail: 'the scheduler holds no run it can prove gone',
+    });
+    await harness.close();
+  });
+});
