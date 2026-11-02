@@ -652,9 +652,10 @@ max_concurrent_children = 2
 # across lanes/repos. It governs only verification commands submitted
 # through that API — it does not set AI-agent/reviewer counts and does
 # not govern arbitrary commands run directly outside it. Requests
-# beyond max_concurrent queue FIFO, a queued request past
-# lock_wait_timeout_ms fails loud, a holder whose pid is dead is
-# released, and every run is recorded for review evidence.
+# beyond max_concurrent queue FIFO and wait at least
+# lock_wait_timeout_ms, longer when the runs ahead of them can still be
+# running; only a request that outlasts both fails loud. A holder whose
+# pid is dead is released, and every run is recorded for review evidence.
 # Maximum simultaneous verification commands; 1 serializes runs and
 # later requests queue FIFO. Not a per-command test-worker count.
 max_concurrent = 1

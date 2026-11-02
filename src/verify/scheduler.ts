@@ -212,7 +212,8 @@ export function maskedEventPayload(payload: Record<string, unknown>): Record<str
   return masked;
 }
 
-/** Raised when a queued request waits past lock_wait_timeout_ms. */
+/** Raised when a queued request outlasts both its `lock_wait_timeout_ms` floor
+ * and the bound of every slot ahead of it. */
 export class VerificationLockTimeoutError extends Error {
   readonly code = 'lock_wait_timeout';
   constructor(
@@ -525,8 +526,9 @@ interface ActiveSlot {
   requestIds: readonly string[];
   /** The instant this holder can no longer legitimately be running, which a
    * queued request derives its own deadline from (issue #537): the run's wall
-   * clock plus its kill grace and drain margin once its clock starts, else the
-   * stale cap the sweep judges a clockless holder by. */
+   * clock plus its kill grace and drain margin once its clock starts, else
+   * `boundWithoutClock()` — a restored holder's stale cap, or an over-estimate
+   * for an owned lease that holds no run. */
   boundUntil: number;
 }
 
@@ -1125,7 +1127,8 @@ export class VerificationScheduler {
         cancellation: null,
         requestIds: slot.request_ids ?? [],
         // A restored holder's clock never started in this process: its bound
-        // is the stale cap that decides its own release (issue #537).
+        // is the stale cap that decides its own release, applied on the
+        // sweep's cadence (issue #537).
         boundUntil: this.boundWithoutClock(slot.granted_at),
       });
     }
@@ -2227,9 +2230,13 @@ export class VerificationScheduler {
     if (index >= 0) this.waiters.splice(index, 1);
   }
 
-  /** The bound of a slot whose run clock never started — a restored holder, or
-   * a lease held without a run: the stale cap the sweep releases it at, so a
-   * queued request never outlasts work that cannot legitimately still run. */
+  /** The bound of a slot whose run clock never started. A RESTORED holder
+   * (unowned) is released at this stale cap, so its bound is the cap the sweep
+   * releases it at — on the sweep's cadence, which can trail the cap itself.
+   * An OWNED lease held without a run (`acquire()`/`bindPid()` holders) is
+   * never swept, because `reconcileStale` skips in-process slots: the cap is
+   * then only an over-estimate of how long it may live, and a queued request
+   * behind one fails loud at it while the holder keeps its slot. */
   private boundWithoutClock(grantedAt: number): number {
     return grantedAt + this.staleMaxAgeMs;
   }

@@ -80,7 +80,8 @@ function makeScheduler(opts: {
   runTimeoutMs?: number;
   staleMaxAgeMs?: number;
   /** The stale sweep's cadence. Issue #537's derived-deadline cases hold it
-   * high: with no child in the slot the sweep has nothing to judge. */
+   * high: every slot in those cases is owned, and the sweep never judges an
+   * in-process slot. */
   sweepIntervalMs?: number;
   /** Issue #559: the run-timeout grace. Production passes none (5 s). */
   killGraceMs?: number;
@@ -758,49 +759,100 @@ describe('verification scheduler — global budget', () => {
     }
   });
 
-  it('A2 (#537): a run admitted ahead re-arms a queued request past the floor, and it is still granted', async () => {
+  it('A2 (#537): a grant and a started run clock each re-derive the queued deadline past the old one, and the request is still granted', async () => {
+    // Timeline, in fake milliseconds from the instant the waiter queues:
+    // holder A is clockless, so its bound is the stale cap (600 s). The waiter
+    // sits behind A AND behind B, so its queue-time deadline is the 900 s
+    // floor. A releases at 500 s and B is granted there, but B is held in
+    // `beforeSpawn` until 900 s: its clockless bound (grantedAt + 600 s =
+    // 1 100 s) is the only bound the grant can re-arm the waiter to. B's run
+    // clock then starts at 900 s and replaces that bound with 900 s + 900 s
+    // (run) + 100 ms (grace) + 5 s (drain) = 1 805.1 s. So the waiter outlives
+    // BOTH deadlines it would have kept without the re-arm — the floor at
+    // 900 s and B's clockless bound at 1 100 s — and is granted at 1 300 s.
     vi.useFakeTimers();
+    let aheadPid: number | null = null;
+    const reapAhead = (): void => {
+      if (aheadPid === null) return;
+      try {
+        process.kill(-aheadPid, 'SIGKILL');
+      } catch { /* already gone */ }
+    };
     try {
       const { scheduler, records } = makeScheduler({
         maxConcurrent: 1,
         lockWaitTimeoutMs: 900_000,
-        staleMaxAgeMs: 1_800_000,
-        sweepIntervalMs: 1_800_000,
+        runTimeoutMs: 900_000,
+        staleMaxAgeMs: 600_000,
+        // Held above the whole wait: only the waiters' own timers may fire.
+        sweepIntervalMs: 2_000_000,
       });
       scheduler.start();
-      const first = await scheduler.acquire(spec('job-first'));
-      const second: Promise<SettledLease> = scheduler.acquire(spec('job-second')).then(
-        (lease): SettledLease => ({ lease }),
-        (error: unknown): SettledLease => ({ error }),
-      );
+      const queuedAt = Date.now();
+      const holder = await scheduler.acquire(spec('job-holder'));
+      // B is admitted to its slot at 500 s but its clock starts only when this
+      // gate opens: the seam that keeps the granted-but-clockless window.
+      let openGate!: () => void;
+      const gate = new Promise<void>((resolve) => { openGate = resolve; });
+      let clockStarted!: () => void;
+      const startedClock = new Promise<void>((resolve) => { clockStarted = resolve; });
+      const aheadFrames: VerificationProgress[] = [];
+      const ahead = scheduler.run(spec('job-ahead', 'sleep 600'), (frame) => {
+        aheadFrames.push(frame);
+        if (frame.type === 'started') {
+          // The started receipt is recorded before this sink runs: it names the
+          // pid whose group ends the run, so a failing assertion still reaps it.
+          aheadPid = records.find((record) => record.kind === 'verification.started' && record.jobId === 'job-ahead')
+            ?.payload['pid'] as number;
+          clockStarted();
+        }
+      }, { beforeSpawn: () => gate }).then((outcome) => outcome, (error: unknown) => error);
       await flush();
-      const last: Promise<SettledLease> = scheduler.acquire(spec('job-last')).then(
-        (lease): SettledLease => ({ lease }),
-        (error: unknown): SettledLease => ({ error }),
+      const frames: VerificationProgress[] = [];
+      const waiting = scheduler.run(spec('job-waiter'), (frame) => { frames.push(frame); }).then(
+        (outcome) => outcome,
+        (error: unknown) => error,
       );
       await flush();
       expect(scheduler.queuedCount()).toBe(2);
-      // Inside the floor when the holder releases: job-second is admitted AHEAD
-      // of job-last, so job-last's deadline is re-derived from that run's own
-      // bound (1800 s from its grant) instead of the 900 s floor it queued with.
-      await vi.advanceTimersByTimeAsync(600_000);
-      scheduler.release(first);
+      // FIFO: job-ahead queued first, the waiter behind it.
+      expect(frames[0]).toMatchObject({ type: 'queued', position: 2 });
+      await vi.advanceTimersByTimeAsync(500_000);
+      scheduler.release(holder);
       await flush();
       expect(scheduler.activeCount()).toBe(1);
       expect(scheduler.queuedCount()).toBe(1);
-      // Past the floor since queueing, still inside the run admitted ahead.
+      // The 900 s floor the waiter queued with is reached exactly here: only
+      // the re-arm at B's grant (deadline 500 s + 600 s) keeps it queued.
       await vi.advanceTimersByTimeAsync(400_000);
+      expect(Date.now() - queuedAt).toBe(900_000);
+      expect(scheduler.queuedCount()).toBe(1);
+      // B's run clock starts at 900 s: the bound it derives replaces the
+      // clockless one, re-arming the waiter to 1 805.1 s.
+      openGate();
+      await startedClock;
+      expect(aheadFrames.find((frame) => frame.type === 'started')).toMatchObject({ queuedMs: 900_000 });
+      // B's clockless bound (1 100 s) is reached exactly here: only the
+      // started clock's own bound keeps the waiter queued.
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(Date.now() - queuedAt).toBe(1_100_000);
       expect(scheduler.queuedCount()).toBe(1);
       expect(records.some((record) => record.kind === 'verification.lock-timeout')).toBe(false);
-      const secondResult = await second;
-      expect(secondResult.lease).toMatchObject({ jobId: 'job-second' });
-      if (secondResult.lease !== undefined) scheduler.release(secondResult.lease);
-      const lastResult = await last;
-      expect(lastResult.error).toBeUndefined();
-      expect(lastResult.lease).toMatchObject({ jobId: 'job-last' });
-      if (lastResult.lease !== undefined) scheduler.release(lastResult.lease);
+      // Still inside the bound of the run ahead.
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(Date.now() - queuedAt).toBe(1_300_000);
+      expect(scheduler.queuedCount()).toBe(1);
+      // B ends: its slot releases and the waiter is granted 1 300 s after it
+      // queued — past both deadlines it would have kept without the re-arm.
+      reapAhead();
+      expect(await ahead).toMatchObject({ jobId: 'job-ahead', ok: false });
+      aheadPid = null; // the group is proven gone: nothing is left to reap
+      expect(await waiting).toMatchObject({ jobId: 'job-waiter', ok: true });
+      // The exact wait the re-armed deadline bought, not merely a longer one.
+      expect(frames.find((frame) => frame.type === 'started')).toMatchObject({ queuedMs: 1_300_000 });
       expect(records.some((record) => record.kind === 'verification.lock-timeout')).toBe(false);
     } finally {
+      reapAhead();
       vi.useRealTimers();
     }
   });
@@ -1696,9 +1748,11 @@ describe('verification scheduler — global budget', () => {
     });
     // A DIFFERENT command is not the identical run: the orphan must not
     // masquerade as a duplicate. It still holds the only slot, so the fresh
-    // submission queues behind it. An unowned slot is bounded by the stale cap
-    // the sweep releases it at, so that wait can end in a grant or the
-    // shutdown — never in a lock-wait timeout (issue #537).
+    // submission queues behind it. A restored (unowned) holder's release is the
+    // stale cap, applied by the sweep on its cadence; here the shutdown ends
+    // the wait before either bound, so this case asserts the rejection and the
+    // queued frame, not a claim about which bound would have landed first
+    // (issue #537).
     const frames: VerificationProgress[] = [];
     const changedCommand = loaded
       .submit(headedSpec('job-orphan', 'a'.repeat(40), 'node -e "process.exit(1)"'), (frame) => { frames.push(frame); })
