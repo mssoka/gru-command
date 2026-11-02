@@ -556,6 +556,9 @@ describe('interrupted dispatch without a lane (issue #583)', () => {
   it('B4: a top-level minion, a spawn event or any agent row keeps the job out', async () => {
     const h = boot();
     const topLevel = seedLaneLessInterruptedDispatch(h, 'job-no-lane-top');
+    // A top-level minion is excluded by the broad agent clause (which
+    // subsumes the lane-required query's top-level clause — one clause, one
+    // exclusion, no dead SQL kept in step).
     h.ledger.registerAgent({ id: 'agent-lane-less-top', role: 'minion', jobId: topLevel, parentage: 'top-level' });
     const spawned = seedLaneLessInterruptedDispatch(h, 'job-no-lane-spawned');
     h.ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: spawned, payload: {} });
@@ -658,7 +661,7 @@ describe('interrupted dispatch without a lane (issue #583)', () => {
     const flips: readonly (readonly [Partial<Evidence>, string])[] = [
       [{ status: 'blocked' }, 'not working'],
       [{ admissions: ['initial dispatch'] }, 'in-flight dispatch admission'],
-      [{ laneRowPresent: true }, 'a worktree row exists'],
+      [{ laneRowPresent: true }, 'neither pass blocks a lane-bearing job'],
       [{ workerStarted: true }, 'a minion started'],
       [{ handoff: false }, 'no job.handoff event'],
       [{ laneOwner: 'job "x" has a live directive request' }, 'live directive request'],
@@ -706,7 +709,8 @@ describe('interrupted dispatch without a lane (issue #583)', () => {
     expect(first.report?.blocked).toEqual([jobId]);
 
     // Re-armed, and this time the dispatch reaches its lane row: the job
-    // leaves the lane-less class (the lane-required pass owns it now).
+    // leaves the lane-less class (only an ACTIVE lane is the lane-required
+    // pass's, and `registerWorktree` creates one).
     h.ledger.setJobStatus(jobId, 'working');
     h.ledger.registerWorktree({
       id: jobId,
@@ -783,5 +787,31 @@ describe('interrupted dispatch without a lane (issue #583)', () => {
     // The pass never touches worktrees, and the request stays unresolved.
     expect(h.ledger.listWorktrees({ jobId })).toEqual([]);
     expect(h.ledger.getCreationContinuation(jobId, 'req-583-continuation')?.state).toBe('accepted');
+  });
+
+  it('B10: bounds one boot pass to the limit, resumes from the head, and never duplicates a card', async () => {
+    const h = boot();
+    const jobIds = ['job-no-lane-page-a', 'job-no-lane-page-b', 'job-no-lane-page-c'].map((id) =>
+      seedLaneLessInterruptedDispatch(h, id),
+    );
+
+    // ONE bounded query per boot (no cursor): blocked rows leave the set, so
+    // the next boot reaches the tail from the head, exactly as the
+    // lane-required pass's bounds case proves for its own query.
+    const first = await runBootPass(h, { limit: 2 });
+    expect(first.kind).toBe('ran');
+    expect(first.report?.examined).toBe(2);
+    expect(first.report?.truncated).toBe(true);
+    expect(first.report?.blocked).toHaveLength(2);
+    const second = await runBootPass(h, { limit: 2 });
+    expect(second.kind).toBe('ran');
+    expect(second.report?.examined).toBe(1);
+    expect(second.report?.truncated).toBe(false);
+    expect(second.report?.blocked).toHaveLength(1);
+    expect([...(first.report?.blocked ?? []), ...(second.report?.blocked ?? [])].sort()).toEqual([...jobIds].sort());
+    for (const jobId of jobIds) {
+      expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+      expect(cards(h, jobId)).toHaveLength(1);
+    }
   });
 });

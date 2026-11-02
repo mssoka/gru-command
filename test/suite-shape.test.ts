@@ -273,7 +273,7 @@ const PINS: Record<string, number> = {
   'intake-server.test.ts': 19,
   'intake-slicing.test.ts': 18,
   'intake.test.ts': 73,
-  'interrupted-dispatch.test.ts': 27,
+  'interrupted-dispatch.test.ts': 28,
   'job-amendments.test.ts': 11,
   'job-stop.test.ts': 35,
   'lan-phone-raw-client.test.ts': 6,

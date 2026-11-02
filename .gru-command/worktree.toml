@@ -1608,7 +1608,10 @@ gc-561-red = 'set -e; root="$PWD"; base=0e8a899b25e61a123792dafc2d0a084208d540a3
 # suite with the registry pins (`prune-stale-dist`), the docs contracts and
 # the suites that own the touched seams; `gc-583-static` is the lint +
 # typecheck + build gate; `gc-583-heavy` builds and re-runs the dispatch
-# end-to-end suite (boot wiring). `gc-583-red` overlays the FINAL
+# end-to-end suite as a smoke check — it constructs `DispatchService`
+# in-process and never boots `main.ts`, so the new boot call is only
+# compile-checked by the build and no test pins the wiring (same as #560's
+# pass). `gc-583-red` overlays the FINAL
 # test/interrupted-dispatch.test.ts on an isolated `git archive` of the verified
 # branch base 64d645c2 (node_modules symlinked, approved RPC patch first) and
 # runs B1 by name: the base's boot path has no lane-less pass, so the ledger

@@ -8489,15 +8489,16 @@ export class LedgerApi {
 
   /** Issue #583: `working` jobs whose dispatch was interrupted BEFORE its
    * lane row — the initial dispatch, or the continuation that likewise only
-   * registers its lane at the end of `createRetainedJobWorktree`. Same
-   * clauses as `listInterruptedDispatchCandidates` except the lane: the job
-   * owns NO worktree row at all (any kind, any status), so the class is
-   * disjoint from the lane-required one and a `paused` (live processes) or
-   * `swept` (retained) lane is never claimed here. ANY agent row also
-   * excludes the job — the continuation fence's own "job-owned agent"
-   * notion, which strictly shrinks the set beyond the top-level minion
-   * clause above. Bounded and cursorless for the same reason as its
-   * lane-required sibling.
+   * registers its lane at the end of `createRetainedJobWorktree`. The
+   * lane-required query with its lane clause complemented: the job owns NO
+   * worktree row at all (any kind, any status), so the class is disjoint
+   * from the lane-required one and a `paused` (live processes) or `swept`
+   * (retained) lane is never claimed here. ANY agent row also excludes the
+   * job — the continuation fence's own "job-owned agent" notion. That clause
+   * subsumes the lane-required query's `role = 'minion' AND parentage =
+   * 'top-level'` clause (a top-level minion is an agent row), so it is not
+   * repeated here: one clause, one exclusion, nothing dead to keep in step.
+   * Bounded and cursorless for the same reason as its lane-required sibling.
    *
    * BOOT-ONLY. A live pass must never use this query: from the dispatch's
    * `working` write until `beginJobAdmission` every dispatch is
@@ -8517,7 +8518,6 @@ export class LedgerApi {
           WHERE j.status = 'working'
             AND EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.kind = 'job.handoff')
             AND NOT EXISTS (SELECT 1 FROM events e WHERE e.job_id = j.id AND e.kind = 'job.minion-spawned')
-            AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.job_id = j.id AND a.role = 'minion' AND a.parentage = 'top-level')
             AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.job_id = j.id)
             AND NOT EXISTS (SELECT 1 FROM worktrees w WHERE w.job_id = j.id)
           ORDER BY j.rowid LIMIT ?`,
@@ -8539,8 +8539,9 @@ export class LedgerApi {
 
   /** Whether this job owns ANY worktree row (`kind` and `status` ignored).
    * The boot-only lane-less reconciler uses it to prove the interrupted
-   * dispatch never reached a lane (issue #583); the lane-required class owns
-   * every job whose lane exists. One indexed row. */
+   * dispatch never reached a lane (issue #583); an `active` lane makes the
+   * job the lane-required class's, a `paused`/`swept` one is the documented
+   * gap neither pass claims. One indexed row. */
   hasAnyJobLane(jobId: string): boolean {
     const row = this.db.prepare('SELECT 1 AS present FROM worktrees WHERE job_id = ? LIMIT 1').get(jobId) as Row | undefined;
     return row !== undefined;

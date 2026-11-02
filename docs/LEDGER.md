@@ -580,15 +580,18 @@ lane only at the end of `createRetainedJobWorktree`, so its crash is
 durably identical to the initial one (the in-memory admission dies with the
 process) and neither the note nor the card may narrow the class to a first
 dispatch. Candidate shape (`listInterruptedLaneLessDispatchCandidates`,
-plus the single-row `hasAnyJobLane`): the lane-required query's clauses
-except the lane — the job owns **no worktree row at all** (any kind, any
-status, so `paused`/`swept` stay out and the two classes are disjoint), and
-**no agent row of any role or parentage** (the continuation fence's own
-"job-owned agent" notion, `api.ts:2107`). The service guards are the same,
-and a survivor gets the same note → card → status order and the same
-`dispatch.interrupted.<jobId>` `action-required` card deduped `active` —
-one card per job across both halves of the window. The pass never creates,
-repairs, sweeps or rolls back a worktree.
+plus the single-row `hasAnyJobLane`): the lane-required query's
+`job.handoff` and no-`job.minion-spawned` clauses, its lane clause
+complemented — the job owns **no worktree row at all** (any kind, any
+status, so `paused`/`swept` stay out and the two classes are disjoint) —
+and **no agent row of any role or parentage** (the continuation fence's
+own "job-owned agent" notion, `api.ts:2107`; it subsumes the
+lane-required query's top-level minion clause, so that clause is not
+repeated). The service guards are the same, and a survivor gets the same
+note → card → status order and the same `dispatch.interrupted.<jobId>`
+`action-required` card deduped `active` — one card per job across both
+halves of the window. The pass never creates, repairs, sweeps or rolls
+back a worktree.
 
 Two premises make the boot-only call safe, and both are load-bearing. It
 runs **before the HTTP listener exists**, so no `POST /api/dispatch` can be

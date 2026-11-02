@@ -97,8 +97,9 @@ export function interruptedDispatchVerdict(evidence: InterruptedDispatchEvidence
 
 /** The facts ONE lane-less candidate is judged on (issue #583). Identical to
  * `InterruptedDispatchEvidence` except that `activeLane` gives way to ANY
- * worktree row: an existing lane — active, paused or swept — belongs to the
- * lane-required class, never to this one. */
+ * worktree row: an `active` lane belongs to the lane-required class, and a
+ * `paused`/`swept` one belongs to neither pass (the documented conservative
+ * gap), but no lane row at all is this pass's candidate. */
 export interface InterruptedLaneLessDispatchEvidence {
   readonly status: JobStatus;
   readonly workerStarted: boolean;
@@ -120,9 +121,10 @@ export interface InterruptedLaneLessDispatchEvidence {
  * in-memory admission, then the durable lane/worker evidence, then the
  * ownership claims (continuation lane owner, provider wait, the pipeline's
  * admission claim) and finally the verification run. The lane guard is the
- * complement: a job that owns ANY worktree row is the lane-required pass's
- * candidate, never this pass's. Exported so a test pins every single-fact
- * exclusion without the SQL pre-filter.
+ * complement: a job that owns ANY worktree row is never this pass's
+ * candidate (only an `active` lane makes it the lane-required pass's, which
+ * is why `paused`/`swept` lanes are surfaced by neither). Exported so a test
+ * pins every single-fact exclusion without the SQL pre-filter.
  */
 export function interruptedDispatchWithoutLaneVerdict(
   evidence: InterruptedLaneLessDispatchEvidence,
@@ -135,7 +137,7 @@ export function interruptedDispatchWithoutLaneVerdict(
     return { block: false, reason: `in-flight dispatch admission (${evidence.admissions.join(', ')})` };
   }
   if (evidence.laneRowPresent) {
-    return { block: false, reason: 'a worktree row exists for this job — the lane-required pass owns it' };
+    return { block: false, reason: 'a worktree row exists for this job — neither pass blocks a lane-bearing job' };
   }
   if (evidence.workerStarted) {
     return { block: false, reason: 'a minion started for this job' };
