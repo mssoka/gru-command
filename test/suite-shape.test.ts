@@ -187,7 +187,7 @@ const PINS: Record<string, number> = {
   'property-stateful-pilot.test.ts': 6,
   'property-vitest-adapter.test.ts': 27,
   'prune-stale-dist.test.ts': 7,
-  'canceled-request-closeout.test.ts': 62,
+  'canceled-request-closeout.test.ts': 64,
   'unshare-review-hardlinks.test.ts': 5,
   'admission-retry-service.test.ts': 1,
   'artifact-context.test.ts': 34,

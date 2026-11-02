@@ -464,14 +464,21 @@ decides which:
 - **keep parked** — `POST /api/silas/directives/<request-id>/closeout`
   `{reason}` (Silas ops, like `/retire`): the request is retired, its debt is
   closed and its card resolved, and the job stays `parked` with its hold in
-  place — nothing is discarded and the readback shows the job unchanged. It
-  requires the job to be parked (`409 job_not_parked` otherwise), is refused
-  `409 request_closeout_mode_conflict` while a closeout of the other mode is
-  active, and stops (`409 request_closeout_stopped`, blocker
-  `code: "gate_duty"`) on a current gate duty: resolve the duty — that is
-  what the gate protects — and the next pass finishes the closeout. Park is
-  still a hold, not a cancel: a later fresh request on that job needs the
-  owner like any other.
+  place — nothing is discarded and the readback shows the job unchanged. A
+  fresh request (no active intent, for the request or the job) requires the
+  job to be parked (`409 job_not_parked` otherwise); an active intent for the
+  request is resumed first, and one whose basis no longer holds is superseded
+  (`409 request_closeout_superseded`) rather than answered with the hold. It
+  is refused `409 request_closeout_mode_conflict` while a closeout of the
+  other mode is active, and `409 request_closeout_target_mismatch` when the
+  job's closeout acts on a different request than the one the URL names. On a
+  current gate duty it stops (`409 request_closeout_stopped`, blocker
+  `code: "gate_duty"`): resolving the duty — that is what the gate protects —
+  is the exit, and the next pass finishes the closeout. Binning is not an exit
+  while the intent is active: a binning request is refused
+  `request_closeout_mode_conflict`, which names the active mode and closeout.
+  Park is still a hold, not a cancel: a later fresh request on that job needs
+  the owner like any other.
 
 There is no unbin: a mistaken bin is corrected by recording the honest
 next action as a NEW lane/job, never by rewriting the closed record.

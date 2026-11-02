@@ -397,12 +397,21 @@ parked as it was. The mode is stored on the intent
 (`request_closeouts.mode`, migration 37) because a resume replays from the row
 alone and the row's `job_status` cannot tell the two apart: a bin intent
 started on a parked job stores the same `parked`. `keep-parked` requires
-`job.status == "parked"` — the hold is the premise of the mode — and is
-otherwise refused `409 job_not_parked` before anything is written. An active
-intent of a **different** mode is never resumed: the request is refused `409
-request_closeout_mode_conflict` with `{active_mode, closeout_id}`, so a binning
-request cannot quietly complete a keep-parked intent (dropping the discard) and
-a keep-parked request cannot bin.
+`job.status == "parked"` — the hold is the premise of the mode — and a fresh
+keep-parked request (its request has no active intent) is otherwise refused
+`409 job_not_parked` before anything is written. An active intent for the
+request is resumed before that premise is read: it answers from the intent —
+its recorded refusal, or the `409 request_closeout_superseded` the step's own
+revalidation writes when its basis no longer holds (the job left `parked`, say)
+— instead of asking the caller to re-park the job. An active intent of a
+**different** mode is never resumed: the request is refused
+`409 request_closeout_mode_conflict` with `{active_mode, closeout_id}`, so a
+binning request cannot quietly complete a keep-parked intent (dropping the
+discard) and a keep-parked request cannot bin. A request-named call is answered
+for the request it names and no other: when the job's closeout acts on a
+different one — an active intent, or the eligibility rule's one live request —
+it is refused `409 request_closeout_target_mismatch` with `active_request_id`
+naming the request the closeout does act on.
 
 The closeout runs the same guards `/retire` runs for that request — the
 route-level lane, supervisor-ownership and pace-queue checks, then the
@@ -436,10 +445,11 @@ gate duty on that debt: `settleObligation` accepts only the duty's own
 completion or a matching terminal status, so S3' stops (`409
 request_closeout_stopped`, one blocker `code: "gate_duty"` naming the duty) and
 writes nothing. That blocker is stable on purpose: a repeat and every
-deterministic pass write nothing until the duty is resolved, and resolving it
-lets the next pass finish the closeout. Binning is not an exit while the intent
-is active — a binning request is refused `request_closeout_mode_conflict`,
-which names the active mode and closeout instead of dropping the discard.
+deterministic pass write nothing until the duty is resolved, and resolving it is
+the exit — the next pass then finishes the closeout. Binning is not an exit
+while the intent is active: a binning request is refused
+`request_closeout_mode_conflict`, which names the active mode and closeout
+instead of dropping the discard.
 
 It never claims a dispatch, spawns or prompts. Before S2 and before S3 the
 intent is revalidated against fixed identities: **P1** the job status is the
@@ -487,8 +497,11 @@ Responses of the closeout path (body `reason` ≤ 500 characters, optional
 - `409 request_closeout_superseded` — `{error, superseded_reason}`.
 - `409 request_closeout_mode_conflict` — `{error, active_mode, closeout_id}`:
   an active intent of the other mode owns the job; it is never resumed.
-- `409 job_not_parked` — `{error, detail}`: a `keep-parked` request for a job
-  that is not parked.
+- `409 request_closeout_target_mismatch` — `{error, active_request_id}`: a
+  request-named call asked for a request the job's closeout does not act on
+  (the named request itself is untouched).
+- `409 job_not_parked` — `{error, detail}`: a fresh `keep-parked` request for a
+  job that is not parked.
 
 The keep-parked route (`POST /api/silas/directives/<request>/closeout`) sits
 beside `/retire` under `silasOps` (a 503 when Silas ops are not hosted) and
@@ -496,7 +509,9 @@ resolves the job from the request row: `404` for an unknown request, `400
 invalid_reason` by the closeout's own rule, the same `200` (the job object —
 still `parked` — plus `closeout`) and the same `409`s, plus `409
 request_closeout_not_applicable` when the job has no deferred request to close
-out. With Silas off, boot and a repeated request remain the drivers.
+out and `409 request_closeout_target_mismatch` when the job's closeout acts on
+a different request than the one the URL names. With Silas off, boot and a
+repeated request remain the drivers.
 
 `GET /api/silas/directives/<request>` carries
 `closeout: {path, eligible, blockers, mode, intent}`: `path` is the job's —
