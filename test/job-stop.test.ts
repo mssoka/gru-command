@@ -258,6 +258,67 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
+  it('credits a proven-gone cancel on a later pass that holds no live run', async () => {
+    // The boot re-proof: the pass that cancelled is gone and the run is
+    // settled, so no cancel is called. The proof must come from the ledger
+    // row, not from absence — the lane reached `stopped` once and must stay
+    // stopped instead of falling back to 'no stop target exists'.
+    const cancelVerification = vi.fn();
+    const f = fixture({ cancelVerification });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
+      f.ledger.appendCustomEvent({
+        kind: 'verification.cancelled',
+        jobId: JOB,
+        payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, process_group_gone: true },
+      });
+      expect(f.ledger.hasUnsettledVerificationRun(JOB)).toBe(false);
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(cancelVerification).not.toHaveBeenCalled();
+      expect(outcome.outstanding).toEqual([]);
+      expect(outcome.state).toBe('stopped');
+      expect(eventStates(f.ledger)).toEqual(['requested', 'stopped']);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('does not credit a proven-gone cancel written before the hold began', async () => {
+    // A row from an earlier hold proves nothing about this one: the fence is
+    // the hold's own start, exactly as for a review receipt.
+    const f = fixture({
+      beforePark: (ledger) => {
+        ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-old' } });
+        ledger.appendCustomEvent({
+          kind: 'verification.cancelled',
+          jobId: JOB,
+          payload: { run_id: 'run-old', cancelled: true, started: true, ok: false, process_group_gone: true },
+        });
+      },
+    });
+    try {
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.outstanding.join(' ')).toMatch(/registry absence is not evidence/u);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('names an unproven cancel that carries no reason of its own as still unproven', async () => {
+    // The scheduler always names its reason; a cancel that answers without one
+    // must not invent a claim about a process group this host may not hold.
+    const f = fixture({ cancelVerification: async () => ({ state: 'unproven', detail: null }) });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.outstanding).toEqual(['a scheduled verification is still unproven']);
+    } finally {
+      f.close();
+    }
+  });
+
   it('keeps an unproven cancel as residue carrying the scheduler\'s own reason', async () => {
     const f = fixture({
       agents: [{ id: 'minion-5', state: 'streaming' }],

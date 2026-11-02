@@ -357,12 +357,9 @@ export class JobExecutionStop {
     // A verification the job holds is the job's producer too (issue #559):
     // stop it, then re-read the predicate — a cancel whose process group is
     // proven gone settles the run, and only that proof drops the residue.
-    // An unproven cancel (a live group, a bound-out settle, a holder this
-    // process cannot signal) stays residue with the scheduler's own reason.
+    // An unproven cancel (a live group, a holder this process cannot signal)
+    // stays residue with the scheduler's own reason.
     const outstanding: string[] = [];
-    // A proven-gone cancel IS a proven stop target: the run was a live
-    // producer, so a pass that proves it gone must not settle on absence.
-    let verificationProven = false;
     let unsettledVerification = ledger.hasUnsettledVerificationRun(input.jobId);
     if (unsettledVerification && this.deps.cancelVerification !== undefined) {
       let verdict: { readonly state: 'stopped' | 'unproven'; readonly detail?: string | null };
@@ -373,19 +370,30 @@ export class JobExecutionStop {
       }
       unsettledVerification = ledger.hasUnsettledVerificationRun(input.jobId);
       if (verdict.state === 'unproven') {
-        outstanding.push(
-          verdict.detail ?? 'a scheduled verification was cancelled but its process group is still alive',
-        );
+        outstanding.push(verdict.detail ?? 'a scheduled verification is still unproven');
       } else if (unsettledVerification) {
         outstanding.push(
           'a scheduled verification was cancelled, but its run is still recorded as unsettled — it may still run',
         );
-      } else {
-        verificationProven = true;
       }
     } else if (unsettledVerification) {
-      outstanding.push('an unsettled verification run remains — it may finish; no per-job scheduler stop exists');
+      outstanding.push(
+        'an unsettled verification run remains — it may finish; this service hosts no per-job verification stop',
+      );
     }
+    // A proven-gone cancel IS a proven stop target — the run was a live
+    // producer — and the proof is the LEDGER row, never this pass's verdict:
+    // the pass that cancels writes `verification.cancelled` and a later pass
+    // (the boot re-proof) reads it back, so the lane is not left concluding
+    // that absence proves nothing. Like `reviewProven`, only a row written
+    // after the hold's fence proves THIS hold, and a `process_group_gone:
+    // false` row is an unproven cancel: neither a target nor a residue.
+    const verificationProven = !unsettledVerification &&
+      ledger
+        .listJobEventsByKinds(input.jobId, ['verification.cancelled'])
+        .some((event) =>
+          (event.payload as { readonly process_group_gone?: unknown } | null)?.process_group_gone === true &&
+          event.seq > fence);
     const provenTargets =
       agents.filter((agent) => agent.state === 'stopped').length +
       children.filter((child) => child.state === 'stopped').length +

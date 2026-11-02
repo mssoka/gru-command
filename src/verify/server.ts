@@ -83,7 +83,8 @@ export interface VerificationServerOptions {
 }
 
 export interface VerificationServer {
-  /** First-mounted hook: claims POST /api/verify and GET /api/verify/status. */
+  /** First-mounted hook: claims POST /api/verify, GET /api/verify/status
+   * and POST /api/verify/cancel. */
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
   /** Board health row (board UX v4): live lock/queue/budget counters. */
   view(): VerificationQueueView;

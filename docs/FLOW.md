@@ -517,13 +517,15 @@ verification budget.
   `POST /api/verify/cancel {job_id, by, reason}` is the same per-job cancel
   the stop pass uses: a queued wait is dropped, a run still readying its lane
   never spawns, and a running one gets SIGTERM to its whole process group
-  and then SIGKILL after the kill grace. The answer is evidence, never
-  intent — `stopped` only when `kill(-pgid, 0)` proves the group gone;
+  and then SIGKILL after the cancel's own short grace. The answer is
+  evidence, never intent — `stopped` only when `kill(-pgid, 0)` proves the
+  group gone (the run's own drain is not the proof);
   `unproven`, with the reason, for a group that survives the bound, a
-  settle that outlasts it, a holder this process cannot signal, or nothing
+  holder this process cannot signal, or nothing
   held at all. The run is recorded once as `verification.cancelled` (never
   `verification.completed`), and only a proven-gone row settles it for the
-  stop and bin gates. The route accepts a lane whose latest stop pass is
+  stop and bin gates — the stop pass reads that row back, so a later pass
+  credits the same proof. The route accepts a lane whose latest stop pass is
   `requested`/`unproven`, a lane with an active closeout intent, or a
   `binned` lane: 401/503 through the ops token, 400 on a missing field, 404
   `job_not_found`, 409 `not_stopping` for a working lane's own run.

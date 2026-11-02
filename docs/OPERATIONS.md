@@ -269,22 +269,29 @@ producer stopped, so the service answers the two facts separately.
   in-flight verification is a producer like any other (issue #559): when the
   job stops, the pass asks the verification scheduler to end it — a queued
   wait is dropped, a run still readying its lane never spawns, and a running
-  one gets SIGTERM to its whole process group and then SIGKILL after the
-  kill grace. The whole ladder and its settle wait are bounded under the
-  shutdown join, so a stop pass never runs underneath a disposed scheduler.
+  one gets SIGTERM to its whole process group, then SIGKILL after the
+  cancel's own short grace (a second, not the run-timeout grace). The cancel
+  — TERM grace, SIGKILL and the group-absence proof together — is bounded
+  under the shutdown join, so the cancel is never still running underneath a
+  disposed scheduler (the rest of the pass, review supersession, is not
+  bounded).
   The verdict is evidence, never intent: the run counts as stopped only when
   `kill(-pgid, 0)` shows no member of that group left, so a TERM-resistant
   descendant is killed and a group that survives the bound keeps the stop
-  `unproven` — with the scheduler's own reason (the live group it observed,
-  the settle that outlasted the bound) as the residue text. A run this
-  process does not own (a holder an earlier process minted, or a slot no
+  `unproven` — with the scheduler's own reason (the live group it observed)
+  as the residue text; the run's own drain is never the proof, so a killed
+  group whose shell has not finished reaping still counts as stopped. A run
+  this process does not own (a holder an earlier process minted, or a slot no
   in-flight attempt backs) is never signalled: it is reported `unproven`
   with that reason, never as a live group this process claimed to see. A
   proven-gone cancel is itself a proven stop target, so a lane whose only
-  live producer was its verification still reaches `stopped`. The run is
-  recorded once as `verification.cancelled` — never as
-  `verification.completed`, because a cancelled run is not evidence that the
-  suite passed — and never as a shutdown `verification.no-start`.
+  live producer was its verification still reaches `stopped` — and the
+  proof is the `verification.cancelled` row, not the pass that wrote it, so
+  the next pass (the boot re-proof) reads it back instead of concluding that
+  registry absence proves nothing. The run is recorded once as
+  `verification.cancelled` — never as `verification.completed`, because a
+  cancelled run is not evidence that the suite passed — and never as a
+  shutdown `verification.no-start`.
 - **An unproven stop is named, never fabricated.** A failed dispose, a
   ledger open turn the runtime no longer holds, an unsettled verification
   run or an in-flight producer admission leaves `state: "unproven"` with the
@@ -292,8 +299,8 @@ producer stopped, so the service answers the two facts separately.
   `job-stop-unproven:<jobId>` incident (reused across boot re-proofs and
   resolved when a later pass proves the stop). A verification that could not
   be proven gone keeps the scheduler's own residue text — a named live
-  process group, a settle past the stop bound, or a holder this process
-  holds no signal for — and the run stays unsettled, so the lane stays held.
+  process group, or a holder this process holds no signal for — and the run
+  stays unsettled, so the lane stays held.
 - **Stopping is not closing.** The job stays parked until the owner moves it
   back to a working status. The stop record and the hold are separate rows,
   so a later reader can tell an administrative hold from a proven producer
