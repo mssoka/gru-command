@@ -86,7 +86,11 @@ repository/PR/SHA and renders it into the frozen spec context (beside, and
 distinct from, the local scheduler verification block) and into the manifest.
 A job whose PR link is a GitLab merge request has no such poll; its evidence is
 read by the host itself at the freeze (see [GitLab merge requests](#gitlab-merge-requests)
-below), and needs `GITLAB_TOKEN` (or `GL_TOKEN`) in the service environment.
+below), and needs `GITLAB_TOKEN` (or `GL_TOKEN`) in the service environment. That
+record also feeds the board's owner readiness (see [BOARD.md](BOARD.md), the FOR
+YOU band), where it is read job-scoped and must be younger
+than 24 hours; the freeze binding below stays round-scoped and never reuses an
+earlier round's read.
 
 - GREEN/PENDING/FAILED render the recorded state with check names/URLs,
   observation time and source event (kind + seq). A host string that lands in
@@ -131,6 +135,15 @@ second round reads again, an earlier round's read is never reused. The request
 ends with the round's setup: a shutdown or supersession during the read cancels
 it, and the cancelled read is recorded as an `other` failure like any other.
 
+**Owner readiness reuses the record, bounded.** The board's FOR YOU projection
+(`BOARD.md`) reads the job's newest `gitlab.mr-observed` / `gitlab.mr-read-failed`
+by ledger seq — not just this round's event — and requires it to be younger than
+24 hours (`GITLAB_EVIDENCE_MAX_AGE_MS`). A newer failed read withholds, exactly
+as rule 1 below refuses an older success. That bound is evidence freshness, never
+escalation, and it is the honest residual of having no GitLab poll: a merge,
+close, or pipeline re-run after the last read stays invisible until the next
+round reads again or the record ages out.
+
 **The link must name the lane.** Before any request, the link's host and project
 must be the origin remote of the job's repository, compared case-insensitively
 like the verdict poster compares them: the host with its port and the project path.
@@ -153,7 +166,8 @@ round. The event's `host` and `project` come from the response's `web_url` and
 
 - `gitlab.mr-observed`, for a parsed 2xx response:
   `{ host, project, mr_iid, state, head_sha, head_pipeline: { id, sha, status,
-  source, web_url } | null, round_id }`. `head_sha` is the response's `sha`.
+  source, web_url } | null, mergeable, round_id }`. `head_sha` is the response's
+  `sha`; `mergeable` is the normalized mergeability described next.
 - `gitlab.mr-read-failed`, otherwise:
   `{ host, project, mr_iid, error_kind, detail, round_id }`, with `host`,
   `project` and `mr_iid` from the request URL. `error_kind` is `token-missing`
@@ -167,6 +181,17 @@ round. The event's `host` and `project` come from the response's `web_url` and
   read was refused before any request because the link does not name the lane's
   origin, or was cancelled with the round's setup).
   `detail` is at most 300 characters. It stays in the event: the frozen reason is fixed text per kind, and for `other` (which joins several causes) it points at the round's `gitlab.mr-read-failed` ledger event; every reason fits the 200-character line of the published appendix whole.
+
+**Mergeability.** `gitlab.mr-observed` records `mergeable` as one of
+`clean` / `not-clean` / `unknown`, normalized at the read (never a raw
+passthrough of GitLab's fields): a present `detailed_merge_status` decides —
+`mergeable` is `clean`, any other value is `not-clean`; with no
+`detailed_merge_status`, `clean` requires `merge_status` `can_be_merged` AND
+`has_conflicts` `false` AND `blocking_discussions_resolved` `true`, and
+everything else records `unknown`. A response that omits all three fields is a
+valid observation (never a read failure) whose `mergeable` is `unknown`, so it
+cannot certify owner readiness. The freeze binding ignores the field; the
+owner gate treats only `clean` as ready.
 
 **Binding order.** Only the event this round's read recorded governs; earlier
 `gitlab.*` events are never used, and no `github.*` event is consulted. The first

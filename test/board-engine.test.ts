@@ -727,11 +727,11 @@ describe('board engine — liveness-first rail and job trackers', () => {
 });
 
 describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
-  function fresh(): { api: LedgerApi; bus: EventBus; engine: BoardEngine } {
+  function fresh(now?: () => number): { api: LedgerApi; bus: EventBus; engine: BoardEngine } {
     const db = new LedgerDb(tmpDir());
     const bus = new EventBus();
     const api = new LedgerApi(db.handle, { bus });
-    return { api, bus, engine: new BoardEngine({ ledger: api, bus }) };
+    return { api, bus, engine: new BoardEngine({ ledger: api, bus, now }) };
   }
 
   const SHA = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
@@ -767,6 +767,110 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     });
     void job;
   }
+
+  const MR_HOST = 'gitlab.example.test';
+  const MR_PROJECT = 'acme/platform/app';
+  const MR_URL = `https://${MR_HOST}/${MR_PROJECT}/-/merge_requests/7`;
+
+  /** Stage one GitLab merge-request job exactly as the real flow would:
+   * in-review + MR link + a head-bound approved round + the round's read. */
+  function stageReadyGitLabMrJob(api: LedgerApi, id: string, sha: string = SHA, observed: Record<string, unknown> = {}): void {
+    api.addJob({ id, repo: 'demo', title: `Heist ${id}` });
+    api.setJobPr(id, MR_URL);
+    api.setJobStatus(id, 'working');
+    api.setJobStatus(id, 'in-review');
+    const round = api.addRound({ jobId: id, targetRef: sha });
+    api.setRoundStatus(round.id, 'live');
+    api.setRoundVerdict(round.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'gitlab.mr-observed',
+      jobId: id,
+      roundId: round.id,
+      payload: {
+        host: MR_HOST,
+        project: MR_PROJECT,
+        mr_iid: 7,
+        state: 'opened',
+        head_sha: sha,
+        mergeable: 'clean',
+        head_pipeline: {
+          id: 4242, sha, status: 'success', source: 'merge_request_event',
+          web_url: `https://${MR_HOST}/${MR_PROJECT}/-/pipelines/4242`,
+        },
+        round_id: round.id,
+        ...observed,
+      },
+    });
+  }
+
+  it('A1: ships one provider-tagged ownerPrs row for an exact-head ready GitLab merge request', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl');
+    const rows = engine.snapshot().ownerPrs;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ jobId: 'job-gl', prUrl: MR_URL, sha: SHA, provider: 'gitlab' });
+  });
+
+  it('renders a GitHub ready PR and a GitLab ready MR in one snapshot, sorted by job id', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-b');
+    stageReadyGitLabMrJob(api, 'job-a');
+    const rows = engine.snapshot().ownerPrs;
+    expect(rows.map((row) => `${row.jobId}:${row.provider}`)).toEqual(['job-a:gitlab', 'job-b:github']);
+  });
+
+  it('drops the GitLab row when the MR is merged after the approval', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl-merged', SHA, { state: 'merged', mergeable: 'unknown' });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when the MR is closed without a merge', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl-closed', SHA, { state: 'closed', mergeable: 'unknown' });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when the MR is conflicted (mergeability not clean)', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl-conflict', SHA, { mergeable: 'not-clean' });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when the MR has no head pipeline', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl-no-pipeline', SHA, { head_pipeline: null });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when the pipeline ran at an older head', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl-old-pipeline', SHA, {
+      head_pipeline: { id: 4243, sha: 'ffff0000aaaa1111bbbb2222cccc3333dddd4444', status: 'success', source: 'merge_request_event', web_url: null },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row when a newer read failed', () => {
+    const { api, engine } = fresh();
+    stageReadyGitLabMrJob(api, 'job-gl-read-failed');
+    api.appendCustomEvent({
+      kind: 'gitlab.mr-read-failed',
+      jobId: 'job-gl-read-failed',
+      payload: { host: MR_HOST, project: MR_PROJECT, mr_iid: 7, error_kind: 'timeout', detail: 'timed out', round_id: 'round-1' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the GitLab row once the observation is older than the 24h evidence bound', () => {
+    let now = Date.now();
+    const { api, engine } = fresh(() => now);
+    stageReadyGitLabMrJob(api, 'job-gl-stale');
+    // No GitLab poll exists: the newest read ages out instead of certifying
+    // forever. The bound comes from the engine's clock seam, not `Date.now()`.
+    now += 24 * 60 * 60 * 1000 + 60_000;
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
 
   it('ships one ownerPrs row for the exact-head ready job (stable id, job order)', () => {
     const { api, engine } = fresh();

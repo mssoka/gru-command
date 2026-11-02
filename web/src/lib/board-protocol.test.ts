@@ -445,6 +445,11 @@ describe('board server-frame validator', () => {
       checkedAt: '2026-01-01T00:00:00.000Z',
     };
     expect(isValidSnapshot({ ...snapshot(), ownerPrs: [ready] } as unknown)).toBe(true);
+    // #527: the provider is additive — a pre-#527 row (no provider) still
+    // validates, a known provider is accepted, and an unknown one is refused
+    // rather than guessed.
+    expect(isValidSnapshot({ ...snapshot(), ownerPrs: [{ ...ready, provider: 'github' }] } as unknown)).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), ownerPrs: [{ ...ready, provider: 'gitlab' }] } as unknown)).toBe(true);
 
     // Readiness is server authority: a malformed row never reaches the band.
     for (const broken of [
@@ -453,6 +458,8 @@ describe('board server-frame validator', () => {
       { ...ready, sha: null },
       { ...ready, checkedAt: 12 },
       { ...ready, prUrl: 'javascript:alert(1)' },
+      { ...ready, provider: 'bitbucket' },
+      { ...ready, provider: null },
     ]) {
       expect(isValidSnapshot({ ...snapshot(), ownerPrs: [broken] } as unknown), JSON.stringify(broken)).toBe(false);
     }

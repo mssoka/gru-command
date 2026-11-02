@@ -101,6 +101,9 @@ function mrBody(world: World, overrides: Record<string, unknown> = {}, pipeline:
     state: 'opened',
     sha: world.target,
     web_url: MR_URL,
+    // #527 records the normalized mergeability additively; the freeze binding
+    // below intentionally ignores it (the rendered bytes stay as #519 froze).
+    detailed_merge_status: 'mergeable',
     head_pipeline: pipeline === null
       ? null
       : { id: PIPELINE_ID, sha: world.target, status: 'success', source: 'merge_request_event', web_url: PIPELINE_URL, ...pipeline },
@@ -272,6 +275,7 @@ describe('GitLab merge request CI evidence through the round freeze', () => {
     expect(frozen.gitlabEvents[0]!.payload).toEqual({
       host: HOST, project: PROJECT, mr_iid: IID, state: 'opened', head_sha: world.target,
       head_pipeline: { id: PIPELINE_ID, sha: world.target, status: 'running', source: 'merge_request_event', web_url: PIPELINE_URL },
+      mergeable: 'clean',
       round_id: frozen.roundId,
     });
     expect(frozen.ci).toMatchObject({ state: 'pending', failures: [], reason: null });

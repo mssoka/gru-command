@@ -160,6 +160,20 @@ describe('owner-band row model', () => {
     ]);
   });
 
+  it('projects a GitLab merge-request row on the same terms (the provider travels, labels are the view\'s)', () => {
+    const rows = ownerRows(
+      snapshot({
+        ownerPrs: [pr('job-mr', { provider: 'gitlab', prUrl: 'https://gitlab.example.test/acme/platform/app/-/merge_requests/7' })],
+      }),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: 'pr',
+      actionId: 'owner-pr:job-mr',
+      pr: { provider: 'gitlab', prUrl: 'https://gitlab.example.test/acme/platform/app/-/merge_requests/7' },
+    });
+  });
+
   it('treats an identical ts as a deterministic tiebreak by action id (never feed order)', () => {
     const rows = ownerRows(
       snapshot({
@@ -250,6 +264,9 @@ describe('safePrUrl', () => {
     expect(safePrUrl('http://github.com/x/y/pull/1')).toBeNull();
     expect(safePrUrl('javascript:alert(1)')).toBeNull();
     expect(safePrUrl('https://')).toBeNull(); // no host — never a real target
+    // A GitLab merge-request link follows the same https-only rule (#527).
+    expect(safePrUrl('https://gitlab.example.test/acme/app/-/merge_requests/3')).toBe('https://gitlab.example.test/acme/app/-/merge_requests/3');
+    expect(safePrUrl('http://gitlab.example.test/acme/app/-/merge_requests/3')).toBeNull();
     expect(safePrUrl('')).toBeNull();
     expect(safePrUrl('github.com/x/y/pull/1')).toBeNull();
   });

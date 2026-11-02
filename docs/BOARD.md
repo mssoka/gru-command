@@ -146,23 +146,37 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   behind a `+N older pending`
   expander — the engine already merges EVERY unacked needs-owner row
   into the snapshot, so no pending obligation is lost to the bounded
-  feed. The PR action is **OPEN PR** (external https link only) — a
-  link click is never a merge; readiness is projected SERVER-side
-  (`ownerPrs` on the snapshot) from the conjunction of durable exact-head
-  facts: `in-review` job + recorded PR, a `github.branch-state`
-  observation whose `pr_url` matches the recorded PR with the pull
-  explicitly OPEN (`pr_open:true` — a closed-without-merge pull is never
-  an open obligation), `merged:false`, `mergeable_state:clean` observed
-  for THAT head (a moved head invalidates the old mergeability — the
-  poll fails closed until GitHub answers for the new head), CI observed
-  **green at that exact sha**, and the job's NEWEST review round
-  `verdict-posted` / `approved` with its frozen `targetRef` equal to that
-  sha. Anything
+  feed. The row's action is **OPEN PR** for a GitHub pull and **OPEN
+  MR** for a GitLab merge request (external https link only) — a link
+  click is never a merge; the provider is the job's own link, never
+  inferred from whichever observation exists. Readiness is projected
+  SERVER-side (`ownerPrs` on the snapshot) from the conjunction of
+  durable exact-head facts: `in-review` job + a recorded PR/MR link that
+  parses on a supported host, an observation of that same provider — a
+  `github.branch-state` whose `pr_url` matches the recorded pull, or the
+  `gitlab.mr-observed` read a review round recorded for the MR with the
+  same host/project/iid (see
+  [REVIEW-INPUTS.md](REVIEW-INPUTS.md#gitlab-merge-requests)) — with the
+  change explicitly OPEN (a closed-without-merge pull or MR is never an
+  open obligation), `merged:false`, mergeability **proved clean** for
+  THAT head (a moved head invalidates the old mergeability — the poll,
+  and the MR read, fail closed until the host answers for the new head),
+  CI observed **green at that exact sha**, and the job's NEWEST review
+  round `verdict-posted` / `approved` with its frozen `targetRef` equal
+  to that sha. A merge request is read once per review round and nothing
+  polls it, so its evidence must be younger than 24 hours (the row shows
+  the observation age); older evidence, a newer failed read, or a link on
+  a host this service does not support for GitLab renders no row, while a
+  merge, close, or pipeline re-run after the last read stays invisible
+  until the next round reads again or the record ages out. Anything
   missing, stale, moved, dirty, blocked, pending/failed, or
   changes-requested renders no row (fail closed — no heuristic).
   Known limitation (deliberate): GitHub-native review approvals beyond
   `mergeable_state` are not separately projected; the Perkins verdict is
-  represented by the head-bound approved round. Then the **attention
+  represented by the head-bound approved round. This freshness bound is
+  evidence aging, not owner escalation: nothing is timed out or nagged.
+
+  Then the **attention
   bands** — NEEDS GRU → IN FLIGHT → SETTLED →
   COLD, recency inside each band — rendered as full-width **dense rows**
   (line 1: dot + title + status chip; line 2: repo + branch + heist/minion

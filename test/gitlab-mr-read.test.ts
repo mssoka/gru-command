@@ -111,8 +111,47 @@ describe('readGitLabMr', () => {
           id: 4242, sha: TARGET, status: 'success', source: 'merge_request_event',
           web_url: `https://${HOST}/${PROJECT}/-/pipelines/4242`,
         },
+        // No mergeability field in the answer: recorded as unproven, never clean.
+        mergeable: 'unknown',
       },
     });
+  });
+
+  it('normalizes `detailed_merge_status: mergeable` to clean (#527)', async () => {
+    const { fetch: fetchDouble } = double(() => json(mrBody({ detailed_merge_status: 'mergeable' })));
+    const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV });
+    expect(outcome).toMatchObject({ ok: true, observed: { mergeable: 'clean' } });
+  });
+
+  it('normalizes any other present detailed_merge_status (GitLab says `conflict`) to not-clean (#527)', async () => {
+    for (const status of ['conflict', 'blocked_status', 'checking', 'unchecked', 'not_open']) {
+      const { fetch: fetchDouble } = double(() => json(mrBody({ detailed_merge_status: status })));
+      const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV });
+      expect(outcome, status).toMatchObject({ ok: true, observed: { mergeable: 'not-clean' } });
+    }
+  });
+
+  it('accepts only the legacy triple as proof when detailed_merge_status is absent, else records unknown (#527)', async () => {
+    const proven = double(() => json(mrBody({
+      merge_status: 'can_be_merged', has_conflicts: false, blocking_discussions_resolved: true,
+    })));
+    expect(await readGitLabMr(REQUEST, { fetch: proven.fetch, env: ENV }))
+      .toMatchObject({ ok: true, observed: { mergeable: 'clean' } });
+    // Any one leg missing leaves mergeability unproven: absence is tolerated,
+    // never a read failure and never a default of clean.
+    const unproven: ReadonlyArray<Record<string, unknown>> = [
+      {},
+      { merge_status: 'can_be_merged' },
+      { merge_status: 'can_be_merged', has_conflicts: false },
+      { merge_status: 'can_be_merged', has_conflicts: true, blocking_discussions_resolved: true },
+      { merge_status: 'cannot_be_merged', has_conflicts: false, blocking_discussions_resolved: true },
+      { merge_status: 'can_be_merged', has_conflicts: false, blocking_discussions_resolved: false },
+    ];
+    for (const overrides of unproven) {
+      const { fetch: fetchDouble } = double(() => json(mrBody(overrides)));
+      const outcome = await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV });
+      expect(outcome, JSON.stringify(overrides)).toMatchObject({ ok: true, observed: { mergeable: 'unknown' } });
+    }
   });
 
   it('resolves the token as the head probe does: GITLAB_TOKEN, then GL_TOKEN, an empty value is missing', async () => {
@@ -373,10 +412,12 @@ describe('recordGitLabMrRead', () => {
           id: 4242, sha: TARGET, status: 'success', source: 'merge_request_event',
           web_url: `https://${HOST}/${PROJECT}/-/pipelines/4242`,
         },
+        // #527: additive normalized mergeability; the freeze renderer ignores it.
+        mergeable: 'unknown',
       },
     });
     expect(Object.keys(events[0]!.payload as object).sort()).toEqual(
-      ['head_pipeline', 'head_sha', 'host', 'mr_iid', 'project', 'round_id', 'state'],
+      ['head_pipeline', 'head_sha', 'host', 'mergeable', 'mr_iid', 'project', 'round_id', 'state'],
     );
     expect(logs.map((entry) => entry.level)).toEqual(['info']);
   });

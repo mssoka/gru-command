@@ -7,10 +7,13 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { BRANCH_STATE_EVENT, branchStatePayload, type CiState, type NormalizedBranchState, type RepoRef } from '../src/dispatch/github-poll.js';
 import {
+  GITLAB_EVIDENCE_MAX_AGE_MS,
+  githubEvidence,
   isSafeHttpsUrl,
   ownerReadyPr,
   readBranchEvidence,
-  type BranchEvidence,
+  readOwnerEvidence,
+  type OwnerEvidence,
   type OwnerPrJob,
 } from '../src/board/owner-actions.js';
 
@@ -28,6 +31,10 @@ function tmpDir(): string {
 const SHA = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
 const OTHER_SHA = 'ffff0000aaaa1111bbbb2222cccc3333dddd4444';
 const PR_URL = 'https://github.com/example/demo/pull/7';
+const CHECKED_AT = '2026-09-28T10:00:00.000Z';
+const MR_HOST = 'gitlab.example.test';
+const MR_PROJECT = 'acme/platform/app';
+const MR_URL = `https://${MR_HOST}/${MR_PROJECT}/-/merge_requests/7`;
 
 function greenCi(sha: string): CiState {
   return { sha, status: 'green', signature: '', failures: [], checks: ['ci'] };
@@ -59,8 +66,10 @@ function branchState(overrides: Partial<NormalizedBranchState> = {}): Normalized
   };
 }
 
-function evidence(overrides: Partial<NormalizedBranchState> = {}): BranchEvidence {
-  return { state: branchState(overrides), checkedAt: '2026-09-28T10:00:00.000Z' };
+/** The GitHub path's normalized evidence — the whole existing gate table
+ * runs through this constructor (behavioral parity with the pre-#527 shape). */
+function evidence(overrides: Partial<NormalizedBranchState> = {}): OwnerEvidence {
+  return githubEvidence(branchState(overrides), CHECKED_AT);
 }
 
 function job(overrides: Partial<OwnerPrJob> = {}): OwnerPrJob {
@@ -85,12 +94,13 @@ describe('owner-action projection — fail-closed readiness gate', () => {
       repo: 'demo',
       prUrl: PR_URL,
       sha: SHA,
-      checkedAt: '2026-09-28T10:00:00.000Z',
+      checkedAt: CHECKED_AT,
+      provider: 'github',
     });
   });
 
-  // Register each case explicitly: the full-suite shape guard must pin all
-  // 28 cases, not just one registration site hidden inside a loop.
+  // Register each case explicitly: the full-suite shape guard must pin every
+  // case, not just one registration site hidden inside a loop.
   it('renders NO ready row when: job is not in-review (hold)', () => {
     expect(ownerReadyPr(job({ status: 'blocked' }), evidence())).toBeNull();
   });
@@ -103,6 +113,13 @@ describe('owner-action projection — fail-closed readiness gate', () => {
     expect(ownerReadyPr(job({ prUrl: 'http://insecure.example/pr' }), evidence())).toBeNull();
   });
 
+  it('renders NO ready row when: prUrl is https but names no supported pull request or merge request', () => {
+    // #527 tightens the GitHub link to a parseable PR URL, as the GitLab
+    // link already had to be a parseable MR URL.
+    expect(ownerReadyPr(job({ prUrl: 'https://github.com/example/demo/issues/7' }), evidence())).toBeNull();
+    expect(ownerReadyPr(job({ prUrl: 'https://example.test/somewhere' }), evidence())).toBeNull();
+  });
+
   it('renders NO ready row when: no branch-state evidence at all', () => {
     expect(ownerReadyPr(job(), null)).toBeNull();
   });
@@ -112,7 +129,10 @@ describe('owner-action projection — fail-closed readiness gate', () => {
   });
 
   it('renders NO ready row when: PR already merged', () => {
-    expect(ownerReadyPr(job(), evidence({ merged: true, prOpen: false }))).toBeNull();
+    // `prOpen:true` isolates the `merged` limb: the closed and never-observed
+    // cases below withhold at `!open`, so dropping `if (evidence.merged)`
+    // would leave only this case red.
+    expect(ownerReadyPr(job(), evidence({ merged: true, prOpen: true }))).toBeNull();
   });
 
   it('renders NO ready row when: PR closed without merging', () => {
@@ -233,5 +253,201 @@ describe('owner-action projection — evidence reader over the durable ledger', 
     api.addJob({ id: 'job-mangled', repo: 'demo', title: 'Mangled' });
     api.appendCustomEvent({ kind: BRANCH_STATE_EVENT, jobId: 'job-mangled', payload: 'not-an-object' });
     expect(readBranchEvidence(api, 'job-mangled')).toBeNull();
+  });
+});
+
+describe('owner-action projection — GitLab merge requests (#527)', () => {
+  let api: LedgerApi;
+
+  beforeAll(() => {
+    const db = new LedgerDb(tmpDir());
+    api = new LedgerApi(db.handle, { bus: new EventBus() });
+  });
+
+  /** A `gitlab.mr-observed` payload exactly as the round's read records it. */
+  function mrObserved(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      host: MR_HOST,
+      project: MR_PROJECT,
+      mr_iid: 7,
+      state: 'opened',
+      head_sha: SHA,
+      mergeable: 'clean',
+      head_pipeline: {
+        id: 4242, sha: SHA, status: 'success', source: 'merge_request_event',
+        web_url: `https://${MR_HOST}/${MR_PROJECT}/-/pipelines/4242`,
+      },
+      round_id: 'round-1',
+      ...overrides,
+    };
+  }
+
+  function stage(id: string, prUrl: string | null = MR_URL): OwnerPrJob {
+    api.addJob({ id, repo: 'demo', title: `Heist ${id}` });
+    return job({ id, prUrl });
+  }
+
+  function observe(jobId: string, kind: string, payload: unknown) {
+    return api.appendCustomEvent({ kind, jobId, roundId: 'round-1', payload });
+  }
+
+  /** Stage one job with one observation, then read through the production
+   * reader and gate — every GitLab case exercises both. */
+  function ready(id: string, observed: Record<string, unknown> = {}, now = Date.now()) {
+    const jobInput = stage(id);
+    observe(id, 'gitlab.mr-observed', mrObserved(observed));
+    return ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, now));
+  }
+
+  it('qualifies an opened GitLab MR: exact-head success pipeline + clean mergeability + head-bound approval', () => {
+    const jobInput = stage('job-gl-ready');
+    const event = observe('job-gl-ready', 'gitlab.mr-observed', mrObserved());
+    const row = ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()));
+    expect(row).toEqual({
+      id: 'owner-pr:job-gl-ready',
+      jobId: 'job-gl-ready',
+      jobTitle: 'Ready heist',
+      repo: 'demo',
+      prUrl: MR_URL,
+      sha: SHA,
+      checkedAt: event.ts,
+      provider: 'gitlab',
+    });
+  });
+
+  it('renders NO ready row when: no GitLab evidence is recorded for the job', () => {
+    const jobInput = stage('job-gl-silent');
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))).toBeNull();
+  });
+
+  it('renders NO ready row when: the only observation is the other provider (attribution matches the link, never the event stream)', () => {
+    const jobInput = stage('job-gl-github-only');
+    api.appendCustomEvent(branchEvent('job-gl-github-only', branchState()));
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))).toBeNull();
+
+    const githubJob = stage('job-gh-gitlab-only', PR_URL);
+    observe('job-gh-gitlab-only', 'gitlab.mr-observed', mrObserved({ host: 'gitlab.example.test' }));
+    expect(ownerReadyPr(githubJob, readOwnerEvidence(api, githubJob, Date.now()))).toBeNull();
+  });
+
+  it('renders NO ready row when: a newer failed read supersedes the observation', () => {
+    const jobInput = stage('job-gl-read-failed');
+    observe('job-gl-read-failed', 'gitlab.mr-observed', mrObserved());
+    observe('job-gl-read-failed', 'gitlab.mr-read-failed', {
+      host: MR_HOST, project: MR_PROJECT, mr_iid: 7, error_kind: 'timeout', detail: 'timed out', round_id: 'round-1',
+    });
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))).toBeNull();
+  });
+
+  it('keeps the earlier observation when a newer read succeeds (newest of either kind decides)', () => {
+    const jobInput = stage('job-gl-recovered');
+    observe('job-gl-recovered', 'gitlab.mr-read-failed', {
+      host: MR_HOST, project: MR_PROJECT, mr_iid: 7, error_kind: 'other', detail: 'boom', round_id: 'round-1',
+    });
+    observe('job-gl-recovered', 'gitlab.mr-observed', mrObserved());
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))?.provider).toBe('gitlab');
+  });
+
+  it('renders NO ready row when: the observation names another host', () => {
+    expect(ready('job-gl-host', { host: 'gitlab.other.test' })).toBeNull();
+  });
+
+  it('renders NO ready row when: the observation names another project (subgroups exact)', () => {
+    expect(ready('job-gl-project', { project: 'acme/platform/other' })).toBeNull();
+    expect(ready('job-gl-project-nested', { project: 'acme/app' })).toBeNull();
+  });
+
+  it('renders NO ready row when: the observation names another MR iid', () => {
+    expect(ready('job-gl-iid', { mr_iid: 8 })).toBeNull();
+  });
+
+  it('renders NO ready row when: the MR is closed', () => {
+    expect(ready('job-gl-closed', { state: 'closed', mergeable: 'unknown' })).toBeNull();
+  });
+
+  it('renders NO ready row when: the MR is merged', () => {
+    expect(ready('job-gl-merged', { state: 'merged', mergeable: 'unknown' })).toBeNull();
+  });
+
+  it('renders NO ready row when: the MR head moved after the approval (newer observation at B)', () => {
+    const jobInput = stage('job-gl-moved');
+    observe('job-gl-moved', 'gitlab.mr-observed', mrObserved());
+    observe('job-gl-moved', 'gitlab.mr-observed', mrObserved({
+      head_sha: OTHER_SHA,
+      head_pipeline: {
+        id: 4243, sha: OTHER_SHA, status: 'success', source: 'merge_request_event',
+        web_url: `https://${MR_HOST}/${MR_PROJECT}/-/pipelines/4243`,
+      },
+    }));
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))).toBeNull();
+  });
+
+  it('renders NO ready row when: the MR has no head pipeline', () => {
+    expect(ready('job-gl-no-pipeline', { head_pipeline: null })).toBeNull();
+  });
+
+  it('renders NO ready row when: the head pipeline is pending (running)', () => {
+    expect(ready('job-gl-pending', {
+      head_pipeline: { id: 4242, sha: SHA, status: 'running', source: 'merge_request_event', web_url: null },
+    })).toBeNull();
+  });
+
+  it('renders NO ready row when: the head pipeline failed', () => {
+    expect(ready('job-gl-failed', {
+      head_pipeline: { id: 4242, sha: SHA, status: 'failed', source: 'merge_request_event', web_url: null },
+    })).toBeNull();
+  });
+
+  it('renders NO ready row when: the head pipeline was skipped (GitLab binds skipped as failed)', () => {
+    expect(ready('job-gl-skipped', {
+      head_pipeline: { id: 4242, sha: SHA, status: 'skipped', source: 'merge_request_event', web_url: null },
+    })).toBeNull();
+  });
+
+  it('renders NO ready row when: the pipeline ran on another head (merged-results or an earlier push)', () => {
+    expect(ready('job-gl-merged-results', {
+      head_pipeline: { id: 4242, sha: OTHER_SHA, status: 'success', source: 'merge_request_event', web_url: null },
+    })).toBeNull();
+  });
+
+  it('renders NO ready row when: mergeability is not-clean (GitLab recorded `conflict`)', () => {
+    expect(ready('job-gl-conflict', { mergeable: 'not-clean' })).toBeNull();
+  });
+
+  it('renders NO ready row when: mergeability is unproven (`unknown`)', () => {
+    expect(ready('job-gl-unproven', { mergeable: 'unknown' })).toBeNull();
+  });
+
+  it('renders NO ready row when: the observation predates #527 and carries no mergeable field', () => {
+    const legacy: Record<string, unknown> = mrObserved();
+    delete legacy['mergeable'];
+    const jobInput = stage('job-gl-legacy');
+    observe('job-gl-legacy', 'gitlab.mr-observed', legacy);
+    const evidenceRead = readOwnerEvidence(api, jobInput, Date.now());
+    expect(evidenceRead?.mergeable).toBe('unknown');
+    expect(ownerReadyPr(jobInput, evidenceRead)).toBeNull();
+  });
+
+  it('renders NO ready row when: the link is an MR on a host this service does not support for GitLab', () => {
+    const jobInput = stage('job-gl-foreign-host', 'https://git.example.test/acme/platform/app/-/merge_requests/7');
+    observe('job-gl-foreign-host', 'gitlab.mr-observed', mrObserved({ host: 'git.example.test' }));
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))).toBeNull();
+  });
+
+  it('renders NO ready row when: the job has no recorded PR link', () => {
+    const jobInput = stage('job-gl-no-link', null);
+    observe('job-gl-no-link', 'gitlab.mr-observed', mrObserved());
+    expect(ownerReadyPr(jobInput, readOwnerEvidence(api, jobInput, Date.now()))).toBeNull();
+  });
+
+  it('withholds a read older than the evidence bound and keeps one inside it (freshness, not escalation)', () => {
+    const freshJob = stage('job-gl-fresh');
+    const freshEvent = observe('job-gl-fresh', 'gitlab.mr-observed', mrObserved());
+    const fresh = readOwnerEvidence(api, freshJob, Date.parse(freshEvent.ts) + GITLAB_EVIDENCE_MAX_AGE_MS - 1_000);
+    expect(ownerReadyPr(freshJob, fresh)?.provider).toBe('gitlab');
+
+    const staleJob = stage('job-gl-stale');
+    const staleEvent = observe('job-gl-stale', 'gitlab.mr-observed', mrObserved());
+    expect(readOwnerEvidence(api, staleJob, Date.parse(staleEvent.ts) + GITLAB_EVIDENCE_MAX_AGE_MS + 1_000)).toBeNull();
   });
 });

@@ -16,7 +16,7 @@ import type { VectorBoardView } from '../vector/board.js';
 import { briefingReviewBoardView, type BriefingReviewBoardView } from '../briefing-review/board.js';
 import type { BriefingReviewStage } from '../briefing-review/types.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
-import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
+import { ownerReadyPr, readOwnerEvidence, type OwnerPrView } from './owner-actions.js';
 import {
   DEFAULT_LENSES,
   LedgerApi,
@@ -1038,7 +1038,7 @@ export class BoardEngine {
           const version = acceptance?.version;
           if (typeof version !== 'number' || version < revision.required) return null;
         }
-        return ownerReadyPr(job, readBranchEvidence(this.ledger, job.id));
+        return ownerReadyPr(job, readOwnerEvidence(this.ledger, job, this.now()));
       })
       .filter((row): row is OwnerPrView => row !== null)
       .sort((left, right) => left.jobId.localeCompare(right.jobId));
