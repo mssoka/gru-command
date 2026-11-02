@@ -10,8 +10,9 @@
  *     that URL parses as a change on a host this service supports;
  *   - an observation recorded for that same provider exists — for GitHub a
  *     `github.branch-state` whose `pr_url` is exactly the recorded PR, for
- *     GitLab the `gitlab.mr-observed` read a review round recorded (see
- *     below) — and its identity names the link's host/project/change;
+ *     GitLab the newest `gitlab.mr-observed` read, recorded by a review
+ *     round or by the GitLab signal poll (see below) — and its identity
+ *     names the link's host/project/change;
  *   - that observation says the change is explicitly OPEN, NOT merged, and
  *     proved mergeable `clean` (conflicts, required gates, and an
  *     unproven/absent mergeability fail closed);
@@ -30,13 +31,17 @@
  * event happens to exist: a GitLab MR link is certified only by a GitLab
  * observation, a GitHub PR link only by a GitHub observation.
  *
- * GitLab freshness: a merge request is read once per review round and
- * nothing polls it (`docs/REVIEW-INPUTS.md` §2), so the newest `gitlab.*`
- * record for the job must be younger than `GITLAB_EVIDENCE_MAX_AGE_MS`.
- * That bound is evidence freshness, not owner escalation: the row simply
- * stops rendering, and the next round's read (or the bound) retires it.
- * A newer `gitlab.mr-read-failed` supersedes an older observation, exactly
- * as the freeze-time binding refuses to fall back to an older success.
+ * GitLab freshness: the GitLab signal poll (#568) reads a live lane's merge
+ * request once per `[silas] poll_interval_ms` tick and re-records an
+ * unchanged observation once it is older than `GITLAB_EVIDENCE_MAX_AGE_MS`,
+ * so a lane the poll is succeeding on does not stay aged out (the refresh
+ * lands at the next tick, so the row can be withheld for up to one interval
+ * past the bound), while a poll that stopped (or a recorded read failure)
+ * does withhold the row. That bound is evidence
+ * freshness, not owner escalation: the row simply stops rendering, and the
+ * next read retires it. A newer `gitlab.mr-read-failed` supersedes an older
+ * observation, exactly as the freeze-time binding refuses to fall back to an
+ * older success.
  */
 
 import {
@@ -47,6 +52,7 @@ import {
   type NormalizedBranchState,
 } from '../dispatch/github-poll.js';
 import { parseGitLabMrLink } from '../dispatch/review-path.js';
+import { GITLAB_EVIDENCE_MAX_AGE_MS } from '../dispatch/gitlab-poll.js';
 import {
   GITLAB_MR_OBSERVED_EVENT,
   GITLAB_MR_READ_FAILED_EVENT,
@@ -55,11 +61,12 @@ import {
   type ChangeMergeability,
 } from '../review-inputs/ci-evidence.js';
 
-/** How old a GitLab observation may be and still certify readiness. A
- * merge request is read once per review round and never polled, so a read
- * older than this can no longer speak for a merge, close, or re-run that
- * happened since. Duration, never escalation: the row stops rendering. */
-export const GITLAB_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** How old a GitLab observation may be and still certify readiness: a record
+ * older than this can no longer speak for a merge, close or re-run that
+ * happened since. The GitLab signal poll keeps it fresh (#568) and owns the
+ * value; it is re-exported here for this module's readers. Duration, never
+ * escalation: the row stops rendering. */
+export { GITLAB_EVIDENCE_MAX_AGE_MS };
 
 /** The ledger slice the evidence reader needs (the engine's LedgerApi
  * satisfies it; tests inject a stub). */

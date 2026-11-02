@@ -530,6 +530,10 @@ export interface GitLabMrObservation {
   readonly state: string;
   readonly headSha: string;
   readonly headPipeline: GitLabHeadPipeline | null;
+  /** The commit GitLab created when it merged (#568), null for an unmerged
+   * request and for payloads recorded before the field existed. The poll's
+   * dedupe reads it; the freeze binding never does. */
+  readonly mergeCommitSha: string | null;
   /** The mergeability normalized and recorded by the read (#527). Absent on
    * payloads recorded before it existed, which read as `unknown`. */
   readonly mergeable: ChangeMergeability;
@@ -549,8 +553,9 @@ export function readGitLabMrObservation(payload: unknown): GitLabMrObservation |
   const mergeable: ChangeMergeability = fields['mergeable'] === 'clean'
     ? 'clean'
     : fields['mergeable'] === 'not-clean' ? 'not-clean' : 'unknown';
+  const mergeCommitSha = clean(fields['merge_commit_sha']);
   const rawPipeline = fields['head_pipeline'];
-  if (rawPipeline === null) return { host, project, iid, state, headSha, mergeable, headPipeline: null };
+  if (rawPipeline === null) return { host, project, iid, state, headSha, mergeable, mergeCommitSha, headPipeline: null };
   const pipeline = record(rawPipeline);
   if (pipeline === null) return null;
   const id = num(pipeline['id']);
@@ -558,7 +563,7 @@ export function readGitLabMrObservation(payload: unknown): GitLabMrObservation |
   const status = clean(pipeline['status']);
   if (id === null || sha === null || status === null) return null;
   return {
-    host, project, iid, state, headSha, mergeable,
+    host, project, iid, state, headSha, mergeable, mergeCommitSha,
     headPipeline: { id, sha, status, source: clean(pipeline['source']), webUrl: clean(pipeline['web_url']) },
   };
 }

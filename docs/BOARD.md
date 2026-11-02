@@ -154,8 +154,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   durable exact-head facts: `in-review` job + a recorded PR/MR link that
   parses on a supported host, an observation of that same provider — a
   `github.branch-state` whose `pr_url` matches the recorded pull, or the
-  `gitlab.mr-observed` read a review round recorded for the MR with the
-  same host/project/iid (see
+  `gitlab.mr-observed` read the GitLab signal poll (or a review round)
+  recorded for the MR with the same host/project/iid (see
   [REVIEW-INPUTS.md](REVIEW-INPUTS.md#gitlab-merge-requests)) — with the
   change explicitly OPEN (a closed-without-merge pull or MR is never an
   open obligation), `merged:false`, mergeability **proved clean** for
@@ -163,12 +163,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   and the MR read, fail closed until the host answers for the new head),
   CI observed **green at that exact sha**, and the job's NEWEST review
   round `verdict-posted` / `approved` with its frozen `targetRef` equal
-  to that sha. A merge request is read once per review round and nothing
-  polls it, so its evidence must be younger than 24 hours (the row shows
-  the observation age); older evidence, a newer failed read, or a link on
-  a host this service does not support for GitLab renders no row, while a
-  merge, close, or pipeline re-run after the last read stays invisible
-  until the next round reads again or the record ages out. Anything
+  to that sha. The GitLab signal poll re-records an unchanged observation
+  once it is 24 hours old, so a merge request's evidence must be younger
+  than 24 hours to count (the row shows the observation age); older
+  evidence, a newer failed read, or a link on a host this service does not
+  support for GitLab renders no row. The poll keeps that evidence current
+  where the round only reads on freeze, but it acts on merges alone: a
+  conflicted or red-pipeline MR changes no lane, and a closed-without-merge
+  MR simply stops rendering. Anything
   missing, stale, moved, dirty, blocked, pending/failed, or
   changes-requested renders no row (fail closed — no heuristic).
   Known limitation (deliberate): GitHub-native review approvals beyond

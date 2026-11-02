@@ -92,7 +92,9 @@ describe('prune-stale-dist', () => {
     // closeout (dist/dispatch/canceled-request-closeout.js and its ledger
     // persistence, dist/ledger/closeouts.js); #519 the GitLab merge-request
     // read behind a native round's CI evidence
-    // (dist/dispatch/perkins-review/gitlab-mr-read.js); and #569 the shared OS
+    // (dist/dispatch/perkins-review/gitlab-mr-read.js); #568 the GitLab
+    // merge-request signal poll that reads beside the GitHub one
+    // (dist/dispatch/gitlab-poll.js); and #569 the shared OS
     // suspend evidence the supervisor's clock-gap classification and the
     // admission probe both read (dist/runtime/suspend-evidence.js); #560 the
     // interrupted-dispatch reconciler (dist/dispatch/interrupted-dispatch.js).
@@ -102,9 +104,9 @@ describe('prune-stale-dist', () => {
     // packages): 151 catalogued names (142 of them ship executable files; the
     // rest are peers, optionals and type-only packages), from which the 0.85.1
     // shrinkwrap's esbuild, clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5306);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5307);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('2fbbebdf26aac408544182c6c016d23aa6f73b069bb35a6e7c645d5c15dd58b2');
+      .toBe('94304c9e1a8475aaae8968e76546367b7b3bbd507bdfefff5c62ca857994dae8');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

@@ -113,6 +113,8 @@ describe('readGitLabMr', () => {
         },
         // No mergeability field in the answer: recorded as unproven, never clean.
         mergeable: 'unknown',
+        // No merge commit in the answer (an unmerged request): null, not absent.
+        merge_commit_sha: null,
       },
     });
   });
@@ -267,6 +269,20 @@ describe('readGitLabMr', () => {
     });
   });
 
+  it('records the merge commit GitLab created when the request merged, and null otherwise (#568)', async () => {
+    const merged = '3a1f0e6c2d9b47a85311627f0a1be0c9a2d4e7f5';
+    const { fetch: fetchDouble } = double(() => json(mrBody({ state: 'merged', merge_commit_sha: merged })));
+    expect(await readGitLabMr(REQUEST, { fetch: fetchDouble, env: ENV })).toMatchObject({
+      ok: true, observed: { state: 'merged', merge_commit_sha: merged },
+    });
+    for (const absent of [{ merge_commit_sha: null }, { merge_commit_sha: undefined }, { merge_commit_sha: '' }]) {
+      const { fetch: nullDouble } = double(() => json(mrBody(absent)));
+      expect(await readGitLabMr(REQUEST, { fetch: nullDouble, env: ENV }), JSON.stringify(absent)).toMatchObject({
+        ok: true, observed: { merge_commit_sha: null },
+      });
+    }
+  });
+
   it('redacts the token from a response body and from a rejection message, and bounds the detail', async () => {
     const echoes: ReadonlyArray<readonly [string, () => Response]> = [
       ['a 500 body', () => new Response(`internal error while handling PRIVATE-TOKEN ${SENTINEL} ${'x'.repeat(2000)}`, { status: 500 })],
@@ -414,10 +430,12 @@ describe('recordGitLabMrRead', () => {
         },
         // #527: additive normalized mergeability; the freeze renderer ignores it.
         mergeable: 'unknown',
+        // #568: additive merge commit; null on a request GitLab has not merged.
+        merge_commit_sha: null,
       },
     });
     expect(Object.keys(events[0]!.payload as object).sort()).toEqual(
-      ['head_pipeline', 'head_sha', 'host', 'mergeable', 'mr_iid', 'project', 'round_id', 'state'],
+      ['head_pipeline', 'head_sha', 'host', 'merge_commit_sha', 'mergeable', 'mr_iid', 'project', 'round_id', 'state'],
     );
     expect(logs.map((entry) => entry.level)).toEqual(['info']);
   });

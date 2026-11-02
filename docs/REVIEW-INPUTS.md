@@ -84,13 +84,16 @@ No operator action is required for a GitHub PR. The GitHub poll records
 lanes; at freeze the host binds the latest observation to the exact
 repository/PR/SHA and renders it into the frozen spec context (beside, and
 distinct from, the local scheduler verification block) and into the manifest.
-A job whose PR link is a GitLab merge request has no such poll; its evidence is
-read by the host itself at the freeze (see [GitLab merge requests](#gitlab-merge-requests)
-below), and needs `GITLAB_TOKEN` (or `GL_TOKEN`) in the service environment. That
-record also feeds the board's owner readiness (see [BOARD.md](BOARD.md), the FOR
-YOU band), where it is read job-scoped and must be younger
-than 24 hours; the freeze binding below stays round-scoped and never reuses an
-earlier round's read.
+A job whose PR link is a GitLab merge request freezes the same way, on the
+merge request's own head pipeline: the host reads it at the freeze (see [GitLab
+merge requests](#gitlab-merge-requests) below), which needs `GITLAB_TOKEN` (or
+`GL_TOKEN`) in the service environment. Beside that round-scoped read, the
+GitLab signal poll observes a live lane's merge request once per
+`[silas] poll_interval_ms` tick and records what it saw as its own
+`gitlab.mr-observed` event; that record feeds the board's owner readiness (see
+[BOARD.md](BOARD.md), the FOR YOU band), where it is read job-scoped and must be
+younger than 24 hours, and it is never bound to a round: the freeze binding
+below stays round-scoped and never reuses an earlier or poll-written read.
 
 - GREEN/PENDING/FAILED render the recorded state with check names/URLs,
   observation time and source event (kind + seq). A host string that lands in
@@ -130,19 +133,29 @@ round's inputs are assembled, the host makes exactly one request, the same one
 the freeze head probe makes: `GET https://<host>/api/v4/projects/<url-encoded
 path>/merge_requests/<iid>` with `PRIVATE-TOKEN` from `GITLAB_TOKEN` (falling
 back to `GL_TOKEN`) and a 30 s timeout, except that it does not follow redirects
-(the token never follows one). There is no timer and no background poll: a
-second round reads again, an earlier round's read is never reused. The request
+(the token never follows one). The round's read is round-scoped: a second round
+reads again, and an earlier round's read is never reused. (The signal poll's
+observations are a separate, job-scoped record — see *Owner readiness reads the
+newest record* below — and no binding ever consults one.) The request
 ends with the round's setup: a shutdown or supersession during the read cancels
 it, and the cancelled read is recorded as an `other` failure like any other.
 
-**Owner readiness reuses the record, bounded.** The board's FOR YOU projection
-(`BOARD.md`) reads the job's newest `gitlab.mr-observed` / `gitlab.mr-read-failed`
-by ledger seq — not just this round's event — and requires it to be younger than
-24 hours (`GITLAB_EVIDENCE_MAX_AGE_MS`). A newer failed read withholds, exactly
-as rule 1 below refuses an older success. That bound is evidence freshness, never
-escalation, and it is the honest residual of having no GitLab poll: a merge,
-close, or pipeline re-run after the last read stays invisible until the next
-round reads again or the record ages out.
+**Owner readiness reads the newest record, bounded.** The board's FOR YOU
+projection (`BOARD.md`) reads the job's newest `gitlab.mr-observed` /
+`gitlab.mr-read-failed` by ledger seq — whether a review round or the GitLab
+signal poll recorded it — and requires it to be younger than 24 hours
+(`GITLAB_EVIDENCE_MAX_AGE_MS`). A newer failed read withholds, exactly as rule 1
+below refuses an older success. The signal poll keeps that record current: it
+re-records an unchanged observation once the newest one is that old, so a lane
+the poll is succeeding on does not stay aged out — the refresh lands at the
+next tick, so the row can be withheld for up to one interval past the bound —
+while a poll that stopped (or a
+recorded read failure) does withhold. That bound is evidence freshness, never
+escalation. The honest residual is narrower than "no GitLab poll": the poll
+records observations, not provider signals. A merge moves the lane to `merged`
+(see [FLOW.md](FLOW.md)), a closed-without-merge merge request stops rendering,
+but a conflicted merge request or a red pipeline changes no lane and wakes
+nobody.
 
 **The link must name the lane.** Before any request, the link's host and project
 must be the origin remote of the job's repository, compared case-insensitively
@@ -160,14 +173,17 @@ block reads `UNAVAILABLE`.
 line, the frozen block or the manifest: `detail` is credential-redacted and every
 occurrence of the token value is replaced with `[redacted]` first.
 
-**Recorded events.** Each read records exactly one job event, tagged with the
-round. The event's `host` and `project` come from the response's `web_url` and
-`mr_iid` from its `iid`, never from the request URL.
+**Recorded events.** Each read records exactly one job event. A round's read tags
+it with the round; the signal poll's read tags it `round_id: null`, and a null
+record is never bindable to a round. The event's `host` and `project` come from
+the response's `web_url` and `mr_iid` from its `iid`, never from the request URL.
 
 - `gitlab.mr-observed`, for a parsed 2xx response:
   `{ host, project, mr_iid, state, head_sha, head_pipeline: { id, sha, status,
-  source, web_url } | null, mergeable, round_id }`. `head_sha` is the response's
-  `sha`; `mergeable` is the normalized mergeability described next.
+  source, web_url } | null, merge_commit_sha, mergeable, round_id }`. `head_sha`
+  is the response's `sha`; `merge_commit_sha` is the commit GitLab created when
+  it merged (`null` while unmerged, and on every payload recorded before the
+  field existed); `mergeable` is the normalized mergeability described next.
 - `gitlab.mr-read-failed`, otherwise:
   `{ host, project, mr_iid, error_kind, detail, round_id }`, with `host`,
   `project` and `mr_iid` from the request URL. `error_kind` is `token-missing`

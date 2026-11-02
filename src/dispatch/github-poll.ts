@@ -859,6 +859,91 @@ export interface GitHubPollLedger {
   setJobStatus(id: string, status: string): JobRecord;
 }
 
+/** The ledger slice the shared merge map writes through. */
+export type MergeMapLedger = Pick<
+  GitHubPollLedger,
+  'getJob' | 'latestJobEvent' | 'setJobStatus' | 'appendCustomEvent'
+>;
+
+/** What the merge map did to the lane (the polls only count it). */
+export type MergeMapOutcome = 'applied' | 'refused' | 'noop' | 'unknown-job';
+
+export interface MergeMapInput {
+  readonly ledger: MergeMapLedger;
+  readonly log: Log;
+  /** The provider's merge event kind (`github.pr-merged`, `gitlab.mr-merged`). */
+  readonly eventKind: string;
+  readonly jobId: string;
+  /** The provider's identity payload, without `applied` (and a refusal's
+   * `reason`, which this function adds). */
+  readonly payload: Record<string, unknown>;
+  /** The field set each log line carries, per provider: the unknown-job and
+   * applied lines use theirs whole; the refusal line adds `status` and
+   * `error` to its own. */
+  readonly logFields: {
+    readonly unknown: Record<string, unknown>;
+    readonly applied: Record<string, unknown>;
+    readonly refused: Record<string, unknown>;
+  };
+  readonly logText: {
+    readonly unknown: string;
+    readonly applied: string;
+    readonly refused: string;
+  };
+}
+
+/**
+ * The merge map both signal polls share: bring the lane to `in-review` when
+ * the hop is legal (merged is terminal truth — a lane whose change landed
+ * while it sat blocked or delivered must not stay open), then
+ * `in-review -> merged`, then the provider's merge event. An unappliable live
+ * transition is recorded loud, never coerced; a binned lane stays terminal
+ * even if a request already in flight independently observes its change
+ * merge. The providers differ only in the event kind, the identity payload
+ * and the log wording — never in the hop sequence, the binned receipt, the
+ * refusal capture or the log levels.
+ */
+export function applyMergedLane(input: MergeMapInput): MergeMapOutcome {
+  const job = input.ledger.getJob(input.jobId);
+  if (job === null) {
+    input.log('warn', input.logText.unknown, input.logFields.unknown);
+    return 'unknown-job';
+  }
+  if (isJobTerminal(job.status)) {
+    // A change observed by an already-running poll may merge while its job
+    // is being discarded. Record the REAL observation once, but neither
+    // resurrect the lane nor call its abandonment a successful closeout.
+    // A job binned before this tick was never tracked, so no extra provider
+    // calls are made to discover future merges of discarded work.
+    if (job.status === 'binned' && input.ledger.latestJobEvent(input.jobId, input.eventKind) === null) {
+      input.ledger.appendCustomEvent({
+        kind: input.eventKind, jobId: input.jobId,
+        payload: { ...input.payload, applied: false, reason: 'job is binned' },
+      });
+    }
+    return 'noop';
+  }
+  try {
+    if (job.status !== 'in-review') input.ledger.setJobStatus(input.jobId, 'in-review');
+    input.ledger.setJobStatus(input.jobId, 'merged');
+    input.ledger.appendCustomEvent({ kind: input.eventKind, jobId: input.jobId, payload: { ...input.payload, applied: true } });
+    input.log('info', input.logText.applied, input.logFields.applied);
+    return 'applied';
+  } catch (error) {
+    input.ledger.appendCustomEvent({
+      kind: input.eventKind,
+      jobId: input.jobId,
+      payload: { ...input.payload, applied: false, reason: String(error).slice(0, 300) },
+    });
+    input.log('error', input.logText.refused, {
+      ...input.logFields.refused,
+      status: job.status,
+      error: String(error).slice(0, 300),
+    });
+    return 'refused';
+  }
+}
+
 export interface GitHubPollNotifications {
   postIncident(input: {
     kind: string;
@@ -1206,62 +1291,35 @@ export class GitHubSignalPoll {
   }
 
   /**
-   * The merge map: bring the lane to `in-review` when the hop is legal
-   * (merged is terminal truth — a lane whose PR landed while it sat blocked
-   * or delivered must not stay open), then `in-review -> merged`, then the
-   * `github.pr-merged` event. An unappliable live transition is recorded
-   * loud, never coerced; a binned lane stays terminal even if a request
-   * already in flight independently observes its PR merge.
+   * The GitHub arm of the shared merge map (see {@link applyMergedLane}):
+   * the lane's `github.pr-merged` event with its PR identity and the
+   * GitHub poll's own log lines.
    */
   private applyMerged(signal: PrMergedSignal): void {
-    const job = this.ledger.getJob(signal.jobId);
-    if (job === null) {
-      this.log('warn', 'github poll: merged PR for an unknown job', { job: signal.jobId });
-      return;
-    }
-    const payload = {
-      repo: repoFullName(signal.repo),
-      branch: signal.branch,
-      pr: signal.prNumber,
-      url: signal.prUrl,
-      sha: signal.sha,
-      merge_commit_sha: signal.mergeCommitSha,
-    };
-    if (isJobTerminal(job.status)) {
-      // A PR observed by an already-running poll may merge while its job
-      // is being discarded. Record the REAL observation once, but neither
-      // resurrect the lane nor call its abandonment a successful closeout.
-      // A job binned before this tick was never tracked, so no extra GitHub
-      // calls are made to discover future merges of discarded work.
-      if (job.status === 'binned' && this.ledger.latestJobEvent(signal.jobId, 'github.pr-merged') === null) {
-        this.ledger.appendCustomEvent({
-          kind: 'github.pr-merged', jobId: signal.jobId,
-          payload: { ...payload, applied: false, reason: 'job is binned' },
-        });
-      }
-      return;
-    }
-    try {
-      if (job.status !== 'in-review') this.ledger.setJobStatus(signal.jobId, 'in-review');
-      this.ledger.setJobStatus(signal.jobId, 'merged');
-      this.ledger.appendCustomEvent({ kind: 'github.pr-merged', jobId: signal.jobId, payload: { ...payload, applied: true } });
-      this.log('info', 'github poll: PR merged, lane closed', {
-        job: signal.jobId,
+    applyMergedLane({
+      ledger: this.ledger,
+      log: this.log,
+      eventKind: 'github.pr-merged',
+      jobId: signal.jobId,
+      payload: {
         repo: repoFullName(signal.repo),
+        branch: signal.branch,
         pr: signal.prNumber,
-      });
-    } catch (error) {
-      this.ledger.appendCustomEvent({
-        kind: 'github.pr-merged',
-        jobId: signal.jobId,
-        payload: { ...payload, applied: false, reason: String(error).slice(0, 300) },
-      });
-      this.log('error', 'github poll: merged PR could not close the lane', {
-        job: signal.jobId,
-        status: job.status,
-        error: String(error).slice(0, 300),
-      });
-    }
+        url: signal.prUrl,
+        sha: signal.sha,
+        merge_commit_sha: signal.mergeCommitSha,
+      },
+      logFields: {
+        unknown: { job: signal.jobId },
+        applied: { job: signal.jobId, repo: repoFullName(signal.repo), pr: signal.prNumber },
+        refused: { job: signal.jobId },
+      },
+      logText: {
+        unknown: 'github poll: merged PR for an unknown job',
+        applied: 'github poll: PR merged, lane closed',
+        refused: 'github poll: merged PR could not close the lane',
+      },
+    });
   }
 
   /** Conflict cascade: the event is the record; the fyi notification is

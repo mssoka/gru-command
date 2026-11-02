@@ -30,6 +30,7 @@ import {
   type DeterministicPassHook,
   type DigestLedger,
   type GitHubPollPort,
+  type GitLabPollPort,
   type RoundBlocker,
   type SilasSlot,
   type SkillModule,
@@ -46,7 +47,8 @@ import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
+import { BRANCH_STATE_EVENT, type GitHubPollTickResult } from '../src/dispatch/github-poll.js';
+import type { GitLabPollTickResult } from '../src/dispatch/gitlab-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import {
   PUBLICATION_ABSENT_EVENT,
@@ -3391,6 +3393,9 @@ function makeDriver(opts: {
   pollIntervalMs?: number;
   unchangedRewakeMs?: number;
   githubPoll?: GitHubPollPort;
+  gitlabPoll?: GitLabPollPort;
+  /** Collected log lines (the driver's own surface, e.g. poll failures). */
+  logs?: string[];
   bus?: boolean;
   skills?: readonly SkillModule[];
   timers?: {
@@ -3459,6 +3464,7 @@ function makeDriver(opts: {
     ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/instance/config.toml' },
     ...(opts.bus === false ? {} : { bus: h.bus }),
     ...(opts.githubPoll !== undefined ? { githubPoll: opts.githubPoll } : {}),
+    ...(opts.gitlabPoll !== undefined ? { gitlabPoll: opts.gitlabPoll } : {}),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
@@ -3468,7 +3474,9 @@ function makeDriver(opts: {
     ...(opts.readyForSurface !== undefined ? { readyForSurface: opts.readyForSurface } : {}),
     ...(opts.modeForSurface !== undefined ? { modeForSurface: opts.modeForSurface } : {}),
     ...(opts.blockersForRound !== undefined ? { blockersForRound: opts.blockersForRound } : {}),
-    log: () => {},
+    log: (level, msg) => {
+      opts.logs?.push(`${level} ${msg}`);
+    },
   });
   return {
     driver,
@@ -4428,6 +4436,141 @@ describe('silas driver github signal poll', () => {
       expect(h.driver.pollRunning).toBe(true);
     } finally {
       h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+// Driver: the gitlab signal poll shares the github poll's timer (#568)
+// ------------------------------------------------------------------
+
+describe('silas driver gitlab signal poll', () => {
+  const emptyGitHubTick: GitHubPollTickResult = {
+    tracked: 0,
+    observed: 0,
+    calls: 0,
+    budgetExhausted: false,
+    rateLimited: false,
+    signals: [],
+  };
+  const emptyGitLabTick: GitLabPollTickResult = {
+    tracked: 0,
+    reads: 0,
+    observed: 0,
+    merged: 0,
+    deadlineExceeded: false,
+    rateLimited: false,
+  };
+
+  function captureTimers(): {
+    ticks: Array<() => void>;
+    clears: () => number;
+    timers: { setInterval: typeof setInterval; clearInterval: typeof clearInterval };
+  } {
+    const ticks: Array<() => void> = [];
+    let clears = 0;
+    return {
+      ticks,
+      clears: () => clears,
+      timers: {
+        setInterval: ((callback: () => void) => {
+          ticks.push(callback);
+          return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+        }) as unknown as typeof setInterval,
+        clearInterval: (() => {
+          clears += 1;
+        }) as unknown as typeof clearInterval,
+      },
+    };
+  }
+
+  it('ticks both providers on ONE poll timer, and interval 0 disables both', async () => {
+    const { ticks, timers } = captureTimers();
+    let githubPolls = 0;
+    let gitlabPolls = 0;
+    const h = makeDriver({
+      sweepIntervalMs: 0,
+      pollIntervalMs: 5_000,
+      githubPoll: { pollOnce: async () => (githubPolls += 1, emptyGitHubTick) },
+      gitlabPoll: { pollOnce: async () => (gitlabPolls += 1, emptyGitLabTick) },
+      timers,
+    });
+    try {
+      h.driver.start();
+      expect(ticks, 'one timer serves both providers').toHaveLength(1);
+      expect(h.driver.pollRunning).toBe(true);
+      ticks[0]?.();
+      await vi.waitFor(() => {
+        expect(githubPolls).toBe(1);
+        expect(gitlabPolls).toBe(1);
+      });
+      h.driver.stop();
+      expect(h.driver.pollRunning).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+
+    const off = makeDriver({
+      sweepIntervalMs: 0,
+      pollIntervalMs: 0,
+      githubPoll: { pollOnce: async () => (githubPolls += 1, emptyGitHubTick) },
+      gitlabPoll: { pollOnce: async () => (gitlabPolls += 1, emptyGitLabTick) },
+      timers,
+    });
+    try {
+      off.driver.start();
+      expect(off.driver.pollRunning).toBe(false);
+      expect(ticks, '0 registers nothing new').toHaveLength(1);
+      expect(gitlabPolls).toBe(1);
+    } finally {
+      off.cleanup();
+    }
+  });
+
+  it('one provider throw never suppresses the other, in both directions', async () => {
+    for (const failing of ['github', 'gitlab'] as const) {
+      const { ticks, timers } = captureTimers();
+      const logs: string[] = [];
+      let githubPolls = 0;
+      let gitlabPolls = 0;
+      const h = makeDriver({
+        sweepIntervalMs: 0,
+        pollIntervalMs: 5_000,
+        githubPoll: {
+          pollOnce: async () => {
+            githubPolls += 1;
+            if (failing === 'github') throw new Error('gh down');
+            return emptyGitHubTick;
+          },
+        },
+        gitlabPoll: {
+          pollOnce: async () => {
+            gitlabPolls += 1;
+            if (failing === 'gitlab') throw new Error('gitlab down');
+            return emptyGitLabTick;
+          },
+        },
+        logs,
+        timers,
+      });
+      try {
+        h.driver.start();
+        ticks[0]?.();
+        await vi.waitFor(() => {
+          expect(githubPolls, failing).toBe(1);
+          expect(gitlabPolls, failing).toBe(1);
+        });
+        expect(logs, failing).toContain(`error ${failing} signal poll failed`);
+        expect(h.driver.pollRunning).toBe(true);
+        // the in-flight guard is released, so the next interval ticks both again
+        ticks[0]?.();
+        await vi.waitFor(() => {
+          expect(githubPolls, failing).toBe(2);
+          expect(gitlabPolls, failing).toBe(2);
+        });
+      } finally {
+        h.cleanup();
+      }
     }
   });
 });

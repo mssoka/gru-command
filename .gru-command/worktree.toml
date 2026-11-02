@@ -1680,6 +1680,7 @@ gc-551-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2
 gc-571-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-adapter.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/directive-own-run-fence.test.ts test/fix-directive.test.ts test/restart-recovery-progress.test.ts"
 gc-571-static = "npm run lint && npm run typecheck && npm run build"
 gc-571-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2; headrev=$(git rev-parse HEAD); prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc571-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/pi-adapter.test.ts "$d/test/pi-adapter.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-571-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-571-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/pi-adapter.test.ts -t "A1 a read with optional nulls and its batch sibling reach their effects"; a=$?; set -e; echo "gc-571-red vitest exit=$a EXPECTED-NONZERO: the base compares the persisted call with the raw model arguments"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-571 A1 passed against the base"; exit 2; fi; node "$root/tools/assert-named-red-baseline.mjs" gc-571 "$d/results.json" "A1 a read with optional nulls and its batch sibling reach their effects" || exit 2; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change guard"; exit 1'
+
 # #537: a queued verification request is never timed out just because the
 # bound ahead of it is longer than `lock_wait_timeout_ms`. The scheduler now
 # derives each waiter's deadline from the bounds of the holders ahead (their
@@ -1705,3 +1706,32 @@ gc-571-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2
 gc-537-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-scheduler.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts test/onboarding-proof.test.ts"
 gc-537-static = "npm run lint && npm run typecheck && npm run build"
 gc-537-red = 'set -e; root="$PWD"; base=bbb2a1088eed37017803af8e5b3ae6c8ba3d4182; headrev=$(git rev-parse HEAD); prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc537-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/verification-scheduler.test.ts "$d/test/verification-scheduler.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-537-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-537-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-scheduler.test.ts -t "A1 \(#537\)"; a=$?; set -e; echo "gc-537-red vitest exit=$a EXPECTED-NONZERO: the base arms one fixed lock-wait timer at queue time"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-537 A1 passed against the base"; exit 2; fi; cp "$d/results.json" "$prep/gc-537-red.results.json"; set +e; node "$root/tools/assert-named-red-baseline.mjs" gc-537 "$prep/gc-537-red.results.json" "verification scheduler — global budget A1 (#537): a queued request behind a bound longer than the floor is never timed out at the floor, and is granted when the holder releases" > "$prep/gc-537-red.classifier.txt" 2>&1; c=$?; set -e; cat "$prep/gc-537-red.classifier.txt"; printf "gc-537-red base=%s head=%s dir=%s results=%s classifier=%s\n" "$base" "$headrev" "$d" "$prep/gc-537-red.results.json" "$prep/gc-537-red.classifier.txt" > "$prep/gc-537-red.last-snapshot.txt"; if [ "$c" -ne 0 ]; then exit 2; fi; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change scheduler"; exit 1'
+
+# #568 Silas observes merged GitLab merge requests. The GitLab signal poll
+# reads every tracked lane's merge request once per `[silas] poll_interval_ms`
+# tick through the #519 reader (now carrying the merge commit), applies the
+# merge through the merge map extracted from the GitHub arm, records on change
+# (with the 24 h refresh the board's freshness bound needs), and rides the
+# driver's existing poll timer with each provider under its own try/catch.
+# `gc-568-focused` runs the new poll suite, the reader and the GitHub arm it
+# shares, the owner-readiness consumers of the freshness bound, the docs and
+# dist-registry pins, the driver suites that construct a poll interval (the
+# shared timer is now either provider's), the suite/budget pins, and the #519
+# freeze path (heavy: real git lanes, its own `--config vitest.heavy.config.ts`
+# leg); the
+# `silas-driver.test.ts` and `gitlab-mr-read.test.ts` counts are re-pinned
+# there, so the suite-shape guard runs in the same leg.
+# `gc-568-static` is the lint + typecheck + build gate (the build runs
+# tools/verify-perkins-resource.mjs, and the new dist module is registered in
+# the executable-path catalog the prune/property pins read).
+# `gc-568-red` is a MUTATION leg (gru-output/gc-568-gitlab-merged/red.mjs):
+# the deliverable is a new module, so archiving the base could only fail by
+# import. It archives HEAD, removes the one merge decision A1 claims (observe
+# every answer, merge none), runs A1 by literal title, and exits non-zero by
+# design once tools/assert-named-red-baseline.mjs classifies the failure as a
+# behavioral assertion — an import/setup failure, a missing anchor or a
+# passing A1 exits 2. The snapshot dir and the ignored pointer file under
+# _bmad-output/gate-prep/ are kept for inspection.
+gc-568-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/gitlab-poll.test.ts test/gitlab-mr-read.test.ts test/github-poll.test.ts test/review-ci-evidence.test.ts test/owner-actions.test.ts test/board-engine.test.ts test/silas-driver.test.ts test/silas-autopilot.test.ts test/silas-verification-debt.test.ts test/silas-deterministic-seam.test.ts test/prune-stale-dist.test.ts test/property-dist-catalog.test.ts test/docs-contracts.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/review-gitlab-ci-wave.test.ts"
+gc-568-static = "npm run lint && npm run typecheck && npm run build"
+gc-568-red = "node gru-output/gc-568-gitlab-merged/red.mjs"

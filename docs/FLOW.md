@@ -407,7 +407,8 @@ token identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). For a job whose
 PR link is a GitLab merge request, the round's frozen CI evidence is the merge
 request's own head pipeline, read once by the host just before the freeze
 (`gitlab.mr-observed` / `gitlab.mr-read-failed`, bound to the exact reviewed SHA;
-a merged-results pipeline never binds; see
+a merged-results pipeline never binds; the signal poll below observes live lanes
+separately and no round binds its records; see
 [REVIEW-INPUTS.md](./REVIEW-INPUTS.md#gitlab-merge-requests)). GitLab runs every
 note body through its quick-action extractor and executes a line such as
 `/merge`, `/approve`, `/close` or `/label …` as the posting account. The
@@ -979,6 +980,36 @@ the judgment; the dispatch surface is the mechanical hand.
   opens no second turn for it; a hold recorded through
   `POST /api/decisions` (issue #218) with a matching basis defers the
   wake to the hold's recheck instead.
+- **The GitLab signal poll (#568)** rides that same timer and needs no
+  model turn: every tracked lane whose recorded link is a supported
+  GitLab merge request is read once per tick
+  (`GET /api/v4/projects/<path>/merge_requests/<iid>`, the request the
+  round's own freeze read makes), and only what CHANGED is recorded.
+  The newest observation is the cursor: an unchanged one is not
+  re-recorded (so a restart double-applies nothing) until it is 24 hours
+  old, when the next tick re-records it so an idle lane does not stay out
+  of the board's FOR YOU band (the row can be withheld for up to one poll
+  interval past the bound); a run of the same failed read records one
+  `gitlab.mr-read-failed`, and a later successful read supersedes it.
+  A merged MR walks the SAME merge map as the GitHub arm — `in-review`
+  (when the hop is legal) → `merged` plus one `gitlab.mr-merged` event,
+  a binned lane gets only its one no-effect receipt, an illegal hop is
+  recorded as a loud refusal and never coerced — and posts no
+  notification. Nothing else is mapped: a conflicted merge request or a
+  red pipeline changes no lane and wakes nobody. The token never leaves
+  the lane's own origin host: only a link that `isGitLabMrHost` accepts
+  AND names the lane's origin remote is read (a lane with no resolvable
+  origin, a link naming another project or host, and a link on an
+  unsupported host make no request and record nothing; each skip logs one
+  line per lane per process), and an answer whose host/project/iid does
+  not match the link never merges the lane. Cost is one request per
+  tracked lane per tick, bounded by a per-tick wall-clock deadline
+  (`30 s`: no read starts past it, so a slow host cannot stretch one tick
+  across several intervals) and cut short by a `429`; a closed or merged
+  merge request is re-read every tick (named, accepted: there is no list
+  endpoint to cursor on). `[silas] poll_interval_ms` 0 disables both
+  polls, and each poll fails and logs on its own — one provider's throw
+  never suppresses the other's tick.
 - **The default-branch CI alert (#446)** rides the managed repository
   overview pass, not the lane poll: each committed GitHub observation hands
   its default-branch run page (20 runs, the same single call) to a watch.
