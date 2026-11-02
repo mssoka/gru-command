@@ -70,6 +70,7 @@ function seedInterruptedDispatch(h: Harness, id: string, title = `job ${id}`): s
  * pre-change base. */
 interface InterruptedSection {
   readonly examined: number;
+  readonly truncated?: boolean;
   readonly blocked: readonly string[];
   readonly skipped: readonly string[];
   readonly failed: number;
@@ -339,9 +340,11 @@ describe('interrupted initial dispatch (issue #560)', () => {
     // the next pass reaches the tail from the head.
     const first = reconcileInterruptedDispatches(deps, { limit: 2 });
     expect(first.examined).toBe(2);
+    expect(first.truncated).toBe(true);
     expect(first.blocked).toHaveLength(2);
     const second = reconcileInterruptedDispatches(deps, { limit: 2 });
     expect(second.examined).toBe(1);
+    expect(second.truncated).toBe(false);
     expect(second.blocked).toHaveLength(1);
     expect([...first.blocked, ...second.blocked].sort()).toEqual([...jobIds].sort());
     for (const jobId of jobIds) expect(cards(h, jobId)).toHaveLength(1);

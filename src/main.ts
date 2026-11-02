@@ -1418,6 +1418,7 @@ async function main(): Promise<number> {
     if (interruptedDispatches.examined > 0) {
       logger.info('interrupted dispatch reconciliation', {
         examined: interruptedDispatches.examined,
+        truncated: interruptedDispatches.truncated,
         blocked: interruptedDispatches.blocked,
         skipped: interruptedDispatches.skipped,
         failed: interruptedDispatches.failed,

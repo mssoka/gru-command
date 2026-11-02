@@ -107,6 +107,9 @@ export interface InterruptedDispatchDeps {
 export interface InterruptedDispatchReport {
   /** Candidates the bounded query returned. */
   readonly examined: number;
+  /** True when the bounded query filled its `limit`: guarded rows ahead of
+   * an unexamined candidate may still hold their place (see `LEDGER.md`). */
+  readonly truncated: boolean;
   /** Jobs this pass surfaced as blocked (note + one card + status). */
   readonly blocked: readonly string[];
   /** Candidates a guard excluded, each entry naming the guard's reason. */
@@ -195,8 +198,8 @@ export function reconcileInterruptedDispatches(
         // followed by a fresh interruption posts a new one.
         detail: (
           `${job.id} — the job was committed and its lane exists, but no minion ever started; ` +
-          'it is blocked for recovery (never re-dispatched) and the interrupted dispatch must be ' +
-          'resolved before the lane is re-armed.'
+          'it is blocked for recovery once this pass completes (never re-dispatched) and the ' +
+          'interrupted dispatch must be resolved before the lane is re-armed.'
         ).slice(0, 1000),
         dedupe: 'active',
       });
@@ -211,5 +214,5 @@ export function reconcileInterruptedDispatches(
     }
   }
 
-  return { examined: candidates.length, blocked, skipped, failed };
+  return { examined: candidates.length, truncated: candidates.length === limit, blocked, skipped, failed };
 }

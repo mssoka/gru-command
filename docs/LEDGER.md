@@ -585,7 +585,14 @@ identical note rather than a silent block. There is deliberately no
 durable cursor: one bounded query (`limit` default 200) reads the crash
 leftover, not a multi-page population, and a row that cannot be written
 keeps its place at the head so the next pass retries it instead of
-rotating past it like the phase-handoff scans above.
+rotating past it like the phase-handoff scans above. The pass examines
+the `limit` oldest candidates (`ORDER BY rowid`) and a guard-skipped row
+keeps its place, so a permanently guarded prefix can delay the tail; the
+report's additive `truncated` flag (the boot log line carries it too) is
+true when the query filled its `limit`, so a full `examined` is never
+read as “nothing was left”. The status write is the last step of the
+three, so the card and its note can be observed a moment before the row
+reads `blocked`.
 
 ### Bounded reconcile cursors (migration 13, PR136 r4 repair)
 
