@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  VerificationCancelledError,
   VerificationDisposedError,
   VerificationDuplicateError,
   VerificationLockTimeoutError,
   VerificationRequestConflictError,
   VerificationRequestExpiredError,
   VerificationScheduler,
+  groupAlive,
   pidAlive,
   verificationEnvironment,
   type VerificationProgress,
@@ -76,6 +78,8 @@ function makeScheduler(opts: {
   lockWaitTimeoutMs?: number;
   runTimeoutMs?: number;
   staleMaxAgeMs?: number;
+  /** Issue #559 seam: the answer to "is the cancelled run's group alive?". */
+  cancellationProbe?: () => boolean;
 } = {}): Harness {
   const storageDir = join(tempDir(), 'verify');
   const records: VerificationRecord[] = [];
@@ -92,6 +96,7 @@ function makeScheduler(opts: {
     killGraceMs: 100,
     disposeGraceMs: 500,
     ...(opts.staleMaxAgeMs === undefined ? {} : { staleMaxAgeMs: opts.staleMaxAgeMs }),
+    ...(opts.cancellationProbe === undefined ? {} : { cancellationProbe: opts.cancellationProbe }),
   });
   return { scheduler, records, storageDir };
 }
@@ -884,6 +889,180 @@ describe('verification scheduler — global budget', () => {
     const outcome = await running;
     expect(outcome.ok).toBe(false);
     await expect(scheduler.acquire(spec('job-after-dispose'))).rejects.toBeInstanceOf(VerificationDisposedError);
+  });
+
+  it('A1 cancels a running job verification: one cancelled terminal, the group proven gone, the slot released', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const frames: VerificationProgress[] = [];
+    const run = scheduler.run(spec('job-cancel', 'sleep 600'), (frame) => {
+      frames.push(frame);
+    });
+    await waitFor(() => frames.some((frame) => frame.type === 'started'));
+    const pid = (records.find((record) => record.kind === 'verification.process-started')?.payload as { pid?: number })
+      ?.pid as number;
+    expect(groupAlive(pid)).toBe(true);
+    // The premise the base lacks: a per-job cancel seam at all. This is the
+    // assertion the fail-before leg REDs on.
+    expect(typeof scheduler.cancelJob).toBe('function');
+
+    const first = await scheduler.cancelJob('job-cancel', { by: 'owner', reason: 'lane parked' });
+    expect(first.state).toBe('stopped');
+    expect(first.runs).toHaveLength(1);
+    expect(first.runs[0]).toMatchObject({ state: 'stopped', detail: null });
+
+    const outcome = await run;
+    expect(outcome.ok).toBe(false);
+    await waitFor(() => scheduler.activeCount() === 0);
+    // Cessation is the GROUP's absence, never the shell's exit code.
+    expect(groupAlive(pid)).toBe(false);
+    const cancelled = records.filter((record) => record.kind === 'verification.cancelled');
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0]?.payload).toMatchObject({
+      run_id: outcome.runId,
+      ok: false,
+      cancelled: true,
+      by: 'owner',
+      reason: 'lane parked',
+      started: true,
+      process_group_gone: true,
+      timed_out: false,
+    });
+    // A cancel is never verification evidence: nothing claims the suite passed.
+    expect(records.some((record) => record.kind === 'verification.completed')).toBe(false);
+
+    // A second cancel joins: nothing is re-signalled and no second terminal lands.
+    expect(await scheduler.cancelJob('job-cancel', { by: 'owner', reason: 'lane parked' })).toEqual({
+      state: 'stopped',
+      runs: [],
+    });
+    expect(records.filter((record) => record.kind === 'verification.cancelled')).toHaveLength(1);
+  });
+
+  it('A1b a cancel SIGKILLs a TERM-resistant descendant and proves the group gone', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const pidFile = join(tempDir(), 'cancel-descendant.pid');
+    const command = `trap 'exit 0' TERM; (trap '' TERM; exec /bin/sh -c 'echo $$ > ${pidFile}; exec sleep 600') >/dev/null 2>&1 & wait`;
+    const frames: VerificationProgress[] = [];
+    const run = scheduler.run(spec('job-cancel-descendant', command), (frame) => {
+      frames.push(frame);
+    });
+    await waitFor(() => frames.some((frame) => frame.type === 'started'));
+    await waitFor(() => existsSync(pidFile) && readFileSync(pidFile, 'utf-8').trim() !== '');
+    const descendant = Number(readFileSync(pidFile, 'utf-8').trim());
+    try {
+      const result = await scheduler.cancelJob('job-cancel-descendant', { by: 'owner', reason: 'job binned' });
+      expect(result.state).toBe('stopped');
+      await run;
+      expect(records.find((record) => record.kind === 'verification.cancelled')?.payload).toMatchObject({
+        cancelled: true,
+        process_group_gone: true,
+      });
+      await waitFor(() => !pidAlive(descendant), 3_000);
+    } finally {
+      try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+
+  it('A2 reports unproven and leaves the run unsettled when the cancelled group survives SIGKILL', async () => {
+    // A live group cannot be manufactured on purpose, so the probe answers for
+    // it: the run IS killed, but no cessation may be claimed.
+    const { scheduler, records } = makeScheduler({ cancellationProbe: () => true });
+    scheduler.start();
+    const frames: VerificationProgress[] = [];
+    const run = scheduler.run(spec('job-cancel-unproven', 'sleep 600'), (frame) => {
+      frames.push(frame);
+    });
+    await waitFor(() => frames.some((frame) => frame.type === 'started'));
+
+    const result = await scheduler.cancelJob('job-cancel-unproven', { by: 'owner', reason: 'lane parked' });
+    expect(result.state).toBe('unproven');
+    expect(result.runs[0]?.state).toBe('unproven');
+    expect(result.runs[0]?.detail).toMatch(/process group \d+ is still alive after SIGTERM and SIGKILL/u);
+    await run;
+    // The record's proof is the same fact: `false` keeps the run unsettled, so
+    // a stop or bin verdict still refuses over it.
+    expect(records.find((record) => record.kind === 'verification.cancelled')?.payload).toMatchObject({
+      cancelled: true,
+      process_group_gone: false,
+    });
+  });
+
+  it('A2 never signals or claims a holder an earlier process minted', async () => {
+    const { scheduler, records, storageDir } = makeScheduler({ staleMaxAgeMs: 600_000 });
+    seedPersistedSlot(storageDir, {
+      run_id: 'restored-run',
+      pid: process.pid, // alive on purpose: the holder is this process's own, but the slot is not
+      job_id: 'job-restored',
+      scope: 'full',
+      command: 'npm test',
+      cwd: '/tmp',
+      granted_at: Date.now(),
+    });
+    scheduler.start();
+    expect(scheduler.activeCount()).toBe(1);
+    const result = await scheduler.cancelJob('job-restored', { by: 'owner', reason: 'lane parked' });
+    expect(result.state).toBe('unproven');
+    expect(result.runs).toEqual([
+      { runId: 'restored-run', state: 'unproven', detail: expect.stringContaining('started by an earlier process') },
+    ]);
+    // Nothing was signalled, and no terminal was invented for it.
+    expect(pidAlive(process.pid)).toBe(true);
+    expect(records.some((record) => record.kind === 'verification.cancelled')).toBe(false);
+  });
+
+  it('A3 cancels a queued run before it starts: one cancelled no-start, no started frame, no lock timeout', async () => {
+    // A short lock wait makes the timer a real witness: a dropped waiter that
+    // kept its timer would record `verification.lock-timeout` here.
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 1, lockWaitTimeoutMs: 200 });
+    scheduler.start();
+    const holderFrames: VerificationProgress[] = [];
+    const holder = scheduler.run(spec('job-cancel-holder', 'sleep 600'), (frame) => {
+      holderFrames.push(frame);
+    });
+    await waitFor(() => holderFrames.some((frame) => frame.type === 'started'));
+    const queued = scheduler.run(spec('job-cancel-queued', 'node -e "process.exit(0)"'), () => {});
+    await waitFor(() => scheduler.queuedCount() === 1);
+
+    const result = await scheduler.cancelJob('job-cancel-queued', { by: 'owner', reason: 'lane parked' });
+    await expect(queued).rejects.toBeInstanceOf(VerificationCancelledError);
+    expect(result.state).toBe('stopped');
+    expect(result.runs).toHaveLength(1);
+    expect(result.runs[0]).toMatchObject({ state: 'stopped', detail: null });
+    const runId = result.runs[0]?.runId;
+    const cancelled = records.filter((record) => record.kind === 'verification.cancelled');
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0]?.payload).toMatchObject({
+      run_id: runId,
+      started: false,
+      cancelled: true,
+      by: 'owner',
+      process_group_gone: true,
+    });
+    expect(records.some((record) => record.kind === 'verification.started' && record.payload['run_id'] === runId)).toBe(false);
+    expect(records.some((record) => record.kind === 'verification.no-start')).toBe(false);
+    // Past the lock-wait bound: the dropped waiter's timer never fired.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(records.some((record) => record.kind === 'verification.lock-timeout')).toBe(false);
+    await scheduler.dispose();
+    await holder.catch(() => {});
+  });
+
+  it('a cancel that holds nothing reports stopped, and a disposed scheduler never claims one', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    // No ledger read: the scheduler holds nothing, so it claims nothing.
+    expect(await scheduler.cancelJob('job-not-held', { by: 'owner', reason: 'lane parked' })).toEqual({
+      state: 'stopped',
+      runs: [],
+    });
+    await scheduler.dispose();
+    expect(await scheduler.cancelJob('job-not-held', { by: 'owner', reason: 'lane parked' })).toEqual({
+      state: 'unproven',
+      runs: [],
+    });
+    expect(records.some((record) => record.kind === 'verification.cancelled')).toBe(false);
   });
 
   it('pins a valid environment shape and reports dead pids truthfully', async () => {

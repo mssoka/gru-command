@@ -7,6 +7,7 @@ import type { LedgerApi } from '../ledger/api.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { loadWorktreeManifest, RESERVED_VERIFY_SCOPE, resolveVerifyCommand } from '../worktrees/manifest.js';
 import {
+  VerificationCancelledError,
   VerificationDuplicateError,
   VerificationLockTimeoutError,
   VerificationRequestConflictError,
@@ -16,6 +17,7 @@ import {
   readGitState,
   type VerificationAttemptState,
   type VerificationAttemptStatus,
+  type VerificationCancelJobOutcome,
   type VerificationLease,
   type VerificationProgress,
   type VerificationQueueView,
@@ -72,9 +74,10 @@ export interface VerificationServerOptions {
   /** Readies the job's lanes once its run holds a verification slot and
    * before its command spawns (#427: restores a slim lane), so restores
    * are bounded by `max_concurrent` and the slot shows the job busy the
-   * whole time. The signal is the run's: a cancelled run (the server is
-   * disposed) ends the restore's setup. It must not reject; when it does,
-   * the run still goes ahead. */
+   * whole time. The signal is the run's: a cancelled run — the server is
+   * disposed, or the job's own verification is cancelled by
+   * {@link VerificationServer.cancelJob} — ends the restore's setup. It
+   * must not reject; when it does, the run still goes ahead. */
   readonly ensureReady?: (jobId: string, signal: AbortSignal) => Promise<void>;
   readonly log?: Log;
 }
@@ -87,6 +90,13 @@ export interface VerificationServer {
   /** True while a verification of the job is being readied, queued or
    * running (#427: a lane is idle for slimming only when this is false). */
   jobHasRun(jobId: string): boolean;
+  /** Stop the job's scheduled verification (issue #559): abort a queued
+   * wait, end a readying run before it spawns, SIGTERM → SIGKILL a running
+   * one. `stopped` only on process-group absence, never on intent. */
+  cancelJob(
+    jobId: string,
+    input: { readonly by: string; readonly reason: string },
+  ): Promise<VerificationCancelJobOutcome>;
   /** The global budget's lease primitives, for a holder that spawns its own
    * command (#427 onboarding proof): one FIFO slot under the same lock-wait
    * timeout, and the per-run worker share to hand that command. */
@@ -620,6 +630,14 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           detail: error.message,
           request_id: error.requestId,
         });
+      } else if (error instanceof VerificationCancelledError) {
+        await writeFrame({
+          type: 'error',
+          code: error.code,
+          detail: error.message,
+          request_id: requestId ?? null,
+          started: false,
+        });
       } else {
         await writeFrame({
           type: 'error',
@@ -669,6 +687,56 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     json(res, 200, status);
   }
 
+  /**
+   * `POST /api/verify/cancel {job_id, by, reason}` (issue #559): the owner
+   * surface a producer stop or a bin rides to end a job's scheduled
+   * verification. It never starts work, so it is not a `job_held` bypass;
+   * it refuses a lane that is not stopping, binning or closing out, because a
+   * working lane's own run is that lane's evidence, not the owner's to
+   * discard.
+   */
+  async function handleCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!authed(req, res)) return;
+    const body = await readBody(req);
+    let jobId: string;
+    let by: string;
+    let reason: string;
+    try {
+      jobId = strField(body, 'job_id');
+      by = strField(body, 'by');
+      reason = strField(body, 'reason');
+    } catch (error) {
+      json(res, 400, { error: 'bad_request', detail: String(error instanceof Error ? error.message : error) });
+      return;
+    }
+    const job = ledger.getJob(jobId);
+    if (job === null) {
+      json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+      return;
+    }
+    // A parked lane whose stop pass asked for or could not prove the physical
+    // stop is exactly the state a live verification blocks; a closeout is the
+    // other path that must retire one; a binned lane is already terminal.
+    const stopState = (ledger.latestJobEvent(jobId, 'job.execution-stop')?.payload as { readonly state?: unknown } | null)
+      ?.state;
+    const eligible =
+      (job.status === 'parked' && (stopState === 'requested' || stopState === 'unproven')) ||
+      ledger.activeCloseoutForJob(jobId) !== null ||
+      job.status === 'binned';
+    if (!eligible) {
+      json(res, 409, {
+        error: 'not_stopping',
+        detail:
+          `job "${jobId}" is not stopping (status ${job.status}) — a job's verification is cancelled only ` +
+          'for a stop (parked with a requested/unproven stop pass), a bin, or an active closeout',
+        status: job.status,
+        stop_state: typeof stopState === 'string' ? stopState : null,
+      });
+      return;
+    }
+    json(res, 200, await scheduler.cancelJob(jobId, { by, reason }));
+  }
+
   return {
     view(): VerificationQueueView {
       return scheduler.view();
@@ -676,6 +744,10 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
 
     jobHasRun(jobId: string): boolean {
       return (requestsByJob.get(jobId) ?? 0) > 0 || scheduler.hasRunFor(jobId);
+    },
+
+    cancelJob(jobId, input): Promise<VerificationCancelJobOutcome> {
+      return scheduler.cancelJob(jobId, input);
     },
 
     budget(): VerificationBudget {
@@ -702,6 +774,27 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           return true;
         }
         handleStatus(req, res, new URL(req.url ?? '/api/verify/status', 'http://localhost'));
+        return true;
+      }
+      if (path === '/api/verify/cancel') {
+        if (req.method !== 'POST') {
+          req.resume();
+          json(res, 405, { error: 'method_not_allowed', allowed: ['POST'] });
+          return true;
+        }
+        const startedAt = Date.now();
+        handleCancel(req, res)
+          .catch((error: unknown) => {
+            const message = String(error instanceof Error ? error.message : error);
+            log('error', 'verify cancel handler failed', { path, error: message });
+            // Body errors are answered inside the handler; anything reaching
+            // here is the service's own failure, never the caller's.
+            if (!res.headersSent) json(res, 500, { error: 'cancel_failed', detail: message });
+            else if (!res.writableEnded) res.end();
+          })
+          .finally(() => {
+            log('info', 'verify cancel', { path, status: res.statusCode, duration_ms: Date.now() - startedAt });
+          });
         return true;
       }
       if (path !== '/api/verify') return false;

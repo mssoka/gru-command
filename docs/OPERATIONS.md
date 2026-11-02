@@ -265,14 +265,28 @@ producer stopped, so the service answers the two facts separately.
   a claim about when the feature shipped. A lane with no live producer can
   still be held: resuming or closing the job lifts the hold, and the
   notice and its incident settle on the next stop reconcile at boot.
+- **A scheduled verification is cancelled, not left to chance.** A job's
+  in-flight verification is a producer like any other (issue #559): when the
+  job stops, the pass asks the verification scheduler to end it — a queued
+  wait is dropped, a run still readying its lane never spawns, and a running
+  one gets SIGTERM to its whole process group and then SIGKILL after the
+  kill grace. The verdict is evidence, never intent: the run counts as
+  stopped only when `kill(-pgid, 0)` shows no member of that group left, so
+  a TERM-resistant descendant is killed and a group that somehow survives
+  keeps the stop `unproven` with the live group named. The run is recorded
+  once as `verification.cancelled` — never as `verification.completed`,
+  because a cancelled run is not evidence that the suite passed, and never
+  as a shutdown `verification.no-start`. A run this process does not own (a
+  holder an earlier process minted) is never signalled and never claimed.
 - **An unproven stop is named, never fabricated.** A failed dispose, a
   ledger open turn the runtime no longer holds, an unsettled verification
   run or an in-flight producer admission leaves `state: "unproven"` with the
   exact residue in the event, and opens one `needs-owner`
   `job-stop-unproven:<jobId>` incident (reused across boot re-proofs and
-  resolved when a later pass proves the stop). A
-  pre-existing verification is never reported stopped merely because the
-  job is parked; it may still finish.
+  resolved when a later pass proves the stop). A verification that could not
+  be proven gone keeps its own residue text
+  (`a scheduled verification was cancelled but its process group is still
+  alive`): the run stays unsettled and the lane stays held.
 - **Stopping is not closing.** The job stays parked until the owner moves it
   back to a working status. The stop record and the hold are separate rows,
   so a later reader can tell an administrative hold from a proven producer
@@ -377,7 +391,15 @@ or automatic binning — the write itself is the ordinary status surface):
   status or event mutation. A historical claimed wait does not hold the
   lane after its runtime attempt settles. Stop live work through its own
   authorized surfaces first — the board keeps showing the live producer and
-  the worktree stays on the record. A live directive or re-brief marker
+  the worktree stays on the record. A scheduled verification is one of those
+  surfaces: `POST /api/verify/cancel {job_id, by, reason}` — the same
+  per-job cancel the stop pass runs — ends the job's queued or running run.
+  A run whose process group is PROVEN gone settles as
+  `verification.cancelled`, so the bin's own live-work transaction no longer
+  refuses over it; a cancel the service could not prove leaves that refusal
+  standing — a bin never rides an unproven stop. The route is gated like the
+  stop pass: a working lane's run is that lane's own evidence, not the
+  owner's to discard. A live directive or re-brief marker
   whose producer custody the service cannot establish is closed by the
   owner's abandonment, never by binning: for a directive request Gru proposes
   it with `POST /api/owner-approvals` and the owner's Approve on the card

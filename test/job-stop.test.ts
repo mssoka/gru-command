@@ -62,6 +62,8 @@ function fixture(opts: {
   readonly reviews?: JobStopDeps['reviews'];
   readonly notifyUnproven?: JobStopDeps['notifyUnproven'];
   readonly notifyResolved?: JobStopDeps['notifyResolved'];
+  /** Issue #559: the scheduler's per-job verification cancel. */
+  readonly cancelVerification?: JobStopDeps['cancelVerification'];
   /** Runs after the lane is working and BEFORE the park that opens the
    * hold, so a test can seed events that genuinely predate the hold. */
   readonly beforePark?: (ledger: LedgerApi) => void;
@@ -86,6 +88,7 @@ function fixture(opts: {
     reviews: opts.reviews === undefined ? null : opts.reviews,
     ...(opts.notifyUnproven === undefined ? {} : { notifyUnproven: opts.notifyUnproven }),
     ...(opts.notifyResolved === undefined ? {} : { notifyResolved: opts.notifyResolved }),
+    ...(opts.cancelVerification === undefined ? {} : { cancelVerification: opts.cancelVerification }),
     log: () => {},
   });
   return { ledger, db, stop, close: () => db.close() };
@@ -194,6 +197,63 @@ describe('job execution stop (issue #455)', () => {
       expect(outcome.state).toBe('unproven');
       expect(outcome.outstanding.join(' ')).toMatch(/unsettled verification run/);
       expect(jobStopResidue(outcome).join(' ')).toMatch(/unsettled verification run/);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('drops the verification residue only on the cancel\'s proven-gone record', async () => {
+    // Issue #559: the physically stopped run's own terminal is what settles it.
+    const f = fixture({
+      agents: [{ id: 'minion-5', state: 'streaming' }],
+      handles: new Map([['minion-5', fakeHandle('minion-5', 'ceased')]]),
+      cancelVerification: async ({ jobId, by, reason }) => {
+        f.ledger.appendCustomEvent({
+          kind: 'verification.cancelled',
+          jobId,
+          payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, by, reason, process_group_gone: 1 },
+        });
+        return { state: 'stopped' };
+      },
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
+      expect(f.ledger.hasUnsettledVerificationRun(JOB)).toBe(true);
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.outstanding).toEqual([]);
+      expect(jobStopResidue(outcome)).toEqual([]);
+      expect(outcome.state).toBe('stopped');
+      expect(eventStates(f.ledger)).toEqual(['requested', 'stopped']);
+      expect(f.ledger.hasUnsettledVerificationRun(JOB)).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('keeps an unproven cancel as residue naming the live process group', async () => {
+    const f = fixture({
+      agents: [{ id: 'minion-5', state: 'streaming' }],
+      handles: new Map([['minion-5', fakeHandle('minion-5', 'ceased')]]),
+      cancelVerification: async ({ jobId }) => {
+        // The group survived the SIGKILL: the run is terminal but NOT settled.
+        f.ledger.appendCustomEvent({
+          kind: 'verification.cancelled',
+          jobId,
+          payload: { run_id: 'run-open', cancelled: true, started: true, ok: false, process_group_gone: false },
+        });
+        return { state: 'unproven' };
+      },
+    });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.outstanding).toEqual([
+        'a scheduled verification was cancelled but its process group is still alive',
+      ]);
+      // The unproven cancel settles nothing: the run still holds the lane.
+      expect(f.ledger.hasUnsettledVerificationRun(JOB)).toBe(true);
+      expect(eventStates(f.ledger)).toEqual(['requested', 'unproven']);
     } finally {
       f.close();
     }

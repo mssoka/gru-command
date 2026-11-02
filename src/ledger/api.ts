@@ -1756,16 +1756,24 @@ export class LedgerApi {
   /** The run ids {@link hasUnsettledVerificationRun} counts (a run recorded
    * without an id is one `null` entry), at most `limit` of them. */
   private unsettledVerificationRunIds(jobId: string, limit = -1): readonly (string | null)[] {
+    // `verification.cancelled` settles a run ONLY with the cessation proof a
+    // per-job cancel records (issue #559): a cancel whose process group
+    // survived the SIGKILL is not a settled run, so a stop/bin verdict still
+    // refuses over it.
     const rows = this.db
       .prepare(
         `SELECT run_id FROM (
            SELECT json_extract(payload, '$.run_id') AS run_id,
                   MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
-                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start') THEN seq ELSE 0 END) AS settled_seq
+                  MAX(CASE
+                        WHEN kind = 'verification.cancelled' AND json_extract(payload, '$.process_group_gone') = 1 THEN seq
+                        WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start') THEN seq
+                        ELSE 0 END) AS settled_seq
            FROM events
            WHERE job_id = ? AND kind IN (
              'verification.requested', 'verification.started', 'verification.completed',
-             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start'
+             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start',
+             'verification.cancelled'
            )
            GROUP BY run_id
          ) WHERE open_seq > settled_seq LIMIT ?`,
@@ -7418,7 +7426,7 @@ export class LedgerApi {
     const requested = this.eventFromRow(attempts!); const request = requested.payload as Record<string, unknown>;
     const amendedAt = this.latestJobEvent(row.jobId, 'job.amendment-accepted')?.seq ?? 0;
     if (requested.seq <= Math.max(root!.seq, amendedAt, candidate!.seq) || !recordsCommand(request['command'], command) || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings or predates the current candidate delivery');
-    const latestFull = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('verification.requested', 'verification.started', 'verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout') AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
+    const latestFull = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('verification.requested', 'verification.started', 'verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout', 'verification.cancelled') AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
     if (latestFull === undefined || (JSON.parse(str(latestFull.payload)) as { run_id?: unknown }).run_id !== request['run_id']) refuse('newer relevant full attempt is failed or UNKNOWN');
     const lifecycle = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind LIKE 'verification.%' AND json_extract(payload, '$.run_id') = ? ORDER BY seq").all(row.jobId, request['run_id'] as string) as Row[];
     const events = lifecycle.map((event) => this.eventFromRow(event));
@@ -7435,7 +7443,7 @@ export class LedgerApi {
           binding['request_id'] === readback['request_id'] && binding['scope'] === 'full' && binding['head'] === facts!.sha;
       });
     };
-    const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout'].includes(event.kind) && !completedReadback(event));
+    const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout', 'verification.cancelled'].includes(event.kind) && !completedReadback(event));
     const terminal = terminals[0]; const start = starts[0]; const run = terminal?.payload as Record<string, unknown> | undefined;
     const started = start?.payload as Record<string, unknown> | undefined;
     if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started === undefined || !recordsCommand(started['command'], command) || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run === undefined || !recordsCommand(run['command'], command) || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');
