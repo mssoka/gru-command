@@ -11,12 +11,15 @@ import { DirectiveProgressService, surfaceDirectiveRecovery } from '../src/dispa
 import {
   binningCloseoutRoute,
   CanceledRequestCloseout,
+  closeoutIntentView,
   runBootDirectiveRecovery,
   type CloseoutHttpResult,
   type CloseoutStep,
 } from '../src/dispatch/canceled-request-closeout.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import { CLOSEOUT_ACTOR, CloseoutPendingError, closeoutBlockerFingerprint } from '../src/ledger/closeouts.js';
+import { DirectiveRetirementError } from '../src/ledger/directives.js';
+import { retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { projectMailbox } from '../src/gru-mailbox/projection.js';
 import type { PacingGate } from '../src/runtime/pacing.js';
 import type { SpawnOptions } from '../src/runtime/types.js';
@@ -137,6 +140,21 @@ const mustRequest = (ctx: Ctx, by: unknown = 'gru', extra: Record<string, unknow
   if (result === null) throw new Error('expected the closeout to take the binning request');
   return result;
 };
+/** The keep-parked closeout request (`POST /api/silas/directives/{request}/closeout`). */
+const keepParkedFor = (ctx: Ctx, requestId: string, by: unknown = 'gru', extra: Record<string, unknown> = {}): CloseoutHttpResult | null =>
+  ctx.closeout.requestBinning(ctx.jobId, { ...(by === undefined ? {} : { by }), ...extra }, { mode: 'keep-parked', requestId });
+const keepParked = (ctx: Ctx, by: unknown = 'gru', extra: Record<string, unknown> = {}): CloseoutHttpResult | null =>
+  keepParkedFor(ctx, ctx.requestId, by, extra);
+const mustKeepParked = (ctx: Ctx, by: unknown = 'gru', extra: Record<string, unknown> = {}): CloseoutHttpResult => {
+  const result = keepParked(ctx, by, extra);
+  if (result === null) throw new Error('expected the closeout to take the keep-parked request');
+  return result;
+};
+const mustKeepParkedFor = (ctx: Ctx, requestId: string, by: unknown = 'gru'): CloseoutHttpResult => {
+  const result = keepParkedFor(ctx, requestId, by);
+  if (result === null) throw new Error(`expected the closeout to take the keep-parked request for "${requestId}"`);
+  return result;
+};
 const bodyOf = (result: CloseoutHttpResult | null): Record<string, unknown> => result?.body as Record<string, unknown>;
 const blockersOf = (result: CloseoutHttpResult | null): Array<{ code: string; detail: string }> => bodyOf(result).blockers as Array<{ code: string; detail: string }>;
 const debt = (ctx: Ctx) => ctx.ledger.listObligations({ jobId: ctx.jobId }).find((row) => row.incidentKey === `directive-recovery:${ctx.requestId}`);
@@ -199,6 +217,58 @@ function expectNoOwnerAttribution(ctx: Ctx): void {
   }
 }
 
+/** The end state of a completed keep-parked closeout (#564): the request is
+ * retired and its debt closed by the closeout's own settlement, the card is
+ * resolved, and the job is exactly as parked as it was. */
+function expectKeptParked(ctx: Ctx): void {
+  expect(ctx.ledger.getDirective(ctx.requestId)).toMatchObject({ state: 'retired', retiredBy: CLOSEOUT_ACTOR });
+  expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+  // The debt closes by the closeout's own settlement, never by a job-terminal one,
+  // and nothing writes a job status, a delivery, a completion or a no-effect claim.
+  expect(debt(ctx)).toMatchObject({ state: 'closed', settlement: { kind: 'cancelled' } });
+  expect(binnedEvents(ctx)).toEqual([]);
+  expect(jobEvents(ctx, 'job.status').filter((event) => event.seq > ctx.baselineSeq)).toEqual([]);
+  expect(jobEvents(ctx, 'job.delivered')).toEqual([]);
+  expect(ctx.ledger.getDirective(ctx.requestId)?.holdReleasedBy).toBeNull();
+  expect(ctx.ledger.findNotificationByKind(kind(ctx), 'active')).toBeNull();
+  expect(ctx.ledger.findNotificationByKind(kind(ctx), 'any')).toMatchObject({ resolvedBy: CLOSEOUT_ACTOR, ackedAt: null });
+  expect(JSON.stringify(projectMailbox(ctx.ledger))).not.toContain(ctx.requestId);
+  expect(ctx.spawns).toEqual([]);
+  // Exactly the closeout's own writes: S1, S2, the debt settlement and S3' —
+  // no completion/no-effect/cessation receipt of any kind and no job status.
+  expect(ctx.ledger.listJobEvents(ctx.jobId, { order: 'asc' }).filter((event) => event.seq > ctx.baselineSeq).map((event) => event.kind))
+    .toEqual(['silas.closeout-intent', 'silas.directive-retired', 'job.obligation-settled', 'silas.closeout-complete']);
+}
+
+/** The refusal the real `/retire` route raises for this fixture, mapped to
+ * blockers exactly as a guard refusal reaches the closeout: route evidence and
+ * the ledger preflight first, then the same expectations the route builds. */
+function retireRouteRefusal(ctx: Ctx): Array<{ code: string; detail: string }> {
+  const row = ctx.ledger.getDirective(ctx.requestId)!;
+  const authority = ctx.ledger.directiveCurrentAuthority(ctx.jobId);
+  const obligation = ctx.ledger.recoveryObligation(ctx.jobId, 'directive', ctx.requestId);
+  const lane = ctx.worktrees.listWorktrees({ jobId: ctx.jobId })[0]!;
+  try {
+    retireInterruptedDirectiveFromRoute({
+      ledger: ctx.ledger,
+      worktrees: ctx.worktrees,
+      pendingProducerBlockers: () => ctx.supervised,
+      workerGate: { view: () => ({ worker: { queued: ctx.queued } }) } as unknown as Pick<PacingGate, 'view'>,
+      requestId: ctx.requestId,
+      expected: { jobId: ctx.jobId, state: 'dispatching', payloadHash: row.payloadHash, head: lane.sha,
+        context: { expectedGeneration: obligation?.generation ?? null, expectedPlanRevision: obligation?.planRevision ?? null,
+          expectedObligationState: obligation?.state ?? null, expectedAuthorityEpoch: authority.authorityEpoch,
+          expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256 } },
+      reason: 'retire by hand',
+      by: 'silas-ops',
+    });
+  } catch (error) {
+    if (!(error instanceof DirectiveRetirementError)) throw error;
+    return error.blockers.length > 0 ? error.blockers.map((detail) => ({ code: error.code, detail })) : [{ code: error.code, detail: error.message }];
+  }
+  throw new Error('expected /retire to refuse this request');
+}
+
 function progress(ctx: Ctx): DirectiveProgressService {
   const registry: DirectiveRegistry = {
     getHandle: () => null,
@@ -236,10 +306,272 @@ describe('canceled-request closeout — the cancel (test 1)', () => {
     // The closeout's own events: exact payloads, attributed to the closeout.
     const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
     expect(payloadOf(jobEvents(ctx, 'silas.closeout-intent')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId, generation: 1,
-      payload_hash: intent.payloadHash, job_status: 'working', requested_by: 'gru', reason: null, by: CLOSEOUT_ACTOR });
+      payload_hash: intent.payloadHash, job_status: 'working', mode: 'bin', requested_by: 'gru', reason: null, by: CLOSEOUT_ACTOR });
     expect(payloadOf(jobEvents(ctx, 'silas.closeout-complete')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId, generation: 1, by: CLOSEOUT_ACTOR });
     expect(jobEvents(ctx, 'silas.closeout-intent')[0]!.seq).toBe(intent.intentSeq);
     expectNoOwnerAttribution(ctx);
+  });
+});
+
+describe('canceled-request closeout — keep parked (#564)', () => {
+  it('A1. a parked job: the request is retired and its debt closed, and the job stays parked with its hold in place', async () => {
+    const ctx = await deferred({ park: true });
+    expect(debt(ctx)?.state).toBe('suspended');
+    const result = mustKeepParked(ctx, 'gru', { reason: 'discard: the heist is canceled' });
+    expect(result.status).toBe(200);
+    expect(bodyOf(result)).toMatchObject({ id: ctx.jobId, status: 'parked', closeout: { state: 'complete', generation: 1 } });
+    expectKeptParked(ctx);
+    const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
+    expect(intent.mode).toBe('keep-parked');
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-intent')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId,
+      generation: 1, payload_hash: intent.payloadHash, job_status: 'parked', mode: 'keep-parked', requested_by: 'gru',
+      reason: 'discard: the heist is canceled', by: CLOSEOUT_ACTOR });
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-complete')[0]!)).toEqual({ closeout_id: intent.closeoutId, request_id: ctx.requestId,
+      generation: 1, mode: 'keep-parked', by: CLOSEOUT_ACTOR });
+    // The retirement's durable reason says what this mode does: it never claims a
+    // binning, and it is the same text the row keeps.
+    const retired = payloadOf(jobEvents(ctx, 'silas.directive-retired')[0]!);
+    const retiredReason = `keep-parked closeout: retire the canceled request ${ctx.requestId} and leave its job parked ` +
+      '(requested by gru): discard: the heist is canceled';
+    expect(retired['reason']).toBe(retiredReason);
+    expect(retiredReason).not.toContain('binning');
+    expect(ctx.ledger.getDirective(ctx.requestId)?.retireReason).toBe(retiredReason);
+    // The readback says which S3 the intent owes, in the describing view and the wire shape.
+    expect(ctx.closeout.describe(ctx.requestId)).toMatchObject({ path: 'binning', eligible: false, mode: 'keep-parked', intent: { state: 'complete' } });
+    expect(closeoutIntentView(intent)).toMatchObject({ mode: 'keep-parked', state: 'complete' });
+    expectNoOwnerAttribution(ctx);
+  });
+
+  it('A2. the keep-parked request refuses exactly where /retire refuses (the route-level live-work guard)', async () => {
+    const ctx = await deferred({ park: true });
+    ctx.supervised = ['restart retry scheduled for minion-1'];
+    const retiredByHand = retireRouteRefusal(ctx);
+    expect(retiredByHand).toEqual([{ code: 'live_work', detail: 'restart retry scheduled for minion-1' }]);
+    const seq = ctx.ledger.latestEventSeq();
+    const result = mustKeepParked(ctx);
+    expect(result.status).toBe(409);
+    expect(bodyOf(result)).toEqual({ error: 'request_closeout_refused', blockers: retiredByHand });
+    // A retry of the unchanged request writes nothing and gives the same answer.
+    expect(mustKeepParked(ctx)).toEqual(result);
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toBeNull();
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+  });
+
+  it('A2b. the keep-parked request refuses with the ledger preflight\'s own code (terminal_receipt_present)', async () => {
+    const ctx = await deferred({ park: true });
+    ctx.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: ctx.jobId, payload: { request_id: ctx.requestId, sha: ctx.repo.head() } });
+    const retiredByHand = retireRouteRefusal(ctx);
+    expect(retiredByHand.map((blocker) => blocker.code)).toEqual(['terminal_receipt_present']);
+    const seq = ctx.ledger.latestEventSeq();
+    const result = mustKeepParked(ctx);
+    expect(result.status).toBe(409);
+    expect(bodyOf(result)).toEqual({ error: 'request_closeout_refused', blockers: retiredByHand });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toBeNull();
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+  });
+
+  it('A3. a repeat after completion replays, and a crash after S2 resumes to the same parked end state', async () => {
+    const ctx = await deferred({ park: true });
+    crashAt(ctx, 'retire');
+    expect(() => keepParked(ctx)).toThrow('crash after retire');
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'open', generation: 1, mode: 'keep-parked' });
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('retired');
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    expect(debt(ctx)?.state).toBe('suspended');
+    ctx.restart();
+    expect(ctx.closeout.resumePending()).toMatchObject({ examined: 1, completed: 1, failures: [] });
+    expectKeptParked(ctx);
+    expect(jobEvents(ctx, 'silas.closeout-intent')).toHaveLength(1);
+    expect(jobEvents(ctx, 'silas.directive-retired')).toHaveLength(1);
+    expect(jobEvents(ctx, 'silas.closeout-complete')).toHaveLength(1);
+    expect(payloadOf(jobEvents(ctx, 'silas.closeout-complete')[0]!).mode).toBe('keep-parked');
+    // The repeat is the request's own completed intent: the same member, no event.
+    const seq = ctx.ledger.latestEventSeq();
+    const first = ctx.closeout.describe(ctx.requestId);
+    const repeated = mustKeepParked(ctx);
+    expect(repeated.status).toBe(200);
+    expect(bodyOf(repeated)).toMatchObject({ status: 'parked', closeout: { state: 'complete', generation: 1 } });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(jobEvents(ctx, 'silas.closeout-intent')).toHaveLength(1);
+    expect(jobEvents(ctx, 'silas.closeout-complete')).toHaveLength(1);
+    expect(ctx.closeout.describe(ctx.requestId)).toEqual(first);
+    expectNoOwnerAttribution(ctx);
+  });
+
+  it('A4. the hold stays: a fresh directive request on the parked job still needs the owner', async () => {
+    const ctx = await deferred({ park: true });
+    expect(mustKeepParked(ctx).status).toBe(200);
+    expectKeptParked(ctx);
+    const later = ctx.ledger.beginDirectiveIntent({ jobId: ctx.jobId, directive: 'carry the discarded work anyway', holder: 'silas-ops', requestId: 'req-later' });
+    expect(later.created).toBe(true);
+    expect(() => ctx.ledger.assertDirectiveAuthority(ctx.ledger.directiveTurnIdentity('req-later')))
+      .toThrow('directive authority is terminal, held or superseded — no work may proceed');
+    expect(() => ctx.ledger.claimDirectiveDispatch('req-later')).toThrow(/terminal, held or superseded/);
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    expect(ctx.spawns).toEqual([]);
+  });
+
+  it('A5. a call that names a request the job\'s closeout does not act on is refused, and the request it would act on is untouched', async () => {
+    // The eligibility rule names the job's only live request (req-second); the call
+    // names the earlier request, retired by hand and with no intent of its own.
+    const ctx = await deferred();
+    retireByHand(ctx);
+    ctx.ledger.beginRebriefIntent({ jobId: ctx.jobId, note: 'second try', holder: 'silas-ops', requestId: 'req-second' });
+    expect(ctx.ledger.claimDirectiveDispatch('req-second')).toBe(true);
+    const start = ctx.ledger.latestJobEventByRequestId(ctx.jobId, 'silas.directive-dispatch-started', 'req-second')!;
+    ctx.ledger.recordDirectiveDispatchDeferral(ctx.ledger.directiveTurnIdentity('req-second'), start.seq, 'deferred again');
+    surfaceDirectiveRecovery({ ledger: ctx.ledger, notifications: ctx.notifications }, 'req-second', 'deferred before reaching its worker');
+    ctx.ledger.setJobStatus(ctx.jobId, 'parked');
+    ctx.baselineSeq = ctx.ledger.latestEventSeq();
+    const secondDebt = ctx.ledger.recoveryObligation(ctx.jobId, 'directive', 'req-second');
+    expect(secondDebt).not.toBeNull();
+    const mismatch = mustKeepParkedFor(ctx, ctx.requestId);
+    expect(mismatch.status).toBe(409);
+    expect(bodyOf(mismatch)).toEqual({ error: 'request_closeout_target_mismatch', active_request_id: 'req-second',
+      detail: expect.stringContaining('the request "req-closeout" this call names') });
+    // Nothing written, and the request the rule names is exactly as it was.
+    expect(ctx.ledger.latestEventSeq()).toBe(ctx.baselineSeq);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toBeNull();
+    expect(ctx.ledger.getDirective('req-second')).toMatchObject({ state: 'dispatching', retiredBy: null });
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    expect(ctx.ledger.recoveryObligation(ctx.jobId, 'directive', 'req-second')).toEqual(secondDebt);
+    // With req-second's own intent open, naming the earlier request is refused the
+    // same way and the intent it owns stays where it was.
+    crashAt(ctx, 'intent');
+    expect(() => mustKeepParkedFor(ctx, 'req-second')).toThrow('crash after intent');
+    const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
+    expect(intent).toMatchObject({ state: 'open', requestId: 'req-second', mode: 'keep-parked' });
+    const seq = ctx.ledger.latestEventSeq();
+    const stillNamed = mustKeepParkedFor(ctx, ctx.requestId);
+    expect(stillNamed.status).toBe(409);
+    expect(bodyOf(stillNamed)).toEqual({ error: 'request_closeout_target_mismatch', active_request_id: 'req-second',
+      detail: expect.stringContaining('the request "req-closeout" this call names') });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.getCloseout(intent.closeoutId)).toMatchObject({ state: 'open' });
+    expect(ctx.ledger.getDirective('req-second')?.state).toBe('dispatching');
+    // The request it belongs to still resumes and finishes it.
+    expect(mustKeepParkedFor(ctx, 'req-second').status).toBe(200);
+    expect(ctx.ledger.getDirective('req-second')).toMatchObject({ state: 'retired', retiredBy: CLOSEOUT_ACTOR });
+    expect(ctx.ledger.recoveryObligation(ctx.jobId, 'directive', 'req-second')).toBeNull();
+    expect(ctx.ledger.listObligations({ jobId: ctx.jobId }).find((row) => row.incidentKey === 'directive-recovery:req-second'))
+      .toMatchObject({ state: 'closed', settlement: { kind: 'cancelled' } });
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    expectNoOwnerAttribution(ctx);
+  });
+
+  it('an active keep-parked intent whose job left parked is superseded, not answered job_not_parked', async () => {
+    const ctx = await deferred({ park: true });
+    crashAt(ctx, 'retire');
+    expect(() => keepParked(ctx)).toThrow('crash after retire');
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'open', mode: 'keep-parked' });
+    // The owner resumes the job while the intent is still open: the parked premise
+    // no longer holds, so the intent is stale and the caller owns that answer.
+    ctx.ledger.setJobStatus(ctx.jobId, 'working');
+    const seq = ctx.ledger.latestEventSeq();
+    const answered = mustKeepParked(ctx);
+    expect(answered.status).toBe(409);
+    expect(bodyOf(answered)).toEqual({ error: 'request_closeout_superseded', superseded_reason: 'job-status' });
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toMatchObject({ state: 'superseded', supersededReason: 'job-status', mode: 'keep-parked' });
+    // The supersede is the only write: S2's retirement stands, the debt is untouched.
+    expect(ctx.ledger.listJobEvents(ctx.jobId, { order: 'asc' }).filter((event) => event.seq > seq).map((event) => event.kind))
+      .toEqual(['silas.closeout-superseded']);
+    expect(ctx.ledger.getDirective(ctx.requestId)).toMatchObject({ state: 'retired', retiredBy: CLOSEOUT_ACTOR });
+    expect(debt(ctx)?.state).toBe('suspended');
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
+  });
+
+  it('the gate duty a keep-parked S3\' cannot discharge stops the intent, names it, and the fingerprint stays put', async () => {
+    const ctx = await deferred({ park: true });
+    const debtId = debt(ctx)!.id;
+    ctx.ledger.appendCustomEvent({ kind: 'silas.directive-current-gates-owed', jobId: ctx.jobId,
+      payload: { obligation_id: debtId, next_action: { kind: 'gru-decision', decision: 'apply the review correction' } } });
+    ctx.baselineSeq = ctx.ledger.latestEventSeq();
+    const stopped = mustKeepParked(ctx);
+    expect(stopped.status).toBe(409);
+    expect(bodyOf(stopped)).toMatchObject({ error: 'request_closeout_stopped' });
+    expect(blockersOf(stopped)).toEqual([{ code: 'gate_duty', detail: expect.stringContaining('apply the review correction') }]);
+    const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
+    expect(intent).toMatchObject({ state: 'stopped', mode: 'keep-parked', blockerFingerprint: closeoutBlockerFingerprint(intent.blockers) });
+    // Nothing partial: the request is retired, the debt is untouched, the card stays, the job stays parked.
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('retired');
+    expect(debt(ctx)?.state).toBe('suspended');
+    expect(ctx.ledger.findNotificationByKind(kind(ctx), 'active')).not.toBeNull();
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    // The readback shows the same refusal and never advertises an eligible closeout.
+    const view = ctx.closeout.describe(ctx.requestId);
+    expect(view).toMatchObject({ path: 'closeout', eligible: false, mode: 'keep-parked' });
+    expect(view.blockers).toEqual(intent.blockers);
+    // Unchanged blockers: a repeat and a pass write nothing.
+    const seq = ctx.ledger.latestEventSeq();
+    expect(mustKeepParked(ctx)).toEqual(stopped);
+    expect(ctx.closeout.resumePending()).toMatchObject({ examined: 1, untouched: 1, completed: 0 });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    // A binning request never completes the keep-parked intent behind the operator's back.
+    const binned = mustRequest(ctx);
+    expect(binned.status).toBe(409);
+    expect(bodyOf(binned)).toEqual({ error: 'request_closeout_mode_conflict', active_mode: 'keep-parked', closeout_id: intent.closeoutId });
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    // The intent still owes the request its end: the fence stays until the duty is resolved.
+    expect(ctx.ledger.hasPendingCloseout(ctx.requestId)).toBe(true);
+    expect(() => ctx.ledger.claimDirectiveDispatch(ctx.requestId)).toThrow(CloseoutPendingError);
+    expect(debt(ctx)?.state).toBe('suspended');
+  });
+
+  it('a binned request on an active keep-parked intent is a 409 mode conflict, and the job stays parked', async () => {
+    const ctx = await deferred({ park: true });
+    crashAt(ctx, 'intent');
+    expect(() => keepParked(ctx)).toThrow('crash after intent');
+    const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
+    expect(intent).toMatchObject({ state: 'open', mode: 'keep-parked' });
+    const seq = ctx.ledger.latestEventSeq();
+    const conflict = mustRequest(ctx);
+    expect(conflict.status).toBe(409);
+    expect(bodyOf(conflict)).toEqual({ error: 'request_closeout_mode_conflict', active_mode: 'keep-parked', closeout_id: intent.closeoutId });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('parked');
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
+    // The keep-parked request itself still resumes the intent it owns.
+    expect(mustKeepParked(ctx).status).toBe(200);
+    expectKeptParked(ctx);
+  });
+
+  it('a keep-parked request on an active bin intent is a 409 mode conflict, and nothing bins', async () => {
+    const ctx = await deferred();
+    crashAt(ctx, 'retire');
+    expect(() => request(ctx)).toThrow('crash after retire');
+    const intent = ctx.ledger.latestCloseoutForJob(ctx.jobId)!;
+    expect(intent).toMatchObject({ state: 'open', mode: 'bin' });
+    const seq = ctx.ledger.latestEventSeq();
+    const conflict = mustKeepParked(ctx);
+    expect(conflict.status).toBe(409);
+    expect(bodyOf(conflict)).toEqual({ error: 'request_closeout_mode_conflict', active_mode: 'bin', closeout_id: intent.closeoutId });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.getJob(ctx.jobId)?.status).toBe('working');
+    expect(debt(ctx)?.state).toBe('open');
+    // The binning request itself still completes the intent it owns.
+    expect(mustRequest(ctx).status).toBe(200);
+    expectCancelled(ctx);
+  });
+
+  it('a job that is not parked is refused before anything is written (409 job_not_parked)', async () => {
+    const ctx = await deferred();
+    const seq = ctx.ledger.latestEventSeq();
+    const refused = mustKeepParked(ctx);
+    expect(refused.status).toBe(409);
+    expect(bodyOf(refused)).toEqual({ error: 'job_not_parked',
+      detail: `job "${ctx.jobId}" is working, not parked — the keep-parked closeout never changes the job status, so the hold must be in place first` });
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
+    expect(ctx.ledger.latestCloseoutForJob(ctx.jobId)).toBeNull();
+    expect(ctx.ledger.getDirective(ctx.requestId)?.state).toBe('dispatching');
+    expect(debt(ctx)?.state).toBe('open');
+    // A reason over the limit is still the closeout's own 400 first.
+    expect(mustKeepParked(ctx, 'gru', { reason: 'x'.repeat(501) }).status).toBe(400);
+    expect(bodyOf(mustKeepParked(ctx, 'gru', { reason: 'x'.repeat(501) })).error).toBe('invalid_reason');
+    expect(ctx.ledger.latestEventSeq()).toBe(seq);
   });
 });
 

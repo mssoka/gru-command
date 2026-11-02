@@ -180,6 +180,7 @@ import {
   updateCloseoutState,
   type CloseoutBlocker,
   type CloseoutIntent,
+  type CloseoutMode,
   type CloseoutRequester,
   type CloseoutSupersededReason,
 } from './closeouts.js';
@@ -215,7 +216,7 @@ const MAX_VERIFICATION_PROCESS_RECEIPT_BYTES = MAX_REBRIEF_RECEIPT_EVIDENCE_BYTE
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirementRefusalCode, DirectiveState } from './directives.js';
 export { DirectiveRetirementError } from './directives.js';
-export type { CloseoutBlocker, CloseoutIntent, CloseoutState, CloseoutSupersededReason } from './closeouts.js';
+export type { CloseoutBlocker, CloseoutIntent, CloseoutMode, CloseoutState, CloseoutSupersededReason } from './closeouts.js';
 export { CloseoutPendingError, TerminalLiveWorkError } from './closeouts.js';
 export type {
   OwnerApprovalFences,
@@ -11159,13 +11160,15 @@ export class LedgerApi {
   }
 
   /** S1: re-run the one evaluation inside the transaction, then record the
-   * intent (`open`) and its `silas.closeout-intent` event. A refusal writes
-   * nothing. */
+   * intent (`open`, with the `mode` S3 it owes) and its
+   * `silas.closeout-intent` event. A refusal writes nothing. */
   beginCloseout(input: {
     readonly jobId: string;
     readonly requestId: string;
     readonly requestedBy: CloseoutRequester;
     readonly reason: string | null;
+    /** Absent = `bin`, the #523 closeout every existing caller starts. */
+    readonly mode?: CloseoutMode;
     readonly evaluate: () => readonly CloseoutBlocker[];
   }): { readonly kind: 'begun'; readonly intent: CloseoutIntent } | { readonly kind: 'refused'; readonly blockers: readonly CloseoutBlocker[] } {
     return this.transaction(() => {
@@ -11180,14 +11183,15 @@ export class LedgerApi {
       const blockers = input.evaluate();
       if (blockers.length > 0) return { kind: 'refused' as const, blockers };
       const job = this.getJob(input.jobId) as JobRecord;
+      const mode = input.mode ?? 'bin';
       const generation = nextCloseoutGeneration(this.db, input.requestId);
       const closeoutId = randomUUID();
       const event = this.appendEvent({ kind: 'silas.closeout-intent', jobId: input.jobId,
         payload: { closeout_id: closeoutId, request_id: input.requestId, generation, payload_hash: candidate.payloadHash,
-          job_status: job.status, requested_by: input.requestedBy, reason: input.reason, by: CLOSEOUT_ACTOR } });
+          job_status: job.status, mode, requested_by: input.requestedBy, reason: input.reason, by: CLOSEOUT_ACTOR } });
       const ts = nowIso();
       insertCloseout(this.db, { closeoutId, jobId: input.jobId, requestId: input.requestId, generation, payloadHash: candidate.payloadHash,
-        jobStatus: job.status, intentSeq: event.seq, requestedBy: input.requestedBy, reason: input.reason, createdAt: ts, updatedAt: ts });
+        mode, jobStatus: job.status, intentSeq: event.seq, requestedBy: input.requestedBy, reason: input.reason, createdAt: ts, updatedAt: ts });
       return { kind: 'begun' as const, intent: selectCloseout(this.db, closeoutId) as CloseoutIntent };
     });
   }
@@ -11287,6 +11291,74 @@ export class LedgerApi {
       updateCloseoutState(this.db, intent.closeoutId, { state: 'complete', updatedAt: nowIso() });
       this.appendEvent({ kind: 'silas.closeout-complete', jobId: intent.jobId,
         payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation, by: CLOSEOUT_ACTOR } });
+      return { kind: 'complete' as const, intent: selectCloseout(this.db, intent.closeoutId) as CloseoutIntent, job };
+    });
+  }
+
+  /** What a keep-parked S3' would refuse on, without writing. The one refusal
+   * left after preflight is the request's current gate duty: `settleObligation`
+   * accepts only a matching terminal status or the duty's own completion, never
+   * a closeout's administrative close. Naming the duty here keeps a stopped
+   * intent's fingerprint stable across passes (a readback must not look
+   * "changed" every time) and never advertises a closeout that will refuse. */
+  closeoutKeepParkedBlockers(closeoutId: string): readonly CloseoutBlocker[] {
+    const intent = this.activeCloseoutOrThrow(closeoutId);
+    if (intent.mode !== 'keep-parked') {
+      throw new Error(`closeout "${closeoutId}" is a "${intent.mode}" intent — only a keep-parked intent finishes without binning`);
+    }
+    return this.keepParkedGateDutyBlockers(intent);
+  }
+
+  private keepParkedGateDutyBlockers(intent: CloseoutIntent): readonly CloseoutBlocker[] {
+    const debt = this.recoveryObligation(intent.jobId, 'directive', intent.requestId);
+    const duty = debt === null ? null : this.currentGateDutyAction(debt.id);
+    if (debt === null || duty === null) return [];
+    const text = duty.kind === 'external-wait' ? duty.condition
+      : duty.kind === 'silas-mechanical' ? 'a mechanical action'
+      : duty.decision;
+    return [{ code: 'gate_duty',
+      detail: `the request's recovery debt "${debt.id}" owes a current gate duty (${text}) — a keep-parked closeout cannot discharge it: ` +
+        'resolve the duty first; a binning request is refused request_closeout_mode_conflict while this intent is active' }];
+  }
+
+  /** S3' for a `keep-parked` intent: settle THIS request's recovery obligation
+   * (the same `{kind:'cancelled'}` close an owner abandonment uses), then
+   * resolve the request's card, then complete the intent, in one transaction.
+   * Settlement comes first because retirement deliberately leaves the card
+   * while a debt incarnation is active. It writes no job status, no
+   * `job-terminal` settlement, no completion/no-effect/cessation claim, and
+   * releases no hold: the job stays exactly as parked as it was. A current
+   * gate duty refuses (blockers, nothing written) instead of closing a duty
+   * only its own resolution or a terminal status may discharge. */
+  completeCloseoutKeepParked(closeoutId: string):
+    | { readonly kind: 'complete'; readonly intent: CloseoutIntent; readonly job: JobRecord }
+    | { readonly kind: 'superseded'; readonly intent: CloseoutIntent }
+    | { readonly kind: 'refused'; readonly intent: CloseoutIntent; readonly blockers: readonly CloseoutBlocker[] } {
+    return this.transaction(() => {
+      const intent = this.activeCloseoutOrThrow(closeoutId);
+      if (intent.mode !== 'keep-parked') {
+        throw new Error(`closeout "${closeoutId}" is a "${intent.mode}" intent — only a keep-parked intent finishes without binning`);
+      }
+      const stale = this.closeoutStaleReason(intent, 'bin');
+      if (stale.reason !== null) return { kind: 'superseded' as const, intent: this.supersedeCloseout(intent, stale.reason) };
+      const blockers = this.keepParkedGateDutyBlockers(intent);
+      if (blockers.length > 0) return { kind: 'refused' as const, intent, blockers };
+      // The request's own debt, never the job's other obligations: the hold and
+      // every unrelated obligation stay exactly as they are.
+      const debt = this.recoveryObligation(intent.jobId, 'directive', intent.requestId);
+      if (debt !== null) {
+        this.settleObligation({ obligationId: debt.id, settlement: { kind: 'cancelled',
+          reason: `canceled request "${intent.requestId}" closed out while its job stays parked (closeout ${intent.closeoutId}): ` +
+            'outcome unknown — no completion, no no-effect and no cessation is claimed' } });
+      }
+      const card = this.findNotificationByKind(`silas.directive-unreconciled.${intent.requestId}`, 'active');
+      if (card?.routing === 'action-required') this.resolveNotificationById(card.id, CLOSEOUT_ACTOR);
+      updateCloseoutState(this.db, intent.closeoutId, { state: 'complete', updatedAt: nowIso() });
+      this.appendEvent({ kind: 'silas.closeout-complete', jobId: intent.jobId,
+        payload: { closeout_id: intent.closeoutId, request_id: intent.requestId, generation: intent.generation,
+          mode: 'keep-parked', by: CLOSEOUT_ACTOR } });
+      const job = this.getJob(intent.jobId);
+      if (job === null) throw new RecordNotFound(`job "${intent.jobId}" not found`);
       return { kind: 'complete' as const, intent: selectCloseout(this.db, intent.closeoutId) as CloseoutIntent, job };
     });
   }

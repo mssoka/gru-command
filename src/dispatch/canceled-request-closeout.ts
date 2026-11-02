@@ -7,6 +7,7 @@ import {
   closeoutRequester,
   type CloseoutBlocker,
   type CloseoutIntent,
+  type CloseoutMode,
   type CloseoutSupersededReason,
 } from '../ledger/closeouts.js';
 import { DirectiveRetirementError, type DirectiveRequestRecord } from '../ledger/directives.js';
@@ -32,9 +33,27 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * S1 the intent, S2 the guarded retirement, S3 the bin + card resolution. A
  * crash leaves the intent `open`, which means resume. The closeout never
  * claims a dispatch, spawns or prompts.
+ *
+ * A `keep-parked` intent (#564) runs the same S1 and S2 and a different S3
+ * (S3'): settle this request's recovery obligation, resolve its card, complete
+ * the intent — and leave the job parked, its hold in place. The mode is stored
+ * on the intent because a resume replays from the row alone and `job_status`
+ * cannot tell the two apart.
  */
 
 export type CloseoutStep = 'intent' | 'retire';
+
+/** What a caller of a closeout path asks for beyond the wire body. */
+export interface BinningRequestOptions {
+  /** Which S3 the caller owes; absent = `bin`, today's closeout. */
+  readonly mode?: CloseoutMode;
+  /** The request a request-scoped caller names. Every answer is for that
+   * request: its own completed intent is the repeat answered, and the job's
+   * closeout is refused `request_closeout_target_mismatch` when it acts on a
+   * different one (a parked job survives the closeout, so a later request
+   * could otherwise be handed an earlier request's completion). */
+  readonly requestId?: string;
+}
 
 export interface CanceledRequestCloseoutDeps {
   readonly ledger: LedgerApi;
@@ -88,6 +107,7 @@ export function closeoutIntentView(intent: CloseoutIntent): Record<string, unkno
     generation: intent.generation,
     state: intent.state,
     superseded_reason: intent.supersededReason,
+    mode: intent.mode,
     requested_by: intent.requestedBy,
     reason: intent.reason,
     payload_hash: intent.payloadHash,
@@ -118,6 +138,14 @@ function stoppedBody(intent: CloseoutIntent): CloseoutHttpResult {
 
 function supersededBody(reason: CloseoutSupersededReason | null): CloseoutHttpResult {
   return { status: 409, body: { error: 'request_closeout_superseded', superseded_reason: reason } };
+}
+
+/** A request-named caller asked for a request the job's closeout does not act
+ * on. `active_request_id` names the request it does act on, so the caller can
+ * address that one instead of believing its own request was closed out. */
+function targetMismatchBody(jobId: string, asked: string, target: string): CloseoutHttpResult {
+  return { status: 409, body: { error: 'request_closeout_target_mismatch', active_request_id: target,
+    detail: `the closeout for job "${jobId}" acts on request "${target}", not the request "${asked}" this call names — request the closeout for "${target}"` } };
 }
 
 function completeBody(job: JobRecord, intent: CloseoutIntent): CloseoutHttpResult {
@@ -160,41 +188,59 @@ export class CanceledRequestCloseout {
   }
 
   /** The readback of one request: which path a binning request would take
-   * for its job, whether the closeout would proceed, and the request's latest
-   * intent. An `open` or `stopped` intent keeps its job on the closeout path
-   * (a binning request resumes it) and what refuses is the step it waits on:
-   * after S2 the live work binning would meet, and an intent whose basis no
+   * for its job, whether the closeout would proceed, the current intent's
+   * mode, and the request's latest intent. An `open` or `stopped` intent keeps
+   * its job on the closeout path (a binning request resumes it) and what
+   * refuses is the step it waits on: after S2 the live work binning would
+   * meet — or, for a `keep-parked` intent, the gate duty only the duty's own
+   * resolution or a terminal status can discharge. An intent whose basis no
    * longer holds reads as not eligible, because the next binning request
    * supersedes it instead of completing it. */
-  describe(requestId: string): { readonly path: 'closeout' | 'binning'; readonly eligible: boolean; readonly blockers: readonly CloseoutBlocker[]; readonly intent: CloseoutIntent | null } {
+  describe(requestId: string): { readonly path: 'closeout' | 'binning'; readonly eligible: boolean; readonly blockers: readonly CloseoutBlocker[]; readonly mode: CloseoutMode | null; readonly intent: CloseoutIntent | null } {
     const { ledger } = this.deps;
     const row = ledger.getDirective(requestId);
     const intent = ledger.latestCloseoutForRequest(requestId);
-    if (row === null) return { path: 'binning', eligible: false, blockers: [], intent };
+    if (row === null) return { path: 'binning', eligible: false, blockers: [], mode: intent?.mode ?? null, intent };
     const active = ledger.activeCloseoutForJob(row.jobId);
     if (active !== null) {
       const waiting = this.currentBlockers(active);
       const stale = waiting.length > 0 ? null : ledger.closeoutStaleness(active.closeoutId);
       const blockers = stale === null ? waiting
         : [{ code: 'intent_stale', detail: `the closeout intent no longer describes the job (${stale}) — the next binning request supersedes it` }];
-      return { path: 'closeout', eligible: blockers.length === 0, blockers, intent };
+      return { path: 'closeout', eligible: blockers.length === 0, blockers, mode: active.mode, intent };
     }
     const evaluation = this.evaluateCloseout(row.jobId);
-    return { path: evaluation.path, eligible: evaluation.path === 'closeout' && evaluation.blockers.length === 0, blockers: evaluation.blockers, intent };
+    return { path: evaluation.path, eligible: evaluation.path === 'closeout' && evaluation.blockers.length === 0, blockers: evaluation.blockers,
+      mode: intent?.mode ?? null, intent };
   }
 
-  /** Route a binning request (`POST /api/jobs/{id}/status` `{"status":"binned"}`).
-   * `null` falls through to today's `ledger.setJobStatus`, unchanged. */
-  requestBinning(jobId: string, body: Record<string, unknown>): CloseoutHttpResult | null {
+  /** Route a binning request (`POST /api/jobs/{id}/status` `{"status":"binned"}`,
+   * mode `bin`) or a keep-parked closeout request (`POST
+   * /api/silas/directives/{request}/closeout`, mode `keep-parked`). `null`
+   * falls through to today's `ledger.setJobStatus`, unchanged. */
+  requestBinning(jobId: string, body: Record<string, unknown>, asked: BinningRequestOptions = {}): CloseoutHttpResult | null {
     const { ledger } = this.deps;
+    const mode = asked.mode ?? 'bin';
     // 1. Validate the body: a reason is at most 500 characters, whatever the job.
     const rawReason = body['reason'];
     const invalidReason: CloseoutHttpResult = { status: 400, body: { error: 'invalid_reason', detail: `reason must be a string of at most ${CLOSEOUT_REASON_MAX_CHARS} characters` } };
     if (typeof rawReason === 'string' && Array.from(rawReason).length > CLOSEOUT_REASON_MAX_CHARS) return invalidReason;
     const reason = typeof rawReason === 'string' && rawReason !== '' ? rawReason : null;
-    // 2. An open or stopped intent has the lifecycle.
+    // 2. An active intent has the lifecycle — but only for a caller that names
+    // its request and asks for the same S3: resuming another mode's intent
+    // would bin a request that asked to keep the hold, or finish one that asked
+    // to bin, and resuming another request's intent would answer a request this
+    // call never named.
     const active = ledger.activeCloseoutForJob(jobId);
     if (active !== null) {
+      if (asked.requestId !== undefined && active.requestId !== asked.requestId) return targetMismatchBody(jobId, asked.requestId, active.requestId);
+      if (active.mode !== mode) {
+        return { status: 409, body: { error: 'request_closeout_mode_conflict', active_mode: active.mode, closeout_id: active.closeoutId } };
+      }
+      // 3. An open or stopped intent is resumed before the parked premise: a
+      // stale one is superseded by the revalidation inside `drive`, which is
+      // the answer the caller owns — not "re-park the job" for an intent that
+      // no longer describes it.
       const resumed = this.resume(active);
       // Unchanged blockers: the recorded refusal stands, nothing is written.
       if (resumed === null) return stoppedBody(active);
@@ -202,20 +248,38 @@ export class CanceledRequestCloseout {
       if (resumed.kind === 'superseded' && ledger.getJob(jobId)?.status === 'binned') return null;
       return this.respond(resumed);
     }
-    // 3. A completed closeout answers again with its original member.
+    // 4. `keep-parked` adds nothing to the job: it finishes the request and
+    // leaves the hold in place, so the hold is the mode's premise for a fresh
+    // request (an intent that is already active was resumed above).
     const job = ledger.getJob(jobId);
+    if (mode === 'keep-parked' && job?.status !== 'parked') {
+      return { status: 409, body: { error: 'job_not_parked',
+        detail: `job "${jobId}" is ${job?.status ?? 'unknown'}, not parked — the keep-parked closeout never changes the job status, so the hold must be in place first` } };
+    }
+    // 5. A completed closeout answers again with its original member.
     if (job !== null && job.status === 'binned') {
       const latest = ledger.latestCloseoutForJob(jobId);
       if (latest !== null && latest.state === 'complete') return completeBody(job, latest);
     }
-    // 4. An eligible job takes the closeout; 5. anything else falls through.
+    // A keep-parked completion leaves the job parked, so the repeat is answered
+    // from the intent the caller named — never from another request's.
+    if (asked.requestId !== undefined && mode === 'keep-parked' && job !== null) {
+      const latest = ledger.latestCloseoutForRequest(asked.requestId);
+      if (latest !== null && latest.jobId === jobId && latest.state === 'complete' && latest.mode === 'keep-parked') return completeBody(job, latest);
+    }
+    // 6. An eligible job takes the closeout; 7. anything else falls through.
     const evaluation = this.evaluateCloseout(jobId);
     if (evaluation.request === null) return null;
+    // The job's eligibility rule names the request to close out; a caller that
+    // named another one is refused rather than handed that request's closeout.
+    if (asked.requestId !== undefined && evaluation.request.requestId !== asked.requestId) {
+      return targetMismatchBody(jobId, asked.requestId, evaluation.request.requestId);
+    }
     // The closeout stores the reason, so a malformed one is refused here and nowhere else.
     if (rawReason !== undefined && rawReason !== null && typeof rawReason !== 'string') return invalidReason;
     if (evaluation.blockers.length > 0) return refusedBody(evaluation.blockers);
     // S1 evaluates once more inside its transaction: the same function.
-    const begun = ledger.beginCloseout({ jobId, requestId: evaluation.request.requestId, requestedBy: closeoutRequester(body['by']), reason,
+    const begun = ledger.beginCloseout({ jobId, requestId: evaluation.request.requestId, mode, requestedBy: closeoutRequester(body['by']), reason,
       evaluate: () => this.evaluateCloseout(jobId).blockers });
     if (begun.kind === 'refused') return refusedBody(begun.blockers);
     this.deps.afterStep?.('intent', begun.intent);
@@ -254,13 +318,18 @@ export class CanceledRequestCloseout {
   }
 
   /** What would refuse the step the intent is waiting on: the retirement
-   * guards while the request is still `dispatching`, the live work binning
-   * refuses once it is retired. An intent that is stale has none: `drive` supersedes it. */
+   * guards while the request is still `dispatching`, then the S3 the intent
+   * owes — the live work binning refuses, or the gate duty a keep-parked
+   * closeout refuses. An intent that is stale has none: `drive` supersedes it. */
   private currentBlockers(intent: CloseoutIntent): readonly CloseoutBlocker[] {
     const request = this.deps.ledger.getDirective(intent.requestId);
     if (request === null) return [];
     if (request.state === 'dispatching') return this.retirementBlockers(request);
-    if (request.state === 'retired') return this.deps.ledger.closeoutBinBlockers(intent.jobId);
+    if (request.state === 'retired') {
+      return intent.mode === 'keep-parked'
+        ? this.deps.ledger.closeoutKeepParkedBlockers(intent.closeoutId)
+        : this.deps.ledger.closeoutBinBlockers(intent.jobId);
+    }
     return [];
   }
 
@@ -269,7 +338,8 @@ export class CanceledRequestCloseout {
       : outcome.kind === 'stopped' ? stoppedBody(outcome.intent) : supersededBody(outcome.intent.supersededReason);
   }
 
-  /** Steps S2 and S3 for an active intent, from wherever it stopped. */
+  /** Steps S2 and S3 (or S3', by the intent's mode) for an active intent,
+   * from wherever it stopped. */
   private drive(intent: CloseoutIntent): DriveOutcome {
     const { ledger } = this.deps;
     const guard = ledger.guardCloseoutRetire(intent.closeoutId);
@@ -279,17 +349,28 @@ export class CanceledRequestCloseout {
       if (refusal !== null) return { kind: 'stopped', intent: ledger.stopCloseout(intent.closeoutId, refusal) };
       this.deps.afterStep?.('retire', guard.intent);
     }
-    let completed: ReturnType<LedgerApi['completeCloseout']>;
-    try {
-      completed = ledger.completeCloseout(intent.closeoutId);
-    } catch (error) {
-      if (!(error instanceof TerminalLiveWorkError)) throw error;
-      return { kind: 'stopped', intent: ledger.stopCloseout(intent.closeoutId, error.blockers.map((detail) => ({ code: 'live_work', detail }))) };
-    }
+    const completed = guard.intent.mode === 'keep-parked' ? ledger.completeCloseoutKeepParked(intent.closeoutId) : this.completeBinning(intent.closeoutId);
+    if (completed.kind === 'refused') return { kind: 'stopped', intent: ledger.stopCloseout(intent.closeoutId, completed.blockers) };
     if (completed.kind === 'superseded') return { kind: 'superseded', intent: completed.intent };
     this.deps.log?.('info', 'canceled-request closeout complete', { closeout: completed.intent.closeoutId, request: completed.intent.requestId,
-      job: completed.intent.jobId, generation: completed.intent.generation });
+      job: completed.intent.jobId, generation: completed.intent.generation, mode: completed.intent.mode });
     return { kind: 'complete', intent: completed.intent, job: completed.job };
+  }
+
+  /** S3 for a `bin` intent. Live work that appeared after S2 makes
+   * `setJobStatus` refuse (`TerminalLiveWorkError`): the step rolls back and
+   * the caller records the intent stopped. A keep-parked intent never writes a
+   * job status, so that refusal cannot apply to it. */
+  private completeBinning(closeoutId: string):
+    | { readonly kind: 'complete'; readonly intent: CloseoutIntent; readonly job: JobRecord }
+    | { readonly kind: 'superseded'; readonly intent: CloseoutIntent }
+    | { readonly kind: 'refused'; readonly blockers: readonly CloseoutBlocker[] } {
+    try {
+      return this.deps.ledger.completeCloseout(closeoutId);
+    } catch (error) {
+      if (!(error instanceof TerminalLiveWorkError)) throw error;
+      return { kind: 'refused', blockers: error.blockers.map((detail) => ({ code: 'live_work', detail })) };
+    }
   }
 
   /** S2: the guarded retirement, built from fresh state at this moment: the
@@ -302,7 +383,11 @@ export class CanceledRequestCloseout {
       const { resolvedHead } = retirementRouteEvidence(this.route, row.jobId);
       const authority = ledger.directiveCurrentAuthority(row.jobId);
       const obligation = ledger.recoveryObligation(row.jobId, 'directive', row.requestId);
-      const base = `canceled heist: its binning closes out the deferred request ${row.requestId} (requested by ${intent.requestedBy})`;
+      // The reason is durable evidence of what the closeout does: a keep-parked
+      // intent never bins, so it cannot claim a binning.
+      const base = intent.mode === 'keep-parked'
+        ? `keep-parked closeout: retire the canceled request ${row.requestId} and leave its job parked (requested by ${intent.requestedBy})`
+        : `canceled heist: its binning closes out the deferred request ${row.requestId} (requested by ${intent.requestedBy})`;
       retireInterruptedDirectiveFromRoute({
         ...this.route,
         requestId: row.requestId,

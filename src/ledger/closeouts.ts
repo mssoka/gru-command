@@ -15,6 +15,13 @@ import { DirectiveCheckpointError } from '../runtime/directive-checkpoint.js';
  * crash leaves it here: it means resume). `stopped` = a guard that passed
  * preflight refused later (a race); the recorded blockers and their
  * fingerprint say why. `complete` and `superseded` are terminal.
+ *
+ * `mode` is which S3 the intent owes, durably: `bin` bins the job and closes
+ * its obligations `job-terminal`/`binned`; `keep-parked` settles only this
+ * request's recovery obligation and leaves the job parked with its hold in
+ * place. It cannot be derived from the row's `job_status` (a bin intent
+ * started on a parked job stores the same `parked`), and a resume replays
+ * from the row alone, so it must be stored.
  */
 
 /** The attribution of every closeout write: retired_by, the card's
@@ -30,6 +37,11 @@ export type CloseoutState = (typeof CLOSEOUT_STATES)[number];
 /** Why an intent no longer describes the job: the first failing revalidation predicate. */
 export const CLOSEOUT_SUPERSEDED_REASONS = ['job-status', 'request-state', 'later-work', 'control-event'] as const;
 export type CloseoutSupersededReason = (typeof CLOSEOUT_SUPERSEDED_REASONS)[number];
+
+/** Which S3 the intent owes: bin the job, or finish the request and leave the
+ * job parked. */
+export const CLOSEOUT_MODES = ['bin', 'keep-parked'] as const;
+export type CloseoutMode = (typeof CLOSEOUT_MODES)[number];
 
 export const CLOSEOUT_REQUESTERS = ['gru', 'unattributed'] as const;
 export type CloseoutRequester = (typeof CLOSEOUT_REQUESTERS)[number];
@@ -61,6 +73,8 @@ export interface CloseoutIntent {
   /** Per-request counter; a superseded intent is followed by generation + 1. */
   readonly generation: number;
   readonly payloadHash: string;
+  /** Which S3 this intent owes; the caller that recorded it decides. */
+  readonly mode: CloseoutMode;
   /** The job status at S1; the P1 revalidation predicate compares against it. */
   readonly jobStatus: string;
   /** The seq of the `silas.closeout-intent` event (S1). */
@@ -106,6 +120,10 @@ function isCloseoutState(value: unknown): value is CloseoutState {
   return typeof value === 'string' && (CLOSEOUT_STATES as readonly string[]).includes(value);
 }
 
+function isCloseoutMode(value: unknown): value is CloseoutMode {
+  return typeof value === 'string' && (CLOSEOUT_MODES as readonly string[]).includes(value);
+}
+
 function parseBlockers(raw: unknown): readonly CloseoutBlocker[] {
   const parsed: unknown = JSON.parse(String(raw ?? '[]'));
   if (!Array.isArray(parsed)) throw new Error('request_closeouts.blockers is not a JSON array');
@@ -118,6 +136,7 @@ function parseBlockers(raw: unknown): readonly CloseoutBlocker[] {
 
 export function closeoutFromRow(row: Row): CloseoutIntent {
   if (!isCloseoutState(row['state'])) throw new Error(`request_closeouts row has unknown state "${String(row['state'])}"`);
+  if (!isCloseoutMode(row['mode'])) throw new Error(`request_closeouts row has unknown mode "${String(row['mode'])}"`);
   const reason = row['superseded_reason'];
   return {
     closeoutId: String(row['closeout_id']),
@@ -125,6 +144,7 @@ export function closeoutFromRow(row: Row): CloseoutIntent {
     requestId: String(row['request_id']),
     generation: Number(row['generation']),
     payloadHash: String(row['payload_hash']),
+    mode: row['mode'],
     jobStatus: String(row['job_status']),
     intentSeq: Number(row['intent_seq']),
     state: row['state'],
@@ -186,10 +206,10 @@ export function nextCloseoutGeneration(db: DatabaseSync, requestId: string): num
 export function insertCloseout(db: DatabaseSync, intent: Omit<CloseoutIntent, 'supersededReason' | 'blockers' | 'blockerFingerprint' | 'state'>): void {
   db.prepare(
     `INSERT INTO request_closeouts
-       (closeout_id, job_id, request_id, generation, payload_hash, job_status, intent_seq, state,
+       (closeout_id, job_id, request_id, generation, payload_hash, mode, job_status, intent_seq, state,
         superseded_reason, requested_by, reason, blockers, blocker_fingerprint, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, '[]', NULL, ?, ?)`,
-  ).run(intent.closeoutId, intent.jobId, intent.requestId, intent.generation, intent.payloadHash, intent.jobStatus,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, '[]', NULL, ?, ?)`,
+  ).run(intent.closeoutId, intent.jobId, intent.requestId, intent.generation, intent.payloadHash, intent.mode, intent.jobStatus,
     intent.intentSeq, intent.requestedBy, intent.reason, intent.createdAt, intent.updatedAt);
 }
 
