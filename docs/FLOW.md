@@ -507,17 +507,17 @@ verification budget.
   concurrency of 1 nothing is reserved (the one slot cannot be withheld
   from a whole class without starving it), so the setting is inert at the
   shipped `max_concurrent` default of 1; a scope name no repo declares
-  simply never matches. Long scopes are deliberately deprioritized: a
-  queued long scope needs a momentarily idle machine (its cap is 1 at
-  effective concurrency 2 and is measured against TOTAL occupancy), so with
-  a persistent backlog of short runs the long waits until that backlog
-  drains. That is a deferral, never a permanent block — the long is granted
-  the moment no short run holds a slot — and its derived deadline follows
-  the holders instead of failing it early. The worker-side capture-helper
-  wrapper's own ~590 s bound lives outside this service. Either way the
-  same-head dirty-at-spawn window (a run queues at a pinned head while the
-  worker keeps editing) is recorded, never refused — only a moved head is
-  refused.
+  simply never matches. Long scopes are deliberately deprioritized: a long
+  scope is admitted only while fewer than `max_concurrent - 1` slots are in
+  use (at effective concurrency 2, one free slot in an otherwise idle
+  machine), so with a persistent backlog of short runs a queued long waits
+  until that backlog drains. That is a deferral, never a permanent block:
+  once the short work drains the long is granted, and its derived deadline
+  follows the holders instead of failing it early. The worker-side
+  capture-helper wrapper's own ~590 s bound lives outside this service.
+  Either way the same-head dirty-at-spawn window (a run queues at a pinned
+  head while the worker keeps editing) is recorded, never refused — only a
+  moved head is refused.
 - **Identical submissions are single-flight, never duplicate producers**
   (issue #159). Same job + lane + scope + head + command shares ONE run:
   the duplicate stream gets an `attached` frame naming the run and then
