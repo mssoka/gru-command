@@ -574,13 +574,15 @@ export const PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP = 12;
  * One shared budget, FIFO queue, recorded evidence for review. */
 export interface VerifyConfig {
   /** Concurrent verification runs across ALL lanes; further requests queue
-   * FIFO. Default 1 keeps full suites from starving each other. */
+   * FIFO, except a long scope whose own cap is full. Default 1 keeps full
+   * suites from starving each other. */
   readonly maxConcurrent: number;
   /** Total concurrent test workers across runs; 0 = auto (cores - 2). */
   readonly workerBudget: number;
   /** Minimum wait for a queued request before failing loud (never a silent
-   * hang): the wait is the LATER of this floor and the bounds of the runs
-   * ahead of it — the timeout lands on the lane and in the ledger. */
+   * hang): the wait is the LATER of this floor and the bounds of every run
+   * holding a slot it may have to outlast (an over-limit restore included)
+   * — the timeout lands on the lane and in the ledger. */
   readonly lockWaitTimeoutMs: number;
   /** Wall-clock cap per run; the process group is terminated on expiry. */
   readonly runTimeoutMs: number;

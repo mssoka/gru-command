@@ -488,12 +488,13 @@ verification budget.
   A repo that declares no verify command gets a loud 409 — no guessed
   command, ever.
 - **The scheduler owns concurrency.** At most `[verify] max_concurrent`
-  runs (default 1) run at once; further requests queue FIFO. A queued
-  request's wait is bounded by `lock_wait_timeout_ms` (default 15 min) as
-  a **floor** and by the bounds of the runs ahead of it (each holder's
-  `run_timeout_ms` plus its kill grace, re-derived whenever a run is
-  admitted ahead of it or its run clock starts — issue #537), so a
-  request is never failed while the work it waits for could still end.
+  runs (default 1) run at once; further requests queue FIFO (except a long
+  scope whose own cap is full, below). A queued request's wait is bounded
+  by `lock_wait_timeout_ms` (default 15 min) as a **floor** and by the
+  bounds of the runs ahead of it (each holder's `run_timeout_ms` plus its
+  kill grace, re-derived whenever a run is admitted ahead of it or its run
+  clock starts — issue #537), so a request is never failed while the work
+  it waits for could still end.
   Outlasting both fails LOUD: the lane receives a typed `error` frame and
   the ledger a `verification.lock-timeout` record — nothing hangs
   silently, and the holder is never killed. A **reserved slot keeps short
@@ -506,10 +507,17 @@ verification budget.
   concurrency of 1 nothing is reserved (the one slot cannot be withheld
   from a whole class without starving it), so the setting is inert at the
   shipped `max_concurrent` default of 1; a scope name no repo declares
-  simply never matches. The worker-side capture-helper wrapper's own ~590 s
-  bound lives outside this service. Either way the same-head dirty-at-spawn
-  window (a run queues at a pinned head while the worker keeps editing) is
-  recorded, never refused — only a moved head is refused.
+  simply never matches. Long scopes are deliberately deprioritized: a
+  queued long scope needs a momentarily idle machine (its cap is 1 at
+  effective concurrency 2 and is measured against TOTAL occupancy), so with
+  a persistent backlog of short runs the long waits until that backlog
+  drains. That is a deferral, never a permanent block — the long is granted
+  the moment no short run holds a slot — and its derived deadline follows
+  the holders instead of failing it early. The worker-side capture-helper
+  wrapper's own ~590 s bound lives outside this service. Either way the
+  same-head dirty-at-spawn window (a run queues at a pinned head while the
+  worker keeps editing) is recorded, never refused — only a moved head is
+  refused.
 - **Identical submissions are single-flight, never duplicate producers**
   (issue #159). Same job + lane + scope + head + command shares ONE run:
   the duplicate stream gets an `attached` frame naming the run and then
@@ -1483,7 +1491,7 @@ or an outside shell to avoid waiting out the drain bound.
 [verify]
 # Verification scheduler (see §4c); lanes request runs, the service owns
 # the machine's one global test budget.
-# max_concurrent = 1               # concurrent runs; further requests queue FIFO
+# max_concurrent = 1               # concurrent runs; further requests queue FIFO (except a long scope whose own cap is full)
 # long_scopes = []                 # scope names that are LONG: at max_concurrent >= 2 one slot stays reserved for every other scope
 # worker_budget = 0                # total test workers across runs; 0 = auto (cores - 2)
 # lock_wait_timeout_ms = 900000    # queued request: FLOOR of its wait (a longer run ahead waits longer)

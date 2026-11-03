@@ -953,6 +953,62 @@ describe('verification scheduler — global budget', () => {
     if (result.lease !== undefined) scheduler.release(result.lease);
   });
 
+  it('admits a queued long scope once a draining short backlog empties (deferral, never a permanent block)', async () => {
+    // The mirror of the red case: a short backlog that keeps the reserved slot
+    // busy defers the long scope, and the moment no short run is left the long
+    // is admitted instead of waiting out its derived deadline.
+    const { scheduler } = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] });
+    scheduler.start();
+    const shortA = await scheduler.acquire(scopedSpec('job-short-a', 'focused'));
+    const shortB = await scheduler.acquire(scopedSpec('job-short-b', 'focused'));
+    let longGranted = false;
+    const settled: Promise<SettledLease> = scheduler.acquire(spec('job-long')).then(
+      (lease): SettledLease => {
+        longGranted = true;
+        return { lease };
+      },
+      (error: unknown): SettledLease => ({ error }),
+    );
+    const shortC: Promise<SettledLease> = scheduler.acquire(scopedSpec('job-short-c', 'focused')).then(
+      (lease): SettledLease => ({ lease }),
+      (error: unknown): SettledLease => ({ error }),
+    );
+    const shortD: Promise<SettledLease> = scheduler.acquire(scopedSpec('job-short-d', 'focused')).then(
+      (lease): SettledLease => ({ lease }),
+      (error: unknown): SettledLease => ({ error }),
+    );
+    await flush();
+    expect(scheduler.queuedCount()).toBe(3);
+    // The backlog drains through the reserved slot one run at a time: each
+    // release hands the slot to the next queued short, and the long stays
+    // queued while any short run holds a slot.
+    scheduler.release(shortA);
+    await flush();
+    // The free slot went to the queued short, not to the long: the long waits
+    // while a short run holds the slot it would need.
+    expect(longGranted).toBe(false);
+    expect(scheduler.queuedCount()).toBe(2);
+    expect(scheduler.activeCount()).toBe(2);
+    const grantedC = await shortC;
+    expect(grantedC.error).toBeUndefined();
+    scheduler.release(shortB);
+    await flush();
+    expect(scheduler.queuedCount()).toBe(1);
+    const grantedD = await shortD;
+    expect(grantedD.error).toBeUndefined();
+    if (grantedC.lease !== undefined) scheduler.release(grantedC.lease);
+    await flush();
+    // One short holder still occupies a slot: the long's cap of 1 is full.
+    expect(scheduler.queuedCount()).toBe(1);
+    if (grantedD.lease !== undefined) scheduler.release(grantedD.lease);
+    // The backlog is empty: the long is granted at once, never blocked.
+    const result = await settled;
+    expect(result.error).toBeUndefined();
+    expect(result.lease).toMatchObject({ jobId: 'job-long' });
+    expect(scheduler.queuedCount()).toBe(0);
+    if (result.lease !== undefined) scheduler.release(result.lease);
+  });
+
   it('a queued short scope is admitted past a head-of-line long scope that does not fit', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] });
     scheduler.start();
