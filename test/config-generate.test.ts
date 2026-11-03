@@ -233,6 +233,12 @@ describe('config-generate CLI', () => {
     // max_concurrent: simultaneous commands, FIFO, not a worker count.
     expect(text).toContain('Maximum simultaneous verification commands; 1 serializes');
     expect(text).toContain('Not a per-command test-worker count');
+    // long_scopes: the long class, the reserved slot, and the inert-at-1 rule.
+    expect(text).toContain('Scope names whose runs are LONG');
+    expect(text).toContain('ONE slot is reserved for runs of every');
+    expect(text).toContain('a long scope runs at most max_concurrent - 1 at a time');
+    expect(text).toContain('admitted ahead of a waiting long one');
+    expect(text).toContain('inert there');
     // worker_budget: test runners not AI agents; auto formula; split;
     // runner-settings enforcement, not an OS quota.
     expect(text).toContain('test-runner worker allowance across admitted runs, NOT AI');
@@ -254,6 +260,7 @@ describe('config-generate CLI', () => {
     const raw = parse(text) as { verify: Record<string, unknown> };
     expect(raw.verify).toEqual({
       max_concurrent: 1,
+      long_scopes: [],
       worker_budget: 0,
       lock_wait_timeout_ms: 900000,
       run_timeout_ms: 1800000,

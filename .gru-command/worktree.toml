@@ -1725,6 +1725,32 @@ gc-571-red = 'set -e; root="$PWD"; base=aafefcff956e2cc6a2544d2b98c88666a74f91b2
 gc-537-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-scheduler.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts test/onboarding-proof.test.ts"
 gc-537-static = "npm run lint && npm run typecheck && npm run build"
 gc-537-red = 'set -e; root="$PWD"; base=bbb2a1088eed37017803af8e5b3ae6c8ba3d4182; headrev=$(git rev-parse HEAD); prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc537-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/verification-scheduler.test.ts "$d/test/verification-scheduler.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-537-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-537-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-scheduler.test.ts -t "A1 \(#537\)"; a=$?; set -e; echo "gc-537-red vitest exit=$a EXPECTED-NONZERO: the base arms one fixed lock-wait timer at queue time"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-537 A1 passed against the base"; exit 2; fi; cp "$d/results.json" "$prep/gc-537-red.results.json"; set +e; node "$root/tools/assert-named-red-baseline.mjs" gc-537 "$prep/gc-537-red.results.json" "verification scheduler — global budget A1 (#537): a queued request behind a bound longer than the floor is never timed out at the floor, and is granted when the holder releases" > "$prep/gc-537-red.classifier.txt" 2>&1; c=$?; set -e; cat "$prep/gc-537-red.classifier.txt"; printf "gc-537-red base=%s head=%s dir=%s results=%s classifier=%s\n" "$base" "$headrev" "$d" "$prep/gc-537-red.results.json" "$prep/gc-537-red.classifier.txt" > "$prep/gc-537-red.last-snapshot.txt"; if [ "$c" -ne 0 ]; then exit 2; fi; echo "EXPECTED-NONZERO: A1 REDs by assertion against the pre-change scheduler"; exit 1'
+# #537 (b): a reserved slot keeps short scopes beside a long one. `[verify]
+# long_scopes` names the long class (default [], inert); while any is set and
+# the effective concurrency is >= 2, one slot is reserved for every other
+# scope — a long scope runs at most max_concurrent - 1 at a time, and pump()
+# grants the first waiter that FITS, so a queued short scope is admitted past
+# a waiting long one. The reservation is short-only (no fairness clause) and
+# inert at an effective concurrency of 1, so the shipped max_concurrent=1
+# default is unchanged; the wait deadline now covers every slot that could
+# release before the grant (an over-limit restore included) and re-arms after
+# a fast-path claim. This lands the latency half of #537; the outside-repo
+# ~590 s capture wrapper and the priority/queue-position work stay out of
+# scope. `gc-537b-focused` runs the suites that own the touched seams (the
+# scheduler, the `[verify]` parser and its generated reference, the pins) and
+# the server wiring in the heavy phase; `gc-537b-static` is the lint +
+# typecheck + build gate; `gc-537b-red` overlays the FINAL
+# test/verification-scheduler.test.ts on an isolated `git archive` of the
+# branch base d3307f01 (node_modules symlinked, approved RPC patch first) and
+# runs the second-long case by literal title: the base has no reserved slot,
+# so it admits both longs and the case REDs by assertion, never by import. The
+# Vitest JSON report is classified by tools/assert-named-red-baseline.mjs (a
+# collection/setup/import failure, or a missing/green case, exits 2); the
+# vitest exit is echoed intact and the snapshot directory and ignored pointer
+# file are preserved for inspection.
+gc-537b-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-scheduler.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts"
+gc-537b-static = "npm run lint && npm run typecheck && npm run build"
+gc-537b-red = 'set -e; root="$PWD"; base=d3307f0187e284046d72c6cbd0c87ee6032b27a1; headrev=$(git rev-parse HEAD); prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gc537b-red.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp test/verification-scheduler.test.ts "$d/test/verification-scheduler.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "gc-537b-red base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/gc-537b-red.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs || { echo "PATCH TOOL FAILED at the archived base"; exit 2; }; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-scheduler.test.ts -t "a second long scope waits"; a=$?; set -e; echo "gc-537b-red vitest exit=$a EXPECTED-NONZERO: the base has no reserved slot and admits both long scopes"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: gc-537b second-long passed against the base"; exit 2; fi; cp "$d/results.json" "$prep/gc-537b-red.results.json"; set +e; node "$root/tools/assert-named-red-baseline.mjs" gc-537b "$prep/gc-537b-red.results.json" "verification scheduler — global budget a second long scope waits while a long holder occupies the only reserved slot at max_concurrent 2" > "$prep/gc-537b-red.classifier.txt" 2>&1; c=$?; set -e; cat "$prep/gc-537b-red.classifier.txt"; printf "gc-537b-red base=%s head=%s dir=%s results=%s classifier=%s\n" "$base" "$headrev" "$d" "$prep/gc-537b-red.results.json" "$prep/gc-537b-red.classifier.txt" > "$prep/gc-537b-red.last-snapshot.txt"; if [ "$c" -ne 0 ]; then exit 2; fi; echo "EXPECTED-NONZERO: the second long scope REDs by assertion against the pre-change scheduler"; exit 1'
 
 # #568 Silas observes merged GitLab merge requests. The GitLab signal poll
 # reads every tracked lane's merge request once per `[silas] poll_interval_ms`
