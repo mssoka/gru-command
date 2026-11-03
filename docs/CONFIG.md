@@ -662,8 +662,20 @@ max_concurrent_children = 2
 # running; only a request that outlasts both fails loud. A holder whose
 # pid is dead is released, and every run is recorded for review evidence.
 # Maximum simultaneous verification commands; 1 serializes runs and
-# later requests queue FIFO. Not a per-command test-worker count.
+# later requests queue FIFO (a long_scopes class below caps under it).
+# Not a per-command test-worker count.
 max_concurrent = 1
+# Scope names whose runs are LONG, e.g. ["full", "typecheck"]: names from
+# a repo's .gru-command/worktree.toml [verify] table (lowercase
+# identifiers). While any is set AND the effective concurrency (see
+# worker_budget) is at least 2, ONE slot is reserved for runs of every
+# other scope: a long scope runs at most max_concurrent - 1 at a time,
+# and a queued short scope is admitted ahead of a waiting long one. A
+# name no repo declares simply never matches. Empty = []; at an
+# effective concurrency of 1 nothing is reserved (the one slot cannot be
+# withheld from a whole class without starving it), so the setting is
+# inert there.
+long_scopes = []
 # Total test-runner worker allowance across admitted runs, NOT AI
 # agents/reviewers. 0 = auto: max(1, OS-available CPU parallelism - 2).
 # The allowance is split across the effective concurrency (max_concurrent

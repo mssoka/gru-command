@@ -30,7 +30,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * coordination problem, not a capacity one, so the service owns a single
  * cross-lane coordinator:
  *
- *  - at most `maxConcurrent` runs in flight, FIFO beyond that;
+ *  - at most `maxConcurrent` runs in flight, FIFO beyond that, except that a
+ *    configured `longScopes` class caps at `maxConcurrent - 1` and the
+ *    reserved slot admits a short scope past a queued long one (issue #537);
  *  - total test workers across runs ≤ `workerBudget` (auto: cores - 2),
  *    enforced by the run wrapper's environment;
  *  - the active holder set is persisted (`<storageDir>/scheduler.json`)
@@ -52,6 +54,10 @@ export interface VerificationLimits {
   readonly workerBudget: number;
   readonly lockWaitTimeoutMs: number;
   readonly runTimeoutMs: number;
+  /** Scope names whose runs are LONG: while any is configured and the
+   * effective concurrency is at least 2, one slot is reserved for runs of
+   * every other scope (issue #537). Empty reserves nothing. */
+  readonly longScopes?: readonly string[];
 }
 
 export interface VerificationRunSpec {
@@ -866,6 +872,8 @@ export class VerificationScheduler {
   private readonly recordEvent: VerificationRecorder;
   private readonly now: () => number;
   private readonly workerBudget: number;
+  /** The LONG scopes: their runs never take the reserved slot. */
+  private readonly longScopes: ReadonlySet<string>;
   private readonly staleMaxAgeMs: number;
   private readonly killGraceMs: number;
   private readonly disposeGraceMs: number;
@@ -917,6 +925,15 @@ export class VerificationScheduler {
         throw new Error(`verification scheduler ${label} must be a positive integer, got ${String(value)}`);
       }
     }
+    const longScopes = opts.limits.longScopes ?? [];
+    for (const scope of longScopes) {
+      if (typeof scope !== 'string' || scope.trim() === '') {
+        throw new Error(
+          `verification scheduler longScopes must be non-empty scope names, got ${JSON.stringify(scope)}`,
+        );
+      }
+    }
+    this.longScopes = new Set(longScopes);
     this.workerBudget = opts.limits.workerBudget > 0 ? opts.limits.workerBudget : defaultWorkerBudget();
     this.staleMaxAgeMs = opts.staleMaxAgeMs ?? opts.limits.runTimeoutMs * 2;
     this.killGraceMs = opts.killGraceMs ?? 5_000;
@@ -945,6 +962,30 @@ export class VerificationScheduler {
    * effective concurrency limit, never below 1. K × workersPerRun ≤ budget. */
   get workersPerRun(): number {
     return Math.max(1, Math.floor(this.workerBudget / this.concurrencyLimit));
+  }
+
+  /** Slots withheld from long scopes (issue #537): ONE while a long scope is
+   * configured and the effective concurrency can spare it. Nothing is
+   * reserved otherwise: at an effective concurrency of 1 the reservation is
+   * inert, because the only slot cannot be withheld from a whole class
+   * without deadlocking it. */
+  private get reservedSlots(): number {
+    return this.longScopes.size > 0 && this.concurrencyLimit >= 2 ? 1 : 0;
+  }
+
+  /** The slot cap that governs one request (issue #537): every scope keeps
+   * the whole effective concurrency, a long scope caps at
+   * `concurrencyLimit - reservedSlots`. The `max(1, …)` clamp keeps a long
+   * scope admittable when nothing is reserved. */
+  private effectiveLimit(scope: string): number {
+    return this.longScopes.has(scope)
+      ? Math.max(1, this.concurrencyLimit - this.reservedSlots)
+      : this.concurrencyLimit;
+  }
+
+  /** True when one more run of `scope` may hold a slot right now. */
+  private hasCapacityFor(scope: string): boolean {
+    return this.slots.size < this.effectiveLimit(scope);
   }
 
   /** How long after its grant a held slot is released as stale (`max-age`). */
@@ -1207,11 +1248,13 @@ export class VerificationScheduler {
   }
 
   /**
-   * Acquire one slot (FIFO when the budget is full). `sink` receives the
-   * `queued` frame before anything else for this run — position 0 means
-   * granted now. The capacity decision and the state mutation happen
-   * atomically (no await between them), so racing callers can never both
-   * pass a check for the last free slot.
+   * Acquire one slot (FIFO when the budget is full, under the class cap of
+   * {@link effectiveLimit}). `sink` receives the `queued` frame before
+   * anything else for this run — position 0 means granted now. The capacity
+   * decision and the state mutation happen atomically (no await between
+   * them), so racing callers can never both pass a check for the last free
+   * slot. A request is queued only once its OWN class's cap is reached, so
+   * this fast path never jumps a waiter that would have fitted.
    */
   async acquire(
     spec: VerificationRunSpec,
@@ -1222,7 +1265,7 @@ export class VerificationScheduler {
     if (!this.started) this.start();
     this.reconcileStale();
     const queuedAt = this.now();
-    if (this.slots.size < this.concurrencyLimit) {
+    if (this.hasCapacityFor(spec.scope)) {
       // Claim BEFORE the frame: the check and the insert must not be
       // separated by an await, or two racing callers could both pass.
       const lease = this.mintLease(runId, spec, queuedAt);
@@ -1239,6 +1282,10 @@ export class VerificationScheduler {
         requestIds: spec.requestId === undefined ? [] : [spec.requestId],
         boundUntil: this.boundWithoutClock(lease.grantedAt),
       });
+      // A claim can coexist with a queued request now (a short run takes the
+      // free slot while a long scope waits at its own cap), so the waiters'
+      // derived deadlines must include the holder just admitted (issue #537).
+      this.rearmWaiters();
       try {
         await sink({ type: 'queued', runId, position: 0, active, limit: this.concurrencyLimit });
       } catch (error) {
@@ -2244,18 +2291,18 @@ export class VerificationScheduler {
   /**
    * The absolute instant a queued request gives up (issue #537): its
    * `lockWaitTimeoutMs` floor measured from its own queue time, or the
-   * furthest bound of the slots ahead of it, whichever is later. Only the
-   * first `concurrencyLimit` slots can be released before this waiter is
-   * granted (`this.slots` is insertion-ordered and every grant goes through
-   * {@link pump}), so those are the ones its deadline must outlast.
+   * furthest bound among the slots it may have to outlast, whichever is
+   * later. Every holder is a candidate: a long scope caps at
+   * `concurrencyLimit - reservedSlots`, so the slot that frees next is not
+   * necessarily one of the first `concurrencyLimit` (an over-limit restore
+   * can also hold more), and {@link pump} grants the first waiter that FITS,
+   * not the head. The bound over-reaches only in the safe direction: a
+   * request is never failed while work it may wait for could still end.
    */
   private waiterDeadline(queuedAt: number): number {
     const floor = queuedAt + this.opts.limits.lockWaitTimeoutMs;
     let bound = 0;
-    let ahead = 0;
     for (const slot of this.slots.values()) {
-      if (ahead >= this.concurrencyLimit) break;
-      ahead += 1;
       if (slot.boundUntil > bound) bound = slot.boundUntil;
     }
     return Math.max(floor, bound);
@@ -2392,10 +2439,15 @@ export class VerificationScheduler {
     return !processGroupAlive(child);
   }
 
-  /** Grant FIFO waiters while capacity remains. */
+  /** Grant waiters while any of them fits, in insertion order: the first
+   * admittable waiter is taken, so a head-of-line long scope whose own cap is
+   * full never blocks a queued short scope behind it (issue #537). Grants
+   * stay FIFO within a class, and the scan stops as soon as nothing fits. */
   private pump(): void {
-    while (!this.disposed && this.waiters.length > 0 && this.slots.size < this.concurrencyLimit) {
-      const waiter = this.waiters.shift() as Waiter;
+    while (!this.disposed && this.waiters.length > 0) {
+      const index = this.waiters.findIndex((waiter) => this.hasCapacityFor(waiter.spec.scope));
+      if (index < 0) return;
+      const waiter = this.waiters.splice(index, 1)[0] as Waiter;
       waiter.settled = true;
       if (waiter.timer !== null) clearTimeout(waiter.timer);
       const lease = this.mintLease(waiter.runId, waiter.spec, waiter.queuedAt);

@@ -85,6 +85,8 @@ async function boot(opts: {
   lockWaitTimeoutMs?: number;
   maxConcurrent?: number;
   workerBudget?: number;
+  /** Issue #537: the `[verify] long_scopes` table the scheduler must receive. */
+  longScopes?: readonly string[];
   heartbeatMs?: number;
   files?: Readonly<Record<string, string>>;
   /** Injected scheduler clock (issue #554 retention-window tests). */
@@ -103,6 +105,9 @@ async function boot(opts: {
     `worker_budget = ${opts.workerBudget ?? 4}`,
     `lock_wait_timeout_ms = ${opts.lockWaitTimeoutMs ?? 5_000}`,
     'run_timeout_ms = 20000',
+    ...(opts.longScopes === undefined
+      ? []
+      : [`long_scopes = [${opts.longScopes.map((scope) => JSON.stringify(scope)).join(', ')}]`]),
     '',
   ].join('\n');
   writeFileSync(join(dir, 'config.toml'), configLines, 'utf-8');
@@ -665,6 +670,48 @@ describe('POST /api/verify', () => {
     const secondStarted = harness.ledger.latestJobEvent(other.id, 'verification.started');
     expect(firstCompleted).not.toBeNull();
     expect(secondStarted?.seq).toBeGreaterThan(firstCompleted?.seq ?? Number.MAX_SAFE_INTEGER);
+    await harness.close();
+  });
+
+  it('wires [verify] long_scopes into the scheduler: two long scopes serialize at max_concurrent 2', async () => {
+    // Issue #537: the long class is configuration, not a client claim. Both
+    // declared scopes are long, so the second run waits at the long cap
+    // (max_concurrent - 1 = 1) while the first holds the gate. Unwired, the
+    // scheduler would admit it to the free slot at once: two active, none
+    // queued.
+    const gate = [
+      "import { existsSync, writeFileSync } from 'node:fs';",
+      'const release = process.argv[2];',
+      "writeFileSync('gate-started.txt', 'started');",
+      'const deadline = Date.now() + 20000;',
+      'while (!existsSync(release) && Date.now() < deadline) {',
+      '  await new Promise((resolve) => setTimeout(resolve, 25));',
+      '}',
+      'process.exit(existsSync(release) ? 0 : 3);',
+    ].join('\n');
+    const harness = await boot({
+      manifest: [
+        '[verify]',
+        'full = "node gate.mjs held.txt"',
+        'typecheck = "node gate.mjs held.txt"',
+        '',
+      ].join('\n'),
+      files: { 'gate.mjs': gate },
+      maxConcurrent: 2,
+      longScopes: ['full', 'typecheck'],
+    });
+    const first = call(harness.port, { job_id: harness.jobId, scope: 'full' });
+    await waitFor(() => existsSync(join(harness.lanePath, 'gate-started.txt')));
+    const second = call(harness.port, { job_id: harness.jobId, scope: 'typecheck' });
+    await waitFor(() => harness.server.view().activeRuns + harness.server.view().queuedRuns === 2);
+    expect(harness.server.view()).toMatchObject({ activeRuns: 1, queuedRuns: 1 });
+    // Release the first run; the ledger proves the second started after it.
+    writeFileSync(join(harness.lanePath, 'held.txt'), 'go');
+    const firstResult = await first;
+    expect(outcomeOf(completedFrame(firstResult.frames))['ok']).toBe(true);
+    const secondResult = await second;
+    expect(secondResult.frames[0]).toMatchObject({ type: 'queued', position: 1 });
+    expect(outcomeOf(completedFrame(secondResult.frames))['ok']).toBe(true);
     await harness.close();
   });
 

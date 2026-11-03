@@ -496,11 +496,18 @@ verification budget.
   request is never failed while the work it waits for could still end.
   Outlasting both fails LOUD: the lane receives a typed `error` frame and
   the ledger a `verification.lock-timeout` record — nothing hangs
-  silently, and the holder is never killed. Residual (issue #537): this
-  bounds the wait, it does not shorten it — a short scope still runs only
-  once the `full` ahead of it releases (that needs priority or a reserved
-  slot), and the worker-side capture-helper wrapper's own ~590 s bound
-  lives outside this service. Either way the same-head dirty-at-spawn
+  silently, and the holder is never killed. A **reserved slot keeps short
+  scopes beside a long one** (issue #537): when `[verify] long_scopes`
+  names any scope and the effective concurrency (`max_concurrent` clamped
+  by `worker_budget`) is at least 2, one slot is reserved for runs of every
+  other scope — a long scope runs at most `max_concurrent - 1` at a time,
+  and the queue grants the first request that FITS rather than its head, so
+  a queued short scope is admitted past a waiting long one. At an effective
+  concurrency of 1 nothing is reserved (the one slot cannot be withheld
+  from a whole class without starving it), so the setting is inert at the
+  shipped `max_concurrent` default of 1; a scope name no repo declares
+  simply never matches. The worker-side capture-helper wrapper's own ~590 s
+  bound lives outside this service. Either way the same-head dirty-at-spawn
   window (a run queues at a pinned head while the worker keeps editing) is
   recorded, never refused — only a moved head is refused.
 - **Identical submissions are single-flight, never duplicate producers**
@@ -1477,6 +1484,7 @@ or an outside shell to avoid waiting out the drain bound.
 # Verification scheduler (see §4c); lanes request runs, the service owns
 # the machine's one global test budget.
 # max_concurrent = 1               # concurrent runs; further requests queue FIFO
+# long_scopes = []                 # scope names that are LONG: at max_concurrent >= 2 one slot stays reserved for every other scope
 # worker_budget = 0                # total test workers across runs; 0 = auto (cores - 2)
 # lock_wait_timeout_ms = 900000    # queued request: FLOOR of its wait (a longer run ahead waits longer)
 # run_timeout_ms = 1800000         # per-run wall clock; expiry kills the process group

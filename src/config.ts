@@ -584,6 +584,12 @@ export interface VerifyConfig {
   readonly lockWaitTimeoutMs: number;
   /** Wall-clock cap per run; the process group is terminated on expiry. */
   readonly runTimeoutMs: number;
+  /** Scope names whose runs are long (a full suite, `typecheck`, …). While
+   * any is configured and the effective concurrency is at least 2, one slot
+   * is reserved for runs of every other scope: a long scope's runs cap at
+   * `max_concurrent - 1` and a queued short scope is admitted past them
+   * (issue #537). Empty (the default) reserves nothing. */
+  readonly longScopes: readonly string[];
 }
 
 export const DEFAULT_VERIFY_CONFIG: VerifyConfig = {
@@ -591,6 +597,7 @@ export const DEFAULT_VERIFY_CONFIG: VerifyConfig = {
   workerBudget: 0,
   lockWaitTimeoutMs: 900_000,
   runTimeoutMs: 1_800_000,
+  longScopes: [],
 };
 
 export interface ConcurrencyConfig {
@@ -1138,6 +1145,27 @@ function requireNonNegativeInt(value: unknown, file: string, field: string): num
     );
   }
   return value;
+}
+
+/** An array of verification scope names, validated by the manifest's own
+ * scope-identifier rule: a name no project can declare would silently never
+ * match a run, so it is refused here instead. */
+function requireScopeNames(value: unknown, file: string, field: string): readonly string[] {
+  if (!Array.isArray(value)) {
+    throw new ConfigError(`${field} must be an array of scope names, got: ${typeof value}`, file, field);
+  }
+  return value.map((entry, index) => {
+    const entryField = `${field}[${index}]`;
+    const scope = requireString(entry, file, entryField);
+    if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(scope)) {
+      throw new ConfigError(
+        `${entryField} must be a lowercase scope identifier (a-z, 0-9, _, -, ≤32 chars), got: ${JSON.stringify(scope)}`,
+        file,
+        entryField,
+      );
+    }
+    return scope;
+  });
 }
 
 /** Node clamps timer delays above 2^31 − 1 ms down to 1 ms, which would
@@ -1892,7 +1920,7 @@ export function loadConfig(
     }
     if (raw['verify'] !== undefined) {
       const table = requireTable(raw['verify'], file, 'verify');
-      const VALID = ['max_concurrent', 'worker_budget', 'lock_wait_timeout_ms', 'run_timeout_ms'];
+      const VALID = ['max_concurrent', 'worker_budget', 'lock_wait_timeout_ms', 'run_timeout_ms', 'long_scopes'];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
           throw new ConfigError(
@@ -1919,6 +1947,10 @@ export function loadConfig(
           table['run_timeout_ms'] !== undefined
             ? requirePositiveInt(table['run_timeout_ms'], file, 'verify.run_timeout_ms')
             : verify.runTimeoutMs,
+        longScopes:
+          table['long_scopes'] !== undefined
+            ? requireScopeNames(table['long_scopes'], file, 'verify.long_scopes')
+            : verify.longScopes,
       };
     }
     if (raw['pacing'] !== undefined) {

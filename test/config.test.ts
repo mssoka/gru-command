@@ -1190,6 +1190,9 @@ describe('verify config (contention fix 2026-09-22)', () => {
       workerBudget: 0,
       lockWaitTimeoutMs: 900_000,
       runTimeoutMs: 1_800_000,
+      // Issue #537: nothing is long until an operator names it, so the
+      // shipped config reserves no slot.
+      longScopes: [],
     });
   });
 
@@ -1203,6 +1206,7 @@ describe('verify config (contention fix 2026-09-22)', () => {
         'worker_budget = 6',
         'lock_wait_timeout_ms = 120000',
         'run_timeout_ms = 600000',
+        'long_scopes = ["full", "typecheck"]',
         '',
       ].join('\n'),
     );
@@ -1211,6 +1215,7 @@ describe('verify config (contention fix 2026-09-22)', () => {
       workerBudget: 6,
       lockWaitTimeoutMs: 120_000,
       runTimeoutMs: 600_000,
+      longScopes: ['full', 'typecheck'],
     });
     const bad: readonly string[] = [
       '[verify]\nunknown = 1\n',
@@ -1219,12 +1224,24 @@ describe('verify config (contention fix 2026-09-22)', () => {
       '[verify]\nworker_budget = -1\n',
       '[verify]\nlock_wait_timeout_ms = 0\n',
       '[verify]\nrun_timeout_ms = -5\n',
+      // Issue #537: the long-scope list takes the manifest's scope names only.
+      '[verify]\nlong_scopes = "full"\n',
+      '[verify]\nlong_scopes = ["full", 7]\n',
+      '[verify]\nlong_scopes = [""]\n',
+      '[verify]\nlong_scopes = ["Full Suite"]\n',
+      '[verify]\nlong_scopes = ["full", "_leading"]\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();
       writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
     }
+    // The refusal names the offending entry instead of failing at run time.
+    const invalid = tmpHome();
+    writeConfig(invalid, '[verify]\nlong_scopes = ["full", "Full Suite"]\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: invalid }, '/home/tester')).toThrow(
+      /verify\.long_scopes\[1\] must be a lowercase scope identifier/,
+    );
   });
 });
 

@@ -79,6 +79,9 @@ function makeScheduler(opts: {
   lockWaitTimeoutMs?: number;
   runTimeoutMs?: number;
   staleMaxAgeMs?: number;
+  /** Issue #537: the scope names whose runs are LONG (a reserved slot is
+   * held back from them while any is set and concurrency is ≥ 2). */
+  longScopes?: readonly string[];
   /** The stale sweep's cadence. Issue #537's derived-deadline cases hold it
    * high: every slot in those cases is owned, and the sweep never judges an
    * in-process slot. */
@@ -97,6 +100,7 @@ function makeScheduler(opts: {
       workerBudget: opts.workerBudget ?? 8,
       lockWaitTimeoutMs: opts.lockWaitTimeoutMs ?? 5_000,
       runTimeoutMs: opts.runTimeoutMs ?? 20_000,
+      ...(opts.longScopes === undefined ? {} : { longScopes: opts.longScopes }),
     },
     record: (record) => records.push(record),
     sweepIntervalMs: opts.sweepIntervalMs ?? 20,
@@ -110,6 +114,12 @@ function makeScheduler(opts: {
 
 function spec(jobId: string, command = 'node -e "process.exit(0)"'): Parameters<VerificationScheduler['run']>[0] {
   return { jobId, scope: 'full', command, cwd: process.cwd() };
+}
+
+/** A spec naming a specific manifest scope: issue #537 classifies a request
+ * by exactly this name. */
+function scopedSpec(jobId: string, scope: string): Parameters<VerificationScheduler['run']>[0] {
+  return { ...spec(jobId), scope };
 }
 
 /** A spec with an explicit head so single-flight keys are deterministic. */
@@ -874,6 +884,270 @@ describe('verification scheduler — global budget', () => {
     expect(record?.payload['wait_ms']).toBeGreaterThanOrEqual(350);
     expect(scheduler.queuedCount()).toBe(0);
     scheduler.release(held);
+  });
+
+  // Issue #537 (reserved slot): a configured `longScopes` class caps at
+  // `concurrencyLimit - 1` while every other scope keeps the whole limit, so
+  // a short scope is never starved by a long `full`. Deterministic: the class
+  // seams are the lease primitives, no child process and no wall clock.
+  it('a short scope is admitted beside a long holder at max_concurrent 2', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] });
+    scheduler.start();
+    const held = await scheduler.acquire(spec('job-long'));
+    expect(scheduler.activeCount()).toBe(1);
+    const short = await scheduler.acquire(scopedSpec('job-short', 'gc-519-focused'));
+    expect(scheduler.activeCount()).toBe(2);
+    expect(scheduler.queuedCount()).toBe(0);
+    scheduler.release(short);
+    scheduler.release(held);
+  });
+
+  it('a second long scope waits while a long holder occupies the only reserved slot at max_concurrent 2', async () => {
+    const { scheduler } = makeScheduler({
+      maxConcurrent: 2,
+      workerBudget: 8,
+      longScopes: ['full', 'typecheck'],
+    });
+    scheduler.start();
+    const held = await scheduler.acquire(spec('job-full'));
+    const settled: Promise<SettledLease> = scheduler.acquire(scopedSpec('job-typecheck', 'typecheck')).then(
+      (lease): SettledLease => ({ lease }),
+      (error: unknown): SettledLease => ({ error }),
+    );
+    await flush();
+    // The long class owns `max_concurrent - 1` = 1 slot: the second long waits
+    // even though a slot is physically free.
+    expect(scheduler.queuedCount()).toBe(1);
+    expect(scheduler.activeCount()).toBe(1);
+    scheduler.release(held);
+    const result = await settled;
+    expect(result.error).toBeUndefined();
+    expect(result.lease).toMatchObject({ jobId: 'job-typecheck' });
+    if (result.lease !== undefined) scheduler.release(result.lease);
+  });
+
+  it('a long scope never takes the slot a short scope holds at max_concurrent 2 (short-only reservation)', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] });
+    scheduler.start();
+    const shortA = await scheduler.acquire(scopedSpec('job-short-a', 'focused'));
+    const settled: Promise<SettledLease> = scheduler.acquire(spec('job-long')).then(
+      (lease): SettledLease => ({ lease }),
+      (error: unknown): SettledLease => ({ error }),
+    );
+    await flush();
+    expect(scheduler.queuedCount()).toBe(1);
+    expect(scheduler.activeCount()).toBe(1);
+    // The free slot is the short class's: another short scope takes it.
+    const shortB = await scheduler.acquire(scopedSpec('job-short-b', 'static'));
+    expect(scheduler.activeCount()).toBe(2);
+    expect(scheduler.queuedCount()).toBe(1);
+    scheduler.release(shortA);
+    await flush();
+    // One short holder still occupies a slot: the long's cap is 1, so it waits.
+    expect(scheduler.queuedCount()).toBe(1);
+    expect(scheduler.activeCount()).toBe(1);
+    scheduler.release(shortB);
+    const result = await settled;
+    expect(result.error).toBeUndefined();
+    expect(result.lease).toMatchObject({ jobId: 'job-long' });
+    if (result.lease !== undefined) scheduler.release(result.lease);
+  });
+
+  it('a queued short scope is admitted past a head-of-line long scope that does not fit', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] });
+    scheduler.start();
+    const shortA = await scheduler.acquire(scopedSpec('job-short-a', 'focused'));
+    const shortB = await scheduler.acquire(scopedSpec('job-short-b', 'focused'));
+    const longFrames: VerificationProgress[] = [];
+    const shortFrames: VerificationProgress[] = [];
+    const long: Promise<SettledLease> = scheduler
+      .acquire(spec('job-long'), (frame) => { longFrames.push(frame); })
+      .then((lease): SettledLease => ({ lease }), (error: unknown): SettledLease => ({ error }));
+    const shortC: Promise<SettledLease> = scheduler
+      .acquire(scopedSpec('job-short-c', 'focused'), (frame) => { shortFrames.push(frame); })
+      .then((lease): SettledLease => ({ lease }), (error: unknown): SettledLease => ({ error }));
+    await flush();
+    expect(scheduler.queuedCount()).toBe(2);
+    // FIFO order is unchanged: the long queued first, the short behind it.
+    expect(longFrames[0]).toMatchObject({ type: 'queued', position: 1 });
+    expect(shortFrames[0]).toMatchObject({ type: 'queued', position: 2 });
+    scheduler.release(shortA);
+    await flush();
+    // The order-preserving skip: the short behind the long is granted, the
+    // long keeps waiting for its own cap.
+    expect(scheduler.queuedCount()).toBe(1);
+    expect(scheduler.activeCount()).toBe(2);
+    const grantedShort = await shortC;
+    expect(grantedShort.error).toBeUndefined();
+    expect(grantedShort.lease).toMatchObject({ jobId: 'job-short-c' });
+    scheduler.release(shortB);
+    await flush();
+    expect(scheduler.queuedCount()).toBe(1);
+    if (grantedShort.lease !== undefined) scheduler.release(grantedShort.lease);
+    const grantedLong = await long;
+    expect(grantedLong.error).toBeUndefined();
+    expect(grantedLong.lease).toMatchObject({ jobId: 'job-long' });
+    if (grantedLong.lease !== undefined) scheduler.release(grantedLong.lease);
+  });
+
+  it('admits a long scope at max_concurrent 1: the reservation is inert and never a permanent zero-slot class', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 1, workerBudget: 4, longScopes: ['full'] });
+    scheduler.start();
+    const held = await scheduler.acquire(spec('job-long'));
+    expect(scheduler.activeCount()).toBe(1);
+    // One slot, one holder: a short scope still waits for the whole run, and
+    // the long class is admitted when the slot frees (the clamp, not a deadlock).
+    const settled: Promise<SettledLease> = scheduler.acquire(scopedSpec('job-short', 'focused')).then(
+      (lease): SettledLease => ({ lease }),
+      (error: unknown): SettledLease => ({ error }),
+    );
+    await flush();
+    expect(scheduler.queuedCount()).toBe(1);
+    scheduler.release(held);
+    const result = await settled;
+    expect(result.error).toBeUndefined();
+    if (result.lease !== undefined) scheduler.release(result.lease);
+    const again = await scheduler.acquire(spec('job-long-2'));
+    expect(again).toMatchObject({ jobId: 'job-long-2' });
+    scheduler.release(again);
+  });
+
+  it('admits a long scope when the worker budget clamps the effective concurrency to 1', async () => {
+    // `max_concurrent = 4` but one worker's budget: concurrencyLimit is 1, so
+    // the reservation has no slot to withhold and changes nothing.
+    const { scheduler } = makeScheduler({ maxConcurrent: 4, workerBudget: 1, longScopes: ['full'] });
+    scheduler.start();
+    expect(scheduler.concurrencyLimit).toBe(1);
+    expect(scheduler.workersPerRun).toBe(1);
+    const held = await scheduler.acquire(spec('job-long'));
+    expect(scheduler.activeCount()).toBe(1);
+    scheduler.release(held);
+    const next = await scheduler.acquire(spec('job-long-2'));
+    scheduler.release(next);
+  });
+
+  it('leaves workersPerRun and the concurrency limit unchanged when a long class is reserved', () => {
+    const reserved = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] }).scheduler;
+    const plain = makeScheduler({ maxConcurrent: 2, workerBudget: 8 }).scheduler;
+    expect(reserved.concurrencyLimit).toBe(plain.concurrencyLimit);
+    expect(reserved.workersPerRun).toBe(plain.workersPerRun);
+    expect(reserved.workersPerRun).toBe(4);
+  });
+
+  it('keeps the queued frame limit at the effective concurrency for a waiting long scope', async () => {
+    // The reservation narrows no frame field: `limit` stays the scheduler's
+    // effective concurrency, `active` the slots in use, and `position` the
+    // queue index — a client's queue reading keeps its meaning.
+    const { scheduler } = makeScheduler({ maxConcurrent: 2, workerBudget: 8, longScopes: ['full'] });
+    scheduler.start();
+    const short = await scheduler.acquire(scopedSpec('job-short', 'focused'));
+    const frames: VerificationProgress[] = [];
+    const settled: Promise<SettledLease> = scheduler.acquire(spec('job-long'), (frame) => { frames.push(frame); }).then(
+      (lease): SettledLease => ({ lease }),
+      (error: unknown): SettledLease => ({ error }),
+    );
+    await flush();
+    expect(frames[0]).toMatchObject({ type: 'queued', position: 1, active: 1, limit: 2 });
+    scheduler.release(short);
+    const result = await settled;
+    expect(result.error).toBeUndefined();
+    if (result.lease !== undefined) scheduler.release(result.lease);
+  });
+
+  it('re-derives a long scope\'s wait past a short claim that took the free slot (the fast path re-arms waiters)', async () => {
+    // Timeline in fake milliseconds: the short holder A bounds the queue at
+    // 600 s. A SECOND short scope claims the free slot at 500 s (a fast-path
+    // claim, not a pump grant), so its own bound is 1 100 s. Without the
+    // re-arm at that claim the long scope's deadline would still be 600 s and
+    // it would be failed at it; with it the wait is re-derived to 1 100 s.
+    vi.useFakeTimers();
+    try {
+      const { scheduler, records } = makeScheduler({
+        maxConcurrent: 2,
+        workerBudget: 8,
+        longScopes: ['full'],
+        lockWaitTimeoutMs: 60_000,
+        staleMaxAgeMs: 600_000,
+        sweepIntervalMs: 2_000_000,
+      });
+      scheduler.start();
+      const shortA = await scheduler.acquire(scopedSpec('job-short-a', 'focused'));
+      const settled: Promise<SettledLease> = scheduler.acquire(spec('job-long')).then(
+        (lease): SettledLease => ({ lease }),
+        (error: unknown): SettledLease => ({ error }),
+      );
+      await flush();
+      expect(scheduler.queuedCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(500_000);
+      const shortB = await scheduler.acquire(scopedSpec('job-short-b', 'focused'));
+      expect(scheduler.activeCount()).toBe(2);
+      // Past the deadline the queue had before B's claim, inside B's bound.
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(scheduler.queuedCount()).toBe(1);
+      expect(records.some((record) => record.kind === 'verification.lock-timeout')).toBe(false);
+      scheduler.release(shortA);
+      await flush();
+      expect(scheduler.queuedCount()).toBe(1); // B still holds a slot: the long's cap is 1
+      scheduler.release(shortB);
+      const result = await settled;
+      expect(result.error).toBeUndefined();
+      expect(result.lease).toMatchObject({ jobId: 'job-long' });
+      if (result.lease !== undefined) scheduler.release(result.lease);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('derives a queued wait from every restored holder, past the effective concurrency (over-limit restore)', async () => {
+    // Two holders were persisted under a larger `max_concurrent`; this process
+    // runs at 1. The waiter may have to outlast the LATER of them, so its
+    // deadline is not "the first `concurrencyLimit` slots' bound" (which would
+    // fail it at the first holder's 100 s). It still fails LOUD at its own
+    // bound, so the widened deadline is proven, not merely longer.
+    vi.useFakeTimers();
+    try {
+      const { scheduler, records, storageDir } = makeScheduler({
+        maxConcurrent: 1,
+        workerBudget: 4,
+        longScopes: ['full'],
+        lockWaitTimeoutMs: 60_000,
+        staleMaxAgeMs: 600_000,
+        sweepIntervalMs: 2_000_000,
+      });
+      const grantedAt = Date.now();
+      mkdirSync(storageDir, { recursive: true });
+      writeFileSync(
+        join(storageDir, 'scheduler.json'),
+        `${JSON.stringify({
+          version: 1,
+          slots: [
+            { run_id: 'restored-early', pid: process.pid, job_id: 'job-early', scope: 'focused', command: 'npm test', cwd: '/tmp', granted_at: grantedAt - 500_000 },
+            { run_id: 'restored-late', pid: process.pid, job_id: 'job-late', scope: 'focused', command: 'npm test', cwd: '/tmp', granted_at: grantedAt },
+          ],
+        })}\n`,
+      );
+      scheduler.start();
+      expect(scheduler.activeCount()).toBe(2);
+      const settled: Promise<SettledLease> = scheduler.acquire(spec('job-long')).then(
+        (lease): SettledLease => ({ lease }),
+        (error: unknown): SettledLease => ({ error }),
+      );
+      await flush();
+      expect(scheduler.queuedCount()).toBe(1);
+      // Past the early holder's bound: the later one still bounds the wait.
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(scheduler.queuedCount()).toBe(1);
+      expect(records.some((record) => record.kind === 'verification.lock-timeout')).toBe(false);
+      // The later holder's bound is where the wait gives up, out loud.
+      await vi.advanceTimersByTimeAsync(500_000);
+      const result = await settled;
+      expect(result.error).toBeInstanceOf(VerificationLockTimeoutError);
+      const timeout = records.find((record) => record.kind === 'verification.lock-timeout');
+      expect(timeout?.payload['wait_ms']).toBeGreaterThanOrEqual(600_000);
+      expect(scheduler.queuedCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('releases a persisted holder whose pid is dead (stale-holder detection)', async () => {

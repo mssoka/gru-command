@@ -253,6 +253,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         workerBudget: options.config.verify.workerBudget,
         lockWaitTimeoutMs: options.config.verify.lockWaitTimeoutMs,
         runTimeoutMs: options.config.verify.runTimeoutMs,
+        longScopes: options.config.verify.longScopes,
       },
       record: (event) => {
         // An onboarding proof's slot (a lock-wait timeout, a stale release)
