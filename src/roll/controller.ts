@@ -204,7 +204,8 @@ export class RollController {
     try {
       state = await this.drain(state);
     } catch (error) {
-      return this.fail(state, 'drain', error);
+      // this.current carries the drain's last published progress.
+      return this.fail(this.current ?? state, 'drain', error);
     }
     try {
       state = await this.swap(state);
@@ -322,12 +323,16 @@ export class RollController {
   private async drain(state: RollState): Promise<RollState> {
     const started = this.now();
     const deadline = started + this.opts.drainTimeoutMs;
+    const startedAt = new Date(started).toISOString();
+    const deadlineAt = new Date(deadline).toISOString();
+    let live = state;
     let inFlightAtStart: readonly RollWorkItem[] = [];
     let lastKey = '';
     let abandoned: readonly RollWorkItem[] = [];
     let drained = false;
     for (;;) {
       const inFlight = await this.opts.probeInFlight();
+      const checked = this.now();
       const key = JSON.stringify(
         [...inFlight].map((item) => `${item.kind}:${item.id}:${item.status}`).sort(),
       );
@@ -336,6 +341,15 @@ export class RollController {
         break;
       }
       if (inFlightAtStart.length === 0) inFlightAtStart = inFlight;
+      // Live progress for GET /api/roll and the CLI countdown; a failure
+      // mid-drain records from this.current, so it keeps the last progress.
+      live = updateRollState(
+        this.opts.dataDir,
+        live,
+        { draining: { startedAt, deadlineAt, checkedAt: new Date(checked).toISOString(), inFlight } },
+        this.now,
+      );
+      this.current = live;
       if (key !== lastKey) {
         lastKey = key;
         this.log('info', 'roll drain waiting on in-flight work', {
@@ -363,14 +377,14 @@ export class RollController {
       });
     }
     const drain: RollDrainRecord = {
-      startedAt: new Date(started).toISOString(),
-      deadlineAt: new Date(deadline).toISOString(),
+      startedAt,
+      deadlineAt,
       waitedMs: this.now() - started,
       drained,
       inFlightAtStart,
       abandoned,
     };
-    const next = updateRollState(this.opts.dataDir, state, { phase: 'swap', drain }, this.now);
+    const next = updateRollState(this.opts.dataDir, live, { phase: 'swap', drain, draining: null }, this.now);
     this.current = next;
     return next;
   }

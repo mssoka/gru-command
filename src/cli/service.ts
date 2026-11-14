@@ -50,6 +50,8 @@ import {
 const DEFAULT_FOLLOW_TIMEOUT_MS = 30 * 60_000;
 const POLL_INTERVAL_MS = 2_000;
 const HEALTH_VERIFY_TIMEOUT_MS = 60_000;
+/** A steady drain countdown repeats at least this often. */
+const DRAIN_LINE_INTERVAL_MS = 60_000;
 
 const USAGE = `usage: gru <command> [options]
 
@@ -58,7 +60,8 @@ const USAGE = `usage: gru <command> [options]
   restart [--now]          relaunch the service on the installed build,
                            e.g. after editing config.toml. It first waits for
                            in-flight turns to settle (up to [roll]
-                           drain_timeout_ms); --now restarts at once and boot
+                           drain_timeout_ms), printing how many still run and
+                           the time left; --now restarts at once and boot
                            recovery resumes the turns it cut. Also takes
                            --no-wait, --detach, --json, --reason and
                            --timeout-ms.
@@ -260,17 +263,40 @@ interface RollApiBody {
   readonly detail?: string;
 }
 
-function phaseLine(state: RollState): string {
+/** `m:ss`, or `h:mm:ss` from an hour up; never negative (past the deadline
+ * reads 0:00). Whole seconds, rounded down. */
+function formatTimeLeft(ms: number): string {
+  const total = Math.floor((ms > 0 ? ms : 0) / 1_000);
+  const hours = Math.floor(total / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  const seconds = String(total % 60).padStart(2, '0');
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
+}
+
+/** The in-flight count a drain line shows; null when the record carries no
+ * live progress (not draining, or an older service). */
+function drainCount(state: RollState): number | null {
+  return state.phase === 'drain' && state.draining !== undefined && state.draining !== null
+    ? state.draining.inFlight.length
+    : null;
+}
+
+/** `offerNow` is false under --detach: inside the service `gru restart --now`
+ * refuses and points back at --detach. */
+function phaseLine(state: RollState, offerNow: boolean): string {
   switch (state.phase) {
     case 'preflight':
       return state.mode === 'restart'
         ? 'preflight: checking the installed build (restart: no pull, no build)…'
         : 'preflight: pulling and rebuilding the deploy clone (old build keeps serving)…';
     case 'drain': {
-      const inFlight = state.drain?.inFlightAtStart.length ?? 0;
-      return inFlight > 0
-        ? `drain: waiting for ${inFlight} in-flight item(s) to settle…`
-        : 'drain: waiting for in-flight work to settle…';
+      // `drain` is the outcome and stays null until the drain ends; the live
+      // progress is `draining` (absent from older services).
+      const progress = state.draining;
+      if (progress === undefined || progress === null) return 'drain: waiting for in-flight work to settle…';
+      const left = formatTimeLeft(Date.parse(progress.deadlineAt) - Date.parse(progress.checkedAt));
+      const hint = offerNow && state.mode === 'restart' ? ' — gru restart --now skips the wait' : '';
+      return `drain: ${progress.inFlight.length} still running, ${left} left${hint}`;
     }
     case 'swap':
       return 'swap: marker written — exiting for the supervised relaunch…';
@@ -347,7 +373,7 @@ export async function runServiceCli(
     if (options.json) {
       deps.stdout(JSON.stringify({ event, roll: state }));
     } else if (state !== null) {
-      deps.stdout(`roll ${state.rollId}: ${phaseLine(state)}`);
+      deps.stdout(`roll ${state.rollId}: ${phaseLine(state, !options.detach)}`);
     }
   };
 
@@ -411,6 +437,9 @@ export async function runServiceCli(
   // --detach answers for exactly the roll it accepted (or attached to).
   const followedId = state?.rollId ?? null;
   let lastPhase: string | null = null;
+  // The last drain countdown printed (a phase line counts): the next comes
+  // when the in-flight count changes or a minute has passed, never per poll.
+  let lastDrain: { readonly count: number; readonly at: number } | null = null;
   let healthDeadline: number | null = null;
   for (;;) {
     if (options.detach && followedId !== null && state !== null && state.rollId !== followedId) {
@@ -433,6 +462,14 @@ export async function runServiceCli(
       if (state.phase === 'failed') emit('failed', state);
       else if (lastPhase !== null || state.phase !== 'preflight') emit('phase', state);
       lastPhase = state.phase;
+      const count = drainCount(state);
+      lastDrain = count === null ? null : { count, at: deps.now() };
+    } else if (state !== null) {
+      const count = drainCount(state);
+      if (count !== null && (lastDrain === null || count !== lastDrain.count || deps.now() - lastDrain.at >= DRAIN_LINE_INTERVAL_MS)) {
+        emit('drain', state);
+        lastDrain = { count, at: deps.now() };
+      }
     }
     if (state !== null && state.phase === 'failed') {
       return 1;

@@ -59,6 +59,22 @@ function rollState(phase: RollState['phase'], toSha = 'b'.repeat(40)): RollState
   };
 }
 
+/** A drain record with live progress: `count` in flight, `leftMs` from the
+ * service's last check to its deadline (negative = checked past it). */
+function drainingState(count: number, leftMs: number, mode?: RollState['mode']): RollState {
+  const checkedAt = Date.parse('2026-09-23T00:05:00.000Z');
+  return {
+    ...rollState('drain'),
+    ...(mode === undefined ? {} : { mode }),
+    draining: {
+      startedAt: '2026-09-23T00:00:00.000Z',
+      deadlineAt: new Date(checkedAt + leftMs).toISOString(),
+      checkedAt: new Date(checkedAt).toISOString(),
+      inFlight: Array.from({ length: count }, (_, index) => ({ kind: 'minion' as const, id: `minion-${index}`, status: 'streaming' })),
+    },
+  };
+}
+
 function doneStateWithPid(pid: number): RollState {
   return {
     ...rollState('done'),
@@ -221,6 +237,95 @@ describe('gru roll follow loop', () => {
     const foreign = await harness({ post: jsonResponse(400, { message: 'not this API' }) });
     expect(await runServiceCli(['restart'], foreign.deps)).toBe(1);
     expect(foreign.stderr.join('\n')).toContain('gru restart --now');
+  });
+
+  it('the drain counts down: in-flight count and time left, a new line when the count changes or once a minute, the --now hint only for a restart', async () => {
+    const restart = (phase: RollState['phase']): RollState => ({ ...rollState(phase), mode: 'restart', fromSha: 'b'.repeat(40) });
+    const verified = jsonResponse(200, { build: { rev: 'b'.repeat(40) } });
+    const drainLines = (out: readonly string[]): string[] => out.filter((line) => line.includes(': drain:'));
+
+    // A restart draining 3 (700 s left), then 2: the count shows within one poll and updates at once.
+    const draining = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: restart('preflight') }),
+      polls: [
+        jsonResponse(200, { roll: drainingState(3, 700_000, 'restart') }),
+        jsonResponse(200, { roll: drainingState(2, 698_000, 'restart') }),
+        jsonResponse(200, { roll: restart('done') }),
+      ],
+      health: verified,
+    });
+    expect(await runServiceCli(['restart'], draining.deps)).toBe(0);
+    expect(drainLines(draining.stdout)).toEqual([
+      'roll roll-cli-1: drain: 3 still running, 11:40 left — gru restart --now skips the wait',
+      'roll roll-cli-1: drain: 2 still running, 11:38 left — gru restart --now skips the wait',
+    ]);
+
+    // An update (mode 'update' or absent on older records) gets no --now hint;
+    // 3 in flight for about 5 minutes of 2 s polls prints once a minute.
+    const steadyPolls = Array.from({ length: 150 }, (_, index) =>
+      jsonResponse(200, { roll: drainingState(3, 700_000 - index * 2_000, index === 0 ? 'update' : undefined) }));
+    const steady = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [...steadyPolls, jsonResponse(200, { roll: rollState('done') })],
+      health: verified,
+    });
+    expect(await runServiceCli(['roll'], steady.deps)).toBe(0);
+    expect(drainLines(steady.stdout)).toEqual([
+      'roll roll-cli-1: drain: 3 still running, 11:40 left',
+      'roll roll-cli-1: drain: 3 still running, 10:40 left',
+      'roll roll-cli-1: drain: 3 still running, 9:40 left',
+      'roll roll-cli-1: drain: 3 still running, 8:40 left',
+      'roll roll-cli-1: drain: 3 still running, 7:40 left',
+    ]);
+
+    // No progress yet (an older service, or the first instant) keeps the
+    // generic line; a 2 h bound reads h:mm:ss; a check past the deadline reads 0:00.
+    const edges = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: restart('preflight') }),
+      polls: [
+        jsonResponse(200, { roll: restart('drain') }),
+        jsonResponse(200, { roll: drainingState(1, 2 * 3_600_000, 'restart') }),
+        jsonResponse(200, { roll: drainingState(2, -5_000, 'restart') }),
+        jsonResponse(200, { roll: restart('done') }),
+      ],
+      health: verified,
+    });
+    expect(await runServiceCli(['restart'], edges.deps)).toBe(0);
+    expect(drainLines(edges.stdout)).toEqual([
+      'roll roll-cli-1: drain: waiting for in-flight work to settle…',
+      'roll roll-cli-1: drain: 1 still running, 2:00:00 left — gru restart --now skips the wait',
+      'roll roll-cli-1: drain: 2 still running, 0:00 left — gru restart --now skips the wait',
+    ]);
+
+    // --json carries the countdown as `drain` events on the same cadence.
+    const json = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: restart('preflight') }),
+      polls: [
+        jsonResponse(200, { roll: drainingState(3, 700_000, 'restart') }),
+        jsonResponse(200, { roll: drainingState(3, 698_000, 'restart') }),
+        jsonResponse(200, { roll: drainingState(2, 696_000, 'restart') }),
+        jsonResponse(200, { roll: restart('done') }),
+      ],
+      health: verified,
+    });
+    expect(await runServiceCli(['restart', '--json'], json.deps)).toBe(0);
+    const events = json.stdout.map((line) => JSON.parse(line) as { event: string; roll: RollState });
+    expect(events.map((event) => event.event)).toEqual(['accepted', 'phase', 'drain', 'phase', 'verified']);
+    expect(events[2]?.roll.draining?.inFlight).toHaveLength(2);
+
+    // --detach (inside the service, where --now refuses and points back at
+    // --detach) keeps the countdown but drops the --now hint.
+    const detached = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: restart('preflight') }),
+      polls: [jsonResponse(200, { roll: drainingState(3, 700_000, 'restart') })],
+    });
+    expect(await runServiceCli(['restart', '--detach'], detached.deps)).toBe(0);
+    expect(drainLines(detached.stdout)).toEqual(['roll roll-cli-1: drain: 3 still running, 11:40 left']);
+    expect(detached.stdout.join('\n')).not.toContain('--now');
+
+    for (const out of [draining.stdout, steady.stdout, edges.stdout, json.stdout, detached.stdout]) {
+      expect(out.every((line) => !line.includes('\n'))).toBe(true);
+    }
   });
 
   it('gru restart refuses, non-zero, while another roll is in progress — it never attaches to it', async () => {

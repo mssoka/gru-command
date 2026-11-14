@@ -54,6 +54,21 @@ export interface RollDrainRecord {
   readonly abandoned: readonly RollWorkItem[];
 }
 
+/**
+ * Live drain progress: rewritten on every drain probe that still finds work
+ * while `phase` is `drain`, and set to null on the move to `swap` (the
+ * outcome then lives in `drain`). A failure during the drain keeps the last
+ * progress. Every time comes from the service's own clock, so a reader
+ * computes the time left as `deadlineAt - checkedAt`.
+ */
+export interface RollDrainProgress {
+  readonly startedAt: string;
+  readonly deadlineAt: string;
+  /** When the probe that found `inFlight` ran. */
+  readonly checkedAt: string;
+  readonly inFlight: readonly RollWorkItem[];
+}
+
 export interface RollErrorRecord {
   readonly phase: RollPhase;
   readonly detail: string;
@@ -81,6 +96,9 @@ export interface RollState {
   readonly updatedAt: string;
   readonly preflight: RollPreflightRecord | null;
   readonly drain: RollDrainRecord | null;
+  /** Live while `phase` is `drain` (see RollDrainProgress); absent on
+   * records written before drain progress existed. */
+  readonly draining?: RollDrainProgress | null;
   readonly error: RollErrorRecord | null;
   readonly verify: RollVerifyRecord | null;
 }
