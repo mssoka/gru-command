@@ -371,6 +371,64 @@ describe('roll controller drain + swap', () => {
     expect(state.drain?.waitedMs).toBe(2_000);
   });
 
+  it('drain publishes live progress on every probe that finds work, clears it on the swap, and a drain failure keeps it', async () => {
+    const fix = fixture();
+    stampBuild(fix.repoRoot, SHA_C);
+    const clock = { now: 1_000_000 };
+    const round = { kind: 'round' as const, id: 'round-1', status: 'live' };
+    const minion = { kind: 'minion' as const, id: 'minion-7', status: 'streaming' };
+    const answers: (readonly RollWorkItem[])[] = [[round, minion], [round], []];
+    // What each probe sees: the record the previous probe published, on disk and in memory.
+    const seen: { disk: unknown; live: unknown }[] = [];
+    let live: RollController | null = null;
+    const { controller } = makeController(fix, {
+      runner: scriptedRunner({ heads: [SHA_A] }).run,
+      readBuiltSha: () => SHA_C,
+      clock,
+      drainTimeoutMs: 30_000,
+      probeInFlight: async () => {
+        seen.push({ disk: readRollState(fix.dataDir), live: live?.state() });
+        return answers[seen.length - 1] ?? [];
+      },
+    });
+    live = controller;
+    const state = await controller.roll({ mode: 'restart' });
+    const progress = (checkedAt: number, inFlight: readonly RollWorkItem[]) => ({
+      phase: 'drain',
+      drain: null,
+      draining: {
+        startedAt: new Date(1_000_000).toISOString(),
+        deadlineAt: new Date(1_030_000).toISOString(),
+        checkedAt: new Date(checkedAt).toISOString(),
+        inFlight,
+      },
+    });
+    expect(seen).toHaveLength(3);
+    expect(seen[0]?.disk).not.toHaveProperty('draining');
+    expect(seen[1]?.disk).toMatchObject(progress(1_000_000, [round, minion]));
+    expect(seen[2]?.disk).toMatchObject(progress(1_001_000, [round]));
+    expect(seen[2]?.live).toEqual(seen[2]?.disk);
+    expect(state).toMatchObject({ phase: 'swap', draining: null, drain: { drained: true, inFlightAtStart: [round, minion], waitedMs: 2_000 } });
+    expect(readRollState(fix.dataDir)).toMatchObject({ phase: 'swap', draining: null, drain: { drained: true } });
+
+    const broken = fixture();
+    stampBuild(broken.repoRoot, SHA_C);
+    let probes = 0;
+    const failing = makeController(broken, {
+      runner: scriptedRunner({ heads: [SHA_A] }).run,
+      readBuiltSha: () => SHA_C,
+      probeInFlight: async () => {
+        probes += 1;
+        if (probes > 1) throw new Error('probe exploded');
+        return [minion];
+      },
+    });
+    const failed = await failing.controller.roll({ mode: 'restart' });
+    expect(failed).toMatchObject({ phase: 'failed', error: { phase: 'drain' }, drain: null, draining: { inFlight: [minion] } });
+    expect(readRollState(broken.dataDir)).toMatchObject({ phase: 'failed', draining: { inFlight: [minion] } });
+    expect(readRollMarker(broken.dataDir)).toBeNull();
+  });
+
   it('drain bound: never-settling work is abandoned at the deadline, then the swap proceeds', async () => {
     const fix = fixture();
     const scripted = scriptedRunner({ heads: [SHA_A, SHA_B, SHA_B], onBuild: () => stampBuild(fix.repoRoot, SHA_B) });
