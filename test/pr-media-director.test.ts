@@ -428,14 +428,14 @@ describe('filming the shot list (owner ruling Q1, option C)', () => {
     expect(logged).toContain('pr media camera: the tick failed');
   });
 
-  it('judges a lane mid-edit once it commits, and records a run the service stopped as no attempt', async () => {
+  it('judges a lane mid-edit by its committed head but films it once it commits, and records a run the service stopped as no attempt', async () => {
     const w = world();
     writeShotList(w, SHOTS);
     w.delivered.set('j-ui', head(w));
     writeFileSync(join(w.lane, 'web', 'card.ts'), 'export const card = 3;\n');
     await tick(w);
     expect(w.films).toHaveLength(0);
-    expect(events(w, MEDIA_COVERAGE_EVENT)).toEqual([]);
+    expect(coverageAtHead(w.api, 'j-ui', head(w))).toMatchObject({ state: 'owed', camera: 'pending' });
     git(w.lane, 'checkout', '--', 'web/card.ts');
     w.next = () => ({ kind: 'failed', code: 'stopped', detail: 'the service is stopping' });
     await tick(w);
@@ -676,8 +676,13 @@ describe('where coverage shows', () => {
     observe(w, head(w));
     const pr = { body: 'Fixes the card wording.', head: head(w) };
     const { gh, edits } = ghFake(pr);
-    await new PrMediaPublisher({ ledger: w.api, dataDir: w.dataDir, config: () => ON, gh, now: () => Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000 }).pollOnce();
+    const publisher = new PrMediaPublisher({ ledger: w.api, dataDir: w.dataDir, config: () => ON, gh, now: () => Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000 });
+    await publisher.pollOnce();
     expect(edits).toEqual([]);
+    // A parked job is never filmed: the owed note is written.
+    w.api.setJobStatus('j-ui', 'parked');
+    await publisher.pollOnce();
+    expect(edits).toEqual([expect.stringContaining('Media owed')]);
   });
 
   it('the PR section carries a shot list\'s skip reason, markdown-inert', async () => {

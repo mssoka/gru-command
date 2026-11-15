@@ -83,10 +83,12 @@ export const AGENT_BROWSER_BIN = 'agent-browser';
 export const WEB_STEP_TIMEOUT_MS = 15_000;
 /** Slack the process gets past its action timeout before it is killed. */
 const COMMAND_SLACK_MS = 15_000;
-/** The session close is bounded tightly: a stopping service waits for it.
- * A browser that outlives it works in the run's folder, and the next boot
- * ends it. */
-const CLOSE_TIMEOUT_MS = 3_000;
+/** The session close: given time on an ordinary run, bounded tightly when
+ * the run was stopped (a stopping service waits for it). A browser that
+ * outlives it works in the run's folder: the run's own cleanup ends it, or
+ * the next boot does. */
+const CLOSE_TIMEOUT_MS = 30_000;
+const STOPPED_CLOSE_TIMEOUT_MS = 3_000;
 /** A clip keeps rolling this long after its last step, so the result shows. */
 export const CLIP_TAIL_MS = 1_000;
 const DETAIL_MAX_CHARS = 300;
@@ -227,7 +229,9 @@ export class AgentBrowserDriver implements WebCaptureDriver {
     } finally {
       // Best effort, and never under the run's signal (a stopped run still
       // closes its browser): a session left open ends with the tool's daemon.
-      await this.run([...base, 'close'], { cwd: request.workDir, env, timeoutMs: CLOSE_TIMEOUT_MS, signal: new AbortController().signal })
+      await this.run([...base, 'close'], {
+        cwd: request.workDir, env, timeoutMs: request.signal.aborted ? STOPPED_CLOSE_TIMEOUT_MS : CLOSE_TIMEOUT_MS, signal: new AbortController().signal,
+      })
         .catch(() => undefined);
     }
   }

@@ -330,7 +330,7 @@ const PINS: Record<string, number> = {
   'pi-gemini-thinking-level.test.ts': 1,
   'pr-creation-policy.test.ts': 5,
   'pr-media.test.ts': 9,
-  'pr-media-camera.test.ts': 12,
+  'pr-media-camera.test.ts': 13,
   'pr-media-capture.test.ts': 15,
   'pr-media-director.test.ts': 24,
   'pr-media-publisher.test.ts': 14,

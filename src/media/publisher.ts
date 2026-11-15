@@ -208,11 +208,12 @@ export function coverageDigest(changeUrl: string, headSha: string, coverage: Med
 }
 
 /** A coverage that the section states instead of captures: owed (once the
- * camera has nothing left to film) or skipped. */
-function noteCoverage(coverage: MediaCoverage | null): MediaCoverage | null {
+ * camera has nothing left to film: a parked job is never filmed) or
+ * skipped. */
+function noteCoverage(coverage: MediaCoverage | null, parked: boolean): MediaCoverage | null {
   if (coverage === null) return null;
   if (coverage.state === 'skipped') return coverage;
-  if (coverage.state === 'owed' && coverage.camera !== 'pending' && coverage.camera !== 'filming') return coverage;
+  if (coverage.state === 'owed' && (parked || (coverage.camera !== 'pending' && coverage.camera !== 'filming'))) return coverage;
   return null;
 }
 
@@ -861,7 +862,7 @@ export class PrMediaPublisher {
       const head = evidence.sha;
       const atHead = orderForSection(mediaAtHead(items, head));
       const latest = latestPublishedFor(ledger, job.id, prUrl);
-      const note = atHead.length > 0 ? null : noteCoverage(coverageAtHead(ledger, job.id, head));
+      const note = atHead.length > 0 ? null : noteCoverage(coverageAtHead(ledger, job.id, head), job.status === 'parked');
       let content: PublishContent;
       let digest: string;
       if (atHead.length > 0) {

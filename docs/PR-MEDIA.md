@@ -168,15 +168,17 @@ the minion by `GET /api/media?job_id=`.
 
 The camera director (`src/media/director.ts`) ticks every 30 seconds while
 `[pr_media] enabled` is true, and at once when a minion delivers. For each
-live job with one live lane at a committed head with no uncommitted tracked
-change, it reads the head's `[capture]` table and the job's shot list, then:
+live job with one live lane, it reads the `[capture]` table of the lane's
+committed head and the job's shot list, then:
 
 - **When it films.** As soon as the head is the minion's delivered head, or
   once the head has stood still for 60 seconds while the minion's attempt is
-  closed. A head that moves is filmed again, and so is a shot list changed at
-  the same head (a new script). One run at a time. A parked job keeps its
-  coverage current and is never filmed; a run whose job is parked or closed
-  is stopped.
+  closed, and only while the lane has no uncommitted tracked change (an
+  edit in progress means the head is about to move). A head that moves is
+  filmed again, and so is a shot list changed at the same head (a new
+  script). One run at a time. A parked job keeps its coverage current and is
+  never filmed (so its owed note is written at once); a run whose job is
+  parked or closed is stopped.
 - **Before the review freezes.** A delivery asks for a tick at once, so the
   delivered head is usually filmed while Perkins prepares its round. The
   review does not wait for the camera yet: PR 3 makes the review round read
@@ -204,8 +206,11 @@ change, it reads the head's `[capture]` table and the job's shot list, then:
      `ready`, films each shot through the web adapter, and ends the app's
      process group (SIGTERM, then SIGKILL after 5 seconds).
   7. It proves the lane is still at the head: a lane that moved yields
-     nothing, and the new head is filmed instead. The run's folder is removed
-     off the event loop.
+     nothing, and the new head is filmed instead. Anything still working in
+     the run's folder (a browser whose close failed) is ended, and the folder
+     is removed off the event loop.
+  The run folders under `<data_dir>/media/.camera/` are GC's own: a process
+  working inside one is ended when GC cleans up.
 - **The web adapter** (`src/media/web-adapter.ts`) drives `agent-browser`
   with an argv, never a shell. Every command names a fresh `--session` and
   an empty `--config` file the run wrote, runs in the run's private folder,

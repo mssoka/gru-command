@@ -324,13 +324,16 @@ export class CameraDirector {
     if (this.timer !== null) clearInterval(this.timer);
     this.timer = null;
     const running = this.running;
-    if (running === null) return;
-    // The stop is journaled now, before the run cleans up: a shutdown that
-    // ends before the cleanup does must not leave a run without an outcome
-    // (that counts as a crash).
-    this.journalOutcome(running.jobId, running.record, 'stopped', 'the service is stopping');
-    running.abort.abort();
-    await running.done;
+    if (running !== null) {
+      // The stop is journaled now, before the run cleans up: a shutdown that
+      // ends before the cleanup does must not leave a run without an outcome
+      // (that counts as a crash).
+      this.journalOutcome(running.jobId, running.record, 'stopped', 'the service is stopping');
+      running.abort.abort();
+      await running.done;
+    }
+    // A pass in progress ends before the ledger is closed under it.
+    if (this.current !== null) await this.current;
   }
 
   /** Boot: end what an earlier process's runs left running and remove
@@ -375,7 +378,12 @@ export class CameraDirector {
       this.again = true;
       return Promise.resolve();
     }
-    if (this.current !== null) return this.current;
+    if (this.current !== null) {
+      // A pass already running may have read the state before the caller
+      // changed it: one more runs after it.
+      this.again = true;
+      return this.current;
+    }
     this.current = this.pass().finally(() => {
       this.current = null;
       if (this.again && !this.disposed) {
@@ -565,9 +573,6 @@ export class CameraDirector {
       this.clearUnknown(job.id, head);
       return;
     }
-    // A lane mid-edit is judged once it commits.
-    const status = await this.git(lane.path, ['status', '--porcelain', '--untracked-files=no']);
-    if (status.code !== 0 || status.stdout.trim() !== '') return;
 
     let shotList: ShotList | null = null;
     let refusal: string | null = null;
@@ -588,6 +593,9 @@ export class CameraDirector {
     this.recordCoverage(job.id, head, facts, shotList, refusal, items, camera);
 
     if (!mayFilm || camera === null || !camera.due || shotList === null || this.running !== null || this.disposed) return;
+    // A lane mid-edit is filmed once it commits: its head is about to move.
+    const status = await this.git(lane.path, ['status', '--porcelain', '--untracked-files=no']);
+    if (status.code !== 0 || status.stdout.trim() !== '') return;
     const delivered = this.options.ledger.latestCandidateDelivery(job.id);
     const deliveredSha = delivered === null ? null : payloadOf(delivered)['sha'];
     const settled = deliveredSha === head ||

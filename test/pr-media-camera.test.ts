@@ -224,6 +224,25 @@ describe('filmShotList', () => {
     expect(existsSync(run.workDir)).toBe(false);
   });
 
+  it('ends whatever is still working in the run\'s folder (a browser whose close failed) before removing it', async () => {
+    const at = lane();
+    let leftover: number | undefined;
+    const lingering: WebCaptureDriver = {
+      probe: async () => null,
+      shoot: async (request) => {
+        if (leftover === undefined) {
+          const child = spawn('sleep', ['30'], { cwd: request.workDir, detached: true, stdio: 'ignore' });
+          leftover = child.pid;
+          pids.push(child.pid!);
+        }
+        writeFileSync(request.outFile, minimalPng());
+      },
+    };
+    expect(await filmShotList(input(at, { driver: lingering }))).toMatchObject({ kind: 'filmed' });
+    expect(leftover).toBeDefined();
+    expect(() => process.kill(leftover!, 0)).toThrow();
+  });
+
   it('waits for an output condition, ANSI colors ignored', async () => {
     const at = lane();
     const app = appScript();
@@ -389,9 +408,9 @@ describe('endOrphanedCameraApps', () => {
 
 describe('the agent-browser adapter', () => {
   function recorder(answer: (argv: readonly string[]) => { code: number | null; stdout?: string; error?: string | null } = () => ({ code: 0 })) {
-    const calls: { argv: readonly string[]; cwd: string; env: NodeJS.ProcessEnv; aborted: boolean }[] = [];
+    const calls: { argv: readonly string[]; cwd: string; env: NodeJS.ProcessEnv; aborted: boolean; timeoutMs: number }[] = [];
     const run: CliRunner = async (argv, options) => {
-      calls.push({ argv, cwd: options.cwd, env: options.env, aborted: options.signal.aborted });
+      calls.push({ argv, cwd: options.cwd, env: options.env, aborted: options.signal.aborted, timeoutMs: options.timeoutMs });
       const result = answer(argv);
       return { code: result.code, stdout: result.stdout ?? '', stderr: '', error: result.error ?? null };
     };
@@ -479,6 +498,8 @@ describe('the agent-browser adapter', () => {
     abort.abort();
     const stopped = recorder();
     await new AgentBrowserDriver(stopped.run, () => ({})).shoot({ baseUrl: 'http://127.0.0.1:1', plan: plan('screenshot'), outFile: join(workDir, 'c.png'), workDir, signal: abort.signal }).catch(() => undefined);
-    expect(stopped.calls.at(-1)).toMatchObject({ aborted: false });
+    expect(stopped.calls.at(-1)).toMatchObject({ aborted: false, timeoutMs: 3_000 });
+    // An ordinary run's close gets its time.
+    expect(failing.calls.at(-1)).toMatchObject({ timeoutMs: 30_000 });
   });
 });

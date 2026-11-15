@@ -433,9 +433,30 @@ export async function filmShotList(input: CameraRunInput): Promise<CameraRunResu
     return { kind: 'failed', code: 'serve_failed', detail: `the camera run failed unexpectedly: ${oneLine(error)}` };
   } finally {
     budget.release(lease);
+    // Anything still working in the run's folder (a browser whose close
+    // failed, a daemon an app left) is ended before the folder goes. A
+    // stopping service leaves that to the next boot.
+    if (!input.signal.aborted) await endRooted(input.workDir, log);
     await removeTree(input.workDir).catch((error: unknown) => {
       log('warn', 'pr media camera: the run folder could not be removed; the next boot removes it', { run: input.runId, error: oneLine(error) });
     });
+  }
+}
+
+/** End every process whose working directory is under `dir`. Never throws. */
+async function endRooted(dir: string, log: Log): Promise<readonly number[]> {
+  try {
+    const rooted = await psEnumeratorAsync(dir, {
+      onCwdError: (error) => log('warn', 'pr media camera: working directories could not be listed', { error: oneLine(error) }),
+    });
+    const pids = rooted.filter((entry) => entry.evidence === 'cwd').map((entry) => entry.pid).filter((pid) => pid !== process.pid);
+    if (pids.length === 0) return [];
+    const survivors = await endProcesses(pids, CAMERA_KILL_GRACE_MS);
+    log('warn', 'pr media camera: processes left working in a run folder were ended', { pids, survivors });
+    return pids.filter((pid) => !survivors.includes(pid));
+  } catch (error) {
+    log('warn', 'pr media camera: processes in a run folder could not be listed', { error: oneLine(error) });
+    return [];
   }
 }
 
