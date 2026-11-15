@@ -147,6 +147,61 @@ export interface OwnerPrView {
   readonly checkedAt: string;
   /** The code host the evidence came from. */
   readonly provider: OwnerProvider;
+  /** PR media (docs/PR-MEDIA.md): the captures bound to `sha`, how many
+   * older-head captures were superseded, and where the current ones stand
+   * on the PR. Absent/null = no captures, or the feature is off. */
+  readonly media?: OwnerPrMediaView | null;
+}
+
+/** One capture as the FOR YOU card lists it (bytes come from
+ * `GET /api/media/<id>`; no store path ever leaves the server). */
+export interface OwnerPrMediaItemView {
+  readonly id: string;
+  readonly kind: 'image' | 'video';
+  readonly mediaType: string;
+  readonly role: 'after' | 'before';
+  readonly caption: string;
+  readonly bytes: number;
+  /** `gc` when GC's camera filmed it from the shot list, `minion` when the
+   * minion submitted it. */
+  readonly capturedBy: 'minion' | 'gc';
+}
+
+/** Whether the head owes media (owner ruling Q4) and where GC's camera
+ * stands with the shot list (docs/PR-MEDIA.md, "When media is owed"). */
+export interface OwnerPrMediaCoverageView {
+  /** `owed`: the diff touches `[capture] paths` with no capture and no skip
+   * reason; `skipped`: the shot list says why none is needed; `covered`: a
+   * capture is bound to the head; `not-owed`: no capture path is touched;
+   * `unknown`: owing could not be decided (`detail` says why). */
+  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed' | 'unknown';
+  readonly touched: number;
+  /** The first touched paths (at most 10). */
+  readonly paths: readonly string[];
+  readonly skip: string | null;
+  readonly camera: 'pending' | 'filming' | 'filmed' | 'failed' | 'unconfigured' | null;
+  /** Why owing is unknown, a refused shot list, or the camera's latest
+   * failure. */
+  readonly detail: string | null;
+}
+
+/** Where the current captures stand on the PR/MR description. */
+export interface OwnerPrMediaPublication {
+  readonly state: 'published' | 'pending' | 'failed' | 'off';
+  readonly at: string | null;
+  readonly detail: string | null;
+}
+
+export interface OwnerPrMediaView {
+  /** The head every listed capture is bound to (always the row's sha). */
+  readonly headSha: string;
+  readonly items: readonly OwnerPrMediaItemView[];
+  /** Captures of earlier heads: superseded, never shown as current. */
+  readonly superseded: number;
+  /** Null when no capture is bound to the current head. */
+  readonly publication: OwnerPrMediaPublication | null;
+  /** Null when no coverage was recorded for the head. */
+  readonly coverage: OwnerPrMediaCoverageView | null;
 }
 
 /** Only https URLs may become an OPEN link (fail closed otherwise). */

@@ -466,6 +466,66 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
   });
 
+  it('FOR YOU ownerPrs media: absent/null tolerated, head-bound captures accepted, anything stale or guessed rejected', () => {
+    const sha = 'a'.repeat(40);
+    const ready = {
+      id: 'owner-pr:job-1', jobId: 'job-1', jobTitle: 'Ready heist', repo: 'demo-repo',
+      prUrl: 'https://github.com/example/demo/pull/7', sha, checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const item = { id: 'm-12345678-1234-1234-1234-123456789abc', kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: 120 };
+    const media = { headSha: sha, items: [item], superseded: 1, publication: { state: 'published', at: '2026-01-01T00:01:00.000Z', detail: null } };
+    const valid = (row: unknown): boolean => isValidSnapshot({ ...snapshot(), ownerPrs: [row] } as unknown);
+    expect(valid({ ...ready, media: null })).toBe(true);
+    expect(valid({ ...ready, media })).toBe(true);
+    expect(valid({ ...ready, media: { ...media, items: [{ ...item, kind: 'video', mediaType: 'video/webm' }] } })).toBe(true);
+    // Only older-head captures: the block says so, with no publication state.
+    expect(valid({ ...ready, media: { headSha: sha, items: [], superseded: 2, publication: null } })).toBe(true);
+    for (const broken of [
+      { ...media, headSha: 'b'.repeat(40) }, // bound to another head than the row
+      { ...media, items: [{ ...item, id: 'not-a-media-id' }] },
+      { ...media, items: [{ ...item, mediaType: 'image/svg+xml' }] },
+      { ...media, items: [{ ...item, kind: 'video' }] }, // kind disagrees with the type
+      { ...media, items: [{ ...item, role: 'during' }] },
+      { ...media, items: [{ ...item, caption: '' }] },
+      { ...media, superseded: -1 },
+      { ...media, publication: null }, // current captures always say where they stand
+      { ...media, publication: { state: 'uploaded', at: null, detail: null } },
+      { headSha: sha, items: [], superseded: 0, publication: { state: 'pending', at: null, detail: null } },
+    ]) {
+      expect(valid({ ...ready, media: broken }), JSON.stringify(broken)).toBe(false);
+    }
+  });
+
+  it('FOR YOU media coverage and GC captures: well-formed accepted, malformed rejected', () => {
+    const sha = 'a'.repeat(40);
+    const ready = {
+      id: 'owner-pr:job-1', jobId: 'job-1', jobTitle: 'Ready heist', repo: 'demo-repo',
+      prUrl: 'https://github.com/example/demo/pull/7', sha, checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const item = { id: 'm-12345678-1234-1234-1234-123456789abc', kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: 120, capturedBy: 'gc' };
+    const coverage = { state: 'owed', touched: 3, paths: ['web/src/a.ts', 'web/src/b.ts'], skip: null, camera: 'failed', detail: 'shot "card" step 2 failed' };
+    const valid = (media: unknown): boolean => isValidSnapshot({ ...snapshot(), ownerPrs: [{ ...ready, media }] } as unknown);
+    // Owed with nothing captured: the block carries coverage only.
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: null })).toBe(true);
+    expect(valid({ headSha: sha, items: [item], superseded: 0, publication: { state: 'pending', at: null, detail: null }, coverage: { ...coverage, state: 'covered', camera: 'filmed', detail: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [{ ...item, capturedBy: 'minion' }], superseded: 0, publication: { state: 'pending', at: null, detail: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: { ...coverage, state: 'skipped', skip: 'no visible change', camera: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: { state: 'unknown', touched: 0, paths: [], skip: null, camera: null, detail: 'the merge base could not be found' } })).toBe(true);
+    for (const broken of [
+      { ...coverage, state: 'maybe' },
+      { ...coverage, touched: -1 },
+      { ...coverage, touched: 1 }, // lists more paths than it counts
+      { ...coverage, paths: [3] },
+      { ...coverage, skip: 4 },
+      { ...coverage, camera: 'rolling' },
+      { ...coverage, detail: {} },
+    ]) {
+      expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: broken }), JSON.stringify(broken)).toBe(false);
+    }
+    expect(valid({ headSha: sha, items: [{ ...item, capturedBy: 'robot' }], superseded: 0, publication: { state: 'pending', at: null, detail: null } })).toBe(false);
+  });
+
   it('managed repo overview: absent/null tolerated, well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), repoOverview: null } as unknown)).toBe(true);

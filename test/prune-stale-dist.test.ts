@@ -106,9 +106,14 @@ describe('prune-stale-dist', () => {
     // packages): 151 catalogued names (142 of them ship executable files; the
     // rest are peers, optionals and type-only packages), from which the 0.85.1
     // shrinkwrap's esbuild, clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5310);
+    // PR media (docs/PR-MEDIA.md) added its store, HTTP surface and
+    // publisher (dist/media/{store,server,publisher}.js), then GC's camera:
+    // the capture globs, the shot list, the runner, its director and the
+    // agent-browser adapter (dist/media/{capture-paths,shot-list,camera,
+    // director,web-adapter}.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5318);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('65410b5662f84883d9555770a69e32c57c8761c0cb54d8dd63536ae1ddcc0859');
+      .toBe('5235591c5c70dd7db4f5eb18c0b783f5c84989940b25ad2616014ede6b8f6714');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

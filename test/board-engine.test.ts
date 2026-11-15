@@ -13,6 +13,9 @@ import type { Role } from '../src/config.js';
 import type { DecisionRuntimeStatus } from '../src/decisions/runtime.js';
 import type { RepoOverviewView } from '../src/repos/overview.js';
 import type { BriefingReviewBoardCounts } from '../src/briefing-review/board.js';
+import { storeMedia } from '../src/media/store.js';
+import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
+import { minimalPng } from './helpers/images.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -879,6 +882,28 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     const snap = engine.snapshot();
     expect(snap.ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-a', 'owner-pr:job-b']);
     expect(snap.ownerPrs[0]).toMatchObject({ jobId: 'job-a', prUrl: PR_URL, sha: SHA });
+  });
+
+  it('PR media: a ready row carries its head-bound captures, the web validator accepts the snapshot, and off means none', () => {
+    const { api, bus } = fresh();
+    const dataDir = tmpDir();
+    stageReadyJob(api, 'job-media');
+    storeMedia({ dataDir, ledger: api, jobId: 'job-media', headSha: 'b'.repeat(40), caption: 'Older head', role: 'after', bytes: minimalPng() });
+    const current = storeMedia({ dataDir, ledger: api, jobId: 'job-media', headSha: SHA, caption: 'New card', role: 'after', bytes: minimalPng() });
+    let config = { enabled: true, publish: 'autonomous' as const };
+    const wired = new BoardEngine({ ledger: api, bus, prMedia: () => config, prMediaPublishing: () => false });
+    const snap = wired.snapshot();
+    expect(snap.ownerPrs[0]?.media).toEqual({
+      headSha: SHA,
+      items: [{ id: current.id, kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: current.bytes, capturedBy: 'minion' }],
+      superseded: 1,
+      publication: { state: 'off', at: null, detail: 'publishing runs on the Silas signal poll, which is off on this instance' },
+      coverage: null,
+    });
+    expect(isValidSnapshot(JSON.parse(JSON.stringify(snap)) as unknown)).toBe(true);
+    config = { enabled: false, publish: 'autonomous' };
+    expect(wired.snapshot().ownerPrs[0]).not.toHaveProperty('media');
+    expect(new BoardEngine({ ledger: api, bus }).snapshot().ownerPrs[0]).not.toHaveProperty('media');
   });
 
   it('drops the row when the head moves after the approval (stale CI/verdict at the old sha)', () => {

@@ -33,6 +33,7 @@ restart produce the same truth without data edits.
 | `GET /api/transcripts` | session transcript list (newest first; ledger-bound agents carry ids/labels) |
 | `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
+| `POST /api/media` · `GET /api/media?job_id=` · `GET /api/media/:id` | PR media: a minion submits a capture of its lane's committed head; the list also carries GC's camera's latest run and the newest media coverage; the board reads one capture's bytes (hash re-verified) for the FOR YOU previews ([PR-MEDIA.md](./PR-MEDIA.md)) |
 | `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md); `binned` is the terminal discard (any non-terminal source; never resumable). A `binned` request for a job whose only live request was deferred before reaching its worker is closed out by the service (optional `reason` ≤ 500 chars, optional `by`): `200` adds `closeout: {state, id, generation}`; `409 request_closeout_refused`/`_stopped`/`_superseded` and `400 invalid_reason` are its typed refusals ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523)); every other job is unchanged (a `reason` over 500 characters is refused first, whatever the job) |
 | `POST /api/jobs/:id/closeout` | `{expected_status, expected_pr_url, provider, reason}` — guarded administrative closeout of a parked PR-backed lane whose recorded provider observation is CLOSED-without-merge; audited, idempotent, refusals are `409 closeout_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
 | `POST /api/silas/directives/:request/closeout` | `{reason}` — the keep-parked closeout (#564) of a deferred request whose job stays `parked`: the request is retired, its debt closed and its card resolved, and no job status is written. `200` is the job object plus `closeout`; `409 request_closeout_refused`/`_stopped`/`_superseded`/`_mode_conflict`/`_target_mismatch`/`_not_applicable`, `409 job_not_parked`, `400 invalid_reason`, `404 not_found` ([DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md#canceled-request-closeout-523)) |
@@ -177,6 +178,24 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `mergeable_state` are not separately projected; the Perkins verdict is
   represented by the head-bound approved round. This freshness bound is
   evidence aging, not owner escalation: nothing is timed out or nagged.
+  A ready row also carries the job's **PR media** bound to that exact
+  head ([PR-MEDIA.md](./PR-MEDIA.md)): a strip of stills (each opens full
+  size) and clips (each plays in place), then one line naming the head,
+  any superseded older-head captures, and where the captures stand on the
+  PR/MR (`posted to the PR ✓`, `posting to the PR…` with the failed
+  attempt when one did, `not posted to the PR: <reason>`, or `board only`
+  with its reason). Captures of an older head are never shown as current.
+  The board fetches the bytes with the pairing token, once per pairing; a
+  refused fetch names its reason. Preview nodes survive re-renders (a
+  playing clip keeps playing) and a card that blinks out for a snapshot
+  keeps its previews for 10 minutes. Captures GC's camera filmed say
+  `filmed by Gru Command`. Below them the row says whether the head
+  **owes media** ([PR-MEDIA.md](./PR-MEDIA.md#when-media-is-owed)):
+  `📸 media owed: …` (in the alert color) when the diff touches
+  `[capture] paths` with no capture and no skip reason, `📸 no media: <reason>`
+  for a shot-list skip reason, and one line on GC's camera (filming, waiting
+  for the head to settle, a refused shot list, or the failure it could not
+  get past).
 
   Then the **attention
   bands** — NEEDS GRU → IN FLIGHT → SETTLED →

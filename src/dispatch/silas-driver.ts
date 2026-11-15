@@ -2352,6 +2352,11 @@ export interface GitLabPollPort {
   pollOnce(): Promise<GitLabPollTickResult>;
 }
 
+/** The PR media publisher's tick (src/media/publisher.ts). */
+export interface MediaPublisherPort {
+  pollOnce(): Promise<unknown>;
+}
+
 /** Bind the supervisor's live per-agent views to the digest's lookup. This
  * is the one seam main.ts wires; it is a factory so the binding is testable
  * without booting the service (final independent review T2). The argument
@@ -2386,6 +2391,9 @@ export interface SilasDriverOptions {
    * fails and logs on its own, so one provider's throw never suppresses the
    * other's tick. */
   readonly gitlabPoll?: GitLabPollPort;
+  /** PR media publication (docs/PR-MEDIA.md), ticked after both polls on the
+   * same interval; its own failure never suppresses either poll. */
+  readonly mediaPublisher?: MediaPublisherPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
@@ -2484,6 +2492,7 @@ export class SilasDriver {
   private timer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private pollInFlight = false;
+  private mediaInFlight = false;
   private wakeInFlight: Promise<void> | null = null;
   private queuedTrigger: SilasTrigger | null = null;
   private passInFlight: Promise<DeterministicPassOutcome> | null = null;
@@ -2690,9 +2699,29 @@ export class SilasDriver {
           this.log('error', 'gitlab signal poll failed', { error: String(error).slice(0, 300) });
         }
       }
+      // PR media publication can take minutes (uploads): it starts after
+      // the provider observations but never holds the poll's in-flight
+      // guard, so merge and CI signals keep their cadence.
+      this.startMediaPublish();
     } finally {
       this.pollInFlight = false;
     }
+  }
+
+  /** One PR media publication tick on its own in-flight guard: a tick
+   * arriving while the previous one still uploads is skipped. */
+  private startMediaPublish(): void {
+    const media = this.opts.mediaPublisher;
+    if (media === undefined || this.disposed || this.mediaInFlight) return;
+    this.mediaInFlight = true;
+    void media
+      .pollOnce()
+      .catch((error: unknown) => {
+        this.log('error', 'pr media publication tick failed', { error: String(error).slice(0, 300) });
+      })
+      .finally(() => {
+        this.mediaInFlight = false;
+      });
   }
 
   /**

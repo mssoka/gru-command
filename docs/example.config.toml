@@ -216,6 +216,14 @@ max_raid_ms = 1800000             # wall-clock cap per raid
 max_raid_tokens = 400000          # token cap per raid, where the runtime reports usage
 max_raids_per_day = 2             # per repository, rolling 24 hours (started, waiting, or ended before starting)
 
+[pr_media]                        # screenshots and clips in PRs (docs/PR-MEDIA.md) — on by default
+# Minions submit captures of their committed head; GC binds each one to that
+# exact commit, shows it on the FOR YOU ready-PR card and writes it into the
+# PR/MR description. Captures use mock or seed data only.
+enabled = true                    # false = the capture API refuses; nothing is shown or published
+publish = "autonomous"            # "autonomous": GC writes the description's media section itself
+                                  # (on a public repository the media is public); "never": FOR YOU only
+
 [onboarding]                      # onboarding heists (docs/ONBOARDING.md)
 # A managed repository whose origin default branch has no
 # .gru-command/worktree.toml gets a minion PR adding one, derived from the

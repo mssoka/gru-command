@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
@@ -46,6 +47,80 @@ describe('job deliverable kind (E19 durable-write guard)', () => {
   });
 });
 
+
+/** The ledger's SQLite handle with every multi-row `worktrees` read reporting
+ * how many rows SQLite handed back: what the read cost, whatever its SQL. */
+function countingWorktreeReads(handle: DatabaseSync, fetched: number[]): DatabaseSync {
+  const bound = (target: object, key: string | symbol): unknown => {
+    const member: unknown = Reflect.get(target, key, target);
+    return typeof member === 'function' ? (member as (...args: unknown[]) => unknown).bind(target) : member;
+  };
+  return new Proxy(handle, {
+    get: (target, key) => key !== 'prepare' ? bound(target, key) : (sql: string): StatementSync => {
+      const statement = target.prepare(sql);
+      if (!/\bFROM worktrees\b/u.test(sql)) return statement;
+      return new Proxy(statement, {
+        get: (inner, member) => member !== 'all' ? bound(inner, member) : (...params: Parameters<StatementSync['all']>) => {
+          const rows = inner.all(...params);
+          fetched.push(rows.length);
+          return rows;
+        },
+      });
+    },
+  });
+}
+
+describe('scoped worktree reads cost their own rows (board snapshot scaling)', () => {
+  it('a job- or status-scoped read fetches only the rows it returns, in whole-registry order', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-worktree-scope-'));
+    const db = new LedgerDb(dir);
+    const fetched: number[] = [];
+    const api = new LedgerApi(countingWorktreeReads(db.handle, fetched));
+    try {
+      for (const id of ['scope-a', 'scope-b', 'scope-c', 'scope-none']) api.addJob({ id, repo: 'r', title: id });
+      const lane = (id: string, kind: 'job' | 'child', jobId: string): void => {
+        api.registerWorktree({ id, kind, repoPath: '/tmp/scope-repo', repoName: 'r', path: `/tmp/${id}`, sha: 'a'.repeat(40), jobId });
+      };
+      lane('scope-a', 'job', 'scope-a');
+      lane('scope-b', 'job', 'scope-b');
+      lane('scope-a-child', 'child', 'scope-a');
+      lane('scope-c', 'job', 'scope-c');
+      api.setWorktreeStatus('scope-a-child', 'swept');
+      api.setWorktreeStatus('scope-b', 'paused');
+
+      fetched.length = 0;
+      const whole = api.listWorktrees();
+      expect(whole.map((row) => row.id).sort()).toEqual(['scope-a', 'scope-a-child', 'scope-b', 'scope-c']);
+      expect(fetched).toEqual([4]);
+
+      const scopes: readonly { readonly jobId?: string; readonly status?: string }[] = [
+        { jobId: 'scope-a' },
+        { jobId: 'scope-b' },
+        { jobId: 'scope-none' },
+        { jobId: 'no-such-job' },
+        { jobId: 'scope-a', status: 'active' },
+        { jobId: 'scope-a', status: 'swept' },
+        { jobId: 'scope-b', status: 'active' },
+        { status: 'active' },
+        { status: 'paused' },
+      ];
+      for (const scope of scopes) {
+        const expected = whole.filter((row) =>
+          (scope.jobId === undefined || row.jobId === scope.jobId) &&
+          (scope.status === undefined || row.status === scope.status));
+        fetched.length = 0;
+        expect(api.listWorktrees(scope), JSON.stringify(scope)).toEqual(expected);
+        // One statement, and SQLite hands back exactly the scope's rows: a
+        // board snapshot reading every job's lanes stays linear in lanes.
+        expect(fetched, JSON.stringify(scope)).toEqual([expected.length]);
+      }
+      expect(() => api.listWorktrees({ jobId: 'scope-a', status: 'gone' })).toThrow(/unknown worktree status "gone"/);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('P48 candidate delivery projections preserve non-candidate debt', () => {
   it('excludes later historical non-candidates from freshness while preserving their original facts and gate debt', () => {

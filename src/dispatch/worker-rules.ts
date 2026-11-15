@@ -34,12 +34,30 @@ export const BACKGROUND_PROCESS_RULE = [
 ].join('\n');
 
 /**
+ * PR media (owner rulings 2026-11-15, docs/PR-MEDIA.md): a minion whose change
+ * is visible captures it from its committed head and submits each capture to
+ * the service, which binds it to that head, shows it on the owner's FOR YOU
+ * card and writes the PR description's media section. The service accepts a
+ * capture only while the lane sits at exactly the named head with a clean
+ * tracked tree: the record says which commit the capture was submitted at.
+ */
+export const PR_MEDIA_RULE = [
+  'PR MEDIA RULE (screenshots and clips for the owner\'s review):',
+  '- Applies only to work that changes something a person sees (a page, a component, a rendered output) in a contract that authorizes a pull request. Review, read-only and other non-publishing jobs submit nothing. When the repository\'s .gru-command/worktree.toml has a [capture] table, a diff touching its `paths` globs owes media or a skip reason, and the owner sees "media owed" on the PR when it has neither.',
+  '- Direct the shots; GC films them. Write `shot-list.json` in your private operational artifacts folder (named in your workflow notes): {"version": 1, "shots": [{"id": "<a-z0-9->", "proves": "<the acceptance item it shows>", "kind": "screenshot" or "clip", "viewports": ["desktop", "mobile"] (or {"width": W, "height": H}), "steps": [{"open": "/path"}, {"click": "<css selector>"}, {"type": "<css selector>", "text": "<mock text>"}, {"wait_for_text": "<text>"}], "compare": "base" (only when your briefing asks for a before/after comparison)}]}. Selectors and texts never start with "-". A shot that cannot be filmed gets {"id", "proves", "skip": "<why>"}; a change with nothing to see gets {"version": 1, "skip": "<why>"}. At most 8 files per head (shots × viewports, twice with compare).',
+  '- GC starts the app with [capture] serve on a port it picks, waits for [capture] ready, and films the list at your committed head once you deliver it (or once the head has stood still), re-filming whenever the head or the list changes. Read the outcome with GET /api/media?job_id=<your job id> (`camera`: started, filmed, or failed with a `code` and `detail`; `coverage`: owed, skipped or covered): a failed step means fix the selector, the text or the code, and the list is filmed again.',
+  '- Fallback, when the repository has no [capture] serve, the output is not a web page, or your workflow notes name no private operational artifacts folder: capture it yourself from your committed head (for example `agent-browser screenshot`, or `agent-browser record start <file>.webm` then `record stop`) and submit each file with POST /api/media to the service (its address and `[auth]` token are in its instance config, as for POST /api/dispatch). Write the JSON body {"job_id": "<your job id>", "head_sha": "<your lane\'s full HEAD sha>", "caption": "<one line: what it shows>", "role": "after" or "before", "content_base64": "<the file, base64>"} to a file outside your worktree and send it with `curl --data-binary @<file>`. It is refused unless your lane sits at exactly that head with no uncommitted tracked changes; `pr_media_disabled` means skip media. PNG, JPEG, GIF, WebP, WebM or MP4; at most 10 MB each.',
+  '- GC binds each capture to its head, shows it to the owner on the FOR YOU card and writes the PR description\'s media section. Never attach media to the PR yourself, never commit captures or the shot list into the repository, keep capture files outside your worktree, and keep the description\'s gc-media section intact when you edit the description.',
+  '- Shots show mock or seed data only: never real accounts, credentials, tokens or personal data, and never text typed from a real secret.',
+].join('\n');
+
+/**
  * The complete set of current rule blocks an assembled worker instruction
  * carries. Rendering and appending live here (one ordered list, one append
  * helper DERIVED from it) so briefings, re-briefs and follow-up directives
  * cannot drift apart block by block.
  */
-export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE];
+export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE, PR_MEDIA_RULE];
 
 /** Append every current worker rule block to an authored instruction text
  * (one blank line between blocks, always). Derived from the ordered list so

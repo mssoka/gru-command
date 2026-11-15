@@ -5,7 +5,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
-import { loadWorktreeManifest, RESERVED_VERIFY_SCOPE, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { loadWorktreeManifest, RESERVED_CAPTURE_SCOPE, RESERVED_VERIFY_SCOPE, resolveVerifyCommand } from '../worktrees/manifest.js';
 import {
   VerificationCancelledError,
   VerificationDuplicateError,
@@ -134,6 +134,11 @@ export interface VerificationBudget {
  * a proof and the job's verification fences never see one.
  */
 export const ONBOARDING_PROOF_SCOPE = RESERVED_VERIFY_SCOPE;
+
+/** The scope GC's PR media camera holds its budget slot under: like an
+ * onboarding proof, a camera run is never verification evidence, so the
+ * scheduler's records of it are dropped (docs/PR-MEDIA.md). */
+export const PR_MEDIA_CAMERA_SCOPE = RESERVED_CAPTURE_SCOPE;
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -265,6 +270,12 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           }
           return;
         }
+        if (event.payload['scope'] === PR_MEDIA_CAMERA_SCOPE) {
+          if (event.kind === 'verification.stale-released' || event.kind === 'verification.lock-timeout') {
+            log('warn', 'pr media camera: a budget slot event (not verification evidence)', { kind: event.kind, job: event.jobId, ...event.payload });
+          }
+          return;
+        }
         if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
           [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
         // The scheduler hands the event over with its command lines masked once
@@ -392,12 +403,13 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     const body = await readBody(req);
     const jobId = strField(body, 'job_id');
     const scope = optStrField(body, 'scope') ?? DEFAULT_VERIFY_SCOPE;
-    if (scope === ONBOARDING_PROOF_SCOPE) {
-      // Every event of this scope is dropped (an onboarding proof is never
-      // verification evidence): a run under it would leave no record.
+    if (scope === ONBOARDING_PROOF_SCOPE || scope === PR_MEDIA_CAMERA_SCOPE) {
+      // Every event of these scopes is dropped (an onboarding proof or a
+      // camera run is never verification evidence): a run under one would
+      // leave no record.
       json(res, 400, {
         error: 'reserved_scope',
-        detail: `verify scope "${ONBOARDING_PROOF_SCOPE}" is reserved for GC's onboarding proof and cannot be requested; name the manifest's scope differently`,
+        detail: `verify scope "${scope}" is reserved for ${scope === ONBOARDING_PROOF_SCOPE ? "GC's onboarding proof" : "GC's PR media camera"} and cannot be requested; name the manifest's scope differently`,
       });
       return;
     }

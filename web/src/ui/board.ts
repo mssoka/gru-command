@@ -95,7 +95,7 @@ import {
   type OwnerPrRow,
   type OwnerProposalRow,
 } from '../lib/owner-band.js';
-import type { NotificationDecisionView } from '../lib/board-protocol.js';
+import type { NotificationDecisionView, OwnerPrMediaCoverageView, OwnerPrMediaItemView, OwnerPrMediaView } from '../lib/board-protocol.js';
 
 /** Detail text shown verbatim on the card face when it is short and
  * single-paragraph; anything longer lives behind the Details disclosure
@@ -176,6 +176,46 @@ export interface TranscriptOpenRequest {
   readonly label: string;
 }
 
+/** The FOR YOU lines for a head's media coverage (docs/PR-MEDIA.md, "When
+ * media is owed"): media owed (the diff touches `[capture] paths` with no
+ * capture and no skip reason), the shot list's skip reason, and where GC's
+ * camera stands. Exported for its tests. */
+export function coverageLines(coverage: OwnerPrMediaCoverageView | null): readonly HTMLElement[] {
+  if (coverage === null) return [];
+  const lines: HTMLElement[] = [];
+  if (coverage.state === 'owed') {
+    const listed = coverage.paths.slice(0, 3).join(', ');
+    const more = coverage.touched - Math.min(coverage.touched, 3, coverage.paths.length);
+    lines.push(el(
+      'div',
+      'lbl board-owner__media-note board-owner__media-note--owed',
+      `📸 media owed: ${coverage.touched} changed file${coverage.touched === 1 ? '' : 's'} under [capture] paths (${listed}${more > 0 ? ` +${more} more` : ''}) — no capture and no skip reason`,
+    ));
+  } else if (coverage.state === 'skipped') {
+    lines.push(el('div', 'lbl board-owner__media-note', `📸 no media: ${coverage.skip ?? 'the shot list gives a skip reason'}`));
+  } else if (coverage.state === 'unknown') {
+    lines.push(el('div', 'lbl board-owner__media-note board-owner__media-note--owed', `📸 media check failed: ${coverage.detail ?? 'see the service log'}`));
+    return lines;
+  }
+  const camera = coverage.camera;
+  const detail = coverage.detail;
+  if (camera === 'filming') lines.push(el('div', 'lbl board-owner__media-note', '🎬 Gru Command is filming the shot list…'));
+  else if (camera === 'pending') {
+    lines.push(el('div', 'lbl board-owner__media-note',
+      `🎬 Gru Command films the shot list once the head settles${detail === null ? '' : ` (last try: ${detail})`}`));
+  } else if (camera === 'failed') {
+    lines.push(el('div', 'lbl board-owner__media-note board-owner__media-note--owed', `🎬 Gru Command could not film the shot list: ${detail ?? 'see the service log'}`));
+  } else if (camera === 'unconfigured') {
+    lines.push(el('div', 'lbl board-owner__media-note', `🎬 ${detail ?? 'the repository declares no [capture] serve, so the shot list is not filmed'}`));
+  } else if (camera === null && detail !== null) {
+    lines.push(el('div', 'lbl board-owner__media-note board-owner__media-note--owed', `🎬 shot list refused: ${detail}`));
+  }
+  return lines;
+}
+
+/** How long a capture's preview outlives the last card that showed it. */
+export const MEDIA_PREVIEW_GRACE_MS = 10 * 60_000;
+
 export class BoardView {
   private readonly mount: HTMLElement;
   private readonly ownerMount: HTMLElement;
@@ -222,6 +262,15 @@ export class BoardView {
    * the mock feed carries ack-ready rows without a client; rebound on
    * re-pair). */
   private boardClient: BoardClient | null;
+  /** PR media previews (docs/PR-MEDIA.md): one object URL per capture,
+   * fetched once per pairing with the token, and one preview node per
+   * surface so a re-render never restarts a playing clip. */
+  private readonly mediaUrls = new Map<string, Promise<{ readonly url: string } | { readonly error: string }>>();
+  private readonly mediaObjectUrls = new Map<string, string>();
+  private readonly mediaNodes = new Map<string, HTMLElement>();
+  /** When each capture was last on a card (ms): previews outlive a card that
+   * blinks out for a snapshot. */
+  private readonly mediaSeen = new Map<string, number>();
   /** Lesson proposal rows' UI state by notification id, shared by the band
    * and the bell and kept across snapshot re-renders (review disclosure,
    * fetched review, in-flight decision, last refusal). Pruned when the
@@ -355,6 +404,7 @@ export class BoardView {
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.clientGeneration += 1;
+    this.resetMedia();
     this.socketLost = false;
     for (const [id, state] of this.proposalStates) {
       if (state.pendingDecision === null) {
@@ -448,6 +498,7 @@ export class BoardView {
     const effective = this.withDecisionOverrides(snapshot);
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    this.pruneMedia(snapshot);
     // Submissions end only when an authoritative snapshot carries an
     // outcome, removes the row, or an HTTP refresh after an option-state refusal
     // proves the current state (even when it matches the old content).
@@ -1100,7 +1151,7 @@ export class BoardView {
    * piece of evidence is bound to, its observation age, and OPEN PR /
    * OPEN MR — an external link, not an in-app merge. Nothing here claims
    * the merge happened. */
-  private ownerPrRow(row: OwnerPrRow): HTMLElement {
+  private ownerPrRow(row: OwnerPrRow, surface: 'band' | 'bell' = 'band'): HTMLElement {
     const pr = row.pr;
     const gitlab = pr.provider === 'gitlab';
     const node = el('article', 'board-owner__row board-owner__row--pr');
@@ -1133,7 +1184,149 @@ export class BoardView {
       // already refuses to project these; this is the browser guard).
       node.append(el('span', 'lbl board-owner__nolink', 'PR link unavailable'));
     }
+    if (pr.media !== undefined && pr.media !== null) node.append(this.ownerPrMedia(pr.media, pr.provider, surface));
     return node;
+  }
+
+  /** The ready card's media block: the captures bound to its exact head
+   * (stills open full size, clips play in place), then one line saying
+   * where they stand on the PR/MR. Captures of older heads are counted as
+   * superseded and never shown as current. */
+  private ownerPrMedia(media: OwnerPrMediaView, provider: 'github' | 'gitlab' | undefined, surface: 'band' | 'bell'): HTMLElement {
+    const block = el('div', 'board-owner__media');
+    const plural = (count: number): string => (count === 1 ? '' : 's');
+    const change = provider === 'gitlab' ? 'MR' : 'PR';
+    const coverage = media.coverage ?? null;
+    if (media.items.length === 0) {
+      if (media.superseded > 0) {
+        block.append(el(
+          'div',
+          'lbl board-owner__media-note',
+          `📸 ${media.superseded} capture${plural(media.superseded)} from an older head — superseded, not shown`,
+        ));
+      }
+      for (const line of coverageLines(coverage)) block.append(line);
+      return block;
+    }
+    const strip = el('div', 'board-owner__media-strip');
+    for (const item of media.items) strip.append(this.mediaPreview(item, surface));
+    const publication = media.publication;
+    const detail = publication?.detail ?? null;
+    const where = publication === null
+      ? ''
+      : publication.state === 'published'
+        ? ` · posted to the ${change} ✓`
+        : publication.state === 'pending'
+          ? ` · posting to the ${change}…${detail === null ? '' : ` (${detail})`}`
+          : publication.state === 'failed'
+            ? ` · not posted to the ${change}: ${detail ?? 'see the service log'}`
+            : ` · board only${detail === null ? '' : `: ${detail}`}`;
+    const older = media.superseded > 0 ? ` · ${media.superseded} older superseded` : '';
+    const filmed = media.items.filter((item) => item.capturedBy === 'gc').length;
+    const by = filmed === 0 ? '' : filmed === media.items.length ? ' · filmed by Gru Command' : ` · ${filmed} filmed by Gru Command`;
+    block.append(
+      strip,
+      el('div', 'lbl board-owner__media-note', `📸 ${media.items.length} capture${plural(media.items.length)} at ${media.headSha.slice(0, 8)}${by}${older}${where}`),
+    );
+    for (const line of coverageLines(coverage)) block.append(line);
+    return block;
+  }
+
+  /** One capture's preview node, reused across renders on its surface. */
+  private mediaPreview(item: OwnerPrMediaItemView, surface: 'band' | 'bell'): HTMLElement {
+    const key = `${surface}:${item.id}`;
+    this.mediaSeen.set(item.id, Date.now());
+    const cached = this.mediaNodes.get(key);
+    if (cached !== undefined) return cached;
+    const label = item.role === 'before' ? 'before' : item.kind === 'video' ? 'clip' : 'after';
+    const figure = el('figure', `board-owner__shot board-owner__shot--${item.kind}`);
+    figure.dataset.mediaId = item.id;
+    const frame = el('div', 'board-owner__shot-frame', 'loading…');
+    figure.append(frame, el('figcaption', 'board-owner__shot-caption', `${label} · ${item.caption}`));
+    this.mediaNodes.set(key, figure);
+    void this.mediaUrl(item.id).then((loaded) => {
+      if ('error' in loaded) {
+        frame.textContent = `preview unavailable: ${loaded.error}`;
+        return;
+      }
+      frame.textContent = '';
+      if (item.kind === 'video') {
+        const video = document.createElement('video');
+        video.src = loaded.url;
+        video.controls = true;
+        video.preload = 'metadata';
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute('aria-label', item.caption);
+        frame.append(video);
+        return;
+      }
+      const link = el('a', 'board-owner__shot-link');
+      link.href = loaded.url;
+      link.target = '_blank';
+      link.rel = 'noreferrer';
+      link.title = 'Open full size';
+      const image = document.createElement('img');
+      image.src = loaded.url;
+      image.alt = item.caption;
+      image.loading = 'lazy';
+      link.append(image);
+      frame.append(link);
+    });
+    return figure;
+  }
+
+  /** A capture's object URL, fetched once per pairing. A refused fetch keeps
+   * its named reason until the next pairing, never a retry storm. */
+  private mediaUrl(id: string): Promise<{ readonly url: string } | { readonly error: string }> {
+    const cached = this.mediaUrls.get(id);
+    if (cached !== undefined) return cached;
+    const client = this.boardClient;
+    if (client === null) return Promise.resolve({ error: 'board not paired' });
+    if (typeof URL.createObjectURL !== 'function') return Promise.resolve({ error: 'this browser cannot show previews' });
+    const generation = this.clientGeneration;
+    const pending: Promise<{ readonly url: string } | { readonly error: string }> = client
+      .fetchMedia(id)
+      .then((blob) => {
+        // A fetch that outlived its pairing or its cache entry creates nothing.
+        if (generation !== this.clientGeneration || this.mediaUrls.get(id) !== pending) return { error: 'superseded' };
+        const url = URL.createObjectURL(blob);
+        this.mediaObjectUrls.set(id, url);
+        return { url };
+      })
+      .catch((error: unknown) => ({
+        error: error instanceof BoardApiError ? (error.code ?? `HTTP ${error.status}`) : 'network error',
+      }));
+    this.mediaUrls.set(id, pending);
+    return pending;
+  }
+
+  /** Drop the previews and object URLs of captures no card has shown for
+   * {@link MEDIA_PREVIEW_GRACE_MS}: a card that blinks out for one snapshot
+   * keeps its previews (and a playing clip keeps playing). */
+  private pruneMedia(snapshot: BoardSnapshot): void {
+    const now = Date.now();
+    // Every capture on a card in THIS snapshot is current, however long the
+    // board was quiet before it arrived.
+    for (const pr of snapshot.ownerPrs ?? []) for (const item of pr.media?.items ?? []) this.mediaSeen.set(item.id, now);
+    const cutoff = now - MEDIA_PREVIEW_GRACE_MS;
+    for (const [id, seen] of this.mediaSeen) {
+      if (seen >= cutoff) continue;
+      const url = this.mediaObjectUrls.get(id);
+      if (url !== undefined) URL.revokeObjectURL(url);
+      this.mediaObjectUrls.delete(id);
+      this.mediaUrls.delete(id);
+      this.mediaSeen.delete(id);
+      for (const key of [...this.mediaNodes.keys()]) if (key.slice(key.indexOf(':') + 1) === id) this.mediaNodes.delete(key);
+    }
+  }
+
+  private resetMedia(): void {
+    for (const url of this.mediaObjectUrls.values()) URL.revokeObjectURL(url);
+    this.mediaObjectUrls.clear();
+    this.mediaUrls.clear();
+    this.mediaNodes.clear();
+    this.mediaSeen.clear();
   }
 
   // ------------------------------------------------------------------
@@ -2543,7 +2736,7 @@ export class BoardView {
             ? this.notificationCard(row.notification)
             : row.kind === 'proposal'
               ? this.ownerProposalPointer(row)
-              : this.ownerPrRow(row),
+              : this.ownerPrRow(row, 'bell'),
         );
       }
     }

@@ -4393,3 +4393,75 @@ html.gru-modal-open {
   display: grid;
   gap: 12px;
 }
+
+/* PR media (docs/PR-MEDIA.md): the ready card's captures, bound to its
+   exact head. Stills open full size; clips play in place. */
+.board-owner__media {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.board-owner__media-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.board-owner__shot {
+  margin: 0;
+  border: 2px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--soft);
+  min-width: 0;
+}
+
+.board-owner__shot-frame {
+  aspect-ratio: 16 / 10;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--soft);
+}
+
+.board-owner__shot-link,
+.board-owner__shot-frame img,
+.board-owner__shot-frame video {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.board-owner__shot-frame img,
+.board-owner__shot-frame video {
+  object-fit: contain;
+  background: var(--card);
+}
+
+.board-owner__shot--video .board-owner__shot-frame video {
+  background: #000;
+}
+
+.board-owner__shot-caption {
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 4px 7px;
+  border-top: 2px solid var(--line);
+  background: var(--card);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__media-note {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* Media owed, or a camera failure: the owner should act before merging. */
+.board-owner__media-note--owed {
+  color: var(--danger);
+}

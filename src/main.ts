@@ -85,6 +85,10 @@ import { createRollProbes } from './roll/probes.js';
 import { createRollServer } from './roll/server.js';
 import { readRollState } from './roll/state.js';
 import { createAttachmentsServer } from './attachments/server.js';
+import { createMediaServer } from './media/server.js';
+import { PrMediaPublisher } from './media/publisher.js';
+import { CameraDirector } from './media/director.js';
+import { AgentBrowserDriver } from './media/web-adapter.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { JournalStore } from './lessons/journal.js';
 import { BibleStore } from './lessons/bible.js';
@@ -590,6 +594,12 @@ async function main(): Promise<number> {
   const engine = new BoardEngine({
     ledger,
     bus,
+    // PR media (docs/PR-MEDIA.md): FOR YOU ready-PR rows carry the captures
+    // bound to their exact head.
+    prMedia: () => config.prMedia,
+    // The publisher rides the Silas signal poll (below): with Silas or its
+    // poll off, the card says publishing is off instead of "posting".
+    prMediaPublishing: () => config.silas.enabled && config.silas.pollIntervalMs > 0,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
     // Issue #171 truthful agent status: the live registry's handle set is
     // the authoritative current-runtime ownership probe. Together with the
@@ -1914,6 +1924,20 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   verificationView = () => verifyServer.view();
+  // GC's camera (PR media, docs/PR-MEDIA.md): films each live job's shot list
+  // at its lane's exact committed head, in a throwaway checkout of that head
+  // (never in the lane), under the verification budget, and journals whether
+  // each head owes media. A delivery asks for a tick at once, so the
+  // delivered head is filmed without waiting for the next one.
+  const camera = new CameraDirector({
+    ledger,
+    dataDir: config.dataDir,
+    config: () => config.prMedia,
+    budget: () => verifyServer.budget(),
+    driver: new AgentBrowserDriver(),
+    setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   // Report-lane slimming (#427): a delivered, idle report job's lane loses
   // its manifest's reclaim folders; the lane's setup brings them back.
   const laneSlimmer = new ReportLaneSlimmer({
@@ -1965,12 +1989,28 @@ async function main(): Promise<number> {
   const diskServer = createDiskServer({ token: config.auth.token, service: disk, log: (level, msg, fields) => logger.log(level, msg, fields) });
   onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
+  state.camera = camera;
+  // Started (its boot cleanup first) before any delivery can ask for a tick.
+  camera.start();
+  bus.subscribe((event) => {
+    if (event.kind === 'job.delivered') camera.requestTick();
+  });
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
   // same seam chat and dispatch both ride — workspace browse (on-disk
   // picks send paths, never bytes) + uploads materialization
   // (clipboard/phone bytes → <data_dir>/uploads/ → that path).
   const attachmentsServer = createAttachmentsServer({
     config,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // PR media (owner rulings 2026-11-15, docs/PR-MEDIA.md): minions submit
+  // captures of their lane's committed head; the board reads the bytes back
+  // for the FOR YOU previews.
+  const mediaServer = createMediaServer({
+    ledger,
+    dataDir: config.dataDir,
+    token: config.auth.token,
+    config: () => config.prMedia,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.bob = bob;
@@ -2040,6 +2080,7 @@ async function main(): Promise<number> {
         diskServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
+        mediaServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
         dispatchServer.requestHook(req, res, path) ||
         verifyServer.requestHook(req, res, path) ||
@@ -2271,6 +2312,14 @@ async function main(): Promise<number> {
       gitlabPoll: new GitLabSignalPoll({
         ledger,
         resolveRemote: resolveLaneRemote,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      }),
+      // PR media publication rides the same tick, after both providers'
+      // observations: it writes captures bound to the observed head only.
+      mediaPublisher: new PrMediaPublisher({
+        ledger,
+        dataDir: config.dataDir,
+        config: () => config.prMedia,
         log: (level, msg, fields) => logger.log(level, msg, fields),
       }),
       log: (level, msg, fields) => logger.log(level, msg, fields),

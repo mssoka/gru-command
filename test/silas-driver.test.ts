@@ -31,6 +31,7 @@ import {
   type DigestLedger,
   type GitHubPollPort,
   type GitLabPollPort,
+  type MediaPublisherPort,
   type RoundBlocker,
   type SilasSlot,
   type SkillModule,
@@ -3394,6 +3395,7 @@ function makeDriver(opts: {
   unchangedRewakeMs?: number;
   githubPoll?: GitHubPollPort;
   gitlabPoll?: GitLabPollPort;
+  mediaPublisher?: MediaPublisherPort;
   /** Collected log lines (the driver's own surface, e.g. poll failures). */
   logs?: string[];
   bus?: boolean;
@@ -3465,6 +3467,7 @@ function makeDriver(opts: {
     ...(opts.bus === false ? {} : { bus: h.bus }),
     ...(opts.githubPoll !== undefined ? { githubPoll: opts.githubPoll } : {}),
     ...(opts.gitlabPoll !== undefined ? { gitlabPoll: opts.gitlabPoll } : {}),
+    ...(opts.mediaPublisher !== undefined ? { mediaPublisher: opts.mediaPublisher } : {}),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
@@ -4524,6 +4527,47 @@ describe('silas driver gitlab signal poll', () => {
       expect(gitlabPolls).toBe(1);
     } finally {
       off.cleanup();
+    }
+  });
+
+  it('ticks the PR media publisher after both polls on its own guard: a slow or failing publication never holds a poll', async () => {
+    const { ticks, timers } = captureTimers();
+    const logs: string[] = [];
+    const order: string[] = [];
+    let release: () => void = () => {};
+    let publications = 0;
+    const h = makeDriver({
+      sweepIntervalMs: 0,
+      pollIntervalMs: 5_000,
+      githubPoll: { pollOnce: async () => (order.push('github'), emptyGitHubTick) },
+      gitlabPoll: { pollOnce: async () => (order.push('gitlab'), emptyGitLabTick) },
+      mediaPublisher: {
+        pollOnce: () => {
+          order.push('media');
+          publications += 1;
+          // The first publication hangs (a long upload); later ones throw.
+          if (publications === 1) return new Promise<void>((resolve) => { release = resolve; });
+          return Promise.reject(new Error('gh down'));
+        },
+      },
+      logs,
+      timers,
+    });
+    try {
+      h.driver.start();
+      ticks[0]?.();
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media']));
+      // The upload is still running: the next interval still polls both
+      // providers and does not start a second publication.
+      ticks[0]?.();
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media', 'github', 'gitlab']));
+      release();
+      await vi.waitFor(() => expect(order.length).toBe(5));
+      ticks[0]?.();
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media', 'github', 'gitlab', 'github', 'gitlab', 'media']));
+      await vi.waitFor(() => expect(logs).toContain('error pr media publication tick failed'));
+    } finally {
+      h.cleanup();
     }
   });
 

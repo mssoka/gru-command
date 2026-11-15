@@ -35,6 +35,12 @@ export const LANE_SLIMMER_STOP_WAIT_MS = 5_000;
  * turn). */
 export const DISK_RECLAIM_STOP_WAIT_MS = 5_000;
 
+/** How long shutdown waits for a PR media camera run to end its app and
+ * release its verification slot: the app's group gets SIGTERM, then SIGKILL
+ * after 5 s, and the browser session is closed. A run cut short leaves an
+ * app the next boot ends. */
+export const CAMERA_STOP_WAIT_MS = 10_000;
+
 /** How long shutdown waits for an in-flight producer stop (issue #455) before
  * the wave and registry teardown it drives are disposed underneath it. A pass
  * cut short leaves its `requested` record, which the next boot re-proves. */
