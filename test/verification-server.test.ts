@@ -290,6 +290,17 @@ async function startDelayingProxy(upstreamPort: number, delayMs: number): Promis
 }
 
 describe('POST /api/verify', () => {
+  it('PR media: refuses the reserved camera scope by name, and holds and releases a camera budget slot like any other', async () => {
+    const h = await boot();
+    const refused = await call(h.port, { job_id: h.jobId, scope: 'pr-media-capture' });
+    expect(refused.status).toBe(400);
+    expect(refused.json).toEqual({ error: 'reserved_scope', detail: expect.stringContaining('"pr-media-capture" is reserved for GC\'s PR media camera') });
+    const budget = h.server.budget();
+    const lease = await budget.acquire({ jobId: h.jobId, scope: 'pr-media-capture', command: 'npm run dev -- --port {port}', cwd: h.lanePath, head: null });
+    budget.release(lease);
+    expect(h.ledger.listJobEvents(h.jobId).filter((event) => event.kind.startsWith('verification.'))).toEqual([]);
+  });
+
   it('#542 a real run\'s request, process-started pid and lane row are what the in-turn fence passes for an admitted request', async () => {
     // The run holds until the test releases it, so both blockers are live when they are read.
     const release = join(tmpdir(), `gru-542-release-${process.pid}-${Date.now()}`);

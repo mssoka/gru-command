@@ -4460,3 +4460,8 @@ html.gru-modal-open {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
+
+/* Media owed, or a camera failure: the owner should act before merging. */
+.board-owner__media-note--owed {
+  color: var(--danger);
+}

@@ -479,6 +479,20 @@ export interface OwnerPrMediaItemView {
   readonly role: 'after' | 'before';
   readonly caption: string;
   readonly bytes: number;
+  /** `gc` when GC's camera filmed it from the minion's shot list; absent on
+   * servers before the camera (every capture was the minion's). */
+  readonly capturedBy?: 'minion' | 'gc';
+}
+
+/** Whether the head owes media and where GC's camera stands (docs/PR-MEDIA.md,
+ * "When media is owed"). */
+export interface OwnerPrMediaCoverageView {
+  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed' | 'unknown';
+  readonly touched: number;
+  readonly paths: readonly string[];
+  readonly skip: string | null;
+  readonly camera: 'pending' | 'filming' | 'filmed' | 'failed' | 'unconfigured' | null;
+  readonly detail: string | null;
 }
 
 export interface OwnerPrMediaView {
@@ -493,6 +507,8 @@ export interface OwnerPrMediaView {
     readonly at: string | null;
     readonly detail: string | null;
   } | null;
+  /** Absent on servers before the camera; null when none was recorded. */
+  readonly coverage?: OwnerPrMediaCoverageView | null;
 }
 
 const MEDIA_ID_RE = /^m-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -507,7 +523,24 @@ function isOwnerPrMediaItem(value: unknown): value is OwnerPrMediaItemView {
     (value.mediaType.startsWith('video/') ? value.kind === 'video' : value.kind === 'image') &&
     (value.role === 'after' || value.role === 'before') &&
     typeof value.caption === 'string' && value.caption !== '' &&
-    typeof value.bytes === 'number' && Number.isSafeInteger(value.bytes) && value.bytes > 0
+    typeof value.bytes === 'number' && Number.isSafeInteger(value.bytes) && value.bytes > 0 &&
+    (value.capturedBy === undefined || value.capturedBy === 'minion' || value.capturedBy === 'gc')
+  );
+}
+
+const COVERAGE_STATES: readonly unknown[] = ['owed', 'skipped', 'covered', 'not-owed', 'unknown'];
+const CAMERA_STATES: readonly unknown[] = ['pending', 'filming', 'filmed', 'failed', 'unconfigured'];
+
+function isOwnerPrMediaCoverage(value: unknown): value is OwnerPrMediaCoverageView {
+  return (
+    isRecord(value) &&
+    COVERAGE_STATES.includes(value.state) &&
+    typeof value.touched === 'number' && Number.isSafeInteger(value.touched) && value.touched >= 0 &&
+    Array.isArray(value.paths) && value.paths.every((path) => typeof path === 'string') &&
+    value.paths.length <= value.touched &&
+    (value.skip === null || typeof value.skip === 'string') &&
+    (value.camera === null || CAMERA_STATES.includes(value.camera)) &&
+    (value.detail === null || typeof value.detail === 'string')
   );
 }
 
@@ -518,6 +551,7 @@ function isOwnerPrMediaView(value: unknown, rowSha: string): value is OwnerPrMed
   if (value.headSha !== rowSha) return false;
   if (!Array.isArray(value.items) || !value.items.every(isOwnerPrMediaItem)) return false;
   if (typeof value.superseded !== 'number' || !Number.isSafeInteger(value.superseded) || value.superseded < 0) return false;
+  if (!(value.coverage === undefined || value.coverage === null || isOwnerPrMediaCoverage(value.coverage))) return false;
   const publication = value.publication;
   if (publication === null) return value.items.length === 0;
   return (

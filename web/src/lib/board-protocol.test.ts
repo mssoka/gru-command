@@ -496,6 +496,36 @@ describe('board server-frame validator', () => {
     }
   });
 
+  it('FOR YOU media coverage and GC captures: well-formed accepted, malformed rejected', () => {
+    const sha = 'a'.repeat(40);
+    const ready = {
+      id: 'owner-pr:job-1', jobId: 'job-1', jobTitle: 'Ready heist', repo: 'demo-repo',
+      prUrl: 'https://github.com/example/demo/pull/7', sha, checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const item = { id: 'm-12345678-1234-1234-1234-123456789abc', kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: 120, capturedBy: 'gc' };
+    const coverage = { state: 'owed', touched: 3, paths: ['web/src/a.ts', 'web/src/b.ts'], skip: null, camera: 'failed', detail: 'shot "card" step 2 failed' };
+    const valid = (media: unknown): boolean => isValidSnapshot({ ...snapshot(), ownerPrs: [{ ...ready, media }] } as unknown);
+    // Owed with nothing captured: the block carries coverage only.
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: null })).toBe(true);
+    expect(valid({ headSha: sha, items: [item], superseded: 0, publication: { state: 'pending', at: null, detail: null }, coverage: { ...coverage, state: 'covered', camera: 'filmed', detail: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [{ ...item, capturedBy: 'minion' }], superseded: 0, publication: { state: 'pending', at: null, detail: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: { ...coverage, state: 'skipped', skip: 'no visible change', camera: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: { state: 'unknown', touched: 0, paths: [], skip: null, camera: null, detail: 'the merge base could not be found' } })).toBe(true);
+    for (const broken of [
+      { ...coverage, state: 'maybe' },
+      { ...coverage, touched: -1 },
+      { ...coverage, touched: 1 }, // lists more paths than it counts
+      { ...coverage, paths: [3] },
+      { ...coverage, skip: 4 },
+      { ...coverage, camera: 'rolling' },
+      { ...coverage, detail: {} },
+    ]) {
+      expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: broken }), JSON.stringify(broken)).toBe(false);
+    }
+    expect(valid({ headSha: sha, items: [{ ...item, capturedBy: 'robot' }], superseded: 0, publication: { state: 'pending', at: null, detail: null } })).toBe(false);
+  });
+
   it('managed repo overview: absent/null tolerated, well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), repoOverview: null } as unknown)).toBe(true);

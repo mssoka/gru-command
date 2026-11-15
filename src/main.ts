@@ -86,6 +86,8 @@ import { readRollState } from './roll/state.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { createMediaServer } from './media/server.js';
 import { PrMediaPublisher } from './media/publisher.js';
+import { CameraDirector } from './media/director.js';
+import { AgentBrowserDriver } from './media/web-adapter.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { JournalStore } from './lessons/journal.js';
 import { BibleStore } from './lessons/bible.js';
@@ -1914,6 +1916,20 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   verificationView = () => verifyServer.view();
+  // GC's camera (PR media, docs/PR-MEDIA.md): films each live job's shot list
+  // at its lane's exact committed head, in a throwaway checkout of that head
+  // (never in the lane), under the verification budget, and journals whether
+  // each head owes media. A delivery asks for a tick at once, so the
+  // delivered head is filmed without waiting for the next one.
+  const camera = new CameraDirector({
+    ledger,
+    dataDir: config.dataDir,
+    config: () => config.prMedia,
+    budget: () => verifyServer.budget(),
+    driver: new AgentBrowserDriver(),
+    setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   // Report-lane slimming (#427): a delivered, idle report job's lane loses
   // its manifest's reclaim folders; the lane's setup brings them back.
   const laneSlimmer = new ReportLaneSlimmer({
@@ -1965,6 +1981,12 @@ async function main(): Promise<number> {
   const diskServer = createDiskServer({ token: config.auth.token, service: disk, log: (level, msg, fields) => logger.log(level, msg, fields) });
   onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
+  state.camera = camera;
+  // Started (its boot cleanup first) before any delivery can ask for a tick.
+  camera.start();
+  bus.subscribe((event) => {
+    if (event.kind === 'job.delivered') camera.requestTick();
+  });
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
   // same seam chat and dispatch both ride — workspace browse (on-disk
   // picks send paths, never bytes) + uploads materialization

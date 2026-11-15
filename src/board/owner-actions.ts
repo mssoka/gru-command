@@ -162,6 +162,27 @@ export interface OwnerPrMediaItemView {
   readonly role: 'after' | 'before';
   readonly caption: string;
   readonly bytes: number;
+  /** `gc` when GC's camera filmed it from the shot list, `minion` when the
+   * minion submitted it. */
+  readonly capturedBy: 'minion' | 'gc';
+}
+
+/** Whether the head owes media (owner ruling Q4) and where GC's camera
+ * stands with the shot list (docs/PR-MEDIA.md, "When media is owed"). */
+export interface OwnerPrMediaCoverageView {
+  /** `owed`: the diff touches `[capture] paths` with no capture and no skip
+   * reason; `skipped`: the shot list says why none is needed; `covered`: a
+   * capture is bound to the head; `not-owed`: no capture path is touched;
+   * `unknown`: owing could not be decided (`detail` says why). */
+  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed' | 'unknown';
+  readonly touched: number;
+  /** The first touched paths (at most 10). */
+  readonly paths: readonly string[];
+  readonly skip: string | null;
+  readonly camera: 'pending' | 'filming' | 'filmed' | 'failed' | 'unconfigured' | null;
+  /** Why owing is unknown, a refused shot list, or the camera's latest
+   * failure. */
+  readonly detail: string | null;
 }
 
 /** Where the current captures stand on the PR/MR description. */
@@ -179,6 +200,8 @@ export interface OwnerPrMediaView {
   readonly superseded: number;
   /** Null when no capture is bound to the current head. */
   readonly publication: OwnerPrMediaPublication | null;
+  /** Null when no coverage was recorded for the head. */
+  readonly coverage: OwnerPrMediaCoverageView | null;
 }
 
 /** Only https URLs may become an OPEN link (fail closed otherwise). */

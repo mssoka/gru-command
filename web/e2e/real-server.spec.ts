@@ -579,7 +579,8 @@ test.describe('board (E6)', () => {
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: { id: 'e2e-media-job', repo: 'demo-repo', title: 'Media heist' } });
     const listed = await page.request.get(`${base}?job_id=e2e-media-job`, { headers });
     expect(listed.ok()).toBe(true);
-    expect(await listed.json()).toEqual({ job_id: 'e2e-media-job', media: [] });
+    // The camera's latest run and the newest media coverage ride along (none yet).
+    expect(await listed.json()).toEqual({ job_id: 'e2e-media-job', media: [], camera: null, coverage: null });
     expect((await page.request.get(`${base}/m-00000000-0000-0000-0000-000000000000`, { headers })).status()).toBe(404);
   });
 

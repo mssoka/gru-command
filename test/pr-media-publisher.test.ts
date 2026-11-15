@@ -468,7 +468,7 @@ describe('PR media publisher', () => {
     observeGitHub(w, HEAD);
     capture(w, 'a'.repeat(40), 'Older head');
     const row = { jobId: 'j-ui', prUrl: PR, sha: HEAD };
-    expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, true)).toEqual({ headSha: HEAD, items: [], superseded: 1, publication: null });
+    expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, true)).toEqual({ headSha: HEAD, items: [], superseded: 1, publication: null, coverage: null });
     const item = capture(w, HEAD, 'Current');
     expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, true)).toMatchObject({
       items: [{ id: item.id, kind: 'image', role: 'after', caption: 'Current' }],

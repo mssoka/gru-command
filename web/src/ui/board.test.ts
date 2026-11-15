@@ -4291,6 +4291,50 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     }
   });
 
+  it('ready PR row says when media is owed, why it was skipped, who filmed it, and where GC\'s camera stands', () => {
+    const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+    const createSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:x');
+    try {
+      const view = new BoardView(() => {});
+      view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia: vi.fn(() => Promise.resolve(new Blob(['x']))) } as unknown as import('../lib/board-client.js').BoardClient);
+      const owed = { state: 'owed' as const, touched: 5, paths: ['web/src/ui/board.ts', 'web/src/styles/components.css', 'web/index.html', 'web/src/a.ts'], skip: null, camera: null, detail: null };
+      // The FOR YOU band's row (the bell repeats it).
+      const notes = (): readonly string[] =>
+        [...document.getElementById('board-owner')!.querySelectorAll('.board-owner__media-note')].map((node) => node.textContent ?? '');
+      const render = (coverage: unknown, items: readonly unknown[] = []): void => {
+        view.render(snapshot({ ownerPrs: [ownerPr('job-owed', {
+          sha,
+          media: { headSha: sha, items, superseded: 0, publication: items.length === 0 ? null : { state: 'published', at: null, detail: null }, coverage },
+        } as never)] }));
+      };
+      render(owed);
+      expect(notes()).toEqual(['📸 media owed: 5 changed files under [capture] paths (web/src/ui/board.ts, web/src/styles/components.css, web/index.html +2 more) — no capture and no skip reason']);
+      expect(document.querySelector('.board-owner__media-note--owed')).not.toBeNull();
+      render({ ...owed, camera: 'failed', detail: 'shot "card" step 2 (click "#go") failed at desktop: Element not found' });
+      expect(notes()[1]).toBe('🎬 Gru Command could not film the shot list: shot "card" step 2 (click "#go") failed at desktop: Element not found');
+      render({ ...owed, camera: 'filming' });
+      expect(notes()[1]).toBe('🎬 Gru Command is filming the shot list…');
+      render({ ...owed, camera: 'pending', detail: 'the app was not ready' });
+      expect(notes()[1]).toBe('🎬 Gru Command films the shot list once the head settles (last try: the app was not ready)');
+      render({ ...owed, shotList: undefined, camera: null, detail: 'shot_list_invalid: shot-list.json version must be 1' });
+      expect(notes()[1]).toBe('🎬 shot list refused: shot_list_invalid: shot-list.json version must be 1');
+      render({ state: 'skipped', touched: 1, paths: ['web/a.ts'], skip: 'renames an internal helper', camera: null, detail: null });
+      expect(notes()).toEqual(['📸 no media: renames an internal helper']);
+      render({ state: 'unknown', touched: 0, paths: [], skip: null, camera: null, detail: 'manifest_invalid: [capture] paths lists only exclusions' });
+      expect(notes()).toEqual(['📸 media check failed: manifest_invalid: [capture] paths lists only exclusions']);
+      render({ ...owed, camera: 'unconfigured', detail: 'the head\'s [capture] declares no serve and ready, so GC cannot film this shot list' });
+      expect(notes()[1]).toBe('🎬 the head\'s [capture] declares no serve and ready, so GC cannot film this shot list');
+      const filmed = { id: 'm-44444444-4444-4444-4444-444444444444', kind: 'image', mediaType: 'image/png', role: 'after', caption: 'Card', bytes: 10, capturedBy: 'gc' };
+      render({ state: 'covered', touched: 1, paths: ['web/a.ts'], skip: null, camera: 'filmed', detail: null }, [filmed]);
+      expect(notes()).toEqual(['📸 1 capture at aaaa1111 · filmed by Gru Command · posted to the PR ✓']);
+      const direct = { ...filmed, id: 'm-55555555-5555-5555-5555-555555555555', capturedBy: 'minion' };
+      render({ state: 'covered', touched: 1, paths: ['web/a.ts'], skip: null, camera: 'filmed', detail: null }, [filmed, direct]);
+      expect(notes()).toEqual(['📸 2 captures at aaaa1111 · 1 filmed by Gru Command · posted to the PR ✓']);
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
   it('a capture the server refuses names its reason, and a re-pair revokes old previews and fetches afresh', async () => {
     const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
     const still = { id: 'm-33333333-3333-3333-3333-333333333333', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'Card', bytes: 10 };
