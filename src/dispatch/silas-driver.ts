@@ -2492,6 +2492,7 @@ export class SilasDriver {
   private timer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private pollInFlight = false;
+  private mediaInFlight = false;
   private wakeInFlight: Promise<void> | null = null;
   private queuedTrigger: SilasTrigger | null = null;
   private passInFlight: Promise<DeterministicPassOutcome> | null = null;
@@ -2698,17 +2699,29 @@ export class SilasDriver {
           this.log('error', 'gitlab signal poll failed', { error: String(error).slice(0, 300) });
         }
       }
-      const media = this.opts.mediaPublisher;
-      if (media !== undefined) {
-        try {
-          await media.pollOnce();
-        } catch (error) {
-          this.log('error', 'pr media publication tick failed', { error: String(error).slice(0, 300) });
-        }
-      }
+      // PR media publication can take minutes (uploads): it starts after
+      // the provider observations but never holds the poll's in-flight
+      // guard, so merge and CI signals keep their cadence.
+      this.startMediaPublish();
     } finally {
       this.pollInFlight = false;
     }
+  }
+
+  /** One PR media publication tick on its own in-flight guard: a tick
+   * arriving while the previous one still uploads is skipped. */
+  private startMediaPublish(): void {
+    const media = this.opts.mediaPublisher;
+    if (media === undefined || this.disposed || this.mediaInFlight) return;
+    this.mediaInFlight = true;
+    void media
+      .pollOnce()
+      .catch((error: unknown) => {
+        this.log('error', 'pr media publication tick failed', { error: String(error).slice(0, 300) });
+      })
+      .finally(() => {
+        this.mediaInFlight = false;
+      });
   }
 
   /**

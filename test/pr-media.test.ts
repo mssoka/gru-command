@@ -6,6 +6,9 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { configPathFor, loadConfig } from '../src/config.js';
+import { renderReferenceConfig } from '../src/config-reference.js';
+import { appendWorkerRules, PR_MEDIA_RULE, WORKER_RULE_BLOCKS } from '../src/dispatch/worker-rules.js';
+import { parse as parseToml } from 'smol-toml';
 import {
   findMedia,
   listMedia,
@@ -70,7 +73,9 @@ describe('PR media store', () => {
     expect(sniffMediaType(minimalWebp())).toBe('image/webp');
     expect(sniffMediaType(webm())).toBe('video/webm');
     expect(sniffMediaType(mp4())).toBe('video/mp4');
-    expect(sniffMediaType(mp4('qt  '))).toBeNull();
+    expect(sniffMediaType(mp4('iso2'))).toBe('video/mp4');
+    // ISO base-media files that are not MP4 video share the ftyp box.
+    for (const brand of ['qt  ', 'heic', 'avif', 'mif1', 'M4A ', '3gp4']) expect(sniffMediaType(mp4(brand)), brand).toBeNull();
     // An EBML header that is not the webm doctype (Matroska) is refused.
     expect(sniffMediaType(Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('matroska'), Buffer.alloc(32)]))).toBeNull();
     expect(sniffMediaType(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'))).toBeNull();
@@ -95,7 +100,7 @@ describe('PR media store', () => {
 
   it('accepts one honest caption line and refuses empty, long or multi-line captions', () => {
     expect(validateCaption('  FOR YOU card at 375 px  ')).toBe('FOR YOU card at 375 px');
-    for (const bad of ['', '   ', 'x'.repeat(201), 'line one\nline two', 'tab\there', 'nel\u0085', 7]) {
+    for (const bad of ['', '   ', 'x'.repeat(201), 'line one\nline two', 'tab\there', 'nel\u0085', 'rtl \u202Egnp.exe', 'zero\u200Bwidth', 'iso\u2066late', 7]) {
       expect(() => validateCaption(bad)).toThrow(MediaError);
     }
   });
@@ -157,5 +162,24 @@ describe('PR media store', () => {
     expect(load('[pr_media]\nenabled = false\npublish = "never"\n').prMedia).toEqual({ enabled: false, publish: 'never' });
     expect(() => load('[pr_media]\npublish = "proposed"\n')).toThrow(/pr_media\.publish must be one of "autonomous", "never"/u);
     expect(() => load('[pr_media]\nmax_bytes = 5\n')).toThrow(/unknown key `max_bytes` in \[pr_media\]/u);
+  });
+
+  it('regenerating the config keeps the owner\'s [pr_media] choices instead of resetting them to the defaults', () => {
+    const home = directory();
+    writeFileSync(configPathFor(home), '[pr_media]\nenabled = false\npublish = "never"\n', { encoding: 'utf-8', mode: 0o600 });
+    const custom = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const text = renderReferenceConfig({ instanceDir: '/i', workspaceRoot: '/w', managedRepos: [], host: '127.0.0.1', port: 7665, token: 't', runtime: 'claude-code', model: 'default', thinkingLevel: 'default', roles: {} }, custom);
+    expect((parseToml(text) as Record<string, unknown>)['pr_media']).toEqual({ enabled: false, publish: 'never' });
+  });
+
+  it('every worker instruction carries the media rule, naming exactly the fields the capture API reads', () => {
+    expect(WORKER_RULE_BLOCKS).toContain(PR_MEDIA_RULE);
+    const brief = appendWorkerRules('Fix the FOR YOU wording.');
+    expect(brief).toContain('POST /api/media');
+    for (const field of ['"job_id"', '"head_sha"', '"caption"', '"role"', '"content_base64"']) expect(brief).toContain(field);
+    // Large bodies go through a file, never a command-line argument.
+    expect(brief).toContain('curl --data-binary @<file>');
+    // Read-only and review jobs are told to submit nothing.
+    expect(brief).toMatch(/Review, read-only and other non-publishing jobs submit nothing/u);
   });
 });

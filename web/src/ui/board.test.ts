@@ -4228,20 +4228,18 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const clip = { id: 'm-22222222-2222-2222-2222-222222222222', kind: 'video' as const, mediaType: 'video/webm', role: 'after' as const, caption: 'Approve flow', bytes: 20 };
     const fetchMedia = vi.fn((id: string) => Promise.resolve(new Blob([id])));
     const created: string[] = [];
-    const revoked: string[] = [];
     const createSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
       const url = `blob:test-${created.length + 1}`;
       created.push(url);
       return url;
     });
-    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url: string) => { revoked.push(url); });
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
     try {
       const view = new BoardView(() => {});
       view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia } as unknown as import('../lib/board-client.js').BoardClient);
-      const withMedia = ownerPr('job-shots', {
-        sha,
-        media: { headSha: sha, items: [still, clip], superseded: 1, publication: { state: 'published', at: '2026-01-01T00:06:00.000Z', detail: null } },
-      });
+      const media = (publication: NonNullable<NonNullable<BoardSnapshot['ownerPrs']>[number]['media']>['publication'], items = [still, clip], superseded = 1) =>
+        ({ headSha: sha, items, superseded, publication });
+      const withMedia = ownerPr('job-shots', { sha, media: media({ state: 'published', at: '2026-01-01T00:06:00.000Z', detail: null }) });
       view.render(snapshot({ ownerPrs: [withMedia] }));
       await vi.waitFor(() => expect(document.querySelector('.board-owner__shot--video video')).not.toBeNull());
       const row = document.getElementById('board-owner')!.querySelector('.board-owner__row--pr')!;
@@ -4251,19 +4249,59 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(row.querySelector<HTMLImageElement>('.board-owner__shot--image img')!.alt).toBe('New FOR YOU card');
       const video = row.querySelector<HTMLVideoElement>('.board-owner__shot--video video')!;
       expect(video.controls).toBe(true);
-      expect(row.querySelector('.board-owner__media-note')?.textContent).toBe('📸 2 captures at aaaa1111 · 1 older superseded · on the PR ✓');
+      const note = (): string | null | undefined => document.querySelector('.board-owner__media-note')?.textContent;
+      expect(note()).toBe('📸 2 captures at aaaa1111 · 1 older superseded · posted to the PR ✓');
       // A re-render reuses the same preview nodes (a playing clip keeps playing)
-      // and never fetches again.
+      // and never fetches again — even after the card blinks out for a snapshot.
+      view.render(snapshot({ ownerPrs: [] }));
       view.render(snapshot({ ownerPrs: [withMedia] }));
       expect(document.querySelector('.board-owner__shot--video video')).toBe(video);
       expect(fetchMedia).toHaveBeenCalledTimes(2);
-      // A failed publication says why; only older-head captures say so instead.
-      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: { headSha: sha, items: [still], superseded: 0, publication: { state: 'failed', at: null, detail: 'gh pr edit --attach failed (exit 1)' } } })] }));
-      expect(document.querySelector('.board-owner__media-note')?.textContent).toBe('📸 1 capture at aaaa1111 · not posted to the PR: gh pr edit --attach failed (exit 1)');
-      expect(revoked).toEqual(['blob:test-2']); // the clip left every card
-      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: { headSha: sha, items: [], superseded: 2, publication: null } })] }));
+      // Every publication state says where the media stands, in plain words.
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: media({ state: 'pending', at: null, detail: 'attempt 1 of 3 failed: HTTP 502' }, [still], 0) })] }));
+      expect(note()).toBe('📸 1 capture at aaaa1111 · posting to the PR… (attempt 1 of 3 failed: HTTP 502)');
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: media({ state: 'failed', at: null, detail: 'gh pr edit --attach failed (exit 1)' }, [still], 0) })] }));
+      expect(note()).toBe('📸 1 capture at aaaa1111 · not posted to the PR: gh pr edit --attach failed (exit 1)');
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: media({ state: 'off', at: null, detail: null }, [still], 0) })] }));
+      expect(note()).toBe('📸 1 capture at aaaa1111 · board only');
+      view.render(snapshot({ ownerPrs: [ownerPr('job-mr', {
+        sha,
+        provider: 'gitlab',
+        prUrl: 'https://gitlab.example.test/acme/app/-/merge_requests/7',
+        media: media({ state: 'published', at: null, detail: null }, [still], 0),
+      })] }));
+      expect(note()).toBe('📸 1 capture at aaaa1111 · posted to the MR ✓');
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: media(null, [], 2) })] }));
       expect(document.querySelector('.board-owner__media-strip')).toBeNull();
-      expect(document.querySelector('.board-owner__media-note')?.textContent).toBe('📸 2 captures from an older head — superseded, not shown');
+      expect(note()).toBe('📸 2 captures from an older head — superseded, not shown');
+    } finally {
+      createSpy.mockRestore();
+      revokeSpy.mockRestore();
+    }
+  });
+
+  it('a capture the server refuses names its reason, and a re-pair revokes old previews and fetches afresh', async () => {
+    const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+    const still = { id: 'm-33333333-3333-3333-3333-333333333333', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'Card', bytes: 10 };
+    const row = ownerPr('job-shots', { sha, media: { headSha: sha, items: [still], superseded: 0, publication: { state: 'published', at: null, detail: null } } });
+    const revoked: string[] = [];
+    const createSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:fresh');
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url: string) => { revoked.push(url); });
+    try {
+      const view = new BoardView(() => {});
+      const refused = vi.fn(() => Promise.reject(new BoardApiError('/api/media/x', 410, 'media_altered', 'changed')));
+      view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia: refused } as unknown as import('../lib/board-client.js').BoardClient);
+      view.render(snapshot({ ownerPrs: [row] }));
+      await vi.waitFor(() => expect(document.querySelector('.board-owner__shot-frame')?.textContent).toBe('preview unavailable: media_altered'));
+      view.render(snapshot({ ownerPrs: [row] }));
+      expect(refused).toHaveBeenCalledTimes(1); // no retry storm within a pairing
+      const fresh = vi.fn(() => Promise.resolve(new Blob(['ok'])));
+      view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia: fresh } as unknown as import('../lib/board-client.js').BoardClient);
+      view.render(snapshot({ ownerPrs: [row] }));
+      await vi.waitFor(() => expect(document.querySelector<HTMLImageElement>('.board-owner__shot-frame img')?.src).toBe('blob:fresh'));
+      expect(fresh).toHaveBeenCalledTimes(1);
+      view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia: fresh } as unknown as import('../lib/board-client.js').BoardClient);
+      expect(revoked).toEqual(['blob:fresh']); // a re-pair releases the old pairing's previews
     } finally {
       createSpy.mockRestore();
       revokeSpy.mockRestore();

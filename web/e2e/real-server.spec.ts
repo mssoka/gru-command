@@ -566,6 +566,23 @@ test.describe('board (E6)', () => {
     expect(resolved).toMatchObject({ resolvedBy: 'gru', decidedOption: 'approve' });
   });
 
+  test('the real service mounts the PR media API: token-locked, named refusals, metadata list (docs/PR-MEDIA.md)', async ({ page }) => {
+    const base = `http://127.0.0.1:${REAL_PORT}/api/media`;
+    const headers = { authorization: `Bearer ${REAL_TOKEN}` };
+    expect((await page.request.post(base, { data: {} })).status()).toBe(401);
+    const unknownJob = await page.request.post(base, {
+      headers,
+      data: { job_id: 'e2e-no-such-job', head_sha: 'a'.repeat(40), caption: 'Card', content_base64: 'iVBORw0KGgo=' },
+    });
+    expect(unknownJob.status()).toBe(404);
+    expect(await unknownJob.json()).toMatchObject({ error: 'job_not_found' });
+    await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: { id: 'e2e-media-job', repo: 'demo-repo', title: 'Media heist' } });
+    const listed = await page.request.get(`${base}?job_id=e2e-media-job`, { headers });
+    expect(listed.ok()).toBe(true);
+    expect(await listed.json()).toEqual({ job_id: 'e2e-media-job', media: [] });
+    expect((await page.request.get(`${base}/m-00000000-0000-0000-0000-000000000000`, { headers })).status()).toBe(404);
+  });
+
   test('unauthenticated board API is a locked door', async ({ page }) => {
     const res = await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`);
     expect(res.status()).toBe(401);

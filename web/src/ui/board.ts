@@ -176,6 +176,9 @@ export interface TranscriptOpenRequest {
   readonly label: string;
 }
 
+/** How long a capture's preview outlives the last card that showed it. */
+export const MEDIA_PREVIEW_GRACE_MS = 10 * 60_000;
+
 export class BoardView {
   private readonly mount: HTMLElement;
   private readonly ownerMount: HTMLElement;
@@ -225,9 +228,12 @@ export class BoardView {
   /** PR media previews (docs/PR-MEDIA.md): one object URL per capture,
    * fetched once per pairing with the token, and one preview node per
    * surface so a re-render never restarts a playing clip. */
-  private readonly mediaUrls = new Map<string, Promise<string | null>>();
+  private readonly mediaUrls = new Map<string, Promise<{ readonly url: string } | { readonly error: string }>>();
   private readonly mediaObjectUrls = new Map<string, string>();
   private readonly mediaNodes = new Map<string, HTMLElement>();
+  /** When each capture was last on a card (ms): previews outlive a card that
+   * blinks out for a snapshot. */
+  private readonly mediaSeen = new Map<string, number>();
   /** Lesson proposal rows' UI state by notification id, shared by the band
    * and the bell and kept across snapshot re-renders (review disclosure,
    * fetched review, in-flight decision, last refusal). Pruned when the
@@ -455,7 +461,7 @@ export class BoardView {
     const effective = this.withDecisionOverrides(snapshot);
     const previous = this.snapshot;
     this.snapshot = snapshot;
-    this.pruneMedia(snapshot);
+    this.pruneMedia();
     // Submissions end only when an authoritative snapshot carries an
     // outcome, removes the row, or an HTTP refresh after an option-state refusal
     // proves the current state (even when it matches the old content).
@@ -1141,17 +1147,18 @@ export class BoardView {
       // already refuses to project these; this is the browser guard).
       node.append(el('span', 'lbl board-owner__nolink', 'PR link unavailable'));
     }
-    if (pr.media !== undefined && pr.media !== null) node.append(this.ownerPrMedia(pr.media, surface));
+    if (pr.media !== undefined && pr.media !== null) node.append(this.ownerPrMedia(pr.media, pr.provider, surface));
     return node;
   }
 
   /** The ready card's media block: the captures bound to its exact head
    * (stills open full size, clips play in place), then one line saying
-   * where they stand on the PR. Captures of older heads are counted as
+   * where they stand on the PR/MR. Captures of older heads are counted as
    * superseded and never shown as current. */
-  private ownerPrMedia(media: OwnerPrMediaView, surface: 'band' | 'bell'): HTMLElement {
+  private ownerPrMedia(media: OwnerPrMediaView, provider: 'github' | 'gitlab' | undefined, surface: 'band' | 'bell'): HTMLElement {
     const block = el('div', 'board-owner__media');
     const plural = (count: number): string => (count === 1 ? '' : 's');
+    const change = provider === 'gitlab' ? 'MR' : 'PR';
     if (media.items.length === 0) {
       block.append(el(
         'div',
@@ -1163,15 +1170,16 @@ export class BoardView {
     const strip = el('div', 'board-owner__media-strip');
     for (const item of media.items) strip.append(this.mediaPreview(item, surface));
     const publication = media.publication;
+    const detail = publication?.detail ?? null;
     const where = publication === null
       ? ''
       : publication.state === 'published'
-        ? ' · on the PR ✓'
+        ? ` · posted to the ${change} ✓`
         : publication.state === 'pending'
-          ? ' · posting to the PR…'
+          ? ` · posting to the ${change}…${detail === null ? '' : ` (${detail})`}`
           : publication.state === 'failed'
-            ? ` · not posted to the PR: ${publication.detail ?? 'see the service log'}`
-            : ' · board only';
+            ? ` · not posted to the ${change}: ${detail ?? 'see the service log'}`
+            : ` · board only${detail === null ? '' : `: ${detail}`}`;
     const older = media.superseded > 0 ? ` · ${media.superseded} older superseded` : '';
     block.append(
       strip,
@@ -1183,6 +1191,7 @@ export class BoardView {
   /** One capture's preview node, reused across renders on its surface. */
   private mediaPreview(item: OwnerPrMediaItemView, surface: 'band' | 'bell'): HTMLElement {
     const key = `${surface}:${item.id}`;
+    this.mediaSeen.set(item.id, Date.now());
     const cached = this.mediaNodes.get(key);
     if (cached !== undefined) return cached;
     const label = item.role === 'before' ? 'before' : item.kind === 'video' ? 'clip' : 'after';
@@ -1191,15 +1200,15 @@ export class BoardView {
     const frame = el('div', 'board-owner__shot-frame', 'loading…');
     figure.append(frame, el('figcaption', 'board-owner__shot-caption', `${label} · ${item.caption}`));
     this.mediaNodes.set(key, figure);
-    void this.mediaUrl(item.id).then((url) => {
-      if (url === null) {
-        frame.textContent = 'preview unavailable';
+    void this.mediaUrl(item.id).then((loaded) => {
+      if ('error' in loaded) {
+        frame.textContent = `preview unavailable: ${loaded.error}`;
         return;
       }
       frame.textContent = '';
       if (item.kind === 'video') {
         const video = document.createElement('video');
-        video.src = url;
+        video.src = loaded.url;
         video.controls = true;
         video.preload = 'metadata';
         video.muted = true;
@@ -1209,12 +1218,12 @@ export class BoardView {
         return;
       }
       const link = el('a', 'board-owner__shot-link');
-      link.href = url;
+      link.href = loaded.url;
       link.target = '_blank';
       link.rel = 'noreferrer';
       link.title = 'Open full size';
       const image = document.createElement('img');
-      image.src = url;
+      image.src = loaded.url;
       image.alt = item.caption;
       image.loading = 'lazy';
       link.append(image);
@@ -1223,37 +1232,45 @@ export class BoardView {
     return figure;
   }
 
-  /** A capture's object URL, fetched once per pairing. A refused fetch stays
-   * "preview unavailable" until the next pairing, never a retry storm. */
-  private mediaUrl(id: string): Promise<string | null> {
+  /** A capture's object URL, fetched once per pairing. A refused fetch keeps
+   * its named reason until the next pairing, never a retry storm. */
+  private mediaUrl(id: string): Promise<{ readonly url: string } | { readonly error: string }> {
     const cached = this.mediaUrls.get(id);
     if (cached !== undefined) return cached;
     const client = this.boardClient;
-    if (client === null || typeof URL.createObjectURL !== 'function') return Promise.resolve(null);
+    if (client === null) return Promise.resolve({ error: 'board not paired' });
+    if (typeof URL.createObjectURL !== 'function') return Promise.resolve({ error: 'this browser cannot show previews' });
     const generation = this.clientGeneration;
-    const pending = client
+    const pending: Promise<{ readonly url: string } | { readonly error: string }> = client
       .fetchMedia(id)
       .then((blob) => {
-        if (generation !== this.clientGeneration) return null;
+        // A fetch that outlived its pairing or its cache entry creates nothing.
+        if (generation !== this.clientGeneration || this.mediaUrls.get(id) !== pending) return { error: 'superseded' };
         const url = URL.createObjectURL(blob);
         this.mediaObjectUrls.set(id, url);
-        return url;
+        return { url };
       })
-      .catch(() => null);
+      .catch((error: unknown) => ({
+        error: error instanceof BoardApiError ? (error.code ?? `HTTP ${error.status}`) : 'network error',
+      }));
     this.mediaUrls.set(id, pending);
     return pending;
   }
 
-  /** Drop the previews and object URLs of captures no longer on any card. */
-  private pruneMedia(snapshot: BoardSnapshot): void {
-    const keep = new Set((snapshot.ownerPrs ?? []).flatMap((pr) => pr.media?.items.map((item) => item.id) ?? []));
-    for (const [id, url] of this.mediaObjectUrls) {
-      if (keep.has(id)) continue;
-      URL.revokeObjectURL(url);
+  /** Drop the previews and object URLs of captures no card has shown for
+   * {@link MEDIA_PREVIEW_GRACE_MS}: a card that blinks out for one snapshot
+   * keeps its previews (and a playing clip keeps playing). */
+  private pruneMedia(): void {
+    const cutoff = Date.now() - MEDIA_PREVIEW_GRACE_MS;
+    for (const [id, seen] of this.mediaSeen) {
+      if (seen >= cutoff) continue;
+      const url = this.mediaObjectUrls.get(id);
+      if (url !== undefined) URL.revokeObjectURL(url);
       this.mediaObjectUrls.delete(id);
+      this.mediaUrls.delete(id);
+      this.mediaSeen.delete(id);
+      for (const key of [...this.mediaNodes.keys()]) if (key.slice(key.indexOf(':') + 1) === id) this.mediaNodes.delete(key);
     }
-    for (const id of [...this.mediaUrls.keys()]) if (!keep.has(id)) this.mediaUrls.delete(id);
-    for (const key of [...this.mediaNodes.keys()]) if (!keep.has(key.slice(key.indexOf(':') + 1))) this.mediaNodes.delete(key);
   }
 
   private resetMedia(): void {
@@ -1261,6 +1278,7 @@ export class BoardView {
     this.mediaObjectUrls.clear();
     this.mediaUrls.clear();
     this.mediaNodes.clear();
+    this.mediaSeen.clear();
   }
 
   // ------------------------------------------------------------------

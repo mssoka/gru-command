@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync, readSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { EventRecord } from '../ledger/api.js';
 import { assertDecodableImage, ReviewEvidenceError, sniffImageMediaType } from '../review-inputs/evidence.js';
@@ -21,6 +21,9 @@ import { assertDecodableImage, ReviewEvidenceError, sniffImageMediaType } from '
  */
 
 export const MEDIA_CAPTURED_EVENT = 'media.captured';
+/** A closed job's local copies were deleted (the PR/MR keeps the published
+ * ones; the board shows only live jobs). */
+export const MEDIA_SWEPT_EVENT = 'media.swept';
 
 /** GitHub's attachment cap for images and GIFs, and its video cap on the
  * Free plan (paid plans allow 100 MB video). One cap keeps every accepted
@@ -105,6 +108,10 @@ export function mediaRoot(dataDir: string): string {
 
 /** The job's directory name: a hash, so no job id spelling ever becomes a
  * path component. */
+export function mediaJobKey(jobId: string): string {
+  return jobKey(jobId);
+}
+
 function jobKey(jobId: string): string {
   return createHash('sha256').update(jobId).digest('hex').slice(0, 32);
 }
@@ -126,9 +133,13 @@ function ascii(bytes: Uint8Array, start: number, end: number): string {
   return text;
 }
 
+/** ISO base-media major brands that are MP4 video. HEIC/AVIF stills, M4A
+ * audio, 3GP and QuickTime share the `ftyp` box and are refused. */
+const MP4_VIDEO_BRANDS = new Set(['isom', 'iso2', 'iso3', 'iso4', 'iso5', 'iso6', 'mp41', 'mp42', 'avc1', 'M4V ', 'dash']);
+
 /** Media identity from magic bytes only — never from a name or a declared
  * type. WebM is the EBML header naming the `webm` doctype; MP4 is an ISO
- * base-media `ftyp` box whose brand is not QuickTime. Null = unsupported. */
+ * base-media `ftyp` box with a video major brand. Null = unsupported. */
 export function sniffMediaType(bytes: Uint8Array): MediaType | null {
   const image = sniffImageMediaType(bytes);
   if (image !== null) return image;
@@ -136,7 +147,7 @@ export function sniffMediaType(bytes: Uint8Array): MediaType | null {
     return ascii(bytes, 4, 64).includes('webm') ? 'video/webm' : null;
   }
   if (bytes.length >= 12 && ascii(bytes, 4, 8) === 'ftyp') {
-    return ascii(bytes, 8, 12) === 'qt  ' ? null : 'video/mp4';
+    return MP4_VIDEO_BRANDS.has(ascii(bytes, 8, 12)) ? 'video/mp4' : null;
   }
   return null;
 }
@@ -157,7 +168,7 @@ export function validateMediaBytes(bytes: Buffer): MediaType {
     throw new MediaError(
       415,
       'media_unsupported_type',
-      'unsupported capture: send PNG, JPEG, GIF or WebP stills, or WebM/MP4 clips (QuickTime .mov must be converted to MP4)',
+      'unsupported capture: send PNG, JPEG, GIF or WebP stills, or WebM/MP4 clips (convert QuickTime .mov to MP4, and HEIC/AVIF stills to PNG)',
     );
   }
   if (mediaKind(mediaType) === 'image') {
@@ -183,6 +194,11 @@ export function validateCaption(value: unknown): string {
     const code = character.codePointAt(0) ?? 0;
     if (code < 32 || code === 127 || (code >= 0x80 && code < 0xa0) || code === 0x2028 || code === 0x2029) {
       throw new MediaError(400, 'bad_request', 'caption must be a single line without control characters');
+    }
+    // Invisible and direction-changing characters can make a caption read
+    // differently from what it says.
+    if ((code >= 0x200b && code <= 0x200f) || (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069) || code === 0xfeff) {
+      throw new MediaError(400, 'bad_request', 'caption must not contain invisible or text-direction characters');
     }
   }
   return caption;
@@ -337,6 +353,33 @@ export function storeMedia(input: StoreMediaInput): MediaItem {
     recordedAt: event.ts,
     seq: event.seq,
   };
+}
+
+/** Delete a closed job's local captures and journal it. Null when the job
+ * has none on disk. The events stay: the record of what was captured is
+ * kept, only the bytes go. */
+export function sweepJobMedia(dataDir: string, ledger: Pick<MediaLedger, 'appendCustomEvent'>, jobId: string): { readonly files: number; readonly bytes: number } | null {
+  const dir = join(mediaRoot(dataDir), jobKey(jobId));
+  if (!existsSync(dir)) return null;
+  const stat = lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new MediaError(500, 'media_store_unsafe', `media store path ${dir} is not a plain directory`);
+  let files = 0;
+  let bytes = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    files += 1;
+    bytes += lstatSync(join(dir, entry.name)).size;
+  }
+  rmSync(dir, { recursive: true, force: true });
+  ledger.appendCustomEvent({ kind: MEDIA_SWEPT_EVENT, jobId, payload: { files, bytes } });
+  return { files, bytes };
+}
+
+/** The job keys that still hold captures on disk. */
+export function storedMediaJobKeys(dataDir: string): ReadonlySet<string> {
+  const root = mediaRoot(dataDir);
+  if (!existsSync(root)) return new Set();
+  return new Set(readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
 }
 
 /** Read a capture's bytes, re-verifying size and hash. A missing or altered

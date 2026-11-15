@@ -4530,19 +4530,24 @@ describe('silas driver gitlab signal poll', () => {
     }
   });
 
-  it('ticks the PR media publisher after both polls; its throw never stops a poll or the next tick', async () => {
+  it('ticks the PR media publisher after both polls on its own guard: a slow or failing publication never holds a poll', async () => {
     const { ticks, timers } = captureTimers();
     const logs: string[] = [];
     const order: string[] = [];
+    let release: () => void = () => {};
+    let publications = 0;
     const h = makeDriver({
       sweepIntervalMs: 0,
       pollIntervalMs: 5_000,
       githubPoll: { pollOnce: async () => (order.push('github'), emptyGitHubTick) },
       gitlabPoll: { pollOnce: async () => (order.push('gitlab'), emptyGitLabTick) },
       mediaPublisher: {
-        pollOnce: async () => {
+        pollOnce: () => {
           order.push('media');
-          throw new Error('gh down');
+          publications += 1;
+          // The first publication hangs (a long upload); later ones throw.
+          if (publications === 1) return new Promise<void>((resolve) => { release = resolve; });
+          return Promise.reject(new Error('gh down'));
         },
       },
       logs,
@@ -4552,9 +4557,15 @@ describe('silas driver gitlab signal poll', () => {
       h.driver.start();
       ticks[0]?.();
       await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media']));
-      expect(logs).toContain('error pr media publication tick failed');
+      // The upload is still running: the next interval still polls both
+      // providers and does not start a second publication.
       ticks[0]?.();
-      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media', 'github', 'gitlab', 'media']));
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media', 'github', 'gitlab']));
+      release();
+      await vi.waitFor(() => expect(order.length).toBe(5));
+      ticks[0]?.();
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media', 'github', 'gitlab', 'github', 'gitlab', 'media']));
+      await vi.waitFor(() => expect(logs).toContain('error pr media publication tick failed'));
     } finally {
       h.cleanup();
     }

@@ -579,7 +579,10 @@ export class BoardClient {
    * cannot send it, and handed back as a Blob for an object URL. */
   async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob> {
     const path = `/api/media/${encodeURIComponent(id)}`;
-    const res = await this.fetchImpl(path, {
+    // A local, as every call here: invoking `fetch` as a method of this
+    // client throws "Illegal invocation" in browsers.
+    const doFetch = this.fetchImpl;
+    const res = await doFetch(path, {
       headers: { authorization: `Bearer ${this.options.token}` },
       ...(signal !== undefined ? { signal } : {}),
     });

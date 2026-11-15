@@ -594,6 +594,9 @@ async function main(): Promise<number> {
     // PR media (docs/PR-MEDIA.md): FOR YOU ready-PR rows carry the captures
     // bound to their exact head.
     prMedia: () => config.prMedia,
+    // The publisher rides the Silas signal poll (below): with Silas or its
+    // poll off, the card says publishing is off instead of "posting".
+    prMediaPublishing: () => config.silas.enabled && config.silas.pollIntervalMs > 0,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
     // Issue #171 truthful agent status: the live registry's handle set is
     // the authoritative current-runtime ownership probe. Together with the

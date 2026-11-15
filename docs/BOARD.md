@@ -182,11 +182,13 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   head ([PR-MEDIA.md](./PR-MEDIA.md)): a strip of stills (each opens full
   size) and clips (each plays in place), then one line naming the head,
   any superseded older-head captures, and where the captures stand on the
-  PR (`on the PR ✓`, `posting to the PR…`, `not posted to the PR:
-  <reason>`, or `board only`). Captures of an older head are never shown
-  as current. The board fetches the bytes with the pairing token, once per
-  pairing, and keeps each preview node across re-renders so a playing clip
-  keeps playing.
+  PR/MR (`posted to the PR ✓`, `posting to the PR…` with the failed
+  attempt when one did, `not posted to the PR: <reason>`, or `board only`
+  with its reason). Captures of an older head are never shown as current.
+  The board fetches the bytes with the pairing token, once per pairing; a
+  refused fetch names its reason. Preview nodes survive re-renders (a
+  playing clip keeps playing) and a card that blinks out for a snapshot
+  keeps its previews for 10 minutes.
 
   Then the **attention
   bands** — NEEDS GRU → IN FLIGHT → SETTLED →

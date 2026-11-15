@@ -36,8 +36,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * it against any other head.
  */
 
-/** Base64 inflates 4/3, plus the JSON fields around it. */
-export const MEDIA_MAX_BODY_BYTES = Math.ceil((MEDIA_MAX_FILE_BYTES * 4) / 3) + 16 * 1024;
+/** Base64 inflates 4/3; wrapped base64 (76-character lines, JSON-escaped
+ * newlines) adds about 3% more; plus the JSON fields around it. The decoded
+ * capture is bounded separately, exactly. */
+export const MEDIA_MAX_BODY_BYTES = Math.ceil(((MEDIA_MAX_FILE_BYTES * 4) / 3) * 1.05) + 64 * 1024;
 
 export interface MediaServerLedger extends MediaLedger {
   getJob(id: string): { readonly id: string; readonly status: string } | null;
@@ -169,12 +171,16 @@ export function createMediaServer(options: MediaServerOptions): MediaServer {
     if (isTerminalJobStatus(job.status)) {
       throw new MediaError(409, 'job_terminal', `job "${jobId}" is ${job.status}; captures bind only to a live lane`);
     }
-    const lane = options.ledger
+    const lanes = options.ledger
       .listWorktrees({ jobId })
-      .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
-    if (lane === undefined) {
+      .filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+    if (lanes.length === 0) {
       throw new MediaError(409, 'no_active_lane', `job "${jobId}" has no active job worktree lane`);
     }
+    if (lanes.length > 1) {
+      throw new MediaError(409, 'lane_ambiguous', `job "${jobId}" has ${lanes.length} live job lanes; captures bind to exactly one`);
+    }
+    const lane = lanes[0]!;
     const state = gitState(lane.path);
     if (state.sha === null) throw new MediaError(409, 'lane_unreadable', `could not read HEAD of job "${jobId}"'s lane`);
     if (state.sha !== headSha) {
@@ -203,6 +209,7 @@ export function createMediaServer(options: MediaServerOptions): MediaServer {
   }
 
   function handleList(res: ServerResponse, query: URLSearchParams): void {
+    requireEnabled();
     const jobId = query.get('job_id');
     if (jobId === null || jobId === '') throw new MediaError(400, 'bad_request', 'job_id query parameter is required');
     if (options.ledger.getJob(jobId) === null) throw new MediaError(404, 'job_not_found', `job "${jobId}" not found`);
@@ -244,7 +251,13 @@ export function createMediaServer(options: MediaServerOptions): MediaServer {
     const byId = /^\/api\/media\/([^/]+)$/u.exec(path);
     if (byId !== null && req.method === 'GET') {
       if (!authed(req, res)) return true;
-      handleBytes(res, decodeURIComponent(byId[1] ?? ''));
+      let id: string;
+      try {
+        id = decodeURIComponent(byId[1] ?? '');
+      } catch {
+        throw new MediaError(404, 'media_not_found', 'capture id is not a valid capture id');
+      }
+      handleBytes(res, id);
       return true;
     }
     return false;

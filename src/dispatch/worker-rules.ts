@@ -37,15 +37,16 @@ export const BACKGROUND_PROCESS_RULE = [
  * PR media (owner rulings 2026-11-15, docs/PR-MEDIA.md): a minion whose change
  * is visible captures it from its committed head and submits each capture to
  * the service, which binds it to that head, shows it on the owner's FOR YOU
- * card and writes the PR description's media section. The service refuses a
- * capture unless the lane sits at exactly the named head with a clean tracked
- * tree, so a capture can never claim a commit it was not taken at.
+ * card and writes the PR description's media section. The service accepts a
+ * capture only while the lane sits at exactly the named head with a clean
+ * tracked tree: the record says which commit the capture was submitted at.
  */
 export const PR_MEDIA_RULE = [
   'PR MEDIA RULE (screenshots and clips for the owner\'s review):',
-  '- When your change alters something a person sees (a page, a component, CLI or terminal output), capture it from your committed head before you hand off: stills with `agent-browser screenshot`, a short clip with `agent-browser record start <file>.webm` and `agent-browser record stop`. PNG, JPEG, GIF, WebP, WebM or MP4; at most 10 MB each and 8 per head. A change with nothing visible needs no media.',
-  '- Submit each capture with POST /api/media and the body {"job_id": "<your job id>", "head_sha": "<your lane\'s full HEAD sha>", "caption": "<one line: what it shows>", "role": "after" (or "before" for the behavior it replaces), "content_base64": "<the file, base64>"}, authenticated like your other service calls. It is refused unless your lane sits at exactly that head with no uncommitted tracked changes.',
-  '- GC binds each capture to that head, shows it to the owner on the FOR YOU card and writes the PR description\'s media section. Never attach media to the PR yourself, never commit captures into the repository, and keep capture files outside your worktree.',
+  '- Applies only to work that changes something a person sees (a page, a component, a rendered output) in a contract that authorizes a pull request. Review, read-only and other non-publishing jobs submit nothing; a change with nothing visible needs no media.',
+  '- Capture it from your committed head before you hand off, with any screenshot or recording tool you have (for example `agent-browser screenshot`, or `agent-browser record start <file>.webm` then `record stop`). PNG, JPEG, GIF, WebP, WebM or MP4; at most 10 MB each and 8 per head. Add a "before" capture of the behavior it replaces only when your briefing asks for a comparison.',
+  '- Submit each capture with POST /api/media to the service (its address and `[auth]` token are in its instance config, as for POST /api/dispatch). Write the JSON body {"job_id": "<your job id>", "head_sha": "<your lane\'s full HEAD sha>", "caption": "<one line: what it shows>", "role": "after" or "before", "content_base64": "<the file, base64>"} to a file outside your worktree and send it with `curl --data-binary @<file>` (a capture is too large for a command-line argument). It is refused unless your lane sits at exactly that head with no uncommitted tracked changes; `pr_media_disabled` means skip media.',
+  '- GC binds each capture to that head, shows it to the owner on the FOR YOU card and writes the PR description\'s media section. Never attach media to the PR yourself, never commit captures into the repository, keep capture files outside your worktree, and keep the description\'s gc-media section intact when you edit the description.',
   '- Capture mock or seed data only: never real accounts, credentials, tokens or personal data. When your head moves (a fix round), submit fresh captures of the new head.',
 ].join('\n');
 

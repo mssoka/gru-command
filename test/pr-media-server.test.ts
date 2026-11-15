@@ -29,7 +29,7 @@ interface Fixture {
   readonly ledger: LedgerApi;
   readonly dataDir: string;
   readonly config: { value: PrMediaConfig };
-  readonly lanes: { kind: string; path: string; status: string }[];
+  readonly lanes: { jobId: string; kind: string; path: string; status: string }[];
   readonly git: { sha: string | null; trackedDirty: boolean };
 }
 
@@ -40,7 +40,11 @@ async function fixture(): Promise<Fixture> {
   dbs.push(db);
   const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
   ledger.addJob({ id: 'j-ui', repo: 'widget-shop', title: 'Plain-language cards' });
-  const lanes = [{ kind: 'job', path: '/lanes/j-ui', status: 'active' }];
+  ledger.addJob({ id: 'j-other', repo: 'widget-shop', title: 'Another heist' });
+  const lanes = [
+    { jobId: 'j-ui', kind: 'job', path: '/lanes/j-ui', status: 'active' },
+    { jobId: 'j-other', kind: 'job', path: '/lanes/j-other', status: 'active' },
+  ];
   const git = { sha: HEAD as string | null, trackedDirty: false };
   const config = { value: { enabled: true, publish: 'autonomous' } as PrMediaConfig };
   const port: MediaServerLedger = {
@@ -48,7 +52,8 @@ async function fixture(): Promise<Fixture> {
     listJobEvents: (jobId, opts) => ledger.listJobEvents(jobId, opts),
     latestEventByPayloadField: (kind, field, value) => ledger.latestEventByPayloadField(kind, field, value),
     getJob: (id) => ledger.getJob(id),
-    listWorktrees: () => lanes,
+    // Lanes are looked up per job, as the ledger does.
+    listWorktrees: (opts) => lanes.filter((lane) => lane.jobId === opts?.jobId),
   };
   const media = createMediaServer({
     ledger: port,
@@ -131,6 +136,9 @@ describe('PR media HTTP surface', () => {
     f.git.sha = null;
     expect(await (await submit(f.base, capture())).json()).toMatchObject({ error: 'lane_unreadable' });
     f.git.sha = HEAD;
+    f.lanes.push({ jobId: 'j-ui', kind: 'job', path: '/lanes/j-ui-old', status: 'paused' });
+    expect(await (await submit(f.base, capture())).json()).toMatchObject({ error: 'lane_ambiguous' });
+    f.lanes.pop();
     f.lanes[0]!.status = 'swept';
     expect(await (await submit(f.base, capture())).json()).toMatchObject({ error: 'no_active_lane' });
     expect(await (await submit(f.base, capture({ job_id: 'j-missing' }))).json()).toMatchObject({ error: 'job_not_found' });
@@ -150,12 +158,26 @@ describe('PR media HTTP surface', () => {
     expect(await error(submit(f.base, 'x'.repeat(MEDIA_MAX_BODY_BYTES + 1)))).toBe('413:media_too_large');
   });
 
-  it('requires the pairing token and honors [pr_media] enabled = false', async () => {
+  it('requires the pairing token on every route and honors [pr_media] enabled = false on every route', async () => {
     const f = await fixture();
+    const created = (await (await submit(f.base, capture())).json()) as { id: string };
     expect((await submit(f.base, capture(), 'wrong')).status).toBe(401);
     expect((await fetch(`${f.base}/api/media?job_id=j-ui`)).status).toBe(401);
+    expect((await fetch(`${f.base}/api/media/${created.id}`)).status).toBe(401);
     f.config.value = { enabled: false, publish: 'autonomous' };
+    const auth = { headers: { authorization: `Bearer ${TOKEN}` } };
     expect(await (await submit(f.base, capture())).json()).toMatchObject({ error: 'pr_media_disabled' });
+    expect(await (await fetch(`${f.base}/api/media?job_id=j-ui`, auth)).json()).toMatchObject({ error: 'pr_media_disabled' });
+    expect(await (await fetch(`${f.base}/api/media/${created.id}`, auth)).json()).toMatchObject({ error: 'pr_media_disabled' });
+  });
+
+  it('accepts a capture near the 10 MB cap sent as wrapped base64', async () => {
+    const f = await fixture();
+    const big = minimalPng(Buffer.alloc(9_900_000)); // an extra chunk-sized run of bytes inside a valid PNG
+    const wrapped = big.toString('base64').replace(/.{76}/gu, '$&\n');
+    const response = await submit(f.base, capture({ content_base64: wrapped }));
+    expect(response.status).toBe(201);
+    expect(((await response.json()) as { bytes: number }).bytes).toBe(big.length);
   });
 
   it('answers a missing capture 404 and an altered one 410, never the bytes', async () => {
@@ -163,6 +185,10 @@ describe('PR media HTTP surface', () => {
     const created = (await (await submit(f.base, capture())).json()) as { id: string };
     const get = (id: string): Promise<Response> => fetch(`${f.base}/api/media/${id}`, { headers: { authorization: `Bearer ${TOKEN}` } });
     expect((await get('m-00000000-0000-0000-0000-000000000000')).status).toBe(404);
+    // A malformed percent-escape is a named 404, never a 500.
+    const malformed = await get('%E0%A4%A');
+    expect(malformed.status).toBe(404);
+    expect(await malformed.json()).toMatchObject({ error: 'media_not_found' });
     const item = findMedia(f.ledger, created.id)!;
     writeFileSync(join(mediaRoot(f.dataDir), item.file), Buffer.concat([minimalPng(), Buffer.from('tail')]));
     const altered = await get(created.id);

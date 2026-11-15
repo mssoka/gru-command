@@ -539,11 +539,16 @@ export interface BoardEngineOptions {
   /** `[pr_media]` (late-bound config read): the FOR YOU ready-PR rows carry
    * the captures bound to their head. Absent = no media on the board. */
   readonly prMedia?: () => PrMediaConfig;
+  /** Whether the PR media publisher actually runs (it rides the Silas
+   * signal poll). False shows "off" with the reason instead of a "posting"
+   * that would never happen. Absent = running. */
+  readonly prMediaPublishing?: () => boolean;
 }
 
 export class BoardEngine {
   readonly mailbox: GruMailbox;
   private readonly prMedia: (() => PrMediaConfig) | null;
+  private readonly prMediaPublishing: () => boolean;
   private readonly ledger: LedgerApi;
   private readonly bus: EventBus;
   private readonly log: Log;
@@ -553,6 +558,7 @@ export class BoardEngine {
   constructor(opts: BoardEngineOptions) {
     this.ledger = opts.ledger;
     this.prMedia = opts.prMedia ?? null;
+    this.prMediaPublishing = opts.prMediaPublishing ?? (() => true);
     this.mailbox = new GruMailbox(opts.ledger, opts.now);
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
@@ -1048,7 +1054,7 @@ export class BoardEngine {
         const row = ownerReadyPr(job, readOwnerEvidence(this.ledger, job, this.now()));
         const prMedia = this.prMedia?.();
         if (row === null || prMedia === undefined) return row;
-        const media = ownerPrMediaView(this.ledger, job.id, row.sha, prMedia);
+        const media = ownerPrMediaView(this.ledger, row, prMedia, this.prMediaPublishing());
         return media === null ? row : { ...row, media };
       })
       .filter((row): row is OwnerPrView => row !== null)

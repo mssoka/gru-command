@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
@@ -8,30 +8,36 @@ import { LedgerDb } from '../src/ledger/db.js';
 import type { PrMediaConfig } from '../src/config.js';
 import {
   escapeMarkdown,
+  findMediaSection,
+  GITHUB_BODY_MAX_CHARS,
   MEDIA_PUBLISH_RETRY_MS,
+  MEDIA_PUBLISH_SETTLE_MS,
   MEDIA_SECTION_BEGIN,
   MEDIA_SECTION_END,
+  orderForSection,
   ownerPrMediaView,
+  parseGhVersion,
   PrMediaPublisher,
   renderMediaSection,
   repairAttachmentLayout,
   sectionFullyLinked,
-  stripMediaSection,
-  withMediaSection,
+  spliceMediaSection,
   type GhRunner,
 } from '../src/media/publisher.js';
-import { storeMedia, type MediaItem } from '../src/media/store.js';
+import { mediaJobKey, mediaRoot, readMediaBytes, storeMedia, type MediaItem } from '../src/media/store.js';
 import { minimalPng } from './helpers/images.js';
 
 /**
  * PR media publication (owner rulings 2026-11-15: PR body section replaced
  * each head; on and autonomous by default). One GC-owned section between two
- * markers, bound to the observed head, written only when the PR still sits at
- * that head, journaled on both sides of the write, never re-sent, and retried
- * a bounded number of times.
+ * marker lines, replaced in place, bound to the observed head, written only
+ * when the PR still sits at that head, journaled on both sides of the write,
+ * never re-sent for the same change/head/captures, retried a bounded number
+ * of times, and never left showing an older head as current.
  */
 
 const PR = 'https://github.com/widget-co/widget-shop/pull/42';
+const PR_NEW = 'https://github.com/widget-co/widget-shop/pull/43';
 const MR = 'https://gitlab.example.com/widget/shop/-/merge_requests/7';
 const HEAD = 'e'.repeat(40);
 const NEXT = 'f'.repeat(40);
@@ -65,17 +71,17 @@ function world(prUrl = PR): World {
   ledger.addJob({ id: 'j-ui', repo: 'widget-shop', title: 'Plain-language cards' });
   ledger.setJobPr('j-ui', prUrl);
   // The ledger stamps events with the real clock; the publisher's clock
-  // starts there and moves forward from it.
-  return { ledger, dataDir, now: Date.now() };
+  // starts past the settle window and moves forward from there.
+  return { ledger, dataDir, now: Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000 };
 }
 
-function observeGitHub(w: World, sha: string, open = true): void {
+function observeGitHub(w: World, sha: string, prUrl = PR): void {
   w.ledger.appendCustomEvent({
     kind: 'github.branch-state',
     jobId: 'j-ui',
     payload: {
-      repo: 'widget-co/widget-shop', branch: 'fix/570', sha, merged: false, pr_open: open, mergeable_state: 'clean',
-      pr_number: 42, pr_url: PR, merge_commit_sha: null, ci: null,
+      repo: 'widget-co/widget-shop', branch: 'fix/570', sha, merged: false, pr_open: true, mergeable_state: 'clean',
+      pr_number: Number(prUrl.split('/').at(-1)), pr_url: prUrl, merge_commit_sha: null, ci: null,
     },
   });
 }
@@ -84,30 +90,42 @@ function capture(w: World, headSha: string, caption: string, bytes = minimalPng(
   return storeMedia({ dataDir: w.dataDir, ledger: w.ledger, jobId: 'j-ui', headSha, caption, role, bytes });
 }
 
-/** A fake gh holding one PR. `videos: 'append'` mimics gh appending a
- * video player after the body instead of rewriting its reference. */
-function fakeGh(state: { body: string; head: string; prState: string }, opts: { videos?: 'rewrite' | 'append'; failEdit?: boolean } = {}) {
+interface FakePr { body: string; head: string; prState: string }
+
+/** A fake gh holding one PR. Modes: `append` mimics gh appending video
+ * players after the body instead of rewriting their references; `drop`
+ * leaves one reference unrewritten (an upload that did not land) and exits
+ * non-zero; `failEdit` fails the upload edit; `failRepair` fails the second
+ * (repair) edit. */
+function fakeGh(pr: FakePr, opts: { videos?: 'rewrite' | 'append'; drop?: boolean; failEdit?: boolean; failRepair?: boolean; version?: string; ledger?: LedgerApi } = {}) {
   const calls: string[][] = [];
   let asset = 0;
+  let edits = 0;
   const gh: GhRunner = async (args, run) => {
     calls.push([...args]);
+    if (args[0] === '--version') return { code: 0, stdout: `gh version ${opts.version ?? '2.101.0'} (2026-09-15)\n`, stderr: '' };
     if (args[0] === 'pr' && args[1] === 'view') {
-      return { code: 0, stdout: JSON.stringify({ body: state.body, headRefOid: state.head, state: state.prState }), stderr: '' };
+      return { code: 0, stdout: JSON.stringify({ body: pr.body, headRefOid: pr.head, state: pr.prState }), stderr: '' };
     }
     if (args[0] === 'pr' && args[1] === 'edit') {
-      if (opts.failEdit === true) return { code: 1, stdout: '', stderr: 'HTTP 502 while uploading' };
-      let body = readFileSync(args[args.indexOf('--body-file') + 1]!, 'utf-8');
+      edits += 1;
+      // The attempt is journaled BEFORE the irreversible write.
+      if (opts.ledger !== undefined) expect(opts.ledger.latestJobEvent('j-ui', 'media.publish-attempt')).not.toBeNull();
       const attached = args.flatMap((arg, index) => (args[index - 1] === '--attach' ? [arg] : []));
-      expect(run.cwd).toBeDefined();
+      if (attached.length > 0) expect(run.cwd).toBeDefined();
+      if (opts.failEdit === true && attached.length > 0) return { code: 1, stdout: '', stderr: 'HTTP 502 while uploading' };
+      if (opts.failRepair === true && attached.length === 0 && edits > 1) return { code: 1, stdout: '', stderr: 'HTTP 500 on repair' };
+      let body = readFileSync(args[args.indexOf('--body-file') + 1]!, 'utf-8');
       const appended: string[] = [];
-      for (const path of attached) {
+      for (const [index, path] of attached.entries()) {
         asset += 1;
         const url = `https://github.com/user-attachments/assets/asset-${asset}`;
+        if (opts.drop === true && index === 0) continue;
         if (path.endsWith('.webm') && opts.videos === 'append') appended.push(url);
         else body = body.split(`](${path})`).join(`](${url})`);
       }
-      state.body = appended.length === 0 ? body : `${body}\n${appended.join('\n')}`;
-      return { code: 0, stdout: PR, stderr: '' };
+      pr.body = appended.length === 0 ? body : `${body}\n${appended.join('\n')}`;
+      return opts.drop === true && attached.length > 0 ? { code: 1, stdout: PR, stderr: 'failed to upload gc-media-1.png' } : { code: 0, stdout: PR, stderr: '' };
     }
     throw new Error(`unexpected gh call ${args.join(' ')}`);
   };
@@ -122,192 +140,358 @@ function kinds(w: World): string[] {
   return w.ledger.listJobEvents('j-ui', { order: 'asc', limit: 500 }).map((event) => event.kind).filter((kind) => kind.startsWith('media.publish'));
 }
 
+function edits(calls: readonly string[][]): number {
+  return calls.filter((call) => call[1] === 'edit').length;
+}
+
 describe('PR media section text', () => {
-  it('renders before shots first, escapes captions so they can never become links, images or markers', () => {
-    expect(escapeMarkdown('[click](https://evil.example) <!-- x --> ![img](u) **bold**')).not.toMatch(/(?<!\\)[[\]()<>!*]/u);
+  it('renders before shots first and escapes captions so they never become links, mentions, emoji or markers', () => {
+    const escaped = escapeMarkdown('[click](https://evil.example) <!-- x --> ![img](u) **bold** @all-team :tada: %milestone &epic $snip');
+    expect(escaped).not.toMatch(/(?<!\\)[[\]()<>!*@:%&$]/u);
     const items = [
       { id: 'm-2', role: 'after', kind: 'image', seq: 2, caption: 'After [x](y)' },
       { id: 'm-1', role: 'before', kind: 'image', seq: 3, caption: 'Before' },
       { id: 'm-3', role: 'after', kind: 'video', seq: 4, caption: 'Clip' },
     ] as unknown as MediaItem[];
-    const section = renderMediaSection({ headSha: HEAD, items, targets: new Map([['m-1', './gc-media-1.png'], ['m-2', './gc-media-2.png'], ['m-3', './gc-media-3.webm']]) });
+    const ordered = orderForSection(items);
+    expect(ordered.map((item) => item.id)).toEqual(['m-1', 'm-2', 'm-3']);
+    const section = renderMediaSection({ headSha: HEAD, items: ordered, targets: new Map([['m-1', './gc-media-1.png'], ['m-2', './gc-media-2.png'], ['m-3', './gc-media-3.webm']]), change: 'MR' });
     expect(section.startsWith(MEDIA_SECTION_BEGIN)).toBe(true);
     expect(section.endsWith(MEDIA_SECTION_END)).toBe(true);
-    expect(section).toContain(`\`${HEAD.slice(0, 12)}\``);
+    expect(section).toContain(`Captured at \`${HEAD.slice(0, 12)}\``);
+    expect(section).toContain('when the MR head moves');
+    expect(section).not.toContain("this PR's head"); // never a claim about the current head
     expect(section.indexOf('**Before:**')).toBeLessThan(section.indexOf('**After:**'));
     expect(section).toContain('**Clip:** Clip');
     expect(section).toContain('After \\[x\\]\\(y\\)');
   });
 
-  it('replaces only its own section, keeps the author\'s text, and refuses damaged markers', () => {
-    const once = withMediaSection(HUMAN, `${MEDIA_SECTION_BEGIN}\nold\n${MEDIA_SECTION_END}`);
-    expect(stripMediaSection(once)).toBe(HUMAN);
-    expect(stripMediaSection(`${HUMAN}\n\n${MEDIA_SECTION_BEGIN}\nold\n${MEDIA_SECTION_END}\n\nAuthor note after.`)).toBe(`${HUMAN}\n\nAuthor note after.`);
-    expect(stripMediaSection(`${HUMAN}\n${MEDIA_SECTION_BEGIN}\nhalf a section`)).toBeNull();
-    expect(stripMediaSection(`${once}\n${once}`)).toBeNull();
-    expect(withMediaSection('', 'S')).toBe('S');
+  it('replaces only its own marker lines in place, and never mistakes quoted or fenced markers for its section', () => {
+    const old = `${MEDIA_SECTION_BEGIN}\nold\n${MEDIA_SECTION_END}`;
+    const body = `${HUMAN}\n\n${old}\n\nAuthor note after.\r\n`;
+    // In place: every byte outside the section is unchanged.
+    expect(spliceMediaSection(body, 'NEW')).toBe(`${HUMAN}\n\nNEW\n\nAuthor note after.\r\n`);
+    expect(spliceMediaSection(HUMAN, 'NEW')).toBe(`${HUMAN}\n\nNEW`);
+    expect(spliceMediaSection('', 'NEW')).toBe('NEW');
+    // A description that DISCUSSES the markers keeps every word.
+    const quoted = `GC writes between \`${MEDIA_SECTION_BEGIN}\` and \`${MEDIA_SECTION_END}\`.\n- Tests added.`;
+    expect(findMediaSection(quoted)).toBeNull();
+    expect(spliceMediaSection(quoted, 'NEW')).toBe(`${quoted}\n\nNEW`);
+    const fenced = `Example:\n\n\`\`\`md\n${old}\n\`\`\`\n`;
+    expect(findMediaSection(fenced)).toBeNull();
+    // Damage is refused, never guessed: a lone marker line, or two sections.
+    expect(spliceMediaSection(`${HUMAN}\n${MEDIA_SECTION_BEGIN}\nhalf`, 'NEW')).toBeNull();
+    expect(spliceMediaSection(`${old}\n\n${old}`, 'NEW')).toBeNull();
   });
 
-  it('moves attachments gh appended back into the section, never a person\'s own text or links', () => {
+  it('moves attachments gh appended at the end into the references they stand for, never a person\'s own text', () => {
     const body = [
-      HUMAN, '', MEDIA_SECTION_BEGIN, '**After:** a', '', '![a](https://github.com/user-attachments/assets/1)', '',
-      '**Clip:** b', '', '![b](./gc-media-2.webm)', '', MEDIA_SECTION_END,
-      'https://github.com/user-attachments/assets/2',
+      HUMAN, '', MEDIA_SECTION_BEGIN, '**After:** a', '', '![Settings \\[beta\\] toggle](https://github.com/user-attachments/assets/1)', '',
+      '**Clip:** b', '', '![Flow \\[x\\]](./gc-media-2.webm)', '', MEDIA_SECTION_END,
       'See https://example.com/docs too.',
+      'https://github.com/user-attachments/assets/2',
     ].join('\n');
+    // A caption with escaped brackets is still seen as unlinked.
     expect(sectionFullyLinked(body)).toBe(false);
     const repaired = repairAttachmentLayout(body);
     expect(sectionFullyLinked(repaired)).toBe(true);
     const [inside, after] = repaired.split(MEDIA_SECTION_END);
     expect(inside).toContain('https://github.com/user-attachments/assets/2');
     expect(inside).not.toContain('./gc-media-2.webm');
-    expect(after).toContain('See https://example.com/docs too.');
-    expect(repairAttachmentLayout(withMediaSection(HUMAN, 'x'))).toBe(withMediaSection(HUMAN, 'x'));
+    expect(after).toBe('\nSee https://example.com/docs too.');
+    expect(repairAttachmentLayout(`${HUMAN}\n\nx`)).toBe(`${HUMAN}\n\nx`);
+    expect(parseGhVersion('gh version 2.101.0 (2026-09-15)\nhttps://github.com/cli/cli/releases')).toEqual([2, 101, 0]);
+    expect(parseGhVersion('not gh')).toBeNull();
   });
 });
 
 describe('PR media publisher', () => {
-  it('writes the section for the observed head once, journaling the attempt before the write', async () => {
+  it('writes the section for the observed head once, after the captures settle, journaling the attempt before the write', async () => {
     const w = world();
     observeGitHub(w, HEAD);
     capture(w, HEAD, 'New FOR YOU card');
     capture(w, HEAD, 'Old FOR YOU card', minimalPng(), 'before');
-    const pr = { body: HUMAN, head: HEAD, prState: 'OPEN' };
-    const { gh, calls } = fakeGh(pr);
+    const pr = { body: `${HUMAN}\n\nTrailing author note.`, head: HEAD, prState: 'OPEN' };
+    const { gh, calls } = fakeGh(pr, { ledger: w.ledger });
+    const settled = w.now;
+    w.now = Date.now(); // captures just arrived: wait for the run to settle
+    expect(await publisher(w, gh).pollOnce()).toMatchObject({ considered: 0 });
+    expect(calls).toEqual([]);
+    w.now = settled;
     expect(await publisher(w, gh).pollOnce()).toMatchObject({ published: 1, failed: 0 });
     expect(kinds(w)).toEqual(['media.publish-attempt', 'media.published']);
-    expect(pr.body.startsWith(HUMAN)).toBe(true);
+    expect(pr.body.startsWith(`${HUMAN}\n\nTrailing author note.`)).toBe(true);
+    expect(pr.body.indexOf('**Before:**')).toBeLessThan(pr.body.indexOf('**After:**'));
     expect(pr.body).toContain('![Old FOR YOU card](https://github.com/user-attachments/assets/');
     expect(sectionFullyLinked(pr.body)).toBe(true);
-    const edit = calls.find((call) => call[1] === 'edit')!;
-    expect(edit.filter((arg) => arg === '--attach')).toHaveLength(2);
-    // The same head and captures are never re-sent.
+    expect(calls.find((call) => call[1] === 'edit')!.filter((arg) => arg === '--attach')).toHaveLength(2);
+    // The same change, head and captures are never re-sent.
     expect(await publisher(w, gh).pollOnce()).toMatchObject({ considered: 0, published: 0 });
-    expect(calls.filter((call) => call[1] === 'edit')).toHaveLength(1);
+    expect(edits(calls)).toBe(1);
   });
 
-  it('replaces the section when the head moves and new captures arrive, keeping exactly one section', async () => {
+  it('marks the section superseded when the head moves, replaces it with new captures, and re-sends a head that returns', async () => {
     const w = world();
     observeGitHub(w, HEAD);
     capture(w, HEAD, 'First head');
     const pr = { body: HUMAN, head: HEAD, prState: 'OPEN' };
     const { gh } = fakeGh(pr);
     await publisher(w, gh).pollOnce();
+    // A fix round moves the head and nothing is captured yet: the section
+    // must not keep presenting the old pixels as this PR.
     observeGitHub(w, NEXT);
     pr.head = NEXT;
-    // No captures at the new head yet: the old section stays, naming its own head.
-    expect(await publisher(w, gh).pollOnce()).toMatchObject({ considered: 0 });
+    expect(await publisher(w, gh).pollOnce()).toMatchObject({ published: 1 });
+    expect(pr.body).not.toContain('First head');
+    expect(pr.body).toContain(`taken at \`${HEAD.slice(0, 12)}\`; this PR is now at \`${NEXT.slice(0, 12)}\``);
+    expect(await publisher(w, gh).pollOnce()).toMatchObject({ considered: 0 }); // the note is not re-sent
     capture(w, NEXT, 'Second head');
+    w.now += MEDIA_PUBLISH_SETTLE_MS;
     expect(await publisher(w, gh).pollOnce()).toMatchObject({ published: 1 });
     expect(pr.body.split(MEDIA_SECTION_END)).toHaveLength(2);
     expect(pr.body).toContain('Second head');
-    expect(pr.body).not.toContain('First head');
-    expect(pr.body).toContain(NEXT.slice(0, 12));
+    // The head returns to HEAD (a revert): its captures are written again.
+    observeGitHub(w, HEAD);
+    pr.head = HEAD;
+    expect(await publisher(w, gh).pollOnce()).toMatchObject({ published: 1 });
+    expect(pr.body).toContain('First head');
+    expect(pr.body).not.toContain('Second head');
   });
 
-  it('repairs a video gh appended after the body so the section holds every capture', async () => {
+  it('keeps before and after in their places when gh appends the clips instead of rewriting them', async () => {
     const w = world();
     observeGitHub(w, HEAD);
-    capture(w, HEAD, 'Still');
-    capture(w, HEAD, 'Approve flow', webm());
+    capture(w, HEAD, 'After clip', webm());
+    capture(w, HEAD, 'Before clip', webm(), 'before');
     const pr = { body: HUMAN, head: HEAD, prState: 'OPEN' };
     const { gh, calls } = fakeGh(pr, { videos: 'append' });
     expect(await publisher(w, gh).pollOnce()).toMatchObject({ published: 1 });
-    expect(calls.filter((call) => call[1] === 'edit')).toHaveLength(2); // the upload, then the repair
+    expect(edits(calls)).toBe(2); // the upload, then the repair
+    // Files are named and attached in section order: gc-media-1 is the
+    // before clip, so the first appended asset belongs under "Before".
     const [inside, after] = pr.body.split(MEDIA_SECTION_END);
-    expect(inside).toContain('https://github.com/user-attachments/assets/asset-2');
+    expect(inside!.indexOf('**Before:** Before clip')).toBeLessThan(inside!.indexOf('assets/asset-1'));
+    expect(inside!.indexOf('assets/asset-1')).toBeLessThan(inside!.indexOf('**Clip:** After clip'));
+    expect(inside!.indexOf('**Clip:** After clip')).toBeLessThan(inside!.indexOf('assets/asset-2'));
     expect(after).toBe('');
   });
 
-  it('skips a moved or closed PR without recording anything, and never publishes in "never" mode', async () => {
+  it('skips a moved or closed PR without recording, publishes nothing when off or "never", and counts skips toward the per-tick cap', async () => {
     const w = world();
     observeGitHub(w, HEAD);
     capture(w, HEAD, 'Card');
     const moved = fakeGh({ body: HUMAN, head: NEXT, prState: 'OPEN' });
-    expect(await publisher(w, moved.gh).pollOnce()).toMatchObject({ skipped: 1, published: 0 });
+    expect(await publisher(w, moved.gh).pollOnce()).toMatchObject({ considered: 1, skipped: 1, published: 0 });
     const closed = fakeGh({ body: HUMAN, head: HEAD, prState: 'CLOSED' });
     expect(await publisher(w, closed.gh).pollOnce()).toMatchObject({ skipped: 1 });
     expect(kinds(w)).toEqual([]);
-    const never = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' });
-    expect(await publisher(w, never.gh, { enabled: true, publish: 'never' }).pollOnce()).toMatchObject({ considered: 0 });
-    expect(never.calls).toEqual([]);
+    for (const config of [{ enabled: true, publish: 'never' }, { enabled: false, publish: 'autonomous' }] as const) {
+      const quiet = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' });
+      expect(await publisher(w, quiet.gh, config).pollOnce()).toMatchObject({ considered: 0 });
+      expect(quiet.calls).toEqual([]);
+    }
+    // Three jobs owe a publication; a tick contacts at most two changes.
+    for (const id of ['j-b', 'j-c']) {
+      w.ledger.addJob({ id, repo: 'widget-shop', title: id });
+      w.ledger.setJobPr(id, PR);
+      w.ledger.appendCustomEvent({
+        kind: 'github.branch-state', jobId: id,
+        payload: { repo: 'widget-co/widget-shop', branch: id, sha: HEAD, merged: false, pr_open: true, mergeable_state: 'clean', pr_number: 42, pr_url: PR, merge_commit_sha: null, ci: null },
+      });
+      storeMedia({ dataDir: w.dataDir, ledger: w.ledger, jobId: id, headSha: HEAD, caption: 'Card', role: 'after', bytes: minimalPng() });
+    }
+    const busy = fakeGh({ body: HUMAN, head: NEXT, prState: 'OPEN' });
+    expect(await publisher(w, busy.gh).pollOnce()).toMatchObject({ considered: 2, skipped: 2 });
   });
 
-  it('retries a failing write at most three times, ten minutes apart, then shows it failed on the card', async () => {
+  it('retries a failing write three times, ten minutes apart, saying which attempt failed, then shows it failed', async () => {
     const w = world();
     observeGitHub(w, HEAD);
     capture(w, HEAD, 'Card');
     const { gh, calls } = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' }, { failEdit: true });
     expect(await publisher(w, gh).pollOnce()).toMatchObject({ failed: 1 });
+    expect(ownerPrMediaView(w.ledger, { jobId: 'j-ui', prUrl: PR, sha: HEAD }, AUTONOMOUS, true)?.publication)
+      .toMatchObject({ state: 'pending', detail: 'attempt 1 of 3 failed: gh pr edit --attach failed (exit 1): HTTP 502 while uploading' });
     expect(await publisher(w, gh).pollOnce()).toMatchObject({ considered: 0 }); // inside the retry gap
-    w.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
-    await publisher(w, gh).pollOnce();
-    w.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
-    await publisher(w, gh).pollOnce();
-    w.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
-    expect(await publisher(w, gh).pollOnce()).toMatchObject({ considered: 0 });
-    expect(calls.filter((call) => call[1] === 'edit')).toHaveLength(3);
-    const view = ownerPrMediaView(w.ledger, 'j-ui', HEAD, AUTONOMOUS);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      w.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
+      await publisher(w, gh).pollOnce();
+    }
+    expect(calls.filter((call) => call[1] === 'edit' && call.includes('--attach'))).toHaveLength(3);
+    const view = ownerPrMediaView(w.ledger, { jobId: 'j-ui', prUrl: PR, sha: HEAD }, AUTONOMOUS, true);
     expect(view?.publication).toMatchObject({ state: 'failed' });
     expect(view?.publication?.detail).toContain('HTTP 502 while uploading');
   });
 
-  it('projects the FOR YOU block: current captures, superseded count and publication state', async () => {
+  it('never leaves broken images: a partial upload or a failed repair is recorded as failed and replaced by a retry note', async () => {
+    const w = world();
+    observeGitHub(w, HEAD);
+    capture(w, HEAD, 'Card one');
+    capture(w, HEAD, 'Card two');
+    const pr = { body: HUMAN, head: HEAD, prState: 'OPEN' };
+    const dropped = fakeGh(pr, { drop: true });
+    expect(await publisher(w, dropped.gh).pollOnce()).toMatchObject({ failed: 1 });
+    expect(pr.body).not.toContain('./gc-media-');
+    expect(pr.body).toContain('did not complete; Gru Command will retry');
+    expect(w.ledger.latestJobEvent('j-ui', 'media.published')).toBeNull();
+
+    const w2 = world();
+    observeGitHub(w2, HEAD);
+    capture(w2, HEAD, 'Clip', webm());
+    const pr2 = { body: HUMAN, head: HEAD, prState: 'OPEN' };
+    const repairFails = fakeGh(pr2, { videos: 'append', failRepair: true });
+    expect(await publisher(w2, repairFails.gh).pollOnce()).toMatchObject({ failed: 1 });
+    expect(JSON.stringify(w2.ledger.latestJobEvent('j-ui', 'media.publish-failed')?.payload)).toContain('HTTP 500 on repair');
+  });
+
+  it('fails by name on preconditions: an old gh (retried), Enterprise Server and an oversize description (once)', async () => {
+    const w = world();
+    observeGitHub(w, HEAD);
+    capture(w, HEAD, 'Card');
+    const old = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' }, { version: '2.60.1' });
+    await publisher(w, old.gh).pollOnce();
+    expect(edits(old.calls)).toBe(0);
+    expect(JSON.stringify(w.ledger.latestJobEvent('j-ui', 'media.publish-failed')?.payload)).toContain('needs gh 2.99.0 or newer to attach files (found 2.60.1)');
+
+    const enterpriseUrl = 'https://code.acme.github/widget-co/widget-shop/pull/42';
+    const ghes = world(enterpriseUrl);
+    observeGitHub(ghes, HEAD, enterpriseUrl);
+    capture(ghes, HEAD, 'Card');
+    const enterprise = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' });
+    await publisher(ghes, enterprise.gh).pollOnce();
+    ghes.now += MEDIA_PUBLISH_RETRY_MS * 5;
+    expect(await publisher(ghes, enterprise.gh).pollOnce()).toMatchObject({ considered: 0 }); // final: no retry
+    expect(enterprise.calls).toEqual([]);
+    expect(ownerPrMediaView(ghes.ledger, { jobId: 'j-ui', prUrl: enterpriseUrl, sha: HEAD }, AUTONOMOUS, true)?.publication)
+      .toMatchObject({ state: 'failed', detail: expect.stringContaining('GitHub Enterprise Server') });
+
+    const long = world();
+    observeGitHub(long, HEAD);
+    capture(long, HEAD, 'Card');
+    const huge = fakeGh({ body: 'x'.repeat(GITHUB_BODY_MAX_CHARS), head: HEAD, prState: 'OPEN' });
+    await publisher(long, huge.gh).pollOnce();
+    expect(edits(huge.calls)).toBe(0);
+    expect(long.ledger.latestJobEvent('j-ui', 'media.publish-failed')?.payload).toMatchObject({ final: true, detail: expect.stringContaining('65536-character limit') });
+  });
+
+  it('publishes again when the job is re-pointed at another PR, and only against an observation of the job\'s own change', async () => {
+    const w = world();
+    observeGitHub(w, HEAD);
+    capture(w, HEAD, 'Card');
+    const first = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' });
+    await publisher(w, first.gh).pollOnce();
+    w.ledger.setJobPr('j-ui', PR_NEW);
+    // An observation still describing the old PR is not this change's head.
+    expect(await publisher(w, first.gh).pollOnce()).toMatchObject({ considered: 0 });
+    observeGitHub(w, HEAD, PR_NEW);
+    const second = fakeGh({ body: 'Recreated PR.', head: HEAD, prState: 'OPEN' });
+    expect(await publisher(w, second.gh).pollOnce()).toMatchObject({ published: 1 });
+    expect(second.calls.find((call) => call[1] === 'edit')).toContain(PR_NEW);
+  });
+
+  it('projects the FOR YOU block: current captures, superseded count, publication state, and an honest "off"', async () => {
     const w = world();
     observeGitHub(w, HEAD);
     capture(w, 'a'.repeat(40), 'Older head');
-    expect(ownerPrMediaView(w.ledger, 'j-ui', HEAD, AUTONOMOUS)).toEqual({ headSha: HEAD, items: [], superseded: 1, publication: null });
+    const row = { jobId: 'j-ui', prUrl: PR, sha: HEAD };
+    expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, true)).toEqual({ headSha: HEAD, items: [], superseded: 1, publication: null });
     const item = capture(w, HEAD, 'Current');
-    expect(ownerPrMediaView(w.ledger, 'j-ui', HEAD, AUTONOMOUS)).toMatchObject({
+    expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, true)).toMatchObject({
       items: [{ id: item.id, kind: 'image', role: 'after', caption: 'Current' }],
       superseded: 1,
-      publication: { state: 'pending' },
+      publication: { state: 'pending', detail: null },
     });
     const { gh } = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' });
     await publisher(w, gh).pollOnce();
-    expect(ownerPrMediaView(w.ledger, 'j-ui', HEAD, AUTONOMOUS)?.publication).toMatchObject({ state: 'published' });
-    expect(ownerPrMediaView(w.ledger, 'j-ui', HEAD, { enabled: true, publish: 'never' })?.publication).toMatchObject({ state: 'off' });
-    expect(ownerPrMediaView(w.ledger, 'j-ui', HEAD, { enabled: false, publish: 'autonomous' })).toBeNull();
+    expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, true)?.publication).toMatchObject({ state: 'published' });
+    expect(ownerPrMediaView(w.ledger, row, { enabled: true, publish: 'never' }, true)?.publication).toMatchObject({ state: 'off', detail: null });
+    expect(ownerPrMediaView(w.ledger, row, AUTONOMOUS, false)?.publication)
+      .toMatchObject({ state: 'off', detail: 'publishing runs on the Silas signal poll, which is off on this instance' });
+    expect(ownerPrMediaView(w.ledger, row, { enabled: false, publish: 'autonomous' }, true)).toBeNull();
   });
 
-  it('publishes to a GitLab merge request through the uploads API, never echoing the token', async () => {
+  it('publishes to a GitLab merge request through the uploads API, keeping an edit made during the uploads, never echoing the token', async () => {
+    const observe = (w: World, sha: string): void => {
+      w.ledger.appendCustomEvent({
+        kind: 'gitlab.mr-observed',
+        jobId: 'j-ui',
+        payload: { host: 'gitlab.example.com', project: 'widget/shop', mr_iid: 7, state: 'opened', head_sha: sha, head_pipeline: null, merge_commit_sha: null, mergeable: 'clean' },
+      });
+    };
     const w = world(MR);
-    w.ledger.appendCustomEvent({
-      kind: 'gitlab.mr-observed',
-      jobId: 'j-ui',
-      payload: { host: 'gitlab.example.com', project: 'widget/shop', mr_iid: 7, state: 'opened', head_sha: HEAD, head_pipeline: null, merge_commit_sha: null, mergeable: 'clean' },
-    });
+    observe(w, HEAD);
     capture(w, HEAD, 'Card');
-    const requests: { method: string; url: string; token: string | null }[] = [];
+    const requests: { method: string; url: string; token: string | null; redirect: string | undefined }[] = [];
     let description = 'MR text';
+    let reads = 0;
     const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
       const headers = (init?.headers ?? {}) as Record<string, string>;
-      requests.push({ method: init?.method ?? 'GET', url: String(url), token: headers['PRIVATE-TOKEN'] ?? null });
-      if (String(url).endsWith('/uploads')) return new Response(JSON.stringify({ url: '/uploads/secret123/gc-media-1.png' }), { status: 201 });
+      requests.push({ method: init?.method ?? 'GET', url: String(url), token: headers['PRIVATE-TOKEN'] ?? null, redirect: init?.redirect });
+      if (String(url).endsWith('/uploads')) {
+        description = 'MR text edited during the upload'; // a person edits meanwhile
+        return new Response(JSON.stringify({ url: '/uploads/secret123/gc-media-1.png' }), { status: 201 });
+      }
       if (init?.method === 'PUT') {
         description = (JSON.parse(String(init.body)) as { description: string }).description;
         return new Response('{}', { status: 200 });
       }
+      reads += 1;
       return new Response(JSON.stringify({ description, sha: HEAD, state: 'opened' }), { status: 200 });
     }) as typeof fetch;
     const result = await publisher(w, fakeGh({ body: '', head: HEAD, prState: 'OPEN' }).gh, AUTONOMOUS, { fetch: fetchImpl, env: { GITLAB_TOKEN: 'glpat-secret' } }).pollOnce();
     expect(result).toMatchObject({ published: 1 });
-    expect(requests.map((request) => request.method)).toEqual(['GET', 'POST', 'PUT']);
-    expect(requests.every((request) => request.url.startsWith('https://gitlab.example.com/api/v4/projects/widget%2Fshop') && request.token === 'glpat-secret')).toBe(true);
-    expect(description.startsWith('MR text')).toBe(true);
+    expect(reads).toBe(2); // once before, once right before the write
+    expect(requests.map((request) => request.method)).toEqual(['GET', 'POST', 'GET', 'PUT']);
+    expect(requests.every((request) => request.url.startsWith('https://gitlab.example.com/api/v4/projects/widget%2Fshop') && request.token === 'glpat-secret' && request.redirect === 'manual')).toBe(true);
+    expect(description.startsWith('MR text edited during the upload')).toBe(true);
     expect(description).toContain('![Card](/uploads/secret123/gc-media-1.png)');
+    expect(description).toContain('when the MR head moves');
 
+    // A merged MR, or one whose head moved, is skipped: no upload, no write, no record.
+    for (const answer of [{ state: 'merged', sha: HEAD }, { state: 'opened', sha: NEXT }]) {
+      const skip = world(MR);
+      observe(skip, HEAD);
+      capture(skip, HEAD, 'Card');
+      const seen: string[] = [];
+      const stub = (async (_url: string | URL, init?: RequestInit) => {
+        seen.push(init?.method ?? 'GET');
+        return new Response(JSON.stringify({ description: '', ...answer }), { status: 200 });
+      }) as typeof fetch;
+      expect(await publisher(skip, fakeGh({ body: '', head: HEAD, prState: 'OPEN' }).gh, AUTONOMOUS, { fetch: stub, env: { GITLAB_TOKEN: 't' } }).pollOnce()).toMatchObject({ skipped: 1 });
+      expect(seen).toEqual(['GET']);
+      expect(kinds(skip)).toEqual([]);
+    }
+
+    // A failed upload writes no description; the token is never echoed.
     const failing = world(MR);
-    failing.ledger.appendCustomEvent({
-      kind: 'gitlab.mr-observed',
-      jobId: 'j-ui',
-      payload: { host: 'gitlab.example.com', project: 'widget/shop', mr_iid: 7, state: 'opened', head_sha: HEAD, head_pipeline: null, merge_commit_sha: null, mergeable: 'clean' },
-    });
+    observe(failing, HEAD);
     capture(failing, HEAD, 'Card');
-    const echo = (async () => new Response('bad token glpat-secret', { status: 401 })) as unknown as typeof fetch;
+    const methods: string[] = [];
+    const echo = (async (url: string | URL, init?: RequestInit) => {
+      methods.push(init?.method ?? 'GET');
+      if (String(url).endsWith('/uploads')) return new Response('bad token glpat-secret', { status: 500 });
+      return new Response(JSON.stringify({ description: '', sha: HEAD, state: 'opened' }), { status: 200 });
+    }) as typeof fetch;
     await publisher(failing, fakeGh({ body: '', head: HEAD, prState: 'OPEN' }).gh, AUTONOMOUS, { fetch: echo, env: { GITLAB_TOKEN: 'glpat-secret' } }).pollOnce();
+    expect(methods).not.toContain('PUT');
     const failed = failing.ledger.latestJobEvent('j-ui', 'media.publish-failed');
-    expect(JSON.stringify(failed?.payload)).toContain('HTTP 401');
+    expect(JSON.stringify(failed?.payload)).toContain('HTTP 500');
     expect(JSON.stringify(failed?.payload)).not.toContain('glpat-secret');
+  });
+
+  it('deletes a closed job\'s local captures and journals it, whatever the publish mode', async () => {
+    const w = world();
+    observeGitHub(w, HEAD);
+    const item = capture(w, HEAD, 'Card');
+    const dir = join(mediaRoot(w.dataDir), mediaJobKey('j-ui'));
+    expect(existsSync(dir)).toBe(true);
+    const { gh } = fakeGh({ body: HUMAN, head: HEAD, prState: 'OPEN' });
+    expect(await publisher(w, gh, { enabled: true, publish: 'never' }).pollOnce()).toMatchObject({ swept: 0 });
+    w.ledger.setJobStatus('j-ui', 'binned');
+    expect(await publisher(w, gh, { enabled: true, publish: 'never' }).pollOnce()).toMatchObject({ swept: 1 });
+    expect(existsSync(dir)).toBe(false);
+    expect(w.ledger.latestJobEvent('j-ui', 'media.swept')?.payload).toEqual({ files: 1, bytes: item.bytes });
+    expect(() => readMediaBytes(w.dataDir, item)).toThrow(/no longer in the media store/u);
+    expect(await publisher(w, gh).pollOnce()).toMatchObject({ swept: 0 });
   });
 });

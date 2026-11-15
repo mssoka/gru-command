@@ -908,9 +908,11 @@ semantics, and the session-store contract, and
 clips are review evidence, not a risky action. A minion whose change is visible
 submits captures of its committed head; GC binds each one to that exact commit,
 shows it on the FOR YOU ready-PR card, and writes it into the PR/MR description
-between two GC markers. `publish = "never"` keeps captures on the board only;
-`enabled = false` turns the capture API off. On a public repository, published
-media is public, so captures use mock or seed data only.
+between two GC marker lines. `publish = "never"` keeps captures on the board
+only; `enabled = false` turns every capture route off. Publication rides the
+Silas signal poll; with Silas or its poll off, the card says publishing is off.
+On a public repository, published media is public, so captures use mock or
+seed data only.
 [PR-MEDIA.md](./PR-MEDIA.md) describes the whole flow.
 
 ### Vector's raids: `proposed` or `autonomous`
