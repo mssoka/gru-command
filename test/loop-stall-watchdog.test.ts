@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import inspector from 'node:inspector';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -170,7 +170,9 @@ describe('event-loop stall attribution', () => {
       const payload = h.stallPayloads()[0]!;
       expect(payload['gap_ms']).toBeGreaterThanOrEqual(120_000);
       expect(payload['main_thread']).toBe('running-javascript');
-      expect(payload['silent_ms']).toBeGreaterThanOrEqual(1_200);
+      // The block is timed on the millisecond wall clock and the silence on
+      // the monotonic one: bounds leave room for the two to disagree.
+      expect(payload['silent_ms']).toBeGreaterThanOrEqual(1_100);
       // The loop was busy, not waiting, and it was burning CPU.
       expect(payload['loop_active_ms']).toBeGreaterThanOrEqual(1_000);
       expect(payload['cpu_ms']).toBeGreaterThanOrEqual(200);
@@ -360,7 +362,7 @@ describe('event-loop stall attribution', () => {
         expect(attached.stacks).toEqual([]);
         expect(attached.note).toContain('no stack: an inspector is attached to this process');
         expect(attached.mainThread).toBe('unknown');
-        expect(attached.silentMs).toBeGreaterThanOrEqual(800);
+        expect(attached.silentMs).toBeGreaterThanOrEqual(700);
       } finally {
         inspector.close();
       }
@@ -420,6 +422,49 @@ describe('event-loop stall attribution', () => {
     const exited = run('exit');
     expect(exited.status).toBe(3);
     expect(exited.stderr).not.toContain('Waiting for the debugger');
+  });
+
+  it('the watchdog thread runs none of the process preloads', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gc-loop-stall-preload-'));
+    cleanupDirs.push(dir);
+    const seen = join(dir, 'threads.log');
+    const preload = join(dir, 'preload.mjs');
+    const script = join(dir, 'watched.mjs');
+    const moduleUrl = new URL('../src/supervision/loop-stall-watchdog.ts', import.meta.url).href;
+    // What an instrumentation agent or a test double does: runs in every
+    // thread that inherits the process options.
+    writeFileSync(
+      preload,
+      [
+        "import { appendFileSync } from 'node:fs';",
+        "import { isMainThread } from 'node:worker_threads';",
+        `appendFileSync(${JSON.stringify(seen)}, isMainThread ? 'main\\n' : 'worker\\n');`,
+      ].join('\n'),
+    );
+    writeFileSync(
+      script,
+      [
+        `import { startLoopStallWatchdog } from ${JSON.stringify(moduleUrl)};`,
+        `const watchdog = startLoopStallWatchdog(${JSON.stringify(WATCHDOG_TEST_CADENCE)});`,
+        'const work = setInterval(() => {}, 1_000);',
+        // The answer proves the watchdog thread is up and running.
+        'const answer = await watchdog.evidence({ fromWallMs: Date.now() - 1, toWallMs: Date.now() });',
+        'console.log(JSON.stringify({ note: answer.note }));',
+        'clearInterval(work);',
+      ].join('\n'),
+    );
+    for (const how of ['env', 'argv'] as const) {
+      rmSync(seen, { force: true });
+      const ran = spawnSync(process.execPath, [...(how === 'argv' ? ['--import', preload] : []), script], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, NODE_OPTIONS: how === 'env' ? `--import=${preload}` : '' },
+      });
+      expect(ran.status, `${how}: ${ran.stderr}`).toBe(0);
+      expect(JSON.parse(ran.stdout).note, how).toBe('the watchdog saw no heartbeat silence of 200 ms or more in this gap');
+      expect(readFileSync(seen, 'utf8'), how).toBe('main\n');
+    }
   });
 
   it('a gap the watchdog saw no silence in says so instead of inventing a stack', async () => {

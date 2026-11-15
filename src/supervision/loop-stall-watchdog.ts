@@ -386,7 +386,16 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
         import.meta.url.endsWith('.ts') ? './loop-stall-watchdog-worker.ts' : './loop-stall-watchdog-worker.js',
         import.meta.url,
       );
-      const worker = new Worker(entry, { workerData: data, name: 'gru-loop-stall-watchdog' });
+      // No inherited options or environment: a worker otherwise re-runs the
+      // process's `--import`/`--require` preloads (from NODE_OPTIONS or the
+      // command line) inside this thread, and a preload written for the
+      // service's main thread has no business in its watchdog.
+      const worker = new Worker(entry, {
+        workerData: data,
+        name: 'gru-loop-stall-watchdog',
+        execArgv: [],
+        env: {},
+      });
       worker.on('message', (message: WatchdogWorkerMessage) => this.onWorkerMessage(message));
       worker.on('error', (error) => this.workerFailed(`the watchdog thread failed: ${String(error)}`));
       worker.on('exit', (code) => {
