@@ -95,7 +95,7 @@ import {
   type OwnerPrRow,
   type OwnerProposalRow,
 } from '../lib/owner-band.js';
-import type { NotificationDecisionView, OwnerPrMediaItemView, OwnerPrMediaView } from '../lib/board-protocol.js';
+import type { NotificationDecisionView, OwnerPrMediaCoverageView, OwnerPrMediaItemView, OwnerPrMediaView } from '../lib/board-protocol.js';
 
 /** Detail text shown verbatim on the card face when it is short and
  * single-paragraph; anything longer lives behind the Details disclosure
@@ -174,6 +174,40 @@ function validWakeStamp(stamp: string | null): string | null {
 export interface TranscriptOpenRequest {
   readonly file: string;
   readonly label: string;
+}
+
+/** The FOR YOU lines for a head's media coverage (docs/PR-MEDIA.md, "When
+ * media is owed"): media owed (the diff touches `[capture] paths` with no
+ * capture and no skip reason), the shot list's skip reason, and where GC's
+ * camera stands. Exported for its tests. */
+export function coverageLines(coverage: OwnerPrMediaCoverageView | null): readonly HTMLElement[] {
+  if (coverage === null) return [];
+  const lines: HTMLElement[] = [];
+  if (coverage.state === 'owed') {
+    const listed = coverage.paths.slice(0, 3).join(', ');
+    const more = coverage.touched - Math.min(coverage.touched, 3, coverage.paths.length);
+    lines.push(el(
+      'div',
+      'lbl board-owner__media-note board-owner__media-note--owed',
+      `📸 media owed: ${coverage.touched} changed file${coverage.touched === 1 ? '' : 's'} under [capture] paths (${listed}${more > 0 ? ` +${more} more` : ''}) — no capture and no skip reason`,
+    ));
+  } else if (coverage.state === 'skipped') {
+    lines.push(el('div', 'lbl board-owner__media-note', `📸 no media: ${coverage.skip ?? 'the shot list gives a skip reason'}`));
+  }
+  const camera = coverage.camera;
+  const detail = coverage.detail;
+  if (camera === 'filming') lines.push(el('div', 'lbl board-owner__media-note', '🎬 Gru Command is filming the shot list…'));
+  else if (camera === 'pending') {
+    lines.push(el('div', 'lbl board-owner__media-note',
+      `🎬 Gru Command films the shot list once the head settles${detail === null ? '' : ` (last try: ${detail})`}`));
+  } else if (camera === 'failed') {
+    lines.push(el('div', 'lbl board-owner__media-note board-owner__media-note--owed', `🎬 Gru Command could not film the shot list: ${detail ?? 'see the service log'}`));
+  } else if (camera === 'unconfigured') {
+    lines.push(el('div', 'lbl board-owner__media-note', `🎬 ${detail ?? 'the repository declares no [capture] serve, so the shot list is not filmed'}`));
+  } else if (camera === null && detail !== null) {
+    lines.push(el('div', 'lbl board-owner__media-note board-owner__media-note--owed', `🎬 shot list refused: ${detail}`));
+  }
+  return lines;
 }
 
 /** How long a capture's preview outlives the last card that showed it. */
@@ -1159,12 +1193,16 @@ export class BoardView {
     const block = el('div', 'board-owner__media');
     const plural = (count: number): string => (count === 1 ? '' : 's');
     const change = provider === 'gitlab' ? 'MR' : 'PR';
+    const coverage = media.coverage ?? null;
     if (media.items.length === 0) {
-      block.append(el(
-        'div',
-        'lbl board-owner__media-note',
-        `📸 ${media.superseded} capture${plural(media.superseded)} from an older head — superseded, not shown`,
-      ));
+      if (media.superseded > 0) {
+        block.append(el(
+          'div',
+          'lbl board-owner__media-note',
+          `📸 ${media.superseded} capture${plural(media.superseded)} from an older head — superseded, not shown`,
+        ));
+      }
+      for (const line of coverageLines(coverage)) block.append(line);
       return block;
     }
     const strip = el('div', 'board-owner__media-strip');
@@ -1181,10 +1219,13 @@ export class BoardView {
             ? ` · not posted to the ${change}: ${detail ?? 'see the service log'}`
             : ` · board only${detail === null ? '' : `: ${detail}`}`;
     const older = media.superseded > 0 ? ` · ${media.superseded} older superseded` : '';
+    const filmed = media.items.filter((item) => item.capturedBy === 'gc').length;
+    const by = filmed === 0 ? '' : filmed === media.items.length ? ' · filmed by Gru Command' : ` · ${filmed} filmed by Gru Command`;
     block.append(
       strip,
-      el('div', 'lbl board-owner__media-note', `📸 ${media.items.length} capture${plural(media.items.length)} at ${media.headSha.slice(0, 8)}${older}${where}`),
+      el('div', 'lbl board-owner__media-note', `📸 ${media.items.length} capture${plural(media.items.length)} at ${media.headSha.slice(0, 8)}${by}${older}${where}`),
     );
+    for (const line of coverageLines(coverage)) block.append(line);
     return block;
   }
 

@@ -895,9 +895,10 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     const snap = wired.snapshot();
     expect(snap.ownerPrs[0]?.media).toEqual({
       headSha: SHA,
-      items: [{ id: current.id, kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: current.bytes }],
+      items: [{ id: current.id, kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: current.bytes, capturedBy: 'minion' }],
       superseded: 1,
       publication: { state: 'off', at: null, detail: 'publishing runs on the Silas signal poll, which is off on this instance' },
+      coverage: null,
     });
     expect(isValidSnapshot(JSON.parse(JSON.stringify(snap)) as unknown)).toBe(true);
     config = { enabled: false, publish: 'autonomous' };

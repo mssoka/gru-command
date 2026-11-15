@@ -29,7 +29,7 @@ import type { ManagedRepoOverviewTracker } from './repos/overview.js';
 import type { SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import type { LedgerApi } from './ledger/api.js';
 import { disposeDirectiveResources, type DirectiveProgressService } from './dispatch/directive-progress.js';
-import { DISK_RECLAIM_STOP_WAIT_MS, JOB_STOP_JOIN_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
+import { CAMERA_STOP_WAIT_MS, DISK_RECLAIM_STOP_WAIT_MS, JOB_STOP_JOIN_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 
 /**
  * Graceful-shutdown orchestration (issue #341). Extracted from `main.ts` with
@@ -83,6 +83,9 @@ export interface ServiceShutdownState {
   propertyCampaigns?: PropertyCampaignService;
   childWorkers?: ChildWorkerService;
   verify?: ReturnType<typeof createVerificationServer>;
+  /** PR media camera: its tick stops, and a run in flight ends its app and
+   * releases its verification slot before the scheduler is disposed. */
+  camera?: { stop(): Promise<void> };
   pipeline?: PipelineService;
   deployDrift?: DeployDriftTracker;
   directiveProgress?: DirectiveProgressService;
@@ -348,6 +351,11 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
         } catch (error) {
           logger.error('child worker shutdown failed', { error: String(error) });
         }
+      }
+      if (state.camera !== undefined) {
+        const camera = state.camera;
+        await stopWithin(logger, () => camera.stop(), CAMERA_STOP_WAIT_MS, 'pr media camera stop failed',
+          'the pr media camera did not stop in time; shutdown goes on (the next boot ends an app it left running)');
       }
       if (state.verify !== undefined) {
         try {

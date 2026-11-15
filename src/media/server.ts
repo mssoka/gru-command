@@ -4,6 +4,8 @@ import type { PrMediaConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { isTerminalJobStatus } from '../ledger/states.js';
 import { readGitState } from '../verify/scheduler.js';
+import type { EventRecord } from '../ledger/api.js';
+import { latestCameraEvent, MEDIA_COVERAGE_EVENT, readCoverage, type MediaCoverage } from './director.js';
 import {
   findMedia,
   isFullSha,
@@ -26,7 +28,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *
  *   POST /api/media                 — a minion submits one capture of its
  *                                     lane's committed head
- *   GET  /api/media?job_id=<id>     — the job's captures (metadata only)
+ *   GET  /api/media?job_id=<id>     — the job's captures (metadata only),
+ *                                     with the camera's latest run and the
+ *                                     newest media coverage
  *   GET  /api/media/<media id>      — one capture's bytes (the board's
  *                                     FOR YOU previews), hash re-verified
  *
@@ -83,7 +87,40 @@ export function mediaView(item: MediaItem): Record<string, unknown> {
     bytes: item.bytes,
     sha256: item.sha256,
     captured_by: item.capturedBy,
+    ...(item.shot === null ? {} : { shot: { run_id: item.shot.runId, shot_id: item.shot.shotId, viewport: item.shot.viewport } }),
     recorded_at: item.recordedAt,
+  };
+}
+
+/** The camera's latest run as the minion reads it: what happened, at which
+ * head and script, and why it failed. */
+export function cameraView(event: EventRecord | null): Record<string, unknown> | null {
+  if (event === null) return null;
+  const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload as Record<string, unknown> : {};
+  const state = event.kind === 'media.capture-filmed' ? 'filmed' : event.kind === 'media.capture-failed' ? 'failed' : 'started';
+  return {
+    state,
+    run_id: payload['run_id'] ?? null,
+    head_sha: payload['head_sha'] ?? null,
+    shot_list_sha256: payload['shot_list_sha256'] ?? null,
+    ...(state === 'failed' ? { code: payload['code'] ?? null, detail: payload['detail'] ?? null } : {}),
+    at: event.ts,
+  };
+}
+
+export function coverageView(coverage: MediaCoverage | null): Record<string, unknown> | null {
+  if (coverage === null) return null;
+  return {
+    head_sha: coverage.headSha,
+    state: coverage.state,
+    touched: coverage.touched,
+    paths: coverage.paths,
+    globs: coverage.globs,
+    skip: coverage.skip,
+    shot_list: coverage.shotList,
+    camera: coverage.camera,
+    detail: coverage.detail,
+    recorded_at: coverage.recordedAt,
   };
 }
 
@@ -213,7 +250,13 @@ export function createMediaServer(options: MediaServerOptions): MediaServer {
     const jobId = query.get('job_id');
     if (jobId === null || jobId === '') throw new MediaError(400, 'bad_request', 'job_id query parameter is required');
     if (options.ledger.getJob(jobId) === null) throw new MediaError(404, 'job_not_found', `job "${jobId}" not found`);
-    json(res, 200, { job_id: jobId, media: listMedia(options.ledger, jobId).map(mediaView) });
+    const coverage = options.ledger.listJobEvents(jobId, { kinds: [MEDIA_COVERAGE_EVENT], order: 'desc', limit: 1 })[0];
+    json(res, 200, {
+      job_id: jobId,
+      media: listMedia(options.ledger, jobId).map(mediaView),
+      camera: cameraView(latestCameraEvent(options.ledger, jobId)),
+      coverage: coverageView(coverage === undefined ? null : readCoverage(coverage)),
+    });
   }
 
   function handleBytes(res: ServerResponse, id: string): void {

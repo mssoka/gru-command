@@ -28,11 +28,30 @@ command = "npm install"
 [verify]                 # verification commands by scope (POST /api/verify;
 full = "npm test"        #   see FLOW.md §4c — default scope `full`)
 quick = "npm run lint"
+
+[capture]                # PR media (PR-MEDIA.md): what owes media, and how
+paths = ["web/src/**"]   #   GC's camera starts the app to film the shot list
+serve = "npm run dev -- --port {port}"
+ready = "http://127.0.0.1:{port}/"
 ```
 
-Scope names are lowercase identifiers; `onboarding-proof` is reserved for
-GC's onboarding proof ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)),
-and a manifest that declares it is refused by name.
+Scope names are lowercase identifiers. `onboarding-proof` is reserved for
+GC's onboarding proof ([ONBOARDING.md](./ONBOARDING.md#proof-before-review))
+and `pr-media-capture` for GC's PR media camera
+([PR-MEDIA.md](./PR-MEDIA.md#gcs-camera)); a manifest that declares either is
+refused by name.
+
+**`[capture]`** ([PR-MEDIA.md](./PR-MEDIA.md#the-capture-table)) is validated
+fail-loud like `[verify]`, each refusal naming its key:
+
+- `paths`: repository-relative globs (`*`, `**` as a whole segment, `?`, and
+  a leading `!` that excludes); no absolute path, `..`, `[ ]` or `{ }` set,
+  repeat, or list of exclusions only; at most 64.
+- `serve` and `ready` come together. `serve` must hold `{port}`. `ready` is a
+  loopback `http://` URL whose port is `{port}`, or `output:<text>`.
+- `url` (optional) is the loopback base the shots open; `ready_timeout_ms`
+  (optional, 1000–600000, default 120000) bounds the wait for `ready`.
+- An empty table or an unknown key is refused.
 
 A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call

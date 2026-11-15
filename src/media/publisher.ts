@@ -22,6 +22,7 @@ import {
   type MediaItem,
   type MediaLedger,
 } from './store.js';
+import { coverageAtHead, MEDIA_COVERAGE_EVENT, readCoverage, type MediaCoverage } from './director.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -170,6 +171,47 @@ export function renderNoticeSection(note: string): string {
 export function supersededNote(change: ChangeKind, capturesHead: string, headSha: string): string {
   return `The captures shown here earlier were taken at \`${capturesHead.slice(0, 12)}\`; this ${change} is now at ` +
     `\`${headSha.slice(0, 12)}\`. Gru Command replaces this note when the new head is captured.`;
+}
+
+/** The note replacing an owed or skipped note written for an older head. */
+export function movedNote(change: ChangeKind, noteHead: string, headSha: string): string {
+  return `The note shown here earlier was written for \`${noteHead.slice(0, 12)}\`; this ${change} is now at ` +
+    `\`${headSha.slice(0, 12)}\`. Gru Command updates this section when the new head is checked.`;
+}
+
+/** Paths named in a note (the count is always given). */
+const NOTE_PATHS_LISTED = 3;
+
+/** The note for a head that owes media (owner ruling Q4): its diff touches
+ * `[capture] paths` and it has no capture and no skip reason. */
+export function owedNote(change: ChangeKind, coverage: MediaCoverage): string {
+  const listed = coverage.paths.slice(0, NOTE_PATHS_LISTED).map((path) => escapeMarkdown(path)).join(', ');
+  const more = coverage.touched - Math.min(coverage.touched, NOTE_PATHS_LISTED, coverage.paths.length);
+  return `Media owed: this ${change} changes ${coverage.touched} file${coverage.touched === 1 ? '' : 's'} under the repository's ` +
+    `capture paths (${listed}${more > 0 ? ` and ${more} more` : ''}) but has no captures and no skip reason at ` +
+    `\`${coverage.headSha.slice(0, 12)}\`. Gru Command replaces this note when the head is captured.`;
+}
+
+/** The note for a head whose shot list says why it needs no media. */
+export function skippedNote(coverage: MediaCoverage): string {
+  return `No captures at \`${coverage.headSha.slice(0, 12)}\`: the shot list says ${escapeMarkdown(coverage.skip ?? '')}`;
+}
+
+/** What an owed or skipped note carries: the change, the head, the note's
+ * kind, and the exact coverage it states. */
+export function coverageDigest(changeUrl: string, headSha: string, coverage: MediaCoverage): string {
+  return createHash('sha256')
+    .update(`${coverage.state} ${changeUrl}\nhead ${headSha}\ntouched ${coverage.touched}\n${coverage.paths.join('\n')}\nskip ${coverage.skip ?? ''}\n`)
+    .digest('hex');
+}
+
+/** A coverage that the section states instead of captures: owed (once the
+ * camera has nothing left to film) or skipped. */
+function noteCoverage(coverage: MediaCoverage | null): MediaCoverage | null {
+  if (coverage === null) return null;
+  if (coverage.state === 'skipped') return coverage;
+  if (coverage.state === 'owed' && coverage.camera !== 'pending' && coverage.camera !== 'filming') return coverage;
+  return null;
 }
 
 export function uploadFailedNote(headSha: string, attempt: number): string {
@@ -357,7 +399,16 @@ export type PublishOutcome =
 /** What one publication writes: the captures, or a note with no media. */
 type PublishContent =
   | { readonly kind: 'media'; readonly items: readonly MediaItem[] }
-  | { readonly kind: 'superseded'; readonly capturesHead: string };
+  | { readonly kind: 'superseded'; readonly capturesHead: string }
+  | { readonly kind: 'owed' | 'skipped'; readonly coverage: MediaCoverage }
+  | { readonly kind: 'moved'; readonly noteHead: string };
+
+/** The note a content without media writes. */
+function contentNote(content: Exclude<PublishContent, { readonly kind: 'media' }>, change: ChangeKind, headSha: string): string {
+  if (content.kind === 'superseded') return supersededNote(change, content.capturesHead, headSha);
+  if (content.kind === 'moved') return movedNote(change, content.noteHead, headSha);
+  return content.kind === 'owed' ? owedNote(change, content.coverage) : skippedNote(content.coverage);
+}
 
 interface PublishRequest {
   readonly url: string;
@@ -428,8 +479,8 @@ class GitHubWriter {
     if (current.head !== request.headSha) return { kind: 'skipped', reason: 'the pull request head moved since it was observed' };
     const dir = mkdtempSync(join(tmpdir(), 'gc-media-'));
     try {
-      if (request.content.kind === 'superseded') {
-        const body = spliceMediaSection(current.body, renderNoticeSection(supersededNote('PR', request.content.capturesHead, request.headSha)));
+      if (request.content.kind !== 'media') {
+        const body = spliceMediaSection(current.body, renderNoticeSection(contentNote(request.content, 'PR', request.headSha)));
         if (body === null) return { kind: 'failed', detail: DAMAGED, needsFix: true };
         request.beginWrite();
         const edit = await this.writeBody(request.url, dir, 'body.md', body, [], GH_VIEW_TIMEOUT_MS);
@@ -529,8 +580,8 @@ async function publishGitLab(request: PublishRequest, deps: GitLabPublishDeps): 
     let section: string;
     let files = 0;
     request.beginWrite();
-    if (request.content.kind === 'superseded') {
-      section = renderNoticeSection(supersededNote('MR', request.content.capturesHead, request.headSha));
+    if (request.content.kind !== 'media') {
+      section = renderNoticeSection(contentNote(request.content, 'MR', request.headSha));
     } else {
       const items = request.content.items;
       const targets = new Map<string, string>();
@@ -618,11 +669,11 @@ function retryGapMs(failures: readonly EventRecord[]): number {
     : MEDIA_PUBLISH_RETRY_MS;
 }
 
-/** The head the newest publication's captures showed (a superseded note
- * carries it forward). */
+/** The head the newest publication's captures showed (every note carries
+ * it forward; null when no captures were ever published). */
 function capturesHeadOf(event: EventRecord): string | null {
   const payload = payloadOf(event);
-  const head = payload['kind'] === 'superseded' ? payload['captures_head'] : payload['head_sha'];
+  const head = payload['kind'] === 'media' || payload['kind'] === undefined ? payload['head_sha'] : payload['captures_head'];
   return typeof head === 'string' ? head : null;
 }
 
@@ -666,7 +717,8 @@ export function ownerPrMediaView(
 ): OwnerPrMediaView | null {
   if (!config.enabled) return null;
   const items = listMedia(ledger, row.jobId);
-  if (items.length === 0) return null;
+  const coverage = coverageAtHead(ledger, row.jobId, row.sha);
+  if (items.length === 0 && coverage === null) return null;
   const atHead = orderForSection(mediaAtHead(items, row.sha));
   return {
     headSha: row.sha,
@@ -677,8 +729,19 @@ export function ownerPrMediaView(
       role: item.role,
       caption: item.caption,
       bytes: item.bytes,
+      capturedBy: item.capturedBy,
     })),
     superseded: items.length - atHead.length,
+    coverage: coverage === null
+      ? null
+      : {
+          state: coverage.state,
+          touched: coverage.touched,
+          paths: coverage.paths,
+          skip: coverage.skip,
+          camera: coverage.camera,
+          detail: coverage.detail,
+        },
     publication: atHead.length === 0
       ? null
       : mediaPublicationView(ledger, { jobId: row.jobId, changeUrl: row.prUrl, headSha: row.sha, items: atHead }, config, publishing),
@@ -727,6 +790,14 @@ function sameChange(prUrl: string, provider: 'github' | 'gitlab', changeUrl: str
     own.number === seen.number;
 }
 
+/** The job's newest coverage asks for a note (owed or skipped): the cheap
+ * pre-filter before the change is read. */
+function mayNeedNote(ledger: MediaLedger, jobId: string): boolean {
+  const event = ledger.listJobEvents(jobId, { kinds: [MEDIA_COVERAGE_EVENT], order: 'desc', limit: 1 })[0];
+  const coverage = event === undefined ? null : readCoverage(event);
+  return coverage !== null && (coverage.state === 'owed' || coverage.state === 'skipped');
+}
+
 export class PrMediaPublisher {
   private readonly github: GitHubWriter;
   private readonly now: () => number;
@@ -765,7 +836,9 @@ export class PrMediaPublisher {
       const prUrl = job.prUrl;
       if (prUrl === null || isTerminalJobStatus(job.status)) continue;
       const items = listMedia(ledger, job.id);
-      if (items.length === 0) continue;
+      // A job with no captures still gets a section when its newest coverage
+      // owes media or gives a skip reason (owner ruling Q4).
+      if (items.length === 0 && !mayNeedNote(ledger, job.id)) continue;
       const evidence = readOwnerEvidence(ledger, { id: job.id, prUrl }, now);
       if (evidence === null || !evidence.open || evidence.merged || evidence.sha === '') continue;
       // The observation must describe THIS job's change: a head read for
@@ -774,6 +847,7 @@ export class PrMediaPublisher {
       const head = evidence.sha;
       const atHead = orderForSection(mediaAtHead(items, head));
       const latest = latestPublishedFor(ledger, job.id, prUrl);
+      const note = atHead.length > 0 ? null : noteCoverage(coverageAtHead(ledger, job.id, head));
       let content: PublishContent;
       let digest: string;
       if (atHead.length > 0) {
@@ -782,13 +856,27 @@ export class PrMediaPublisher {
         if (now - newest < MEDIA_PUBLISH_SETTLE_MS) continue;
         content = { kind: 'media', items: atHead };
         digest = mediaDigest(prUrl, head, atHead);
+      } else if (note !== null) {
+        // The head owes media, or its shot list says why it needs none: the
+        // section says so. A coverage still settling waits like captures do.
+        if (now - Date.parse(note.recordedAt) < MEDIA_PUBLISH_SETTLE_MS) continue;
+        content = { kind: note.state === 'owed' ? 'owed' : 'skipped', coverage: note };
+        digest = coverageDigest(prUrl, head, note);
       } else {
         // Nothing captured at the new head: once something was published
         // for an older head, say so instead of leaving it looking current.
         const capturesHead = latest === null ? null : capturesHeadOf(latest);
-        if (latest === null || capturesHead === null || payloadOf(latest)['head_sha'] === head) continue;
-        content = { kind: 'superseded', capturesHead };
-        digest = supersededDigest(prUrl, head, capturesHead);
+        const noteHead = latest === null ? null : payloadOf(latest)['head_sha'];
+        if (latest === null || noteHead === head || typeof noteHead !== 'string') continue;
+        if (capturesHead !== null) {
+          content = { kind: 'superseded', capturesHead };
+          digest = supersededDigest(prUrl, head, capturesHead);
+        } else {
+          // An owed or skipped note written for an older head: it no longer
+          // describes this one.
+          content = { kind: 'moved', noteHead };
+          digest = supersededDigest(prUrl, head, `note ${noteHead}`);
+        }
       }
       if (latest !== null && payloadOf(latest)['digest'] === digest) continue;
       const failures = failuresFor(ledger, job.id, digest);
@@ -807,7 +895,11 @@ export class PrMediaPublisher {
         url: prUrl,
         ...(content.kind === 'media'
           ? { media_ids: content.items.map((item) => item.id) }
-          : { captures_head: content.capturesHead }),
+          : content.kind === 'superseded'
+            ? { captures_head: content.capturesHead }
+            : content.kind === 'moved'
+              ? { captures_head: null }
+              : { captures_head: latest === null ? null : capturesHeadOf(latest), touched: content.coverage.touched }),
       };
       const request: PublishRequest = {
         url: prUrl,

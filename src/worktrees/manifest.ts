@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, relative, resolve, win32 } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
+import { CaptureGlobError, compileCaptureGlob } from '../media/capture-paths.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -34,6 +35,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   [vector]                 # Vector's raids (#351, docs/VECTOR.md)
  *   enabled = false          #   false removes this repository from raid candidates
  *
+ *   [capture]                # PR media (docs/PR-MEDIA.md): what owes media and
+ *   paths = ["web/src/**"]   #   how GC's camera starts the app; serve/ready
+ *   serve = "npm run dev -- --port {port}"   # come together, paths may stand
+ *   ready = "http://127.0.0.1:{port}/"      # alone
+ *
  *   reclaim = ["build"]      # top-level, before any table (#427): repo-relative
  *                            #   folders setup or builds create and git ignores,
  *                            #   which GC may delete and recreate; never .., an
@@ -45,11 +51,23 @@ export const MANIFEST_DIR = '.gru-command';
  * under. A manifest may not declare it: the verification server records
  * nothing for this scope, so a run of it would leave no evidence. */
 export const RESERVED_VERIFY_SCOPE = 'onboarding-proof';
+/** The verify scope GC's PR media camera holds its budget slot under
+ * (docs/PR-MEDIA.md): reserved for the same reason. */
+export const RESERVED_CAPTURE_SCOPE = 'pr-media-capture';
+const RESERVED_SCOPE_OWNERS: Readonly<Record<string, string>> = {
+  [RESERVED_VERIFY_SCOPE]: "GC's onboarding proof",
+  [RESERVED_CAPTURE_SCOPE]: "GC's PR media camera",
+};
+
+/** True for a verify scope GC holds budget slots under itself. */
+export function isReservedVerifyScope(scope: string): boolean {
+  return Object.hasOwn(RESERVED_SCOPE_OWNERS, scope);
+}
 
 /** A manifest declares a verify scope GC reserves for itself. */
 export class ReservedVerifyScopeError extends Error {
   constructor(readonly source: string, readonly scope: string) {
-    super(`worktree manifest ${source} [verify] scope "${scope}" is reserved for GC's onboarding proof; name the scope differently`);
+    super(`worktree manifest ${source} [verify] scope "${scope}" is reserved for ${RESERVED_SCOPE_OWNERS[scope] ?? 'GC'}; name the scope differently`);
     this.name = 'ReservedVerifyScopeError';
   }
 }
@@ -78,6 +96,149 @@ export interface ManifestSetup {
  */
 export type ManifestVerify = Readonly<Record<string, string>>;
 
+/** How the capture readiness is judged: a loopback URL answering below 400,
+ * or a line of the serve command's output containing the text. */
+export type CaptureReady =
+  | { readonly kind: 'url'; readonly url: string }
+  | { readonly kind: 'output'; readonly text: string };
+
+/**
+ * `[capture]` (PR media, docs/PR-MEDIA.md): `paths` decides when a diff owes
+ * media (owner ruling Q4); `serve` + `ready` let GC's camera start the app on
+ * a port it picks for the run and film the minion's shot list. Templates hold
+ * the `{port}` placeholder; `url` is the base the shots' `open` paths resolve
+ * against.
+ */
+export interface ManifestCapture {
+  readonly paths: readonly string[];
+  readonly serve: string | null;
+  readonly ready: CaptureReady | null;
+  readonly url: string | null;
+  readonly readyTimeoutMs: number;
+}
+
+export const CAPTURE_READY_TIMEOUT_DEFAULT_MS = 120_000;
+export const CAPTURE_READY_TIMEOUT_MIN_MS = 1_000;
+export const CAPTURE_READY_TIMEOUT_MAX_MS = 600_000;
+export const CAPTURE_PATHS_MAX = 64;
+const CAPTURE_KEYS = ['paths', 'serve', 'ready', 'url', 'ready_timeout_ms'] as const;
+/** A loopback http URL template whose port is exactly the run's `{port}`
+ * (plain http: a dev server's self-signed certificate would fail readiness). */
+const CAPTURE_URL_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\{port\}(?:\/[^\s{}]*)?$/u;
+
+/** A `[capture]` table that cannot be used, named by its key. */
+export class CaptureManifestError extends Error {
+  constructor(readonly source: string, readonly key: string, reason: string) {
+    super(`worktree manifest ${source} [capture] ${key} ${reason}`);
+    this.name = 'CaptureManifestError';
+  }
+}
+
+function captureUrl(source: string, key: string, value: string): string {
+  if (!CAPTURE_URL_RE.test(value)) {
+    throw new CaptureManifestError(source, key,
+      `must be a loopback URL whose port is the run's {port}, such as "http://127.0.0.1:{port}/" (got ${JSON.stringify(value)}): ` +
+      'GC picks a free port for each capture run and its browser opens only loopback addresses');
+  }
+  return value;
+}
+
+function parseCapture(raw: unknown, source: string): ManifestCapture {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error(`worktree manifest ${source}: [capture] must be a table`);
+  }
+  const table = raw as Record<string, unknown>;
+  for (const key of Object.keys(table)) {
+    if (!(CAPTURE_KEYS as readonly string[]).includes(key)) {
+      throw new CaptureManifestError(source, `key "${key}"`, `is unknown (valid: ${CAPTURE_KEYS.join(', ')})`);
+    }
+  }
+  if (Object.keys(table).length === 0) {
+    throw new CaptureManifestError(source, 'table', 'is empty: declare paths, or serve and ready, or remove it');
+  }
+  const paths: string[] = [];
+  const rawPaths = table['paths'];
+  if (rawPaths !== undefined) {
+    if (!Array.isArray(rawPaths)) throw new CaptureManifestError(source, 'paths', 'must be an array of repository-relative globs');
+    if (rawPaths.length > CAPTURE_PATHS_MAX) throw new CaptureManifestError(source, 'paths', `may list at most ${CAPTURE_PATHS_MAX} globs`);
+    for (const [index, entry] of rawPaths.entries()) {
+      if (typeof entry !== 'string') throw new CaptureManifestError(source, `paths[${index}]`, `must be a string, got: ${JSON.stringify(entry)}`);
+      let pattern: string;
+      try {
+        pattern = compileCaptureGlob(entry).pattern;
+      } catch (error) {
+        if (error instanceof CaptureGlobError) throw new CaptureManifestError(source, `paths[${index}]`, error.message);
+        throw error;
+      }
+      const earlier = paths.indexOf(pattern);
+      if (earlier !== -1) throw new CaptureManifestError(source, `paths[${index}]`, `duplicates paths[${earlier}] (${JSON.stringify(pattern)})`);
+      paths.push(pattern);
+    }
+    if (paths.length > 0 && paths.every((pattern) => pattern.startsWith('!'))) {
+      throw new CaptureManifestError(source, 'paths', 'lists only exclusions (! entries), so nothing could owe media: add the globs that do');
+    }
+  }
+  const rawServe = table['serve'];
+  const rawReady = table['ready'];
+  if ((rawServe === undefined) !== (rawReady === undefined)) {
+    throw new CaptureManifestError(source, rawServe === undefined ? 'ready' : 'serve',
+      'needs its partner: serve starts the app and ready says when it is up, so declare both or neither');
+  }
+  let serve: string | null = null;
+  let ready: CaptureReady | null = null;
+  if (rawServe !== undefined) {
+    if (typeof rawServe !== 'string' || rawServe.trim() === '') throw new CaptureManifestError(source, 'serve', 'must be a non-empty command string');
+    serve = rawServe.trim();
+    if (!serve.includes('{port}')) {
+      throw new CaptureManifestError(source, 'serve',
+        `must start the app on the run's {port} (for example "npm run dev -- --port {port}"): lanes capture side by side, so a fixed port would collide`);
+    }
+    if (typeof rawReady !== 'string' || rawReady.trim() === '') {
+      throw new CaptureManifestError(source, 'ready', 'must be a loopback URL with {port}, or "output:<text>" the serve command prints when it is up');
+    }
+    const value = rawReady.trim();
+    if (value.startsWith('output:')) {
+      const text = value.slice('output:'.length).trim();
+      if (text === '' || [...text].length > 200 || /\p{Cc}/u.test(text)) {
+        throw new CaptureManifestError(source, 'ready', 'output text must be 1–200 characters on one line');
+      }
+      ready = { kind: 'output', text };
+    } else {
+      ready = { kind: 'url', url: captureUrl(source, 'ready', value) };
+    }
+  }
+  let url: string | null = null;
+  const rawUrl = table['url'];
+  if (rawUrl !== undefined) {
+    if (serve === null) throw new CaptureManifestError(source, 'url', 'needs serve and ready: it is the base the camera opens');
+    if (typeof rawUrl !== 'string') throw new CaptureManifestError(source, 'url', 'must be a string');
+    url = captureUrl(source, 'url', rawUrl.trim());
+  }
+  let readyTimeoutMs = CAPTURE_READY_TIMEOUT_DEFAULT_MS;
+  const rawTimeout = table['ready_timeout_ms'];
+  if (rawTimeout !== undefined) {
+    if (serve === null) throw new CaptureManifestError(source, 'ready_timeout_ms', 'needs serve and ready');
+    if (typeof rawTimeout !== 'number' || !Number.isInteger(rawTimeout) ||
+      rawTimeout < CAPTURE_READY_TIMEOUT_MIN_MS || rawTimeout > CAPTURE_READY_TIMEOUT_MAX_MS) {
+      throw new CaptureManifestError(source, 'ready_timeout_ms',
+        `must be an integer from ${CAPTURE_READY_TIMEOUT_MIN_MS} to ${CAPTURE_READY_TIMEOUT_MAX_MS}, got: ${JSON.stringify(rawTimeout)}`);
+    }
+    readyTimeoutMs = rawTimeout;
+  }
+  return { paths, serve, ready, url, readyTimeoutMs };
+}
+
+/** The base URL template the camera opens: `url`, else the ready URL's
+ * origin, else the loopback address on the run's port. */
+export function captureBaseUrl(capture: ManifestCapture): string {
+  if (capture.url !== null) return capture.url.replace(/\/+$/u, '');
+  if (capture.ready?.kind === 'url') {
+    const match = /^(http:\/\/[^/]+)/u.exec(capture.ready.url);
+    if (match !== null) return match[1]!;
+  }
+  return 'http://127.0.0.1:{port}';
+}
+
 export interface WorktreeManifest {
   readonly links: readonly ManifestLink[];
   readonly copies: readonly ManifestCopy[];
@@ -85,6 +246,8 @@ export interface WorktreeManifest {
   readonly verify: ManifestVerify;
   /** Per-repository raid opt-out (#351); absent means the instance setting decides. */
   readonly vector?: { readonly enabled: boolean };
+  /** PR media capture (docs/PR-MEDIA.md); absent = nothing owes media and GC films nothing. */
+  readonly capture?: ManifestCapture;
   /** Regenerable folders (#427): repo-relative, normalized ("a/b"), unique.
    * Lane slimming deletes them from an idle lane; the lane's setup restores them. */
   readonly reclaim?: readonly string[];
@@ -123,8 +286,8 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     throw new Error(`worktree manifest ${source} is not valid TOML: ${String(error)}`);
   }
   for (const key of Object.keys(raw)) {
-    if (!['link', 'copy', 'setup', 'verify', 'vector', 'reclaim'].includes(key)) {
-      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify, vector, reclaim)`);
+    if (!['link', 'copy', 'setup', 'verify', 'vector', 'reclaim', 'capture'].includes(key)) {
+      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify, vector, reclaim, capture)`);
     }
   }
 
@@ -177,7 +340,7 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
           `worktree manifest ${source} [verify] scope "${scope}" must be a lowercase identifier (a-z, 0-9, _, -, ≤32 chars)`,
         );
       }
-      if (scope === RESERVED_VERIFY_SCOPE) throw new ReservedVerifyScopeError(source, scope);
+      if (isReservedVerifyScope(scope)) throw new ReservedVerifyScopeError(source, scope);
       verifyEntries[scope] = nonEmptyString(command, `${source} verify.${scope}`);
     }
   }
@@ -219,6 +382,8 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     }
   }
 
+  const capture = raw['capture'] === undefined ? undefined : parseCapture(raw['capture'], source);
+
   // Distinguish actual comment markers from the same text inside a user's
   // multiline setup string. Removing a comment cannot alter parsed TOML.
   const retired = [...text.matchAll(/^[\t ]*#[\t ]*(?:BEGIN|END)[\t ]+GRU[\t ]+COMMAND[\t ]+BMAD[\t ]+BOOTSTRAP\b[^\r\n]*/gmu)].some((match) => {
@@ -232,6 +397,7 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     verify: verifyEntries,
     ...(vector === undefined ? {} : { vector }),
     ...(reclaim === undefined ? {} : { reclaim }),
+    ...(capture === undefined ? {} : { capture }),
     ...(retired ? { retiredGcBmadBootstrap: true as const } : {}),
   };
 }

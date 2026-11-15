@@ -41,9 +41,21 @@ export const MEDIA_ROLES = ['after', 'before'] as const;
 /** `after` shows the change at the head; `before` shows the behavior it
  * replaces (captured for comparison, still submitted at the head). */
 export type MediaRole = (typeof MEDIA_ROLES)[number];
-/** Who produced the pixels. PR 1 accepts captures submitted by the minion
- * working the lane; GC's own camera (PR 2) records `gc`. */
-export type MediaCapturedBy = 'minion';
+/** Who produced the pixels: `minion` for a capture the lane's minion
+ * submitted (`POST /api/media`), `gc` for one GC's own camera filmed from the
+ * minion's shot list (docs/PR-MEDIA.md, "GC's camera"). */
+export type MediaCapturedBy = 'minion' | 'gc';
+export const MEDIA_CAPTURED_BY: readonly MediaCapturedBy[] = ['minion', 'gc'];
+
+/** Where a GC capture came from: the camera run, the shot it films and the
+ * viewport. Null on a minion's capture. */
+export interface MediaShot {
+  readonly runId: string;
+  readonly shotId: string;
+  readonly viewport: string;
+  /** How many files the run filmed: a run counts only once all are stored. */
+  readonly files: number;
+}
 
 const EXTENSIONS: Readonly<Record<MediaType, string>> = {
   'image/png': 'png',
@@ -76,6 +88,8 @@ export interface MediaItem {
   /** Path relative to the media home (`<job key>/<id>.<ext>`). */
   readonly file: string;
   readonly capturedBy: MediaCapturedBy;
+  /** Set exactly when `capturedBy` is `gc`. */
+  readonly shot: MediaShot | null;
   readonly recordedAt: string;
   readonly seq: number;
 }
@@ -117,6 +131,10 @@ function jobKey(jobId: string): string {
 }
 
 const SHA_RE = /^[0-9a-f]{40}$/u;
+/** A camera run id (`cr-<uuid>`). */
+export const CAPTURE_RUN_ID_RE = /^cr-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const SHOT_ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/u;
+const VIEWPORT_NAME_RE = /^(?:[a-z]{1,16}|[0-9]{3,4}x[0-9]{3,4})$/u;
 const MEDIA_ID_RE = /^m-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 export function isMediaId(value: string): boolean {
@@ -228,6 +246,7 @@ export function readMediaItem(event: EventRecord): MediaItem | null {
   const sha256 = payload['sha256'];
   const file = payload['file'];
   const capturedBy = payload['captured_by'];
+  const shot = readShot(payload['shot']);
   if (
     typeof id !== 'string' || !isMediaId(id) ||
     typeof headSha !== 'string' || !isFullSha(headSha) ||
@@ -237,7 +256,8 @@ export function readMediaItem(event: EventRecord): MediaItem | null {
     typeof bytes !== 'number' || !Number.isSafeInteger(bytes) || bytes <= 0 ||
     typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(sha256) ||
     typeof file !== 'string' || file !== `${jobKey(event.jobId)}/${id}.${mediaExtension(mediaType as MediaType)}` ||
-    capturedBy !== 'minion'
+    // A GC capture always names its run and shot; a minion's never does.
+    !(capturedBy === 'minion' ? payload['shot'] === undefined : capturedBy === 'gc' && shot !== null)
   ) {
     return null;
   }
@@ -252,10 +272,24 @@ export function readMediaItem(event: EventRecord): MediaItem | null {
     bytes,
     sha256,
     file,
-    capturedBy,
+    capturedBy: capturedBy as MediaCapturedBy,
+    shot: capturedBy === 'gc' ? shot : null,
     recordedAt: event.ts,
     seq: event.seq,
   };
+}
+
+function readShot(value: unknown): MediaShot | null {
+  if (!isRecord(value)) return null;
+  const runId = value['run_id'];
+  const shotId = value['shot_id'];
+  const viewport = value['viewport'];
+  const files = value['files'];
+  if (typeof runId !== 'string' || !CAPTURE_RUN_ID_RE.test(runId) ||
+    typeof shotId !== 'string' || !SHOT_ID_RE.test(shotId) ||
+    typeof viewport !== 'string' || !VIEWPORT_NAME_RE.test(viewport) ||
+    typeof files !== 'number' || !Number.isInteger(files) || files < 1 || files > MEDIA_MAX_PER_HEAD) return null;
+  return { runId, shotId, viewport, files };
 }
 
 /** The job's captures, oldest first (the newest 200 events). */
@@ -267,9 +301,32 @@ export function listMedia(ledger: Pick<MediaLedger, 'listJobEvents'>, jobId: str
     .reverse();
 }
 
-/** The captures bound to exactly `headSha`, oldest first. */
+/**
+ * The CURRENT captures bound to exactly `headSha`, oldest first: every
+ * minion capture at the head, and the GC captures of the newest COMPLETE
+ * camera run at the head (every file it filmed is stored). A shot list
+ * changed at the same head is filmed again; the new run replaces the older
+ * run's files, which count as superseded. A run cut short never shows.
+ */
 export function mediaAtHead(items: readonly MediaItem[], headSha: string): readonly MediaItem[] {
-  return items.filter((item) => item.headSha === headSha);
+  const atHead = items.filter((item) => item.headSha === headSha);
+  const runs = new Map<string, { count: number; files: number; seq: number }>();
+  for (const item of atHead) {
+    if (item.shot === null) continue;
+    const run = runs.get(item.shot.runId) ?? { count: 0, files: item.shot.files, seq: -1 };
+    run.count += 1;
+    run.seq = Math.max(run.seq, item.seq);
+    runs.set(item.shot.runId, run);
+  }
+  let newestRun: string | null = null;
+  let newestSeq = -1;
+  for (const [runId, run] of runs) {
+    if (run.count === run.files && run.seq > newestSeq) {
+      newestSeq = run.seq;
+      newestRun = runId;
+    }
+  }
+  return atHead.filter((item) => item.shot === null || item.shot.runId === newestRun);
 }
 
 export function findMedia(ledger: Pick<MediaLedger, 'latestEventByPayloadField'>, id: string): MediaItem | null {
@@ -299,15 +356,33 @@ export interface StoreMediaInput {
   readonly caption: string;
   readonly role: MediaRole;
   readonly bytes: Buffer;
+  /** Absent = a minion's submission. GC's camera passes `gc` and the shot. */
+  readonly capturedBy?: MediaCapturedBy;
+  readonly shot?: MediaShot;
+}
+
+/** The current captures a new one at `headSha` would join: for a camera
+ * run, the minion's captures plus the run's own earlier files (the run
+ * replaces any older run at the head). */
+function joinedAtHead(items: readonly MediaItem[], headSha: string, shot: MediaShot | undefined): readonly MediaItem[] {
+  if (shot === undefined) return mediaAtHead(items, headSha);
+  return items.filter((item) => item.headSha === headSha && (item.shot === null || item.shot.runId === shot.runId));
 }
 
 /** Validate, write once, and journal one capture. The caller has already
  * proved the lane sits at `headSha` with a clean tracked tree. */
 export function storeMedia(input: StoreMediaInput): MediaItem {
   if (!isFullSha(input.headSha)) throw new MediaError(400, 'bad_request', 'head_sha must be the full 40-character commit sha');
+  const capturedBy = input.capturedBy ?? 'minion';
+  if ((capturedBy === 'gc') !== (input.shot !== undefined)) {
+    throw new Error('storeMedia: a GC capture names its camera run and shot, and a minion capture names none');
+  }
+  if (input.shot !== undefined && readShot({ run_id: input.shot.runId, shot_id: input.shot.shotId, viewport: input.shot.viewport, files: input.shot.files }) === null) {
+    throw new Error(`storeMedia: malformed camera shot identity ${JSON.stringify(input.shot)}`);
+  }
   const caption = validateCaption(input.caption);
   const mediaType = validateMediaBytes(input.bytes);
-  const atHead = mediaAtHead(listMedia(input.ledger, input.jobId), input.headSha);
+  const atHead = joinedAtHead(listMedia(input.ledger, input.jobId), input.headSha, input.shot);
   if (atHead.length >= MEDIA_MAX_PER_HEAD) {
     throw new MediaError(
       409,
@@ -335,7 +410,10 @@ export function storeMedia(input: StoreMediaInput): MediaItem {
       bytes: input.bytes.length,
       sha256,
       file,
-      captured_by: 'minion',
+      captured_by: capturedBy,
+      ...(input.shot === undefined
+        ? {}
+        : { shot: { run_id: input.shot.runId, shot_id: input.shot.shotId, viewport: input.shot.viewport, files: input.shot.files } }),
     },
   });
   return {
@@ -349,7 +427,8 @@ export function storeMedia(input: StoreMediaInput): MediaItem {
     bytes: input.bytes.length,
     sha256,
     file,
-    capturedBy: 'minion',
+    capturedBy,
+    shot: input.shot ?? null,
     recordedAt: event.ts,
     seq: event.seq,
   };

@@ -394,6 +394,15 @@ function sourceIdentities(values: readonly ArtifactSource[]): readonly ArtifactS
   })));
 }
 
+/** Where a job's private operational artifacts live, without creating or
+ * checking anything (the PR media camera reads the minion's shot list there).
+ * The same derivation {@link createArtifactContext} binds: the project key is
+ * the sha256 of the registered repository's real path. Throws when the
+ * repository path cannot be resolved. */
+export function operationalDirectoryFor(dataDir: string, repoPath: string, jobId: string): string {
+  return join(dataDir, 'projects', hash(realpathSync(repoPath)), 'jobs', jobId, 'operational');
+}
+
 /** Share the storage precondition with fresh dispatch BEFORE it creates
  * ledger/worktree state. Historical record identities are not migrated. */
 export function requireArtifactJobId(jobId: string): void {

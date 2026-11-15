@@ -1,18 +1,21 @@
 # PR media: screenshots and clips in PRs
 
 Owner rulings 2026-11-15: when a change is something a person can see, the
-owner should see it before merging, without running the app. Minions capture
-stills and short clips of their committed head. GC binds each capture to that
-exact commit, shows it on the FOR YOU ready-PR card, and writes it into the
-PR/MR description.
+owner should see it before merging, without running the app. The minion
+directs the shots; GC films them (ruling Q1, option C). GC binds each capture
+to the exact commit it shows, shows it on the FOR YOU ready-PR card, and
+writes it into the PR/MR description. Code decides when media is owed
+(ruling Q4): a diff touching the repository's `[capture] paths` owes media
+or a skip reason, and the owner sees "media owed" when it has neither.
 
-This is PR 1 of 4:
+The program is 4 PRs:
 
-1. **This PR:** the media store, head binding, the PR/MR description
-   publisher, the FOR YOU previews, and the minion rule that submits captures.
-2. A `[capture]` table in `.gru-command/worktree.toml` and GC's own camera.
-   The minion writes a shot list; GC records it at the exact final head and
-   re-shoots when the head moves.
+1. The media store, head binding, the PR/MR description publisher, the FOR
+   YOU previews, and the minion rule that submits captures (#599).
+2. **This PR:** the [`[capture]` table](#the-capture-table) in
+   `.gru-command/worktree.toml`, the [shot list](#the-shot-list),
+   [GC's camera](#gcs-camera), which films it at the exact head and re-shoots
+   when the head moves, and [path-glob enforcement](#when-media-is-owed).
 3. Perkins sees the stills in its review round, checks them against their
    captions, and flags visible changes that have no media.
 4. Terminal (vhs/asciinema) and iOS simulator (simctl) capture adapters.
@@ -20,41 +23,238 @@ This is PR 1 of 4:
 ## The flow
 
 ```
-minion commits ──▶ captures the head ──▶ POST /api/media ──▶ media.captured (bound to the sha)
-                                                                     │
-                       FOR YOU ready-PR card ◀── board snapshot ◀────┤
-                       PR/MR description     ◀── publisher tick ◀────┘
+minion writes shot-list.json ──▶ GC's camera films it at the head ──▶ media.captured (captured_by gc)
+minion captures it itself    ──▶ POST /api/media (fallback)       ──▶ media.captured (captured_by minion)
+                                                                            │
+                        FOR YOU ready-PR card ◀── board snapshot ◀──────────┤
+                        PR/MR description     ◀── publisher tick ◀──────────┘
 ```
 
-1. **Capture.** A minion whose change alters something a person sees captures
-   it from its committed head. Any screenshot or recording tool works; the
-   rule suggests `agent-browser screenshot` and `agent-browser record`. The
-   worker rule `PR_MEDIA_RULE` (`src/dispatch/worker-rules.ts`) says how.
-   - A change with nothing visible needs no media.
+1. **Direct.** A minion whose change alters something a person sees writes a
+   [shot list](#the-shot-list) in its private operational artifacts folder:
+   which page or flow proves which acceptance item, at which viewports, and
+   a skip reason for anything that cannot be filmed. The worker rule
+   `PR_MEDIA_RULE` (`src/dispatch/worker-rules.ts`) says how.
+   - A change with nothing visible needs no media; a diff that touches
+     `[capture] paths` anyway says why in the shot list's `skip`.
    - Review, read-only and other non-publishing jobs submit nothing.
-   - A "before" capture of the replaced behavior is added only when the
-     briefing asks for a comparison.
-2. **Submit and bind.** Each capture goes to `POST /api/media`, with the body
+   - A "before" shot of the merge base is filmed only for a shot that asks to
+     compare (ruling Q6).
+2. **Film.** [GC's camera](#gcs-camera) starts the app with `[capture] serve`
+   on a port it picks, waits for `[capture] ready`, drives `agent-browser`
+   through each shot, and stores every file bound to the head it filmed.
+3. **Fallback: submit and bind.** When the repository declares no
+   `[capture] serve`, or the output is not a web page, the minion captures
+   it itself from its committed head (any screenshot or recording tool; the
+   rule suggests `agent-browser screenshot` and `agent-browser record`). Each
+   capture goes to `POST /api/media`, with the body
    sent from a file (`curl --data-binary @file`). The service accepts it only
    while the job's one live lane sits at exactly the named head, with no
    uncommitted tracked changes. So the record says which commit the capture
-   was submitted at; GC's own camera (PR 2) will also prove where the pixels
-   came from.
+   was submitted at. A capture GC's camera filmed also proves where the pixels
+   came from: GC ran the app at that head itself.
    - The capture is validated by magic bytes and bounds, then hashed.
    - It is written once into `<data_dir>/media/`: 0700 directories, 0600 files.
    - It is journaled as a `media.captured` job event naming its head. The
      event is the record.
    - Nothing is ever committed to the repository.
-3. **Show.** The board's FOR YOU ready-PR row carries the captures bound to
+4. **Show.** The board's FOR YOU ready-PR row carries the captures bound to
    the row's exact head. Stills open full size and clips play in place. The
    board fetches the bytes with the pairing token, and the server re-checks
    the hash on every read. Captures of an older head are counted as
    superseded and never shown as current.
-4. **Publish.** On the signal-poll tick (`[silas] poll_interval_ms`), the
+5. **Publish.** On the signal-poll tick (`[silas] poll_interval_ms`), the
    publisher keeps one section of the open PR/MR description current. The
    section sits between the marker lines `<!-- gc-media:begin … -->` and
    `<!-- gc-media:end -->`. It is replaced in place, and every byte outside
    it stays as written.
+
+## The capture table
+
+A repository opts in through `[capture]` in `.gru-command/worktree.toml`
+([WORKTREES.md](./WORKTREES.md#1-bootstrap-manifest-18a)):
+
+```toml
+[capture]
+paths = ["web/src/**", "web/index.html"]  # a diff touching these owes media or a skip reason
+serve = "npm run dev -- --port {port}"    # starts the app on the run's port
+ready = "http://127.0.0.1:{port}/"        # answered below 400 = up; or "output:<text>"
+# url = "http://127.0.0.1:{port}/app"     # optional: the base the shots open
+# ready_timeout_ms = 120000               # optional: 1000–600000
+```
+
+- **`paths`** are repository-relative globs in the subset every ecosystem
+  agrees on: `*` (within one segment), `**` (whole segments, any depth) and
+  `?`. A leading `!` excludes: a path it matches owes nothing, whatever else
+  matches it (`"!web/**/*.test.ts"` keeps a test-only diff from owing
+  media). Absolute paths, `..`, `[ ]`/`{ }` sets and a list of exclusions
+  only are refused, so a glob never matches less than its author meant.
+  `paths` may stand alone: media is then owed, and the minion submits it
+  directly.
+- **`serve`** must hold `{port}`: lanes are filmed side by side, so the app
+  binds the port GC picks for the run. It runs in the lane (or the base
+  checkout) with `/bin/sh`, in its own process group; `GRU_CAPTURE_PORT`
+  carries the port too.
+- **`ready`** is a loopback `http://` URL whose port is `{port}`, polled until
+  it answers below 400, or `output:<text>`, matched against the app's output
+  with ANSI colors removed. `serve` and `ready` come together.
+- The table is read from the head's **committed** manifest, never from an
+  edit the lane has not committed. Every refusal names its key, like
+  `[verify]`; a manifest GC cannot parse owes and films nothing until it
+  parses.
+
+GC's own repository declares `paths` for the board's visible sources
+(`web/src/ui/**`, `web/src/styles/**`, `web/index.html`, tests excluded) and
+no `serve` yet: the board needs its service and a pairing token to show
+anything, so its minions capture the board themselves and submit the files.
+
+## The shot list
+
+The minion writes `shot-list.json` in its private operational artifacts
+folder (`<data_dir>/projects/<project>/jobs/<job>/operational/`, named in the
+workflow notes of every GC-built job). It is never committed.
+
+```json
+{
+  "version": 1,
+  "shots": [
+    {
+      "id": "ready-row",
+      "proves": "AC2: a ready PR row shows its captures",
+      "kind": "screenshot",
+      "viewports": ["desktop", "mobile"],
+      "steps": [
+        {"open": "/board"},
+        {"click": "[data-tab=for-you]"},
+        {"type": "#filter", "text": "media"},
+        {"wait_for_text": "What it looks like"}
+      ],
+      "compare": "base"
+    },
+    {"id": "sign-in", "proves": "AC3: the sign-in banner", "skip": "needs a real GitHub sign-in"}
+  ]
+}
+```
+
+- **`id`**: 1–40 lowercase letters, digits or dashes, unique.
+- **`proves`**: the acceptance item the shot shows (at most 150
+  characters); it becomes the caption, with the viewport when a shot has
+  more than one, and `before (merge base)` for a before shot.
+- **`kind`**: `screenshot` (PNG) or `clip` (WebM, recorded from the first
+  page through a moment past the last step).
+- **`viewports`**: 1–3 of `desktop` (1280×800), `tablet` (768×1024), `mobile`
+  (390×844), or `{"width": W, "height": H}` (320–3840 × 320–2160).
+- **`steps`**: 1–20, the first an `open`. `open` takes a path on the app
+  (one leading `/`, never a URL); `click` a CSS selector; `type` a selector
+  and the `text` that replaces the field's value; `wait_for_text` text that
+  must appear.
+- **`compare: "base"`** also films the shot at the merge base.
+- **`skip`**: a shot that cannot be filmed carries only `id`, `proves` and
+  why. A change with nothing to see writes `{"version": 1, "skip": "<why>"}`.
+- A list plans at most 8 files (each shot × its viewports, twice with
+  compare): the per-head cap.
+
+Every field is validated with a named reason (`shot_list_invalid`,
+`shot_list_over_limit`, `shot_list_unreadable` for a link, a non-file or a
+file over 64 KiB). A refused list is shown on the FOR YOU card and returned to
+the minion by `GET /api/media?job_id=`.
+
+## GC's camera
+
+The camera director (`src/media/director.ts`) ticks every 30 seconds while
+`[pr_media] enabled` is true. For each live job (not parked) with one live
+lane at a committed head with no uncommitted tracked change, it reads the
+head's `[capture]` table and the job's shot list, then:
+
+- **When it films.** As soon as the head is the minion's delivered head, or
+  once the head has stood still for 60 seconds while the minion's attempt is
+  closed. A head that moves is filmed again, and so is a shot list changed at
+  the same head (a new script). One run at a time.
+- **How a run goes** (`src/media/camera.ts`):
+  1. It holds one slot of the global verification budget for its whole life,
+     under the reserved scope `pr-media-capture`. The scheduler's records of
+     that scope are dropped, so a camera run is never verification evidence
+     and never fences a review.
+  2. A slim lane gets its setup back first, as before a verification.
+  3. It proves the lane is at the head with a clean tracked tree.
+  4. It starts the app on a free loopback port, waits for `ready`, films
+     each after shot through the web adapter, and ends the app's process
+     group (SIGTERM, then SIGKILL after 5 seconds).
+  5. Before shots run in a throwaway checkout of the merge base
+     (`clone --shared`, detached: the repository gains no worktree, ref or
+     index entry), set up by that commit's own manifest (or the head's when
+     the base has none), served the same way, then removed.
+  6. It proves the head again: a lane that moved or changed during the run
+     yields nothing, and the new head is filmed instead.
+- **The web adapter** (`src/media/web-adapter.ts`) drives `agent-browser`
+  with an argv, never a shell. Every command names a fresh `--session` and
+  an empty `--config` file the run wrote, runs in the run's private folder,
+  drops every `AGENT_BROWSER_*` variable, and passes `--allowed-domains`
+  with the app's loopback host only. So neither the owner's browser profile
+  nor a repository's `agent-browser.json` reaches the camera, and a step
+  that navigates elsewhere fails instead of loading it. agent-browser must
+  be installed on the GC host (`npm install -g agent-browser && agent-browser
+  install`); without it the run fails `tool_missing`.
+- **Storing.** A run stores all its files together, each a `media.captured`
+  event with `captured_by: "gc"` and its `shot` (`run_id`, `shot_id`,
+  `viewport`, `files`). A run counts only once all its files are stored. At a
+  head, the newest complete camera run replaces older runs (they count as
+  superseded); minion submissions at the head stay. A run that would pass the
+  8 captures a head holds, with the minion's own, is refused (`media_limit`).
+- **Journal.** `media.capture-started`, then `media.capture-filmed` (the
+  media ids) or `media.capture-failed` (`code`, `detail`), each with the run
+  id, head and the shot list's sha256.
+- **Failures.**
+  - The shot list or the app must fix it (`step_failed`, `capture_invalid`,
+    `media_limit`): final for that head and script. A fixed list or a new
+    head is filmed again.
+  - Infrastructure may cure it (`serve_failed`, `ready_timeout`,
+    `tool_missing`, `budget_unavailable`, `base_setup_failed`,
+    `base_unavailable`, `lane_unreadable`): retried 3 times, 10 minutes
+    apart.
+  - `head_moved` is not an attempt (the new head is filmed). `dirty_tree`
+    waits a minute. A run the service stopped is not recorded.
+- **Restarts.** A boot ends the apps an earlier process's runs left running:
+  each restored `pr-media-capture` slot names the app shell's pid and argv
+  (which names the run), and only a live pid running exactly that argv has
+  its group ended. A lane being filmed is busy for lane slimming and the disk
+  reclaim, as a verified one is. Shutdown stops a run in flight (bounded to
+  10 seconds) before the verification scheduler is disposed.
+
+## When media is owed
+
+Owner ruling Q4: code decides. On each tick the director diffs the head
+against its merge base (`git diff --name-only --no-renames`) and matches the
+changed paths against the head's `[capture] paths`. The result is journaled
+as one `media.coverage` event whenever it changes:
+
+| State | When |
+|---|---|
+| `owed` | the diff touches `[capture] paths`, and the head has no current capture and no skip reason |
+| `skipped` | touched, and the shot list gives a skip reason (top-level, or every shot skipped) |
+| `covered` | touched, and a capture is bound to the head |
+| `not-owed` | no capture path is touched, but the minion wrote a shot list |
+
+Each record carries the touched count, the first 10 paths, the globs they
+matched, the skip reason, the shot list's state (`absent`, `valid`,
+`refused`), the camera's (`pending`, `filming`, `filmed`, `failed`,
+`unconfigured`) and the latest refusal or failure. A head that touches no
+capture path and has no shot list records nothing.
+
+Where it shows:
+
+- **FOR YOU ready-PR card:** `📸 media owed: 3 changed files under [capture]
+  paths (…) — no capture and no skip reason` in the alert color, or
+  `📸 no media: <reason>`, and one line on the camera (filming, waiting for
+  the head to settle, a refused shot list, or the failure it could not get
+  past).
+- **PR/MR description:** an owed head gets a note in the media section once
+  the camera has nothing left to film at it ("Media owed: this PR changes 3
+  files under the repository's capture paths (…) but has no captures and no
+  skip reason at `<sha>`"), and a skipped head the shot list's reason, both
+  markdown-escaped. A note left for an older head is replaced by one saying
+  the PR moved on. Captures at the head always win over a note.
+- **The minion:** `GET /api/media?job_id=` returns the newest coverage.
 
 ## The capture API
 
@@ -65,7 +265,7 @@ config.
 | Route | Body / query | Answer |
 |---|---|---|
 | `POST /api/media` | `{job_id, head_sha, caption, role?, content_base64}` | `201` with the capture's metadata (no store path) |
-| `GET /api/media?job_id=<id>` | — | the job's captures, metadata only |
+| `GET /api/media?job_id=<id>` | — | the job's captures (metadata only), `camera` (the latest run: `started`, `filmed`, or `failed` with `code` and `detail`) and `coverage` (the newest [media coverage](#when-media-is-owed)) |
 | `GET /api/media/<media id>` | — | the capture's bytes (`content-type` from the sniffed type, `no-store`, `nosniff`) |
 
 - `head_sha` is the full 40-character lowercase sha of the lane's HEAD.
@@ -74,6 +274,8 @@ config.
 - `role` is `after` (the default) for the change, or `before` for the
   behavior it replaces.
 - The body may carry wrapped base64.
+- Each capture's metadata says `captured_by` (`minion` or `gc`); a GC capture
+  also names its `shot` (`run_id`, `shot_id`, `viewport`).
 
 Refusals are named:
 
@@ -142,6 +344,8 @@ upload), so a fix made later is still picked up.
   Publication is tied to the change URL.
 - **A person deletes the section:** GC writes it again only when the head or
   the captures change.
+- **The head owes media, or its shot list says why it needs none:** the
+  section says so ([When media is owed](#when-media-is-owed)).
 
 **GitHub.** GC runs `gh pr edit <url> --body-file … --attach ./gc-media-N.ext …`.
 
@@ -226,7 +430,10 @@ mergeable) shows:
   - `board only: publishing runs on the Silas signal poll, which is off on this instance`
     when Silas or its poll is off;
 - `📸 N captures from an older head — superseded, not shown` when no capture
-  is bound to the current head.
+  is bound to the current head;
+- `· filmed by Gru Command` (or `· N filmed by Gru Command`) for captures GC's
+  camera filmed;
+- the head's [media coverage](#when-media-is-owed) lines.
 
 Previews are fetched once per pairing.
 
@@ -271,8 +478,18 @@ the GitHub/GitLab polls run.
 ## Code
 
 - `src/media/store.ts`: sniffing, bounds, write-once storage,
-  `media.captured`, read-back with hash verification, and the closed-job
-  sweep.
+  `media.captured` (with `captured_by` and a GC capture's `shot`), the
+  current captures at a head, read-back with hash verification, and the
+  closed-job sweep.
+- `src/media/capture-paths.ts`: the `[capture] paths` glob dialect.
+- `src/worktrees/manifest.ts`: the `[capture]` table and the reserved
+  `pr-media-capture` scope.
+- `src/media/shot-list.ts`: the shot-list format, its validation and the
+  planned captures.
+- `src/media/camera.ts`: one camera run under the verification budget, and
+  the boot cleanup of apps an earlier process left.
+- `src/media/web-adapter.ts`: the `agent-browser` adapter.
+- `src/media/director.ts`: the tick, media coverage, scheduling and retries.
 - `src/media/server.ts`: the three HTTP routes and the head binding.
 - `src/media/publisher.ts`: the section text and marker lines, the GitHub and
   GitLab writers, the tick, and the FOR YOU projection (`ownerPrMediaView`).
@@ -283,5 +500,10 @@ the GitHub/GitLab polls run.
 - Tests:
   - `test/pr-media.test.ts`, `test/pr-media-server.test.ts` and
     `test/pr-media-publisher.test.ts`;
+  - `test/pr-media-capture.test.ts` (the table, globs, shot list, GC
+    captures, the rule), `test/pr-media-camera.test.ts` (real app processes,
+    a fake browser, the base checkout, the boot cleanup, the adapter's argv)
+    and `test/pr-media-director.test.ts` (coverage, scheduling, re-shoots,
+    retries, the FOR YOU block and the PR notes);
   - the engine, driver and web validator, client and render tests;
   - a real-service route check in `web/e2e/real-server.spec.ts`.
