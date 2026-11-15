@@ -461,7 +461,7 @@ export class BoardView {
     const effective = this.withDecisionOverrides(snapshot);
     const previous = this.snapshot;
     this.snapshot = snapshot;
-    this.pruneMedia();
+    this.pruneMedia(snapshot);
     // Submissions end only when an authoritative snapshot carries an
     // outcome, removes the row, or an HTTP refresh after an option-state refusal
     // proves the current state (even when it matches the old content).
@@ -1260,8 +1260,12 @@ export class BoardView {
   /** Drop the previews and object URLs of captures no card has shown for
    * {@link MEDIA_PREVIEW_GRACE_MS}: a card that blinks out for one snapshot
    * keeps its previews (and a playing clip keeps playing). */
-  private pruneMedia(): void {
-    const cutoff = Date.now() - MEDIA_PREVIEW_GRACE_MS;
+  private pruneMedia(snapshot: BoardSnapshot): void {
+    const now = Date.now();
+    // Every capture on a card in THIS snapshot is current, however long the
+    // board was quiet before it arrived.
+    for (const pr of snapshot.ownerPrs ?? []) for (const item of pr.media?.items ?? []) this.mediaSeen.set(item.id, now);
+    const cutoff = now - MEDIA_PREVIEW_GRACE_MS;
     for (const [id, seen] of this.mediaSeen) {
       if (seen >= cutoff) continue;
       const url = this.mediaObjectUrls.get(id);

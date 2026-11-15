@@ -121,9 +121,10 @@ first, and gives each capture a caption line and its image or player.
 **Markers count only as whole lines outside fenced code.** A description that
 quotes the markers in prose or in a code block keeps every word.
 
-**Damaged markers fail once, with a reason.** A marker line without its pair,
-or two sections, is recorded as one failure asking for the stray lines to be
-deleted by hand. GC never guesses which text is its own.
+**Damaged markers fail with a reason, and are retried.** A marker line
+without its pair, or two sections, is recorded as a failure asking for the
+stray lines to be deleted by hand. GC never guesses which text is its own,
+and the retries pick up the fix.
 
 **What the section shows**
 
@@ -146,13 +147,16 @@ deleted by hand. GC never guesses which text is its own.
 - The files are named and attached in section order.
 - gh uploads each file and rewrites the body's `./gc-media-N.ext` references
   to the uploaded assets.
-- Attachment lines gh appends at the end instead (a video player has no alt
-  text) are moved into the place of the references they stand for. Only that
-  trailing run of lines on GitHub's attachment hosts is moved; a person's own
-  text and links never are.
+- gh sometimes appends attachments at the very end of the description
+  instead of rewriting their references (a video player has no alt text). GC
+  moves exactly as many lines as there are references left unrewritten,
+  taking the last lines of that trailing run on GitHub's attachment hosts,
+  into the places they stand for. Anything else stays where it is,
+  including a person's own screenshot added after the section.
 - The result is re-read and must hold no unlinked reference.
-- A partial upload is replaced by a "will retry" note, never left as broken
-  images.
+- A partial upload is replaced by a note, never left as broken images. The
+  note says GC will retry; after the last attempt it says the captures are on
+  the board.
 
 Preconditions:
 
@@ -162,7 +166,8 @@ Preconditions:
 - **GitHub Enterprise Server:** `--attach` is not supported there, so GC
   records one final failure; the media stays on the board.
 - **Description length:** a description that would exceed GitHub's
-  65,536-character limit fails once, before anything is uploaded.
+  65,536-character limit fails before anything is uploaded. It is retried,
+  so a shortened description gets the media.
 - **Private repositories:** attachments are visible only to signed-in users
   with access.
 
@@ -183,8 +188,9 @@ then the MR description update.
   captures.
 - A failing digest gets 3 attempts, 10 minutes apart, and then shows as failed
   on the FOR YOU card with its reason.
-- A failure that retrying cannot fix is recorded once, as final: Enterprise
-  Server, an oversize description, or damaged markers.
+- A failure that no fix to the description can change is recorded once, as
+  final: GitHub Enterprise Server, or a GitLab host the service does not send
+  credentials to.
 
 The publisher writes only when the change still sits at the head the captures
 are bound to. A head that moved, or a closed change, is skipped and nothing is
@@ -240,8 +246,10 @@ the GitHub/GitLab polls run.
 
 ## Retention and privacy
 
-- **When a job closes:** its local captures are deleted on the next tick, and
-  a `media.swept` event records how many files and bytes went. The PR/MR
+- **When a job closes:** its local captures are deleted on the next publisher
+  tick, and a `media.swept` event records how many files and bytes went. The
+  tick rides the Silas signal poll, so with Silas or its poll off, captures
+  stay on disk until it runs. The PR/MR
   keeps the published copies, and the `media.captured` events keep the
   record of what was captured.
 - **Data in captures:** captures show mock or seed data only, never real

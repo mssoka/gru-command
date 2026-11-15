@@ -179,6 +179,10 @@ describe('PR media section text', () => {
     expect(spliceMediaSection(quoted, 'NEW')).toBe(`${quoted}\n\nNEW`);
     const fenced = `Example:\n\n\`\`\`md\n${old}\n\`\`\`\n`;
     expect(findMediaSection(fenced)).toBeNull();
+    // A closing fence longer than its opener still closes it.
+    const longer = `\`\`\`\n${old}\n\`\`\`\`\n\n${old}`;
+    expect(findMediaSection(longer)).not.toBeNull();
+    expect(findMediaSection(`~~~\n${old}\n\`\`\`\n${old}`)).toBeNull(); // a backtick line never closes a tilde fence
     // Damage is refused, never guessed: a lone marker line, or two sections.
     expect(spliceMediaSection(`${HUMAN}\n${MEDIA_SECTION_BEGIN}\nhalf`, 'NEW')).toBeNull();
     expect(spliceMediaSection(`${old}\n\n${old}`, 'NEW')).toBeNull();
@@ -200,6 +204,14 @@ describe('PR media section text', () => {
     expect(inside).not.toContain('./gc-media-2.webm');
     expect(after).toBe('\nSee https://example.com/docs too.');
     expect(repairAttachmentLayout(`${HUMAN}\n\nx`)).toBe(`${HUMAN}\n\nx`);
+    // A person's own screenshot after a fully linked section stays theirs.
+    const linked = `${MEDIA_SECTION_BEGIN}\n![a](https://github.com/user-attachments/assets/1)\n${MEDIA_SECTION_END}\n\n![mine](https://github.com/user-attachments/assets/9)`;
+    expect(repairAttachmentLayout(linked)).toBe(linked);
+    // With one reference unlinked, only the LAST trailing line (gh's) moves.
+    const mixed = `${MEDIA_SECTION_BEGIN}\n![b](./gc-media-1.webm)\n${MEDIA_SECTION_END}\n![mine](https://github.com/user-attachments/assets/9)\nhttps://github.com/user-attachments/assets/2`;
+    const fixed = repairAttachmentLayout(mixed);
+    expect(fixed.split(MEDIA_SECTION_END)[0]).toContain('assets/2');
+    expect(fixed.split(MEDIA_SECTION_END)[1]).toBe('\n![mine](https://github.com/user-attachments/assets/9)');
     expect(parseGhVersion('gh version 2.101.0 (2026-09-15)\nhttps://github.com/cli/cli/releases')).toEqual([2, 101, 0]);
     expect(parseGhVersion('not gh')).toBeNull();
   });
@@ -334,6 +346,12 @@ describe('PR media publisher', () => {
     expect(pr.body).not.toContain('./gc-media-');
     expect(pr.body).toContain('did not complete; Gru Command will retry');
     expect(w.ledger.latestJobEvent('j-ui', 'media.published')).toBeNull();
+    // The last attempt's note promises no retry.
+    for (let attempt = 2; attempt <= 3; attempt += 1) {
+      w.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
+      await publisher(w, dropped.gh).pollOnce();
+    }
+    expect(pr.body).toContain('did not complete after 3 attempts; they are on the Gru Command board');
 
     const w2 = world();
     observeGitHub(w2, HEAD);
@@ -344,7 +362,7 @@ describe('PR media publisher', () => {
     expect(JSON.stringify(w2.ledger.latestJobEvent('j-ui', 'media.publish-failed')?.payload)).toContain('HTTP 500 on repair');
   });
 
-  it('fails by name on preconditions: an old gh (retried), Enterprise Server and an oversize description (once)', async () => {
+  it('fails by name on preconditions: Enterprise Server once; an old gh, an oversize description and damaged markers retried until fixed', async () => {
     const w = world();
     observeGitHub(w, HEAD);
     capture(w, HEAD, 'Card');
@@ -368,10 +386,28 @@ describe('PR media publisher', () => {
     const long = world();
     observeGitHub(long, HEAD);
     capture(long, HEAD, 'Card');
-    const huge = fakeGh({ body: 'x'.repeat(GITHUB_BODY_MAX_CHARS), head: HEAD, prState: 'OPEN' });
+    const hugePr = { body: 'x'.repeat(GITHUB_BODY_MAX_CHARS), head: HEAD, prState: 'OPEN' };
+    const huge = fakeGh(hugePr);
     await publisher(long, huge.gh).pollOnce();
     expect(edits(huge.calls)).toBe(0);
-    expect(long.ledger.latestJobEvent('j-ui', 'media.publish-failed')?.payload).toMatchObject({ final: true, detail: expect.stringContaining('65536-character limit') });
+    const oversize = long.ledger.latestJobEvent('j-ui', 'media.publish-failed')?.payload as Record<string, unknown>;
+    expect(oversize['detail']).toContain('65536-character limit');
+    expect(oversize).not.toHaveProperty('final');
+    // The author shortens the description; the next attempt publishes.
+    hugePr.body = 'Short now.';
+    long.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
+    expect(await publisher(long, huge.gh).pollOnce()).toMatchObject({ published: 1 });
+
+    // Damaged markers: the card asks for a hand fix, and the retry picks it up.
+    const damaged = world();
+    observeGitHub(damaged, HEAD);
+    capture(damaged, HEAD, 'Card');
+    const damagedPr = { body: `${HUMAN}\n${MEDIA_SECTION_BEGIN}\nhalf a section`, head: HEAD, prState: 'OPEN' };
+    const fixer = fakeGh(damagedPr);
+    expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ failed: 1 });
+    damagedPr.body = HUMAN;
+    damaged.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
+    expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ published: 1 });
   });
 
   it('publishes again when the job is re-pointed at another PR, and only against an observation of the job\'s own change', async () => {

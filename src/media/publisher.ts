@@ -166,8 +166,10 @@ export function supersededNote(change: ChangeKind, capturesHead: string, headSha
     `\`${headSha.slice(0, 12)}\`. Gru Command replaces this note when the new head is captured.`;
 }
 
-export function uploadFailedNote(headSha: string): string {
-  return `Uploading the captures for \`${headSha.slice(0, 12)}\` did not complete; Gru Command will retry.`;
+export function uploadFailedNote(headSha: string, attempt: number): string {
+  return attempt < MEDIA_PUBLISH_MAX_ATTEMPTS
+    ? `Uploading the captures for \`${headSha.slice(0, 12)}\` did not complete; Gru Command will retry.`
+    : `Uploading the captures for \`${headSha.slice(0, 12)}\` did not complete after ${MEDIA_PUBLISH_MAX_ATTEMPTS} attempts; they are on the Gru Command board.`;
 }
 
 interface LineSpan {
@@ -194,7 +196,9 @@ function markerLines(body: string): { readonly begins: readonly LineSpan[]; read
       continue;
     }
     if (fence !== null) {
-      if (line.startsWith(fence) && line.slice(fence.length).trim() === '') fence = null;
+      // A closer is the opener's character repeated at least as many times.
+      // (Backticks and tildes need no escaping in a pattern.)
+      if (new RegExp(`^${fence[0]}{${fence.length},}\\s*$`, 'u').test(line)) fence = null;
       continue;
     }
     if (line === MEDIA_SECTION_BEGIN) begins.push({ start, end });
@@ -234,31 +238,35 @@ const ATTACHMENT_LINE = new RegExp(String.raw`^\s*(?:!\[(?:\\.|[^\]\n])*\]\(${AT
 const LOCAL_REFERENCE = /\]\(\.\/gc-media-\d+\.[a-z0-9]+\)/u;
 
 /**
- * Repair the layout gh produced: attachment lines gh appended at the very end
- * of the description (instead of rewriting their `./gc-media-N` references)
- * replace the references still left unrewritten, in order; any extra
- * attachment line goes at the end of the section. Only the trailing run of
- * attachment lines after the section is moved — a person's own text, even an
- * attachment link of their own placed earlier, never is.
+ * Repair the layout gh produced: when references in the section were left
+ * unrewritten, gh appended their attachments at the very end of the
+ * description instead. Exactly that many lines are taken from the end of
+ * the trailing run of attachment lines after the section — the last ones,
+ * which gh wrote — and put in place of the unrewritten references, in
+ * order. Anything else, including a person's own attachment placed after
+ * the section, is left where it is.
  */
 export function repairAttachmentLayout(body: string): string {
   const span = findMediaSection(body);
   if (span === null || span === 'damaged') return body;
-  const tailLines = body.slice(span.end).split('\n');
-  let keep = tailLines.length;
-  while (keep > 0 && (tailLines[keep - 1]!.trim() === '' || ATTACHMENT_LINE.test(tailLines[keep - 1]!))) keep -= 1;
-  const appended = tailLines.slice(keep).map((line) => line.trim()).filter((line) => line !== '');
-  if (appended.length === 0) return body;
   const sectionText = body.slice(span.start, span.end);
-  const endMarker = sectionText.lastIndexOf(MEDIA_SECTION_END);
-  const sectionLines = sectionText.slice(0, endMarker).split('\n');
+  const sectionLines = sectionText.split('\n');
+  const unlinked = sectionLines.filter((line) => LOCAL_REFERENCE.test(line)).length;
+  if (unlinked === 0) return body;
+  const tailLines = body.slice(span.end).split('\n');
+  let last = tailLines.length;
+  while (last > 0 && tailLines[last - 1]!.trim() === '') last -= 1;
+  const appended: string[] = [];
+  let cut = last;
+  while (cut > 0 && appended.length < unlinked && ATTACHMENT_LINE.test(tailLines[cut - 1]!)) {
+    appended.unshift(tailLines[cut - 1]!.trim());
+    cut -= 1;
+  }
+  if (appended.length === 0) return body;
   for (let index = 0; index < sectionLines.length && appended.length > 0; index += 1) {
     if (LOCAL_REFERENCE.test(sectionLines[index]!)) sectionLines[index] = appended.shift()!;
   }
-  while (sectionLines.length > 0 && sectionLines.at(-1)!.trim() === '') sectionLines.pop();
-  if (appended.length > 0) sectionLines.push('', ...appended);
-  sectionLines.push('', MEDIA_SECTION_END);
-  const tail = tailLines.slice(0, keep).join('\n').replace(/\s+$/u, '');
+  const tail = tailLines.slice(0, cut).join('\n').replace(/\s+$/u, '');
   return `${body.slice(0, span.start)}${sectionLines.join('\n')}${tail}`;
 }
 
@@ -340,6 +348,8 @@ interface PublishRequest {
   readonly headSha: string;
   readonly content: PublishContent;
   readonly dataDir: string;
+  /** This attempt's number for the digest (1-based). */
+  readonly attempt: number;
   /** Journals the attempt; called right before the first irreversible write. */
   readonly beginWrite: () => void;
 }
@@ -404,7 +414,7 @@ class GitHubWriter {
     try {
       if (request.content.kind === 'superseded') {
         const body = spliceMediaSection(current.body, renderNoticeSection(supersededNote('PR', request.content.capturesHead, request.headSha)));
-        if (body === null) return { kind: 'failed', detail: DAMAGED, final: true };
+        if (body === null) return { kind: 'failed', detail: DAMAGED };
         request.beginWrite();
         const edit = await this.writeBody(request.url, dir, 'body.md', body, [], GH_VIEW_TIMEOUT_MS);
         if (edit.code !== 0) return { kind: 'failed', detail: `gh pr edit failed (exit ${edit.code}): ${edit.stderr}` };
@@ -420,9 +430,9 @@ class GitHubWriter {
         attach.push('--attach', `./${name}`);
       });
       const body = spliceMediaSection(current.body, renderMediaSection({ headSha: request.headSha, items, targets, change: 'PR' }));
-      if (body === null) return { kind: 'failed', detail: DAMAGED, final: true };
+      if (body === null) return { kind: 'failed', detail: DAMAGED };
       if (body.length > GITHUB_BODY_MAX_CHARS) {
-        return { kind: 'failed', detail: `the description would exceed GitHub's ${GITHUB_BODY_MAX_CHARS}-character limit with the media section`, final: true };
+        return { kind: 'failed', detail: `the description would exceed GitHub's ${GITHUB_BODY_MAX_CHARS}-character limit with the media section: shorten it` };
       }
       request.beginWrite();
       const edit = await this.writeBody(request.url, dir, 'body.md', body, attach, GH_EDIT_TIMEOUT_MS);
@@ -453,7 +463,7 @@ class GitHubWriter {
    * the description: replace an unlinked section with a "retrying" note. */
   private async replaceBroken(request: PublishRequest, dir: string, after: { body: string } | string): Promise<void> {
     if (typeof after === 'string' || sectionFullyLinked(after.body) || findMediaSection(after.body) === null) return;
-    const body = spliceMediaSection(after.body, renderNoticeSection(uploadFailedNote(request.headSha)));
+    const body = spliceMediaSection(after.body, renderNoticeSection(uploadFailedNote(request.headSha, request.attempt)));
     if (body !== null) await this.writeBody(request.url, dir, 'notice.md', body, [], GH_VIEW_TIMEOUT_MS);
   }
 }
@@ -497,7 +507,7 @@ async function publishGitLab(request: PublishRequest, deps: GitLabPublishDeps): 
     if (typeof mr === 'string') return { kind: 'failed', detail: scrub(mr) };
     if (mr.state !== 'opened') return { kind: 'skipped', reason: `the merge request is ${String(mr.state)}` };
     if (mr.sha !== request.headSha) return { kind: 'skipped', reason: 'the merge request head moved since it was observed' };
-    if (findMediaSection(mr.description) === 'damaged') return { kind: 'failed', detail: DAMAGED, final: true };
+    if (findMediaSection(mr.description) === 'damaged') return { kind: 'failed', detail: DAMAGED };
     let section: string;
     let files = 0;
     request.beginWrite();
@@ -526,7 +536,7 @@ async function publishGitLab(request: PublishRequest, deps: GitLabPublishDeps): 
     if (typeof fresh === 'string') return { kind: 'failed', detail: scrub(fresh) };
     if (fresh.sha !== request.headSha) return { kind: 'failed', detail: 'the merge request head moved during the uploads' };
     const description = spliceMediaSection(fresh.description, section);
-    if (description === null) return { kind: 'failed', detail: DAMAGED, final: true };
+    if (description === null) return { kind: 'failed', detail: DAMAGED };
     const update = await call(`/merge_requests/${link.iid}`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
@@ -759,6 +769,7 @@ export class PrMediaPublisher {
         headSha: head,
         content,
         dataDir: this.options.dataDir,
+        attempt: failures.length + 1,
         beginWrite: () => {
           ledger.appendCustomEvent({ kind: MEDIA_PUBLISH_ATTEMPT_EVENT, jobId: job.id, payload: base });
         },

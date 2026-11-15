@@ -4257,6 +4257,17 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       view.render(snapshot({ ownerPrs: [withMedia] }));
       expect(document.querySelector('.board-owner__shot--video video')).toBe(video);
       expect(fetchMedia).toHaveBeenCalledTimes(2);
+      // A quiet board: the next snapshot arrives long after the grace window,
+      // and a card still on it keeps its previews.
+      const later = Date.now() + 60 * 60_000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+      try {
+        view.render(snapshot({ ownerPrs: [withMedia] }));
+        expect(document.querySelector('.board-owner__shot--video video')).toBe(video);
+        expect(fetchMedia).toHaveBeenCalledTimes(2);
+      } finally {
+        clock.mockRestore();
+      }
       // Every publication state says where the media stands, in plain words.
       view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: media({ state: 'pending', at: null, detail: 'attempt 1 of 3 failed: HTTP 502' }, [still], 0) })] }));
       expect(note()).toBe('📸 1 capture at aaaa1111 · posting to the PR… (attempt 1 of 3 failed: HTTP 502)');
