@@ -31,6 +31,7 @@ import {
   type DigestLedger,
   type GitHubPollPort,
   type GitLabPollPort,
+  type MediaPublisherPort,
   type RoundBlocker,
   type SilasSlot,
   type SkillModule,
@@ -3394,6 +3395,7 @@ function makeDriver(opts: {
   unchangedRewakeMs?: number;
   githubPoll?: GitHubPollPort;
   gitlabPoll?: GitLabPollPort;
+  mediaPublisher?: MediaPublisherPort;
   /** Collected log lines (the driver's own surface, e.g. poll failures). */
   logs?: string[];
   bus?: boolean;
@@ -3465,6 +3467,7 @@ function makeDriver(opts: {
     ...(opts.bus === false ? {} : { bus: h.bus }),
     ...(opts.githubPoll !== undefined ? { githubPoll: opts.githubPoll } : {}),
     ...(opts.gitlabPoll !== undefined ? { gitlabPoll: opts.gitlabPoll } : {}),
+    ...(opts.mediaPublisher !== undefined ? { mediaPublisher: opts.mediaPublisher } : {}),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
@@ -4524,6 +4527,36 @@ describe('silas driver gitlab signal poll', () => {
       expect(gitlabPolls).toBe(1);
     } finally {
       off.cleanup();
+    }
+  });
+
+  it('ticks the PR media publisher after both polls; its throw never stops a poll or the next tick', async () => {
+    const { ticks, timers } = captureTimers();
+    const logs: string[] = [];
+    const order: string[] = [];
+    const h = makeDriver({
+      sweepIntervalMs: 0,
+      pollIntervalMs: 5_000,
+      githubPoll: { pollOnce: async () => (order.push('github'), emptyGitHubTick) },
+      gitlabPoll: { pollOnce: async () => (order.push('gitlab'), emptyGitLabTick) },
+      mediaPublisher: {
+        pollOnce: async () => {
+          order.push('media');
+          throw new Error('gh down');
+        },
+      },
+      logs,
+      timers,
+    });
+    try {
+      h.driver.start();
+      ticks[0]?.();
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media']));
+      expect(logs).toContain('error pr media publication tick failed');
+      ticks[0]?.();
+      await vi.waitFor(() => expect(order).toEqual(['github', 'gitlab', 'media', 'github', 'gitlab', 'media']));
+    } finally {
+      h.cleanup();
     }
   });
 

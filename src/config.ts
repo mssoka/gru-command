@@ -347,6 +347,27 @@ export const DEFAULT_VECTOR_CONFIG: VectorConfig = {
   maxRaidsPerDay: 2,
 };
 
+/** Where PR media goes (owner ruling 2026-11-15, docs/PR-MEDIA.md):
+ * `autonomous` writes the captures into the PR/MR description's GC media
+ * section by itself; `never` keeps them on the board (FOR YOU) only. */
+export const PR_MEDIA_PUBLISH_MODES = ['autonomous', 'never'] as const;
+export type PrMediaPublishMode = (typeof PR_MEDIA_PUBLISH_MODES)[number];
+
+/** `[pr_media]`: screenshots and clips the crew captures so the owner can see
+ * a change before merging. On and autonomous by default for every GC user
+ * (owner ruling 2026-11-15): media is review evidence, not a risky action. */
+export interface PrMediaConfig {
+  /** false = the capture API refuses, FOR YOU shows no media and nothing is
+   * published. */
+  readonly enabled: boolean;
+  readonly publish: PrMediaPublishMode;
+}
+
+export const DEFAULT_PR_MEDIA_CONFIG: PrMediaConfig = {
+  enabled: true,
+  publish: 'autonomous',
+};
+
 /** Nefario, the pre-dispatch briefing review (GH-505, docs/BRIEFING-REVIEW.md).
  * `enabled = false` is the stop state: no commission, no readiness refusal and
  * an empty card. `stage = auto` (the default) follows the tier: high and medium
@@ -809,6 +830,8 @@ export interface GruCommandConfig {
   readonly silas: SilasConfig;
   readonly providerRecovery: ProviderRecoveryConfig;
   readonly vector: VectorConfig;
+  /** `[pr_media]`: screenshots and clips in PRs and on FOR YOU. */
+  readonly prMedia: PrMediaConfig;
   readonly onboarding: OnboardingConfig;
   readonly roll: RollConfig;
   readonly concurrency: ConcurrencyConfig;
@@ -1017,6 +1040,7 @@ const TOP_LEVEL_KEYS = [
   'silas',
   'provider_recovery',
   'vector',
+  'pr_media',
   'onboarding',
   'roll',
   'concurrency',
@@ -1340,6 +1364,7 @@ export function loadConfig(
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;
   let vector: VectorConfig = DEFAULT_VECTOR_CONFIG;
+  let prMedia: PrMediaConfig = DEFAULT_PR_MEDIA_CONFIG;
   let onboarding: OnboardingConfig = DEFAULT_ONBOARDING_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
@@ -1857,6 +1882,23 @@ export function loadConfig(
         throw new ConfigError(`vector.max_runs must be at least ${String(VECTOR_MAX_RUNS_PER_ATTACK)}: one attack can need that many sandboxed runs (both controls, the attack, the baseline and the replay), so a smaller cap never attacks`, file, 'vector.max_runs');
       }
     }
+    if (raw['pr_media'] !== undefined) {
+      const table = requireTable(raw['pr_media'], file, 'pr_media');
+      const VALID = ['enabled', 'publish'];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(`unknown key \`${key}\` in [pr_media] (valid keys: ${VALID.join(', ')})`, file, `pr_media.${key}`);
+        }
+      }
+      const publish = table['publish'];
+      if (publish !== undefined && (typeof publish !== 'string' || !(PR_MEDIA_PUBLISH_MODES as readonly string[]).includes(publish))) {
+        throw new ConfigError(`pr_media.publish must be one of ${PR_MEDIA_PUBLISH_MODES.map((entry) => `"${entry}"`).join(', ')}, got: ${JSON.stringify(publish)}`, file, 'pr_media.publish');
+      }
+      prMedia = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'pr_media.enabled') : prMedia.enabled,
+        publish: (publish as PrMediaPublishMode | undefined) ?? prMedia.publish,
+      };
+    }
     if (raw['onboarding'] !== undefined) {
       const table = requireTable(raw['onboarding'], file, 'onboarding');
       for (const key of Object.keys(table)) {
@@ -2059,6 +2101,7 @@ export function loadConfig(
     silas,
     providerRecovery,
     vector,
+    prMedia,
     onboarding,
     roll,
     concurrency,

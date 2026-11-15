@@ -147,6 +147,38 @@ export interface OwnerPrView {
   readonly checkedAt: string;
   /** The code host the evidence came from. */
   readonly provider: OwnerProvider;
+  /** PR media (docs/PR-MEDIA.md): the captures bound to `sha`, how many
+   * older-head captures were superseded, and where the current ones stand
+   * on the PR. Absent/null = no captures, or the feature is off. */
+  readonly media?: OwnerPrMediaView | null;
+}
+
+/** One capture as the FOR YOU card lists it (bytes come from
+ * `GET /api/media/<id>`; no store path ever leaves the server). */
+export interface OwnerPrMediaItemView {
+  readonly id: string;
+  readonly kind: 'image' | 'video';
+  readonly mediaType: string;
+  readonly role: 'after' | 'before';
+  readonly caption: string;
+  readonly bytes: number;
+}
+
+/** Where the current captures stand on the PR/MR description. */
+export interface OwnerPrMediaPublication {
+  readonly state: 'published' | 'pending' | 'failed' | 'off';
+  readonly at: string | null;
+  readonly detail: string | null;
+}
+
+export interface OwnerPrMediaView {
+  /** The head every listed capture is bound to (always the row's sha). */
+  readonly headSha: string;
+  readonly items: readonly OwnerPrMediaItemView[];
+  /** Captures of earlier heads: superseded, never shown as current. */
+  readonly superseded: number;
+  /** Null when no capture is bound to the current head. */
+  readonly publication: OwnerPrMediaPublication | null;
 }
 
 /** Only https URLs may become an OPEN link (fail closed otherwise). */

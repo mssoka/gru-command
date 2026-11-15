@@ -465,6 +465,68 @@ export interface OwnerPrView {
    * opens a PR, a GitLab row a merge request. Absent on pre-#527 servers,
    * which only ever projected GitHub rows. */
   readonly provider?: RepoProvider;
+  /** PR media (docs/PR-MEDIA.md): captures bound to `sha`. Absent on
+   * servers before PR media, null when the job has none. */
+  readonly media?: OwnerPrMediaView | null;
+}
+
+/** One capture on the FOR YOU card; its bytes come from
+ * `GET /api/media/<id>` (authenticated, so the board fetches them). */
+export interface OwnerPrMediaItemView {
+  readonly id: string;
+  readonly kind: 'image' | 'video';
+  readonly mediaType: string;
+  readonly role: 'after' | 'before';
+  readonly caption: string;
+  readonly bytes: number;
+}
+
+export interface OwnerPrMediaView {
+  readonly headSha: string;
+  readonly items: readonly OwnerPrMediaItemView[];
+  /** Captures of earlier heads: superseded, never shown as current. */
+  readonly superseded: number;
+  /** Where the current captures stand on the PR/MR description; null when
+   * none is bound to the current head. */
+  readonly publication: {
+    readonly state: 'published' | 'pending' | 'failed' | 'off';
+    readonly at: string | null;
+    readonly detail: string | null;
+  } | null;
+}
+
+const MEDIA_ID_RE = /^m-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MEDIA_TYPES: readonly string[] = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'video/webm', 'video/mp4'];
+
+function isOwnerPrMediaItem(value: unknown): value is OwnerPrMediaItemView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' && MEDIA_ID_RE.test(value.id) &&
+    (value.kind === 'image' || value.kind === 'video') &&
+    typeof value.mediaType === 'string' && MEDIA_TYPES.includes(value.mediaType) &&
+    (value.mediaType.startsWith('video/') ? value.kind === 'video' : value.kind === 'image') &&
+    (value.role === 'after' || value.role === 'before') &&
+    typeof value.caption === 'string' && value.caption !== '' &&
+    typeof value.bytes === 'number' && Number.isSafeInteger(value.bytes) && value.bytes > 0
+  );
+}
+
+/** Strict when present: a malformed media block fails the row's snapshot
+ * rather than rendering a guessed capture or a stale one as current. */
+function isOwnerPrMediaView(value: unknown, rowSha: string): value is OwnerPrMediaView {
+  if (!isRecord(value)) return false;
+  if (value.headSha !== rowSha) return false;
+  if (!Array.isArray(value.items) || !value.items.every(isOwnerPrMediaItem)) return false;
+  if (typeof value.superseded !== 'number' || !Number.isSafeInteger(value.superseded) || value.superseded < 0) return false;
+  const publication = value.publication;
+  if (publication === null) return value.items.length === 0;
+  return (
+    value.items.length > 0 &&
+    isRecord(publication) &&
+    (publication.state === 'published' || publication.state === 'pending' || publication.state === 'failed' || publication.state === 'off') &&
+    (publication.at === null || typeof publication.at === 'string') &&
+    (publication.detail === null || typeof publication.detail === 'string')
+  );
 }
 
 /** The For You notification kind for a Book of Lessons proposal (owner
@@ -1270,7 +1332,8 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
     typeof value.prUrl !== 'string' ||
     typeof value.sha !== 'string' || value.sha === '' ||
     typeof value.checkedAt !== 'string' ||
-    !(value.provider === undefined || isRepoProvider(value.provider))
+    !(value.provider === undefined || isRepoProvider(value.provider)) ||
+    !(value.media === undefined || value.media === null || isOwnerPrMediaView(value.media, value.sha))
   ) {
     return false;
   }

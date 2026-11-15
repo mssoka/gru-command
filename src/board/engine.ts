@@ -17,6 +17,8 @@ import { briefingReviewBoardView, type BriefingReviewBoardView } from '../briefi
 import type { BriefingReviewStage } from '../briefing-review/types.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
 import { ownerReadyPr, readOwnerEvidence, type OwnerPrView } from './owner-actions.js';
+import { ownerPrMediaView } from '../media/publisher.js';
+import type { PrMediaConfig } from '../config.js';
 import {
   DEFAULT_LENSES,
   LedgerApi,
@@ -534,10 +536,14 @@ export interface BoardEngineOptions {
   readonly selfHeal?: () => SelfHealView | null;
   /** Clock seam for the day-boundary health derivations. */
   readonly now?: () => number;
+  /** `[pr_media]` (late-bound config read): the FOR YOU ready-PR rows carry
+   * the captures bound to their head. Absent = no media on the board. */
+  readonly prMedia?: () => PrMediaConfig;
 }
 
 export class BoardEngine {
   readonly mailbox: GruMailbox;
+  private readonly prMedia: (() => PrMediaConfig) | null;
   private readonly ledger: LedgerApi;
   private readonly bus: EventBus;
   private readonly log: Log;
@@ -546,6 +552,7 @@ export class BoardEngine {
 
   constructor(opts: BoardEngineOptions) {
     this.ledger = opts.ledger;
+    this.prMedia = opts.prMedia ?? null;
     this.mailbox = new GruMailbox(opts.ledger, opts.now);
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
@@ -1038,7 +1045,11 @@ export class BoardEngine {
           const version = acceptance?.version;
           if (typeof version !== 'number' || version < revision.required) return null;
         }
-        return ownerReadyPr(job, readOwnerEvidence(this.ledger, job, this.now()));
+        const row = ownerReadyPr(job, readOwnerEvidence(this.ledger, job, this.now()));
+        const prMedia = this.prMedia?.();
+        if (row === null || prMedia === undefined) return row;
+        const media = ownerPrMediaView(this.ledger, job.id, row.sha, prMedia);
+        return media === null ? row : { ...row, media };
       })
       .filter((row): row is OwnerPrView => row !== null)
       .sort((left, right) => left.jobId.localeCompare(right.jobId));

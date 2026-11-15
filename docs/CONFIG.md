@@ -598,6 +598,18 @@ max_raid_tokens = 400000
 # or ended before starting (refused, or failed before they started).
 max_raids_per_day = 2
 
+[pr_media]
+# Screenshots and clips in PRs (docs/PR-MEDIA.md): minions submit captures
+# of their committed head, GC binds each one to that exact commit, shows
+# them on the FOR YOU ready-PR card and writes them into the PR/MR
+# description. A capture of an older head is shown as superseded, never
+# as current. Captures use mock or seed data only.
+# false = the capture API refuses and nothing is shown or published.
+enabled = true
+# "autonomous": GC writes the description's media section itself (on a
+# public repository the media is public). "never": FOR YOU only.
+publish = "autonomous"
+
 [onboarding]
 # Onboarding heists (#427, docs/ONBOARDING.md): a managed repository whose
 # origin default branch has no .gru-command/worktree.toml gets no lane
@@ -889,6 +901,17 @@ real liveness. See
 semantics, and the session-store contract, and
 [SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
 `[supervision]` table drives plus the log-rotation knobs.
+
+### PR media: on and autonomous by default
+
+`[pr_media]` is on for every GC user (owner ruling 2026-11-15): screenshots and
+clips are review evidence, not a risky action. A minion whose change is visible
+submits captures of its committed head; GC binds each one to that exact commit,
+shows it on the FOR YOU ready-PR card, and writes it into the PR/MR description
+between two GC markers. `publish = "never"` keeps captures on the board only;
+`enabled = false` turns the capture API off. On a public repository, published
+media is public, so captures use mock or seed data only.
+[PR-MEDIA.md](./PR-MEDIA.md) describes the whole flow.
 
 ### Vector's raids: `proposed` or `autonomous`
 

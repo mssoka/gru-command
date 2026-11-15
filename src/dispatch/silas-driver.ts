@@ -2352,6 +2352,11 @@ export interface GitLabPollPort {
   pollOnce(): Promise<GitLabPollTickResult>;
 }
 
+/** The PR media publisher's tick (src/media/publisher.ts). */
+export interface MediaPublisherPort {
+  pollOnce(): Promise<unknown>;
+}
+
 /** Bind the supervisor's live per-agent views to the digest's lookup. This
  * is the one seam main.ts wires; it is a factory so the binding is testable
  * without booting the service (final independent review T2). The argument
@@ -2386,6 +2391,9 @@ export interface SilasDriverOptions {
    * fails and logs on its own, so one provider's throw never suppresses the
    * other's tick. */
   readonly gitlabPoll?: GitLabPollPort;
+  /** PR media publication (docs/PR-MEDIA.md), ticked after both polls on the
+   * same interval; its own failure never suppresses either poll. */
+  readonly mediaPublisher?: MediaPublisherPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
@@ -2688,6 +2696,14 @@ export class SilasDriver {
           }
         } catch (error) {
           this.log('error', 'gitlab signal poll failed', { error: String(error).slice(0, 300) });
+        }
+      }
+      const media = this.opts.mediaPublisher;
+      if (media !== undefined) {
+        try {
+          await media.pollOnce();
+        } catch (error) {
+          this.log('error', 'pr media publication tick failed', { error: String(error).slice(0, 300) });
         }
       }
     } finally {

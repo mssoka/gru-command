@@ -466,6 +466,36 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
   });
 
+  it('FOR YOU ownerPrs media: absent/null tolerated, head-bound captures accepted, anything stale or guessed rejected', () => {
+    const sha = 'a'.repeat(40);
+    const ready = {
+      id: 'owner-pr:job-1', jobId: 'job-1', jobTitle: 'Ready heist', repo: 'demo-repo',
+      prUrl: 'https://github.com/example/demo/pull/7', sha, checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const item = { id: 'm-12345678-1234-1234-1234-123456789abc', kind: 'image', mediaType: 'image/png', role: 'after', caption: 'New card', bytes: 120 };
+    const media = { headSha: sha, items: [item], superseded: 1, publication: { state: 'published', at: '2026-01-01T00:01:00.000Z', detail: null } };
+    const valid = (row: unknown): boolean => isValidSnapshot({ ...snapshot(), ownerPrs: [row] } as unknown);
+    expect(valid({ ...ready, media: null })).toBe(true);
+    expect(valid({ ...ready, media })).toBe(true);
+    expect(valid({ ...ready, media: { ...media, items: [{ ...item, kind: 'video', mediaType: 'video/webm' }] } })).toBe(true);
+    // Only older-head captures: the block says so, with no publication state.
+    expect(valid({ ...ready, media: { headSha: sha, items: [], superseded: 2, publication: null } })).toBe(true);
+    for (const broken of [
+      { ...media, headSha: 'b'.repeat(40) }, // bound to another head than the row
+      { ...media, items: [{ ...item, id: 'not-a-media-id' }] },
+      { ...media, items: [{ ...item, mediaType: 'image/svg+xml' }] },
+      { ...media, items: [{ ...item, kind: 'video' }] }, // kind disagrees with the type
+      { ...media, items: [{ ...item, role: 'during' }] },
+      { ...media, items: [{ ...item, caption: '' }] },
+      { ...media, superseded: -1 },
+      { ...media, publication: null }, // current captures always say where they stand
+      { ...media, publication: { state: 'uploaded', at: null, detail: null } },
+      { headSha: sha, items: [], superseded: 0, publication: { state: 'pending', at: null, detail: null } },
+    ]) {
+      expect(valid({ ...ready, media: broken }), JSON.stringify(broken)).toBe(false);
+    }
+  });
+
   it('managed repo overview: absent/null tolerated, well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     expect(isValidSnapshot({ ...snapshot(), repoOverview: null } as unknown)).toBe(true);

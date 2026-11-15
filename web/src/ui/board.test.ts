@@ -4222,6 +4222,54 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(badRow.textContent).toContain('PR link unavailable');
   });
 
+  it('ready PR row shows the head-bound captures: stills open full size, clips play in place, one fetch per capture', async () => {
+    const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+    const still = { id: 'm-11111111-1111-1111-1111-111111111111', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'New FOR YOU card', bytes: 10 };
+    const clip = { id: 'm-22222222-2222-2222-2222-222222222222', kind: 'video' as const, mediaType: 'video/webm', role: 'after' as const, caption: 'Approve flow', bytes: 20 };
+    const fetchMedia = vi.fn((id: string) => Promise.resolve(new Blob([id])));
+    const created: string[] = [];
+    const revoked: string[] = [];
+    const createSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
+      const url = `blob:test-${created.length + 1}`;
+      created.push(url);
+      return url;
+    });
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url: string) => { revoked.push(url); });
+    try {
+      const view = new BoardView(() => {});
+      view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia } as unknown as import('../lib/board-client.js').BoardClient);
+      const withMedia = ownerPr('job-shots', {
+        sha,
+        media: { headSha: sha, items: [still, clip], superseded: 1, publication: { state: 'published', at: '2026-01-01T00:06:00.000Z', detail: null } },
+      });
+      view.render(snapshot({ ownerPrs: [withMedia] }));
+      await vi.waitFor(() => expect(document.querySelector('.board-owner__shot--video video')).not.toBeNull());
+      const row = document.getElementById('board-owner')!.querySelector('.board-owner__row--pr')!;
+      const link = row.querySelector<HTMLAnchorElement>('.board-owner__shot--image a')!;
+      expect(link.href).toBe('blob:test-1');
+      expect(link.target).toBe('_blank');
+      expect(row.querySelector<HTMLImageElement>('.board-owner__shot--image img')!.alt).toBe('New FOR YOU card');
+      const video = row.querySelector<HTMLVideoElement>('.board-owner__shot--video video')!;
+      expect(video.controls).toBe(true);
+      expect(row.querySelector('.board-owner__media-note')?.textContent).toBe('📸 2 captures at aaaa1111 · 1 older superseded · on the PR ✓');
+      // A re-render reuses the same preview nodes (a playing clip keeps playing)
+      // and never fetches again.
+      view.render(snapshot({ ownerPrs: [withMedia] }));
+      expect(document.querySelector('.board-owner__shot--video video')).toBe(video);
+      expect(fetchMedia).toHaveBeenCalledTimes(2);
+      // A failed publication says why; only older-head captures say so instead.
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: { headSha: sha, items: [still], superseded: 0, publication: { state: 'failed', at: null, detail: 'gh pr edit --attach failed (exit 1)' } } })] }));
+      expect(document.querySelector('.board-owner__media-note')?.textContent).toBe('📸 1 capture at aaaa1111 · not posted to the PR: gh pr edit --attach failed (exit 1)');
+      expect(revoked).toEqual(['blob:test-2']); // the clip left every card
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: { headSha: sha, items: [], superseded: 2, publication: null } })] }));
+      expect(document.querySelector('.board-owner__media-strip')).toBeNull();
+      expect(document.querySelector('.board-owner__media-note')?.textContent).toBe('📸 2 captures from an older head — superseded, not shown');
+    } finally {
+      createSpy.mockRestore();
+      revokeSpy.mockRestore();
+    }
+  });
+
   it('older pending obligations stay reachable behind the +N older expander', () => {
     const view = new BoardView(() => {});
     const stops = Array.from({ length: 9 }, (_, i) =>

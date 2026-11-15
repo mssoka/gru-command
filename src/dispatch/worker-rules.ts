@@ -34,12 +34,28 @@ export const BACKGROUND_PROCESS_RULE = [
 ].join('\n');
 
 /**
+ * PR media (owner rulings 2026-11-15, docs/PR-MEDIA.md): a minion whose change
+ * is visible captures it from its committed head and submits each capture to
+ * the service, which binds it to that head, shows it on the owner's FOR YOU
+ * card and writes the PR description's media section. The service refuses a
+ * capture unless the lane sits at exactly the named head with a clean tracked
+ * tree, so a capture can never claim a commit it was not taken at.
+ */
+export const PR_MEDIA_RULE = [
+  'PR MEDIA RULE (screenshots and clips for the owner\'s review):',
+  '- When your change alters something a person sees (a page, a component, CLI or terminal output), capture it from your committed head before you hand off: stills with `agent-browser screenshot`, a short clip with `agent-browser record start <file>.webm` and `agent-browser record stop`. PNG, JPEG, GIF, WebP, WebM or MP4; at most 10 MB each and 8 per head. A change with nothing visible needs no media.',
+  '- Submit each capture with POST /api/media and the body {"job_id": "<your job id>", "head_sha": "<your lane\'s full HEAD sha>", "caption": "<one line: what it shows>", "role": "after" (or "before" for the behavior it replaces), "content_base64": "<the file, base64>"}, authenticated like your other service calls. It is refused unless your lane sits at exactly that head with no uncommitted tracked changes.',
+  '- GC binds each capture to that head, shows it to the owner on the FOR YOU card and writes the PR description\'s media section. Never attach media to the PR yourself, never commit captures into the repository, and keep capture files outside your worktree.',
+  '- Capture mock or seed data only: never real accounts, credentials, tokens or personal data. When your head moves (a fix round), submit fresh captures of the new head.',
+].join('\n');
+
+/**
  * The complete set of current rule blocks an assembled worker instruction
  * carries. Rendering and appending live here (one ordered list, one append
  * helper DERIVED from it) so briefings, re-briefs and follow-up directives
  * cannot drift apart block by block.
  */
-export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE];
+export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE, PR_MEDIA_RULE];
 
 /** Append every current worker rule block to an authored instruction text
  * (one blank line between blocks, always). Derived from the ordered list so

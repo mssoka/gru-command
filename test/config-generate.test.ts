@@ -95,6 +95,7 @@ describe('config-generate CLI', () => {
       'silas',
       'provider_recovery',
       'vector',
+      'pr_media',
       'onboarding',
       'roll',
       'concurrency',
@@ -138,6 +139,10 @@ describe('config-generate CLI', () => {
     expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(604_800_000);
     expect(loaded.dispatch.bobIntervalMs).toBe(604_800_000);
     expect(raw.lessons).toMatchObject({ dream_interval_ms: 604_800_000 });
+    // Owner ruling 2026-11-15: a fresh install ships PR media on and
+    // autonomous (docs/PR-MEDIA.md).
+    expect(raw.pr_media).toEqual({ enabled: true, publish: 'autonomous' });
+    expect(loaded.prMedia).toEqual({ enabled: true, publish: 'autonomous' });
     expect(loaded.lessons.dreamIntervalMs).toBe(604_800_000);
     expect(raw.concurrency).toMatchObject({ max_workers: 4 });
     expect(raw.review).toMatchObject({ max_concurrent_children: 2 });

@@ -574,6 +574,19 @@ export class BoardClient {
     return body;
   }
 
+  /** One PR media capture's bytes (docs/PR-MEDIA.md) for the FOR YOU
+   * previews: fetched with the pairing token, since an <img> or <video>
+   * cannot send it, and handed back as a Blob for an object URL. */
+  async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob> {
+    const path = `/api/media/${encodeURIComponent(id)}`;
+    const res = await this.fetchImpl(path, {
+      headers: { authorization: `Bearer ${this.options.token}` },
+      ...(signal !== undefined ? { signal } : {}),
+    });
+    if (!res.ok) return this.refused(path, res);
+    return res.blob();
+  }
+
   private async postApi(path: string, body: unknown): Promise<unknown> {
     return (await this.postApiWithStatus(path, body)).body;
   }
