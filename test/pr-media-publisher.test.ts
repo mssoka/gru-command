@@ -364,16 +364,19 @@ describe('PR media publisher', () => {
     expect(pr.body).toContain('did not complete after 3 attempts; they are on the Gru Command board');
 
     // One clip dropped, the other landed but appended by gh: the appended
-    // link leaves with the replaced section instead of piling up.
+    // link leaves with the replaced section instead of piling up — and a
+    // screenshot a person added below the section is never taken for it.
     const w3 = world();
     observeGitHub(w3, HEAD);
     capture(w3, HEAD, 'Clip one', webm());
     capture(w3, HEAD, 'Clip two', webm());
-    const pr3 = { body: HUMAN, head: HEAD, prState: 'OPEN' };
+    const mine = '![mine](https://github.com/user-attachments/assets/mine)';
+    const pr3 = { body: `${HUMAN}\n\n${MEDIA_SECTION_BEGIN}\nold\n${MEDIA_SECTION_END}\n\n${mine}`, head: HEAD, prState: 'OPEN' };
     const partial = fakeGh(pr3, { drop: true, videos: 'append' });
     expect(await publisher(w3, partial.gh).pollOnce()).toMatchObject({ failed: 1 });
-    expect(pr3.body).not.toContain('user-attachments');
+    expect(pr3.body).not.toContain('assets/asset-');
     expect(pr3.body.startsWith(HUMAN)).toBe(true);
+    expect(pr3.body.endsWith(mine)).toBe(true);
 
     const w2 = world();
     observeGitHub(w2, HEAD);
@@ -439,6 +442,10 @@ describe('PR media publisher', () => {
     damagedPr.body = HUMAN; // the owner deletes the stray marker line hours later
     damaged.now += MEDIA_PUBLISH_FIX_RECHECK_MS * 3;
     expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ published: 1 });
+    // Hand-fix re-checks are not upload attempts: the attempt number recorded
+    // for them never counts them toward "3 of 3".
+    const recorded = damaged.ledger.listJobEvents('j-ui', { kinds: ['media.publish-failed'], order: 'asc' }).map((event) => (event.payload as { attempt: number }).attempt);
+    expect(recorded.every((attempt) => attempt === 1)).toBe(true);
   });
 
   it('publishes again when the job is re-pointed at another PR, and only against an observation of the job\'s own change', async () => {

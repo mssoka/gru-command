@@ -219,8 +219,9 @@ mergeable) shows:
   - `posting to the PR…` while a write is due;
   - `posting to the PR… (attempt 1 of 3 failed: <reason>)` between retries;
   - `not posted to the PR: <reason>` once the attempts run out;
-  - `not posted to the PR: <what to fix> (Gru Command checks again every hour)`
-    when a hand fix of the description is needed;
+  - `not posted to the PR: <what to fix> (Gru Command checks again within 10 minutes)`
+    when a hand fix of the description is needed, and `… every hour` once
+    the 3 attempts have passed;
   - `board only` with `publish = "never"`;
   - `board only: publishing runs on the Silas signal poll, which is off on this instance`
     when Silas or its poll is off;

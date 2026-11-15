@@ -240,6 +240,7 @@ export function spliceMediaSection(body: string, section: string): string | null
 /** A line gh may have written for an uploaded attachment: an image or a bare
  * asset URL on GitHub's attachment hosts only — never a person's own link. */
 const ATTACHMENT_URL = String.raw`https://(?:github\.com/user-attachments/|private-user-images\.githubusercontent\.com/|user-images\.githubusercontent\.com/)[^\s)"'<>]+`;
+const ATTACHMENT_URL_GLOBAL = new RegExp(ATTACHMENT_URL, 'gu');
 const ATTACHMENT_LINE = new RegExp(String.raw`^\s*(?:!\[(?:\\.|[^\]\n])*\]\(${ATTACHMENT_URL}\)|${ATTACHMENT_URL}|<img\b[^>\n]*src="${ATTACHMENT_URL}"[^>\n]*>|<video\b[^>\n]*src="${ATTACHMENT_URL}"[^>\n]*>(?:</video>)?)\s*$`, 'u');
 /** A `./gc-media-N.ext` reference gh did not rewrite (alt text may hold
  * escaped brackets, so only the target is matched). */
@@ -252,9 +253,11 @@ const LOCAL_REFERENCE = /\]\(\.\/gc-media-\d+\.[a-z0-9]+\)/u;
  * attachment lines are taken from the end (blank lines between them
  * skipped) — the last ones, which gh wrote — and put in place of the
  * unrewritten references, in order. Anything else, including a person's own
- * attachment placed after the section, is left where it is.
+ * attachment placed after the section, is left where it is: given the
+ * description as it was before the edit (`before`), a line whose URL was
+ * already there ends gh's run.
  */
-export function repairAttachmentLayout(body: string): string {
+export function repairAttachmentLayout(body: string, before?: string): string {
   const span = findMediaSection(body);
   if (span === null || span === 'damaged') return body;
   const sectionText = body.slice(span.start, span.end);
@@ -268,6 +271,10 @@ export function repairAttachmentLayout(body: string): string {
     const line = tailLines[index]!;
     if (line.trim() === '') continue;
     if (!ATTACHMENT_LINE.test(line)) break;
+    // Upload URLs are unique: a line whose URL was already in the
+    // description before gh wrote is a person's (or an earlier attempt's),
+    // never one gh just appended. The run of gh's lines ends there.
+    if (before !== undefined && (line.match(ATTACHMENT_URL_GLOBAL) ?? []).some((url) => before.includes(url))) break;
     appended.unshift(line.trim());
     cut = index;
   }
@@ -447,11 +454,11 @@ class GitHubWriter {
       const edit = await this.writeBody(request.url, dir, 'body.md', body, attach, GH_EDIT_TIMEOUT_MS);
       const after = await this.view(request.url);
       if (edit.code !== 0) {
-        await this.replaceBroken(request, dir, after);
+        await this.replaceBroken(request, dir, after, current.body);
         return { kind: 'failed', detail: `gh pr edit --attach failed (exit ${edit.code}): ${edit.stderr}` };
       }
       if (typeof after === 'string') return { kind: 'failed', detail: `the description was written but could not be re-read: ${after}` };
-      const repaired = repairAttachmentLayout(after.body);
+      const repaired = repairAttachmentLayout(after.body, current.body);
       if (repaired !== after.body) {
         const fix = await this.writeBody(request.url, dir, 'repaired.md', repaired, [], GH_VIEW_TIMEOUT_MS);
         if (fix.code !== 0) {
@@ -459,7 +466,7 @@ class GitHubWriter {
         }
       }
       if (!sectionFullyLinked(repaired)) {
-        await this.replaceBroken(request, dir, { ...after, body: repaired });
+        await this.replaceBroken(request, dir, { ...after, body: repaired }, current.body);
         return { kind: 'failed', detail: 'gh left a capture unlinked in the GC section (an upload did not land)' };
       }
       return { kind: 'published', files: items.length };
@@ -472,9 +479,9 @@ class GitHubWriter {
    * the description: replace an unlinked section with a note. gh's appended
    * links are pulled into the section first, so they leave with it instead
    * of piling up at the end of the description on every retry. */
-  private async replaceBroken(request: PublishRequest, dir: string, after: { body: string } | string): Promise<void> {
+  private async replaceBroken(request: PublishRequest, dir: string, after: { body: string } | string, before: string): Promise<void> {
     if (typeof after === 'string' || sectionFullyLinked(after.body) || findMediaSection(after.body) === null) return;
-    const body = spliceMediaSection(repairAttachmentLayout(after.body), renderNoticeSection(uploadFailedNote(request.headSha, request.attempt)));
+    const body = spliceMediaSection(repairAttachmentLayout(after.body, before), renderNoticeSection(uploadFailedNote(request.headSha, request.attempt)));
     if (body !== null) await this.writeBody(request.url, dir, 'notice.md', body, [], GH_VIEW_TIMEOUT_MS);
   }
 }
@@ -642,7 +649,8 @@ export function mediaPublicationView(
     return { state: 'failed', at: failures[0]!.ts, detail: `${detail ?? 'see the service log'} (Gru Command checks again ${again})` };
   }
   if (failures.length > 0) {
-    return { state: 'pending', at: failures[0]!.ts, detail: `attempt ${failures.length} of ${MEDIA_PUBLISH_MAX_ATTEMPTS} failed: ${detail ?? 'see the service log'}` };
+    const attempts = failures.filter((event) => !needsFix(event)).length;
+    return { state: 'pending', at: failures[0]!.ts, detail: `attempt ${attempts} of ${MEDIA_PUBLISH_MAX_ATTEMPTS} failed: ${detail ?? 'see the service log'}` };
   }
   return { state: 'pending', at: null, detail: null };
 }
@@ -788,6 +796,9 @@ export class PrMediaPublisher {
       const lastFailure = failures[0];
       if (lastFailure !== undefined && now - Date.parse(lastFailure.ts) < retryGapMs(failures)) continue;
       result.considered += 1;
+      // The attempt number counts ordinary failures only: hourly re-checks
+      // of a description awaiting a hand fix are not upload attempts.
+      const attempt = failures.filter((event) => !needsFix(event)).length + 1;
       const base = {
         digest,
         kind: content.kind,
@@ -803,7 +814,7 @@ export class PrMediaPublisher {
         headSha: head,
         content,
         dataDir: this.options.dataDir,
-        attempt: failures.length + 1,
+        attempt,
         beginWrite: () => {
           ledger.appendCustomEvent({ kind: MEDIA_PUBLISH_ATTEMPT_EVENT, jobId: job.id, payload: base });
         },
@@ -828,13 +839,13 @@ export class PrMediaPublisher {
           jobId: job.id,
           payload: {
             ...base,
-            attempt: failures.length + 1,
+            attempt,
             detail,
             ...(outcome.final === true ? { final: true } : {}),
             ...(outcome.needsFix === true ? { needs_fix: true } : {}),
           },
         });
-        this.log('warn', 'pr media publication failed', { job: job.id, head, attempt: failures.length + 1, detail });
+        this.log('warn', 'pr media publication failed', { job: job.id, head, attempt, detail });
       } else {
         result.skipped += 1;
         this.log('info', 'pr media publication skipped', { job: job.id, reason: outcome.reason });
