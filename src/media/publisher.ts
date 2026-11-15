@@ -48,8 +48,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *           whatever gh appends instead (a video player has no alt text)
  *           is moved into the place of the reference it stands for. The
  *           result is re-read and must hold no unlinked reference; a
- *           partial upload is replaced by a "retrying" note, never left
- *           as broken images.
+ *           partial upload is replaced by a note (it says GC will retry
+ *           while an attempt remains), never left as broken images.
  *   GitLab: the project uploads API, then the description update (re-read
  *           just before the write, so an edit made during the uploads is
  *           kept), with the same `GITLAB_TOKEN`/`GL_TOKEN` the MR reads use.
@@ -60,8 +60,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * NEWEST publication for the job's current change counts as "on the PR", so
  * a head that returns, or a job re-pointed at another PR, is written again.
  * A failing digest gets {@link MEDIA_PUBLISH_MAX_ATTEMPTS} attempts,
- * {@link MEDIA_PUBLISH_RETRY_MS} apart; a precondition that cannot change by
- * retrying (Enterprise Server, a description over GitHub's limit) fails once.
+ * {@link MEDIA_PUBLISH_RETRY_MS} apart. A failure a person fixes by hand
+ * (damaged markers, a description over GitHub's limit) is re-checked after
+ * that every {@link MEDIA_PUBLISH_FIX_RECHECK_MS}, so the fix is picked up;
+ * one nothing can fix from the description (Enterprise Server, an
+ * unsupported GitLab host) is final and recorded once.
  * Captures still arriving are left to settle for {@link MEDIA_PUBLISH_SETTLE_MS}
  * so a run of submissions is uploaded once. A person who deletes the
  * section is not overridden: it is written again only when the head or the
@@ -76,6 +79,9 @@ export const MEDIA_PUBLISHED_EVENT = 'media.published';
 export const MEDIA_PUBLISH_FAILED_EVENT = 'media.publish-failed';
 export const MEDIA_PUBLISH_MAX_ATTEMPTS = 3;
 export const MEDIA_PUBLISH_RETRY_MS = 10 * 60_000;
+/** After the attempts run out, a failure a person fixes by hand is
+ * re-checked this often (one read, no upload) until the fix lands. */
+export const MEDIA_PUBLISH_FIX_RECHECK_MS = 60 * 60_000;
 /** Newest capture at a head must be this old before the head is published. */
 export const MEDIA_PUBLISH_SETTLE_MS = 2 * 60_000;
 /** Changes contacted per tick (published, failed or skipped after a read). */
@@ -190,8 +196,10 @@ function markerLines(body: string): { readonly begins: readonly LineSpan[]; read
     const end = start + raw.length;
     offset = end + 1;
     const line = raw.replace(/\r$/u, '').trim();
-    const fenceOpen = /^(`{3,}|~{3,})/u.exec(line);
-    if (fence === null && fenceOpen !== null) {
+    const fenceOpen = /^(`{3,}|~{3,})(.*)$/u.exec(line);
+    // A backtick fence's info string has no backtick (CommonMark): a line
+    // like ```npm test``` is an inline code span, not an opener.
+    if (fence === null && fenceOpen !== null && !(fenceOpen[1]!.startsWith('`') && fenceOpen[2]!.includes('`'))) {
       fence = fenceOpen[1]!;
       continue;
     }
@@ -240,11 +248,11 @@ const LOCAL_REFERENCE = /\]\(\.\/gc-media-\d+\.[a-z0-9]+\)/u;
 /**
  * Repair the layout gh produced: when references in the section were left
  * unrewritten, gh appended their attachments at the very end of the
- * description instead. Exactly that many lines are taken from the end of
- * the trailing run of attachment lines after the section — the last ones,
- * which gh wrote — and put in place of the unrewritten references, in
- * order. Anything else, including a person's own attachment placed after
- * the section, is left where it is.
+ * description instead, each as its own paragraph. Exactly that many
+ * attachment lines are taken from the end (blank lines between them
+ * skipped) — the last ones, which gh wrote — and put in place of the
+ * unrewritten references, in order. Anything else, including a person's own
+ * attachment placed after the section, is left where it is.
  */
 export function repairAttachmentLayout(body: string): string {
   const span = findMediaSection(body);
@@ -254,13 +262,14 @@ export function repairAttachmentLayout(body: string): string {
   const unlinked = sectionLines.filter((line) => LOCAL_REFERENCE.test(line)).length;
   if (unlinked === 0) return body;
   const tailLines = body.slice(span.end).split('\n');
-  let last = tailLines.length;
-  while (last > 0 && tailLines[last - 1]!.trim() === '') last -= 1;
   const appended: string[] = [];
-  let cut = last;
-  while (cut > 0 && appended.length < unlinked && ATTACHMENT_LINE.test(tailLines[cut - 1]!)) {
-    appended.unshift(tailLines[cut - 1]!.trim());
-    cut -= 1;
+  let cut = tailLines.length;
+  for (let index = tailLines.length - 1; index > 0 && appended.length < unlinked; index -= 1) {
+    const line = tailLines[index]!;
+    if (line.trim() === '') continue;
+    if (!ATTACHMENT_LINE.test(line)) break;
+    appended.unshift(line.trim());
+    cut = index;
   }
   if (appended.length === 0) return body;
   for (let index = 0; index < sectionLines.length && appended.length > 0; index += 1) {
@@ -336,7 +345,7 @@ export const runGh: GhRunner = (args, opts) =>
 export type PublishOutcome =
   | { readonly kind: 'published'; readonly files: number }
   | { readonly kind: 'skipped'; readonly reason: string }
-  | { readonly kind: 'failed'; readonly detail: string; readonly final?: boolean };
+  | { readonly kind: 'failed'; readonly detail: string; readonly final?: boolean; readonly needsFix?: boolean };
 
 /** What one publication writes: the captures, or a note with no media. */
 type PublishContent =
@@ -414,7 +423,7 @@ class GitHubWriter {
     try {
       if (request.content.kind === 'superseded') {
         const body = spliceMediaSection(current.body, renderNoticeSection(supersededNote('PR', request.content.capturesHead, request.headSha)));
-        if (body === null) return { kind: 'failed', detail: DAMAGED };
+        if (body === null) return { kind: 'failed', detail: DAMAGED, needsFix: true };
         request.beginWrite();
         const edit = await this.writeBody(request.url, dir, 'body.md', body, [], GH_VIEW_TIMEOUT_MS);
         if (edit.code !== 0) return { kind: 'failed', detail: `gh pr edit failed (exit ${edit.code}): ${edit.stderr}` };
@@ -430,9 +439,9 @@ class GitHubWriter {
         attach.push('--attach', `./${name}`);
       });
       const body = spliceMediaSection(current.body, renderMediaSection({ headSha: request.headSha, items, targets, change: 'PR' }));
-      if (body === null) return { kind: 'failed', detail: DAMAGED };
+      if (body === null) return { kind: 'failed', detail: DAMAGED, needsFix: true };
       if (body.length > GITHUB_BODY_MAX_CHARS) {
-        return { kind: 'failed', detail: `the description would exceed GitHub's ${GITHUB_BODY_MAX_CHARS}-character limit with the media section: shorten it` };
+        return { kind: 'failed', detail: `the description would exceed GitHub's ${GITHUB_BODY_MAX_CHARS}-character limit with the media section: shorten it`, needsFix: true };
       }
       request.beginWrite();
       const edit = await this.writeBody(request.url, dir, 'body.md', body, attach, GH_EDIT_TIMEOUT_MS);
@@ -460,10 +469,12 @@ class GitHubWriter {
   }
 
   /** After a partial upload, never leave broken `./gc-media-N` images in
-   * the description: replace an unlinked section with a "retrying" note. */
+   * the description: replace an unlinked section with a note. gh's appended
+   * links are pulled into the section first, so they leave with it instead
+   * of piling up at the end of the description on every retry. */
   private async replaceBroken(request: PublishRequest, dir: string, after: { body: string } | string): Promise<void> {
     if (typeof after === 'string' || sectionFullyLinked(after.body) || findMediaSection(after.body) === null) return;
-    const body = spliceMediaSection(after.body, renderNoticeSection(uploadFailedNote(request.headSha, request.attempt)));
+    const body = spliceMediaSection(repairAttachmentLayout(after.body), renderNoticeSection(uploadFailedNote(request.headSha, request.attempt)));
     if (body !== null) await this.writeBody(request.url, dir, 'notice.md', body, [], GH_VIEW_TIMEOUT_MS);
   }
 }
@@ -507,7 +518,7 @@ async function publishGitLab(request: PublishRequest, deps: GitLabPublishDeps): 
     if (typeof mr === 'string') return { kind: 'failed', detail: scrub(mr) };
     if (mr.state !== 'opened') return { kind: 'skipped', reason: `the merge request is ${String(mr.state)}` };
     if (mr.sha !== request.headSha) return { kind: 'skipped', reason: 'the merge request head moved since it was observed' };
-    if (findMediaSection(mr.description) === 'damaged') return { kind: 'failed', detail: DAMAGED };
+    if (findMediaSection(mr.description) === 'damaged') return { kind: 'failed', detail: DAMAGED, needsFix: true };
     let section: string;
     let files = 0;
     request.beginWrite();
@@ -536,7 +547,7 @@ async function publishGitLab(request: PublishRequest, deps: GitLabPublishDeps): 
     if (typeof fresh === 'string') return { kind: 'failed', detail: scrub(fresh) };
     if (fresh.sha !== request.headSha) return { kind: 'failed', detail: 'the merge request head moved during the uploads' };
     const description = spliceMediaSection(fresh.description, section);
-    if (description === null) return { kind: 'failed', detail: DAMAGED };
+    if (description === null) return { kind: 'failed', detail: DAMAGED, needsFix: true };
     const update = await call(`/merge_requests/${link.iid}`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
@@ -577,8 +588,27 @@ function failuresFor(ledger: MediaLedger, jobId: string, digest: string): readon
     .filter((event) => payloadOf(event)['digest'] === digest);
 }
 
+function needsFix(event: EventRecord): boolean {
+  return payloadOf(event)['needs_fix'] === true;
+}
+
+/** No further attempt: a final failure, or the attempts ran out on failures
+ * no hand fix of the description can cure. A failure awaiting a hand fix is
+ * never exhausted; it is re-checked (see {@link retryGapMs}). */
 function exhausted(failures: readonly EventRecord[]): boolean {
-  return failures.length >= MEDIA_PUBLISH_MAX_ATTEMPTS || failures.some((event) => payloadOf(event)['final'] === true);
+  if (failures.some((event) => payloadOf(event)['final'] === true)) return true;
+  const latest = failures[0];
+  if (latest !== undefined && needsFix(latest)) return false;
+  return failures.filter((event) => !needsFix(event)).length >= MEDIA_PUBLISH_MAX_ATTEMPTS;
+}
+
+/** The wait before the next attempt: the retry gap, or the slower re-check
+ * once a failure awaiting a hand fix has used up the attempts. */
+function retryGapMs(failures: readonly EventRecord[]): number {
+  const latest = failures[0];
+  return latest !== undefined && needsFix(latest) && failures.length >= MEDIA_PUBLISH_MAX_ATTEMPTS
+    ? MEDIA_PUBLISH_FIX_RECHECK_MS
+    : MEDIA_PUBLISH_RETRY_MS;
 }
 
 /** The head the newest publication's captures showed (a superseded note
@@ -607,6 +637,10 @@ export function mediaPublicationView(
   const reason = failures.length === 0 ? null : payloadOf(failures[0]!)['detail'];
   const detail = typeof reason === 'string' ? reason : null;
   if (exhausted(failures)) return { state: 'failed', at: failures[0]!.ts, detail };
+  if (failures.length > 0 && needsFix(failures[0]!)) {
+    const again = retryGapMs(failures) === MEDIA_PUBLISH_FIX_RECHECK_MS ? 'every hour' : 'within 10 minutes';
+    return { state: 'failed', at: failures[0]!.ts, detail: `${detail ?? 'see the service log'} (Gru Command checks again ${again})` };
+  }
   if (failures.length > 0) {
     return { state: 'pending', at: failures[0]!.ts, detail: `attempt ${failures.length} of ${MEDIA_PUBLISH_MAX_ATTEMPTS} failed: ${detail ?? 'see the service log'}` };
   }
@@ -752,7 +786,7 @@ export class PrMediaPublisher {
       const failures = failuresFor(ledger, job.id, digest);
       if (exhausted(failures)) continue;
       const lastFailure = failures[0];
-      if (lastFailure !== undefined && now - Date.parse(lastFailure.ts) < MEDIA_PUBLISH_RETRY_MS) continue;
+      if (lastFailure !== undefined && now - Date.parse(lastFailure.ts) < retryGapMs(failures)) continue;
       result.considered += 1;
       const base = {
         digest,
@@ -792,7 +826,13 @@ export class PrMediaPublisher {
         ledger.appendCustomEvent({
           kind: MEDIA_PUBLISH_FAILED_EVENT,
           jobId: job.id,
-          payload: { ...base, attempt: failures.length + 1, detail, ...(outcome.final === true ? { final: true } : {}) },
+          payload: {
+            ...base,
+            attempt: failures.length + 1,
+            detail,
+            ...(outcome.final === true ? { final: true } : {}),
+            ...(outcome.needsFix === true ? { needs_fix: true } : {}),
+          },
         });
         this.log('warn', 'pr media publication failed', { job: job.id, head, attempt: failures.length + 1, detail });
       } else {

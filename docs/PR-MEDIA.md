@@ -121,10 +121,11 @@ first, and gives each capture a caption line and its image or player.
 **Markers count only as whole lines outside fenced code.** A description that
 quotes the markers in prose or in a code block keeps every word.
 
-**Damaged markers fail with a reason, and are retried.** A marker line
-without its pair, or two sections, is recorded as a failure asking for the
-stray lines to be deleted by hand. GC never guesses which text is its own,
-and the retries pick up the fix.
+**Damaged markers fail with a reason until someone fixes them.** A marker
+line without its pair, or two sections, is recorded as a failure asking for
+the stray lines to be deleted by hand. GC never guesses which text is its
+own. After the usual 3 attempts it re-checks every hour (one read, no
+upload), so a fix made later is still picked up.
 
 **What the section shows**
 
@@ -166,8 +167,9 @@ Preconditions:
 - **GitHub Enterprise Server:** `--attach` is not supported there, so GC
   records one final failure; the media stays on the board.
 - **Description length:** a description that would exceed GitHub's
-  65,536-character limit fails before anything is uploaded. It is retried,
-  so a shortened description gets the media.
+  65,536-character limit fails before anything is uploaded. Like damaged
+  markers, it is re-checked every hour after the third attempt, so a
+  shortened description gets the media.
 - **Private repositories:** attachments are visible only to signed-in users
   with access.
 
@@ -217,6 +219,8 @@ mergeable) shows:
   - `posting to the PR…` while a write is due;
   - `posting to the PR… (attempt 1 of 3 failed: <reason>)` between retries;
   - `not posted to the PR: <reason>` once the attempts run out;
+  - `not posted to the PR: <what to fix> (Gru Command checks again every hour)`
+    when a hand fix of the description is needed;
   - `board only` with `publish = "never"`;
   - `board only: publishing runs on the Silas signal poll, which is off on this instance`
     when Silas or its poll is off;

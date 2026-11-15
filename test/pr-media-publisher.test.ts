@@ -10,6 +10,7 @@ import {
   escapeMarkdown,
   findMediaSection,
   GITHUB_BODY_MAX_CHARS,
+  MEDIA_PUBLISH_FIX_RECHECK_MS,
   MEDIA_PUBLISH_RETRY_MS,
   MEDIA_PUBLISH_SETTLE_MS,
   MEDIA_SECTION_BEGIN,
@@ -124,7 +125,8 @@ function fakeGh(pr: FakePr, opts: { videos?: 'rewrite' | 'append'; drop?: boolea
         if (path.endsWith('.webm') && opts.videos === 'append') appended.push(url);
         else body = body.split(`](${path})`).join(`](${url})`);
       }
-      pr.body = appended.length === 0 ? body : `${body}\n${appended.join('\n')}`;
+      // gh appends each unreferenced attachment as its own paragraph.
+      pr.body = `${body}${appended.map((url) => `\n\n${url}`).join('')}`;
       return opts.drop === true && attached.length > 0 ? { code: 1, stdout: PR, stderr: 'failed to upload gc-media-1.png' } : { code: 0, stdout: PR, stderr: '' };
     }
     throw new Error(`unexpected gh call ${args.join(' ')}`);
@@ -183,6 +185,8 @@ describe('PR media section text', () => {
     const longer = `\`\`\`\n${old}\n\`\`\`\`\n\n${old}`;
     expect(findMediaSection(longer)).not.toBeNull();
     expect(findMediaSection(`~~~\n${old}\n\`\`\`\n${old}`)).toBeNull(); // a backtick line never closes a tilde fence
+    // An inline ```npm test``` line is a code span, not a fence that hides the section.
+    expect(findMediaSection(`Run \n\`\`\`npm test\`\`\`\n\n${old}`)).not.toBeNull();
     // Damage is refused, never guessed: a lone marker line, or two sections.
     expect(spliceMediaSection(`${HUMAN}\n${MEDIA_SECTION_BEGIN}\nhalf`, 'NEW')).toBeNull();
     expect(spliceMediaSection(`${old}\n\n${old}`, 'NEW')).toBeNull();
@@ -212,6 +216,11 @@ describe('PR media section text', () => {
     const fixed = repairAttachmentLayout(mixed);
     expect(fixed.split(MEDIA_SECTION_END)[0]).toContain('assets/2');
     expect(fixed.split(MEDIA_SECTION_END)[1]).toBe('\n![mine](https://github.com/user-attachments/assets/9)');
+    // gh's paragraphs are separated by blank lines: both are taken, in order.
+    const two = `${MEDIA_SECTION_BEGIN}\n![b](./gc-media-1.webm)\n![a](./gc-media-2.webm)\n${MEDIA_SECTION_END}\n\nhttps://github.com/user-attachments/assets/1\n\nhttps://github.com/user-attachments/assets/2\n`;
+    const both = repairAttachmentLayout(two).split(MEDIA_SECTION_END);
+    expect(both[0]!.indexOf('assets/1')).toBeLessThan(both[0]!.indexOf('assets/2'));
+    expect(both[1]).toBe('');
     expect(parseGhVersion('gh version 2.101.0 (2026-09-15)\nhttps://github.com/cli/cli/releases')).toEqual([2, 101, 0]);
     expect(parseGhVersion('not gh')).toBeNull();
   });
@@ -344,6 +353,7 @@ describe('PR media publisher', () => {
     const dropped = fakeGh(pr, { drop: true });
     expect(await publisher(w, dropped.gh).pollOnce()).toMatchObject({ failed: 1 });
     expect(pr.body).not.toContain('./gc-media-');
+    expect(pr.body).not.toContain('user-attachments'); // the landed upload left with the section
     expect(pr.body).toContain('did not complete; Gru Command will retry');
     expect(w.ledger.latestJobEvent('j-ui', 'media.published')).toBeNull();
     // The last attempt's note promises no retry.
@@ -352,6 +362,18 @@ describe('PR media publisher', () => {
       await publisher(w, dropped.gh).pollOnce();
     }
     expect(pr.body).toContain('did not complete after 3 attempts; they are on the Gru Command board');
+
+    // One clip dropped, the other landed but appended by gh: the appended
+    // link leaves with the replaced section instead of piling up.
+    const w3 = world();
+    observeGitHub(w3, HEAD);
+    capture(w3, HEAD, 'Clip one', webm());
+    capture(w3, HEAD, 'Clip two', webm());
+    const pr3 = { body: HUMAN, head: HEAD, prState: 'OPEN' };
+    const partial = fakeGh(pr3, { drop: true, videos: 'append' });
+    expect(await publisher(w3, partial.gh).pollOnce()).toMatchObject({ failed: 1 });
+    expect(pr3.body).not.toContain('user-attachments');
+    expect(pr3.body.startsWith(HUMAN)).toBe(true);
 
     const w2 = world();
     observeGitHub(w2, HEAD);
@@ -405,8 +427,17 @@ describe('PR media publisher', () => {
     const damagedPr = { body: `${HUMAN}\n${MEDIA_SECTION_BEGIN}\nhalf a section`, head: HEAD, prState: 'OPEN' };
     const fixer = fakeGh(damagedPr);
     expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ failed: 1 });
-    damagedPr.body = HUMAN;
+    for (let attempt = 2; attempt <= 3; attempt += 1) {
+      damaged.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
+      expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ failed: 1 });
+    }
+    // The attempts ran out, but a hand fix is still picked up: hourly re-checks.
+    const row = { jobId: 'j-ui', prUrl: PR, sha: HEAD };
+    expect(ownerPrMediaView(damaged.ledger, row, AUTONOMOUS, true)?.publication?.detail).toMatch(/delete the stray gc-media marker lines by hand \(Gru Command checks again every hour\)$/u);
     damaged.now += MEDIA_PUBLISH_RETRY_MS + 1_000;
+    expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ considered: 0 }); // not every 10 minutes forever
+    damagedPr.body = HUMAN; // the owner deletes the stray marker line hours later
+    damaged.now += MEDIA_PUBLISH_FIX_RECHECK_MS * 3;
     expect(await publisher(damaged, fixer.gh).pollOnce()).toMatchObject({ published: 1 });
   });
 
