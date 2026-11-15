@@ -3655,18 +3655,27 @@ export class LedgerApi {
     return row === undefined ? null : this.worktreeFromRow(row);
   }
 
+  /** Registry rows in creation order. Both scopes filter in SQL, so a
+   * job-scoped read walks `idx_worktrees_job` and costs that job's lanes,
+   * never the whole registry: the board reads every job's lanes on each
+   * snapshot, and a whole-table read per job made that quadratic. */
   listWorktrees(opts: { status?: string; jobId?: string } = {}): readonly WorktreeRecord[] {
-    let rows: Row[];
-    if (opts.status !== undefined) {
-      if (!isWorktreeStatus(opts.status)) {
-        throw new Error(`unknown worktree status "${opts.status}"`);
-      }
-      rows = this.db.prepare('SELECT * FROM worktrees WHERE status = ? ORDER BY created_at, id').all(opts.status) as Row[];
-    } else {
-      rows = this.db.prepare('SELECT * FROM worktrees ORDER BY created_at, id').all() as Row[];
+    const { jobId, status } = opts;
+    if (status !== undefined && !isWorktreeStatus(status)) {
+      throw new Error(`unknown worktree status "${status}"`);
     }
-    const all = rows.map((row) => this.worktreeFromRow(row));
-    return opts.jobId === undefined ? all : all.filter((row) => row.jobId === opts.jobId);
+    const scopes = [
+      // `IS` keeps a null scope meaning "lanes with no job", as `===` did.
+      ...(jobId !== undefined ? [{ sql: 'job_id IS ?', value: jobId }] : []),
+      // Beside a job scope, unary `+` keeps the planner off the status
+      // index: most of a long-lived registry is `swept`.
+      ...(status !== undefined ? [{ sql: jobId !== undefined ? '+status = ?' : 'status = ?', value: status }] : []),
+    ];
+    const where = scopes.length === 0 ? '' : ` WHERE ${scopes.map((scope) => scope.sql).join(' AND ')}`;
+    const rows = this.db
+      .prepare(`SELECT * FROM worktrees${where} ORDER BY created_at, id`)
+      .all(...scopes.map((scope) => scope.value)) as Row[];
+    return rows.map((row) => this.worktreeFromRow(row));
   }
 
   setWorktreeStatus(id: string, status: string, note?: string): WorktreeRecord {
@@ -8552,8 +8561,7 @@ export class LedgerApi {
 
   /** Whether this job owns a live job lane (`active` only — a `paused` lane
    * was paused on live processes and a `swept` one holds none). One indexed
-   * row via `idx_worktrees_job`; never `listWorktrees`, which maps the whole
-   * table before filtering. */
+   * row via `idx_worktrees_job`, with no lane row mapped. */
   hasLiveJobLane(jobId: string): boolean {
     const row = this.db
       .prepare("SELECT 1 AS live FROM worktrees WHERE job_id = ? AND kind = 'job' AND status = 'active' LIMIT 1")
