@@ -9,7 +9,7 @@ import { isTerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { VerificationBudget } from '../verify/server.js';
 import { MANIFEST_PATH, parseWorktreeManifest, type ManifestCapture, type WorktreeManifest } from '../worktrees/manifest.js';
-import { CAMERA_WORK_DIR, endOrphanedCameraApps, filmShotList, type CameraFailureCode, type CameraRunResult } from './camera.js';
+import { CAMERA_SHUTDOWN, CAMERA_WORK_DIR, endOrphanedCameraApps, filmShotList, type CameraFailureCode, type CameraRunResult } from './camera.js';
 import { compileCaptureGlob, touchedCapturePaths, type TouchedCapturePath } from './capture-paths.js';
 import { planCaptures, readShotList, shotListPath, shotListSkipReason, ShotListError, type ShotList } from './shot-list.js';
 import { listMedia, MEDIA_MAX_PER_HEAD, mediaAtHead, mediaRoot, storeMedia, type MediaItem, type MediaLedger } from './store.js';
@@ -59,6 +59,8 @@ export const MEDIA_CAPTURE_FILMED_EVENT = 'media.capture-filmed';
 export const MEDIA_CAPTURE_FAILED_EVENT = 'media.capture-failed';
 
 export const CAMERA_TICK_MS = 30_000;
+/** The boot cleanup's bound: past it, ticks start anyway (and say so). */
+export const CAMERA_BOOT_CLEANUP_MS = 120_000;
 /** A head that is not the delivered one is filmed once it stood this long. */
 export const CAMERA_SETTLE_MS = 60_000;
 export const CAMERA_MAX_ATTEMPTS = 3;
@@ -323,17 +325,27 @@ export class CameraDirector {
     this.disposed = true;
     if (this.timer !== null) clearInterval(this.timer);
     this.timer = null;
-    const running = this.running;
-    if (running !== null) {
-      // The stop is journaled now, before the run cleans up: a shutdown that
-      // ends before the cleanup does must not leave a run without an outcome
-      // (that counts as a crash).
-      this.journalOutcome(running.jobId, running.record, 'stopped', 'the service is stopping');
-      running.abort.abort();
-      await running.done;
-    }
-    // A pass in progress ends before the ledger is closed under it.
+    await this.stopRun();
+    // A pass in progress ends before the ledger is closed under it; one that
+    // started a run meanwhile has that run stopped too.
     if (this.current !== null) await this.current;
+    await this.stopRun();
+  }
+
+  /** Stop the run in flight for shutdown: abort it first, then journal the
+   * stop at once (before the run cleans up, so a shutdown that ends before
+   * the cleanup never leaves a run without an outcome, which counts as a
+   * crash), then wait for it. */
+  private async stopRun(): Promise<void> {
+    const running = this.running;
+    if (running === null) return;
+    running.abort.abort(CAMERA_SHUTDOWN);
+    try {
+      this.journalOutcome(running.jobId, running.record, 'stopped', 'the service is stopping');
+    } catch (error) {
+      this.log('warn', 'pr media camera: the stop could not be journaled', { job: running.jobId, run: running.runId, error: message(error) });
+    }
+    await running.done;
   }
 
   /** Boot: end what an earlier process's runs left running and remove
@@ -342,16 +354,31 @@ export class CameraDirector {
   start(): void {
     if (this.timer !== null || this.disposed) return;
     this.booted = false;
-    void endOrphanedCameraApps(this.options.budget, this.options.dataDir, this.log)
+    let bound: ReturnType<typeof setTimeout> | undefined;
+    void Promise.race([
+      endOrphanedCameraApps(this.options.budget, this.options.dataDir, this.log),
+      new Promise<void>((resolveBound) => {
+        bound = setTimeout(() => {
+          this.log('warn', 'pr media camera: the boot cleanup did not finish in time; filming starts anyway', { waited_ms: CAMERA_BOOT_CLEANUP_MS });
+          resolveBound();
+        }, CAMERA_BOOT_CLEANUP_MS);
+        bound.unref?.();
+      }),
+    ])
       .catch((error: unknown) => {
         this.log('warn', 'pr media camera: the boot cleanup failed', { error: message(error) });
       })
       .then(() => {
+        clearTimeout(bound);
         this.booted = true;
         this.again = false;
         return this.tick();
       });
-    this.timer = setInterval(() => void this.tick(), CAMERA_TICK_MS);
+    // The timer never queues a pass behind a running one (a slow pass would
+    // otherwise run back to back forever).
+    this.timer = setInterval(() => {
+      if (this.current === null) void this.tick();
+    }, CAMERA_TICK_MS);
     this.timer.unref?.();
   }
 
@@ -400,6 +427,7 @@ export class CameraDirector {
       const live = new Set<string>();
       const filmable = new Set<string>();
       for (const job of this.options.ledger.listJobs()) {
+        if (this.disposed) return;
         if (isTerminalJobStatus(job.status)) continue;
         live.add(job.id);
         // A parked job (an owner hold) keeps its coverage current and is
@@ -596,6 +624,9 @@ export class CameraDirector {
     // A lane mid-edit is filmed once it commits: its head is about to move.
     const status = await this.git(lane.path, ['status', '--porcelain', '--untracked-files=no']);
     if (status.code !== 0 || status.stdout.trim() !== '') return;
+    // Checked again after the await: the service may have begun stopping, or
+    // another run started, meanwhile.
+    if (this.disposed || this.running !== null) return;
     const delivered = this.options.ledger.latestCandidateDelivery(job.id);
     const deliveredSha = delivered === null ? null : payloadOf(delivered)['sha'];
     const settled = deliveredSha === head ||

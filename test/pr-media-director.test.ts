@@ -650,6 +650,47 @@ describe('where coverage shows', () => {
     expect(second.edits.at(-1)).toMatch(/The note shown here earlier was written for `[0-9a-f]{12}`; this PR is now at `[0-9a-f]{12}`\._/u);
   });
 
+  it('starts no run once the service has begun stopping, even from a pass already under way', async () => {
+    const w = world();
+    writeShotList(w, SHOTS);
+    w.delivered.set('j-ui', head(w));
+    let disposing: Promise<void> | null = null;
+    const films: CameraRunInput[] = [];
+    // The pass is reading the lane's status when shutdown begins.
+    const director = new CameraDirector({
+      ledger: {
+        appendCustomEvent: (fields) => w.api.appendCustomEvent(fields),
+        listJobEvents: (jobId, opts) => w.api.listJobEvents(jobId, opts),
+        latestEventByPayloadField: (kind, field, value) => w.api.latestEventByPayloadField(kind, field, value),
+        listJobs: () => w.api.listJobs(),
+        listWorktrees: () => [{ kind: 'job', path: w.lane, repoPath: w.lane, status: 'active' }],
+        latestCandidateDelivery: () => ({ seq: 1, ts: new Date().toISOString(), kind: 'job.delivered', agentId: null, jobId: 'j-ui', roundId: null, lens: null, payload: { sha: head(w) } }),
+      },
+      dataDir: w.dataDir,
+      config: () => ON,
+      budget: () => ({ restored: () => [] }) as unknown as VerificationBudget,
+      driver: { probe: async () => null, shoot: async () => {} },
+      setupTimeoutMs: 1_000,
+      git: async (cwd, args) => {
+        if (args[0] === 'status' && disposing === null) disposing = director.dispose();
+        try {
+          return { code: 0, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf-8' }) };
+        } catch (error) {
+          return { code: (error as { status?: number }).status ?? -1, stdout: '' };
+        }
+      },
+      film: async (input) => {
+        films.push(input);
+        return { kind: 'filmed', files: [] };
+      },
+    });
+    await director.tick();
+    expect(disposing).not.toBeNull();
+    await disposing;
+    expect(films).toEqual([]);
+    expect(events(w, MEDIA_CAPTURE_STARTED_EVENT)).toEqual([]);
+  });
+
   it('journals a stop at shutdown at once, so a run still cleaning up when the service exits is no crash', async () => {
     const w = world();
     writeShotList(w, SHOTS);

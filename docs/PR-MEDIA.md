@@ -250,10 +250,14 @@ committed head and the job's shot list, then:
   running: every process whose working directory is a run's folder is ended
   (a process that only names one, a person's shell say, is not), with the
   group of each restored `pr-media-capture` slot that leads one, and the
-  folders are removed. No tick runs until this is done. A restored slot
+  folders are removed (not when the working directories could not be
+  listed: nothing is then ended, and the next boot tries again). No tick
+  runs until this is done, or for at most 2 minutes. A restored slot
   whose pid is gone is released; a live pid working elsewhere (a reused pid)
   is never signalled. Shutdown stops a run in flight (bounded to 10 seconds)
-  before the verification scheduler is disposed.
+  before the verification scheduler is disposed, and no run starts once it
+  has begun. A run stopped while the service runs on (its job was parked)
+  cleans up its folder itself.
 
 ## When media is owed
 

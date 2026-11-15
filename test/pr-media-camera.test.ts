@@ -3,7 +3,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CAMERA_SCOPE, CAMERA_SERVE_ENV, endOrphanedCameraApps, filmShotList, type CameraRunInput } from '../src/media/camera.js';
+import { CAMERA_SCOPE, CAMERA_SERVE_ENV, CAMERA_SHUTDOWN, endOrphanedCameraApps, filmShotList, type CameraRunInput } from '../src/media/camera.js';
 import { parseShotList, planCaptures, type PlannedCapture } from '../src/media/shot-list.js';
 import {
   AgentBrowserDriver,
@@ -241,6 +241,28 @@ describe('filmShotList', () => {
     expect(await filmShotList(input(at, { driver: lingering }))).toMatchObject({ kind: 'filmed' });
     expect(leftover).toBeDefined();
     expect(() => process.kill(leftover!, 0)).toThrow();
+    // A run stopped while the service runs on (its job was parked) cleans up
+    // the same way; one stopped by a shutdown leaves that to the next boot.
+    const stopWith = async (reason: string): Promise<number> => {
+      const abort = new AbortController();
+      let pid = 0;
+      const stopping: WebCaptureDriver = {
+        probe: async () => null,
+        shoot: async (request) => {
+          const child = spawn('sleep', ['30'], { cwd: request.workDir, detached: true, stdio: 'ignore' });
+          pid = child.pid!;
+          pids.push(pid);
+          abort.abort(reason);
+          throw new CaptureToolError('the capture run was stopped');
+        },
+      };
+      expect(await filmShotList(input(at, { driver: stopping, signal: abort.signal }))).toMatchObject({ kind: 'failed', code: 'stopped' });
+      return pid;
+    };
+    const parked = await stopWith('parked');
+    expect(() => process.kill(parked, 0)).toThrow();
+    const shutdown = await stopWith(CAMERA_SHUTDOWN);
+    expect(() => process.kill(shutdown, 0)).not.toThrow();
   });
 
   it('waits for an output condition, ANSI colors ignored', async () => {
@@ -379,10 +401,12 @@ describe('endOrphanedCameraApps', () => {
     const stranger = spawn('sleep', ['31'], { cwd: dataDir, detached: true, stdio: 'ignore' });
     // A process that only names a run folder (a person's shell looking at
     // it) works elsewhere: it is not GC's and is never signalled.
-    const onlooker = spawn('/bin/sh', ['-c', 'sleep 32', runDir], { cwd: dataDir, detached: true, stdio: 'ignore' });
+    // (`; exit 0` keeps the shell alive, so its command line names the folder.)
+    const onlooker = spawn('/bin/sh', ['-c', 'sleep 32; exit 0', runDir], { cwd: dataDir, detached: true, stdio: 'ignore' });
     pids.push(orphan.pid!, stranger.pid!, onlooker.pid!);
     const lease = (id: string): VerificationLease => ({ runId: id, jobId: 'j-ui', scope: CAMERA_SCOPE, command: 'x', cwd: runDir, head: null, queuedAt: 0, grantedAt: 0 });
     await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+    expect(execFileSync('ps', ['-o', 'command=', '-p', String(onlooker.pid)], { encoding: 'utf-8' })).toContain(runDir);
     const slots = budget({
       restored: [
         { lease: lease('orphan'), pid: orphan.pid!, processCommand: '/bin/sh -c eval "$GRU_CAPTURE_SERVE" # pr media camera x' },

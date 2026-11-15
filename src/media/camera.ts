@@ -61,6 +61,9 @@ export const CAMERA_SCOPE = RESERVED_CAPTURE_SCOPE;
 export const CAMERA_SERVE_ENV = 'GRU_CAPTURE_SERVE';
 /** The folder (under the media home) every run's checkouts live in. */
 export const CAMERA_WORK_DIR = '.camera';
+/** The abort reason of a run stopped because the service is stopping: its
+ * leftovers are the next boot's to end. Any other stop cleans up itself. */
+export const CAMERA_SHUTDOWN = 'gru-command-shutdown';
 /** Grace between SIGTERM and SIGKILL when the app is stopped. */
 export const CAMERA_KILL_GRACE_MS = 5_000;
 const READY_POLL_MS = 250;
@@ -436,7 +439,7 @@ export async function filmShotList(input: CameraRunInput): Promise<CameraRunResu
     // Anything still working in the run's folder (a browser whose close
     // failed, a daemon an app left) is ended before the folder goes. A
     // stopping service leaves that to the next boot.
-    if (!input.signal.aborted) await endRooted(input.workDir, log);
+    if (input.signal.reason !== CAMERA_SHUTDOWN) await endRooted(input.workDir, log);
     await removeTree(input.workDir).catch((error: unknown) => {
       log('warn', 'pr media camera: the run folder could not be removed; the next boot removes it', { run: input.runId, error: oneLine(error) });
     });
@@ -492,8 +495,12 @@ export async function endOrphanedCameraApps(budget: () => VerificationBudget, da
   const restored = slots?.restored(CAMERA_SCOPE) ?? [];
   let ended = 0;
   if (existsSync(root)) {
+    let listed = true;
     const rooted = await psEnumeratorAsync(root, {
-      onCwdError: (error) => log('warn', 'pr media camera: working directories could not be listed; only processes naming a run folder are ended', { error: oneLine(error) }),
+      onCwdError: (error) => {
+        listed = false;
+        log('warn', 'pr media camera: working directories could not be listed, so nothing an earlier run left is ended and its folders stay until the next boot', { error: oneLine(error) });
+      },
     });
     // Working in a run folder is the evidence: a command line that merely
     // names one (a person's `ls` of it, say) is not.
@@ -504,9 +511,12 @@ export async function endOrphanedCameraApps(budget: () => VerificationBudget, da
       ended = [...pids].filter((pid) => !survivors.includes(pid)).length;
       log('warn', 'pr media camera: processes an earlier run left were ended', { pids: [...pids], survivors });
     }
-    await removeTree(root).catch((error: unknown) => {
-      log('warn', 'pr media camera: an earlier run\'s folder could not be removed', { error: oneLine(error) });
-    });
+    // Never from under processes that could not be judged.
+    if (listed) {
+      await removeTree(root).catch((error: unknown) => {
+        log('warn', 'pr media camera: an earlier run\'s folder could not be removed', { error: oneLine(error) });
+      });
+    }
   }
   for (const holder of restored) {
     if (alive(holder.pid)) {
