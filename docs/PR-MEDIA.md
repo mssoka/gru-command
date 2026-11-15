@@ -238,14 +238,17 @@ change, it reads the head's `[capture]` table and the job's shot list, then:
     three, so a crash can never loop.
   - `head_moved` and `stopped` (the service stopped, or the job was parked
     or closed) are recorded and are no attempt; the same head and script
-    are tried again after 60 seconds.
+    are tried again after 60 seconds. A stop at shutdown is recorded at
+    once, before the run has cleaned up, so a service that exits first never
+    leaves it looking like a crash.
 - **Restarts.** A boot ends what the runs of an earlier process left
-  running: every process working in a run's folder (its working directory or
-  its command line names it) is ended, with the group of each restored
-  `pr-media-capture` slot that leads one, and the folders are removed. A
-  restored slot whose pid is gone is released; a live pid working elsewhere
-  (a reused pid) is never signalled. Shutdown stops a run in flight (bounded
-  to 10 seconds) before the verification scheduler is disposed.
+  running: every process whose working directory is a run's folder is ended
+  (a process that only names one, a person's shell say, is not), with the
+  group of each restored `pr-media-capture` slot that leads one, and the
+  folders are removed. No tick runs until this is done. A restored slot
+  whose pid is gone is released; a live pid working elsewhere (a reused pid)
+  is never signalled. Shutdown stops a run in flight (bounded to 10 seconds)
+  before the verification scheduler is disposed.
 
 ## When media is owed
 
@@ -264,7 +267,7 @@ journaled as one `media.coverage` event whenever it changes:
 | `skipped` | touched, and the shot list gives a skip reason (top-level, or every shot skipped) |
 | `covered` | touched, and a capture is bound to the head |
 | `not-owed` | no capture path is touched, but the minion wrote a shot list |
-| `unknown` | owing could not be decided: a manifest that declares `[capture]` does not parse (`manifest_invalid: …`), or the merge base, a manifest or the diff could not be read. A read that failed is tried again on the next tick, never remembered as "not owed" |
+| `unknown` | owing could not be decided: a manifest that declares `[capture]` does not parse (`manifest_invalid: …`), or the merge base, a manifest or the diff could not be read. A read that failed is tried again on the next tick, never remembered as "not owed"; once the head is decided with nothing owed, a `not-owed` record sets it straight |
 
 Each record carries the touched count, the first 10 paths, the globs they
 matched, the skip reason, the shot list's state (`absent`, `valid`,
@@ -283,9 +286,10 @@ Where it shows:
   the camera has nothing left to film at it ("Media owed: this PR changes 3
   files under the repository's capture paths (…) but has no captures and no
   skip reason at `<sha>`"), and a skipped head the shot list's reason, both
-  markdown-escaped. A note left for an older head that owes nothing is
-  replaced by one saying the PR moved on. Captures at the head always win
-  over a note. An unknown head gets no note: the FOR YOU card says why.
+  markdown-escaped. A note left for an older head that nothing at the new
+  head replaces gives way to one naming both heads, with no claim about the
+  new one. Captures at the head always win over a note. An unknown head gets
+  no note: the FOR YOU card says why.
 - **The minion:** `GET /api/media?job_id=` returns the newest coverage.
 
 ## The capture API

@@ -244,11 +244,20 @@ type ManifestRead =
   | { readonly kind: 'refused'; readonly error: string; readonly mentionsCapture: boolean }
   | { readonly kind: 'unreadable'; readonly error: string };
 
+/** A run's identity and whether its outcome is journaled (a stop at
+ * shutdown writes it before the run has finished cleaning up). */
+interface RunRecord {
+  readonly runId: string;
+  readonly base: Record<string, unknown>;
+  settled: boolean;
+}
+
 interface Running {
   readonly jobId: string;
   readonly runId: string;
   readonly head: string;
   readonly shotList: string;
+  readonly record: RunRecord;
   readonly abort: AbortController;
   readonly done: Promise<void>;
 }
@@ -284,6 +293,9 @@ export class CameraDirector {
   private current: Promise<void> | null = null;
   private again = false;
   private disposed = false;
+  /** False while the boot cleanup runs: a tick then would start a run the
+   * cleanup could end. */
+  private booted = true;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly options: CameraDirectorOptions) {
@@ -313,19 +325,29 @@ export class CameraDirector {
     this.timer = null;
     const running = this.running;
     if (running === null) return;
+    // The stop is journaled now, before the run cleans up: a shutdown that
+    // ends before the cleanup does must not leave a run without an outcome
+    // (that counts as a crash).
+    this.journalOutcome(running.jobId, running.record, 'stopped', 'the service is stopping');
     running.abort.abort();
     await running.done;
   }
 
   /** Boot: end what an earlier process's runs left running and remove
-   * their folders, then tick every {@link CAMERA_TICK_MS}. */
+   * their folders, then tick every {@link CAMERA_TICK_MS}. No tick runs
+   * before the cleanup has finished (one asked for meanwhile runs after). */
   start(): void {
     if (this.timer !== null || this.disposed) return;
+    this.booted = false;
     void endOrphanedCameraApps(this.options.budget, this.options.dataDir, this.log)
       .catch((error: unknown) => {
         this.log('warn', 'pr media camera: the boot cleanup failed', { error: message(error) });
       })
-      .then(() => this.tick());
+      .then(() => {
+        this.booted = true;
+        this.again = false;
+        return this.tick();
+      });
     this.timer = setInterval(() => void this.tick(), CAMERA_TICK_MS);
     this.timer.unref?.();
   }
@@ -338,7 +360,7 @@ export class CameraDirector {
    * runs again when it ends. */
   requestTick(): void {
     if (this.disposed) return;
-    if (this.current !== null) {
+    if (this.current !== null || !this.booted) {
       this.again = true;
       return;
     }
@@ -349,6 +371,10 @@ export class CameraDirector {
    * rejects; a job that fails is logged and the rest still run. */
   tick(): Promise<void> {
     if (this.disposed) return Promise.resolve();
+    if (!this.booted) {
+      this.again = true;
+      return Promise.resolve();
+    }
     if (this.current !== null) return this.current;
     this.current = this.pass().finally(() => {
       this.current = null;
@@ -369,8 +395,12 @@ export class CameraDirector {
         if (isTerminalJobStatus(job.status)) continue;
         live.add(job.id);
         // A parked job (an owner hold) keeps its coverage current and is
-        // never filmed.
-        if (job.status !== 'parked') filmable.add(job.id);
+        // never filmed. A job is filmable from the moment it is seen so, so
+        // a run that settles before the pass ends keeps its film.
+        if (job.status !== 'parked') {
+          filmable.add(job.id);
+          this.filmable.add(job.id);
+        }
         try {
           await this.consider(job, job.status !== 'parked');
         } catch (error) {
@@ -408,7 +438,8 @@ export class CameraDirector {
     try {
       return { kind: 'parsed', manifest: parseWorktreeManifest(shown.stdout, `${commit.slice(0, 12)}:${MANIFEST_PATH}`) };
     } catch (error) {
-      return { kind: 'refused', error: message(error), mentionsCapture: /^\s*\[capture\]/mu.test(shown.stdout) };
+      // `[capture]`, `[ capture ]` or an inline `capture = {…}`.
+      return { kind: 'refused', error: message(error), mentionsCapture: /^\s*(?:\[\s*capture\s*\]|capture\s*=)/mu.test(shown.stdout) };
     }
   }
 
@@ -462,12 +493,12 @@ export class CameraDirector {
     // either side says owes media owes it.
     const sides = [capture?.paths ?? [], baseCapture?.paths ?? []]
       .filter((paths) => paths.length > 0)
-      .map((paths) => touchedCapturePaths(paths.map((pattern) => compileCaptureGlob(pattern)), changed));
+      .map((paths) => new Map(touchedCapturePaths(paths.map((pattern) => compileCaptureGlob(pattern)), changed).map((entry) => [entry.path, entry])));
     const seen = new Set<string>();
     const touched: TouchedCapturePath[] = [];
     for (const path of changed) {
       if (seen.has(path)) continue;
-      const hit = sides.map((side) => side.find((entry) => entry.path === path)).find((entry) => entry !== undefined);
+      const hit = sides.map((side) => side.get(path)).find((entry) => entry !== undefined);
       if (hit === undefined) continue;
       seen.add(path);
       touched.push(hit);
@@ -530,7 +561,10 @@ export class CameraDirector {
     const seen = this.firstSeen.get(job.id);
     if (seen === undefined || seen.head !== head) this.firstSeen.set(job.id, { head, at: this.now() });
     const facts = await this.headFacts(job.id, lane.path, job.baseBranch, head);
-    if (!facts.relevant) return;
+    if (!facts.relevant) {
+      this.clearUnknown(job.id, head);
+      return;
+    }
     // A lane mid-edit is judged once it commits.
     const status = await this.git(lane.path, ['status', '--porcelain', '--untracked-files=no']);
     if (status.code !== 0 || status.stdout.trim() !== '') return;
@@ -573,8 +607,11 @@ export class CameraDirector {
   ): void {
     const touched = facts.touched;
     // Nothing to say: owing is decided, no path owes media and the minion
-    // directed nothing.
-    if (facts.undecided === null && touched.length === 0 && shotList === null && refusal === null) return;
+    // directed nothing (an earlier "unknown" at this head is set straight).
+    if (facts.undecided === null && touched.length === 0 && shotList === null && refusal === null) {
+      this.clearUnknown(jobId, head);
+      return;
+    }
     const skip = shotList === null ? null : shotListSkipReason(shotList);
     const state: CoverageState = facts.undecided !== null
       ? 'unknown'
@@ -597,6 +634,26 @@ export class CameraDirector {
     this.options.ledger.appendCustomEvent({ kind: MEDIA_COVERAGE_EVENT, jobId, payload: { ...payload, digest } });
   }
 
+  /** Owing at `head` was unknown and is now decided with nothing owed: the
+   * record says so, so the card and the minion stop reading "unknown". */
+  private clearUnknown(jobId: string, head: string): void {
+    const latest = this.options.ledger.listJobEvents(jobId, { kinds: [MEDIA_COVERAGE_EVENT], order: 'desc', limit: 1 })[0];
+    const coverage = latest === undefined ? null : readCoverage(latest);
+    if (coverage === null || coverage.headSha !== head || coverage.state !== 'unknown') return;
+    const payload = { head_sha: head, state: 'not-owed', touched: 0, paths: [], globs: [], skip: null, shot_list: 'absent', camera: null, detail: null };
+    const digest = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+    this.options.ledger.appendCustomEvent({ kind: MEDIA_COVERAGE_EVENT, jobId, payload: { ...payload, digest } });
+  }
+
+  /** Journal a run's failed outcome once (a stop at shutdown may come
+   * before the run's own). */
+  private journalOutcome(jobId: string, run: RunRecord, code: CameraOutcomeCode, detail: string): void {
+    if (run.settled) return;
+    run.settled = true;
+    this.options.ledger.appendCustomEvent({ kind: MEDIA_CAPTURE_FAILED_EVENT, jobId, payload: { ...run.base, code, detail: bounded(detail), at: this.now() } });
+    this.log(NOT_ATTEMPTS.has(code) ? 'info' : 'warn', 'pr media camera: the shot list was not filmed', { job: jobId, run: run.runId, code, detail });
+  }
+
   private beginRun(
     jobId: string,
     lane: { readonly path: string; readonly repoPath: string },
@@ -611,6 +668,7 @@ export class CameraDirector {
     const runId = `cr-${randomUUID()}`;
     const abort = new AbortController();
     const base = { run_id: runId, head_sha: head, shot_list_sha256: shotList.sha256 };
+    const record: RunRecord = { runId, base, settled: false };
     this.options.ledger.appendCustomEvent({ kind: MEDIA_CAPTURE_STARTED_EVENT, jobId, payload: { ...base, files: plans.length, at: this.now() } });
     this.log('info', 'pr media camera: filming the shot list', { job: jobId, run: runId, head, files: plans.length });
     const film = this.options.film ?? filmShotList;
@@ -637,7 +695,7 @@ export class CameraDirector {
       } catch (error) {
         result = { kind: 'failed', code: 'serve_failed', detail: `the camera run failed unexpectedly: ${message(error)}` };
       }
-      this.settle(jobId, head, runId, base, result);
+      this.settle(jobId, head, record, result);
     })()
       .catch((error: unknown) => {
         // Never an unhandled rejection: the run's start stays journaled
@@ -649,17 +707,17 @@ export class CameraDirector {
         // Coverage reflects the outcome at once, not a tick later.
         this.requestTick();
       });
-    this.running = { jobId, runId, head, shotList: shotList.sha256, abort, done };
+    this.running = { jobId, runId, head, shotList: shotList.sha256, record, abort, done };
   }
 
-  private settle(jobId: string, head: string, runId: string, base: Record<string, unknown>, result: CameraRunResult): void {
+  private settle(jobId: string, head: string, record: RunRecord, result: CameraRunResult): void {
     const ledger = this.options.ledger;
+    const { runId, base } = record;
     // Every run gets its outcome, a stopped one included (not an attempt):
-    // only a run with none was cut short by a crash.
-    const fail = (code: CameraOutcomeCode, detail: string): void => {
-      ledger.appendCustomEvent({ kind: MEDIA_CAPTURE_FAILED_EVENT, jobId, payload: { ...base, code, detail: bounded(detail), at: this.now() } });
-      this.log(NOT_ATTEMPTS.has(code) ? 'info' : 'warn', 'pr media camera: the shot list was not filmed', { job: jobId, run: runId, head, code, detail });
-    };
+    // only a run with none was cut short by a crash. A run whose stop was
+    // already journaled (at shutdown) gets nothing more.
+    if (record.settled) return;
+    const fail = (code: CameraOutcomeCode, detail: string): void => this.journalOutcome(jobId, record, code, detail);
     if (result.kind === 'failed') {
       fail(result.code, result.detail);
       return;
@@ -697,6 +755,7 @@ export class CameraDirector {
       fail('store_failed', `the filmed captures could not be stored: ${message(error)}`);
       return;
     }
+    record.settled = true;
     ledger.appendCustomEvent({ kind: MEDIA_CAPTURE_FILMED_EVENT, jobId, payload: { ...base, media_ids: ids, at: this.now() } });
   }
 }

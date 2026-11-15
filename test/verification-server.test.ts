@@ -290,7 +290,7 @@ async function startDelayingProxy(upstreamPort: number, delayMs: number): Promis
 }
 
 describe('POST /api/verify', () => {
-  it('PR media: refuses the reserved camera scope by name, and a camera budget slot leaves no verification record', async () => {
+  it('PR media: refuses the reserved camera scope by name, and holds and releases a camera budget slot like any other', async () => {
     const h = await boot();
     const refused = await call(h.port, { job_id: h.jobId, scope: 'pr-media-capture' });
     expect(refused.status).toBe(400);

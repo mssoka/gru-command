@@ -174,10 +174,11 @@ export function supersededNote(change: ChangeKind, capturesHead: string, headSha
 }
 
 /** The note replacing an owed or skipped note written for an older head
- * that nothing at the new head replaces. */
+ * that nothing at the new head replaces. It claims nothing about the new
+ * head: an owed or skipped head gets its own note when it is judged. */
 export function movedNote(change: ChangeKind, noteHead: string, headSha: string): string {
   return `The note shown here earlier was written for \`${noteHead.slice(0, 12)}\`; this ${change} is now at ` +
-    `\`${headSha.slice(0, 12)}\`, which owes no media.`;
+    `\`${headSha.slice(0, 12)}\`.`;
 }
 
 /** Paths named in a note (the count is always given). */

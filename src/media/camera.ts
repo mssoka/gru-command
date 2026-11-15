@@ -453,8 +453,8 @@ function alive(pid: number): boolean {
  * stopped mid-run, so a detached app group, or a browser session that never
  * closed, outlived it), then remove their folders. Every such process works
  * in a run's private folder under `<data_dir>/media/.camera/`, so that is the
- * evidence: each process rooted there (its working directory, or its
- * command line) is ended, with the group of each restored
+ * evidence: each process whose working directory is there is ended, with
+ * the group of each restored
  * {@link CAMERA_SCOPE} slot that leads one of them. A restored slot whose
  * pid is gone afterwards is released; a live pid rooted elsewhere (a
  * reused pid) is never signalled, and its slot waits for the scheduler's
@@ -474,11 +474,13 @@ export async function endOrphanedCameraApps(budget: () => VerificationBudget, da
     const rooted = await psEnumeratorAsync(root, {
       onCwdError: (error) => log('warn', 'pr media camera: working directories could not be listed; only processes naming a run folder are ended', { error: oneLine(error) }),
     });
-    const pids = new Set(rooted.map((entry) => entry.pid).filter((pid) => pid !== process.pid));
+    // Working in a run folder is the evidence: a command line that merely
+    // names one (a person's `ls` of it, say) is not.
+    const pids = new Set(rooted.filter((entry) => entry.evidence === 'cwd').map((entry) => entry.pid).filter((pid) => pid !== process.pid));
     const targets = [...pids, ...restored.filter((holder) => pids.has(holder.pid)).map((holder) => -holder.pid)];
     if (targets.length > 0) {
       const survivors = await endProcesses(targets, CAMERA_KILL_GRACE_MS);
-      ended = pids.size;
+      ended = [...pids].filter((pid) => !survivors.includes(pid)).length;
       log('warn', 'pr media camera: processes an earlier run left were ended', { pids: [...pids], survivors });
     }
     await removeTree(root).catch((error: unknown) => {

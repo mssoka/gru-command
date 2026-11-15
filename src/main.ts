@@ -1930,9 +1930,6 @@ async function main(): Promise<number> {
     setupTimeoutMs: config.worktrees.setupTimeoutMs,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  bus.subscribe((event) => {
-    if (event.kind === 'job.delivered') camera.requestTick();
-  });
   // Report-lane slimming (#427): a delivered, idle report job's lane loses
   // its manifest's reclaim folders; the lane's setup brings them back.
   const laneSlimmer = new ReportLaneSlimmer({
@@ -1985,7 +1982,11 @@ async function main(): Promise<number> {
   onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
   state.camera = camera;
+  // Started (its boot cleanup first) before any delivery can ask for a tick.
   camera.start();
+  bus.subscribe((event) => {
+    if (event.kind === 'job.delivered') camera.requestTick();
+  });
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
   // same seam chat and dispatch both ride — workspace browse (on-disk
   // picks send paths, never bytes) + uploads materialization

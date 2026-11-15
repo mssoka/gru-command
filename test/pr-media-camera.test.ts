@@ -358,7 +358,10 @@ describe('endOrphanedCameraApps', () => {
     // `exec` replaces the shell's argv: the app is known by where it works.
     const orphan = spawn('/bin/sh', ['-c', 'exec sleep 30'], { cwd: runDir, detached: true, stdio: 'ignore' });
     const stranger = spawn('sleep', ['31'], { cwd: dataDir, detached: true, stdio: 'ignore' });
-    pids.push(orphan.pid!, stranger.pid!);
+    // A process that only names a run folder (a person's shell looking at
+    // it) works elsewhere: it is not GC's and is never signalled.
+    const onlooker = spawn('/bin/sh', ['-c', 'sleep 32', runDir], { cwd: dataDir, detached: true, stdio: 'ignore' });
+    pids.push(orphan.pid!, stranger.pid!, onlooker.pid!);
     const lease = (id: string): VerificationLease => ({ runId: id, jobId: 'j-ui', scope: CAMERA_SCOPE, command: 'x', cwd: runDir, head: null, queuedAt: 0, grantedAt: 0 });
     await new Promise((resolveWait) => setTimeout(resolveWait, 200));
     const slots = budget({
@@ -373,8 +376,10 @@ describe('endOrphanedCameraApps', () => {
     await exited;
     expect(existsSync(join(dataDir, 'media', '.camera'))).toBe(false);
     expect(slots.released.map((released) => released.runId).sort()).toEqual(['gone', 'orphan']);
-    // The stranger (a pid working elsewhere, as a reused pid would) is alive.
+    // The stranger (a pid working elsewhere, as a reused pid would) and the
+    // onlooker are alive.
     expect(() => process.kill(stranger.pid!, 0)).not.toThrow();
+    expect(() => process.kill(onlooker.pid!, 0)).not.toThrow();
     // Nothing left: no folder, no process, slots of gone pids still released.
     const quiet = budget({ restored: [{ lease: lease('late'), pid: 999_998, processCommand: 'x' }] });
     expect(await endOrphanedCameraApps(() => quiet, dataDir)).toBe(0);

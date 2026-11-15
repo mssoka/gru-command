@@ -238,6 +238,13 @@ describe('media coverage (owner ruling Q4)', () => {
     git(baseless.lane, 'branch', 'release', 'main');
     await tick(baseless);
     expect(coverageAtHead(baseless.api, 'j-ui', head(baseless))).toMatchObject({ state: 'owed', touched: 1 });
+    // Decided with nothing owed: the unknown record is set straight.
+    const quiet = world('[capture]\npaths = ["docs/**"]\n', { baseBranch: 'release' });
+    await tick(quiet);
+    expect(coverageAtHead(quiet.api, 'j-ui', head(quiet))?.state).toBe('unknown');
+    git(quiet.lane, 'branch', 'release', 'main');
+    await tick(quiet);
+    expect(coverageAtHead(quiet.api, 'j-ui', head(quiet))).toMatchObject({ state: 'not-owed', touched: 0, detail: null });
   });
 
   it('records not-owed for a shot list on a head that touches no capture path', async () => {
@@ -512,16 +519,22 @@ describe('filming the shot list (owner ruling Q1, option C)', () => {
 });
 
 describe('the director\'s lifecycle', () => {
-  it('a boot removes the folders runs of an earlier process left, then ticks; stop ends the timer', async () => {
+  it('a boot removes the folders runs of an earlier process left before any tick runs, then ticks; stop ends the timer', async () => {
     const w = world();
     const leftover = join(mediaRoot(w.dataDir), '.camera', 'cr-44444444-4444-4444-8444-444444444444', 'base');
     mkdirSync(leftover, { recursive: true });
     writeFileSync(join(leftover, 'version.txt'), 'base\n');
     w.director.start();
+    // A tick asked for during the cleanup (a delivery) waits for it.
+    w.director.requestTick();
+    await w.director.tick();
+    expect(events(w, MEDIA_COVERAGE_EVENT)).toEqual([]);
+    // The boot lists the host's processes (ps and lsof) first: slow on a
+    // loaded host.
     await vi.waitFor(() => {
       expect(existsSync(join(mediaRoot(w.dataDir), '.camera'))).toBe(false);
       expect(events(w, MEDIA_COVERAGE_EVENT)).toHaveLength(1);
-    });
+    }, { timeout: 20_000, interval: 50 });
     await w.director.stop();
     // A stopped director ticks no more.
     await w.director.tick();
@@ -634,7 +647,24 @@ describe('where coverage shows', () => {
     observe(w2, reverted);
     clock2 += 1_000;
     await publisher2.pollOnce();
-    expect(second.edits.at(-1)).toMatch(/The note shown here earlier was written for `[0-9a-f]{12}`; this PR is now at `[0-9a-f]{12}`, which owes no media\./u);
+    expect(second.edits.at(-1)).toMatch(/The note shown here earlier was written for `[0-9a-f]{12}`; this PR is now at `[0-9a-f]{12}`\._/u);
+  });
+
+  it('journals a stop at shutdown at once, so a run still cleaning up when the service exits is no crash', async () => {
+    const w = world();
+    writeShotList(w, SHOTS);
+    w.delivered.set('j-ui', head(w));
+    let finish: (result: CameraRunResult) => void = () => {};
+    w.next = () => new Promise<CameraRunResult>((resolveFilm) => {
+      finish = resolveFilm;
+    });
+    await w.director.tick();
+    const disposing = w.director.dispose();
+    // Before the run itself has finished: the stop is on record.
+    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT)).toEqual([expect.objectContaining({ code: 'stopped' })]);
+    finish({ kind: 'failed', code: 'stopped', detail: 'the service is stopping' });
+    await disposing;
+    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT)).toHaveLength(1);
   });
 
   it('the PR section holds an owed note while GC is still to film the head', async () => {

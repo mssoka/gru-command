@@ -332,7 +332,7 @@ const PINS: Record<string, number> = {
   'pr-media.test.ts': 9,
   'pr-media-camera.test.ts': 12,
   'pr-media-capture.test.ts': 15,
-  'pr-media-director.test.ts': 23,
+  'pr-media-director.test.ts': 24,
   'pr-media-publisher.test.ts': 14,
   'pr-media-server.test.ts': 7,
   'prebootstrap-patch.test.ts': 46,
