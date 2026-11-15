@@ -34,12 +34,29 @@ export const BACKGROUND_PROCESS_RULE = [
 ].join('\n');
 
 /**
+ * PR media (owner rulings 2026-11-15, docs/PR-MEDIA.md): a minion whose change
+ * is visible captures it from its committed head and submits each capture to
+ * the service, which binds it to that head, shows it on the owner's FOR YOU
+ * card and writes the PR description's media section. The service accepts a
+ * capture only while the lane sits at exactly the named head with a clean
+ * tracked tree: the record says which commit the capture was submitted at.
+ */
+export const PR_MEDIA_RULE = [
+  'PR MEDIA RULE (screenshots and clips for the owner\'s review):',
+  '- Applies only to work that changes something a person sees (a page, a component, a rendered output) in a contract that authorizes a pull request. Review, read-only and other non-publishing jobs submit nothing; a change with nothing visible needs no media.',
+  '- Capture it from your committed head before you hand off, with any screenshot or recording tool you have (for example `agent-browser screenshot`, or `agent-browser record start <file>.webm` then `record stop`). PNG, JPEG, GIF, WebP, WebM or MP4; at most 10 MB each and 8 per head. Add a "before" capture of the behavior it replaces only when your briefing asks for a comparison.',
+  '- Submit each capture with POST /api/media to the service (its address and `[auth]` token are in its instance config, as for POST /api/dispatch). Write the JSON body {"job_id": "<your job id>", "head_sha": "<your lane\'s full HEAD sha>", "caption": "<one line: what it shows>", "role": "after" or "before", "content_base64": "<the file, base64>"} to a file outside your worktree and send it with `curl --data-binary @<file>` (a capture is too large for a command-line argument). It is refused unless your lane sits at exactly that head with no uncommitted tracked changes; `pr_media_disabled` means skip media.',
+  '- GC binds each capture to that head, shows it to the owner on the FOR YOU card and writes the PR description\'s media section. Never attach media to the PR yourself, never commit captures into the repository, keep capture files outside your worktree, and keep the description\'s gc-media section intact when you edit the description.',
+  '- Capture mock or seed data only: never real accounts, credentials, tokens or personal data. When your head moves (a fix round), submit fresh captures of the new head.',
+].join('\n');
+
+/**
  * The complete set of current rule blocks an assembled worker instruction
  * carries. Rendering and appending live here (one ordered list, one append
  * helper DERIVED from it) so briefings, re-briefs and follow-up directives
  * cannot drift apart block by block.
  */
-export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE];
+export const WORKER_RULE_BLOCKS: readonly string[] = [PR_CREATION_RULE, TOOL_CALL_POLICY, REVIEW_CONVERGENCE_RULE, BACKGROUND_PROCESS_RULE, PR_MEDIA_RULE];
 
 /** Append every current worker rule block to an authored instruction text
  * (one blank line between blocks, always). Derived from the ordered list so

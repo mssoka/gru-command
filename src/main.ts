@@ -84,6 +84,8 @@ import { createRollProbes } from './roll/probes.js';
 import { createRollServer } from './roll/server.js';
 import { readRollState } from './roll/state.js';
 import { createAttachmentsServer } from './attachments/server.js';
+import { createMediaServer } from './media/server.js';
+import { PrMediaPublisher } from './media/publisher.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { JournalStore } from './lessons/journal.js';
 import { BibleStore } from './lessons/bible.js';
@@ -589,6 +591,12 @@ async function main(): Promise<number> {
   const engine = new BoardEngine({
     ledger,
     bus,
+    // PR media (docs/PR-MEDIA.md): FOR YOU ready-PR rows carry the captures
+    // bound to their exact head.
+    prMedia: () => config.prMedia,
+    // The publisher rides the Silas signal poll (below): with Silas or its
+    // poll off, the card says publishing is off instead of "posting".
+    prMediaPublishing: () => config.silas.enabled && config.silas.pollIntervalMs > 0,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
     // Issue #171 truthful agent status: the live registry's handle set is
     // the authoritative current-runtime ownership probe. Together with the
@@ -1965,6 +1973,16 @@ async function main(): Promise<number> {
     config,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // PR media (owner rulings 2026-11-15, docs/PR-MEDIA.md): minions submit
+  // captures of their lane's committed head; the board reads the bytes back
+  // for the FOR YOU previews.
+  const mediaServer = createMediaServer({
+    ledger,
+    dataDir: config.dataDir,
+    token: config.auth.token,
+    config: () => config.prMedia,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   state.bob = bob;
 
   // Graceful self-roll (issue #34): the operator surface + the state
@@ -2032,6 +2050,7 @@ async function main(): Promise<number> {
         diskServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
+        mediaServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
         dispatchServer.requestHook(req, res, path) ||
         verifyServer.requestHook(req, res, path) ||
@@ -2263,6 +2282,14 @@ async function main(): Promise<number> {
       gitlabPoll: new GitLabSignalPoll({
         ledger,
         resolveRemote: resolveLaneRemote,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      }),
+      // PR media publication rides the same tick, after both providers'
+      // observations: it writes captures bound to the observed head only.
+      mediaPublisher: new PrMediaPublisher({
+        ledger,
+        dataDir: config.dataDir,
+        config: () => config.prMedia,
         log: (level, msg, fields) => logger.log(level, msg, fields),
       }),
       log: (level, msg, fields) => logger.log(level, msg, fields),

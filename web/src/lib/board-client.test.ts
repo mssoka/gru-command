@@ -242,6 +242,27 @@ describe('board client', () => {
     );
   });
 
+  it('fetches a PR media capture with the token, calling fetch unbound the way browsers require', async () => {
+    const seen: { self: unknown; path: string; auth: string | undefined }[] = [];
+    // Browsers throw "Illegal invocation" when fetch runs with `this` set to
+    // anything but the window: this strict stand-in refuses the same way.
+    const fetchImpl = function (this: unknown, path: string, init?: RequestInit): Promise<Response> {
+      if (this !== undefined && this !== globalThis) return Promise.reject(new TypeError('Illegal invocation'));
+      seen.push({ self: this, path, auth: (init?.headers as Record<string, string> | undefined)?.['authorization'] });
+      return Promise.resolve(path.endsWith('missing')
+        ? new Response(JSON.stringify({ error: 'media_altered', detail: 'changed' }), { status: 410 })
+        : new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/png' } }));
+    } as unknown as typeof fetch;
+    client = new BoardClient(
+      { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+    const blob = await client.fetchMedia('m-11111111-1111-1111-1111-111111111111');
+    expect(blob.size).toBe(3);
+    expect(seen[0]).toMatchObject({ path: '/api/media/m-11111111-1111-1111-1111-111111111111', auth: `Bearer ${TOKEN}` });
+    await expect(client.fetchMedia('a/b missing')).rejects.toMatchObject({ path: '/api/media/a%2Fb%20missing', status: 410, code: 'media_altered' });
+  });
+
   it('records the owner as the decider only for the owner-reserved abandonment card (#523)', async () => {
     const fetchImpl = vi.fn(async () =>
       new Response(
