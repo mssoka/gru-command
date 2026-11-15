@@ -475,10 +475,10 @@ describe('stall evidence helpers', () => {
     expect(formatStallFrame(frame('spawnSync', 'node:child_process'), root)).toBe('spawnSync (node:child_process:12:7)');
     // Outside the install only the file name survives: a script in a home
     // directory must not name its owner.
-    expect(formatStallFrame(frame('', 'file:///Users/someone/run.js'), root)).toBe('(anonymous) (…/run.js:12:7)');
+    expect(formatStallFrame(frame('', 'file:///home/tester/run.js'), root)).toBe('(anonymous) (…/run.js:12:7)');
     expect(formatStallFrame(frame('f', '/opt/gru command-other/x/y.js'), root)).toBe('f (…/y.js:12:7)');
     // A package outside the install keeps its package path.
-    expect(formatStallFrame(frame('g', '/Users/someone/lib/node_modules/pkg/lib/x.js'), root))
+    expect(formatStallFrame(frame('g', '/home/tester/lib/node_modules/pkg/lib/x.js'), root))
       .toBe('g (…/node_modules/pkg/lib/x.js:12:7)');
     expect(formatStallFrame(frame('evaluated', ''), root)).toBe('evaluated ((unknown script):12:7)');
     // A data: module's URL is its source text: only the scheme is kept.
