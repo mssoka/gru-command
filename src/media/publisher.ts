@@ -173,10 +173,11 @@ export function supersededNote(change: ChangeKind, capturesHead: string, headSha
     `\`${headSha.slice(0, 12)}\`. Gru Command replaces this note when the new head is captured.`;
 }
 
-/** The note replacing an owed or skipped note written for an older head. */
+/** The note replacing an owed or skipped note written for an older head
+ * that nothing at the new head replaces. */
 export function movedNote(change: ChangeKind, noteHead: string, headSha: string): string {
   return `The note shown here earlier was written for \`${noteHead.slice(0, 12)}\`; this ${change} is now at ` +
-    `\`${headSha.slice(0, 12)}\`. Gru Command updates this section when the new head is checked.`;
+    `\`${headSha.slice(0, 12)}\`, which owes no media.`;
 }
 
 /** Paths named in a note (the count is always given). */
@@ -718,8 +719,9 @@ export function ownerPrMediaView(
   if (!config.enabled) return null;
   const items = listMedia(ledger, row.jobId);
   const coverage = coverageAtHead(ledger, row.jobId, row.sha);
-  if (items.length === 0 && coverage === null) return null;
+  const older = items.filter((item) => item.headSha !== row.sha).length;
   const atHead = orderForSection(mediaAtHead(items, row.sha));
+  if (atHead.length === 0 && older === 0 && !coverageWorthShowing(coverage)) return null;
   return {
     headSha: row.sha,
     items: atHead.map((item) => ({
@@ -731,7 +733,7 @@ export function ownerPrMediaView(
       bytes: item.bytes,
       capturedBy: item.capturedBy,
     })),
-    superseded: items.length - atHead.length,
+    superseded: older,
     coverage: coverage === null
       ? null
       : {
@@ -790,12 +792,23 @@ function sameChange(prUrl: string, provider: 'github' | 'gitlab', changeUrl: str
     own.number === seen.number;
 }
 
-/** The job's newest coverage asks for a note (owed or skipped): the cheap
- * pre-filter before the change is read. */
+/** The job's newest coverage asks for a note (owed or skipped), or its
+ * newest publication is such a note (a later head may need it replaced):
+ * the cheap pre-filter before the change is read. */
 function mayNeedNote(ledger: MediaLedger, jobId: string): boolean {
   const event = ledger.listJobEvents(jobId, { kinds: [MEDIA_COVERAGE_EVENT], order: 'desc', limit: 1 })[0];
   const coverage = event === undefined ? null : readCoverage(event);
-  return coverage !== null && (coverage.state === 'owed' || coverage.state === 'skipped');
+  if (coverage !== null && (coverage.state === 'owed' || coverage.state === 'skipped')) return true;
+  const published = ledger.listJobEvents(jobId, { kinds: [MEDIA_PUBLISHED_EVENT], order: 'desc', limit: 1 })[0];
+  const kind = published === undefined ? null : payloadOf(published)['kind'];
+  return kind === 'owed' || kind === 'skipped';
+}
+
+/** A coverage the FOR YOU card has something to say about. */
+function coverageWorthShowing(coverage: MediaCoverage | null): boolean {
+  if (coverage === null) return false;
+  if (coverage.state === 'owed' || coverage.state === 'skipped' || coverage.state === 'unknown') return true;
+  return (coverage.camera !== null && coverage.camera !== 'filmed') || coverage.detail !== null;
 }
 
 export class PrMediaPublisher {

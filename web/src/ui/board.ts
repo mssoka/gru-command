@@ -193,6 +193,9 @@ export function coverageLines(coverage: OwnerPrMediaCoverageView | null): readon
     ));
   } else if (coverage.state === 'skipped') {
     lines.push(el('div', 'lbl board-owner__media-note', `📸 no media: ${coverage.skip ?? 'the shot list gives a skip reason'}`));
+  } else if (coverage.state === 'unknown') {
+    lines.push(el('div', 'lbl board-owner__media-note board-owner__media-note--owed', `📸 media check failed: ${coverage.detail ?? 'see the service log'}`));
+    return lines;
   }
   const camera = coverage.camera;
   const detail = coverage.detail;

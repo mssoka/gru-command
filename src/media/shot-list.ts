@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { operationalDirectoryFor } from '../artifacts/context.js';
 import { MEDIA_MAX_PER_HEAD, MediaError, validateCaption, type MediaRole } from './store.js';
@@ -143,11 +143,14 @@ function line(value: unknown, where: string, max: number): string {
   return text;
 }
 
-/** Selectors and typed text: one line, no control characters, bounded. */
+/** Selectors and typed text: one line, no control characters, bounded,
+ * and never starting with "-" (the browser tool would read it as one of its
+ * options: it takes no "--" end-of-options marker). */
 function plain(value: unknown, where: string, max: number): string {
   if (typeof value !== 'string' || value === '') throw invalid(where, 'must be a non-empty string');
   if ([...value].length > max) throw invalid(where, `must be at most ${max} characters`);
   if (/\p{Cc}/u.test(value)) throw invalid(where, 'must be one line without control characters');
+  if (value.startsWith('-')) throw invalid(where, 'must not start with "-" (the browser tool would read it as an option)');
   return value;
 }
 
@@ -299,14 +302,26 @@ export function shotListPath(dataDir: string, repoPath: string, jobId: string): 
 }
 
 /** Read and validate the job's shot list. Null when there is none. A file
- * that is a symlink, not a regular file, or over the size cap is refused. */
+ * that is a symlink, not a regular file (a named pipe, a device, a folder)
+ * or over the size cap is refused. Nothing here can block: the kind is
+ * checked before the open, and the open itself never waits. */
 export function readShotList(path: string): ShotList | null {
-  let fd: number;
+  let kind;
   try {
-    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    kind = lstatSync(path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw new ShotListError('shot_list_unreadable', `${SHOT_LIST_FILE} cannot be read (${code ?? String(error)})`);
+  }
+  if (kind.isSymbolicLink()) throw new ShotListError('shot_list_unreadable', `${SHOT_LIST_FILE} is a link: write it as a plain file, not a link`);
+  if (!kind.isFile()) throw new ShotListError('shot_list_unreadable', `${SHOT_LIST_FILE} is not a regular file`);
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return null;
     throw new ShotListError('shot_list_unreadable', `${SHOT_LIST_FILE} cannot be opened (${code ?? String(error)}): write it as a plain file, not a link`);
   }
   try {

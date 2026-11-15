@@ -511,6 +511,7 @@ describe('board server-frame validator', () => {
     expect(valid({ headSha: sha, items: [item], superseded: 0, publication: { state: 'pending', at: null, detail: null }, coverage: { ...coverage, state: 'covered', camera: 'filmed', detail: null } })).toBe(true);
     expect(valid({ headSha: sha, items: [{ ...item, capturedBy: 'minion' }], superseded: 0, publication: { state: 'pending', at: null, detail: null } })).toBe(true);
     expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: { ...coverage, state: 'skipped', skip: 'no visible change', camera: null } })).toBe(true);
+    expect(valid({ headSha: sha, items: [], superseded: 0, publication: null, coverage: { state: 'unknown', touched: 0, paths: [], skip: null, camera: null, detail: 'the merge base could not be found' } })).toBe(true);
     for (const broken of [
       { ...coverage, state: 'maybe' },
       { ...coverage, touched: -1 },

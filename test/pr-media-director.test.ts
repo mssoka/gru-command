@@ -9,10 +9,10 @@ import { LedgerDb } from '../src/ledger/db.js';
 import type { PrMediaConfig } from '../src/config.js';
 import type { CameraRunInput, CameraRunResult } from '../src/media/camera.js';
 import {
-  CAMERA_DIRTY_BACKOFF_MS,
   CAMERA_MAX_ATTEMPTS,
   CAMERA_RETRY_MS,
   CAMERA_SETTLE_MS,
+  CAMERA_TICK_MS,
   CameraDirector,
   coverageAtHead,
   MEDIA_CAPTURE_FAILED_EVENT,
@@ -82,15 +82,19 @@ interface World {
 }
 
 /** A job lane whose head commits `web/card.ts` over a `main` base. */
-function world(manifest = CAPTURE): World {
+function world(manifest = CAPTURE, opts: { readonly baseManifest?: string; readonly baseBranch?: string } = {}): World {
   const dataDir = tmp('gru-camera-director-data-');
   const lane = tmp('gru-camera-director-lane-');
   git(lane, 'init', '-q', '-b', 'main');
   writeFileSync(join(lane, 'README.md'), 'widget shop\n');
+  if (opts.baseManifest !== undefined) {
+    mkdirSync(join(lane, '.gru-command'));
+    writeFileSync(join(lane, '.gru-command', 'worktree.toml'), opts.baseManifest);
+  }
   git(lane, 'add', '.');
   git(lane, 'commit', '-q', '-m', 'base');
   git(lane, 'checkout', '-q', '-b', 'gru/j-ui');
-  mkdirSync(join(lane, '.gru-command'));
+  mkdirSync(join(lane, '.gru-command'), { recursive: true });
   writeFileSync(join(lane, '.gru-command', 'worktree.toml'), manifest);
   mkdirSync(join(lane, 'web'));
   writeFileSync(join(lane, 'web', 'card.ts'), 'export const card = 1;\n');
@@ -99,7 +103,7 @@ function world(manifest = CAPTURE): World {
   const db = new LedgerDb(dataDir);
   dbs.push(db);
   const api = new LedgerApi(db.handle, { bus: new EventBus() });
-  api.addJob({ id: 'j-ui', repo: 'widget-shop', title: 'Plain-language cards', baseBranch: 'main' });
+  api.addJob({ id: 'j-ui', repo: 'widget-shop', title: 'Plain-language cards', baseBranch: opts.baseBranch ?? 'main' });
   api.setJobPr('j-ui', PR);
   const delivered = new Map<string, string>();
   const port: CameraLedger = {
@@ -116,9 +120,8 @@ function world(manifest = CAPTURE): World {
   const films: CameraRunInput[] = [];
   const w: World = {
     api, dataDir, lane, films, delivered,
-    // The ledger stamps events with the real clock; the director's clock
-    // runs a minute ahead of it and moves forward from there.
-    now: Date.now() + 60_000,
+    // The director's own clock: its waits are measured on it alone.
+    now: 1_800_000_000_000,
     next: (input) => ({ kind: 'filmed', files: input.plans.map((plan) => ({ plan, bytes: minimalPng() })) }),
     config: ON,
     director: undefined as unknown as CameraDirector,
@@ -156,7 +159,7 @@ const SHOTS = {
 
 async function tick(w: World): Promise<void> {
   await w.director.tick();
-  await w.director.inFlight();
+  await w.director.idle();
 }
 
 function events(w: World, kind: string): readonly Record<string, unknown>[] {
@@ -210,6 +213,44 @@ describe('media coverage (owner ruling Q4)', () => {
     const refused = coverageAtHead(w.api, 'j-ui', head(w));
     expect(refused).toMatchObject({ state: 'owed', shotList: 'refused' });
     expect(refused?.detail).toMatch(/^shot_list_invalid: shot-list\.json shots\[0\]\.id must be/u);
+  });
+
+  it('judges a diff by the base\'s capture paths as well as the head\'s, so a diff cannot narrow them away', async () => {
+    const narrowed = world('[capture]\npaths = ["docs/**"]\n', { baseManifest: '[capture]\npaths = ["web/**"]\n' });
+    await tick(narrowed);
+    expect(coverageAtHead(narrowed.api, 'j-ui', head(narrowed))).toMatchObject({ state: 'owed', paths: ['web/card.ts'], globs: ['web/**'] });
+    const excluded = world('[capture]\npaths = ["web/**", "!web/card.ts"]\n', { baseManifest: '[capture]\npaths = ["web/**"]\n' });
+    await tick(excluded);
+    expect(coverageAtHead(excluded.api, 'j-ui', head(excluded))).toMatchObject({ state: 'owed', paths: ['web/card.ts'] });
+    const removed = world('[verify]\nfull = "true"\n', { baseManifest: '[capture]\npaths = ["web/**"]\n' });
+    await tick(removed);
+    expect(coverageAtHead(removed.api, 'j-ui', head(removed))).toMatchObject({ state: 'owed' });
+  });
+
+  it('says owing is unknown, with the reason, when it cannot be decided, and decides once it can', async () => {
+    const broken = world('[capture]\npaths = ["!web/**"]\n');
+    await tick(broken);
+    expect(coverageAtHead(broken.api, 'j-ui', head(broken))).toMatchObject({ state: 'unknown', detail: expect.stringMatching(/^manifest_invalid: worktree manifest [0-9a-f]{12}:\.gru-command\/worktree\.toml \[capture\] paths lists only exclusions/u) });
+    const baseless = world(CAPTURE, { baseBranch: 'release' });
+    await tick(baseless);
+    expect(coverageAtHead(baseless.api, 'j-ui', head(baseless))).toMatchObject({ state: 'unknown', detail: expect.stringContaining('the merge base could not be found') });
+    // Not remembered as "nothing owed": the base appears, and the head is decided.
+    git(baseless.lane, 'branch', 'release', 'main');
+    await tick(baseless);
+    expect(coverageAtHead(baseless.api, 'j-ui', head(baseless))).toMatchObject({ state: 'owed', touched: 1 });
+  });
+
+  it('records not-owed for a shot list on a head that touches no capture path', async () => {
+    const w = world('[capture]\npaths = ["docs/**"]\nserve = "node app.mjs {port}"\nready = "output:up"\n');
+    writeShotList(w, SHOTS);
+    w.delivered.set('j-ui', head(w));
+    await tick(w);
+    expect(coverageAtHead(w.api, 'j-ui', head(w))).toMatchObject({ state: 'not-owed', touched: 0, camera: 'filmed' });
+    expect(w.films).toHaveLength(1);
+  });
+
+  it('pins the documented timings: 30 s ticks, 60 s settle, 3 attempts 10 minutes apart', () => {
+    expect([CAMERA_TICK_MS, CAMERA_SETTLE_MS, CAMERA_MAX_ATTEMPTS, CAMERA_RETRY_MS]).toEqual([30_000, 60_000, 3, 600_000]);
   });
 
   it('says the camera cannot film a shot list when [capture] has no serve', async () => {
@@ -319,24 +360,81 @@ describe('filming the shot list (owner ruling Q1, option C)', () => {
     writeShotList(moved, SHOTS);
     moved.delivered.set('j-ui', head(moved));
     moved.next = () => ({ kind: 'failed', code: 'head_moved', detail: 'the lane moved' });
-    for (let run = 0; run < CAMERA_MAX_ATTEMPTS + 1; run += 1) await tick(moved);
+    await tick(moved);
+    // Not an attempt, but not repeated at once either: it rests like a head settling.
+    await tick(moved);
+    expect(moved.films).toHaveLength(1);
+    for (let run = 1; run < CAMERA_MAX_ATTEMPTS + 1; run += 1) {
+      moved.now += CAMERA_SETTLE_MS;
+      await tick(moved);
+    }
     expect(moved.films).toHaveLength(CAMERA_MAX_ATTEMPTS + 1);
     expect(coverageAtHead(moved.api, 'j-ui', head(moved))?.camera).toBe('pending');
   });
 
-  it('backs off a lane found mid-edit, and never records a run the service stopped', async () => {
+  it('counts a run cut short by a crash as an attempt, so a crash can never loop, and retries a store that failed', async () => {
+    const crashed = world();
+    writeShotList(crashed, SHOTS);
+    crashed.delivered.set('j-ui', head(crashed));
+    const sha = (await import('node:crypto')).createHash('sha256').update(JSON.stringify(SHOTS)).digest('hex');
+    for (let run = 0; run < CAMERA_MAX_ATTEMPTS; run += 1) {
+      crashed.api.appendCustomEvent({ kind: MEDIA_CAPTURE_STARTED_EVENT, jobId: 'j-ui', payload: { run_id: `cr-0000000${run}-0000-4000-8000-000000000000`, head_sha: head(crashed), shot_list_sha256: sha, files: 2 } });
+    }
+    await tick(crashed);
+    expect(crashed.films).toHaveLength(0);
+    expect(coverageAtHead(crashed.api, 'j-ui', head(crashed))).toMatchObject({ camera: 'failed', detail: 'an earlier run was cut short before it finished' });
+
+    const full = world();
+    writeShotList(full, SHOTS);
+    full.delivered.set('j-ui', head(full));
+    const append = full.api.appendCustomEvent.bind(full.api);
+    let diskFull = true;
+    full.api.appendCustomEvent = ((fields: Parameters<LedgerApi['appendCustomEvent']>[0]) => {
+      if (diskFull && fields.kind === 'media.captured') throw new Error('SQLITE_FULL: database or disk is full');
+      return append(fields);
+    }) as LedgerApi['appendCustomEvent'];
+    await tick(full);
+    expect(events(full, MEDIA_CAPTURE_FAILED_EVENT)).toEqual([expect.objectContaining({ code: 'store_failed', detail: expect.stringContaining('SQLITE_FULL') })]);
+    diskFull = false;
+    full.now += CAMERA_RETRY_MS;
+    await tick(full);
+    expect(full.films).toHaveLength(2);
+    expect(events(full, MEDIA_CAPTURE_FILMED_EVENT)).toHaveLength(1);
+  });
+
+  it('never leaves an unhandled rejection: a settle or a tick that cannot write is logged', async () => {
     const w = world();
     writeShotList(w, SHOTS);
     w.delivered.set('j-ui', head(w));
-    w.next = () => ({ kind: 'failed', code: 'dirty_tree', detail: 'uncommitted tracked changes' });
+    const logged: string[] = [];
+    const append = w.api.appendCustomEvent.bind(w.api);
+    w.api.appendCustomEvent = ((fields: Parameters<LedgerApi['appendCustomEvent']>[0]) => {
+      if (fields.kind === MEDIA_CAPTURE_FAILED_EVENT) throw new Error('SQLITE_BUSY');
+      return append(fields);
+    }) as LedgerApi['appendCustomEvent'];
+    (w.director as unknown as { log: (level: string, msg: string) => void }).log = (_level, msg) => logged.push(msg);
+    w.next = () => ({ kind: 'failed', code: 'serve_failed', detail: 'boom' });
     await tick(w);
+    expect(logged).toContain('pr media camera: a run could not be settled');
+    w.api.listJobs = () => { throw new Error('the ledger is closed'); };
+    await expect(w.director.tick()).resolves.toBeUndefined();
+    expect(logged).toContain('pr media camera: the tick failed');
+  });
+
+  it('judges a lane mid-edit once it commits, and records a run the service stopped as no attempt', async () => {
+    const w = world();
+    writeShotList(w, SHOTS);
+    w.delivered.set('j-ui', head(w));
+    writeFileSync(join(w.lane, 'web', 'card.ts'), 'export const card = 3;\n');
     await tick(w);
-    expect(w.films).toHaveLength(1);
-    w.now += CAMERA_DIRTY_BACKOFF_MS;
+    expect(w.films).toHaveLength(0);
+    expect(events(w, MEDIA_COVERAGE_EVENT)).toEqual([]);
+    git(w.lane, 'checkout', '--', 'web/card.ts');
     w.next = () => ({ kind: 'failed', code: 'stopped', detail: 'the service is stopping' });
     await tick(w);
-    expect(w.films).toHaveLength(2);
-    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT).map((event) => event['code'])).toEqual(['dirty_tree']);
+    expect(w.films).toHaveLength(1);
+    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT)).toEqual([expect.objectContaining({ code: 'stopped' })]);
+    expect(coverageAtHead(w.api, 'j-ui', head(w))).toMatchObject({ state: 'owed', camera: 'pending', detail: null });
   });
 
   it('refuses to store a run that would pass the per-head cap with the minion\'s captures, as final', async () => {
@@ -354,18 +452,38 @@ describe('filming the shot list (owner ruling Q1, option C)', () => {
     expect(w.films).toHaveLength(1);
   });
 
-  it('films nothing for a parked or closed job or with [pr_media] off, holds the lane busy while filming, and stops a run on dispose', async () => {
+  it('films nothing with [pr_media] off or for a parked or closed job (a parked one keeps its coverage), stops a run whose job is parked, and on dispose', async () => {
     const w = world();
     writeShotList(w, SHOTS);
     w.delivered.set('j-ui', head(w));
     w.config = { enabled: false, publish: 'autonomous' };
     await tick(w);
+    expect(events(w, MEDIA_COVERAGE_EVENT)).toEqual([]);
     w.config = ON;
     w.api.setJobStatus('j-ui', 'parked');
     await tick(w);
     expect(w.films).toHaveLength(0);
-    expect(events(w, MEDIA_COVERAGE_EVENT)).toEqual([]);
+    expect(coverageAtHead(w.api, 'j-ui', head(w))).toMatchObject({ state: 'owed', camera: 'pending' });
     w.api.setJobStatus('j-ui', 'in-review');
+    // Parking the job mid-run stops the run; nothing is recorded or stored.
+    let parkedSignal: AbortSignal | null = null;
+    let finish: (result: CameraRunResult) => void = () => {};
+    w.next = (input) => {
+      parkedSignal = input.signal;
+      input.signal.addEventListener('abort', () => finish({ kind: 'failed', code: 'stopped', detail: 'the service is stopping' }), { once: true });
+      return new Promise<CameraRunResult>((resolveFilm) => {
+        finish = resolveFilm;
+      });
+    };
+    await w.director.tick();
+    expect(w.films).toHaveLength(1);
+    w.api.setJobStatus('j-ui', 'parked');
+    await w.director.tick();
+    await w.director.idle();
+    expect((parkedSignal as AbortSignal | null)?.aborted).toBe(true);
+    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT)).toEqual([expect.objectContaining({ code: 'stopped' })]);
+    w.api.setJobStatus('j-ui', 'in-review');
+    w.now += CAMERA_SETTLE_MS;
     let release: (result: CameraRunResult) => void = () => {};
     let seen: AbortSignal | null = null;
     w.next = (input) => {
@@ -375,16 +493,21 @@ describe('filming the shot list (owner ruling Q1, option C)', () => {
       });
     };
     await w.director.tick();
-    expect(w.director.jobBusy('j-ui')).toBe(true);
+    expect(w.director.inFlight()).not.toBeNull();
     // Another tick while the run is in flight starts no second run.
     await w.director.tick();
-    expect(w.films).toHaveLength(1);
+    expect(w.films).toHaveLength(2);
     const disposed = w.director.dispose();
     expect((seen as AbortSignal | null)?.aborted).toBe(true);
     release({ kind: 'failed', code: 'stopped', detail: 'the service is stopping' });
     await disposed;
-    expect(w.director.jobBusy('j-ui')).toBe(false);
-    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT)).toEqual([]);
+    expect(w.director.inFlight()).toBeNull();
+    expect(events(w, MEDIA_CAPTURE_FAILED_EVENT).map((event) => event['code'])).toEqual(['stopped', 'stopped']);
+    // A closed job is not considered at all.
+    const closed = world();
+    closed.api.setJobStatus('j-ui', 'binned');
+    await tick(closed);
+    expect(events(closed, MEDIA_COVERAGE_EVENT)).toEqual([]);
   });
 });
 
@@ -410,10 +533,16 @@ describe('where coverage shows', () => {
   function ghFake(pr: { body: string; head: string }): { gh: GhRunner; edits: string[] } {
     const edits: string[] = [];
     const gh: GhRunner = async (args) => {
+      if (args[0] === '--version') return { code: 0, stdout: 'gh version 2.101.0 (2026-09-15)\n', stderr: '' };
       if (args[0] === 'pr' && args[1] === 'view') return { code: 0, stdout: JSON.stringify({ body: pr.body, headRefOid: pr.head, state: 'OPEN' }), stderr: '' };
       if (args[0] === 'pr' && args[1] === 'edit') {
         const { readFileSync } = await import('node:fs');
-        pr.body = readFileSync(args[args.indexOf('--body-file') + 1]!, 'utf-8');
+        let body = readFileSync(args[args.indexOf('--body-file') + 1]!, 'utf-8');
+        // gh uploads each attachment and rewrites its reference.
+        args.forEach((arg, index) => {
+          if (args[index - 1] === '--attach') body = body.split(`](${arg})`).join(`](https://github.com/user-attachments/assets/a-${index})`);
+        });
+        pr.body = body;
         edits.push(pr.body);
         return { code: 0, stdout: PR, stderr: '' };
       }
@@ -443,6 +572,14 @@ describe('where coverage shows', () => {
     });
     // Another head's coverage is never shown against this one.
     expect(ownerPrMediaView(w.api, { ...row, sha: 'd'.repeat(40) }, ON, true)).toBeNull();
+    // With a capture: the item and the coverage that now says covered.
+    const item = storeMedia({ dataDir: w.dataDir, ledger: w.api, jobId: 'j-ui', headSha: head(w), caption: 'The card', role: 'after', bytes: minimalPng() });
+    await tick(w);
+    expect(ownerPrMediaView(w.api, row, ON, true)).toMatchObject({
+      items: [{ id: item.id, capturedBy: 'minion', caption: 'The card' }],
+      superseded: 0,
+      coverage: { state: 'covered', touched: 1 },
+    });
   });
 
   it('the PR section says media is owed, then shows the captures once they land, and says when an owed note goes stale', async () => {
@@ -452,11 +589,13 @@ describe('where coverage shows', () => {
     observe(w, first);
     const pr = { body: 'Fixes the card wording.', head: first };
     const { gh, edits } = ghFake(pr);
-    const publisher = new PrMediaPublisher({ ledger: w.api, dataDir: w.dataDir, config: () => ON, gh, now: () => w.now });
+    // The publisher's clock runs against the ledger's real stamps.
+    let clock = Date.now();
+    const publisher = new PrMediaPublisher({ ledger: w.api, dataDir: w.dataDir, config: () => ON, gh, now: () => clock });
     // A fresh coverage settles first, as fresh captures do.
     await publisher.pollOnce();
     expect(edits).toHaveLength(0);
-    w.now = Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000;
+    clock = Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000;
     await publisher.pollOnce();
     expect(edits).toHaveLength(1);
     expect(edits[0]).toContain(MEDIA_SECTION_BEGIN);
@@ -467,12 +606,48 @@ describe('where coverage shows', () => {
     // Unchanged: not written again.
     await publisher.pollOnce();
     expect(edits).toHaveLength(1);
-    // The head moves; nothing is known about the new head yet.
-    const second = commit(w, 'README.md', 'widget shop, renamed\n');
-    pr.head = second;
-    observe(w, second);
+    // A capture lands at the head: the captures replace the note.
+    storeMedia({ dataDir: w.dataDir, ledger: w.api, jobId: 'j-ui', headSha: first, caption: 'The plain card', role: 'after', bytes: minimalPng() });
+    await tick(w);
+    clock = Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000;
     await publisher.pollOnce();
-    expect(edits.at(-1)).toMatch(/The note shown here earlier was written for `[0-9a-f]{12}`; this PR is now at `[0-9a-f]{12}`/u);
+    expect(edits).toHaveLength(2);
+    expect(edits[1]).toContain('**After:** The plain card');
+    expect(edits[1]).not.toContain('Media owed');
+    // The head moves to one that owes nothing (its diff no longer touches
+    // the paths) while the owed note of another job state stood: say so.
+    const w2 = world();
+    const owedHead = head(w2);
+    await tick(w2);
+    observe(w2, owedHead);
+    const pr2 = { body: '', head: owedHead };
+    const second = ghFake(pr2);
+    let clock2 = Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000;
+    const publisher2 = new PrMediaPublisher({ ledger: w2.api, dataDir: w2.dataDir, config: () => ON, gh: second.gh, now: () => clock2 });
+    await publisher2.pollOnce();
+    expect(second.edits.at(-1)).toContain('Media owed');
+    git(w2.lane, 'rm', '-q', 'web/card.ts');
+    const reverted = commit(w2, 'README.md', 'widget shop, renamed\n');
+    writeShotList(w2, { version: 1, skip: 'nothing to see' });
+    await tick(w2);
+    pr2.head = reverted;
+    observe(w2, reverted);
+    clock2 += 1_000;
+    await publisher2.pollOnce();
+    expect(second.edits.at(-1)).toMatch(/The note shown here earlier was written for `[0-9a-f]{12}`; this PR is now at `[0-9a-f]{12}`, which owes no media\./u);
+  });
+
+  it('the PR section holds an owed note while GC is still to film the head', async () => {
+    const w = world();
+    writeShotList(w, SHOTS);
+    w.api.setJobStatus('j-ui', 'working');
+    await tick(w);
+    expect(coverageAtHead(w.api, 'j-ui', head(w))).toMatchObject({ state: 'owed', camera: 'pending' });
+    observe(w, head(w));
+    const pr = { body: 'Fixes the card wording.', head: head(w) };
+    const { gh, edits } = ghFake(pr);
+    await new PrMediaPublisher({ ledger: w.api, dataDir: w.dataDir, config: () => ON, gh, now: () => Date.now() + MEDIA_PUBLISH_SETTLE_MS + 1_000 }).pollOnce();
+    expect(edits).toEqual([]);
   });
 
   it('the PR section carries a shot list\'s skip reason, markdown-inert', async () => {

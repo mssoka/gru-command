@@ -9,7 +9,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { PrMediaConfig } from '../src/config.js';
 import { createMediaServer, MEDIA_MAX_BODY_BYTES, type MediaServerLedger } from '../src/media/server.js';
-import { findMedia, mediaRoot } from '../src/media/store.js';
+import { findMedia, mediaRoot, storeMedia } from '../src/media/store.js';
 import { minimalPng } from './helpers/images.js';
 
 /**
@@ -121,6 +121,25 @@ describe('PR media HTTP surface', () => {
     expect(bytes.headers.get('x-content-type-options')).toBe('nosniff');
     expect(bytes.headers.get('cache-control')).toBe('private, no-store');
     expect(Buffer.from(await bytes.arrayBuffer()).equals(minimalPng())).toBe(true);
+  });
+
+  it('lists GC captures with their shot, the camera\'s latest run and the newest coverage, for the minion to read back', async () => {
+    const f = await fixture();
+    const runId = 'cr-55555555-5555-4555-8555-555555555555';
+    const list = async (): Promise<Record<string, unknown>> =>
+      (await (await fetch(`${f.base}/api/media?job_id=j-ui`, { headers: { authorization: `Bearer ${TOKEN}` } })).json()) as Record<string, unknown>;
+    expect(await list()).toEqual({ job_id: 'j-ui', media: [], camera: null, coverage: null });
+    storeMedia({ dataDir: f.dataDir, ledger: f.ledger, jobId: 'j-ui', headSha: HEAD, caption: 'Filmed card', role: 'after', bytes: minimalPng(), capturedBy: 'gc', shot: { runId, shotId: 'card', viewport: 'desktop', files: 1 } });
+    f.ledger.appendCustomEvent({ kind: 'media.capture-started', jobId: 'j-ui', payload: { run_id: runId, head_sha: HEAD, shot_list_sha256: 'a'.repeat(64), files: 1 } });
+    f.ledger.appendCustomEvent({ kind: 'media.capture-failed', jobId: 'j-ui', payload: { run_id: runId, head_sha: HEAD, shot_list_sha256: 'a'.repeat(64), code: 'step_failed', detail: 'shot "card" step 2 failed' } });
+    f.ledger.appendCustomEvent({ kind: 'media.coverage', jobId: 'j-ui', payload: { head_sha: HEAD, state: 'owed', touched: 2, paths: ['web/a.ts', 'web/b.ts'], globs: ['web/**'], skip: null, shot_list: 'valid', camera: 'failed', detail: 'shot "card" step 2 failed' } });
+    const body = await list();
+    expect(body['media']).toEqual([expect.objectContaining({ captured_by: 'gc', shot: { run_id: runId, shot_id: 'card', viewport: 'desktop' } })]);
+    expect(body['camera']).toEqual({ state: 'failed', run_id: runId, head_sha: HEAD, shot_list_sha256: 'a'.repeat(64), code: 'step_failed', detail: 'shot "card" step 2 failed', at: expect.any(String) });
+    expect(body['coverage']).toEqual({
+      head_sha: HEAD, state: 'owed', touched: 2, paths: ['web/a.ts', 'web/b.ts'], globs: ['web/**'], skip: null,
+      shot_list: 'valid', camera: 'failed', detail: 'shot "card" step 2 failed', recorded_at: expect.any(String),
+    });
   });
 
   it('binds only at the lane head with a clean tracked tree, on a live lane', async () => {

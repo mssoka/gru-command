@@ -83,6 +83,10 @@ export const AGENT_BROWSER_BIN = 'agent-browser';
 export const WEB_STEP_TIMEOUT_MS = 15_000;
 /** Slack the process gets past its action timeout before it is killed. */
 const COMMAND_SLACK_MS = 15_000;
+/** The session close is bounded tightly: a stopping service waits for it.
+ * A browser that outlives it works in the run's folder, and the next boot
+ * ends it. */
+const CLOSE_TIMEOUT_MS = 3_000;
 /** A clip keeps rolling this long after its last step, so the result shows. */
 export const CLIP_TAIL_MS = 1_000;
 const DETAIL_MAX_CHARS = 300;
@@ -199,6 +203,9 @@ export class AgentBrowserDriver implements WebCaptureDriver {
       if (result.code === 0) return;
       if (result.error === 'ENOENT') throw new CaptureToolError('agent-browser is not installed on the Gru Command host');
       if (request.signal.aborted) throw new CaptureToolError('the capture run was stopped');
+      // No exit status (killed past its bound, or never started): the tool
+      // failed, not the step. A step's own failure is a non-zero exit.
+      if (result.code === null || result.error !== null) throw new CaptureToolError(`agent-browser ${what} did not finish: ${detail(result)}`);
       if (step === null) throw new CaptureToolError(`agent-browser ${what} failed: ${detail(result)}`);
       throw new ShotStepError(plan.shotId, step, `shot "${plan.shotId}" step ${step + 1} (${what}) failed at ${plan.viewport.name}: ${detail(result)}`);
     };
@@ -220,7 +227,7 @@ export class AgentBrowserDriver implements WebCaptureDriver {
     } finally {
       // Best effort, and never under the run's signal (a stopped run still
       // closes its browser): a session left open ends with the tool's daemon.
-      await this.run([...base, 'close'], { cwd: request.workDir, env, timeoutMs: 30_000, signal: new AbortController().signal })
+      await this.run([...base, 'close'], { cwd: request.workDir, env, timeoutMs: CLOSE_TIMEOUT_MS, signal: new AbortController().signal })
         .catch(() => undefined);
     }
   }

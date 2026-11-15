@@ -52,6 +52,9 @@ fail-loud like `[verify]`, each refusal naming its key:
 - `url` (optional) is the loopback base the shots open; `ready_timeout_ms`
   (optional, 1000–600000, default 120000) bounds the wait for `ready`.
 - An empty table or an unknown key is refused.
+- A service older than the release that brought `[capture]` refuses the table
+  as an unknown key, so update every GC instance that works on a repository
+  before committing its first `[capture]` table.
 
 A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -147,7 +148,8 @@ describe('[capture] manifest table', () => {
       ['serve = "x {port}"\nready = "output:up"\nready_timeout_ms = 10', /ready_timeout_ms must be an integer from 1000 to 600000/u],
     ];
     for (const [body, reason] of cases) expect(refusal(body), body).toMatch(reason);
-    expect(() => parseWorktreeManifest('capture = 3\n')).toThrow(/\[capture\] must be a table/u);
+    expect(() => parseWorktreeManifest('capture = 3\n')).toThrow(CaptureManifestError);
+    expect(() => parseWorktreeManifest('capture = 3\n')).toThrow(/\[capture\] table must be a table/u);
   });
 
   it('reserves the camera budget scope from [verify], as the onboarding proof is', () => {
@@ -175,6 +177,20 @@ describe('[capture] paths globs', () => {
     }
     expect(() => compileCaptureGlob('web\\src')).toThrow(CaptureGlobError);
     expect(() => compileCaptureGlob('x'.repeat(201))).toThrow(/at most 200/u);
+    // `**/**` means one `**`; a trailing one needs a segment.
+    expect(compileCaptureGlob('web/**/**/a.ts').matches('web/a.ts')).toBe(true);
+    expect(compileCaptureGlob('web/**/**').matches('web')).toBe(false);
+  });
+
+  it('matches in linear time: a glob built to backtrack against a deep path answers at once', () => {
+    const glob = compileCaptureGlob(`${'**/'.repeat(30)}zz`);
+    const starry = compileCaptureGlob(`${'*a'.repeat(40)}b`);
+    const deep = Array.from({ length: 40 }, (_, index) => `seg${index}`).join('/');
+    const started = performance.now();
+    expect(glob.matches(`${deep}/not-it`)).toBe(false);
+    expect(glob.matches(`${deep}/zz`)).toBe(true);
+    expect(starry.matches('a'.repeat(200))).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1_000);
   });
 
   it('lists each touched path once, with the first glob it matched, in diff order; a ! entry excludes', () => {
@@ -254,6 +270,9 @@ describe('shot list', () => {
       [{ version: 1, shots: [{ ...SHOT, steps: [{ open: '/' }, { type: '#a' }] }] }, /steps\[1\]\.text must be a non-empty string/u],
       [{ version: 1, shots: [{ ...SHOT, steps: [{ open: '/' }, { eval: 'x' }] }] }, /exactly one of/u],
       [{ version: 1, shots: [{ ...SHOT, steps: [{ open: '/' }, { click: 'a\nb' }] }] }, /one line without control characters/u],
+      [{ version: 1, shots: [{ ...SHOT, steps: [{ open: '/' }, { click: '--headed' }] }] }, /steps\[1\]\.click must not start with "-"/u],
+      [{ version: 1, shots: [{ ...SHOT, steps: [{ open: '/' }, { type: '#q', text: '-20% off' }] }] }, /steps\[1\]\.text must not start with "-"/u],
+      [{ version: 1, shots: [{ ...SHOT, steps: [{ open: '/' }, { wait_for_text: '--config=x' }] }] }, /wait_for_text must not start with "-"/u],
       [{ version: 1, shots: [{ ...SHOT, compare: 'main' }] }, /compare must be "base"/u],
       [{ version: 1, shots: [{ id: 'a', proves: 'AC1', skip: 'x', steps: [] }] }, /\(skipped\) has unknown key "steps"/u],
     ];
@@ -287,6 +306,13 @@ describe('shot list', () => {
     writeFileSync(path, ' '.repeat(SHOT_LIST_MAX_BYTES + 1));
     expect(() => readShotList(path)).toThrow(/limit is 65536/u);
     rmSync(path);
+    // A named pipe is refused without blocking the service on its open.
+    execFileSync('mkfifo', [path]);
+    expect(() => readShotList(path)).toThrow(/is not a regular file/u);
+    rmSync(path);
+    mkdirSync(path);
+    expect(() => readShotList(path)).toThrow(/is not a regular file/u);
+    rmSync(path, { recursive: true });
     const elsewhere = join(dataDir, 'elsewhere.json');
     writeFileSync(elsewhere, list({ version: 1, shots: [SHOT] }));
     symlinkSync(elsewhere, path);

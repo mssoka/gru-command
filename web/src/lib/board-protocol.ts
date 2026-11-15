@@ -487,7 +487,7 @@ export interface OwnerPrMediaItemView {
 /** Whether the head owes media and where GC's camera stands (docs/PR-MEDIA.md,
  * "When media is owed"). */
 export interface OwnerPrMediaCoverageView {
-  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed';
+  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed' | 'unknown';
   readonly touched: number;
   readonly paths: readonly string[];
   readonly skip: string | null;
@@ -528,7 +528,7 @@ function isOwnerPrMediaItem(value: unknown): value is OwnerPrMediaItemView {
   );
 }
 
-const COVERAGE_STATES: readonly unknown[] = ['owed', 'skipped', 'covered', 'not-owed'];
+const COVERAGE_STATES: readonly unknown[] = ['owed', 'skipped', 'covered', 'not-owed', 'unknown'];
 const CAMERA_STATES: readonly unknown[] = ['pending', 'filming', 'filmed', 'failed', 'unconfigured'];
 
 function isOwnerPrMediaCoverage(value: unknown): value is OwnerPrMediaCoverageView {

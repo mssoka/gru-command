@@ -145,7 +145,7 @@ function captureUrl(source: string, key: string, value: string): string {
 
 function parseCapture(raw: unknown, source: string): ManifestCapture {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    throw new Error(`worktree manifest ${source}: [capture] must be a table`);
+    throw new CaptureManifestError(source, 'table', 'must be a table ([capture] with key = value lines)');
   }
   const table = raw as Record<string, unknown>;
   for (const key of Object.keys(table)) {

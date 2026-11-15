@@ -172,14 +172,16 @@ export interface OwnerPrMediaItemView {
 export interface OwnerPrMediaCoverageView {
   /** `owed`: the diff touches `[capture] paths` with no capture and no skip
    * reason; `skipped`: the shot list says why none is needed; `covered`: a
-   * capture is bound to the head; `not-owed`: no capture path is touched. */
-  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed';
+   * capture is bound to the head; `not-owed`: no capture path is touched;
+   * `unknown`: owing could not be decided (`detail` says why). */
+  readonly state: 'owed' | 'skipped' | 'covered' | 'not-owed' | 'unknown';
   readonly touched: number;
   /** The first touched paths (at most 10). */
   readonly paths: readonly string[];
   readonly skip: string | null;
   readonly camera: 'pending' | 'filming' | 'filmed' | 'failed' | 'unconfigured' | null;
-  /** A refused shot list, or the camera's latest failure. */
+  /** Why owing is unknown, a refused shot list, or the camera's latest
+   * failure. */
   readonly detail: string | null;
 }
 

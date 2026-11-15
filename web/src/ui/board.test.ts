@@ -4320,9 +4320,16 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(notes()[1]).toBe('🎬 shot list refused: shot_list_invalid: shot-list.json version must be 1');
       render({ state: 'skipped', touched: 1, paths: ['web/a.ts'], skip: 'renames an internal helper', camera: null, detail: null });
       expect(notes()).toEqual(['📸 no media: renames an internal helper']);
+      render({ state: 'unknown', touched: 0, paths: [], skip: null, camera: null, detail: 'manifest_invalid: [capture] paths lists only exclusions' });
+      expect(notes()).toEqual(['📸 media check failed: manifest_invalid: [capture] paths lists only exclusions']);
+      render({ ...owed, camera: 'unconfigured', detail: 'the head\'s [capture] declares no serve and ready, so GC cannot film this shot list' });
+      expect(notes()[1]).toBe('🎬 the head\'s [capture] declares no serve and ready, so GC cannot film this shot list');
       const filmed = { id: 'm-44444444-4444-4444-4444-444444444444', kind: 'image', mediaType: 'image/png', role: 'after', caption: 'Card', bytes: 10, capturedBy: 'gc' };
       render({ state: 'covered', touched: 1, paths: ['web/a.ts'], skip: null, camera: 'filmed', detail: null }, [filmed]);
       expect(notes()).toEqual(['📸 1 capture at aaaa1111 · filmed by Gru Command · posted to the PR ✓']);
+      const direct = { ...filmed, id: 'm-55555555-5555-5555-5555-555555555555', capturedBy: 'minion' };
+      render({ state: 'covered', touched: 1, paths: ['web/a.ts'], skip: null, camera: 'filmed', detail: null }, [filmed, direct]);
+      expect(notes()).toEqual(['📸 2 captures at aaaa1111 · 1 filmed by Gru Command · posted to the PR ✓']);
     } finally {
       createSpy.mockRestore();
     }

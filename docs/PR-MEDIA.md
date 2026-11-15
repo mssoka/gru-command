@@ -92,21 +92,22 @@ ready = "http://127.0.0.1:{port}/"        # answered below 400 = up; or "output:
   `paths` may stand alone: media is then owed, and the minion submits it
   directly.
 - **`serve`** must hold `{port}`: lanes are filmed side by side, so the app
-  binds the port GC picks for the run. It runs in the lane (or the base
-  checkout) with `/bin/sh`, in its own process group; `GRU_CAPTURE_PORT`
-  carries the port too.
+  binds the port GC picks for the run. It runs in GC's own checkout of the
+  commit being filmed (never in the minion's lane) with `/bin/sh`, in its own
+  process group; `GRU_CAPTURE_PORT` carries the port too.
 - **`ready`** is a loopback `http://` URL whose port is `{port}`, polled until
   it answers below 400, or `output:<text>`, matched against the app's output
   with ANSI colors removed. `serve` and `ready` come together.
 - The table is read from the head's **committed** manifest, never from an
   edit the lane has not committed. Every refusal names its key, like
-  `[verify]`; a manifest GC cannot parse owes and films nothing until it
-  parses.
+  `[verify]`. A head whose manifest does not parse films nothing, and its
+  coverage says `unknown` with the refusal ([When media is owed](#when-media-is-owed)).
 
-GC's own repository declares `paths` for the board's visible sources
-(`web/src/ui/**`, `web/src/styles/**`, `web/index.html`, tests excluded) and
-no `serve` yet: the board needs its service and a pairing token to show
-anything, so its minions capture the board themselves and submit the files.
+**Rolling out a `[capture]` table.** A GC service older than this release
+refuses a manifest with `[capture]` as an unknown key, and with it every new
+lane of that repository. Update every GC instance that works on a repository
+before committing its first `[capture]` table. GC's own repository gets its
+table in a follow-up for that reason.
 
 ## The shot list
 
@@ -151,50 +152,71 @@ workflow notes of every GC-built job). It is never committed.
 - **`compare: "base"`** also films the shot at the merge base.
 - **`skip`**: a shot that cannot be filmed carries only `id`, `proves` and
   why. A change with nothing to see writes `{"version": 1, "skip": "<why>"}`.
-- A list plans at most 8 files (each shot × its viewports, twice with
-  compare): the per-head cap.
+- A list holds at most 8 shots, skipped ones included, and plans at most 8
+  files (each filmed shot × its viewports, twice with compare): the per-head
+  cap.
+- Selectors and texts never start with `-`: the browser tool would read them
+  as its own options.
 
 Every field is validated with a named reason (`shot_list_invalid`,
-`shot_list_over_limit`, `shot_list_unreadable` for a link, a non-file or a
-file over 64 KiB). A refused list is shown on the FOR YOU card and returned to
+`shot_list_over_limit`, `shot_list_unreadable` for a link, anything but a
+regular file (a named pipe is refused without being opened) or a file over
+64 KiB). A refused list is shown on the FOR YOU card and returned to
 the minion by `GET /api/media?job_id=`.
 
 ## GC's camera
 
 The camera director (`src/media/director.ts`) ticks every 30 seconds while
-`[pr_media] enabled` is true. For each live job (not parked) with one live
-lane at a committed head with no uncommitted tracked change, it reads the
-head's `[capture]` table and the job's shot list, then:
+`[pr_media] enabled` is true, and at once when a minion delivers. For each
+live job with one live lane at a committed head with no uncommitted tracked
+change, it reads the head's `[capture]` table and the job's shot list, then:
 
 - **When it films.** As soon as the head is the minion's delivered head, or
   once the head has stood still for 60 seconds while the minion's attempt is
   closed. A head that moves is filmed again, and so is a shot list changed at
-  the same head (a new script). One run at a time.
+  the same head (a new script). One run at a time. A parked job keeps its
+  coverage current and is never filmed; a run whose job is parked or closed
+  is stopped.
+- **Before the review freezes.** A delivery asks for a tick at once, so the
+  delivered head is usually filmed while Perkins prepares its round. The
+  review does not wait for the camera yet: PR 3 makes the review round read
+  the head's stills.
 - **How a run goes** (`src/media/camera.ts`):
-  1. It holds one slot of the global verification budget for its whole life,
-     under the reserved scope `pr-media-capture`. The scheduler's records of
-     that scope are dropped, so a camera run is never verification evidence
-     and never fences a review.
-  2. A slim lane gets its setup back first, as before a verification.
-  3. It proves the lane is at the head with a clean tracked tree.
-  4. It starts the app on a free loopback port, waits for `ready`, films
-     each after shot through the web adapter, and ends the app's process
-     group (SIGTERM, then SIGKILL after 5 seconds).
-  5. Before shots run in a throwaway checkout of the merge base
-     (`clone --shared`, detached: the repository gains no worktree, ref or
-     index entry), set up by that commit's own manifest (or the head's when
-     the base has none), served the same way, then removed.
-  6. It proves the head again: a lane that moved or changed during the run
-     yields nothing, and the new head is filmed instead.
+  1. The browser tool is checked first, and a compare shot with no merge
+     base is refused; neither waits for a budget slot.
+  2. It holds one slot of the global verification budget for the rest of its
+     life, under the reserved scope `pr-media-capture`. The scheduler's
+     records of that scope are dropped, so a camera run is never verification
+     evidence and never fences a review.
+  3. It proves the lane is at the head.
+  4. **Nothing runs in the minion's lane.** Each commit is filmed in a
+     throwaway checkout under the run's private folder
+     (`<data_dir>/media/.camera/<run>/`): `clone --shared`, then a detached
+     checkout, so the repository gains no worktree, ref or index entry. The
+     checkout is set up by that commit's own manifest (`[[link]]`, `[[copy]]`,
+     `[[setup]]`), exactly as a fresh lane is. It is the commit, so its tree
+     is clean by construction, and nothing the app writes (a regenerated
+     tracked file, say) can reach the lane.
+  5. Before shots go first, in a checkout of the merge base (set up by its own
+     manifest, or the head's when the base has none): a base that cannot be
+     set up fails the run before the head is filmed.
+  6. In each checkout it starts the app on a free loopback port, waits for
+     `ready`, films each shot through the web adapter, and ends the app's
+     process group (SIGTERM, then SIGKILL after 5 seconds).
+  7. It proves the lane is still at the head: a lane that moved yields
+     nothing, and the new head is filmed instead. The run's folder is removed
+     off the event loop.
 - **The web adapter** (`src/media/web-adapter.ts`) drives `agent-browser`
   with an argv, never a shell. Every command names a fresh `--session` and
   an empty `--config` file the run wrote, runs in the run's private folder,
   drops every `AGENT_BROWSER_*` variable, and passes `--allowed-domains`
   with the app's loopback host only. So neither the owner's browser profile
   nor a repository's `agent-browser.json` reaches the camera, and a step
-  that navigates elsewhere fails instead of loading it. agent-browser must
-  be installed on the GC host (`npm install -g agent-browser && agent-browser
-  install`); without it the run fails `tool_missing`.
+  that navigates elsewhere fails instead of loading it. A step that fails is
+  the step's (`step_failed`); a command that never finishes is the tool's.
+  agent-browser must be installed on the GC host (`npm install -g
+  agent-browser && agent-browser install`); without it the run fails
+  `tool_missing`.
 - **Storing.** A run stores all its files together, each a `media.captured`
   event with `captured_by: "gc"` and its `shot` (`run_id`, `shot_id`,
   `viewport`, `files`). A run counts only once all its files are stored. At a
@@ -203,30 +225,38 @@ head's `[capture]` table and the job's shot list, then:
   8 captures a head holds, with the minion's own, is refused (`media_limit`).
 - **Journal.** `media.capture-started`, then `media.capture-filmed` (the
   media ids) or `media.capture-failed` (`code`, `detail`), each with the run
-  id, head and the shot list's sha256.
+  id, head, the shot list's sha256 and the director's clock (`at`).
 - **Failures.**
   - The shot list or the app must fix it (`step_failed`, `capture_invalid`,
     `media_limit`): final for that head and script. A fixed list or a new
     head is filmed again.
   - Infrastructure may cure it (`serve_failed`, `ready_timeout`,
-    `tool_missing`, `budget_unavailable`, `base_setup_failed`,
-    `base_unavailable`, `lane_unreadable`): retried 3 times, 10 minutes
-    apart.
-  - `head_moved` is not an attempt (the new head is filmed). `dirty_tree`
-    waits a minute. A run the service stopped is not recorded.
-- **Restarts.** A boot ends the apps an earlier process's runs left running:
-  each restored `pr-media-capture` slot names the app shell's pid and argv
-  (which names the run), and only a live pid running exactly that argv has
-  its group ended. A lane being filmed is busy for lane slimming and the disk
-  reclaim, as a verified one is. Shutdown stops a run in flight (bounded to
-  10 seconds) before the verification scheduler is disposed.
+    `tool_missing`, `budget_unavailable`, `checkout_failed`, `setup_failed`,
+    `base_setup_failed`, `base_unavailable`, `lane_unreadable`,
+    `store_failed`): retried 3 times, 10 minutes apart. A run that started
+    and never got an outcome (the service crashed) counts as one of the
+    three, so a crash can never loop.
+  - `head_moved` and `stopped` (the service stopped, or the job was parked
+    or closed) are recorded and are no attempt; the same head and script
+    are tried again after 60 seconds.
+- **Restarts.** A boot ends what the runs of an earlier process left
+  running: every process working in a run's folder (its working directory or
+  its command line names it) is ended, with the group of each restored
+  `pr-media-capture` slot that leads one, and the folders are removed. A
+  restored slot whose pid is gone is released; a live pid working elsewhere
+  (a reused pid) is never signalled. Shutdown stops a run in flight (bounded
+  to 10 seconds) before the verification scheduler is disposed.
 
 ## When media is owed
 
 Owner ruling Q4: code decides. On each tick the director diffs the head
 against its merge base (`git diff --name-only --no-renames`) and matches the
-changed paths against the head's `[capture] paths`. The result is journaled
-as one `media.coverage` event whenever it changes:
+changed paths against the `[capture] paths` of the head's committed manifest
+**and** of the merge base's. A path either side says owes media owes it, so
+a diff cannot narrow, exclude or delete its way out of the paths it is
+judged by. The lanes are read with `GIT_OPTIONAL_LOCKS=0`, so a tick never
+takes the index lock a minion's own `git commit` needs. The result is
+journaled as one `media.coverage` event whenever it changes:
 
 | State | When |
 |---|---|
@@ -234,6 +264,7 @@ as one `media.coverage` event whenever it changes:
 | `skipped` | touched, and the shot list gives a skip reason (top-level, or every shot skipped) |
 | `covered` | touched, and a capture is bound to the head |
 | `not-owed` | no capture path is touched, but the minion wrote a shot list |
+| `unknown` | owing could not be decided: a manifest that declares `[capture]` does not parse (`manifest_invalid: …`), or the merge base, a manifest or the diff could not be read. A read that failed is tried again on the next tick, never remembered as "not owed" |
 
 Each record carries the touched count, the first 10 paths, the globs they
 matched, the skip reason, the shot list's state (`absent`, `valid`,
@@ -245,15 +276,16 @@ Where it shows:
 
 - **FOR YOU ready-PR card:** `📸 media owed: 3 changed files under [capture]
   paths (…) — no capture and no skip reason` in the alert color, or
-  `📸 no media: <reason>`, and one line on the camera (filming, waiting for
-  the head to settle, a refused shot list, or the failure it could not get
-  past).
+  `📸 no media: <reason>`, or `📸 media check failed: <reason>` for an
+  unknown head, and one line on the camera (filming, waiting for the head to
+  settle, a refused shot list, or the failure it could not get past).
 - **PR/MR description:** an owed head gets a note in the media section once
   the camera has nothing left to film at it ("Media owed: this PR changes 3
   files under the repository's capture paths (…) but has no captures and no
   skip reason at `<sha>`"), and a skipped head the shot list's reason, both
-  markdown-escaped. A note left for an older head is replaced by one saying
-  the PR moved on. Captures at the head always win over a note.
+  markdown-escaped. A note left for an older head that owes nothing is
+  replaced by one saying the PR moved on. Captures at the head always win
+  over a note. An unknown head gets no note: the FOR YOU card says why.
 - **The minion:** `GET /api/media?job_id=` returns the newest coverage.
 
 ## The capture API

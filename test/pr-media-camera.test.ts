@@ -61,9 +61,11 @@ function appScript(): string {
   const file = join(dir, 'app.mjs');
   writeFileSync(file, [
     "import http from 'node:http';",
-    "import { existsSync, readFileSync } from 'node:fs';",
+    "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
     'const port = Number(process.argv[2]);',
     "if (process.argv[3] === 'crash') { console.error('boom: missing dependency'); process.exit(3); }",
+    // Like a dev server that regenerates a tracked file as it starts.
+    "if (process.argv[3] === 'scribble') { writeFileSync('version.txt', readFileSync('version.txt', 'utf8').trim() + '-regenerated'); }",
     'const server = http.createServer((req, res) => {',
     "  if (process.argv[3] === 'slow') { res.writeHead(503); res.end('starting'); return; }",
     "  const body = readFileSync('version.txt', 'utf8').trim() + (existsSync('setup-marker.txt') ? '+setup' : '');",
@@ -197,24 +199,24 @@ async function answers(url: string): Promise<boolean> {
 }
 
 describe('filmShotList', () => {
-  it('films every after plan against the app it serves on the run\'s port, under one budget slot, then stops the app', async () => {
+  it('films every after plan against the app it serves from a set-up checkout of the head, on the run\'s port, under one budget slot, then stops it', async () => {
     const at = lane();
     const camera = driver();
-    let readied = 0;
-    const run = input(at, { driver: camera, ensureReady: async () => { readied += 1; } });
+    const run = input(at, { driver: camera });
     const result = await filmShotList(run);
     expect(result.kind).toBe('filmed');
     if (result.kind !== 'filmed') return;
     expect(result.files.map((file) => [file.plan.shotId, file.plan.viewport.name])).toEqual([['home', 'desktop'], ['home', 'mobile']]);
     expect(result.files.every((file) => file.bytes.equals(minimalPng()))).toBe(true);
-    expect(readied).toBe(1);
-    // The app served the HEAD's bytes, on a loopback port the run picked.
-    expect(camera.shots.map((shot) => shot.page)).toEqual(['head', 'head']);
+    // The app served the HEAD's bytes from a checkout its manifest set up, on
+    // a loopback port the run picked; the lane itself gained nothing.
+    expect(camera.shots.map((shot) => shot.page)).toEqual(['head+setup', 'head+setup']);
+    expect(existsSync(join(at.path, 'setup-marker.txt'))).toBe(false);
     const baseUrl = camera.shots[0]!.request.baseUrl;
     expect(baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/u);
     expect(camera.shots[0]!.request.outFile.startsWith(run.workDir)).toBe(true);
     // One slot of the global budget, under the reserved scope, at the head.
-    expect(run.budgetFake.specs).toEqual([expect.objectContaining({ jobId: 'j-ui', scope: 'pr-media-capture', cwd: at.path, head: at.head })]);
+    expect(run.budgetFake.specs).toEqual([expect.objectContaining({ jobId: 'j-ui', scope: 'pr-media-capture', cwd: run.workDir, head: at.head })]);
     expect(run.budgetFake.released).toHaveLength(1);
     expect(run.budgetFake.bound).toEqual([expect.objectContaining({ leadsGroup: true, command: `/bin/sh -c eval "$${CAMERA_SERVE_ENV}" # pr media camera ${run.runId}` })]);
     // The app is gone and the run's folder removed.
@@ -245,22 +247,30 @@ describe('filmShotList', () => {
     const step = input(at, { driver: driver({ fail: new ShotStepError('home', 1, 'shot "home" step 2 (click "#nope") failed at desktop: Element not found') }) });
     expect(await filmShotList(step)).toMatchObject({ kind: 'failed', code: 'step_failed', detail: expect.stringContaining('click "#nope"') });
     expect(step.budgetFake.released).toHaveLength(1);
-    expect(await filmShotList(input(at, { driver: driver({ probe: 'agent-browser is not installed on the Gru Command host' }) })))
-      .toMatchObject({ kind: 'failed', code: 'tool_missing', detail: expect.stringContaining('not installed') });
+    // A missing tool is known before any budget slot is waited for.
+    const missing = input(at, { driver: driver({ probe: 'agent-browser is not installed on the Gru Command host' }) });
+    expect(await filmShotList(missing)).toMatchObject({ kind: 'failed', code: 'tool_missing', detail: expect.stringContaining('not installed') });
+    expect(missing.budgetFake.specs).toEqual([]);
     expect(await filmShotList(input(at, { driver: driver({ fail: new CaptureToolError('agent-browser set viewport failed: daemon crashed') }) })))
       .toMatchObject({ kind: 'failed', code: 'tool_missing' });
     expect(await filmShotList(input(at, { driver: driver({ bytes: Buffer.from('not an image') }) })))
       .toMatchObject({ kind: 'failed', code: 'capture_invalid', detail: expect.stringContaining('unsupported capture') });
   });
 
-  it('films only a committed head: a dirty or moved lane yields nothing', async () => {
+  it('films the committed head, never the lane: an edit in the lane does not show, an app that rewrites a tracked file never dirties it, a moved lane yields nothing', async () => {
     const at = lane();
-    writeFileSync(join(at.path, 'version.txt'), 'edited\n');
-    const dirty = input(at);
-    expect(await filmShotList(dirty)).toMatchObject({ kind: 'failed', code: 'dirty_tree', detail: expect.stringContaining('before filming') });
-    // Nothing was served for a dirty lane.
-    expect(dirty.budgetFake.bound).toEqual([]);
+    writeFileSync(join(at.path, 'version.txt'), 'uncommitted edit\n');
+    const camera = driver();
+    expect(await filmShotList(input(at, { driver: camera }))).toMatchObject({ kind: 'filmed' });
+    expect(camera.shots.map((shot) => shot.page)).toEqual(['head+setup', 'head+setup']);
     git(at.path, 'checkout', '--', 'version.txt');
+    const app = appScript();
+    const scribbler = driver();
+    expect(await filmShotList(input(at, { driver: scribbler, capture: captureTable(`node ${app} {port} scribble`, 'http://127.0.0.1:{port}/') }))).toMatchObject({ kind: 'filmed' });
+    expect(scribbler.shots[0]!.page).toBe('head-regenerated+setup');
+    expect(git(at.path, 'status', '--porcelain')).toBe('');
+    // The lane must sit at the head when the run starts.
+    expect(await filmShotList(input(at, { headSha: at.base }))).toMatchObject({ kind: 'failed', code: 'head_moved', detail: expect.stringContaining('before filming') });
     // The minion commits while the camera films: the head moved, nothing binds.
     let committed = false;
     const moved = input(at, {
@@ -287,14 +297,43 @@ describe('filmShotList', () => {
     if (result.kind !== 'filmed') return;
     // The plans' order: before (base) captures first, then after.
     expect(result.files.map((file) => `${file.plan.role}:${file.plan.viewport.name}`)).toEqual(['before:desktop', 'before:mobile', 'after:desktop', 'after:mobile']);
-    // After shots saw the lane's head; before shots the base, after its setup ran.
-    expect(camera.shots.map((shot) => shot.page)).toEqual(['head', 'head', 'base+setup', 'base+setup']);
-    // The lane gained no setup marker, no worktree, no ref; the checkout is gone.
+    // The base is filmed first, then the head, each after its own setup ran.
+    expect(camera.shots.map((shot) => shot.page)).toEqual(['base+setup', 'base+setup', 'head+setup', 'head+setup']);
+    // The lane gained no setup marker, no worktree, no ref; the checkouts are gone.
     expect(existsSync(join(at.path, 'setup-marker.txt'))).toBe(false);
     expect(git(at.path, 'worktree', 'list').split('\n')).toHaveLength(1);
+    expect(git(at.path, 'for-each-ref', '--format=%(refname)').split('\n').sort()).toEqual(['refs/heads/gru/j-ui', 'refs/heads/main']);
     expect(existsSync(run.workDir)).toBe(false);
-    // Without a merge base there is no before to film.
-    expect(await filmShotList(input(at, { plans: plans(true), baseSha: null }))).toMatchObject({ kind: 'failed', code: 'base_unavailable' });
+    // Without a merge base there is no before to film, and nothing is waited for.
+    const noBase = input(at, { plans: plans(true), baseSha: null });
+    expect(await filmShotList(noBase)).toMatchObject({ kind: 'failed', code: 'base_unavailable' });
+    expect(noBase.budgetFake.specs).toEqual([]);
+  });
+
+  it('sets up a base without a manifest by the head\'s, and names a base whose setup fails before the head is filmed', async () => {
+    const bare = tmp('gru-camera-bare-');
+    git(bare, 'init', '-q', '-b', 'main');
+    writeFileSync(join(bare, 'version.txt'), 'base\n');
+    writeFileSync(join(bare, '.gitignore'), 'setup-marker.txt\n');
+    git(bare, 'add', '.');
+    git(bare, 'commit', '-q', '-m', 'base');
+    const base = git(bare, 'rev-parse', 'HEAD');
+    git(bare, 'checkout', '-q', '-b', 'gru/j-ui');
+    mkdirSync(join(bare, '.gru-command'));
+    writeFileSync(join(bare, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "echo ran > setup-marker.txt"\n');
+    writeFileSync(join(bare, 'version.txt'), 'head\n');
+    git(bare, 'add', '.');
+    git(bare, 'commit', '-q', '-m', 'head');
+    const at: Lane = { path: bare, head: git(bare, 'rev-parse', 'HEAD'), base };
+    const camera = driver();
+    const headManifest = parseWorktreeManifest('[[setup]]\ncommand = "echo ran > setup-marker.txt"\n');
+    expect(await filmShotList(input(at, { driver: camera, plans: plans(true), headManifest }))).toMatchObject({ kind: 'filmed' });
+    expect(camera.shots.map((shot) => shot.page)).toEqual(['base+setup', 'base+setup', 'head+setup', 'head+setup']);
+    const broken = driver();
+    const failing = await filmShotList(input(at, { driver: broken, plans: plans(true), headManifest: parseWorktreeManifest('[[setup]]\ncommand = "echo no network >&2; exit 7"\n') }));
+    expect(failing).toMatchObject({ kind: 'failed', code: 'base_setup_failed' });
+    expect(failing.kind === 'failed' && failing.detail).toMatch(/setting up the merge base [0-9a-f]{12} failed: .*exited 7/u);
+    expect(broken.shots).toEqual([]);
   });
 
   it('stops when the service stops: a budget wait or a run in flight ends as stopped, its slot released', async () => {
@@ -312,31 +351,34 @@ describe('filmShotList', () => {
 });
 
 describe('endOrphanedCameraApps', () => {
-  it('ends an app an earlier process left running, releases a slot whose app is gone, and never signals a reused pid', async () => {
-    const runId = 'cr-33333333-3333-4333-8333-333333333333';
-    const orphan = spawn('/bin/sh', ['-c', `eval "$${CAMERA_SERVE_ENV}" # pr media camera ${runId}`], {
-      env: { ...process.env, [CAMERA_SERVE_ENV]: 'sleep 30' },
-      detached: true,
-      stdio: 'ignore',
-    });
-    const stranger = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  it('ends every process an earlier run left working in its folder (an exec\'d app included), removes the folders, and never signals a stranger', async () => {
+    const dataDir = tmp('gru-camera-boot-');
+    const runDir = join(dataDir, 'media', '.camera', 'cr-33333333-3333-4333-8333-333333333333', 'head');
+    mkdirSync(runDir, { recursive: true });
+    // `exec` replaces the shell's argv: the app is known by where it works.
+    const orphan = spawn('/bin/sh', ['-c', 'exec sleep 30'], { cwd: runDir, detached: true, stdio: 'ignore' });
+    const stranger = spawn('sleep', ['31'], { cwd: dataDir, detached: true, stdio: 'ignore' });
     pids.push(orphan.pid!, stranger.pid!);
-    const lease = (id: string): VerificationLease => ({ runId: id, jobId: 'j-ui', scope: CAMERA_SCOPE, command: 'x', cwd: '/lane', head: null, queuedAt: 0, grantedAt: 0 });
-    // Give ps a moment to see the shell's argv.
+    const lease = (id: string): VerificationLease => ({ runId: id, jobId: 'j-ui', scope: CAMERA_SCOPE, command: 'x', cwd: runDir, head: null, queuedAt: 0, grantedAt: 0 });
     await new Promise((resolveWait) => setTimeout(resolveWait, 200));
     const slots = budget({
       restored: [
-        { lease: lease('orphan'), pid: orphan.pid!, processCommand: orphan.spawnargs.join(' ') },
-        { lease: lease('stranger'), pid: stranger.pid!, processCommand: orphan.spawnargs.join(' ') },
+        { lease: lease('orphan'), pid: orphan.pid!, processCommand: '/bin/sh -c eval "$GRU_CAPTURE_SERVE" # pr media camera x' },
+        { lease: lease('stranger'), pid: stranger.pid!, processCommand: 'whatever' },
         { lease: lease('gone'), pid: 999_999, processCommand: 'whatever' },
       ],
     });
     const exited = new Promise((resolveExit) => orphan.once('exit', resolveExit));
-    expect(await endOrphanedCameraApps(() => slots)).toBe(1);
+    expect(await endOrphanedCameraApps(() => slots, dataDir)).toBe(1);
     await exited;
+    expect(existsSync(join(dataDir, 'media', '.camera'))).toBe(false);
     expect(slots.released.map((released) => released.runId).sort()).toEqual(['gone', 'orphan']);
-    // The stranger (a pid that runs something else) is alive and untouched.
+    // The stranger (a pid working elsewhere, as a reused pid would) is alive.
     expect(() => process.kill(stranger.pid!, 0)).not.toThrow();
+    // Nothing left: no folder, no process, slots of gone pids still released.
+    const quiet = budget({ restored: [{ lease: lease('late'), pid: 999_998, processCommand: 'x' }] });
+    expect(await endOrphanedCameraApps(() => quiet, dataDir)).toBe(0);
+    expect(quiet.released.map((released) => released.runId)).toEqual(['late']);
   });
 });
 
@@ -418,6 +460,11 @@ describe('the agent-browser adapter', () => {
     await expect(shot).rejects.toThrow(ShotStepError);
     await expect(shot).rejects.toThrow('shot "flow" step 2 (click "#go") failed at 640x480: ✗ Element not found. Verify the selector');
     expect(failing.calls.at(-1)!.argv.slice(7)).toEqual(['close']);
+    // A command that never finished (killed past its bound) is the tool's
+    // failure, retried; it is never blamed on the shot list's step.
+    const hung = recorder((argv) => (argv.includes('click') ? { code: null, error: 'timed out' } : { code: 0 }));
+    await expect(new AgentBrowserDriver(hung.run, () => ({})).shoot({ baseUrl: 'http://127.0.0.1:1', plan: plan('screenshot'), outFile: join(workDir, 'h.png'), workDir, signal: abort.signal }))
+      .rejects.toThrow(/agent-browser click "#go" did not finish: timed out/u);
     const missing = recorder(() => ({ code: null, error: 'ENOENT' }));
     await expect(new AgentBrowserDriver(missing.run, () => ({})).shoot({ baseUrl: 'http://127.0.0.1:1', plan: plan('screenshot'), outFile: join(workDir, 'b.png'), workDir, signal: abort.signal }))
       .rejects.toThrow(CaptureToolError);

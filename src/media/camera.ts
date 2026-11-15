@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -7,8 +7,9 @@ import { repositoryGitEnv } from '../git-env.js';
 import type { LogLevel } from '../logger.js';
 import { endProcesses } from '../onboarding/proof.js';
 import { redactCredentials, utf8Tail } from '../redaction.js';
-import { readGitState, VerificationDisposedError, VerificationLockTimeoutError, type VerificationLease } from '../verify/scheduler.js';
+import { VerificationDisposedError, VerificationLockTimeoutError, type VerificationLease } from '../verify/scheduler.js';
 import type { VerificationBudget } from '../verify/server.js';
+import { psEnumeratorAsync } from '../worktrees/manager.js';
 import {
   applyWorktreeManifest,
   captureBaseUrl,
@@ -17,32 +18,37 @@ import {
   type ManifestCapture,
   type WorktreeManifest,
 } from '../worktrees/manifest.js';
+import { removeTree } from '../worktrees/reclaim.js';
 import type { PlannedCapture } from './shot-list.js';
-import { MediaError, validateMediaBytes } from './store.js';
+import { MediaError, mediaRoot, validateMediaBytes } from './store.js';
 import { CaptureToolError, ShotStepError, stripAnsi, type WebCaptureDriver } from './web-adapter.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
  * GC's camera (PR media, docs/PR-MEDIA.md "GC's camera"): one run films a
- * minion's shot list at the lane's exact committed head.
+ * minion's shot list at an exact committed head.
  *
+ * - The browser tool is probed first, so a host without it costs nothing.
  * - It holds ONE slot of the global verification budget for its whole life,
  *   under the reserved scope {@link CAMERA_SCOPE} (the scheduler's records of
  *   it are dropped: a camera run is never verification evidence and never
  *   fences a review).
- * - The lane is readied first (a slim lane gets its setup back), then the
- *   head is proved: HEAD is the named sha and no tracked file is changed.
- * - `[capture] serve` starts the app on a free loopback port the run picks
- *   (`{port}`), in its own process group; the run waits for `ready`, films
- *   each planned capture through the web adapter, and ends the group.
- * - A shot that compares with the base is filmed in a throwaway checkout of
- *   the merge base (`clone --shared`, detached), set up by that commit's own
- *   manifest (or the head's when the base has none), served the same way and
- *   removed afterwards.
- * - The head is proved again at the end: a lane that moved or changed during
- *   the run yields nothing, so no file is ever bound to a head it may not
- *   show.
+ * - Nothing runs in the minion's lane. Each commit is filmed in a throwaway
+ *   checkout under the run's private folder (`clone --shared`, then a
+ *   detached checkout: the repository gains no worktree, ref or index
+ *   entry), set up by that commit's own manifest, exactly as a fresh lane
+ *   is. The checkout IS the commit, so its tree is clean by construction and
+ *   nothing the app writes can reach the lane.
+ * - `[capture] serve` starts the app there on a free loopback port the run
+ *   picks (`{port}`), in its own process group; the run waits for `ready`,
+ *   films each planned capture through the web adapter, and ends the group.
+ * - A shot that compares with the base is filmed the same way in a checkout
+ *   of the merge base, set up by that commit's own manifest (or the head's
+ *   when the base has none). It is filmed first: a base that cannot be set
+ *   up fails the run before the head is filmed.
+ * - The lane must still sit at the head at the end: a lane that moved yields
+ *   nothing, so no file is bound to a head the lane has left.
  *
  * The run returns the files or a named failure; it stores nothing. The
  * director decides what to keep and what to retry.
@@ -51,21 +57,25 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 /** The verification-budget scope a camera run holds its slot under. */
 export const CAMERA_SCOPE = RESERVED_CAPTURE_SCOPE;
 /** The environment variable the serve shell evaluates its command from: its
- * argv then names the run, so a later boot can tell an orphan is its own. */
+ * argv then names the run. */
 export const CAMERA_SERVE_ENV = 'GRU_CAPTURE_SERVE';
+/** The folder (under the media home) every run's checkouts live in. */
+export const CAMERA_WORK_DIR = '.camera';
 /** Grace between SIGTERM and SIGKILL when the app is stopped. */
 export const CAMERA_KILL_GRACE_MS = 5_000;
 const READY_POLL_MS = 250;
 const READY_PROBE_TIMEOUT_MS = 2_000;
+const GIT_TIMEOUT_MS = 120_000;
 const OUTPUT_KEEP_BYTES = 64 * 1024;
 const DETAIL_MAX_CHARS = 600;
 
 export type CameraFailureCode =
   | 'head_moved'
-  | 'dirty_tree'
   | 'lane_unreadable'
   | 'budget_unavailable'
   | 'tool_missing'
+  | 'checkout_failed'
+  | 'setup_failed'
   | 'serve_failed'
   | 'ready_timeout'
   | 'step_failed'
@@ -86,25 +96,24 @@ export type CameraRunResult =
 export interface CameraRunInput {
   readonly jobId: string;
   readonly runId: string;
+  /** The job's lane: read (its HEAD), never written or served from. */
   readonly lanePath: string;
-  /** The registered repository (the base checkout clones from it). */
+  /** The registered repository the checkouts clone from (they share its
+   * objects, so every lane commit is there). */
   readonly repoPath: string;
   readonly headSha: string;
   /** The merge base; needed only when a plan is a `before` capture. */
   readonly baseSha: string | null;
   /** The head's committed `[capture]` table, with serve and ready. */
   readonly capture: ManifestCapture;
-  /** The head's committed manifest (the base checkout's setup when the base
-   * commit has none). */
+  /** The head's committed manifest: the head checkout's setup, and the base
+   * checkout's when the base commit has none. */
   readonly headManifest: WorktreeManifest;
   readonly plans: readonly PlannedCapture[];
   /** A private folder this run owns; removed when the run ends. */
   readonly workDir: string;
   readonly budget: () => VerificationBudget;
   readonly driver: WebCaptureDriver;
-  /** Gives a slim lane its setup back before anything runs in it (#427). */
-  readonly ensureReady?: (signal: AbortSignal) => Promise<void>;
-  readonly gitState?: (cwd: string) => { readonly sha: string | null; readonly trackedDirty: boolean };
   readonly setupTimeoutMs: number;
   readonly signal: AbortSignal;
   readonly log?: Log;
@@ -124,8 +133,7 @@ function oneLine(error: unknown): string {
 
 /** The tail of the app's output, ANSI colors removed, redacted, bounded. */
 function outputTail(text: string): string {
-  const plain = stripAnsi(text);
-  const lines = plain.split('\n').map((part) => part.trimEnd()).filter((part) => part.trim() !== '').slice(-8).join(' ⏎ ');
+  const lines = stripAnsi(text).split('\n').map((part) => part.trimEnd()).filter((part) => part.trim() !== '').slice(-8).join(' ⏎ ');
   return redactCredentials(lines.length <= DETAIL_MAX_CHARS ? lines : `…${lines.slice(-DETAIL_MAX_CHARS)}`);
 }
 
@@ -163,6 +171,18 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return abortable(new Promise((resolveSleep) => setTimeout(resolveSleep, ms)), signal);
 }
 
+/** One git command, off the event loop, killed when the run stops. */
+function git(cwd: string, args: readonly string[], signal: AbortSignal): Promise<string> {
+  return new Promise((resolveGit, rejectGit) => {
+    execFile('git', ['-C', cwd, ...args], { env: repositoryGitEnv(true), timeout: GIT_TIMEOUT_MS, encoding: 'utf-8', signal, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (signal.aborted) rejectGit(new CameraFailure('stopped', 'the service is stopping'));
+        else if (error === null) resolveGit(stdout.trim());
+        else rejectGit(new Error(`git ${args[0] ?? ''} failed: ${(stderr || error.message).trim()}`));
+      });
+  });
+}
+
 /** A running app: its group, its output so far, and how it ended. */
 interface ServedApp {
   readonly child: ChildProcess;
@@ -180,6 +200,8 @@ function startApp(input: {
 }): ServedApp {
   let child: ChildProcess;
   try {
+    // The shell evaluates the command from its environment, so its argv
+    // names the run whatever the command is.
     child = spawn('/bin/sh', ['-c', `eval "$${CAMERA_SERVE_ENV}" # pr media camera ${input.runId}`], {
       cwd: input.cwd,
       env: { ...repositoryGitEnv(false), [CAMERA_SERVE_ENV]: input.command, GRU_CAPTURE_PORT: String(input.port), GRU_CAPTURE_RUN_ID: input.runId },
@@ -219,7 +241,7 @@ async function stopApp(app: ServedApp, log: Log): Promise<void> {
   const pid = app.child.pid;
   if (pid === undefined) return;
   const survivors = await endProcesses([-pid], CAMERA_KILL_GRACE_MS);
-  if (survivors.length > 0) log('error', 'pr media camera: the app outlived SIGKILL', { pid });
+  if (survivors.length > 0) log('error', 'pr media camera: the app outlived SIGKILL; the next boot ends it', { pid });
 }
 
 async function probeUrl(url: string): Promise<boolean> {
@@ -236,9 +258,8 @@ async function waitReady(app: ServedApp, capture: ManifestCapture, port: number,
   const ready = capture.ready;
   if (ready === null) throw new CameraFailure('serve_failed', '[capture] declares no ready condition');
   const deadline = Date.now() + capture.readyTimeoutMs;
-  const plain = (): string => stripAnsi(app.output());
   for (;;) {
-    if (ready.kind === 'output' ? plain().includes(ready.text) : await probeUrl(withPort(ready.url, port))) return;
+    if (ready.kind === 'output' ? stripAnsi(app.output()).includes(ready.text) : await probeUrl(withPort(ready.url, port))) return;
     if (app.exitedNow) {
       const exit = await app.exited;
       throw new CameraFailure('serve_failed',
@@ -282,8 +303,9 @@ async function serveAndFilm(input: CameraRunInput, lease: VerificationLease, cwd
       try {
         await input.driver.shoot({ baseUrl, plan, outFile, workDir: input.workDir, signal: input.signal });
       } catch (error) {
+        if (input.signal.aborted) throw new CameraFailure('stopped', 'the service is stopping');
         if (error instanceof ShotStepError) throw new CameraFailure('step_failed', error.message);
-        if (error instanceof CaptureToolError) throw new CameraFailure(input.signal.aborted ? 'stopped' : 'tool_missing', error.message);
+        if (error instanceof CaptureToolError) throw new CameraFailure('tool_missing', error.message);
         throw error;
       }
       let bytes: Buffer;
@@ -307,68 +329,75 @@ async function serveAndFilm(input: CameraRunInput, lease: VerificationLease, cwd
   }
 }
 
-function git(cwd: string, args: readonly string[], timeoutMs = 120_000): Promise<void> {
-  return new Promise((resolveGit, rejectGit) => {
-    execFile('git', ['-C', cwd, ...args], { env: repositoryGitEnv(true), timeout: timeoutMs, encoding: 'utf-8' }, (error, _stdout, stderr) => {
-      if (error === null) resolveGit();
-      else rejectGit(new Error(`git ${args[0] ?? ''} failed: ${(stderr || error.message).trim()}`));
-    });
-  });
-}
-
-/** Film the before plans in a throwaway checkout of the merge base. */
-async function filmBase(input: CameraRunInput, lease: VerificationLease, plans: readonly PlannedCapture[]): Promise<readonly FilmedCapture[]> {
-  if (input.baseSha === null) throw new CameraFailure('base_unavailable', 'a shot compares with the base, but the merge base of this head could not be found');
-  const dir = join(input.workDir, 'base');
+/** A throwaway checkout of `sha`, set up by its own manifest (or
+ * `fallback` when the commit has none), as a fresh lane is. */
+async function checkoutAt(input: CameraRunInput, sha: string, name: 'head' | 'base', fallback: WorktreeManifest): Promise<string> {
+  const dir = join(input.workDir, name);
+  const what = name === 'head' ? `the head ${sha.slice(0, 12)}` : `the merge base ${sha.slice(0, 12)}`;
   try {
-    // `clone --shared --no-checkout` + a detached checkout: the repository
-    // gains no worktree, ref or index entry.
-    await abortable(git(input.workDir, ['clone', '--quiet', '--shared', '--no-checkout', input.repoPath, dir]), input.signal);
-    await abortable(git(dir, ['checkout', '--quiet', '--detach', input.baseSha]), input.signal);
+    await git(input.workDir, ['clone', '--quiet', '--shared', '--no-checkout', input.repoPath, dir], input.signal);
+    await git(dir, ['checkout', '--quiet', '--detach', sha], input.signal);
   } catch (error) {
     if (error instanceof CameraFailure) throw error;
-    throw new CameraFailure('base_unavailable', `the merge base ${input.baseSha.slice(0, 12)} could not be checked out: ${oneLine(error)}`);
+    throw new CameraFailure(name === 'head' ? 'checkout_failed' : 'base_unavailable', `${what} could not be checked out: ${oneLine(error)}`);
   }
+  const setupFailed: CameraFailureCode = name === 'head' ? 'setup_failed' : 'base_setup_failed';
   let manifest: WorktreeManifest;
   try {
-    manifest = loadWorktreeManifest(dir) ?? input.headManifest;
+    manifest = loadWorktreeManifest(dir) ?? fallback;
   } catch (error) {
-    throw new CameraFailure('base_setup_failed', `the merge base's ${oneLine(error)}`);
+    throw new CameraFailure(setupFailed, `${what}: ${oneLine(error)}`);
   }
   try {
     await applyWorktreeManifest(manifest, { sourceRoot: input.repoPath, worktreePath: dir, setupTimeoutMs: input.setupTimeoutMs, signal: input.signal });
   } catch (error) {
     if (input.signal.aborted) throw new CameraFailure('stopped', 'the service is stopping');
-    throw new CameraFailure('base_setup_failed', `setting up the merge base ${input.baseSha.slice(0, 12)} failed: ${oneLine(error)}`);
+    throw new CameraFailure(setupFailed, `setting up ${what} failed: ${oneLine(error)}`);
   }
-  return serveAndFilm(input, lease, dir, plans, 'before');
+  return dir;
 }
 
-function proveHead(input: CameraRunInput, when: string): void {
-  const state = (input.gitState ?? ((cwd: string) => readGitState(cwd)))(input.lanePath);
-  if (state.sha === null) throw new CameraFailure('lane_unreadable', `GC could not read the lane's HEAD ${when}`);
-  if (state.sha !== input.headSha) {
-    throw new CameraFailure('head_moved', `the lane moved from ${input.headSha.slice(0, 12)} to ${state.sha.slice(0, 12)} ${when}; the new head is filmed instead`);
+async function proveLane(input: CameraRunInput, when: string): Promise<void> {
+  let sha: string;
+  try {
+    sha = await git(input.lanePath, ['rev-parse', 'HEAD'], input.signal);
+  } catch (error) {
+    if (error instanceof CameraFailure) throw error;
+    throw new CameraFailure('lane_unreadable', `GC could not read the lane's HEAD ${when}: ${oneLine(error)}`);
   }
-  if (state.trackedDirty) throw new CameraFailure('dirty_tree', `the lane had uncommitted tracked changes ${when}; GC films only a committed head`);
+  if (sha !== input.headSha) {
+    throw new CameraFailure('head_moved', `the lane moved from ${input.headSha.slice(0, 12)} to ${sha.slice(0, 12)} ${when}; the new head is filmed instead`);
+  }
 }
 
-/** Film the plans at the lane's head. Never throws for a named failure. */
+/** Film the plans at the head (and the merge base). Never throws for a
+ * named failure, and never throws for the folder it could not remove. */
 export async function filmShotList(input: CameraRunInput): Promise<CameraRunResult> {
   const log = input.log ?? (() => {});
+  const before = input.plans.filter((plan) => plan.role === 'before');
+  const after = input.plans.filter((plan) => plan.role === 'after');
+  // Cheap refusals first: no budget slot is waited for to learn them.
+  let problem: string | null;
+  try {
+    problem = await abortable(input.driver.probe(input.signal), input.signal);
+  } catch (error) {
+    return { kind: 'failed', code: error instanceof CameraFailure ? error.code : 'tool_missing', detail: oneLine(error) };
+  }
+  if (problem !== null) return { kind: 'failed', code: 'tool_missing', detail: problem };
+  if (before.length > 0 && input.baseSha === null) {
+    return { kind: 'failed', code: 'base_unavailable', detail: 'a shot compares with the base, but the merge base of this head could not be found' };
+  }
   let budget: VerificationBudget;
   try {
     budget = input.budget();
   } catch (error) {
     return { kind: 'failed', code: 'budget_unavailable', detail: `the verification budget is unavailable: ${oneLine(error)}` };
   }
-  mkdirSync(input.workDir, { recursive: true, mode: 0o700 });
-  const granted = budget.acquire({ jobId: input.jobId, scope: CAMERA_SCOPE, command: input.capture.serve ?? '', cwd: input.lanePath, head: input.headSha });
+  const granted = budget.acquire({ jobId: input.jobId, scope: CAMERA_SCOPE, command: input.capture.serve ?? '', cwd: input.workDir, head: input.headSha });
   let lease: VerificationLease;
   try {
     lease = await abortable(granted, input.signal);
   } catch (error) {
-    rmSync(input.workDir, { recursive: true, force: true });
     if (error instanceof CameraFailure) {
       void granted.then((late) => budget.release(late), () => {});
       return { kind: 'failed', code: 'stopped', detail: error.message };
@@ -380,23 +409,17 @@ export async function filmShotList(input: CameraRunInput): Promise<CameraRunResu
     return { kind: 'failed', code: 'budget_unavailable', detail: `no verification budget slot: ${oneLine(error)}` };
   }
   try {
-    if (input.ensureReady !== undefined) {
-      // Like a verification's readying (#427): a failed restore is logged and
-      // the run goes ahead; the app's own start then says what is missing.
-      await abortable(input.ensureReady(input.signal).catch((error: unknown) => {
-        log('warn', 'pr media camera: readying the lane failed; filming goes ahead', { job: input.jobId, error: oneLine(error) });
-      }), input.signal);
-    }
-    proveHead(input, 'before filming');
-    const problem = await abortable(input.driver.probe(input.signal), input.signal);
-    if (problem !== null) throw new CameraFailure('tool_missing', problem);
-    const after = input.plans.filter((plan) => plan.role === 'after');
-    const before = input.plans.filter((plan) => plan.role === 'before');
-    const filmedAfter = after.length === 0 ? [] : await serveAndFilm(input, lease, input.lanePath, after, 'after');
-    const filmedBefore = before.length === 0 ? [] : await filmBase(input, lease, before);
-    proveHead(input, 'while it was filmed');
+    mkdirSync(input.workDir, { recursive: true, mode: 0o700 });
+    await proveLane(input, 'before filming');
+    const filmedBefore = before.length === 0
+      ? []
+      : await serveAndFilm(input, lease, await checkoutAt(input, input.baseSha!, 'base', input.headManifest), before, 'before');
+    const filmedAfter = after.length === 0
+      ? []
+      : await serveAndFilm(input, lease, await checkoutAt(input, input.headSha, 'head', input.headManifest), after, 'after');
+    await proveLane(input, 'while it was filmed');
     // The plans' own order (before shots first within each shot).
-    const byPlan = new Map<PlannedCapture, Buffer>([...filmedAfter, ...filmedBefore].map((file) => [file.plan, file.bytes]));
+    const byPlan = new Map<PlannedCapture, Buffer>([...filmedBefore, ...filmedAfter].map((file) => [file.plan, file.bytes]));
     const files = input.plans.map((plan) => {
       const bytes = byPlan.get(plan);
       if (bytes === undefined) throw new CameraFailure('capture_invalid', `shot "${plan.shotId}" at ${plan.viewport.name} produced no file`);
@@ -407,25 +430,18 @@ export async function filmShotList(input: CameraRunInput): Promise<CameraRunResu
   } catch (error) {
     if (error instanceof CameraFailure) return { kind: 'failed', code: error.code, detail: error.message };
     if (input.signal.aborted) return { kind: 'failed', code: 'stopped', detail: 'the service is stopping' };
-    throw error;
+    return { kind: 'failed', code: 'serve_failed', detail: `the camera run failed unexpectedly: ${oneLine(error)}` };
   } finally {
     budget.release(lease);
-    rmSync(input.workDir, { recursive: true, force: true });
+    await removeTree(input.workDir).catch((error: unknown) => {
+      log('warn', 'pr media camera: the run folder could not be removed; the next boot removes it', { run: input.runId, error: oneLine(error) });
+    });
   }
 }
 
-/** The argv `ps` reports for a pid, or null when it is gone or unreadable. */
-function commandOf(pid: number): Promise<string | null> {
-  return new Promise((resolveCommand) => {
-    execFile('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 10_000 }, (error, stdout) => {
-      resolveCommand(error === null ? stdout.trim() || null : null);
-    });
-  });
-}
-
-function alive(target: number): boolean {
+function alive(pid: number): boolean {
   try {
-    process.kill(target, 0);
+    process.kill(pid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
@@ -433,47 +449,48 @@ function alive(target: number): boolean {
 }
 
 /**
- * Boot: end the apps a camera run of an earlier process left running (the
- * service stopped mid-run, so its detached app group outlived it). Each
- * restored {@link CAMERA_SCOPE} slot names the serve shell's pid, the
- * leader of its own group, with its argv. A live pid running exactly that
- * argv has its group ended and its slot released; a pid that is gone has
- * its slot released; a live pid running anything else (a reused pid) is
- * never signalled, and its slot waits for the scheduler's age limit.
+ * Boot: end what the runs of an earlier process left running (the service
+ * stopped mid-run, so a detached app group, or a browser session that never
+ * closed, outlived it), then remove their folders. Every such process works
+ * in a run's private folder under `<data_dir>/media/.camera/`, so that is the
+ * evidence: each process rooted there (its working directory, or its
+ * command line) is ended, with the group of each restored
+ * {@link CAMERA_SCOPE} slot that leads one of them. A restored slot whose
+ * pid is gone afterwards is released; a live pid rooted elsewhere (a
+ * reused pid) is never signalled, and its slot waits for the scheduler's
+ * age limit. Returns how many processes were ended.
  */
-export async function endOrphanedCameraApps(budget: () => VerificationBudget, log: Log = () => {}): Promise<number> {
-  let slots: VerificationBudget;
+export async function endOrphanedCameraApps(budget: () => VerificationBudget, dataDir: string, log: Log = () => {}): Promise<number> {
+  const root = join(mediaRoot(dataDir), CAMERA_WORK_DIR);
+  let slots: VerificationBudget | null = null;
   try {
     slots = budget();
   } catch (error) {
-    log('warn', 'pr media camera: the verification budget is unavailable, so an app an earlier run left is not ended now', { error: oneLine(error) });
-    return 0;
+    log('warn', 'pr media camera: the verification budget is unavailable, so slots an earlier run left are not released now', { error: oneLine(error) });
   }
+  const restored = slots?.restored(CAMERA_SCOPE) ?? [];
   let ended = 0;
-  for (const holder of slots.restored(CAMERA_SCOPE)) {
-    const fields = { run: holder.lease.runId, job: holder.lease.jobId, pid: holder.pid };
-    try {
-      if (alive(holder.pid)) {
-        const running = await commandOf(holder.pid);
-        if (running === null || holder.processCommand === null || running !== holder.processCommand) {
-          if (alive(holder.pid)) {
-            log('warn', 'pr media camera: a budget slot an earlier run left names a live pid that is not its app; it is not signalled and the slot waits for the age limit', { ...fields, recorded: holder.processCommand, running });
-            continue;
-          }
-        } else {
-          const survivors = await endProcesses([-holder.pid], CAMERA_KILL_GRACE_MS);
-          if (survivors.length > 0) {
-            log('error', 'pr media camera: an app an earlier run left outlived SIGKILL; its slot waits for the age limit', fields);
-            continue;
-          }
-          ended += 1;
-          log('warn', 'pr media camera: an app an earlier run left running was ended', fields);
-        }
-      }
-      slots.release(holder.lease);
-    } catch (error) {
-      log('error', 'pr media camera: an app an earlier run left could not be judged; its slot waits for the age limit', { ...fields, error: oneLine(error) });
+  if (existsSync(root)) {
+    const rooted = await psEnumeratorAsync(root, {
+      onCwdError: (error) => log('warn', 'pr media camera: working directories could not be listed; only processes naming a run folder are ended', { error: oneLine(error) }),
+    });
+    const pids = new Set(rooted.map((entry) => entry.pid).filter((pid) => pid !== process.pid));
+    const targets = [...pids, ...restored.filter((holder) => pids.has(holder.pid)).map((holder) => -holder.pid)];
+    if (targets.length > 0) {
+      const survivors = await endProcesses(targets, CAMERA_KILL_GRACE_MS);
+      ended = pids.size;
+      log('warn', 'pr media camera: processes an earlier run left were ended', { pids: [...pids], survivors });
     }
+    await removeTree(root).catch((error: unknown) => {
+      log('warn', 'pr media camera: an earlier run\'s folder could not be removed', { error: oneLine(error) });
+    });
+  }
+  for (const holder of restored) {
+    if (alive(holder.pid)) {
+      log('warn', 'pr media camera: a budget slot an earlier run left names a live pid that is not one of its processes; it is not signalled and the slot waits for the age limit', { run: holder.lease.runId, pid: holder.pid });
+      continue;
+    }
+    slots?.release(holder.lease);
   }
   return ended;
 }

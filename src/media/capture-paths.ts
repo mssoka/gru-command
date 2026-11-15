@@ -38,8 +38,60 @@ export interface CaptureGlob {
   readonly matches: (path: string) => boolean;
 }
 
-function escapeRegex(text: string): string {
-  return text.replace(/[\\^$.*+?()[\]{}|/]/gu, (character) => `\\${character}`);
+/** One path segment against one pattern segment (`*` and `?` only), by
+ * dynamic programming: linear in their product, never backtracking. */
+function segmentMatches(pattern: string, text: string): boolean {
+  const p = [...pattern];
+  const t = [...text];
+  // reach[j]: the pattern so far matches the first j characters of the text.
+  let reach = new Array<boolean>(t.length + 1).fill(false);
+  reach[0] = true;
+  for (const character of p) {
+    const next = new Array<boolean>(t.length + 1).fill(false);
+    if (character === '*') {
+      let any = false;
+      for (let j = 0; j <= t.length; j += 1) {
+        any = any || reach[j]!;
+        next[j] = any;
+      }
+    } else {
+      for (let j = 0; j < t.length; j += 1) {
+        if (reach[j] && (character === '?' || character === t[j])) next[j + 1] = true;
+      }
+    }
+    reach = next;
+  }
+  return reach[t.length]!;
+}
+
+/** A path's segments against a pattern's, `**` spanning whole segments, by
+ * the same dynamic programming. A trailing `**` needs at least one segment
+ * (`web/**` is everything below web/, never web itself). */
+function pathMatches(pattern: readonly string[], path: readonly string[]): boolean {
+  let reach = new Array<boolean>(path.length + 1).fill(false);
+  reach[0] = true;
+  pattern.forEach((segment, index) => {
+    const next = new Array<boolean>(path.length + 1).fill(false);
+    if (segment === '**') {
+      const atLeastOne = index === pattern.length - 1;
+      let any = false;
+      for (let j = 0; j <= path.length; j += 1) {
+        if (atLeastOne) {
+          next[j] = any;
+          any = any || reach[j]!;
+        } else {
+          any = any || reach[j]!;
+          next[j] = any;
+        }
+      }
+    } else {
+      for (let j = 0; j < path.length; j += 1) {
+        if (reach[j] && segmentMatches(segment, path[j]!)) next[j + 1] = true;
+      }
+    }
+    reach = next;
+  });
+  return reach[path.length]!;
 }
 
 /** Validate and compile one glob. Throws {@link CaptureGlobError}. */
@@ -60,25 +112,9 @@ export function compileCaptureGlob(raw: string): CaptureGlob {
   if (segments.some((segment) => segment.includes('**') && segment !== '**')) {
     throw new CaptureGlobError(raw, 'may use ** only as a whole segment (web/**/x.css, not web/**.css)');
   }
-  let source = '^';
-  segments.forEach((segment, index) => {
-    const last = index === segments.length - 1;
-    if (segment === '**') {
-      // Zero or more whole segments. As the last segment it also needs at
-      // least one character after the directory (`web/**` is everything
-      // below web/, not web itself, which is a directory, never a file).
-      source += last ? '.+' : '(?:[^/]+/)*';
-      return;
-    }
-    source += segment
-      .split('')
-      .map((character) => (character === '*' ? '[^/]*' : character === '?' ? '[^/]' : escapeRegex(character)))
-      .join('');
-    if (!last) source += '/';
-  });
-  source += '$';
-  const regex = new RegExp(source, 'u');
-  return { pattern, exclude, matches: (path) => regex.test(path) };
+  // `**/**` means what one `**` does.
+  const collapsed = segments.filter((segment, index) => !(segment === '**' && segments[index + 1] === '**'));
+  return { pattern, exclude, matches: (path) => pathMatches(collapsed, path.split('/')) };
 }
 
 /** One changed path that owes media, with the first glob it matched. */

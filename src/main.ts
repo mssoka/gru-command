@@ -1917,18 +1917,21 @@ async function main(): Promise<number> {
   });
   verificationView = () => verifyServer.view();
   // GC's camera (PR media, docs/PR-MEDIA.md): films each live job's shot list
-  // at its lane's exact committed head under the verification budget, and
-  // journals whether each head owes media. A lane it films is busy for
-  // slimming, as a verified one is.
+  // at its lane's exact committed head, in a throwaway checkout of that head
+  // (never in the lane), under the verification budget, and journals whether
+  // each head owes media. A delivery asks for a tick at once, so the
+  // delivered head is filmed without waiting for the next one.
   const camera = new CameraDirector({
     ledger,
     dataDir: config.dataDir,
     config: () => config.prMedia,
     budget: () => verifyServer.budget(),
     driver: new AgentBrowserDriver(),
-    ensureReady: laneHooks.beforeVerification,
     setupTimeoutMs: config.worktrees.setupTimeoutMs,
     log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  bus.subscribe((event) => {
+    if (event.kind === 'job.delivered') camera.requestTick();
   });
   // Report-lane slimming (#427): a delivered, idle report job's lane loses
   // its manifest's reclaim folders; the lane's setup brings them back.
@@ -1937,7 +1940,7 @@ async function main(): Promise<number> {
     bus,
     worktrees: worktreeManager,
     workerTurns: (jobId) => pacing.gate.workerTurnsFor(jobId),
-    verificationBusy: (jobId) => verifyServer.jobHasRun(jobId) || camera.jobBusy(jobId),
+    verificationBusy: (jobId) => verifyServer.jobHasRun(jobId),
     // Each reconcile also closes the lane rows whose lane is gone.
     onReconcile: laneHooks.settleLaneRows,
     log: (level, msg, fields) => logger.log(level, msg, fields),
@@ -1974,7 +1977,7 @@ async function main(): Promise<number> {
     expiry,
     floor: diskFloor,
     workerTurns: (jobId) => pacing.gate.workerTurnsFor(jobId),
-    verificationBusy: (jobId) => verifyServer.jobHasRun(jobId) || camera.jobBusy(jobId),
+    verificationBusy: (jobId) => verifyServer.jobHasRun(jobId),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   diskBoardView = () => disk.boardView();
