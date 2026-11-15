@@ -106,8 +106,12 @@ ready = "http://127.0.0.1:{port}/"        # answered below 400 = up; or "output:
 **Rolling out a `[capture]` table.** A GC service older than this release
 refuses a manifest with `[capture]` as an unknown key, and with it every new
 lane of that repository. Update every GC instance that works on a repository
-before committing its first `[capture]` table. GC's own repository gets its
-table in a follow-up for that reason.
+before committing its first `[capture]` table. GC's own repository now
+declares `paths` for the board's visible sources (`web/src/ui/**`,
+`web/src/styles/**` and `web/index.html`, test files excluded). It has no
+`serve`, because the board shows nothing without its service and a pairing
+token, so its minions capture the board themselves and send the files to
+`POST /api/media`.
 
 ## The shot list
 
