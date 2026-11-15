@@ -9,16 +9,21 @@
  * reads the JavaScript call frames out of the pause notification, and lets
  * the main thread run again.
  *
- * Two rules keep this from ever being the reason the service hangs:
+ * Three rules keep this from ever being the reason the service hangs:
  *
  * - The pause handler resumes the main thread FIRST, before it reads
  *   anything. The frames travel in the notification itself, so the main
  *   thread never waits on this thread's bookkeeping. (Node swallows a throw
  *   from an inspector listener into a warning; a handler that threw before
  *   resuming would leave the main thread paused for good.)
- * - The Debugger domain is enabled only for the duration of one capture and
- *   disabled straight after, so an idle watchdog costs the main thread one
- *   counter increment per heartbeat and nothing else.
+ * - The inspector session exists only for the duration of one capture. A
+ *   session left connected makes Node print "Waiting for the debugger to
+ *   disconnect..." at every exit, and wait for it when an inspector is open.
+ *   Between captures the main thread pays one counter increment per
+ *   heartbeat and nothing else.
+ * - No capture is asked for while an inspector is attached to the process
+ *   (the main thread says so in the shared buffer on every beat): a
+ *   watchdog pause would resume a developer's breakpoint.
  *
  * Self-contained on purpose: Node builtins and erasable TypeScript only, so
  * the same file runs compiled from `dist` and — in the tests — straight from
@@ -29,7 +34,9 @@ import { parentPort, workerData } from 'node:worker_threads';
 
 /** What the main thread hands this worker at start. */
 export interface WatchdogWorkerData {
-  /** One Int32 the main thread increments on every heartbeat. */
+  /** Two Int32. Slot 0: the heartbeat counter the main thread increments.
+   * Slot 1: 1 while an inspector is attached to the process, as of the
+   * last beat. */
   readonly beat: SharedArrayBuffer;
   /** How often this thread looks at the counter. */
   readonly pollMs: number;
@@ -76,6 +83,8 @@ export interface WatchdogEpisode {
   readonly captures: readonly WatchdogRawCapture[];
   /** A pause was requested and the heartbeat returned before it was served. */
   readonly unservedPause: boolean;
+  /** A stack was due and not asked for, because an inspector was attached. */
+  readonly inspectorAttached: boolean;
 }
 
 export type WatchdogWorkerMessage =
@@ -85,6 +94,8 @@ export type WatchdogWorkerMessage =
 
 export type WatchdogWorkerRequest = { readonly type: 'collect'; readonly id: number };
 
+const BEAT_SLOT = 0;
+const INSPECTOR_SLOT = 1;
 /** A deep stack keeps this many innermost frames (the blocking site)… */
 const INNER_FRAMES = 12;
 /** …and this many outermost ones (the callback that started the work). */
@@ -97,19 +108,16 @@ if (port === null) throw new Error('the loop-stall watchdog worker must run as a
 const config = workerData as WatchdogWorkerData;
 const beat = new Int32Array(config.beat);
 
-const session = new Session();
-session.connectToMainThread();
-
-/** Script ids of the capture in flight; filled by `Debugger.enable`. */
-const scriptUrls = new Map<string, string>();
-let pending: { readonly requestedAt: number; readonly silentMs: number } | null = null;
+/** The capture in flight, with the session that exists only for it. */
+let capture: { readonly session: Session; readonly requestedAt: number; readonly silentMs: number } | null = null;
 let episode: {
   readonly startedAtMs: number;
   readonly captures: WatchdogRawCapture[];
   lastRequestAt: number | null;
+  inspectorAttached: boolean;
 } | null = null;
 
-let lastCount = Atomics.load(beat, 0);
+let lastCount = Atomics.load(beat, BEAT_SLOT);
 let lastBeatSeenAt = performance.now();
 let lastBeatSeenWallMs = Date.now();
 let lastTickAt = lastBeatSeenAt;
@@ -123,65 +131,79 @@ function fault(what: string, error: unknown): void {
   send({ type: 'fault', message: `${what}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300) });
 }
 
-session.on('Debugger.scriptParsed', (message) => {
-  scriptUrls.set(message.params.scriptId, message.params.url);
-});
-
-session.on('Debugger.paused', (message) => {
-  // Resume FIRST (see the header): nothing below may delay the main thread.
-  session.post('Debugger.resume');
-  const request = pending;
-  pending = null;
+/** Drop the capture's session. Disconnecting also makes V8 forget a pause
+ * that was asked for and never served. */
+function endCapture(session: Session): void {
+  if (capture !== null && capture.session === session) capture = null;
   try {
-    if (request !== null && episode !== null) {
-      const all = message.params.callFrames;
-      const kept = all.length <= INNER_FRAMES + OUTER_FRAMES
-        ? all
-        : [...all.slice(0, INNER_FRAMES), ...all.slice(all.length - OUTER_FRAMES)];
-      episode.captures.push({
-        silentMs: Math.round(request.silentMs),
-        pauseLatencyMs: Math.round(performance.now() - request.requestedAt),
-        frames: kept.map((frame) => ({
-          functionName: frame.functionName.slice(0, NAME_LIMIT),
-          url: (scriptUrls.get(frame.location.scriptId) ?? frame.url).slice(0, URL_LIMIT),
-          line: frame.location.lineNumber + 1,
-          column: (frame.location.columnNumber ?? 0) + 1,
-        })),
-        omitted: all.length === kept.length ? null : { count: all.length - kept.length, after: INNER_FRAMES },
-      });
-    }
+    session.disconnect();
   } catch (error) {
-    fault('stack capture failed', error);
-  } finally {
-    scriptUrls.clear();
-    session.post('Debugger.disable');
+    fault('inspector disconnect failed', error);
   }
-});
+}
 
 function requestCapture(now: number, silentMs: number): void {
   if (episode === null) return;
-  pending = { requestedAt: now, silentMs };
   episode.lastRequestAt = now;
+  let session: Session;
+  try {
+    session = new Session();
+    session.connectToMainThread();
+  } catch (error) {
+    fault('inspector session could not connect', error);
+    return;
+  }
+  /** Script ids of this capture; filled by `Debugger.enable`. */
+  const scriptUrls = new Map<string, string>();
+  session.on('Debugger.scriptParsed', (message) => {
+    scriptUrls.set(message.params.scriptId, message.params.url);
+  });
+  session.on('Debugger.paused', (message) => {
+    // Resume FIRST (see the header): nothing below may delay the main thread.
+    session.post('Debugger.resume');
+    const request = capture;
+    try {
+      if (request !== null && request.session === session && episode !== null) {
+        const all = message.params.callFrames;
+        const kept = all.length <= INNER_FRAMES + OUTER_FRAMES
+          ? all
+          : [...all.slice(0, INNER_FRAMES), ...all.slice(all.length - OUTER_FRAMES)];
+        episode.captures.push({
+          silentMs: Math.round(request.silentMs),
+          pauseLatencyMs: Math.round(performance.now() - request.requestedAt),
+          frames: kept.map((frame) => ({
+            functionName: frame.functionName.slice(0, NAME_LIMIT),
+            url: (scriptUrls.get(frame.location.scriptId) ?? frame.url).slice(0, URL_LIMIT),
+            line: frame.location.lineNumber + 1,
+            column: (frame.location.columnNumber ?? 0) + 1,
+          })),
+          omitted: all.length === kept.length ? null : { count: all.length - kept.length, after: INNER_FRAMES },
+        });
+      }
+    } catch (error) {
+      fault('stack capture failed', error);
+    } finally {
+      session.post('Debugger.disable');
+      endCapture(session);
+    }
+  });
+  capture = { session, requestedAt: now, silentMs };
   // Posted back to back, not chained on the first reply: the main thread
   // serves both at the same interrupt, so the pause lands at the statement
   // it was executing (or, after an uninterruptible call, the first one it
-  // reaches) instead of one thread hop later.
-  session.post('Debugger.enable', { maxScriptsCacheSize: 0 }, (error) => {
-    if (error !== null) fault('Debugger.enable was refused', error);
-  });
-  session.post('Debugger.pause', (error) => {
-    if (error !== null) fault('Debugger.pause was refused', error);
-  });
+  // reaches) instead of one thread hop later. A refusal is reported unless
+  // the session was closed first, which answers every open request.
+  const refused = (what: string) => (error: Error | null): void => {
+    if (error !== null && capture !== null && capture.session === session) fault(what, error);
+  };
+  session.post('Debugger.enable', { maxScriptsCacheSize: 0 }, refused('Debugger.enable was refused'));
+  session.post('Debugger.pause', refused('Debugger.pause was refused'));
 }
 
 function closeEpisode(): void {
   if (episode === null) return;
-  const unservedPause = pending !== null;
-  if (unservedPause) {
-    pending = null;
-    scriptUrls.clear();
-    session.post('Debugger.disable');
-  }
+  const unserved = capture;
+  if (unserved !== null) endCapture(unserved.session);
   send({
     type: 'episode',
     episode: {
@@ -189,7 +211,8 @@ function closeEpisode(): void {
       endedAtMs: Date.now(),
       watchdogLagMs: Math.round(lagSinceBeatMs),
       captures: episode.captures,
-      unservedPause,
+      unservedPause: unserved !== null,
+      inspectorAttached: episode.inspectorAttached,
     },
   });
   episode = null;
@@ -204,9 +227,9 @@ function tick(): void {
   // Also opened in hindsight: a silence this thread slept through (the whole
   // process was not running) is still a silence the record must explain.
   if (silentMs >= config.overdueMs && episode === null) {
-    episode = { startedAtMs: lastBeatSeenWallMs, captures: [], lastRequestAt: null };
+    episode = { startedAtMs: lastBeatSeenWallMs, captures: [], lastRequestAt: null, inspectorAttached: false };
   }
-  const count = Atomics.load(beat, 0);
+  const count = Atomics.load(beat, BEAT_SLOT);
   if (count !== lastCount) {
     closeEpisode();
     lastCount = count;
@@ -215,13 +238,17 @@ function tick(): void {
     lagSinceBeatMs = 0;
     return;
   }
-  if (episode === null || pending !== null) return;
+  if (episode === null || capture !== null) return;
   // A tick that was itself very late proves this thread was not running
   // either: the main thread is about to beat, and a pause now would blame
   // whatever callback happens to run first. The next tick asks instead.
   if (lag >= config.overdueMs / 2) return;
   if (episode.captures.length >= config.maxCaptures) return;
   if (episode.lastRequestAt !== null && now - episode.lastRequestAt < config.recaptureMs) return;
+  if (Atomics.load(beat, INSPECTOR_SLOT) !== 0) {
+    episode.inspectorAttached = true;
+    return;
+  }
   requestCapture(now, silentMs);
 }
 
@@ -229,7 +256,11 @@ port.on('message', (request: WatchdogWorkerRequest) => {
   if (request.type !== 'collect') return;
   // The main thread beats before it asks, so this closes a finished episode
   // now instead of at the next poll.
-  tick();
+  try {
+    tick();
+  } catch (error) {
+    fault('watchdog tick failed', error);
+  }
   send({ type: 'collected', id: request.id });
 });
 

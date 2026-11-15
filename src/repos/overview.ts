@@ -1055,8 +1055,9 @@ class RootValidationTrace {
     this.settledAtMs = this.now();
   }
 
-  /** Log fields for a validation whose deadline passed. `started` is false
-   * when no budget was left to start it. */
+  /** Log fields for a validation whose deadline passed, as of now — read
+   * after the health look, so they include its wait (at most a second).
+   * `started` is false when no budget was left to start it. */
   fields(started: boolean): Record<string, unknown> {
     const now = this.now();
     const pending = this.settledAtMs === null;
@@ -1433,14 +1434,17 @@ export class ManagedRepoOverviewTracker {
           rootResolutionTimedOut = true;
           resolveBudgetSpent = true;
           const detail = 'root validation exceeded the origin-resolution budget';
-          // Read before the health look, so its own wait is not in them.
-          const traced = trace.fields(!pendingPath.timedOut || pendingPath.timerLateMs !== null);
+          // The health look first: it yields to the event loop, so an answer
+          // that was only waiting for the loop to run again (the deadline
+          // timer of a blocked main thread fires before its I/O callbacks)
+          // is in by the time the trace is read, and is not called pending.
+          const health = await this.rootHealthFields();
           this.log('warn', 'repo overview: root validation exceeded its deadline — retaining cached observation without provider polling', {
             repo: name,
             budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
-            ...traced,
+            ...trace.fields(!pendingPath.timedOut || pendingPath.timerLateMs !== null),
             timerLateMs: pendingPath.timedOut ? pendingPath.timerLateMs : null,
-            ...(await this.rootHealthFields()),
+            ...health,
           });
           unreadable(true, detail);
           continue;

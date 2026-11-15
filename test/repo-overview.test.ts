@@ -2030,8 +2030,9 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       logs.filter((line) => line.msg.startsWith('repo overview: root validation exceeded its deadline')).map((line) => line.fields);
     const health = { threadPoolMs: 2, workspaceStatMs: 3, probeLimitMs: 1_000, activeResources: { Timeout: 4, PipeWrap: 2 } };
     const probed: string[] = [];
-    let mode: 'hangs silently' | 'answers late' = 'hangs silently';
+    let mode: 'hangs silently' | 'answers late' | 'answers during the health look' = 'hangs silently';
     let probeFails = false;
+    let answer: (() => void) | null = null;
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
       managedRepos: ['alpha'],
@@ -2041,6 +2042,13 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       sleep: async () => {},
       resolveRepoPath: (_workspaceRoot, name, observe) => {
         if (mode === 'hangs silently') return new Promise(() => {});
+        if (mode === 'answers during the health look') {
+          observe?.('workspace realpath');
+          observe?.('candidate lstat');
+          return new Promise((resolve) => {
+            answer = () => resolve({ kind: 'available', path: `/ws/${name}` });
+          });
+        }
         observe?.('workspace realpath');
         clock.ms += 5;
         observe?.('git rev-parse running', 'pid 4242');
@@ -2052,6 +2060,13 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       probeRootHealth: async (workspaceRoot) => {
         probed.push(workspaceRoot);
         if (probeFails) throw new Error('probe exploded');
+        // The look yields to the event loop: an answer that was only
+        // waiting for the loop to run again arrives during it.
+        if (answer !== null) {
+          answer();
+          answer = null;
+          for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+        }
         return health;
       },
       resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
@@ -2095,14 +2110,35 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
         ...health,
       });
 
+      // The deadline timer of a blocked main thread fires before the I/O
+      // answers that were already in: such a validation is not "pending".
+      mode = 'answers during the health look';
+      const answeredLate = tracker.refresh();
+      await vi.advanceTimersByTimeAsync(0);
+      clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS;
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS);
+      await answeredLate;
+      expect(deadlineFields()[2]).toEqual({
+        repo: 'alpha',
+        budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+        resolver: 'returned after the deadline',
+        pendingStep: null,
+        pendingStepDetail: null,
+        pendingStepMs: null,
+        steps: 'workspace realpath 0 ms > candidate lstat 60000 ms',
+        waitedMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+        timerLateMs: 0,
+        ...health,
+      });
+
       mode = 'hangs silently';
       probeFails = true;
       const hungAgain = tracker.refresh();
       await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS);
       await hungAgain;
-      expect(deadlineFields()).toHaveLength(3);
-      expect(deadlineFields()[2]).toMatchObject({ resolver: 'still pending', healthProbeError: 'probe exploded' });
-      expect(deadlineFields()[2]).not.toHaveProperty('threadPoolMs');
+      expect(deadlineFields()).toHaveLength(4);
+      expect(deadlineFields()[3]).toMatchObject({ resolver: 'still pending', healthProbeError: 'probe exploded' });
+      expect(deadlineFields()[3]).not.toHaveProperty('threadPoolMs');
     } finally {
       vi.useRealTimers();
     }

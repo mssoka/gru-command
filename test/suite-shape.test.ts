@@ -301,7 +301,7 @@ const PINS: Record<string, number> = {
   'lessons-server.test.ts': 12,
   'listener-probe.test.ts': 5,
   'logger.test.ts': 8,
-  'loop-stall-watchdog.test.ts': 9,
+  'loop-stall-watchdog.test.ts': 12,
   'managed-repositories-runtime.test.ts': 4,
   'native-tools-parity.test.ts': 2,
   'notification-decisions.test.ts': 37,

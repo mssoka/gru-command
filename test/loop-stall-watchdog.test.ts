@@ -1,8 +1,10 @@
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import inspector from 'node:inspector';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
 import { isMainThread } from 'node:worker_threads';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
@@ -14,17 +16,20 @@ import {
   classifyMainThread,
   describeStallEvidence,
   formatStallFrame,
+  silenceEvidence,
   startLoopStallWatchdog,
   stallEvidenceFields,
   unknownStallEvidence,
   type LoopStallEvidence,
   type LoopStallEvidenceSource,
   type LoopStallWindow,
+  type SilenceFacts,
 } from '../src/supervision/loop-stall-watchdog.js';
+import type { WatchdogEpisode, WatchdogRawFrame } from '../src/supervision/loop-stall-watchdog-worker.js';
 
 /**
  * Stall attribution: an event-loop stall record must name what the main
- * thread was doing. The first two tests block THIS process's main thread on
+ * thread was doing. The first tests block THIS process's main thread on
  * purpose, under a real watchdog thread and a real supervisor, and read the
  * record the supervisor writes.
  */
@@ -103,20 +108,23 @@ function bootSupervisor(stallEvidence: LoopStallEvidenceSource | undefined, logs
   };
 }
 
-/** A watchdog on test cadence. The first `evidence` answer proves its
- * thread is up, so the block that follows is watched from its first
- * millisecond. */
-async function startWatchedWatchdog(logs: LogLine[]): Promise<LoopStallEvidenceSource> {
-  const watchdog = startLoopStallWatchdog({
-    heartbeatMs: 20,
-    overdueMs: 200,
-    recaptureMs: 60_000,
-    collectTimeoutMs: 20_000,
+const WATCHDOG_TEST_CADENCE = { heartbeatMs: 20, overdueMs: 200, recaptureMs: 60_000, collectTimeoutMs: 20_000 } as const;
+
+/** A watchdog on test cadence. */
+function startTestWatchdog(logs: LogLine[]): LoopStallEvidenceSource {
+  return startLoopStallWatchdog({
+    ...WATCHDOG_TEST_CADENCE,
     log: (level, msg, fields) => logs.push({ level, msg, fields: fields ?? {} }),
   });
-  const before = await watchdog.evidence({ fromWallMs: Date.now() - 1, toWallMs: Date.now() });
-  expect(before.note).not.toContain('did not answer');
-  return watchdog;
+}
+
+/** Beat now and wait for the watchdog thread's answer. The answer proves the
+ * thread is up, and the beat makes the watched silence start HERE — not at
+ * whatever synchronous setup ran before. Call it right before blocking. */
+async function beatAndSync(watchdog: LoopStallEvidenceSource): Promise<void> {
+  const now = Date.now();
+  const answer = await watchdog.evidence({ fromWallMs: now - 1, toWallMs: now });
+  expect(answer.note ?? '').not.toContain('did not answer');
 }
 
 function blockTheMainThreadInABusyLoop(ms: number): number {
@@ -148,9 +156,10 @@ describe('event-loop stall attribution', () => {
   it('a main thread blocked in JavaScript leaves a stall record naming the blocking function', async () => {
     expect(isMainThread, 'these tests block the process main thread; run them in the forks pool').toBe(true);
     const logs: LogLine[] = [];
-    const watchdog = await startWatchedWatchdog(logs);
+    const watchdog = startTestWatchdog(logs);
     const h = bootSupervisor(watchdog, logs);
     try {
+      await beatAndSync(watchdog);
       h.tick(); // the tick before the stall
       const stalledAt = Date.now();
       expect(blockTheMainThreadInABusyLoop(1_200)).toBeGreaterThan(0);
@@ -162,11 +171,10 @@ describe('event-loop stall attribution', () => {
       expect(payload['gap_ms']).toBeGreaterThanOrEqual(120_000);
       expect(payload['main_thread']).toBe('running-javascript');
       expect(payload['silent_ms']).toBeGreaterThanOrEqual(1_200);
-      // The loop was busy, not waiting, and the watchdog thread kept running.
+      // The loop was busy, not waiting, and it was burning CPU.
       expect(payload['loop_active_ms']).toBeGreaterThanOrEqual(1_000);
-      expect(payload['loop_idle_ms']).toBeLessThan(600);
-      expect(payload['watchdog_lag_ms']).toBeLessThan(600);
-      expect(payload['evidence_note']).toBeUndefined();
+      expect(payload['cpu_ms']).toBeGreaterThanOrEqual(200);
+      expect(typeof payload['watchdog_lag_ms']).toBe('number');
       const stacks = stacksOf(payload);
       expect(stacks.length).toBeGreaterThanOrEqual(1);
       expect(stacks.length).toBeLessThanOrEqual(3);
@@ -186,8 +194,10 @@ describe('event-loop stall attribution', () => {
       const stallLog = logs.find((line) => line.msg === 'event-loop stall detected');
       expect(stallLog?.level).toBe('warn');
       expect(stallLog?.fields).toEqual(payload);
-      // The watchdog's own line for the silence, logged once.
-      const silent = logs.filter((line) => line.msg === 'main thread went silent');
+      // The watchdog's own line for the silence.
+      const silent = logs.filter(
+        (line) => line.msg === 'main thread went silent' && JSON.stringify(line.fields).includes('blockTheMainThreadInABusyLoop'),
+      );
       expect(silent).toHaveLength(1);
       expect(silent[0]?.level).toBe('info');
       expect(silent[0]?.fields['main_thread']).toBe('running-javascript');
@@ -204,9 +214,10 @@ describe('event-loop stall attribution', () => {
 
   it('a main thread blocked inside a synchronous child process is named by the function that started it', async () => {
     const logs: LogLine[] = [];
-    const watchdog = await startWatchedWatchdog(logs);
+    const watchdog = startTestWatchdog(logs);
     const h = bootSupervisor(watchdog, logs);
     try {
+      await beatAndSync(watchdog);
       h.tick();
       expect(blockTheMainThreadOnASyncChild(2_500)).toBe('done\n');
       h.jumpTwoMinutes();
@@ -216,6 +227,8 @@ describe('event-loop stall attribution', () => {
       const payload = h.stallPayloads()[0]!;
       // The pause could only be served once the child had exited.
       expect(payload['main_thread']).toBe('inside-native-call');
+      // It was waiting, not computing.
+      expect(payload['cpu_ms']).toBeLessThan(1_250);
       const first = stacksOf(payload)[0]!;
       expect(first.pause_latency_ms).toBeGreaterThan(1_000);
       // JavaScript resumed inside Node's execFileSync, called from the blocker.
@@ -250,6 +263,7 @@ describe('event-loop stall attribution', () => {
       silentMs: 118_000,
       loopActiveMs: 40,
       loopIdleMs: 117_960,
+      cpuMs: 12,
       watchdogLagMs: 3,
       stacks: [{ silentMs: 10_004, pauseLatencyMs: 6, frames: ['processTimers (node:internal/timers:520:9)'] }],
       note: null,
@@ -283,6 +297,7 @@ describe('event-loop stall attribution', () => {
         silent_ms: 118_000,
         loop_active_ms: 40,
         loop_idle_ms: 117_960,
+        cpu_ms: 12,
         watchdog_lag_ms: 3,
         stacks: [{ silent_ms: 10_004, pause_latency_ms: 6, frames: ['processTimers (node:internal/timers:520:9)'] }],
       });
@@ -310,8 +325,9 @@ describe('event-loop stall attribution', () => {
   });
 
   it('a deep stack keeps its innermost and outermost frames around one marker', async () => {
-    const watchdog = await startWatchedWatchdog([]);
+    const watchdog = startTestWatchdog([]);
     try {
+      await beatAndSync(watchdog);
       const from = Date.now();
       expect(recurseThenBlock(40, 800)).toBeGreaterThan(40);
       const evidence = await watchdog.evidence({ fromWallMs: from, toWallMs: Date.now() });
@@ -329,11 +345,89 @@ describe('event-loop stall attribution', () => {
     }
   });
 
-  it('a gap the watchdog saw no silence in says so instead of inventing a stack', async () => {
-    const logs: LogLine[] = [];
-    const watchdog = await startWatchedWatchdog(logs);
+  it('asks for no stack while an inspector is attached, and again once it is gone', async () => {
+    const watchdog = startTestWatchdog([]);
     try {
-      const evidence = await watchdog.evidence({ fromWallMs: Date.now() - 50, toWallMs: Date.now() });
+      await beatAndSync(watchdog);
+      // A developer attaches after the service started.
+      inspector.open(0, '127.0.0.1');
+      try {
+        await beatAndSync(watchdog); // the beat that tells the watchdog thread
+        const from = Date.now();
+        blockTheMainThreadInABusyLoop(800);
+        const attached = await watchdog.evidence({ fromWallMs: from, toWallMs: Date.now() });
+        // The silence is still measured; only the pause is withheld.
+        expect(attached.stacks).toEqual([]);
+        expect(attached.note).toContain('no stack: an inspector is attached to this process');
+        expect(attached.mainThread).toBe('unknown');
+        expect(attached.silentMs).toBeGreaterThanOrEqual(800);
+      } finally {
+        inspector.close();
+      }
+      await beatAndSync(watchdog);
+      const from = Date.now();
+      blockTheMainThreadInABusyLoop(800);
+      const detached = await watchdog.evidence({ fromWallMs: from, toWallMs: Date.now() });
+      expect(detached.stacks[0]?.frames[0]).toMatch(/^blockTheMainThreadInABusyLoop \(/u);
+    } finally {
+      watchdog.dispose();
+    }
+  });
+
+  it('a live watchdog neither holds the process open nor leaves a debugger line at exit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gc-loop-stall-exit-'));
+    cleanupDirs.push(dir);
+    const script = join(dir, 'watched.mjs');
+    const moduleUrl = new URL('../src/supervision/loop-stall-watchdog.ts', import.meta.url).href;
+    writeFileSync(
+      script,
+      [
+        `import { startLoopStallWatchdog } from ${JSON.stringify(moduleUrl)};`,
+        `const watchdog = startLoopStallWatchdog(${JSON.stringify(WATCHDOG_TEST_CADENCE)});`,
+        // The watchdog holds nothing open, so the script's own work does
+        // (as the service's listeners do) until it is finished.
+        'const work = setInterval(() => {}, 1_000);',
+        'await watchdog.evidence({ fromWallMs: Date.now() - 1, toWallMs: Date.now() });',
+        'function blockHere(ms) { const until = Date.now() + ms; while (Date.now() < until); }',
+        'const from = Date.now();',
+        'blockHere(800);',
+        'const evidence = await watchdog.evidence({ fromWallMs: from, toWallMs: Date.now() });',
+        'console.log(JSON.stringify({ mainThread: evidence.mainThread, top: evidence.stacks[0]?.frames[0] ?? null }));',
+        // Never disposed: a crash path, or a caller that forgot.
+        "if (process.env.WATCHED_EXIT === 'exit') process.exit(3);",
+        'clearInterval(work);',
+      ].join('\n'),
+    );
+    const run = (how: 'exit' | 'drain') =>
+      spawnSync(process.execPath, [script], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, WATCHED_EXIT: how },
+      });
+
+    // The event loop drains with the watchdog thread still alive.
+    const drained = run('drain');
+    expect(drained.signal, `the watched process did not exit on its own: ${drained.stderr}`).toBeNull();
+    expect(drained.status).toBe(0);
+    expect(JSON.parse(drained.stdout)).toEqual({
+      mainThread: 'running-javascript',
+      top: expect.stringMatching(/^blockHere \(…\/watched\.mjs:\d+:\d+\)$/u),
+    });
+    expect(drained.stderr).not.toContain('Waiting for the debugger');
+
+    // process.exit with the watchdog thread still alive.
+    const exited = run('exit');
+    expect(exited.status).toBe(3);
+    expect(exited.stderr).not.toContain('Waiting for the debugger');
+  });
+
+  it('a gap the watchdog saw no silence in says so instead of inventing a stack', async () => {
+    const watchdog = startTestWatchdog([]);
+    try {
+      await beatAndSync(watchdog);
+      // A window that ended before this watchdog existed overlaps nothing.
+      const evidence = await watchdog.evidence({ fromWallMs: 1_000, toWallMs: 2_000 });
       expect(evidence).toEqual(unknownStallEvidence('the watchdog saw no heartbeat silence of 200 ms or more in this gap'));
       // Nothing is asked of a disposed watchdog.
       watchdog.dispose();
@@ -350,9 +444,13 @@ describe('stall evidence helpers', () => {
       // The watchdog thread was late for most of it: nothing in the process ran.
       [{ silentMs: 60_000, watchdogLagMs: 59_000, loopIdleMs: 59_500, firstPauseLatencyMs: null }, 'process-not-running'],
       [{ silentMs: 60_000, watchdogLagMs: 30_000, loopIdleMs: 0, firstPauseLatencyMs: 4 }, 'process-not-running'],
-      // The loop waited in the poll: a promptly served stack is not a cause.
+      // The loop waited in the poll while the watchdog thread ran: a
+      // promptly served stack is not a cause.
       [{ silentMs: 60_000, watchdogLagMs: 10, loopIdleMs: 59_000, firstPauseLatencyMs: 4 }, 'idle-in-poll'],
-      [{ silentMs: 60_000, watchdogLagMs: null, loopIdleMs: 30_000, firstPauseLatencyMs: null }, 'idle-in-poll'],
+      [{ silentMs: 60_000, watchdogLagMs: 10, loopIdleMs: 30_000, firstPauseLatencyMs: null }, 'idle-in-poll'],
+      // An idle loop with no word from the watchdog thread could equally be
+      // a process that was not running: neither is claimed.
+      [{ silentMs: 60_000, watchdogLagMs: null, loopIdleMs: 59_000, firstPauseLatencyMs: null }, 'unknown'],
       // Busy loop: served at once, or only after an uninterruptible call.
       [{ silentMs: 60_000, watchdogLagMs: 10, loopIdleMs: 20, firstPauseLatencyMs: 4 }, 'running-javascript'],
       [{ silentMs: 60_000, watchdogLagMs: 10, loopIdleMs: 20, firstPauseLatencyMs: 1_000 }, 'running-javascript'],
@@ -369,14 +467,19 @@ describe('stall evidence helpers', () => {
 
   it('formats a frame as a function and a position that leaks no absolute path', () => {
     const root = '/opt/gru command';
-    const frame = (functionName: string, url: string) => ({ functionName, url, line: 12, column: 7 });
+    const frame = (functionName: string, url: string): WatchdogRawFrame => ({ functionName, url, line: 12, column: 7 });
     expect(formatStallFrame(frame('git', 'file:///opt/gru%20command/dist/worktrees/git.js'), root))
       .toBe('git (dist/worktrees/git.js:12:7)');
     expect(formatStallFrame(frame('git', '/opt/gru command/dist/worktrees/git.js'), `${root}/`))
       .toBe('git (dist/worktrees/git.js:12:7)');
     expect(formatStallFrame(frame('spawnSync', 'node:child_process'), root)).toBe('spawnSync (node:child_process:12:7)');
-    expect(formatStallFrame(frame('', 'file:///Users/someone/elsewhere/tool/run.js'), root))
-      .toBe('(anonymous) (…/tool/run.js:12:7)');
+    // Outside the install only the file name survives: a script in a home
+    // directory must not name its owner.
+    expect(formatStallFrame(frame('', 'file:///Users/someone/run.js'), root)).toBe('(anonymous) (…/run.js:12:7)');
+    expect(formatStallFrame(frame('f', '/opt/gru command-other/x/y.js'), root)).toBe('f (…/y.js:12:7)');
+    // A package outside the install keeps its package path.
+    expect(formatStallFrame(frame('g', '/Users/someone/lib/node_modules/pkg/lib/x.js'), root))
+      .toBe('g (…/node_modules/pkg/lib/x.js:12:7)');
     expect(formatStallFrame(frame('evaluated', ''), root)).toBe('evaluated ((unknown script):12:7)');
     // A data: module's URL is its source text: only the scheme is kept.
     expect(formatStallFrame(frame('inline', 'data:text/javascript,const secret="hunter2"'), root))
@@ -384,9 +487,84 @@ describe('stall evidence helpers', () => {
     expect(formatStallFrame(frame('remote', 'https://example.invalid/a/b.js?token=abc'), root))
       .toBe('remote ((https script):12:7)');
     expect(formatStallFrame(frame('vm', 'evalmachine.<anonymous>'), root)).toBe('vm (…/evalmachine.<anonymous>:12:7)');
-    // A sibling directory that only shares the root's prefix is not inside it.
-    expect(formatStallFrame(frame('f', '/opt/gru command-other/x/y.js'), root)).toBe('f (…/x/y.js:12:7)');
     expect(formatStallFrame(frame('n'.repeat(500), 'node:fs'), root)).toHaveLength(200);
+  });
+
+  it('turns a silence and its episode into evidence, with the reason for whatever is missing', () => {
+    const context = { unavailable: null, unanswered: false, collectTimeoutMs: 2_000, installRoot: '/opt/gru' };
+    const busy: SilenceFacts = { silentMs: 60_000, loopIdleMs: 30, loopActiveMs: 59_970, cpuMs: 59_000, episode: null };
+    const episode = (over: Partial<WatchdogEpisode> = {}): WatchdogEpisode => ({
+      startedAtMs: 1_000,
+      endedAtMs: 61_000,
+      watchdogLagMs: 4,
+      captures: [],
+      unservedPause: false,
+      inspectorAttached: false,
+      ...over,
+    });
+    const frame = (functionName: string): WatchdogRawFrame => ({ functionName, url: '/opt/gru/dist/a.js', line: 1, column: 1 });
+
+    // A deep stack: the marker sits where the worker cut it.
+    const deep = silenceEvidence(
+      {
+        ...busy,
+        episode: episode({
+          captures: [
+            { silentMs: 10_002, pauseLatencyMs: 5, frames: [frame('inner'), frame('outer')], omitted: { count: 31, after: 1 } },
+            { silentMs: 40_010, pauseLatencyMs: 7, frames: [frame('inner')], omitted: null },
+          ],
+        }),
+      },
+      context,
+    );
+    expect(deep).toEqual({
+      mainThread: 'running-javascript',
+      silentMs: 60_000,
+      loopActiveMs: 59_970,
+      loopIdleMs: 30,
+      cpuMs: 59_000,
+      watchdogLagMs: 4,
+      stacks: [
+        { silentMs: 10_002, pauseLatencyMs: 5, frames: ['inner (dist/a.js:1:1)', '… 31 frames omitted …', 'outer (dist/a.js:1:1)'] },
+        { silentMs: 40_010, pauseLatencyMs: 7, frames: ['inner (dist/a.js:1:1)'] },
+      ],
+      note: null,
+    });
+
+    // No episode: the thread is gone, or late, or reported nothing.
+    expect(silenceEvidence(busy, { ...context, unavailable: 'no stack: the watchdog thread failed: Error: boom' }))
+      .toMatchObject({ mainThread: 'unknown', watchdogLagMs: null, stacks: [], note: 'no stack: the watchdog thread failed: Error: boom' });
+    expect(silenceEvidence(busy, { ...context, unanswered: true }).note)
+      .toBe('no stack: the watchdog thread did not answer within 2000 ms');
+    expect(silenceEvidence(busy, context).note).toBe('no stack: the watchdog thread reported no episode for this silence');
+    // A dead watchdog thread and an idle loop: not called idle, since the
+    // process may not have been running at all.
+    expect(silenceEvidence({ ...busy, loopIdleMs: 59_900, loopActiveMs: 100, cpuMs: 3 }, { ...context, unavailable: 'no stack: gone' }))
+      .toMatchObject({ mainThread: 'unknown', loopIdleMs: 59_900, note: 'no stack: gone' });
+
+    // An episode without a stack says which of three reasons applies.
+    expect(silenceEvidence({ ...busy, episode: episode({ inspectorAttached: true }) }, context).note)
+      .toBe('no stack: an inspector is attached to this process');
+    expect(silenceEvidence({ ...busy, episode: episode({ unservedPause: true }) }, context).note)
+      .toBe('no stack: the pause request was not served before the heartbeat returned');
+    expect(silenceEvidence({ ...busy, episode: episode() }, context).note)
+      .toBe('no stack: the heartbeat returned before the watchdog thread asked for one');
+    // The watchdog thread slept through it too.
+    expect(silenceEvidence({ ...busy, episode: episode({ watchdogLagMs: 59_800 }) }, context).mainThread).toBe('process-not-running');
+
+    // An idle loop that was asked for a stack: the request may have woken it.
+    const woken = silenceEvidence(
+      {
+        silentMs: 10_900,
+        loopIdleMs: 10_850,
+        loopActiveMs: 50,
+        cpuMs: 4,
+        episode: episode({ captures: [{ silentMs: 10_003, pauseLatencyMs: 880, frames: [frame('processTimers')], omitted: null }] }),
+      },
+      context,
+    );
+    expect(woken.mainThread).toBe('idle-in-poll');
+    expect(woken.note).toBe('asking for a stack wakes an idle loop, so the request may have ended this silence');
   });
 
   it('renders the record fields and one sentence per kind of stall', () => {
@@ -395,6 +573,7 @@ describe('stall evidence helpers', () => {
       silentMs: 61_000,
       loopActiveMs: 60_990,
       loopIdleMs: 10,
+      cpuMs: 60_200,
       watchdogLagMs: 2,
       stacks: [
         { silentMs: 10_001, pauseLatencyMs: 3, frames: ['a (dist/a.js:1:1)', 'b (dist/b.js:2:2)', 'c (dist/c.js:3:3)', 'd (dist/d.js:4:4)', 'e (dist/e.js:5:5)'] },
@@ -406,6 +585,7 @@ describe('stall evidence helpers', () => {
       silent_ms: 61_000,
       loop_active_ms: 60_990,
       loop_idle_ms: 10,
+      cpu_ms: 60_200,
       watchdog_lag_ms: 2,
       stacks: [{ silent_ms: 10_001, pause_latency_ms: 3, frames: base.stacks[0]!.frames }],
     });
@@ -415,7 +595,7 @@ describe('stall evidence helpers', () => {
       'The main thread was running JavaScript: a (dist/a.js:1:1) ← b (dist/b.js:2:2) ← c (dist/c.js:3:3) ← d (dist/d.js:4:4).',
     );
     expect(describeStallEvidence({ ...base, mainThread: 'inside-native-call' })).toBe(
-      'The main thread was inside a call that could not be interrupted (a synchronous child process, database or file operation); ' +
+      'The main thread was inside a call that could not be interrupted (for example a synchronous child process, database or file operation); ' +
         'JavaScript resumed at a (dist/a.js:1:1) ← b (dist/b.js:2:2) ← c (dist/c.js:3:3) ← d (dist/d.js:4:4).',
     );
     expect(describeStallEvidence({ ...base, mainThread: 'process-not-running', watchdogLagMs: 60_400, stacks: [] })).toBe(

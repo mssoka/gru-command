@@ -34,6 +34,14 @@ import type {
  * does not answer is logged and reported in the evidence as the reason no
  * stack exists. Frames carry a function name and a source position only —
  * never arguments, scope values or source text.
+ *
+ * One limit to know: asking the main thread for a stack wakes its event
+ * loop. A loop that was parked in the OS poll with timers due — blocked by
+ * nothing — therefore runs again at the first request, ten seconds in. Such
+ * a silence is reported as `idle-in-poll` with a note saying the request may
+ * have ended it; it will usually be too short for the supervisor's
+ * 30-second stall record and is found by its own `main thread went silent`
+ * log line.
  */
 
 /** What the main thread was doing during a silence. */
@@ -45,9 +53,10 @@ export type MainThreadState =
    * returned: the stack is where JavaScript resumed, so the blocking call is
    * the one its innermost frames had just made. */
   | 'inside-native-call'
-  /** The event loop sat in the OS poll for most of the silence: no code of
-   * this process was running on the main thread, its timers simply were not
-   * woken. Any stack is the first callback that ran afterwards, not a cause. */
+  /** The event loop sat in the OS poll for most of the silence while the
+   * watchdog thread kept running: no code of this process was running on
+   * the main thread, its timers simply were not woken. Any stack is the
+   * first callback that ran afterwards, not a cause. */
   | 'idle-in-poll'
   /** The watchdog thread was late for most of the silence too: the whole
    * process was not running (stopped, suspended or starved by the OS). */
@@ -73,6 +82,9 @@ export interface LoopStallEvidence {
   /** How the main event loop spent that silence. */
   readonly loopActiveMs: number | null;
   readonly loopIdleMs: number | null;
+  /** CPU time (user + system) the whole process used during that silence.
+   * About the silence: something was computing. Near zero: it was waiting. */
+  readonly cpuMs: number | null;
   /** Largest lateness of the watchdog thread's own timer in that silence. */
   readonly watchdogLagMs: number | null;
   /** Up to three stacks of the silence, oldest first. */
@@ -130,10 +142,10 @@ const FRAME_LIMIT = 200;
 /**
  * One frame as `function (file:line:column)`. A file inside the installed
  * package is shown relative to it; Node's own modules keep their `node:`
- * name; any other file keeps its last two path segments, so no home
- * directory or user name reaches a record; and a script that is not a file
- * (a `data:` module carries its whole source in its URL) is named by its
- * scheme alone.
+ * name; any other file keeps its path from `node_modules/` on, or else its
+ * file name alone, so no home directory or user name reaches a record; and
+ * a script that is not a file (a `data:` module carries its whole source in
+ * its URL) is named by its scheme alone.
  */
 export function formatStallFrame(frame: WatchdogRawFrame, installRoot: string): string {
   const name = frame.functionName === '' ? '(anonymous)' : frame.functionName;
@@ -155,9 +167,11 @@ export function formatStallFrame(frame: WatchdogRawFrame, installRoot: string): 
       }
     }
     const root = installRoot.endsWith('/') ? installRoot : `${installRoot}/`;
+    const segments = path.split(/[\\/]/u).filter((segment) => segment !== '');
+    const modules = segments.lastIndexOf('node_modules');
     file = path.startsWith(root)
       ? path.slice(root.length)
-      : `…/${path.split(/[\\/]/u).filter((segment) => segment !== '').slice(-2).join('/')}`;
+      : `…/${(modules >= 0 ? segments.slice(modules) : segments.slice(-1)).join('/')}`;
   }
   return `${name} (${file}:${frame.line}:${frame.column})`.slice(0, FRAME_LIMIT);
 }
@@ -172,7 +186,9 @@ function formatStack(capture: WatchdogRawCapture, installRoot: string): LoopStal
 
 /** Which of the four things a silence was. Order matters: a process that
  * was not running also shows an idle loop, and an idle loop also yields a
- * (meaningless) promptly served stack. */
+ * (meaningless) promptly served stack. Without the watchdog thread's own
+ * lateness an idle loop cannot be told from a process that was not running,
+ * so neither is claimed. */
 export function classifyMainThread(input: {
   readonly silentMs: number;
   readonly watchdogLagMs: number | null;
@@ -181,7 +197,9 @@ export function classifyMainThread(input: {
 }): MainThreadState {
   const most = input.silentMs / 2;
   if (input.watchdogLagMs !== null && input.watchdogLagMs >= most) return 'process-not-running';
-  if (input.loopIdleMs !== null && input.loopIdleMs >= most) return 'idle-in-poll';
+  if (input.loopIdleMs !== null && input.loopIdleMs >= most) {
+    return input.watchdogLagMs === null ? 'unknown' : 'idle-in-poll';
+  }
   if (input.firstPauseLatencyMs === null) return 'unknown';
   return input.firstPauseLatencyMs <= PROMPT_PAUSE_MS ? 'running-javascript' : 'inside-native-call';
 }
@@ -193,6 +211,7 @@ export function unknownStallEvidence(note: string): LoopStallEvidence {
     silentMs: null,
     loopActiveMs: null,
     loopIdleMs: null,
+    cpuMs: null,
     watchdogLagMs: null,
     stacks: [],
     note: note.slice(0, 300),
@@ -207,6 +226,7 @@ export function stallEvidenceFields(evidence: LoopStallEvidence): Record<string,
     silent_ms: evidence.silentMs,
     loop_active_ms: evidence.loopActiveMs,
     loop_idle_ms: evidence.loopIdleMs,
+    cpu_ms: evidence.cpuMs,
     watchdog_lag_ms: evidence.watchdogLagMs,
     stacks: evidence.stacks.map((stack) => ({
       silent_ms: stack.silentMs,
@@ -230,7 +250,7 @@ export function describeStallEvidence(evidence: LoopStallEvidence): string {
       return `The main thread was running JavaScript: ${where ?? 'no frames were captured'}.`;
     case 'inside-native-call':
       return 'The main thread was inside a call that could not be interrupted ' +
-        `(a synchronous child process, database or file operation); JavaScript resumed at ${where ?? 'an unknown frame'}.`;
+        `(for example a synchronous child process, database or file operation); JavaScript resumed at ${where ?? 'an unknown frame'}.`;
     case 'idle-in-poll':
       return `The main thread was idle in the event-loop poll for ${seconds(evidence.loopIdleMs)} of ` +
         `${seconds(evidence.silentMs)}: no code of this service was blocking it, its timers were not woken.`;
@@ -241,19 +261,79 @@ export function describeStallEvidence(evidence: LoopStallEvidence): string {
   }
 }
 
+/** One heartbeat silence: the main thread's own measurements of it and,
+ * once it arrived, the watchdog thread's episode for the same stretch. */
+export interface SilenceFacts {
+  readonly silentMs: number;
+  readonly loopIdleMs: number | null;
+  readonly loopActiveMs: number | null;
+  readonly cpuMs: number | null;
+  readonly episode: WatchdogEpisode | null;
+}
+
+/** The evidence one silence amounts to, with the reason for anything missing. */
+export function silenceEvidence(
+  silence: SilenceFacts,
+  context: {
+    /** Why the watchdog thread cannot capture at all, or null. */
+    readonly unavailable: string | null;
+    /** The thread was asked for its episode and did not answer in time. */
+    readonly unanswered: boolean;
+    readonly collectTimeoutMs: number;
+    readonly installRoot: string;
+  },
+): LoopStallEvidence {
+  const episode = silence.episode;
+  const stacks = episode === null ? [] : episode.captures.map((capture) => formatStack(capture, context.installRoot));
+  const watchdogLagMs = episode === null ? null : episode.watchdogLagMs;
+  let note: string | null = null;
+  if (episode === null) {
+    note = context.unavailable ??
+      (context.unanswered
+        ? `no stack: the watchdog thread did not answer within ${context.collectTimeoutMs} ms`
+        : 'no stack: the watchdog thread reported no episode for this silence');
+  } else if (stacks.length === 0) {
+    note = episode.inspectorAttached
+      ? 'no stack: an inspector is attached to this process'
+      : episode.unservedPause
+        ? 'no stack: the pause request was not served before the heartbeat returned'
+        : 'no stack: the heartbeat returned before the watchdog thread asked for one';
+  }
+  const mainThread = classifyMainThread({
+    silentMs: silence.silentMs,
+    watchdogLagMs,
+    loopIdleMs: silence.loopIdleMs,
+    firstPauseLatencyMs: episode?.captures[0]?.pauseLatencyMs ?? null,
+  });
+  if (mainThread === 'idle-in-poll' && stacks.length > 0) {
+    note = 'asking for a stack wakes an idle loop, so the request may have ended this silence';
+  }
+  return {
+    mainThread,
+    silentMs: silence.silentMs,
+    loopActiveMs: silence.loopActiveMs,
+    loopIdleMs: silence.loopIdleMs,
+    cpuMs: silence.cpuMs,
+    watchdogLagMs,
+    stacks,
+    note,
+  };
+}
+
 // ------------------------------------------------------------------
 // The watchdog
 // ------------------------------------------------------------------
 
-interface Silence {
+interface Silence extends SilenceFacts {
   readonly fromWallMs: number;
   readonly toWallMs: number;
-  readonly silentMs: number;
-  readonly loopIdleMs: number | null;
-  readonly loopActiveMs: number | null;
   episode: WatchdogEpisode | null;
   logged: boolean;
 }
+
+/** Slots of the buffer shared with the worker (see `WatchdogWorkerData`). */
+const BEAT_SLOT = 0;
+const INSPECTOR_SLOT = 1;
 
 const overlap = (a: { fromWallMs: number; toWallMs: number }, fromWallMs: number, toWallMs: number): number =>
   Math.min(a.toWallMs, toWallMs) - Math.max(a.fromWallMs, fromWallMs);
@@ -272,6 +352,7 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
   private lastBeatAt = performance.now();
   private lastBeatWallMs = Date.now();
   private lastUtilization = performance.eventLoopUtilization();
+  private lastCpu = process.cpuUsage();
   private nextCollectId = 1;
   private readonly collects = new Map<number, () => void>();
   private disposed = false;
@@ -283,8 +364,9 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
     this.collectTimeoutMs = opts.collectTimeoutMs ?? COLLECT_TIMEOUT_MS;
     // This module is `<root>/dist/supervision/…` (or `<root>/src/supervision/…`).
     this.installRoot = opts.installRoot ?? fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/u, '');
-    const beat = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const beat = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
     this.beatView = new Int32Array(beat);
+    Atomics.store(this.beatView, INSPECTOR_SLOT, inspectorUrl() === undefined ? 0 : 1);
     this.startWorker({
       beat,
       pollMs: heartbeatMs,
@@ -297,13 +379,6 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
   }
 
   private startWorker(data: WatchdogWorkerData): void {
-    if (inspectorUrl() !== undefined) {
-      // A developer's debugger owns pauses; a watchdog pause would resume
-      // their breakpoints.
-      this.unavailable = 'no stack: an inspector is attached to this process';
-      this.log('info', 'event-loop stall watchdog: stack capture is off while an inspector is attached');
-      return;
-    }
     try {
       // The worker entry sits beside this module with the same extension:
       // `.js` when built, `.ts` when the tests run the source.
@@ -312,12 +387,14 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
         import.meta.url,
       );
       const worker = new Worker(entry, { workerData: data, name: 'gru-loop-stall-watchdog' });
-      worker.unref();
       worker.on('message', (message: WatchdogWorkerMessage) => this.onWorkerMessage(message));
       worker.on('error', (error) => this.workerFailed(`the watchdog thread failed: ${String(error)}`));
       worker.on('exit', (code) => {
         if (!this.disposed) this.workerFailed(`the watchdog thread exited (code ${code})`);
       });
+      // After the listeners: a `message` listener refs the worker again, and
+      // a watchdog must never be what keeps the process alive.
+      worker.unref();
       this.worker = worker;
     } catch (error) {
       this.workerFailed(`the watchdog thread could not start: ${String(error)}`);
@@ -326,9 +403,11 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
 
   private workerFailed(reason: string): void {
     this.worker = null;
-    const first = this.unavailable === null;
-    this.unavailable = `no stack: ${reason}`.slice(0, 300);
-    if (first) this.log('error', 'event-loop stall watchdog stopped — stalls will be recorded without a stack', { error: reason });
+    // The first reason is the cause; the exit that follows an error is not.
+    if (this.unavailable === null) {
+      this.unavailable = `no stack: ${reason}`.slice(0, 300);
+      this.log('error', 'event-loop stall watchdog stopped — stalls will be recorded without a stack', { error: reason });
+    }
     for (const settle of [...this.collects.values()]) settle();
   }
 
@@ -365,9 +444,12 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
       silentMs: episode.endedAtMs - episode.startedAtMs,
       loopIdleMs: null,
       loopActiveMs: null,
+      cpuMs: null,
       episode,
       logged: false,
     });
+    // No late beat of the main thread's own will settle this one.
+    this.logSilences(false);
   }
 
   private remember(silence: Silence): void {
@@ -381,27 +463,35 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
     const now = performance.now();
     const wallMs = Date.now();
     const utilization = performance.eventLoopUtilization();
+    const cpu = process.cpuUsage();
     const silentMs = now - this.lastBeatAt;
-    if (silentMs >= this.overdueMs) {
+    const late = silentMs >= this.overdueMs;
+    if (late) {
       this.remember({
         fromWallMs: this.lastBeatWallMs,
         toWallMs: wallMs,
         silentMs: Math.round(silentMs),
         loopIdleMs: Math.round(utilization.idle - this.lastUtilization.idle),
         loopActiveMs: Math.round(utilization.active - this.lastUtilization.active),
+        cpuMs: Math.round((cpu.user - this.lastCpu.user + cpu.system - this.lastCpu.system) / 1_000),
         episode: null,
         logged: false,
-      });
-      // Every silence leaves a log line of its own, also one too short for
-      // the supervisor's stall record.
-      void this.settle().catch((error: unknown) => {
-        this.log('warn', 'event-loop stall watchdog could not settle a silence', { error: String(error) });
       });
     }
     this.lastBeatAt = now;
     this.lastBeatWallMs = wallMs;
     this.lastUtilization = utilization;
-    Atomics.add(this.beatView, 0, 1);
+    this.lastCpu = cpu;
+    Atomics.store(this.beatView, INSPECTOR_SLOT, inspectorUrl() === undefined ? 0 : 1);
+    Atomics.add(this.beatView, BEAT_SLOT, 1);
+    if (late) {
+      // Every silence leaves a log line of its own, also one too short for
+      // the supervisor's stall record. Asked only now that the counter has
+      // moved: the worker closes its episode when it sees that.
+      void this.settle().catch((error: unknown) => {
+        this.log('warn', 'event-loop stall watchdog could not settle a silence', { error: String(error) });
+      });
+    }
   }
 
   /** Ask the worker for the episode it has finished, bounded; then log
@@ -426,7 +516,13 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
         worker.postMessage({ type: 'collect', id } satisfies WatchdogWorkerRequest);
       });
     }
-    if (this.disposed) return unanswered;
+    this.logSilences(unanswered);
+    return unanswered;
+  }
+
+  /** One info line per silence, once. */
+  private logSilences(unanswered: boolean): void {
+    if (this.disposed) return;
     for (const silence of this.silences) {
       if (silence.logged) continue;
       silence.logged = true;
@@ -435,38 +531,15 @@ class LoopStallWatchdog implements LoopStallEvidenceSource {
         ...stallEvidenceFields(this.evidenceOf(silence, unanswered)),
       });
     }
-    return unanswered;
   }
 
   private evidenceOf(silence: Silence, unanswered: boolean): LoopStallEvidence {
-    const episode = silence.episode;
-    const stacks = episode === null ? [] : episode.captures.map((capture) => formatStack(capture, this.installRoot));
-    const watchdogLagMs = episode === null ? null : episode.watchdogLagMs;
-    let note: string | null = null;
-    if (episode === null) {
-      note = this.unavailable ??
-        (unanswered
-          ? `no stack: the watchdog thread did not answer within ${this.collectTimeoutMs} ms`
-          : 'no stack: the watchdog thread reported no episode for this silence');
-    } else if (stacks.length === 0) {
-      note = episode.unservedPause
-        ? 'no stack: the pause request was not served before the heartbeat returned'
-        : 'no stack: the heartbeat returned before the watchdog thread asked for one';
-    }
-    return {
-      mainThread: classifyMainThread({
-        silentMs: silence.silentMs,
-        watchdogLagMs,
-        loopIdleMs: silence.loopIdleMs,
-        firstPauseLatencyMs: episode?.captures[0]?.pauseLatencyMs ?? null,
-      }),
-      silentMs: silence.silentMs,
-      loopActiveMs: silence.loopActiveMs,
-      loopIdleMs: silence.loopIdleMs,
-      watchdogLagMs,
-      stacks,
-      note,
-    };
+    return silenceEvidence(silence, {
+      unavailable: this.unavailable,
+      unanswered,
+      collectTimeoutMs: this.collectTimeoutMs,
+      installRoot: this.installRoot,
+    });
   }
 
   async evidence(window: LoopStallWindow): Promise<LoopStallEvidence> {

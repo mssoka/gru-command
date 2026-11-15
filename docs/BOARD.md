@@ -316,9 +316,10 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   pass gives root validation 60 s in all. When a repository's validation
   is still unanswered at that deadline, the warn line `repo overview: root
   validation exceeded its deadline` names the cause instead of only the
-  repository: `resolver` (`still pending`, `returned after the deadline`
-  — the answer existed but the main thread reached it late — or `not
-  started`), `pendingStep` with `pendingStepDetail` and `pendingStepMs`
+  repository: `resolver` (`still pending`; `returned after the deadline`
+  — it answered late, and a large `timerLateMs` beside it means the main
+  thread was blocked rather than the step slow; or `not started`),
+  `pendingStep` with `pendingStepDetail` and `pendingStepMs`
   (the resolver step that was awaited and for how long: `workspace
   realpath`, `candidate lstat`, `candidate realpath`, `git marker lstat`,
   `git marker access`, `git pointer read`, `git directory access`, `git
@@ -327,8 +328,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   code or signal, `reported root realpath`), `steps` (every step so far
   with its duration, the pending one marked `+`), `waitedMs`, and
   `timerLateMs` (how late the deadline timer itself fired; seconds here
-  mean the main thread was blocked). It also takes a health look, bounded
-  at one second: `threadPoolMs` (how long a no-op job waited for a libuv
+  mean the main thread was blocked). The fields are read after a health
+  look bounded at one second: `threadPoolMs` (how long a no-op job waited for a libuv
   pool thread; `null` = none came free, the pool is full of work that is
   not finishing), `workspaceStatMs` (a `stat` of `workspace_root`; slow or
   `null` beside a small `threadPoolMs` points at that filesystem),
