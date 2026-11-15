@@ -198,6 +198,33 @@ for the same hour is never lowered after a restart, and a resolved row
 keeps the count it had. A gap whose clocks disagree by less than the
 threshold is classified by evidence, not by the sleep rule.
 
+**A stall names what the main thread was doing.** A watchdog thread
+(`src/supervision/loop-stall-watchdog.ts`) watches a heartbeat the main
+thread beats every second. After ten seconds of silence it pauses the main
+thread through the inspector, reads its JavaScript call frames and resumes
+it at once; a silence that lasts gets up to three stacks, thirty seconds
+apart. The main thread, on its first late beat, reads how its event loop
+spent the gap. The `supervision.loop-stall` event and the `event-loop stall
+detected` log line carry the result, and the FYI's detail ends with one
+`Latest stall:` sentence:
+
+| Field | Meaning |
+| --- | --- |
+| `main_thread` | `running-javascript`: the pause was served at once, so `stacks` is the code that was running. `inside-native-call`: it was served only when a call that cannot be interrupted returned (a synchronous child process, SQLite, a file read, a blocking write), so `stacks` is where JavaScript resumed — the blocking call is the one the innermost frames had just made. `idle-in-poll`: the loop sat in the OS poll for most of the silence; no code of the service was blocking it and any stack is only the first callback that ran afterwards. `process-not-running`: the watchdog thread was late too, so the whole process was stopped, suspended or starved. `unknown`: no evidence; `evidence_note` says why. |
+| `silent_ms` | The heartbeat silence the watchdog measured inside the gap. |
+| `loop_active_ms`, `loop_idle_ms` | How the main event loop spent that silence (`performance.eventLoopUtilization`). |
+| `watchdog_lag_ms` | The largest lateness of the watchdog thread's own timer during the silence. |
+| `stacks` | Up to three of `{ silent_ms, pause_latency_ms, frames }`, oldest first. `silent_ms` is the silence when the stack was requested and `pause_latency_ms` how long the pause took to be served. `frames` are innermost first, each `function (file:line:column)` with the file relative to the install (`dist/…`, `node_modules/…`) or a `node:` module; a deep stack keeps its twelve innermost and four outermost frames. No arguments, values or source text are recorded. |
+| `evidence_note` | Present only when something above is missing, with the reason (the watchdog thread failed, an inspector is attached, the pause was not served). |
+
+Every silence of ten seconds or more also leaves one `main thread went
+silent` info line with the same fields, so a block too short for the
+30-second stall record is still attributable. The watchdog runs only while
+supervision is enabled and never while an inspector is attached to the
+process (its pause would resume a developer's breakpoint). A watchdog that
+cannot start or stops is logged at error level once; stalls are then
+recorded with `main_thread: unknown` and the reason.
+
 **Interrupted turns are resumed, never silently orphaned.** Before a
 restart rung (or a wall stop / breaker trip) kills an open turn, the
 supervisor snapshots the runtime's `pendingTurn` (prompt text, owner,

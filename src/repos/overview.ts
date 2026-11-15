@@ -1,4 +1,7 @@
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { stat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import type { LogLevel } from '../logger.js';
 import {
   GhApiError,
@@ -11,7 +14,12 @@ import {
   type RepoRef,
 } from '../dispatch/github-poll.js';
 import { isGitHubRemote, isGitLabRemote, parseRepoRemote } from '../dispatch/review-path.js';
-import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } from './managed-names.js';
+import {
+  gitProbeEnvironment,
+  resolveManagedRepoPath,
+  type ManagedRepoPath,
+  type ManagedRepoResolveObserver,
+} from './managed-names.js';
 
 /**
  * Managed repository overview (owner-approved compact rows A): a
@@ -985,24 +993,144 @@ function emptySourceState(): RepoSourceState {
   };
 }
 
-const ROOT_RESOLUTION_TIMEOUT = Symbol('root resolution timeout');
+/** The deadline won. `timerLateMs` is how late the deadline timer itself
+ * fired on the real clock — seconds here mean the main thread was blocked,
+ * not that the work was slow; null when the work was never started. */
+interface RootResolutionTimeout {
+  readonly timedOut: true;
+  readonly timerLateMs: number | null;
+}
 
 async function resolveBeforeDeadline<T>(
   work: () => T | Promise<T>,
   timeoutMs: number,
-): Promise<T | typeof ROOT_RESOLUTION_TIMEOUT> {
-  if (timeoutMs <= 0) return ROOT_RESOLUTION_TIMEOUT;
+): Promise<{ readonly timedOut: false; readonly value: T } | RootResolutionTimeout> {
+  if (timeoutMs <= 0) return { timedOut: true, timerLateMs: null };
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
     return await Promise.race([
-      Promise.resolve().then(work),
-      new Promise<typeof ROOT_RESOLUTION_TIMEOUT>((resolveTimeout) => {
-        timer = setTimeout(() => resolveTimeout(ROOT_RESOLUTION_TIMEOUT), timeoutMs);
+      Promise.resolve().then(work).then((value) => ({ timedOut: false as const, value })),
+      new Promise<RootResolutionTimeout>((resolveTimeout) => {
+        const dueAt = performance.now() + timeoutMs;
+        timer = setTimeout(
+          () => resolveTimeout({ timedOut: true, timerLateMs: Math.max(0, Math.round(performance.now() - dueAt)) }),
+          timeoutMs,
+        );
       }),
     ]);
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
+}
+
+/** Most steps one root validation's trace keeps (the resolver announces a
+ * dozen); beyond it the newest step replaces the last slot, so the pending
+ * step is always the one shown. */
+const ROOT_VALIDATION_TRACE_STEPS = 24;
+
+/**
+ * What one root validation announced, on the tracker's clock: when its
+ * deadline passes, this names the step that was still pending, how long it
+ * had been pending, and how long every earlier step took.
+ */
+class RootValidationTrace {
+  private readonly now: () => number;
+  private readonly steps: { readonly step: string; readonly detail: string | null; readonly atMs: number }[] = [];
+  private readonly startedAtMs: number;
+  private settledAtMs: number | null = null;
+
+  constructor(now: () => number) {
+    this.now = now;
+    this.startedAtMs = now();
+  }
+
+  readonly observe: ManagedRepoResolveObserver = (step, detail) => {
+    const entry = { step, detail: detail === undefined ? null : detail.slice(0, 80), atMs: this.now() };
+    if (this.steps.length < ROOT_VALIDATION_TRACE_STEPS) this.steps.push(entry);
+    else this.steps[ROOT_VALIDATION_TRACE_STEPS - 1] = entry;
+  };
+
+  /** The resolver answered (in time or not). */
+  settled(): void {
+    this.settledAtMs = this.now();
+  }
+
+  /** Log fields for a validation whose deadline passed. `started` is false
+   * when no budget was left to start it. */
+  fields(started: boolean): Record<string, unknown> {
+    const now = this.now();
+    const pending = this.settledAtMs === null;
+    const last = this.steps.at(-1);
+    const end = this.settledAtMs ?? now;
+    const timeline = this.steps.map((entry, index) => {
+      const next = this.steps[index + 1];
+      const took = Math.max(0, (next === undefined ? end : next.atMs) - entry.atMs);
+      const open = next === undefined && pending ? '+' : '';
+      return `${entry.step}${entry.detail === null ? '' : ` (${entry.detail})`} ${took} ms${open}`;
+    });
+    return {
+      resolver: !started ? 'not started' : pending ? 'still pending' : 'returned after the deadline',
+      pendingStep: !started || !pending ? null : last?.step ?? 'not reported',
+      pendingStepDetail: started && pending ? last?.detail ?? null : null,
+      pendingStepMs: started && pending ? Math.max(0, now - (last?.atMs ?? this.startedAtMs)) : null,
+      steps: timeline.join(' > '),
+      waitedMs: Math.max(0, now - this.startedAtMs),
+    };
+  }
+}
+
+/** How long each health probe may take before its answer is "none". */
+export const ROOT_VALIDATION_PROBE_LIMIT_MS = 1_000;
+
+/** A cheap look at the process the moment a root validation timed out. */
+export interface RootValidationHealth {
+  /** How long a no-op job waited for a libuv thread-pool thread (every
+   * `fs.promises` call and every `realpath`/`lstat` of the resolver queues
+   * there). null = no answer within {@link probeLimitMs}: the pool is full
+   * of work that is not finishing. */
+  readonly threadPoolMs: number | null;
+  /** How long `stat(workspace_root)` took. Slow or null while
+   * `threadPoolMs` is small means that filesystem, not the pool. */
+  readonly workspaceStatMs: number | null;
+  readonly probeLimitMs: number;
+  /** `process.getActiveResourcesInfo()` counted by type, largest first
+   * (for example `FSReqPromise` piling up, or `ProcessWrap`/`PipeWrap`
+   * left by a child that never closed). */
+  readonly activeResources: Readonly<Record<string, number>>;
+}
+
+/** Bounded and never rejects: a probe that fails or is late answers null. */
+export async function probeRootValidationHealth(
+  workspaceRoot: string,
+  limitMs: number = ROOT_VALIDATION_PROBE_LIMIT_MS,
+): Promise<RootValidationHealth> {
+  // Counted first, so the probes' own requests are not in it.
+  const counts = new Map<string, number>();
+  for (const type of process.getActiveResourcesInfo()) counts.set(type, (counts.get(type) ?? 0) + 1);
+  const activeResources = Object.fromEntries(
+    [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 24),
+  );
+  const timed = async (work: () => Promise<unknown>): Promise<number | null> => {
+    const startedAt = performance.now();
+    const elapsed = (): number => Math.round(performance.now() - startedAt);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        // A failed probe still answered: its time is the signal.
+        Promise.resolve().then(work).then(elapsed, elapsed),
+        new Promise<null>((resolveLate) => {
+          timer = setTimeout(() => resolveLate(null), limitMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
+  const [threadPoolMs, workspaceStatMs] = await Promise.all([
+    timed(() => new Promise<void>((done) => randomBytes(1, () => done()))),
+    timed(() => stat(workspaceRoot)),
+  ]);
+  return { threadPoolMs, workspaceStatMs, probeLimitMs: limitMs, activeResources };
 }
 
 export interface ManagedRepoOverviewOptions {
@@ -1017,7 +1145,14 @@ export interface ManagedRepoOverviewOptions {
   /** Test seams. Production membership is always `managedRepos`; no
    * directory discovery fallback exists. */
   readonly scanRepos?: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
-  readonly resolveRepoPath?: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath> | ManagedRepoPath;
+  readonly resolveRepoPath?: (
+    workspaceRoot: string,
+    name: string,
+    observe?: ManagedRepoResolveObserver,
+  ) => Promise<ManagedRepoPath> | ManagedRepoPath;
+  /** The process-health look taken when a root validation times out;
+   * default {@link probeRootValidationHealth}. */
+  readonly probeRootHealth?: (workspaceRoot: string) => Promise<RootValidationHealth>;
   readonly resolveRemote?: RemoteResolver;
   /** Refresh cadence; default {@link REPO_OVERVIEW_REFRESH_MS}. */
   readonly intervalMs?: number;
@@ -1068,7 +1203,12 @@ function providerScopeOf(state: RepoSourceState): string {
 export class ManagedRepoOverviewTracker {
   private readonly opts: ManagedRepoOverviewOptions;
   private readonly scanRepos: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
-  private readonly resolveRepoPath: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath> | ManagedRepoPath;
+  private readonly resolveRepoPath: (
+    workspaceRoot: string,
+    name: string,
+    observe?: ManagedRepoResolveObserver,
+  ) => Promise<ManagedRepoPath> | ManagedRepoPath;
+  private readonly probeRootHealth: (workspaceRoot: string) => Promise<RootValidationHealth>;
   private readonly resolveRemote: RemoteResolver;
   private readonly intervalMs: number;
   private readonly staleAfterMs: number;
@@ -1096,6 +1236,7 @@ export class ManagedRepoOverviewTracker {
     this.opts = opts;
     this.scanRepos = opts.scanRepos ?? (() => opts.managedRepos);
     this.resolveRepoPath = opts.resolveRepoPath ?? resolveManagedRepoPath;
+    this.probeRootHealth = opts.probeRootHealth ?? probeRootValidationHealth;
     this.resolveRemote = opts.resolveRemote ?? defaultRemoteResolver;
     this.intervalMs = opts.intervalMs ?? REPO_OVERVIEW_REFRESH_MS;
     // A disabled timer (intervalMs 0) must not collapse the freshness
@@ -1166,6 +1307,16 @@ export class ManagedRepoOverviewTracker {
       } satisfies RepoOverviewRowView;
     });
     return { rows };
+  }
+
+  /** The health look for a timed-out root validation, as log fields. A
+   * failing probe is reported in its place and never fails the pass. */
+  private async rootHealthFields(): Promise<Record<string, unknown>> {
+    try {
+      return { ...(await this.probeRootHealth(this.opts.workspaceRoot)) };
+    } catch (error) {
+      return { healthProbeError: messageOf(error).slice(0, 300) };
+    }
   }
 
   /** Re-scan the registry and observe provider state (coalesced). */
@@ -1266,23 +1417,35 @@ export class ManagedRepoOverviewTracker {
       }
       let selectedPath: ManagedRepoPath;
       try {
+        const trace = new RootValidationTrace(this.now);
         const pendingPath = await resolveBeforeDeadline(
-          () => this.resolveRepoPath(this.opts.workspaceRoot, name),
+          async () => {
+            try {
+              return await this.resolveRepoPath(this.opts.workspaceRoot, name, trace.observe);
+            } finally {
+              trace.settled();
+            }
+          },
           Math.max(0, resolveDeadline - this.now()),
         );
-        if (pendingPath === ROOT_RESOLUTION_TIMEOUT || this.now() > resolveDeadline) {
+        if (pendingPath.timedOut || this.now() > resolveDeadline) {
           attemptedResolutions += 1;
           rootResolutionTimedOut = true;
           resolveBudgetSpent = true;
           const detail = 'root validation exceeded the origin-resolution budget';
+          // Read before the health look, so its own wait is not in them.
+          const traced = trace.fields(!pendingPath.timedOut || pendingPath.timerLateMs !== null);
           this.log('warn', 'repo overview: root validation exceeded its deadline — retaining cached observation without provider polling', {
             repo: name,
             budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+            ...traced,
+            timerLateMs: pendingPath.timedOut ? pendingPath.timerLateMs : null,
+            ...(await this.rootHealthFields()),
           });
           unreadable(true, detail);
           continue;
         }
-        selectedPath = pendingPath;
+        selectedPath = pendingPath.value;
       } catch (error) {
         attemptedResolutions += 1;
         const detail = messageOf(error).slice(0, 300);

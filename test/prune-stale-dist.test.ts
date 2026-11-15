@@ -97,16 +97,18 @@ describe('prune-stale-dist', () => {
     // (dist/dispatch/gitlab-poll.js); and #569 the shared OS
     // suspend evidence the supervisor's clock-gap classification and the
     // admission probe both read (dist/runtime/suspend-evidence.js); #560 the
-    // interrupted-dispatch reconciler (dist/dispatch/interrupted-dispatch.js).
+    // interrupted-dispatch reconciler (dist/dispatch/interrupted-dispatch.js);
+    // and the event-loop stall watchdog with its worker-thread entry
+    // (dist/supervision/loop-stall-watchdog.js and -worker.js).
     // #521 replaced the installed
     // part with the pi 1.4 closure (pi-coding-agent and pi-ai 1.4.0 with
     // their pi-agent-core, pi-mcp, pi-codemode, pi-tui and pi-telemetry
     // packages): 151 catalogued names (142 of them ship executable files; the
     // rest are peers, optionals and type-only packages), from which the 0.85.1
     // shrinkwrap's esbuild, clipboard and AWS-crypto trees are gone.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5308);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5310);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('83c95e254d703e9d9abac78e3edcc4ff486bbeaf993aebcb07a48cfa8b0f852f');
+      .toBe('65410b5662f84883d9555770a69e32c57c8761c0cb54d8dd63536ae1ddcc0859');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

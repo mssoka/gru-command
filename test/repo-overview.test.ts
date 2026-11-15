@@ -1,5 +1,18 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -26,6 +39,7 @@ import {
   REPO_OVERVIEW_RESOLVE_BUDGET_MS,
   REPO_OVERVIEW_RUNS_PER_FETCH,
   REPO_OVERVIEW_STALE_AFTER_MS,
+  ROOT_VALIDATION_PROBE_LIMIT_MS,
   classifyGhError,
   classifyRemote,
   freshnessOf,
@@ -41,6 +55,7 @@ import {
   type RepoOverviewRunRaw,
   type RepoOverviewRowView,
   defaultRemoteResolver,
+  probeRootValidationHealth,
 } from '../src/repos/overview.js';
 import { discoverManagedRepos, discoverManagedReposAsync } from '../src/repos/discovery.js';
 
@@ -1795,9 +1810,21 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     mkdirSync(workspace);
     execFileSync('git', ['init', '-q', repo]);
     writeFileSync(join(fakeBin, 'git'), '#!/bin/sh\nexec /bin/sleep 5\n', { mode: 0o755 });
+    const announced: string[] = [];
     try {
       vi.stubEnv('PATH', fakeBin);
-      await expect(resolveManagedRepoPath(workspace, 'alpha')).resolves.toMatchObject({ kind: 'error' });
+      await expect(
+        resolveManagedRepoPath(workspace, 'alpha', (step, detail) => {
+          announced.push(detail === undefined ? step : `${step} [${detail.replace(/\d+/u, 'N')}]`);
+        }),
+      ).resolves.toMatchObject({ kind: 'error' });
+      // The child was named while it ran, and again when the probe's own
+      // two-second limit ended it.
+      expect(announced.slice(-3)).toEqual([
+        'git rev-parse spawn',
+        'git rev-parse running [pid N]',
+        'git rev-parse exited, output still open [pid N, signal SIGTERM]',
+      ]);
     } finally {
       vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });
@@ -1922,6 +1949,227 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('names the pending step and the starved thread pool when a root validation hangs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-pool-'));
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    // Park every libuv pool thread in open(2) on a FIFO nobody writes to: the
+    // real resolver's first filesystem step then queues behind them forever.
+    const poolSize = Math.max(4, Number(process.env['UV_THREADPOOL_SIZE'] ?? 4) || 4);
+    const fifos = Array.from({ length: poolSize }, (_value, index) => join(root, `fifo-${index}`));
+    for (const fifo of fifos) execFileSync('mkfifo', [fifo]);
+    const parked = fifos.map((fifo) => open(fifo, 'r'));
+    const clock = { ms: T0 };
+    const logs: { level: string; msg: string; fields: Record<string, unknown> }[] = [];
+    const announced: string[] = [];
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: workspace,
+      managedRepos: ['alpha'],
+      api: new FakeApi(),
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      // The production resolver and the production health look; the wrapper
+      // only lets the test see that the first step has started.
+      resolveRepoPath: (workspaceRoot, name, observe) =>
+        resolveManagedRepoPath(workspaceRoot, name, (step, detail) => {
+          announced.push(step);
+          observe?.(step, detail);
+        }),
+      log: (level, msg, fields) => logs.push({ level, msg, fields: fields ?? {} }),
+    });
+    vi.useFakeTimers();
+    try {
+      const refreshed = tracker.refresh();
+      await vi.waitFor(() => expect(announced).toEqual(['workspace realpath']), { timeout: 10_000 });
+      clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS;
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS + ROOT_VALIDATION_PROBE_LIMIT_MS);
+      const view = await refreshed;
+
+      const deadline = logs.filter((line) => line.msg.startsWith('repo overview: root validation exceeded its deadline'));
+      expect(deadline).toHaveLength(1);
+      expect(deadline[0]?.level).toBe('warn');
+      const { activeResources, ...fields } = deadline[0]!.fields;
+      expect(fields).toEqual({
+        repo: 'alpha',
+        budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+        resolver: 'still pending',
+        pendingStep: 'workspace realpath',
+        pendingStepDetail: null,
+        pendingStepMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+        steps: 'workspace realpath 60000 ms+',
+        waitedMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+        timerLateMs: 0,
+        // Neither the no-op pool job nor the stat got a thread within the limit.
+        threadPoolMs: null,
+        workspaceStatMs: null,
+        probeLimitMs: ROOT_VALIDATION_PROBE_LIMIT_MS,
+      });
+      // The parked opens and the resolver's own realpath are all still queued.
+      expect((activeResources as Record<string, number>)['FSReqPromise']).toBeGreaterThanOrEqual(poolSize + 1);
+      // The row and its user-facing reason are unchanged by the richer log.
+      expect(row(view, 'alpha').linked).toBe(false);
+      expect(row(view, 'alpha').linkReason).toBe('origin remote could not be read yet');
+    } finally {
+      vi.useRealTimers();
+      // A FIFO opened read-write never blocks, and lets its parked reader through.
+      const writers = fifos.map((fifo) => openSync(fifo, fsConstants.O_RDWR | fsConstants.O_NONBLOCK));
+      for (const handle of await Promise.all(parked)) await handle.close();
+      for (const fd of writers) closeSync(fd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('tells a root validation that answered after its deadline from one still pending, and survives a failing health look', async () => {
+    vi.useFakeTimers();
+    const clock = { ms: T0 };
+    const logs: { msg: string; fields: Record<string, unknown> }[] = [];
+    const deadlineFields = () =>
+      logs.filter((line) => line.msg.startsWith('repo overview: root validation exceeded its deadline')).map((line) => line.fields);
+    const health = { threadPoolMs: 2, workspaceStatMs: 3, probeLimitMs: 1_000, activeResources: { Timeout: 4, PipeWrap: 2 } };
+    const probed: string[] = [];
+    let mode: 'hangs silently' | 'answers late' = 'hangs silently';
+    let probeFails = false;
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
+      api: new FakeApi(),
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name, observe) => {
+        if (mode === 'hangs silently') return new Promise(() => {});
+        observe?.('workspace realpath');
+        clock.ms += 5;
+        observe?.('git rev-parse running', 'pid 4242');
+        // The answer exists, but only after the deadline: the main thread
+        // was busy, the step itself was not stuck.
+        clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS + 1;
+        return { kind: 'available', path: `/ws/${name}` };
+      },
+      probeRootHealth: async (workspaceRoot) => {
+        probed.push(workspaceRoot);
+        if (probeFails) throw new Error('probe exploded');
+        return health;
+      },
+      resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
+      log: (_level, msg, fields) => logs.push({ msg, fields: fields ?? {} }),
+    });
+    try {
+      // A resolver that announces nothing: the log says so instead of guessing.
+      const hung = tracker.refresh();
+      await vi.advanceTimersByTimeAsync(0);
+      clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS;
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS);
+      await hung;
+      expect(deadlineFields()).toEqual([
+        {
+          repo: 'alpha',
+          budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+          resolver: 'still pending',
+          pendingStep: 'not reported',
+          pendingStepDetail: null,
+          pendingStepMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+          steps: '',
+          waitedMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+          timerLateMs: 0,
+          ...health,
+        },
+      ]);
+      expect(probed).toEqual(['/ws']);
+
+      mode = 'answers late';
+      await tracker.refresh();
+      expect(deadlineFields()[1]).toEqual({
+        repo: 'alpha',
+        budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+        resolver: 'returned after the deadline',
+        pendingStep: null,
+        pendingStepDetail: null,
+        pendingStepMs: null,
+        steps: 'workspace realpath 5 ms > git rev-parse running (pid 4242) 60001 ms',
+        waitedMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS + 6,
+        timerLateMs: null,
+        ...health,
+      });
+
+      mode = 'hangs silently';
+      probeFails = true;
+      const hungAgain = tracker.refresh();
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS);
+      await hungAgain;
+      expect(deadlineFields()).toHaveLength(3);
+      expect(deadlineFields()[2]).toMatchObject({ resolver: 'still pending', healthProbeError: 'probe exploded' });
+      expect(deadlineFields()[2]).not.toHaveProperty('threadPoolMs');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the root resolver announces each step before it awaits it', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gru-repo-overview-steps-')));
+    try {
+      execFileSync('git', ['init', '-q', join(root, 'alpha')]);
+      mkdirSync(join(root, 'linked'));
+      writeFileSync(join(root, 'linked', '.git'), `gitdir: ${join(root, 'alpha', '.git')}\n`);
+      const resolveTraced = async (name: string) => {
+        const steps: string[] = [];
+        const result = await resolveManagedRepoPath(root, name, (step, detail) => {
+          steps.push(detail === undefined ? step : `${step} [${detail.replace(/\d+/u, 'N')}]`);
+        });
+        return { result, steps };
+      };
+
+      const alpha = await resolveTraced('alpha');
+      expect(alpha.result).toEqual({ kind: 'available', path: join(root, 'alpha') });
+      expect(alpha.steps).toEqual([
+        'workspace realpath',
+        'candidate lstat',
+        'candidate realpath',
+        'git marker lstat',
+        'git directory access',
+        'git HEAD access',
+        'git rev-parse spawn',
+        'git rev-parse running [pid N]',
+        'git rev-parse exited, output still open [pid N, exit code 0]',
+        'reported root realpath',
+      ]);
+
+      // A worktree-pointer file adds its own read before the same checks.
+      const linked = await resolveTraced('linked');
+      expect(linked.steps.slice(3, 9)).toEqual([
+        'git marker lstat',
+        'git marker access',
+        'git pointer read',
+        'git directory access',
+        'git HEAD access',
+        'git rev-parse spawn',
+      ]);
+
+      // A step that settles the answer is the last one announced.
+      const missing = await resolveTraced('missing');
+      expect(missing.result.kind).toBe('unavailable');
+      expect(missing.steps).toEqual(['workspace realpath', 'candidate lstat']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('the root-validation health look times a pool job and a stat and counts active resources', async () => {
+    const health = await probeRootValidationHealth(tmpdir(), 20_000);
+    expect(health.probeLimitMs).toBe(20_000);
+    expect(health.threadPoolMs).toBeGreaterThanOrEqual(0);
+    expect(health.workspaceStatMs).toBeGreaterThanOrEqual(0);
+    const counts = Object.values(health.activeResources);
+    expect(counts.length).toBeLessThanOrEqual(24);
+    expect(counts.every((count) => Number.isInteger(count) && count > 0)).toBe(true);
+    expect(counts).toEqual([...counts].sort((a, b) => b - a));
+    // A workspace that is gone still answers: a failed stat is quick, not late.
+    const gone = await probeRootValidationHealth(join(tmpdir(), 'gru-no-such-workspace-root'), 20_000);
+    expect(gone.workspaceStatMs).toBeGreaterThanOrEqual(0);
+    expect(ROOT_VALIDATION_PROBE_LIMIT_MS).toBe(1_000);
   });
 
   it('coordinates root validation and provider cursors so joint budgets eventually observe every selected root', async () => {
