@@ -7,6 +7,14 @@ reclaim = ["node_modules", "web/node_modules"]
 [[setup]]
 command = "npm ci"
 
+# PR media (docs/PR-MEDIA.md, owner ruling 2026-11-15 Q4): a diff touching the
+# board's visible sources owes media, or a skip reason in the shot list. No
+# `serve` yet: the board shows nothing without its service and a pairing
+# token, so GC's camera cannot film it. Minions on this repository capture the
+# board themselves and submit the files with `POST /api/media`.
+[capture]
+paths = ["web/src/ui/**", "web/src/styles/**", "web/index.html", "!web/**/*.test.ts"]
+
 [verify]
 full = "npm test"
 
