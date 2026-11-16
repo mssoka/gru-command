@@ -7,6 +7,8 @@ import {
   AWARENESS_STATE_NAME,
   AWARENESS_WAKE_INSTRUCTION,
   GruAwareness,
+  MAILBOX_UNAVAILABLE_NOTICE,
+  WAKE_FAILURE_RETRIES,
   type AwarenessInjection,
   type AwarenessLimits,
   type GruAwarenessLedger,
@@ -3223,6 +3225,535 @@ describe('GH-305 awareness repair regressions', () => {
         vi.advanceTimersByTime(60000);
         expect(sink).toHaveBeenCalledTimes(1);
       } finally { next.dispose(); }
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+});
+
+/**
+ * One lane's corrupt evidence makes the whole mailbox unreadable (the F03
+ * fixtures in gru-mailbox.test.ts: it must read unavailable, never clean).
+ * The board answers 503 for that; awareness used to let the same throw end
+ * the process — at boot through setWakeSink, live through a wake timer or a
+ * chat report on the in-flight batch. It now holds wake work instead.
+ */
+describe('an unreadable mailbox holds wake work instead of ending the process', () => {
+  const ownerDecision = {
+    question: 'Merge the ready pull request?',
+    context: 'The exact head carries the final native review verdict READY.',
+    recommendation: 'Merge it.',
+    ifNothing: 'If you do nothing, nothing merges and the work stays parked.',
+    reservedClass: 'merge',
+    whyNotDelegable: 'Every final PR merge is the owner’s call.',
+    options: [
+      { id: 'merge', label: 'Merge the PR', consequence: 'The PR merges and its loop closes.' },
+      { id: 'hold', label: 'Hold the PR', consequence: 'Nothing merges; the work stays parked.' },
+    ],
+    discussion: false,
+  } as const;
+
+  function holdRig(options: Partial<ConstructorParameters<typeof GruAwareness>[0]> = {}) {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const notifications = new NotificationCenter({ ledger: api, bus });
+    const mailbox = new GruMailbox(api);
+    const logs: string[] = [];
+    const instances: GruAwareness[] = [];
+    const start = (overrides: Partial<ConstructorParameters<typeof GruAwareness>[0]> = {}) => {
+      const awareness = new GruAwareness({
+        dir, ledger: api, mailbox, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, mailboxReconcileIntervalMs: 1000,
+        log: (_level, message, fields) => logs.push(`${message} ${String(fields?.['error'] ?? '')}`), ...options, ...overrides,
+      });
+      instances.push(awareness);
+      return awareness;
+    };
+    const block = (id: string) => { api.addJob({ id, repo: 'r', title: id }); api.setJobStatus(id, 'blocked'); };
+    // The latest branch observation of ONE unrelated lane is malformed.
+    const corrupt = () => {
+      if (api.getJob('corrupt-lane') === null) api.addJob({ id: 'corrupt-lane', repo: 'r', title: 'corrupt lane' });
+      api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'corrupt-lane', payload: { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null } });
+    };
+    const repair = () => api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'corrupt-lane', payload: { pr_url: null, pr_open: null, mergeable_state: null, sha: null } });
+    const sidecar = () => JSON.parse(readFileSync(join(dir, AWARENESS_STATE_NAME), 'utf8')) as { wake: { pending: string[]; wakeFailures?: Record<string, number>; unreceipted?: unknown[] }; coveredThroughSeq: number };
+    const held = () => logs.filter((line) => line.startsWith('mailbox reconciliation failed') && line.includes('malformed PR evidence'));
+    /** A sink that accepts every wake like the chat server does. */
+    const accepting = (awareness: GruAwareness, turns: AwarenessInjection[]) => () => {
+      if (!awareness.admitWake()) return;
+      const injection = awareness.prepare('wake');
+      if (injection === null) { awareness.noteWakeOutcome(false, 'no awareness context to inject'); return; }
+      turns.push(injection);
+      awareness.commit(injection, 'wake');
+      awareness.noteWakeOutcome(true, undefined, injection);
+    };
+    return { dir, api, bus, notifications, mailbox, logs, start, block, corrupt, repair, sidecar, held, accepting,
+      close: () => { for (const awareness of instances) awareness.dispose(); db.close(); } };
+  }
+
+  it('boot: setWakeSink holds, keeps the restored pending wake, and releases it once the evidence reads again', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const first = r.start();
+      first.setWakeSink(() => {}); // requested, never accepted: the id stays durably pending
+      const pending = r.sidecar().wake.pending;
+      expect(pending).toHaveLength(1);
+      first.dispose();
+      r.corrupt();
+      expect(() => r.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      const next = r.start();
+      const turns: AwarenessInjection[] = [];
+      expect(() => next.setWakeSink(r.accepting(next, turns))).not.toThrow();
+      expect(turns).toHaveLength(0);
+      expect(r.held().length).toBeGreaterThan(0);
+      vi.advanceTimersByTime(5000);
+      expect(turns).toHaveLength(0);
+      expect(r.sidecar().wake.pending).toEqual(pending);
+      // Still unavailable to every other reader: the hold never reads as a clean queue.
+      expect(() => r.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.text).toContain('job:lane-a');
+      expect(r.mailbox.snapshot().items.find((item) => item.jobId === 'lane-a')?.receipt).toMatchObject({ source: 'wake' });
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('boot: nothing is released between the repair and the receipt replay the hold postponed', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const first = r.start();
+      const delivered: AwarenessInjection[] = [];
+      first.setWakeSink(r.accepting(first, delivered));
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner');
+      expect(delivered).toHaveLength(2); // the mailbox item, then the decision follow-through
+      first.dispose();
+      // A torn sidecar: only the ledger's gru.wake receipts prove both deliveries.
+      rmSync(join(r.dir, AWARENESS_STATE_NAME));
+      r.corrupt();
+      const next = r.start();
+      const turns: AwarenessInjection[] = [];
+      expect(() => next.setWakeSink(r.accepting(next, turns))).not.toThrow();
+      r.repair();
+      // A live event re-offers the delivered decision before the postponed boot reconciliation ran.
+      r.bus.publish({ seq: r.api.latestEventSeq(), ts: new Date().toISOString(), kind: 'notification.decision', agentId: null, jobId: null, roundId: null, lens: null, payload: { id: card.id } });
+      expect(turns).toHaveLength(0);
+      vi.advanceTimersByTime(5000);
+      expect(turns).toHaveLength(0); // replayed receipts claim it: no second follow-through turn
+      // ...and the postponed boot did finish: new attention flows as usual.
+      r.block('lane-b');
+      vi.advanceTimersByTime(1000);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.text).toContain('job:lane-b');
+      expect(turns[0]!.text).not.toContain('Merge #612?');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('boot: a legacy sidecar is adopted after the hold instead of failing construction', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const key = r.mailbox.attentionRows()[0]!.id; // bare pre-domain key, as old sidecars stored it
+      r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [], pending: [key], wakeFailures: { [key]: 1 }, lastFiredAt: Date.now() } }));
+      r.corrupt();
+      let next!: GruAwareness;
+      expect(() => { next = r.start(); }).not.toThrow();
+      const requests = vi.fn();
+      expect(() => next.setWakeSink(requests)).not.toThrow();
+      expect(requests).not.toHaveBeenCalled();
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      // The failed-turn retry the legacy key carried survives the hold (same outcome as an ordinary legacy boot).
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(next.admitWake()).toBe(true);
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('live: a deferred wake timer firing over an unreadable mailbox neither throws nor prunes, and fires after repair', () => {
+    vi.useFakeTimers();
+    const r = holdRig({ wakeMinIntervalMs: 300_000 });
+    try {
+      r.block('lane-a');
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(r.accepting(awareness, turns));
+      expect(turns).toHaveLength(1);
+      r.block('lane-b');
+      vi.advanceTimersByTime(1000); // admitted, rate-deferred: a wake timer is armed for the interval's end
+      const pending = r.sidecar().wake.pending;
+      expect(pending).toHaveLength(1);
+      r.corrupt();
+      expect(() => vi.advanceTimersByTime(300_000)).not.toThrow();
+      expect(turns).toHaveLength(1);
+      expect(r.sidecar().wake.pending).toEqual(pending);
+      // Hundreds of held probes, one error line: the hold is logged when it starts, not per probe.
+      expect(r.held()).toHaveLength(1);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      expect(r.logs.filter((line) => line.startsWith('mailbox readable again'))).toHaveLength(1);
+      expect(turns).toHaveLength(2);
+      expect(turns[1]!.text).toContain('job:lane-b');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('live: chat reports on an in-flight batch hold instead of throwing, and the batch is requested again after repair', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const awareness = r.start();
+      const requests = vi.fn();
+      awareness.setWakeSink(requests); // the chat lane is busy: the batch stays in flight
+      expect(requests).toHaveBeenCalledTimes(1);
+      const pending = r.sidecar().wake.pending;
+      const stops = () => r.api.listNotifications({ routing: 'needs-owner' }).filter((row) => row.kind.startsWith('gru.wake-blocked-mailbox.'));
+      r.corrupt();
+      // The chat server's order: a busy or blocked settle reports on the batch while it is still active.
+      expect(() => awareness.noteWakeDeferred('busy')).not.toThrow();
+      expect(() => awareness.noteWakeBlocked('Gru breaker is open; authorized re-arm required')).not.toThrow();
+      expect(stops()).toHaveLength(0); // the alert cannot be named while unreadable
+      expect(r.sidecar().wake.pending).toEqual(pending);
+      expect(r.api.latestEventOfKind('gru.wake')).toBeNull();
+      vi.advanceTimersByTime(30_000);
+      expect(requests).toHaveBeenCalledTimes(1);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      expect(requests).toHaveBeenCalledTimes(2);
+      // Requested again and still blocked: now the owner stop names the alert.
+      awareness.noteWakeBlocked('Gru breaker is open; authorized re-arm required');
+      expect(stops()).toHaveLength(1);
+      expect(stops()[0]!.detail).toContain('Alert "lane-a"');
+      vi.advanceTimersByTime(6000);
+      expect(requests).toHaveBeenCalledTimes(3);
+      r.corrupt();
+      let admitted = true;
+      expect(() => { admitted = awareness.admitWake(); }).not.toThrow();
+      expect(admitted).toBe(false);
+      expect(r.sidecar().wake.pending).toEqual(pending);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      expect(requests).toHaveBeenCalledTimes(4);
+      expect(awareness.admitWake()).toBe(true);
+      expect(awareness.prepare('wake')?.text).toContain('job:lane-a');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('live: a turn that fails over an unreadable mailbox is owed again after repair; only its mailbox item skips the retry budget', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(r.accepting(awareness, turns));
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner');
+      r.block('lane-a');
+      vi.advanceTimersByTime(1000);
+      expect(turns).toHaveLength(2);
+      r.corrupt();
+      expect(() => awareness.noteWakeTurnFailure('provider wall', turns[0]!)).not.toThrow();
+      expect(() => awareness.noteWakeTurnFailure('provider wall', turns[1]!)).not.toThrow();
+      // The ledger-backed decision is counted as usual; the mailbox item's basis cannot be read.
+      expect(Object.values(r.sidecar().wake.wakeFailures ?? {})).toEqual([1]);
+      expect(r.api.listNotifications({ routing: 'needs-owner' }).filter((row) => row.kind.startsWith('gru.wake-failed-escalation.'))).toHaveLength(0);
+      vi.advanceTimersByTime(30_000);
+      expect(turns).toHaveLength(2);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      // The decision follow-through is retried at once; the mailbox item returns through its own unhandled grace.
+      expect(turns).toHaveLength(3);
+      expect(turns[2]!.text).toContain('Merge #612?');
+      vi.advanceTimersByTime(300_000);
+      expect(turns).toHaveLength(4);
+      expect(turns[3]!.text).toContain('job:lane-a');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('live: a passive block accepted as the mailbox became unreadable still commits; its receipt settles after repair', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const awareness = r.start();
+      awareness.setWakeSink(() => {}); // a wake for the same item is queued behind the owner's turn
+      const pending = r.sidecar().wake.pending;
+      expect(pending).toHaveLength(1);
+      const injection = awareness.prepare()!;
+      expect(injection.text).toContain('job:lane-a');
+      const acceptedAt = new Date(Date.now()).toISOString();
+      r.corrupt();
+      expect(() => awareness.commit(injection)).not.toThrow();
+      expect(r.sidecar().coveredThroughSeq).toBe(injection.coveredThroughSeq);
+      expect(r.sidecar().wake.unreceipted).toHaveLength(1);
+      expect(r.sidecar().wake.pending).toEqual(pending); // not pruned on evidence nobody could read
+      r.repair();
+      vi.advanceTimersByTime(5000);
+      expect(r.sidecar().wake.unreceipted).toBeUndefined();
+      expect(r.mailbox.snapshot().items.find((item) => item.jobId === 'lane-a')?.receipt).toMatchObject({ source: 'chat', receivedAt: acceptedAt });
+      expect(awareness.admitWake()).toBe(false); // the owner's turn already carried it
+      expect(r.api.latestEventOfKind('gru.wake')).toBeNull();
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('owner chat: an unreadable mailbox is reported, never rendered empty, and owner rows still ride', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      r.api.recordNotification({ id: 'owner-q', kind: 'owner.question', routing: 'needs-owner', severity: 'info', title: 'Approve the deploy window?' });
+      const awareness = r.start();
+      awareness.setWakeSink(() => {});
+      r.corrupt();
+      let injection: AwarenessInjection | null = null;
+      expect(() => { injection = awareness.prepare(); }).not.toThrow();
+      const first = injection as AwarenessInjection | null;
+      expect(first?.text.split('\n')[1]).toContain(MAILBOX_UNAVAILABLE_NOTICE);
+      expect(first?.text).toContain('malformed PR evidence for corrupt-lane');
+      expect(first?.text).toContain('Approve the deploy window?');
+      expect(first?.text).not.toContain('job:lane-a');
+      expect(first?.mailboxDeliveries).toEqual([]);
+      awareness.commit(first!);
+      // Nothing new happened, but the mailbox is still unreadable: the next owner turn says so again.
+      expect(awareness.prepare()?.text).toContain(MAILBOX_UNAVAILABLE_NOTICE);
+      r.repair();
+      const repaired = awareness.prepare();
+      expect(repaired?.text).not.toContain(MAILBOX_UNAVAILABLE_NOTICE);
+      expect(repaired?.text).toContain('job:lane-a');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('an owner decision recorded during the hold waits with the rest and opens its turn after repair', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(r.accepting(awareness, turns));
+      r.corrupt();
+      vi.advanceTimersByTime(1000);
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner');
+      vi.advanceTimersByTime(30_000);
+      expect(turns).toHaveLength(0); // no autonomous turn opens while Gru's mailbox cannot be read
+      expect(r.sidecar().wake.pending).toHaveLength(1);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.text).toContain('Merge #612?');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('restart: a decision turn that fails during the hold is still owed after a restart and the repair', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const first = r.start();
+      const delivered: AwarenessInjection[] = [];
+      first.setWakeSink(r.accepting(first, delivered));
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner');
+      expect(delivered).toHaveLength(1);
+      r.corrupt();
+      first.noteWakeTurnFailure('provider wall', delivered[0]!);
+      first.dispose(); // gru update / gru roll before anyone repairs the lane
+      const next = r.start();
+      const turns: AwarenessInjection[] = [];
+      next.setWakeSink(r.accepting(next, turns));
+      vi.advanceTimersByTime(30_000);
+      expect(turns).toHaveLength(0);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      // The replayed gru.wake receipt must not claim a follow-through that is still owed.
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.text).toContain('Merge #612?');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('boot: legacy claims are re-keyed before a reconcile that runs ahead of setWakeSink can prune them', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [], pending: [key], wakeFailures: { [key]: 1 }, lastFiredAt: Date.now() } }));
+      r.corrupt();
+      const next = r.start();
+      r.repair(); // the source event queues a reconcile before the chat server binds its sink
+      vi.advanceTimersByTime(0);
+      const requests = vi.fn();
+      next.setWakeSink(requests);
+      // The legacy failed-turn retry survives, exactly as in an ordinary legacy boot.
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(next.admitWake()).toBe(true);
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('boot: every legacy claim shape is adopted after the hold instead of failing construction', () => {
+    vi.useFakeTimers();
+    const variants = [
+      (key: string) => ({ woken: [key], pending: [] }),
+      (key: string) => ({ woken: [], pending: [], unreceipted: [{ ids: [key], at: Date.now(), source: 'wake' }] }),
+      (key: string) => ({ woken: [], pending: [], wakeFailures: { [`\u0000mailbox:${key}`]: 1 } }),
+    ];
+    try {
+      for (const variant of variants) {
+        const r = holdRig();
+        try {
+          r.block('lane-a');
+          const key = r.mailbox.attentionRows()[0]!.id;
+          r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
+          writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, lastFiredAt: Date.now(), ...variant(key) } }));
+          r.corrupt();
+          let next!: GruAwareness;
+          expect(() => { next = r.start(); }).not.toThrow();
+          expect(() => next.setWakeSink(() => {})).not.toThrow();
+          r.repair();
+          expect(() => vi.advanceTimersByTime(6000)).not.toThrow();
+          expect(() => next.prepare()).not.toThrow();
+        } finally { r.close(); }
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('boot: a re-keying failure after a readable probe holds like an unreadable mailbox instead of throwing', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [], pending: [key], wakeFailures: { [key]: 1 }, lastFiredAt: Date.now() } }));
+      r.corrupt();
+      const next = r.start();
+      r.repair();
+      // The projection reads again, but the re-key's own row read fails once (a transient ledger fault).
+      vi.spyOn(r.mailbox, 'getAttentionRow').mockImplementationOnce(() => { throw new Error('simulated ledger fault'); });
+      let injection: AwarenessInjection | null = null;
+      expect(() => { injection = next.prepare(); }).not.toThrow();
+      expect((injection as AwarenessInjection | null)?.text).toContain('simulated ledger fault');
+      expect(r.logs.some((line) => line.startsWith('mailbox reconciliation failed') && line.includes('simulated ledger fault'))).toBe(true);
+      const requests = vi.fn();
+      next.setWakeSink(requests); // the next readable probe re-keys, and the legacy retry is owed as before
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(next.admitWake()).toBe(true);
+    } finally { r.close(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it('live: a ledger-backed id that exhausts its retries during the hold is escalated to the owner as usual', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(r.accepting(awareness, turns));
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner');
+      expect(turns).toHaveLength(1);
+      for (let attempt = 1; attempt <= WAKE_FAILURE_RETRIES; attempt += 1) {
+        awareness.noteWakeTurnFailure('provider wall', turns.at(-1)!);
+        vi.advanceTimersByTime(6000);
+        expect(turns).toHaveLength(attempt + 1);
+      }
+      r.corrupt();
+      expect(() => awareness.noteWakeTurnFailure('provider wall', turns.at(-1)!)).not.toThrow();
+      const stops = r.api.listNotifications({ routing: 'needs-owner' }).filter((row) => row.kind.startsWith('gru.wake-failed-escalation.'));
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.detail).toContain('Merge #612?');
+      r.repair();
+      vi.advanceTimersByTime(30_000);
+      expect(turns).toHaveLength(WAKE_FAILURE_RETRIES + 1); // the stop replaces the autonomous path
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('boot: a decision recorded while the service was down is seeded by the held boot once it runs', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner'); // no awareness running: only the boot seed can find it
+      r.corrupt();
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(r.accepting(awareness, turns));
+      vi.advanceTimersByTime(30_000);
+      expect(turns).toHaveLength(0);
+      r.repair();
+      vi.advanceTimersByTime(1000);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.text).toContain('Merge #612?');
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('owner chat: with nothing else to report, an unreadable mailbox still leads the block and names its whole cause', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const awareness = r.start();
+      awareness.setWakeSink(() => {});
+      const lane = 'intake-slice-gru-service-restart-16f2da'; // a realistic lane id, longer than the old clamp left room for
+      r.api.addJob({ id: lane, repo: 'r', title: lane });
+      r.api.appendCustomEvent({ kind: 'github.branch-state', jobId: lane, payload: { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null } });
+      const first = awareness.prepare();
+      expect(first?.text.split('\n')[1]).toContain(MAILBOX_UNAVAILABLE_NOTICE);
+      expect(first?.text).toContain(`malformed PR evidence for ${lane}`);
+      awareness.commit(first!);
+      // No new event, nothing pending, no owner row: an empty block would read as an empty mailbox.
+      const again = awareness.prepare();
+      expect(again).not.toBeNull();
+      expect(again!.text.split('\n')[1]).toContain(MAILBOX_UNAVAILABLE_NOTICE);
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('live: a wake accepted as the mailbox became unreadable is claimed, and its unrendered member stays owed', () => {
+    vi.useFakeTimers();
+    let maxBytes = 0;
+    const measure = holdRig();
+    try {
+      measure.block('lane-a');
+      measure.block('lane-b');
+      const probe = measure.start();
+      probe.setWakeSink(() => {});
+      expect(probe.admitWake()).toBe(true);
+      const lines = probe.prepare('wake')!.text.split('\n');
+      const second = lines.findIndex((line, index) => line.includes('job:lane-') && lines.slice(0, index).some((earlier) => earlier.includes('job:lane-')));
+      expect(second).toBeGreaterThan(0);
+      maxBytes = Buffer.byteLength(lines.slice(0, second).join('\n'), 'utf8') + 1; // room for one mailbox line, not two
+    } catch (error) { vi.useRealTimers(); throw error; } finally { measure.close(); }
+    const r = holdRig({ limits: { maxBytes } });
+    try {
+      r.block('lane-a');
+      r.block('lane-b');
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(() => {
+        if (!awareness.admitWake()) return;
+        const injection = awareness.prepare('wake');
+        if (injection !== null) turns.push(injection);
+      });
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.attentionKeys).toHaveLength(1); // the byte cap rendered one of the two
+      const rendered = turns[0]!.text.includes('job:lane-a') ? 'lane-a' : 'lane-b';
+      const owed = rendered === 'lane-a' ? 'lane-b' : 'lane-a';
+      awareness.commit(turns[0]!, 'wake');
+      r.corrupt(); // between prepare and the turn-start acceptance
+      expect(() => awareness.noteWakeOutcome(true, undefined, turns[0]!)).not.toThrow();
+      // Claimed and parked: the receipt cannot be recorded until the mailbox reads.
+      expect(r.sidecar().wake.unreceipted).toHaveLength(1);
+      expect(r.sidecar().wake.pending).toHaveLength(1);
+      r.repair();
+      vi.advanceTimersByTime(5000);
+      expect(r.sidecar().wake.unreceipted).toBeUndefined();
+      expect(r.api.latestEventOfKind('gru.wake')).not.toBeNull();
+      expect(turns).toHaveLength(2);
+      expect(turns[1]!.text).toContain(`job:${owed}`);
+      expect(turns[1]!.text).not.toContain(`job:${rendered}`);
     } finally { r.close(); vi.useRealTimers(); }
   });
 });
