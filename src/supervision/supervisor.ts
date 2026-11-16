@@ -130,6 +130,10 @@ export type SupervisionState = 'watching' | 'restarting' | 'stopped';
  * says whether the machine slept or this process's event loop stalled. */
 const WAKE_GAP_MIN_MS = 30_000;
 
+/** The stop reason an aborted isolated review attempt's record carries: the
+ * board renders it, and the directive producer fence recognizes the record by it. */
+const REVIEW_ABORTED_STOP_REASON = 'review aborted';
+
 /** Per-agent supervision view (board + /health). */
 export interface AgentSupervisionView {
   readonly agentId: string;
@@ -211,10 +215,13 @@ interface SupervisedAgent {
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
   /** The enclosing Perkins workflow's isolated review attempt was aborted
-   * here (`abortIsolatedReviewAttempt`). Its `inRestart` is then only the
-   * persistent stop guard, never a restart in flight; `isAbortedReviewAttempt`
-   * names the one state in which that guard is not producer ownership. */
-  reviewAborted: boolean;
+   * here (`abortIsolatedReviewAttempt`): `disposing` from the abort until its
+   * handle disposal completes successfully, then `disposed`; a failed
+   * disposal stays `disposing`. The record's `inRestart` is then only the
+   * persistent stop guard, never a restart in flight;
+   * `releasedReviewAbort` names the one state in which that guard has
+   * stopped being producer ownership. */
+  reviewAbort: 'disposing' | 'disposed' | null;
   /**
    * Retained ordinary predecessor custody (F60-P2). When an ordinary restart
    * is refused because the predecessor's adapter could not attest cessation,
@@ -1137,7 +1144,7 @@ export class Supervisor {
       // optional, so a late publication can still name this id: it must
       // neither classify into the generic restart ladder nor reopen the
       // producer state the abort settled.
-      if (this.isAbortedReviewAttempt(agent)) return null;
+      if (this.holdsReviewAbortGuard(agent)) return null;
       const event = envelope.event;
       if (event === undefined) return null;
       agent.lastEventAt = this.now();
@@ -1355,7 +1362,7 @@ export class Supervisor {
       breakerNotificationId: null,
       pendingRearmFenceAlert: null,
       inRestart: false,
-      reviewAborted: false,
+      reviewAbort: null,
       unprovenStop: null,
       backoffTimer: null,
       activityGeneration: 0,
@@ -2083,14 +2090,24 @@ export class Supervisor {
   // Decision-backed recovery guidance + restart ladder
   // ------------------------------------------------------------------
 
-  /** True for an isolated review attempt this supervisor aborted and whose
-   * record now only holds the stop guard: handle detached, stopped, no
-   * breaker. Such a record can never produce again (the workflow owns every
-   * replacement attempt under a new id), so it takes no event and is not a
-   * pending producer. Any other state, including a re-adopted handle or a
-   * restored breaker stop, is not this and keeps its ordinary custody. */
-  private isAbortedReviewAttempt(agent: SupervisedAgent): boolean {
-    return agent.reviewAborted && agent.handle === null && agent.state === 'stopped' && !agent.breakerOpen;
+  /** An isolated review attempt this supervisor aborted, with its handle
+   * detached: the record stays only as the persistent stop guard (`inRestart`)
+   * and takes no further event. It can never produce again; the workflow owns
+   * every replacement attempt under a new id. */
+  private holdsReviewAbortGuard(agent: SupervisedAgent): boolean {
+    return agent.reviewAbort !== null && agent.handle === null;
+  }
+
+  /** The aborted attempt's guard has stopped being producer ownership: the
+   * record is stopped for the review abort, handle-less, not a breaker stop,
+   * and its handle disposal COMPLETED successfully. While that disposal is
+   * still in flight, or after it failed, the record fences as it always has.
+   * The caller's other pending terms (backoff timer, rate-limit retry,
+   * recovery admission, queued recovery, pending decision) are separate
+   * terms of the fence and still count. */
+  private releasedReviewAbort(agent: SupervisedAgent): boolean {
+    return agent.reviewAbort === 'disposed' && agent.handle === null && agent.state === 'stopped' &&
+      agent.stopReason === REVIEW_ABORTED_STOP_REASON && !agent.breakerOpen;
   }
 
   /** Review attempts are fresh, ambient-free, and owned by the enclosing
@@ -2101,10 +2118,10 @@ export class Supervisor {
     const handle = agent.handle;
     // Persistent workflow-owned stop guard: late fatal/state events from the
     // detached handle must never enter the generic restart ladder. It guards
-    // the record; it is not a restart in flight and not producer ownership
-    // (`isAbortedReviewAttempt`, `pendingProducerBlockers`).
+    // the record; once the disposal below completes it is not producer
+    // ownership (`releasedReviewAbort`, `pendingProducerBlockers`).
     agent.inRestart = true;
-    agent.reviewAborted = true;
+    agent.reviewAbort = 'disposing';
     agent.handle = null;
     // The detached handle's open work is settled with it: its disposed
     // envelope is filtered by handle identity and can no longer clear these.
@@ -2114,7 +2131,7 @@ export class Supervisor {
     agent.backgroundTasks = [];
     agent.compactionWarned = false;
     agent.state = 'stopped';
-    agent.stopReason = 'review aborted';
+    agent.stopReason = REVIEW_ABORTED_STOP_REASON;
     agent.stoppedAt = this.now();
     this.rememberStop(agent);
     this.log('warn', 'isolated review attempt aborted for workflow-owned recovery', {
@@ -2146,6 +2163,9 @@ export class Supervisor {
       } finally {
         try {
           await this.registry.disposeHandle(handle);
+          // Only a completed disposal releases the job fence; a failed one
+          // leaves the record fencing until the handle's cessation is proven.
+          agent.reviewAbort = 'disposed';
         } catch (error) {
           this.log('warn', 'isolated review attempt disposal failed', {
             agent_id: agent.agentId,
@@ -4621,9 +4641,10 @@ export class Supervisor {
           ? [`supervision ownership unknown: ${row.id}`] : [];
       }
       // An aborted review attempt keeps `inRestart` only as its stop guard:
-      // that one term is not a pending restart, so it must not fence the
-      // job's writers forever (j-586). Every other term still counts for it.
-      const pending = (agent.inRestart && !this.isAbortedReviewAttempt(agent)) || agent.backoffTimer !== null || agent.decisionPending ||
+      // once its handle disposal has completed that one term is not a
+      // pending restart, so it must not fence the job's writers forever
+      // (j-586). Every other term still counts for it.
+      const pending = (agent.inRestart && !this.releasedReviewAbort(agent)) || agent.backoffTimer !== null || agent.decisionPending ||
         agent.queuedRecovery !== null || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null ||
         (agent.state !== 'stopped' && !agent.breakerOpen && agent.pendingRecovery !== null);
       const directive = currentNative === undefined ? null : this.ledger.getDirective(currentNative.producer.identity.requestId);

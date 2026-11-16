@@ -4634,64 +4634,158 @@ describe('supervisor — isolated review ownership', () => {
     h.dispose();
   });
 
-  it('an aborted review attempt no longer reports as a pending producer on its job (j-586)', async () => {
+  /** A review-isolated Perkins attempt registered on its own fresh job, the
+   * way a round's lead agent is: the job fence reads the ledger's job binding. */
+  function reviewAttemptOnJob(h: Harness, name: string): { readonly jobId: string; readonly handle: FakeHandle } {
+    const jobId = `job-${name}`;
+    h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+    const handle = new FakeHandle('perkins', `perkins-${name}`, null, true);
+    h.registry.adopt(handle);
+    h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+    return { jobId, handle };
+  }
+  const fenceOf = (h: Harness, jobId: string): string => h.supervisor.pendingProducerBlockers(jobId).join('; ');
+  const recordOf = (h: Harness, agentId: string): Record<string, unknown> =>
+    (h.supervisor as unknown as { agents: Map<string, Record<string, unknown>> }).agents.get(agentId)!;
+
+  it('an aborted review attempt stops fencing its job once its handle disposal completes (j-586)', async () => {
     const h = boot();
     try {
-      const jobId = 'job-review-abort-fence';
-      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
-      const handle = new FakeHandle('perkins', 'perkins-abort-fence', null, true);
-      h.registry.adopt(handle);
-      h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-fence');
       const spawns = h.registry.spawnCalls.length;
       expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
       // The provider refuses the attempt at start: a fatal error aborts it.
       handle.emit({ type: 'error', error: 'prompt is too long', fatal: true });
       await vi.waitFor(() => expect(handle.disposed).toBe(true));
-      await vi.waitFor(() => expect(h.api.getAgent(handle.id)?.state).toBe('error'));
+      // The record stays as the stop guard, but once its disposal completed
+      // it is not a producer: no writer directive, closeout or re-arm on the
+      // job is fenced by it.
+      await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: false, stopReason: 'review aborted' });
-      // The record stays as the stop guard, but it is not a producer: no
-      // writer directive, closeout or re-arm on the job is fenced by it.
-      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      expect(h.api.getAgent(handle.id)?.state).toBe('error');
       expect(h.registry.spawnCalls).toHaveLength(spawns);
     } finally { h.dispose(); }
   });
 
-  it('an attempt aborted by the watchdog with an open tool call and compaction releases the job fence too', async () => {
+  it('an attempt aborted by the watchdog with an open tool call and compaction releases both fence branches', async () => {
     const h = boot();
     try {
-      const jobId = 'job-review-abort-open-work';
-      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
-      const handle = new FakeHandle('perkins', 'perkins-abort-open-work', null, true);
-      h.registry.adopt(handle);
-      h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-open-work');
       hang(handle);
       handle.emit({ type: 'tool_start', callId: 'review-read-1', tool: 'bash' });
       handle.emit({ type: 'compaction_start' });
       // While the attempt is live its open work is a real producer fence.
-      expect(h.supervisor.pendingProducerBlockers(jobId).join(' ')).toContain('open turn/control/tool');
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (open turn/control/tool)`);
       h.advance(60);
       await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted', openControl: false, openToolCalls: 0 });
-      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
     } finally { h.dispose(); }
   });
 
-  it('late events from an aborted review attempt never enter the restart ladder, respawn it, or re-fence the job', async () => {
+  it('an aborted review attempt keeps fencing while its disposal is in flight and releases when it completes', async () => {
     const h = boot();
     try {
-      const jobId = 'job-review-abort-late';
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-inflight');
+      let finish!: () => void;
+      const gate = new Promise<void>((resolve) => { finish = resolve; });
+      const realDispose = handle.dispose.bind(handle);
+      handle.dispose = async () => { await gate; await realDispose(); };
+      handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await flushMicrotasks();
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
+      expect(handle.disposed).toBe(false);
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      finish();
+      await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
+      expect(handle.disposed).toBe(true);
+    } finally { h.dispose(); }
+  });
+
+  it('an aborted review attempt keeps fencing after its disposal fails', async () => {
+    const logs: string[] = [];
+    const h = boot(undefined, { log: (_level, message) => { logs.push(message); } });
+    try {
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-dispose-failed');
+      handle.dispose = async () => { throw new Error('disposal refused'); };
+      handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await vi.waitFor(() => expect(logs).toContain('isolated review attempt disposal failed'));
+      await flushMicrotasks();
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      h.advance(2_000_000);
+      await sleep(20);
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+    } finally { h.dispose(); }
+  });
+
+  it('only a review-aborted record is excluded: another stop reason, or an unmarked record, still fences', async () => {
+    const h = boot();
+    try {
+      const jobId = 'job-abort-other-stops';
       h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
-      const handle = new FakeHandle('perkins', 'perkins-abort-late', null, true);
-      h.registry.adopt(handle);
-      h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+      const writer = new FakeHandle('minion', 'writer-abort-other-stops', null);
+      h.registry.adopt(writer);
+      h.api.registerAgent({ id: writer.id, role: 'minion', jobId });
+      const stopped = recordOf(h, writer.id);
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      // Stopped, handle-less and holding inRestart, under a different stop reason.
+      stopped['handle'] = null;
+      stopped['state'] = 'stopped';
+      stopped['inRestart'] = true;
+      stopped['stopReason'] = 'operator stop';
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
+      // The review-abort stop reason alone, with no abort having disposed a handle, is not the exclusion.
+      stopped['stopReason'] = 'review aborted';
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
+    } finally { h.dispose(); }
+  });
+
+  it('a released review-abort record still fences for every other pending term it holds', async () => {
+    const h = boot();
+    const timer = setTimeout(() => {}, 60_000);
+    try {
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-other-terms');
+      handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
+      const aborted = recordOf(h, handle.id);
+      const terms: readonly (readonly [string, unknown])[] = [
+        ['backoffTimer', timer],
+        ['rateLimitRetry', {}],
+        ['recoveryAdmission', new AbortController()],
+        ['queuedRecovery', {}],
+        ['decisionPending', true],
+      ];
+      for (const [field, held] of terms) {
+        const idle = aborted[field];
+        aborted[field] = held;
+        expect(fenceOf(h, jobId), field).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+        aborted[field] = idle;
+        expect(h.supervisor.pendingProducerBlockers(jobId), field).toEqual([]);
+      }
+    } finally { clearTimeout(timer); h.dispose(); }
+  });
+
+  it('a live isolated review attempt with an open turn still fences its job', async () => {
+    const h = boot();
+    try {
+      const { jobId, handle } = reviewAttemptOnJob(h, 'live-attempt');
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      hang(handle);
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (open turn/control/tool)`);
+    } finally { h.dispose(); }
+  });
+
+  it('late events and late recovery calls for an aborted review attempt never enter the restart ladder or respawn it', async () => {
+    const h = boot();
+    try {
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-late');
       const spawns = h.registry.spawnCalls.length;
       handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
       await vi.waitFor(() => expect(handle.disposed).toBe(true));
-      await vi.waitFor(() => expect(h.api.getAgent(handle.id)?.state).toBe('error'));
+      await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
       const supervisionKinds = (): string[] => h.api.listEvents({ limit: 200 })
         .filter((event) => event.kind.startsWith('supervision.')).map((event) => event.kind);
       expect(supervisionKinds()).toEqual(['supervision.review-attempt-aborted']);
-      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
       // Late fatal and state events from the detached handle, then the same
       // events with no handle provenance (which handle identity cannot
       // filter): none classifies, climbs the ladder, spawns or re-fences.
@@ -4702,6 +4796,14 @@ describe('supervisor — isolated review ownership', () => {
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'state', state: 'error', error: 'late untagged state' });
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'turn_start' });
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'tool_start', callId: 'late-call', tool: 'bash' });
+      // An evaluateRecovery or restart rung that was already in flight when
+      // the abort landed reaches the same record: the stop guard refuses it.
+      const internals = h.supervisor as unknown as {
+        evaluateRecovery(agent: unknown, reason: string, allowRestart: boolean, runtimeError: boolean): Promise<void>;
+        restartRung(agent: unknown, reason: string): Promise<void>;
+      };
+      await internals.evaluateRecovery(recordOf(h, handle.id), 'fatal error: late recovery', true, true);
+      await internals.restartRung(recordOf(h, handle.id), 'late restart');
       await sleep(60);
       h.advance(2_000_000);
       await sleep(60);
