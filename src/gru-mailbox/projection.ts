@@ -146,7 +146,9 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) throw new Error(`mailbox malformed PR evidence for ${job.id}`);
       const evidence = payload as Record<string, unknown>;
       const nullableString = (value: unknown): boolean => value === null || (typeof value === 'string' && value.trim() !== '');
-      const hadConflict = surfaced.get(`job:${job.id}`)?.reasons.some((reason) => reason.signal === 'pr-conflict') === true;
+      // A settled thread keeps its last reasons as history; only a live one still owes closure evidence.
+      const prior = surfaced.get(`job:${job.id}`);
+      const hadConflict = prior !== undefined && prior.state !== 'resolved' && prior.reasons.some((reason) => reason.signal === 'pr-conflict');
       const hasOpen = Object.hasOwn(evidence, 'pr_open');
       if (!nullableString(evidence['pr_url']) || !nullableString(evidence['mergeable_state']) || !nullableString(evidence['sha'])
         || (hasOpen && evidence['pr_open'] !== null && typeof evidence['pr_open'] !== 'boolean') || (!hasOpen && hadConflict)) {
@@ -155,11 +157,16 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       // Pre-open-status observations remain readable as unknown, never eligible.
       // Once a conflict surfaced, an unobserved pull/head/mergeability cannot
       // certify its closure. Explicit same-pull closed evidence still can.
-      if (hadConflict && job.prUrl !== null && (evidence['pr_url'] !== job.prUrl || evidence['pr_open'] === null
-        || (evidence['pr_open'] !== false && (evidence['sha'] === null || evidence['mergeable_state'] === null || evidence['mergeable_state'] === 'unknown')))) {
-        throw new Error(`mailbox PR closure evidence unavailable for ${job.id}: re-observe the pull before clearing retained attention`);
-      }
-      if (evidence['pr_url'] === job.prUrl && job.prUrl !== null && evidence['pr_open'] === true && evidence['mergeable_state'] === 'dirty') {
+      // The poll records exactly this for every moved head until GitHub
+      // computes mergeability, so it is routine evidence, not a fault: the
+      // thread is retained as unconfirmed until the pull is observed again.
+      // Throwing here made the board, the wake path and boot unavailable
+      // before the next poll could ever record that observation.
+      const closureUnobserved = hadConflict && job.prUrl !== null && (evidence['pr_url'] !== job.prUrl || evidence['pr_open'] === null
+        || (evidence['pr_open'] !== false && (evidence['sha'] === null || evidence['mergeable_state'] === null || evidence['mergeable_state'] === 'unknown')));
+      if (closureUnobserved) {
+        add('pr-conflict', 'PR conflict unconfirmed', [job.prUrl, evidence['pr_url'], evidence['pr_open'], evidence['sha'], evidence['mergeable_state'], 'unobserved']);
+      } else if (evidence['pr_url'] === job.prUrl && job.prUrl !== null && evidence['pr_open'] === true && evidence['mergeable_state'] === 'dirty') {
         if (typeof evidence['sha'] !== 'string' || evidence['sha'] === '') throw new Error(`mailbox conflicting PR evidence for ${job.id} is missing head sha`);
         add('pr-conflict', 'PR conflicting', [job.prUrl, evidence['sha'], 'dirty']);
       }

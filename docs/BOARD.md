@@ -484,6 +484,13 @@ delegated items remain inspectable with their owner, dependency, recheck,
 control/follow-up references, restrictions and delivery receipt. Source job
 statuses and child reports are never rewritten by mailbox reconciliation.
 
+A surfaced PR conflict stays until the pull is observed again. Right after a
+push GitHub has not yet computed mergeability for the new head, so the thread
+reads **PR conflict unconfirmed** until the next observation either confirms
+the conflict (**PR conflicting**) or settles the thread. An unobserved pull
+never clears a conflict and never makes the mailbox unavailable; a settled
+thread is not reopened by a later push.
+
 An absent mailbox means **unavailable**, not guessed eligibility or a clean
 queue. FOR YOU, notification acknowledgements, and other bands keep their
 existing authority. The mailbox is read-only on the board; disclosure does not

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
-import { branchStatePayload } from '../src/dispatch/github-poll.js';
+import { branchStatePayload, nextBranchState } from '../src/dispatch/github-poll.js';
 import { DirectiveNativeFixture } from './helpers/directive-native-fixture.js';
 import { inspectDirectiveAdmission } from '../src/runtime/directive-checkpoint.js';
 
@@ -414,10 +414,69 @@ describe('GH-305 canonical durable mailbox', () => {
       ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: observed });
       const before = mailbox.snapshot().items[0]!;
       ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: { ...observed, ...unknown } });
-      expect(() => mailbox.snapshot()).toThrow(/PR closure evidence unavailable/);
-      expect(ledger.listMailboxItems()).toEqual([before]);
+      // Retained, never cleared and never unreadable: an unobserved pull is no closure evidence.
+      const retained = mailbox.snapshot().items[0]!;
+      expect(retained.id).toBe(before.id);
+      expect(retained.state).toBe('needs-gru');
+      expect(retained.severity).toBe('error');
+      expect(retained.reasons.map((reason) => [reason.signal, reason.label])).toEqual([['pr-conflict', 'PR conflict unconfirmed']]);
+      expect(mailbox.snapshot().items[0]?.attentionKey).toBe(retained.attentionKey);
       expect(ledger.latestEventOfKind('mailbox.disposition')).toBeNull();
+      // Only a genuine observation of the recorded pull settles the thread.
+      ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: { ...observed, sha: 'new-head', mergeable_state: 'clean' } });
+      expect(mailbox.snapshot().items[0]?.state).toBe('resolved');
     }
+  });
+
+  it('keeps the mailbox readable when a push lands on a conflicting pull before GitHub computes mergeability', () => {
+    const { ledger, mailbox } = fixture();
+    const prUrl = 'https://github.com/org/repo/pull/22';
+    const lane = { jobId: 'j', repo: { host: 'github.com', owner: 'org', repo: 'repo' }, branch: 'j', prNumber: 22, prUrl };
+    const pull = { number: 22, headRef: 'j', headSha: 'old-head', state: 'open', merged: false, mergeableState: 'dirty', mergeCommitSha: null, url: prUrl };
+    const labels = (): readonly string[] => mailbox.snapshot().items[0]!.reasons.map((reason) => reason.label);
+    ledger.addJob({ id: 'j', repo: 'r', title: 'j' });
+    ledger.setJobPr('j', prUrl);
+    const conflicting = nextBranchState(null, { pull, ci: null });
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, conflicting) });
+    expect(labels()).toEqual(['PR conflicting']);
+    // The poll's own record for a moved head: unknown until GitHub computes it for the new head.
+    const pushed = nextBranchState(conflicting, { pull: { ...pull, headSha: 'new-head', mergeableState: 'unknown' }, ci: null });
+    expect(pushed).toMatchObject({ sha: 'new-head', prOpen: true, mergeableState: null });
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, pushed) });
+    expect(labels()).toEqual(['PR conflict unconfirmed']);
+    // The wake path and boot recovery read single rows; they must stay readable too.
+    const row = mailbox.attentionRows()[0]!;
+    expect(mailbox.getAttentionRow(row.id)?.id).toBe(row.id);
+    // The next tick observes the computed result for the new head.
+    const stillDirty = nextBranchState(pushed, { pull: { ...pull, headSha: 'new-head', mergeableState: 'dirty' }, ci: null });
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, stillDirty) });
+    expect(labels()).toEqual(['PR conflicting']);
+    const fixed = nextBranchState(stillDirty, { pull: { ...pull, headSha: 'fixed-head', mergeableState: 'clean' }, ci: null });
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, fixed) });
+    expect(mailbox.snapshot().items[0]?.state).toBe('resolved');
+  });
+
+  it('does not reopen a settled conflict thread when a later push has unknown mergeability', () => {
+    const { ledger, mailbox } = fixture();
+    const prUrl = 'https://github.com/org/repo/pull/22';
+    const lane = { jobId: 'j', repo: { host: 'github.com', owner: 'org', repo: 'repo' }, branch: 'j', prNumber: 22, prUrl };
+    const pull = { number: 22, headRef: 'j', headSha: 'old-head', state: 'open', merged: false, mergeableState: 'dirty', mergeCommitSha: null, url: prUrl };
+    ledger.addJob({ id: 'j', repo: 'r', title: 'j' });
+    ledger.setJobPr('j', prUrl);
+    const conflicting = nextBranchState(null, { pull, ci: null });
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, conflicting) });
+    expect(mailbox.snapshot().items[0]?.state).toBe('needs-gru');
+    const fixed = nextBranchState(conflicting, { pull: { ...pull, headSha: 'fixed-head', mergeableState: 'clean' }, ci: null });
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, fixed) });
+    const settled = mailbox.snapshot().items[0]!;
+    expect(settled.state).toBe('resolved');
+    // The settled row still lists its old reasons; they are history, not a live conflict.
+    expect(settled.reasons.map((reason) => reason.signal)).toEqual(['pr-conflict']);
+    const later = nextBranchState(fixed, { pull: { ...pull, headSha: 'later-head', mergeableState: null }, ci: null });
+    expect(later.mergeableState).toBeNull();
+    ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: 'j', payload: branchStatePayload(lane, later) });
+    expect(mailbox.snapshot().items).toEqual([settled]);
+    expect(mailbox.attentionRows()).toEqual([]);
   });
 
   it('G23 rejects a partial exact-basis multi-reason resolution without changing metadata', () => {
