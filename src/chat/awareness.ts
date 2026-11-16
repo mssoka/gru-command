@@ -103,7 +103,7 @@ export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not
 
 /** Leads an owner turn's block while the mailbox projection cannot be read. */
 export const MAILBOX_UNAVAILABLE_NOTICE =
-  'FOR GRU mailbox unavailable, not empty: GET /api/mailbox fails until its source evidence reads again, and autonomous wakes wait for it.';
+  'FOR GRU mailbox unavailable, not empty: the board and GET /api/mailbox fail and autonomous wakes wait until its evidence reads again. Tell the owner which lane the cause names.';
 
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
@@ -604,7 +604,8 @@ export class GruAwareness {
   private mailboxEventTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly mailboxIntervalMs: number;
   private readonly limits: AwarenessLimits;
-  /** Rebuilt once, by {@link adoptLegacyKeys}, when legacy claims are re-keyed. */
+  /** Rebuilt by {@link adoptLegacyKeys}: at construction, or at the first
+   * readable probe when the mailbox could not be read then. */
   private wakePolicy: WakePolicy;
   private readonly wakePolicyConfig: WakePolicyConfig;
   private readonly wakeMode: NotifyWakeMode;
@@ -678,8 +679,11 @@ export class GruAwareness {
    * Nothing is released until it has: a wake flushed before the receipts
    * replay could re-prompt an id a previous process already delivered. */
   private bootOwed = false;
-  /** Persisted pre-domain keys still need the mailbox to be re-keyed. */
+  /** Persisted pre-domain keys still need the mailbox to be re-keyed; the
+   * first readable probe ({@link mailboxFailure}) does it. */
   private legacyKeysOwed = false;
+  /** The cause of the current hold, logged once; null while the mailbox reads. */
+  private mailboxHeldCause: string | null = null;
   private disposed = false;
 
   constructor(opts: GruAwarenessOptions) {
@@ -918,10 +922,6 @@ export class GruAwareness {
   private bootWake(): void {
     this.bootOwed = true; // until the receipt replay below has run
     if (!this.mailboxReadable('boot wake reconciliation')) return;
-    if (this.legacyKeysOwed) {
-      this.adoptLegacyKeys();
-      this.legacyKeysOwed = false;
-    }
     this.reconcileUnreceiptedReceipts();
     this.reconcileWakeReceipts();
     this.bootOwed = false;
@@ -933,26 +933,41 @@ export class GruAwareness {
    * The one place awareness asks whether the mailbox can be read. A
    * projection that throws (corrupt evidence for a single lane) is NOT an
    * empty mailbox, and it is not a reason to end the process either: every
-   * root of wake work asks here first and, on false, changes nothing —
-   * pending wakes, delivery claims and receipt debt stay exactly as they
-   * are, no autonomous turn opens, and the same roots run again on the next
-   * reconcile tick. Other readers are untouched: the board keeps answering
-   * 503 and `GET /api/mailbox` keeps failing for as long as the source does.
+   * root of wake work asks here first and, on false, takes no step that
+   * needs the mailbox — pending wakes are neither pruned nor released,
+   * delivery claims and receipt debt are not settled, no autonomous turn
+   * opens, and the same roots run again on the next reconcile tick. Other
+   * readers are untouched: the board keeps answering 503 and
+   * `GET /api/mailbox` keeps failing for as long as the source does.
    */
   private mailboxReadable(held: string): boolean {
     return this.mailboxFailure(held) === null;
   }
 
-  /** {@link mailboxReadable} with the cause, for the owner-context notice. */
+  /** {@link mailboxReadable} with the cause, for the owner-context notice.
+   * A hold is logged when it starts or its cause changes, never per probe
+   * (the receipt retry alone probes every 5 s), and its end is logged too.
+   * The first readable probe re-keys owed legacy claims before any caller
+   * reads them. */
   private mailboxFailure(held: string): string | null {
     if (this.mailbox === null) return null;
     try {
       this.mailbox.snapshot();
-      return null;
     } catch (error) {
-      this.log('error', 'mailbox reconciliation failed', { error: String(error), held });
-      return error instanceof Error ? error.message : String(error);
+      const cause = error instanceof Error ? error.message : String(error);
+      if (cause !== this.mailboxHeldCause) this.log('error', 'mailbox reconciliation failed', { error: String(error), held });
+      this.mailboxHeldCause = cause;
+      return cause;
     }
+    if (this.mailboxHeldCause !== null) {
+      this.log('info', 'mailbox readable again; held wake work resumes', { previous_error: this.mailboxHeldCause });
+      this.mailboxHeldCause = null;
+    }
+    if (this.legacyKeysOwed) {
+      this.adoptLegacyKeys();
+      this.legacyKeysOwed = false;
+    }
+    return null;
   }
 
   /** Re-key persisted pre-domain `mailbox:` claims to their current mailbox
@@ -1563,25 +1578,15 @@ export class GruAwareness {
     if (this.disposed) return;
     const ids = injection.attentionKeys ?? injection.notificationIds ?? [];
     this.recordWakeFailure(detail, ids);
-    if (!this.mailboxReadable('failed-turn retry accounting')) {
-      // The retry budget is keyed by mailbox basis and the owner stop names
-      // the alert; neither can be read. Owe the turn again instead, uncounted:
-      // no turn opens during the hold, so this is at most the one in flight.
-      // A mailbox delivery keeps its receipt and returns through the mailbox's
-      // own unhandled grace; every other id goes back to pending, unclaimed.
-      for (const id of ids) {
-        if (id.startsWith(MAILBOX_KEY_PREFIX)) continue;
-        this.pendingWakeIds.add(id);
-        this.wakePolicy.forget(id);
-        const row = this.attentionRow(id);
-        if (row !== null && parseOwnerDecisionKey(id) === null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
-      }
-      this.persistWakeState();
-      return;
-    }
+    // While the mailbox is unreadable a mailbox delivery is left out: its
+    // budget is keyed by a basis nobody can read. It keeps its receipt and
+    // returns through the mailbox's own unhandled grace. Every other id is
+    // ledger-backed and is counted, retried and escalated as usual, so its
+    // count survives a restart's receipt replay.
+    const counted = this.mailboxReadable('failed-turn retry accounting') ? ids : ids.filter((id) => !id.startsWith(MAILBOX_KEY_PREFIX));
     const retried: string[] = [];
     const escalated: string[] = [];
-    for (const id of ids) {
+    for (const id of counted) {
       const capture = injection.mailboxDeliveries?.find((delivery) => MAILBOX_KEY_PREFIX + delivery.deliveryKey === id);
       const failureKey = capture === undefined ? this.failureKey(id) : FAILURE_BASIS_PREFIX + JSON.stringify([capture.id, capture.basis]);
       const count = (this.wakeFailures.get(failureKey) ?? 0) + 1;
@@ -1848,7 +1853,7 @@ export class GruAwareness {
    * time, never the retry. A still-failing ledger re-arms the retry —
    * the receipt can never stay missing while the process runs. */
   private retryUnreceiptedReceipts(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.unreceipted.length === 0) return;
     if (!this.mailboxReadable('delivery receipt retry')) {
       this.scheduleReceiptRetry(); // the receipt stays parked at its original time
       return;
@@ -2901,7 +2906,7 @@ export class GruAwareness {
    * re-keyed legacy claims and replayed delivered receipts. */
   private prunePending(): boolean {
     if (this.pendingWakeIds.size === 0) return true;
-    if (this.bootOwed || this.legacyKeysOwed || !this.mailboxReadable('pending wakes')) return false;
+    if (this.bootOwed || !this.mailboxReadable('pending wakes')) return false;
     let changed = false;
     for (const id of this.pendingWakeIds) {
       const row = this.attentionRow(id);

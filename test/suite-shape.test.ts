@@ -194,7 +194,7 @@ const PINS: Record<string, number> = {
   'artifact-context.test.ts': 34,
   'attachments.test.ts': 28,
 
-  'awareness.test.ts': 160,
+  'awareness.test.ts': 166,
   'awareness-adversarial.test.ts': 2,
 
 
