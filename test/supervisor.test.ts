@@ -4718,25 +4718,70 @@ describe('supervisor — isolated review ownership', () => {
     } finally { h.dispose(); }
   });
 
-  it('only a review-aborted record is excluded: another stop reason, or an unmarked record, still fences', async () => {
+  it('only a released review-abort record is excluded: any other stop reason, mark, state or handle still fences', async () => {
     const h = boot();
     try {
-      const jobId = 'job-abort-other-stops';
-      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+      // A stopped, handle-less record holding inRestart under another stop
+      // reason, then under the review-abort reason with no abort behind it.
+      const otherJob = 'job-abort-other-stops';
+      h.api.addJob({ id: otherJob, repo: 'fixture', title: otherJob });
       const writer = new FakeHandle('minion', 'writer-abort-other-stops', null);
       h.registry.adopt(writer);
-      h.api.registerAgent({ id: writer.id, role: 'minion', jobId });
+      h.api.registerAgent({ id: writer.id, role: 'minion', jobId: otherJob });
       const stopped = recordOf(h, writer.id);
-      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
-      // Stopped, handle-less and holding inRestart, under a different stop reason.
+      expect(h.supervisor.pendingProducerBlockers(otherJob)).toEqual([]);
       stopped['handle'] = null;
       stopped['state'] = 'stopped';
       stopped['inRestart'] = true;
       stopped['stopReason'] = 'operator stop';
-      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
-      // The review-abort stop reason alone, with no abort having disposed a handle, is not the exclusion.
+      expect(fenceOf(h, otherJob)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
       stopped['stopReason'] = 'review aborted';
-      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
+      expect(fenceOf(h, otherJob)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
+      // A real aborted attempt, released: every conjunct of the exclusion is
+      // broken one at a time, and the fence must come back each time.
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-conjuncts');
+      handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
+      const aborted = recordOf(h, handle.id);
+      const successor = new FakeHandle('perkins', 'perkins-abort-conjuncts-successor', null, true);
+      const broken: readonly (readonly [string, unknown])[] = [
+        ['stopReason', 'crash loop'],
+        ['breakerOpen', true],
+        ['state', 'watching'],
+        ['handle', successor],
+        ['reviewAbort', null],
+      ];
+      for (const [field, value] of broken) {
+        const intact = aborted[field];
+        aborted[field] = value;
+        expect(fenceOf(h, jobId), field).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+        aborted[field] = intact;
+        expect(h.supervisor.pendingProducerBlockers(jobId), field).toEqual([]);
+      }
+    } finally { h.dispose(); }
+  });
+
+  it('an aborted review attempt keeps fencing until the adapter attests cessation, however its disposal settled', async () => {
+    const h = boot();
+    try {
+      const { jobId, handle } = reviewAttemptOnJob(h, 'abort-unproven');
+      // The disposal fulfils but the adapter cannot attest the child gone:
+      // fulfilment is never cessation proof, so the job stays fenced.
+      handle.dispose = async () => { handle.disposed = true; handle.setState('disposed'); };
+      handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      await flushMicrotasks();
+      expect(handle.cessation).toBe('unknown');
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      // Evidence that throws, or an adapter with no evidence method, is unknown too.
+      handle.cessationEvidence = () => { throw new Error('evidence unavailable'); };
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      handle.cessationEvidence = undefined;
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      // A late attestation releases the job at the next fence read, with no further event.
+      handle.cessationEvidence = () => handle.cessation;
+      handle.cessation = 'ceased';
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
     } finally { h.dispose(); }
   });
 
