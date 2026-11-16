@@ -4784,8 +4784,8 @@ describe('supervisor — isolated review ownership', () => {
       handle.cessationEvidence = undefined;
       expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
       // The record retains the detached handle while its evidence can matter.
-      const retained = recordOf(h, handle.id)['reviewAbort'] as { handle: unknown };
-      expect(retained.handle).toBe(handle);
+      const retained = recordOf(h, handle.id)['reviewAbort'] as { handle: unknown } | undefined;
+      expect(retained?.handle).toBe(handle);
       expect(retained).toMatchObject({ disposed: true, ceased: false });
       // A late attestation releases the job at the next fence read, with no further event.
       handle.cessationEvidence = () => handle.cessation;
