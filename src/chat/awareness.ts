@@ -21,7 +21,7 @@ import {
   isHardFloorRow,
 } from './incident.js';
 import { redactedText } from '../decisions/questions.js';
-import { WakePolicy, type WakeCandidate, type WakeDecision } from './wake-policy.js';
+import { WakePolicy, type WakeCandidate, type WakeDecision, type WakePolicyConfig } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -100,6 +100,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 export const AWARENESS_STATE_NAME = 'awareness.json';
 
 export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not a user message]';
+
+/** Leads an owner turn's block while the mailbox projection cannot be read. */
+export const MAILBOX_UNAVAILABLE_NOTICE =
+  'FOR GRU mailbox unavailable, not empty: GET /api/mailbox fails until its source evidence reads again, and autonomous wakes wait for it.';
 
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
@@ -600,7 +604,9 @@ export class GruAwareness {
   private mailboxEventTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly mailboxIntervalMs: number;
   private readonly limits: AwarenessLimits;
-  private readonly wakePolicy: WakePolicy;
+  /** Rebuilt once, by {@link adoptLegacyKeys}, when legacy claims are re-keyed. */
+  private wakePolicy: WakePolicy;
+  private readonly wakePolicyConfig: WakePolicyConfig;
   private readonly wakeMode: NotifyWakeMode;
   private readonly morningDigestGapMs: number;
   /** Issue #219 kill switch: hold-covered deferral (default ON). */
@@ -667,6 +673,13 @@ export class GruAwareness {
    * the created→triaged event double-delivery, not a correctness
    * contract; FIFO-evicted at 512 ids. */
   private readonly askedEscalations = new Set<string>();
+  /** The bound sink's boot reconciliation (legacy keys, receipt replay,
+   * backlog seed) has not completed because the mailbox was unreadable.
+   * Nothing is released until it has: a wake flushed before the receipts
+   * replay could re-prompt an id a previous process already delivered. */
+  private bootOwed = false;
+  /** Persisted pre-domain keys still need the mailbox to be re-keyed. */
+  private legacyKeysOwed = false;
   private disposed = false;
 
   constructor(opts: GruAwarenessOptions) {
@@ -704,44 +717,30 @@ export class GruAwareness {
     // by the digest's own 101-row caps and the `since` filters.
     this.baselineIsNew = state.digest?.baselineAt === undefined;
     this.digestBaselineAt = state.digest?.baselineAt ?? this.now();
-    const compatibleLegacyRow = (id: string): NotificationRecord | null =>
-      id.startsWith('mailbox:') && this.ledger.getNotification(id) === null ? this.mailbox?.getAttentionRow(id) ?? null : null;
-    const normalizeLegacyKey = (id: string): string => {
-      const row = compatibleLegacyRow(id);
-      return row === null ? id : this.rowKey(row);
-    };
-    this.pendingWakeIds = new Set((state.wake?.pending ?? []).map(normalizeLegacyKey));
+    // Persisted keys are adopted as written; pre-domain `mailbox:` keys are
+    // re-keyed through the mailbox below, or at boot when it is unreadable.
+    this.pendingWakeIds = new Set(state.wake?.pending ?? []);
     this.unreceipted = (state.wake?.unreceipted ?? []).map((batch, index) => ({
       ...batch,
       id: batch.id ?? `legacy-${index}`,
-      ids: batch.deliveries === undefined ? batch.ids.map(normalizeLegacyKey) : [...batch.ids],
+      ids: [...batch.ids],
       at: batch.at,
     }));
-    this.wakeFailures = new Map(Object.entries(state.wake?.wakeFailures ?? {}).map(([id, count]) => {
-      const key = normalizeLegacyKey(id);
-      return [this.failureKey(key), count];
-    }));
-    this.wakePolicy = new WakePolicy(
-      {
-        mode: this.wakeMode,
-        minSeverity: opts.wakeMinSeverity ?? 'info',
-        minIntervalMs: opts.wakeMinIntervalMs ?? 300_000,
-        quietHours: opts.wakeQuietHours ?? null,
-      },
-      state.wake === undefined ? { woken: [], lastFiredAt: null } : {
-        ...state.wake,
-        woken: state.wake.woken.flatMap((id) => {
-          if (!id.startsWith('mailbox:')) return [id];
-          const row = compatibleLegacyRow(id);
-          if (row !== null) {
-            const item = JSON.parse(row.detail!) as MailboxItem;
-            return item.receipt?.attentionKey === item.attentionKey ? [this.rowKey(row)] : [];
-          }
-          // Bare collision claims cannot prove a genuine delivery; durable domain-linked events replay below.
-          return this.mailbox?.getAttentionRow(id) != null ? [] : [id];
-        }),
-      },
-    );
+    this.wakeFailures = new Map(Object.entries(state.wake?.wakeFailures ?? {}));
+    this.wakePolicyConfig = {
+      mode: this.wakeMode,
+      minSeverity: opts.wakeMinSeverity ?? 'info',
+      minIntervalMs: opts.wakeMinIntervalMs ?? 300_000,
+      quietHours: opts.wakeQuietHours ?? null,
+    };
+    this.wakePolicy = new WakePolicy(this.wakePolicyConfig, state.wake ?? { woken: [], lastFiredAt: null });
+    const legacy = (id: string): boolean => id.startsWith('mailbox:');
+    const rekeyReadsMailbox = this.mailbox !== null && (
+      [...this.pendingWakeIds, ...this.wakePolicy.snapshot().woken].some(legacy) ||
+      this.unreceipted.some((batch) => batch.deliveries === undefined && batch.ids.some(legacy)) ||
+      [...this.wakeFailures.keys()].some((id) => legacy(id) || id.startsWith(MAILBOX_KEY_PREFIX)));
+    this.legacyKeysOwed = rekeyReadsMailbox && !this.mailboxReadable('legacy wake keys');
+    if (!this.legacyKeysOwed) this.adoptLegacyKeys();
     if (this.baselineIsNew && this.lastOwnerAt === null) {
       try { this.persist(); } catch (error) {
         this.log('error', 'gru awareness baseline persist failed — digest baseline resets on restart', {
@@ -905,14 +904,90 @@ export class GruAwareness {
    * Existing machine-routed rows remain Gru's backlog, not owner bell items. */
   setWakeSink(sink: () => void): void {
     this.wakeSink = sink;
-    this.reconcileUnreceiptedReceipts();
-    this.reconcileWakeReceipts();
-    this.seedBacklog();
-    this.flushPendingWakes();
+    // Armed first: this interval is also the clock that retries a held boot.
     if (this.mailbox !== null && this.mailboxTimer === null) {
       this.mailboxTimer = setInterval(() => this.reconcileMailboxAttention(), this.mailboxIntervalMs);
       this.mailboxTimer.unref?.();
     }
+    this.bootWake();
+  }
+
+  /** Boot reconciliation as one unit: re-key legacy claims, replay delivered
+   * receipts, then seed and release the backlog. Over an unreadable mailbox
+   * none of it runs and it stays owed; the reconcile clock retries it. */
+  private bootWake(): void {
+    this.bootOwed = true; // until the receipt replay below has run
+    if (!this.mailboxReadable('boot wake reconciliation')) return;
+    if (this.legacyKeysOwed) {
+      this.adoptLegacyKeys();
+      this.legacyKeysOwed = false;
+    }
+    this.reconcileUnreceiptedReceipts();
+    this.reconcileWakeReceipts();
+    this.bootOwed = false;
+    this.seedBacklog();
+    this.flushPendingWakes();
+  }
+
+  /**
+   * The one place awareness asks whether the mailbox can be read. A
+   * projection that throws (corrupt evidence for a single lane) is NOT an
+   * empty mailbox, and it is not a reason to end the process either: every
+   * root of wake work asks here first and, on false, changes nothing —
+   * pending wakes, delivery claims and receipt debt stay exactly as they
+   * are, no autonomous turn opens, and the same roots run again on the next
+   * reconcile tick. Other readers are untouched: the board keeps answering
+   * 503 and `GET /api/mailbox` keeps failing for as long as the source does.
+   */
+  private mailboxReadable(held: string): boolean {
+    return this.mailboxFailure(held) === null;
+  }
+
+  /** {@link mailboxReadable} with the cause, for the owner-context notice. */
+  private mailboxFailure(held: string): string | null {
+    if (this.mailbox === null) return null;
+    try {
+      this.mailbox.snapshot();
+      return null;
+    } catch (error) {
+      this.log('error', 'mailbox reconciliation failed', { error: String(error), held });
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /** Re-key persisted pre-domain `mailbox:` claims to their current mailbox
+   * rows. Idempotent, and every read happens before the first write, so a
+   * failed read leaves the adopted state as it was. */
+  private adoptLegacyKeys(): void {
+    const compatibleLegacyRow = (id: string): NotificationRecord | null =>
+      id.startsWith('mailbox:') && this.ledger.getNotification(id) === null ? this.mailbox?.getAttentionRow(id) ?? null : null;
+    const normalizeLegacyKey = (id: string): string => {
+      const row = compatibleLegacyRow(id);
+      return row === null ? id : this.rowKey(row);
+    };
+    const pending = [...this.pendingWakeIds].map(normalizeLegacyKey);
+    const unreceipted = this.unreceipted.map((batch) => ({
+      ...batch,
+      ids: batch.deliveries === undefined ? batch.ids.map(normalizeLegacyKey) : [...batch.ids],
+    }));
+    const failures = [...this.wakeFailures].map(([id, count]) => [this.failureKey(normalizeLegacyKey(id)), count] as const);
+    const policy = this.wakePolicy.snapshot();
+    const woken = policy.woken.flatMap((id) => {
+      if (!id.startsWith('mailbox:')) return [id];
+      const row = compatibleLegacyRow(id);
+      if (row !== null) {
+        const item = JSON.parse(row.detail!) as MailboxItem;
+        return item.receipt?.attentionKey === item.attentionKey ? [this.rowKey(row)] : [];
+      }
+      // Bare collision claims cannot prove a genuine delivery; durable domain-linked events replay below.
+      return this.mailbox?.getAttentionRow(id) != null ? [] : [id];
+    });
+    this.pendingWakeIds.clear();
+    for (const id of pending) this.pendingWakeIds.add(id);
+    this.unreceipted.splice(0, this.unreceipted.length, ...unreceipted);
+    this.wakeFailures.clear();
+    for (const [key, count] of failures) this.wakeFailures.set(key, count);
+    this.wakePolicy = new WakePolicy(this.wakePolicyConfig, { ...policy, woken });
   }
 
   private rowKey(row: NotificationRecord): string {
@@ -996,8 +1071,12 @@ export class GruAwareness {
   private reconcileMailboxAttention(): void {
     if (this.disposed || this.mailbox === null) return;
     // Decision backlog is a boot/live-event obligation, not a per-mailbox-
-    // event scan: skip it on routine reconciliations (#506 review).
-    try { this.seedBacklog({ seedDecisions: false }); } catch (error) {
+    // event scan: skip it on routine reconciliations (#506 review). A boot
+    // held by an unreadable mailbox is the exception: it runs whole, here.
+    try {
+      if (this.bootOwed) this.bootWake();
+      else this.seedBacklog({ seedDecisions: false });
+    } catch (error) {
       this.log('error', 'mailbox reconciliation failed', { error: String(error) });
     }
   }
@@ -1049,6 +1128,9 @@ export class GruAwareness {
   private prepareBlock(source: 'chat' | 'wake'): AwarenessInjection | null {
     const latest = this.ledger.latestEventSeq();
     const exclusiveWake = source === 'wake' && this.activeWakeIds !== null;
+    // An unreadable mailbox is said so, never rendered as an empty one. The
+    // rest of the block (owner rows, digests) does not depend on it.
+    const mailboxUnavailable = exclusiveWake ? null : this.mailboxFailure('owner context');
     const morning = source === 'chat' ? this.morningDigest() : null;
     // A delivered context block is not a disposition. Open machine and
     // owner stops remain in subsequent user turns even after the event
@@ -1059,7 +1141,8 @@ export class GruAwareness {
     // receipts. They are LABELED here and rendered under their own
     // section, never counted as machine attention and never wake seeds.
     const owners = exclusiveWake ? null : this.rotatedOwnerQueue();
-    const machine = exclusiveWake ? null : this.rotatedMachineQueue();
+    const machine = exclusiveWake ? null : mailboxUnavailable === null ? this.rotatedMachineQueue()
+      : { offset: this.attentionRotation.machine, live: [], receiptRows: [], noLiveAdvance: this.attentionRotation.machine };
     // Composed candidate rows with their absolute queue positions: the
     // rotation advance is computed from what the delivered block actually
     // rendered (GH-109), never from the fetched page alone — slot and byte
@@ -1087,7 +1170,7 @@ export class GruAwareness {
       };
     })();
     const openAttention = attention.live;
-    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null && openAttention.length === 0) {
+    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null && openAttention.length === 0 && mailboxUnavailable === null) {
       // A page holding only closed receipts (or empty queues) renders
       // nothing — a null block, never delivered. The rotation must still
       // move (GH-109): advancing only at commit would wedge the offset
@@ -1189,6 +1272,7 @@ export class GruAwareness {
       for (const row of openAttention) addNote(this.rowKey(row));
       for (const row of attention.receipts) addReceipt(this.rowKey(row));
       for (const id of this.pendingWakeIds) {
+        if (mailboxUnavailable !== null && id.startsWith(MAILBOX_KEY_PREFIX)) continue; // kept pending, not readable
         const row = this.attentionRow(id);
         if (row !== null && this.isReceiptNotification(row.agentId)) {
           // A stored seed for a row that became a receipt (or predates
@@ -1216,7 +1300,7 @@ export class GruAwareness {
         addNote(id);
       }
     }
-    const rendered = this.render(notes, receiptNotes, digestLines, overflow, morning);
+    const rendered = this.render(notes, receiptNotes, digestLines, overflow, morning, mailboxUnavailable);
     for (const note of notes) {
       if (!note.mailbox || rendered?.ids.includes(note.id)) continue;
       const row = this.attentionRow(note.id);
@@ -1306,6 +1390,12 @@ export class GruAwareness {
    * a batch with no eligible member left cancels the turn. */
   admitWake(): boolean {
     if (this.activeWakeIds === null) return false;
+    if (!this.mailboxReadable('wake admission')) {
+      // Nothing in the batch can be revalidated, so no turn opens. Its ids
+      // are still durably pending; the next readable reconcile requests them.
+      this.activeWakeIds = null;
+      return false;
+    }
     const stillEligible: string[] = [];
     for (const id of this.activeWakeIds) {
       const row = this.attentionRow(id);
@@ -1369,6 +1459,10 @@ export class GruAwareness {
     const delivered = active
       .map((id) => {
         if (deliveredKeys.has(id)) return id;
+        // A mailbox delivery has one identity (only a decided owner card is
+        // delivered under another key), so an accepted turn never needs the
+        // mailbox — which may have become unreadable since it was prepared.
+        if (id.startsWith(MAILBOX_KEY_PREFIX)) return null;
         const row = this.attentionRow(id);
         const identity = row === null ? id : this.deliveredIdentity(id, row);
         return deliveredKeys.has(identity) ? identity : null;
@@ -1469,6 +1563,22 @@ export class GruAwareness {
     if (this.disposed) return;
     const ids = injection.attentionKeys ?? injection.notificationIds ?? [];
     this.recordWakeFailure(detail, ids);
+    if (!this.mailboxReadable('failed-turn retry accounting')) {
+      // The retry budget is keyed by mailbox basis and the owner stop names
+      // the alert; neither can be read. Owe the turn again instead, uncounted:
+      // no turn opens during the hold, so this is at most the one in flight.
+      // A mailbox delivery keeps its receipt and returns through the mailbox's
+      // own unhandled grace; every other id goes back to pending, unclaimed.
+      for (const id of ids) {
+        if (id.startsWith(MAILBOX_KEY_PREFIX)) continue;
+        this.pendingWakeIds.add(id);
+        this.wakePolicy.forget(id);
+        const row = this.attentionRow(id);
+        if (row !== null && parseOwnerDecisionKey(id) === null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
+      }
+      this.persistWakeState();
+      return;
+    }
     const retried: string[] = [];
     const escalated: string[] = [];
     for (const id of ids) {
@@ -1512,8 +1622,10 @@ export class GruAwareness {
   }
 
   noteWakeDeferred(reason: 'busy'): void {
-    for (const id of this.activeWakeIds ?? []) {
-      if (!id.startsWith(MAILBOX_KEY_PREFIX)) continue;
+    const mailboxIds = (this.activeWakeIds ?? []).filter((id) => id.startsWith(MAILBOX_KEY_PREFIX));
+    // The deferral is an audit line about a row; without the row there is nothing to record.
+    if (mailboxIds.length === 0 || !this.mailboxReadable('busy deferral record')) return;
+    for (const id of mailboxIds) {
       const row = this.attentionRow(id);
       if (row !== null) this.recordDeferred({ id, incidentKey: row.kind, routing: row.routing, severity: row.severity }, reason, null);
     }
@@ -1524,7 +1636,10 @@ export class GruAwareness {
   noteWakeBlocked(reason: string): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
-    for (const id of active) {
+    // An unreadable mailbox cannot name the alert. The batch is still released
+    // below, and the stop is posted when it is requested again and still blocked.
+    const nameable = active.length > 0 && this.mailboxReadable('blocked-wake owner stop') ? active : [];
+    for (const id of nameable) {
       const row = this.attentionRow(id);
       if (row?.routing !== 'action-required' || row.ackedAt !== null || row.resolvedAt !== null) continue;
       // Internal attention domains never enter SQLite TEXT identities. Keep
@@ -1734,6 +1849,10 @@ export class GruAwareness {
    * the receipt can never stay missing while the process runs. */
   private retryUnreceiptedReceipts(): void {
     if (this.disposed) return;
+    if (!this.mailboxReadable('delivery receipt retry')) {
+      this.scheduleReceiptRetry(); // the receipt stays parked at its original time
+      return;
+    }
     let changed = false;
     while (this.unreceipted.length > 0) {
       const batch = this.unreceipted[0]!;
@@ -1825,10 +1944,18 @@ export class GruAwareness {
     digestLines: readonly string[],
     overflow: boolean,
     morning: readonly string[] | null,
+    mailboxUnavailable: string | null = null,
   ): { text: string; ids: readonly string[]; digestDelivered: boolean } | null {
     const parts: string[] = [AWARENESS_BLOCK_HEADER];
     const ids: string[] = [];
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
+    if (mailboxUnavailable !== null) {
+      // Leads the block and is never budgeted away: without it an unreadable
+      // mailbox would look exactly like one with nothing in it.
+      const line = clampLine(`${MAILBOX_UNAVAILABLE_NOTICE} Cause: ${promptSafe(mailboxUnavailable)}`, this.limits.maxLineChars);
+      parts.push(line);
+      bytes += Buffer.byteLength(line, 'utf8') + 1;
+    }
     let truncated = overflow;
     let exhausted = false;
     // GH-110: the morning digest is owner-directed catch-up whose watermark
@@ -2567,6 +2694,8 @@ export class GruAwareness {
    * defers exactly as a fresh bus-event candidate would. */
   private seedBacklog(options: { readonly seedDecisions?: boolean } = {}): void {
     if (this.disposed || (this.wakeMode === 'never' && this.mailbox === null)) return;
+    // Every step below can read the mailbox; take none of them on a partial read.
+    if (!this.mailboxReadable('backlog seed')) return;
     let seeded = false;
     // Keep every still-open receipt (no 256-ID eviction), but discard
     // terminal IDs from pre-upgrade state or a missed close event.
@@ -2718,8 +2847,8 @@ export class GruAwareness {
   /** Release the pending batch as ONE turn when the schedule allows; while
    * it does not, arm the timer for the earliest allowed instant. */
   private flushPendingWakes(): void {
-    if (this.disposed || this.activeWakeIds !== null) return;
-    this.prunePending();
+    if (this.disposed || this.activeWakeIds !== null || this.bootOwed) return;
+    if (!this.prunePending()) return;
     if (this.pendingWakeIds.size === 0) return;
     if (this.now() < this.failedRetryAtMs) {
       const gate = this.wakePolicy.scheduleDecision(this.now());
@@ -2764,8 +2893,15 @@ export class GruAwareness {
    * sitting in pending only until this prune removes it. Incident dedupe
    * alone is NOT a prune reason: it is an admission decision (admitPath),
    * and pruning by it would undo the hard-floor bypass before its wake
-   * could flush (issue #219 review). */
-  private prunePending(): void {
+   * could flush (issue #219 review).
+   *
+   * Returns false, having changed nothing, while the mailbox is unreadable:
+   * a row that cannot be read is not a closed row, so the pending set is
+   * neither pruned nor released on it. The same holds until a held boot has
+   * re-keyed legacy claims and replayed delivered receipts. */
+  private prunePending(): boolean {
+    if (this.pendingWakeIds.size === 0) return true;
+    if (this.bootOwed || this.legacyKeysOwed || !this.mailboxReadable('pending wakes')) return false;
     let changed = false;
     for (const id of this.pendingWakeIds) {
       const row = this.attentionRow(id);
@@ -2783,6 +2919,7 @@ export class GruAwareness {
       changed = true;
     }
     if (changed) this.persistWakeState();
+    return true;
   }
 
   private persistWakeState(): void {
