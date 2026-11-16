@@ -196,6 +196,13 @@ class FakeRegistry implements SupervisorRegistry {
     for (const listener of this.listeners) listener(envelope);
   }
 
+  /** A tap publication with no handle provenance (the envelope's `handle` is
+   * optional): the shape a detached handle's late event can take when it is
+   * not filtered by handle identity. */
+  publishUntagged(agentId: string, role: Role, event: RuntimeEvent): void {
+    this.emit({ agentId, role, sessionFile: null, phase: 'event', event });
+  }
+
   onAgentEvent(listener: (envelope: AgentEventEnvelope) => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -4625,6 +4632,112 @@ describe('supervisor — isolated review ownership', () => {
     expect(h.registry.spawnCalls).toHaveLength(spawnsBefore);
 
     h.dispose();
+  });
+
+  it('an aborted review attempt no longer reports as a pending producer on its job (j-586)', async () => {
+    const h = boot();
+    try {
+      const jobId = 'job-review-abort-fence';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+      const handle = new FakeHandle('perkins', 'perkins-abort-fence', null, true);
+      h.registry.adopt(handle);
+      h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+      const spawns = h.registry.spawnCalls.length;
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      // The provider refuses the attempt at start: a fatal error aborts it.
+      handle.emit({ type: 'error', error: 'prompt is too long', fatal: true });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      await vi.waitFor(() => expect(h.api.getAgent(handle.id)?.state).toBe('error'));
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: false, stopReason: 'review aborted' });
+      // The record stays as the stop guard, but it is not a producer: no
+      // writer directive, closeout or re-arm on the job is fenced by it.
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      expect(h.registry.spawnCalls).toHaveLength(spawns);
+    } finally { h.dispose(); }
+  });
+
+  it('an attempt aborted by the watchdog with an open tool call and compaction releases the job fence too', async () => {
+    const h = boot();
+    try {
+      const jobId = 'job-review-abort-open-work';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+      const handle = new FakeHandle('perkins', 'perkins-abort-open-work', null, true);
+      h.registry.adopt(handle);
+      h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+      hang(handle);
+      handle.emit({ type: 'tool_start', callId: 'review-read-1', tool: 'bash' });
+      handle.emit({ type: 'compaction_start' });
+      // While the attempt is live its open work is a real producer fence.
+      expect(h.supervisor.pendingProducerBlockers(jobId).join(' ')).toContain('open turn/control/tool');
+      h.advance(60);
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted', openControl: false, openToolCalls: 0 });
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+    } finally { h.dispose(); }
+  });
+
+  it('late events from an aborted review attempt never enter the restart ladder, respawn it, or re-fence the job', async () => {
+    const h = boot();
+    try {
+      const jobId = 'job-review-abort-late';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+      const handle = new FakeHandle('perkins', 'perkins-abort-late', null, true);
+      h.registry.adopt(handle);
+      h.api.registerAgent({ id: handle.id, role: 'perkins', jobId });
+      const spawns = h.registry.spawnCalls.length;
+      handle.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      await vi.waitFor(() => expect(h.api.getAgent(handle.id)?.state).toBe('error'));
+      const supervisionKinds = (): string[] => h.api.listEvents({ limit: 200 })
+        .filter((event) => event.kind.startsWith('supervision.')).map((event) => event.kind);
+      expect(supervisionKinds()).toEqual(['supervision.review-attempt-aborted']);
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      // Late fatal and state events from the detached handle, then the same
+      // events with no handle provenance (a publication handle identity does
+      // not filter): none classifies, climbs the ladder, spawns or re-fences.
+      handle.emit({ type: 'error', error: 'late fatal from the detached handle', fatal: true });
+      handle.emit({ type: 'state', state: 'error', error: 'late state from the detached handle' });
+      h.registry.publishUntagged(handle.id, 'perkins', { type: 'error', error: 'late untagged fatal', fatal: true });
+      h.registry.publishUntagged(handle.id, 'perkins', { type: 'error', error: 'late untagged rate limit 429 too many requests', fatal: false });
+      h.registry.publishUntagged(handle.id, 'perkins', { type: 'state', state: 'error', error: 'late untagged state' });
+      h.registry.publishUntagged(handle.id, 'perkins', { type: 'turn_start' });
+      h.registry.publishUntagged(handle.id, 'perkins', { type: 'tool_start', callId: 'late-call', tool: 'bash' });
+      await sleep(60);
+      h.advance(2_000_000);
+      await sleep(60);
+      expect(h.registry.spawnCalls).toHaveLength(spawns);
+      expect(supervisionKinds()).toEqual(['supervision.review-attempt-aborted']);
+      expect(h.notificationsOfKind('supervision.breaker')).toHaveLength(0);
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({
+        state: 'stopped', breakerOpen: false, stopReason: 'review aborted', openTurn: false, openToolCalls: 0,
+      });
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+    } finally { h.dispose(); }
+  });
+
+  it('an aborted review attempt is excluded per agent: a sibling pending recovery on the same job still fences', async () => {
+    vi.useFakeTimers();
+    const h = boot();
+    try {
+      const jobId = 'job-review-abort-sibling';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId });
+      const writer = new FakeHandle('minion', 'writer-abort-sibling', null);
+      h.registry.adopt(writer);
+      h.api.registerAgent({ id: writer.id, role: 'minion', jobId });
+      const review = new FakeHandle('perkins', 'perkins-abort-sibling', null, true);
+      h.registry.adopt(review);
+      h.api.registerAgent({ id: review.id, role: 'perkins', jobId });
+      h.registry.spawnImpl = async () => { throw new Error('restart transport unavailable'); };
+      writer.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writer.disposed).toBe(true);
+      review.emit({ type: 'error', error: 'review transport failed', fatal: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(review.disposed).toBe(true);
+      expect(h.supervisor.viewFor(review.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
+      // Exactly the writer's pending restart; the aborted review adds nothing.
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([`supervised producer: ${writer.id} (pending recovery/retry)`]);
+    } finally { h.dispose(); vi.useRealTimers(); }
   });
 });
 
