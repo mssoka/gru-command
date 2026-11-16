@@ -261,7 +261,7 @@ const PINS: Record<string, number> = {
   'gitlab-poll.test.ts': 17,
   'gitlab-mr-read.test.ts': 31,
   'gru-cli.test.ts': 12,
-  'gru-mailbox.test.ts': 39,
+  'gru-mailbox.test.ts': 41,
   'report-artifact-handback.test.ts': 9,
   'report-handback-mailbox.test.ts': 31,
   'health.test.ts': 19,
