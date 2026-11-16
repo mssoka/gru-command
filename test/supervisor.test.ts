@@ -4693,12 +4693,12 @@ describe('supervisor — isolated review ownership', () => {
       expect(supervisionKinds()).toEqual(['supervision.review-attempt-aborted']);
       expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
       // Late fatal and state events from the detached handle, then the same
-      // events with no handle provenance (a publication handle identity does
-      // not filter): none classifies, climbs the ladder, spawns or re-fences.
+      // events with no handle provenance (which handle identity cannot
+      // filter): none classifies, climbs the ladder, spawns or re-fences.
       handle.emit({ type: 'error', error: 'late fatal from the detached handle', fatal: true });
       handle.emit({ type: 'state', state: 'error', error: 'late state from the detached handle' });
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'error', error: 'late untagged fatal', fatal: true });
-      h.registry.publishUntagged(handle.id, 'perkins', { type: 'error', error: 'late untagged rate limit 429 too many requests', fatal: false });
+      h.registry.publishUntagged(handle.id, 'perkins', { type: 'error', error: 'late untagged nonfatal error', fatal: false });
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'state', state: 'error', error: 'late untagged state' });
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'turn_start' });
       h.registry.publishUntagged(handle.id, 'perkins', { type: 'tool_start', callId: 'late-call', tool: 'bash' });
