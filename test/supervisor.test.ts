@@ -4712,6 +4712,8 @@ describe('supervisor — isolated review ownership', () => {
       await vi.waitFor(() => expect(logs).toContain('isolated review attempt disposal failed'));
       await flushMicrotasks();
       expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      // The failed disposal never releases, so the record does not pin the adapter.
+      expect(recordOf(h, handle.id)['reviewAbort']).toMatchObject({ handle: null, disposed: false, ceased: false });
       h.advance(2_000_000);
       await sleep(20);
       expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
@@ -4736,6 +4738,9 @@ describe('supervisor — isolated review ownership', () => {
       stopped['stopReason'] = 'operator stop';
       expect(fenceOf(h, otherJob)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
       stopped['stopReason'] = 'review aborted';
+      expect(fenceOf(h, otherJob)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
+      // A record built without the field (a hand-built fixture) is nullish-safe: it fences, never throws.
+      delete stopped['reviewAbort'];
       expect(fenceOf(h, otherJob)).toBe(`supervised producer: ${writer.id} (pending recovery/retry)`);
       // A real aborted attempt, released: every conjunct of the exclusion is
       // broken one at a time, and the fence must come back each time.
@@ -4778,9 +4783,17 @@ describe('supervisor — isolated review ownership', () => {
       expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
       handle.cessationEvidence = undefined;
       expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      // The record retains the detached handle while its evidence can matter.
+      const retained = recordOf(h, handle.id)['reviewAbort'] as { handle: unknown };
+      expect(retained.handle).toBe(handle);
+      expect(retained).toMatchObject({ disposed: true, ceased: false });
       // A late attestation releases the job at the next fence read, with no further event.
       handle.cessationEvidence = () => handle.cessation;
       handle.cessation = 'ceased';
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      // Cessation is monotonic: it is latched and the adapter is no longer retained.
+      expect(recordOf(h, handle.id)['reviewAbort']).toMatchObject({ handle: null, disposed: true, ceased: true });
+      handle.cessation = 'unknown';
       expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
     } finally { h.dispose(); }
   });

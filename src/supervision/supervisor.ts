@@ -215,12 +215,14 @@ interface SupervisedAgent {
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
   /** The enclosing Perkins workflow's isolated review attempt was aborted
-   * here (`abortIsolatedReviewAttempt`): the detached handle, and whether its
-   * disposal completed successfully (a failed disposal never sets it). The
+   * here (`abortIsolatedReviewAttempt`): whether its disposal completed
+   * successfully (a failed disposal never sets it), whether the adapter has
+   * attested the detached handle ceased (latched: it is monotonic), and the
+   * detached handle itself only while that evidence can still matter. The
    * record's `inRestart` is then only the persistent stop guard, never a
    * restart in flight; `releasedReviewAbort` names the one state in which
    * that guard has stopped being producer ownership. */
-  reviewAbort: { readonly handle: AgentHandle; disposed: boolean } | null;
+  reviewAbort: { handle: AgentHandle | null; disposed: boolean; ceased: boolean } | null;
   /**
    * Retained ordinary predecessor custody (F60-P2). When an ordinary restart
    * is refused because the predecessor's adapter could not attest cessation,
@@ -2094,7 +2096,7 @@ export class Supervisor {
    * and takes no further event. It can never produce again; the workflow owns
    * every replacement attempt under a new id. */
   private holdsReviewAbortGuard(agent: SupervisedAgent): boolean {
-    return agent.reviewAbort !== null && agent.handle === null;
+    return agent.reviewAbort != null && agent.handle === null;
   }
 
   /** The aborted attempt's guard has stopped being producer ownership: the
@@ -2104,15 +2106,21 @@ export class Supervisor {
    * failed, and while the adapter's evidence is unknown, the record fences as
    * it always has: a fulfilled disposal is never cessation proof (see
    * `adapterCessationEvidence`). The evidence is read at fence-read time, so a
-   * late attestation releases the job without another event. The caller's
-   * other pending terms (backoff timer, rate-limit retry, recovery admission,
-   * queued recovery, pending decision) are separate terms of the fence and
-   * still count. */
+   * late attestation releases the job without another event; the first
+   * `ceased` reading is latched and the detached handle dropped, so a released
+   * record retains no adapter. The caller's other pending terms (backoff
+   * timer, rate-limit retry, recovery admission, queued recovery, pending
+   * decision) are separate terms of the fence and still count. */
   private releasedReviewAbort(agent: SupervisedAgent): boolean {
     const abort = agent.reviewAbort;
-    return abort !== null && abort.disposed && agent.handle === null && agent.state === 'stopped' &&
-      agent.stopReason === REVIEW_ABORTED_STOP_REASON && !agent.breakerOpen &&
-      adapterCessationEvidence(abort.handle) === 'ceased';
+    if (abort == null || !abort.disposed || agent.handle !== null || agent.state !== 'stopped' ||
+      agent.stopReason !== REVIEW_ABORTED_STOP_REASON || agent.breakerOpen) return false;
+    if (!abort.ceased) {
+      if (abort.handle === null || adapterCessationEvidence(abort.handle) !== 'ceased') return false;
+      abort.ceased = true;
+      abort.handle = null;
+    }
+    return true;
   }
 
   /** Review attempts are fresh, ambient-free, and owned by the enclosing
@@ -2126,7 +2134,7 @@ export class Supervisor {
     // the record; once the disposal below completes and the adapter attests
     // cessation it is not producer ownership (`releasedReviewAbort`,
     // `pendingProducerBlockers`).
-    const abort = { handle, disposed: false };
+    const abort = { handle: handle as AgentHandle | null, disposed: false, ceased: false };
     agent.inRestart = true;
     agent.reviewAbort = abort;
     agent.handle = null;
@@ -2174,6 +2182,9 @@ export class Supervisor {
           // leaves the record fencing as it always has.
           abort.disposed = true;
         } catch (error) {
+          // A failed disposal never releases, so the handle's evidence can no
+          // longer matter: do not pin the adapter for the life of the process.
+          abort.handle = null;
           this.log('warn', 'isolated review attempt disposal failed', {
             agent_id: agent.agentId,
             error: String(error),
