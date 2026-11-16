@@ -4696,6 +4696,9 @@ describe('supervisor — isolated review ownership', () => {
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
       expect(handle.disposed).toBe(false);
       expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
+      // Even an adapter that already attests the child gone does not release a disposal still in flight.
+      handle.cessation = 'ceased';
+      expect(fenceOf(h, jobId)).toBe(`supervised producer: ${handle.id} (pending recovery/retry)`);
       finish();
       await vi.waitFor(() => expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]));
       expect(handle.disposed).toBe(true);
