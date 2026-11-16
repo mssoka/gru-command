@@ -97,7 +97,9 @@ describe('prune-stale-dist', () => {
     // (dist/dispatch/gitlab-poll.js); and #569 the shared OS
     // suspend evidence the supervisor's clock-gap classification and the
     // admission probe both read (dist/runtime/suspend-evidence.js); #560 the
-    // interrupted-dispatch reconciler (dist/dispatch/interrupted-dispatch.js).
+    // interrupted-dispatch reconciler (dist/dispatch/interrupted-dispatch.js);
+    // and the event-loop stall watchdog with its worker-thread entry
+    // (dist/supervision/loop-stall-watchdog.js and -worker.js).
     // #521 replaced the installed
     // part with the pi 1.4 closure (pi-coding-agent and pi-ai 1.4.0 with
     // their pi-agent-core, pi-mcp, pi-codemode, pi-tui and pi-telemetry
@@ -109,9 +111,9 @@ describe('prune-stale-dist', () => {
     // the capture globs, the shot list, the runner, its director and the
     // agent-browser adapter (dist/media/{capture-paths,shot-list,camera,
     // director,web-adapter}.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5316);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5318);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('3b9da2c6b86d02d3c76765e2070e4db24f8a173915dddc48329ea48a658d1b99');
+      .toBe('5235591c5c70dd7db4f5eb18c0b783f5c84989940b25ad2616014ede6b8f6714');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

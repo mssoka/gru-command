@@ -119,6 +119,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
   { file: 'lane-lifecycle.test.ts', workload: 'real git lanes swept with tracked-edit snapshots, slimmed and restored by running manifest setup, plus real verification runs' },
   { file: 'listener-probe.test.ts', workload: 'real child listeners and service port-guard probes' },
+  { file: 'loop-stall-watchdog.test.ts', workload: 'blocks its own main thread for seconds under a real watchdog thread and inspector, with real child processes; its millisecond thresholds need an unstarved host' },
   { file: 'onboarding-real-service.test.ts', workload: 'boots the compiled dist/main.js service and calls its onboarding route over HTTP' },
   { file: 'onboarding-proof.test.ts', workload: 'real throwaway git clones running manifest commands under the real verification budget, plus a whole review round over a real git lane' },
   { file: 'pr-media-camera.test.ts', workload: 'spawns real app processes on loopback ports, ends their process groups, and films a throwaway git clone of the merge base set up by its manifest' },

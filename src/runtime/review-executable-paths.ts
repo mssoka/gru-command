@@ -2666,6 +2666,8 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/supervision/notification-disposition.js",
   "dist/supervision/supervisor.js",
   "dist/supervision/restart-cleanup.js",
+  "dist/supervision/loop-stall-watchdog.js",
+  "dist/supervision/loop-stall-watchdog-worker.js",
   "dist/telemetry/yield.js",
   "dist/transcripts/service.js",
   "dist/vector/attack.js",

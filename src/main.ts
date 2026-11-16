@@ -22,6 +22,7 @@ import { NotificationCenter } from './notifications/center.js';
 import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
 import { bindSupervisorNotificationDisposition } from './supervision/notification-disposition.js';
 import { Supervisor } from './supervision/supervisor.js';
+import { startLoopStallWatchdog } from './supervision/loop-stall-watchdog.js';
 import { TranscriptService } from './transcripts/service.js';
 import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
@@ -974,6 +975,13 @@ async function main(): Promise<number> {
     ledger,
     notifications,
     decisions: decisionRuntime,
+    // A stall must name its cause: a watchdog thread captures what the main
+    // thread is doing while its heartbeat is silent, and the supervisor adds
+    // it to the stall record. Supervision off = no stall detection, so no
+    // watchdog either. Disposed with the supervisor.
+    ...(config.supervision.enabled
+      ? { stallEvidence: startLoopStallWatchdog({ log: (level, msg, fields) => logger.log(level, msg, fields) }) }
+      : {}),
     rateLimitBackoff: pacing.backoff,
     workerGate: pacing.gate,
     providerWalls: {

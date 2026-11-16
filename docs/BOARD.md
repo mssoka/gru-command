@@ -331,6 +331,29 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   per-repository, and cached data renders `STALE · last …` like any other
   row. GitLab pipelines never feed the default-branch CI alert below: a
   red GitLab pipeline shows on its row without waking Gru.
+  **A root validation that misses its deadline says where it was.** Each
+  pass gives root validation 60 s in all. When a repository's validation
+  is still unanswered at that deadline, the warn line `repo overview: root
+  validation exceeded its deadline` names the cause instead of only the
+  repository: `resolver` (`still pending`; `returned after the deadline`
+  — it answered late, and a large `timerLateMs` beside it means the main
+  thread was blocked rather than the step slow; or `not started`),
+  `pendingStep` with `pendingStepDetail` and `pendingStepMs`
+  (the resolver step that was awaited and for how long: `workspace
+  realpath`, `candidate lstat`, `candidate realpath`, `git marker lstat`,
+  `git marker access`, `git pointer read`, `git directory access`, `git
+  HEAD access`, `git rev-parse spawn`, `git rev-parse running` with the
+  child's pid, `git rev-parse exited, output still open` with its exit
+  code or signal, `reported root realpath`), `steps` (every step so far
+  with its duration, the pending one marked `+`), `waitedMs`, and
+  `timerLateMs` (how late the deadline timer itself fired; seconds here
+  mean the main thread was blocked). The fields are read after a health
+  look bounded at one second: `threadPoolMs` (how long a no-op job waited for a libuv
+  pool thread; `null` = none came free, the pool is full of work that is
+  not finishing), `workspaceStatMs` (a `stat` of `workspace_root`; slow or
+  `null` beside a small `threadPoolMs` points at that filesystem),
+  `probeLimitMs`, and `activeResources` (`process.getActiveResourcesInfo()`
+  counted by type). The row and its reason are unchanged.
   **Default-branch CI alert (#446):** the one runs call reads the 20
   newest default-branch runs; the chip shows the newest of them that tested
   the branch itself — `pull_request*` and fork runs that merely share its

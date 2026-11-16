@@ -36,6 +36,13 @@ import { observeDisposalSettlement } from '../runtime/disposal-observation.js';
 import { classifyProviderRejection } from '../provider-recovery/classify.js';
 import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDebt } from './restart-cleanup.js';
 import { readSuspendedSince } from '../runtime/suspend-evidence.js';
+import {
+  describeStallEvidence,
+  stallEvidenceFields,
+  unknownStallEvidence,
+  type LoopStallEvidence,
+  type LoopStallEvidenceSource,
+} from './loop-stall-watchdog.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -105,7 +112,8 @@ export interface SupervisorRegistry {
  *   when they agree it is either a macOS sleep (every Node clock keeps
  *   counting there) or a stalled event loop, and the OS decides. Either way
  *   every open turn gets a fresh window before the classification; only a
- *   stall leaves a `supervision.loop-stall` record and an hourly FYI.
+ *   stall leaves a `supervision.loop-stall` record and an hourly FYI, both
+ *   naming what the main thread was doing when a stall watchdog is wired.
  * - A restart that kills an open turn snapshots the pending prompt and
  *   re-delivers it on the resumed session; when no snapshot is possible
  *   it posts a durable action-required recoverable-lane note.
@@ -454,6 +462,11 @@ export interface SupervisorOptions {
    * false where the monotonic clock already decides (Linux) and when the
    * evidence is unreadable. */
   readonly suspendEvidence?: (sinceWallMs: number) => Promise<boolean>;
+  /** What the main thread was doing across a stall (its stack, and whether
+   * its loop was blocked or idle): added to the stall's event, log line and
+   * FYI. Disposed with the supervisor. Omitted = a stall is recorded with
+   * its gap alone. Production wires `startLoopStallWatchdog()`. */
+  readonly stallEvidence?: LoopStallEvidenceSource;
   /** Resolved rate-limit automatic retry policy (owner heist 2026-09-29);
    * null/omitted = feature off — the failure keeps its current ladder
    * behavior (stop for provider walls, nothing for other in-band errors). */
@@ -537,6 +550,7 @@ export class Supervisor {
   private readonly wallNow: () => number;
   private readonly monotonicNow: () => number;
   private readonly suspendEvidence: (sinceWallMs: number) => Promise<boolean>;
+  private readonly stallEvidence: LoopStallEvidenceSource | null;
   private readonly rateLimitBackoff: RateLimitBackoffPolicy | null;
   private readonly workerGate: PacingGate | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -601,6 +615,7 @@ export class Supervisor {
     this.wallNow = opts.wallNow ?? Date.now;
     this.monotonicNow = opts.monotonicNow ?? (() => performance.now());
     this.suspendEvidence = opts.suspendEvidence ?? readSuspendedSince;
+    this.stallEvidence = opts.stallEvidence ?? null;
     this.rateLimitBackoff = opts.rateLimitBackoff ?? null;
     this.workerGate = opts.workerGate;
     this.sleep = opts.sleep ?? defaultSleep;
@@ -1497,8 +1512,13 @@ export class Supervisor {
           suspended = false; // no evidence is a stall: a stall is visible, a sleep is not
         }
         if (this.disposed) return;
-        if (suspended) this.recordSleep(wallGap, affected);
-        else this.recordStall(wall, wallGap, monotonicGap);
+        if (suspended) {
+          this.recordSleep(wallGap, affected);
+          return;
+        }
+        const evidence = await this.readStallEvidence(previousWall, wall);
+        if (this.disposed) return;
+        this.recordStall(wall, wallGap, monotonicGap, evidence);
       })
       .catch((error) => this.log('warn', 'clock-gap classification failed', { error: String(error) }));
   }
@@ -1546,20 +1566,38 @@ export class Supervisor {
     }
   }
 
+  /** What the stall watchdog knows about the gap between two ticks. Never
+   * throws and never waits longer than the watchdog's own bound: a source
+   * that fails is itself the evidence ("unknown", with the reason). */
+  private async readStallEvidence(fromWallMs: number, toWallMs: number): Promise<LoopStallEvidence | null> {
+    if (this.stallEvidence === null) return null;
+    try {
+      return await this.stallEvidence.evidence({ fromWallMs, toWallMs });
+    } catch (error) {
+      return unknownStallEvidence(`the stall watchdog failed: ${String(error)}`);
+    }
+  }
+
   /** This process's own work could not run across the gap: the machine did
    * not sleep, so the silence is real and the service owes itself a record.
    * The grace already ran — an open turn is not restarted for a gap nothing
-   * could observe. */
-  private recordStall(wallMs: number, gapMs: number, monotonicGapMs: number): void {
-    this.log('warn', 'event-loop stall detected', {
+   * could observe. With a stall watchdog wired, the record also says what
+   * the main thread was doing (`main_thread`, `stacks`, how its loop spent
+   * the gap). */
+  private recordStall(
+    wallMs: number,
+    gapMs: number,
+    monotonicGapMs: number,
+    evidence: LoopStallEvidence | null,
+  ): void {
+    const fields = {
       gap_ms: gapMs,
       monotonic_gap_ms: monotonicGapMs,
-    });
-    this.recordEvent('supervision.loop-stall', null, {
-      gap_ms: gapMs,
-      monotonic_gap_ms: monotonicGapMs,
-    });
-    this.postStallFyi(wallMs, gapMs);
+      ...(evidence !== null ? stallEvidenceFields(evidence) : {}),
+    };
+    this.log('warn', 'event-loop stall detected', fields);
+    this.recordEvent('supervision.loop-stall', null, fields);
+    this.postStallFyi(wallMs, gapMs, evidence);
   }
 
   /**
@@ -1570,7 +1608,7 @@ export class Supervisor {
    * count and longest gap, a row a previous process created this hour is
    * never lowered, and a row the owner already resolved keeps its count.
    */
-  private postStallFyi(wallMs: number, gapMs: number): void {
+  private postStallFyi(wallMs: number, gapMs: number, evidence: LoopStallEvidence | null): void {
     const key = new Date(wallMs).toISOString().slice(0, 13);
     if (this.stallHour === null || this.stallHour.key !== key) {
       this.stallHour = {
@@ -1592,7 +1630,8 @@ export class Supervisor {
       'clock disagreement longer than that, so the machine did not sleep: its event loop was ' +
       'blocked. Open turns got a fresh silence window and were not restarted. This row aggregates ' +
       'every event-loop stall of this clock hour — ' +
-      `${hour.count} so far, longest ${Math.round(hour.longestMs / 1_000)} s.`;
+      `${hour.count} so far, longest ${Math.round(hour.longestMs / 1_000)} s.` +
+      (evidence !== null ? ` Latest stall: ${describeStallEvidence(evidence)}` : '');
     try {
       const existed = this.ledger.getNotification(hour.notificationId) !== null;
       if (!existed) {
@@ -4615,6 +4654,11 @@ export class Supervisor {
     }
     this.agents.clear();
     this.slots.clear();
+    try {
+      this.stallEvidence?.dispose();
+    } catch (error) {
+      this.log('warn', 'stall watchdog dispose failed', { error: String(error) });
+    }
   }
 }
 
