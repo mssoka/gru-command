@@ -8,6 +8,7 @@ import {
   AWARENESS_WAKE_INSTRUCTION,
   GruAwareness,
   MAILBOX_UNAVAILABLE_NOTICE,
+  WAKE_FAILURE_RETRIES,
   type AwarenessInjection,
   type AwarenessLimits,
   type GruAwarenessLedger,
@@ -3601,23 +3602,74 @@ describe('an unreadable mailbox holds wake work instead of ending the process', 
       (key: string) => ({ woken: [], pending: [], unreceipted: [{ ids: [key], at: Date.now(), source: 'wake' }] }),
       (key: string) => ({ woken: [], pending: [], wakeFailures: { [`\u0000mailbox:${key}`]: 1 } }),
     ];
-    for (const variant of variants) {
-      const r = holdRig();
-      try {
-        r.block('lane-a');
-        const key = r.mailbox.attentionRows()[0]!.id;
-        r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
-        writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, lastFiredAt: Date.now(), ...variant(key) } }));
-        r.corrupt();
-        let next!: GruAwareness;
-        expect(() => { next = r.start(); }).not.toThrow();
-        expect(() => next.setWakeSink(() => {})).not.toThrow();
-        r.repair();
-        expect(() => vi.advanceTimersByTime(6000)).not.toThrow();
-        expect(() => next.prepare()).not.toThrow();
-      } finally { r.close(); }
-    }
-    vi.useRealTimers();
+    try {
+      for (const variant of variants) {
+        const r = holdRig();
+        try {
+          r.block('lane-a');
+          const key = r.mailbox.attentionRows()[0]!.id;
+          r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
+          writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, lastFiredAt: Date.now(), ...variant(key) } }));
+          r.corrupt();
+          let next!: GruAwareness;
+          expect(() => { next = r.start(); }).not.toThrow();
+          expect(() => next.setWakeSink(() => {})).not.toThrow();
+          r.repair();
+          expect(() => vi.advanceTimersByTime(6000)).not.toThrow();
+          expect(() => next.prepare()).not.toThrow();
+        } finally { r.close(); }
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('boot: a re-keying failure after a readable probe holds like an unreadable mailbox instead of throwing', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      r.block('lane-a');
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.mailbox.receiptForKeys([key], 'wake', 'legacy-delivery');
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [], pending: [key], wakeFailures: { [key]: 1 }, lastFiredAt: Date.now() } }));
+      r.corrupt();
+      const next = r.start();
+      r.repair();
+      // The projection reads again, but the re-key's own row read fails once (a transient ledger fault).
+      vi.spyOn(r.mailbox, 'getAttentionRow').mockImplementationOnce(() => { throw new Error('simulated ledger fault'); });
+      let injection: AwarenessInjection | null = null;
+      expect(() => { injection = next.prepare(); }).not.toThrow();
+      expect((injection as AwarenessInjection | null)?.text).toContain('simulated ledger fault');
+      expect(r.logs.some((line) => line.startsWith('mailbox reconciliation failed') && line.includes('simulated ledger fault'))).toBe(true);
+      const requests = vi.fn();
+      next.setWakeSink(requests); // the next readable probe re-keys, and the legacy retry is owed as before
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(next.admitWake()).toBe(true);
+    } finally { r.close(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it('live: a ledger-backed id that exhausts its retries during the hold is escalated to the owner as usual', () => {
+    vi.useFakeTimers();
+    const r = holdRig();
+    try {
+      const awareness = r.start();
+      const turns: AwarenessInjection[] = [];
+      awareness.setWakeSink(r.accepting(awareness, turns));
+      const card = r.notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Merge #612?', detail: 'evidence', decision: ownerDecision });
+      r.notifications.decide(card.id, 'merge', 'owner');
+      expect(turns).toHaveLength(1);
+      for (let attempt = 1; attempt <= WAKE_FAILURE_RETRIES; attempt += 1) {
+        awareness.noteWakeTurnFailure('provider wall', turns.at(-1)!);
+        vi.advanceTimersByTime(6000);
+        expect(turns).toHaveLength(attempt + 1);
+      }
+      r.corrupt();
+      expect(() => awareness.noteWakeTurnFailure('provider wall', turns.at(-1)!)).not.toThrow();
+      const stops = r.api.listNotifications({ routing: 'needs-owner' }).filter((row) => row.kind.startsWith('gru.wake-failed-escalation.'));
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.detail).toContain('Merge #612?');
+      r.repair();
+      vi.advanceTimersByTime(30_000);
+      expect(turns).toHaveLength(WAKE_FAILURE_RETRIES + 1); // the stop replaces the autonomous path
+    } finally { r.close(); vi.useRealTimers(); }
   });
 
   it('boot: a decision recorded while the service was down is seeded by the held boot once it runs', () => {
@@ -3639,15 +3691,18 @@ describe('an unreadable mailbox holds wake work instead of ending the process', 
     } finally { r.close(); vi.useRealTimers(); }
   });
 
-  it('owner chat: with nothing else to report, an unreadable mailbox still leads the block', () => {
+  it('owner chat: with nothing else to report, an unreadable mailbox still leads the block and names its whole cause', () => {
     vi.useFakeTimers();
     const r = holdRig();
     try {
       const awareness = r.start();
       awareness.setWakeSink(() => {});
-      r.corrupt();
+      const lane = 'intake-slice-gru-service-restart-16f2da'; // a realistic lane id, longer than the old clamp left room for
+      r.api.addJob({ id: lane, repo: 'r', title: lane });
+      r.api.appendCustomEvent({ kind: 'github.branch-state', jobId: lane, payload: { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null } });
       const first = awareness.prepare();
       expect(first?.text.split('\n')[1]).toContain(MAILBOX_UNAVAILABLE_NOTICE);
+      expect(first?.text).toContain(`malformed PR evidence for ${lane}`);
       awareness.commit(first!);
       // No new event, nothing pending, no owner row: an empty block would read as an empty mailbox.
       const again = awareness.prepare();
@@ -3658,8 +3713,8 @@ describe('an unreadable mailbox holds wake work instead of ending the process', 
 
   it('live: a wake accepted as the mailbox became unreadable is claimed, and its unrendered member stays owed', () => {
     vi.useFakeTimers();
+    let maxBytes = 0;
     const measure = holdRig();
-    let maxBytes: number;
     try {
       measure.block('lane-a');
       measure.block('lane-b');
@@ -3670,7 +3725,7 @@ describe('an unreadable mailbox holds wake work instead of ending the process', 
       const second = lines.findIndex((line, index) => line.includes('job:lane-') && lines.slice(0, index).some((earlier) => earlier.includes('job:lane-')));
       expect(second).toBeGreaterThan(0);
       maxBytes = Buffer.byteLength(lines.slice(0, second).join('\n'), 'utf8') + 1; // room for one mailbox line, not two
-    } finally { measure.close(); }
+    } catch (error) { vi.useRealTimers(); throw error; } finally { measure.close(); }
     const r = holdRig({ limits: { maxBytes } });
     try {
       r.block('lane-a');

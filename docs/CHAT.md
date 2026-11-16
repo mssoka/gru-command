@@ -480,17 +480,20 @@ autonomous wake work instead: no step that needs the mailbox runs, so pending
 wakes are neither pruned nor released and delivery claims and receipt debt are
 not settled; no wake turn opens (owner-decision follow-throughs included, by
 owner ruling 2026-11-16). The hold logs `mailbox reconciliation failed` when it
-starts or its cause changes, and `mailbox readable again; held wake work
-resumes` when it ends. A boot that meets an unreadable mailbox still starts;
-legacy key re-keying, receipt replay and backlog seed run on the first
-reconcile (a source event or the interval) that can read the mailbox again,
-before anything is released. After repair the held work is released under the
-normal wake policy (rate limit, quiet hours), not necessarily as one turn. The
-hold ends when the lane's latest evidence reads again, for example when a newer
-`github.branch-state` observation for that lane replaces the malformed one.
-Owner turns keep their service context (owner rows, digests) and lead with
-`FOR GRU mailbox unavailable, not empty`, naming the cause so Gru can tell the
-owner which lane is affected. A wake turn that fails during the hold counts
+starts or its cause changes, and `mailbox readable again` when it ends. The
+first check that reads the mailbox again re-keys persisted legacy claims; a
+boot that met an unreadable mailbox still starts, and its receipt replay and
+backlog seed run on the first reconcile (a source event or the interval) that
+can read the mailbox, before anything is released. After repair the held work
+is released under the normal wake policy (rate limit, quiet hours), not
+necessarily as one turn. The hold ends when the projection reads again: for PR
+evidence, when a newer `github.branch-state` observation for that lane replaces
+the malformed one; for obligation evidence, when the obligation rows the cause
+lists are corrected. With several corrupt lanes the cause names the first one
+the projection meets, and repairing it moves the hold to the next (logged as a
+new cause). Owner turns keep their service context (owner rows, digests) and
+lead with `FOR GRU mailbox unavailable, not empty` and the cause on its own
+line, so Gru can tell the owner which lane or rows are affected. A wake turn that fails during the hold counts
 against the usual retry budget for its ledger-backed ids (owner decisions,
 notifications), so the count survives a restart; a mailbox item it carried is
 not counted, keeps its receipt and returns through the unhandled-delivery

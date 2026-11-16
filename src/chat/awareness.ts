@@ -103,7 +103,7 @@ export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not
 
 /** Leads an owner turn's block while the mailbox projection cannot be read. */
 export const MAILBOX_UNAVAILABLE_NOTICE =
-  'FOR GRU mailbox unavailable, not empty: the board and GET /api/mailbox fail and autonomous wakes wait until its evidence reads again. Tell the owner which lane the cause names.';
+  'FOR GRU mailbox unavailable, not empty: the board and GET /api/mailbox fail and autonomous wakes wait until its evidence reads again. Tell the owner what the cause below names.';
 
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
@@ -948,11 +948,16 @@ export class GruAwareness {
    * A hold is logged when it starts or its cause changes, never per probe
    * (the receipt retry alone probes every 5 s), and its end is logged too.
    * The first readable probe re-keys owed legacy claims before any caller
-   * reads them. */
+   * reads them; a re-keying failure holds exactly like an unreadable
+   * mailbox (the re-key reads before it writes, so nothing is half-done). */
   private mailboxFailure(held: string): string | null {
     if (this.mailbox === null) return null;
     try {
       this.mailbox.snapshot();
+      if (this.legacyKeysOwed) {
+        this.adoptLegacyKeys();
+        this.legacyKeysOwed = false;
+      }
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error);
       if (cause !== this.mailboxHeldCause) this.log('error', 'mailbox reconciliation failed', { error: String(error), held });
@@ -960,12 +965,8 @@ export class GruAwareness {
       return cause;
     }
     if (this.mailboxHeldCause !== null) {
-      this.log('info', 'mailbox readable again; held wake work resumes', { previous_error: this.mailboxHeldCause });
+      this.log('info', 'mailbox readable again', { previous_error: this.mailboxHeldCause });
       this.mailboxHeldCause = null;
-    }
-    if (this.legacyKeysOwed) {
-      this.adoptLegacyKeys();
-      this.legacyKeysOwed = false;
     }
     return null;
   }
@@ -1956,10 +1957,13 @@ export class GruAwareness {
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
     if (mailboxUnavailable !== null) {
       // Leads the block and is never budgeted away: without it an unreadable
-      // mailbox would look exactly like one with nothing in it.
-      const line = clampLine(`${MAILBOX_UNAVAILABLE_NOTICE} Cause: ${promptSafe(mailboxUnavailable)}`, this.limits.maxLineChars);
-      parts.push(line);
-      bytes += Buffer.byteLength(line, 'utf8') + 1;
+      // mailbox would look exactly like one with nothing in it. The cause has
+      // its own line so the clamp cannot cut the lane or rows it names.
+      for (const text of [MAILBOX_UNAVAILABLE_NOTICE, `Cause: ${promptSafe(mailboxUnavailable)}`]) {
+        const line = clampLine(text, this.limits.maxLineChars);
+        parts.push(line);
+        bytes += Buffer.byteLength(line, 'utf8') + 1;
+      }
     }
     let truncated = overflow;
     let exhausted = false;
