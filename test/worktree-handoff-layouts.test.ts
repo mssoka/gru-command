@@ -742,8 +742,9 @@ describe('lane release in a repository whose worktree inventory holds folders GC
     // lives under a folder that is gone.
     const noBacklink = folder(f.container, 'desktop-lane', { HEAD: 'ref: refs/heads/main\n', 'desktop-worktree-marker': '' });
     const goneParent = folder(f.container, 'gone-parent', { HEAD: 'ref: refs/heads/main\n', gitdir: `${join(directory(), 'missing', 'checkout', '.git')}\n` });
-    const result = await f.h.worktrees.release({ worktreeId: f.lane.id });
-    expect(result.status).toBe('swept');
+    const outcome = await f.h.worktrees.release({ worktreeId: f.lane.id }).then((result) => ({ result, error: null }), (error: unknown) => ({ result: null, error }));
+    expect(outcome.error).toBeNull();
+    expect(outcome.result?.status).toBe('swept');
     expect(existsSync(f.lane.path)).toBe(false);
     expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
     expect(kindsOf(f.h)).toContain('worktree.swept');
