@@ -170,6 +170,80 @@ export function sniffMediaType(bytes: Uint8Array): MediaType | null {
   return null;
 }
 
+const EBML_SEGMENT = 0x18538067;
+const EBML_TRACKS = 0x1654ae6b;
+const EBML_TRACK_ENTRY = 0xae;
+const EBML_VIDEO = 0xe0;
+const EBML_PIXEL_WIDTH = 0xb0;
+const EBML_PIXEL_HEIGHT = 0xba;
+
+/** Leading zero bits of one byte: an EBML number's length is one more. */
+function leadingZeros(byte: number): number {
+  return Math.clz32(byte) - 24;
+}
+
+/** One EBML element's contents; `whole` is false when the file ends before
+ * the element does. */
+interface EbmlRange {
+  readonly start: number;
+  readonly end: number;
+  readonly whole: boolean;
+}
+
+/** The children of one EBML master element named `wanted`. The walk ends at
+ * the first child it cannot read. A child of unknown size runs to the end of
+ * its parent (nothing says where else it ends), so it is the last one. */
+function ebmlChildren(bytes: Uint8Array, from: number, to: number, wanted: number): readonly EbmlRange[] {
+  const found: EbmlRange[] = [];
+  let at = from;
+  while (at < to) {
+    const idLength = leadingZeros(bytes[at]!) + 1;
+    if (idLength > 4 || at + idLength >= to) break;
+    let id = 0;
+    for (let index = 0; index < idLength; index += 1) id = id * 256 + bytes[at + index]!;
+    const sizeAt = at + idLength;
+    const sizeLength = leadingZeros(bytes[sizeAt]!) + 1;
+    if (sizeLength > 8 || sizeAt + sizeLength > to) break;
+    let size = bytes[sizeAt]! & (0xff >> sizeLength);
+    for (let index = 1; index < sizeLength; index += 1) size = size * 256 + bytes[sizeAt + index]!;
+    const unknown = size === 2 ** (7 * sizeLength) - 1;
+    const start = sizeAt + sizeLength;
+    const end = unknown ? to : Math.min(to, start + size);
+    if (id === wanted) found.push({ start, end, whole: unknown || start + size <= to });
+    at = end;
+  }
+  return found;
+}
+
+/** An unsigned integer element; null when it is absent, cut short or wider
+ * than a safe integer holds. */
+function ebmlUint(bytes: Uint8Array, range: EbmlRange | undefined): number | null {
+  if (range === undefined || !range.whole || range.end <= range.start || range.end - range.start > 6) return null;
+  let value = 0;
+  for (let index = range.start; index < range.end; index += 1) value = value * 256 + bytes[index]!;
+  return value;
+}
+
+/** The frame size of a WebM clip: `PixelWidth` × `PixelHeight` of its first
+ * video track. Null when the file names none (not WebM, cut short, or
+ * audio only). The camera checks a filmed clip against its shot's viewport
+ * with it. */
+export function webmFrameSize(bytes: Uint8Array): { readonly width: number; readonly height: number } | null {
+  if (sniffMediaType(bytes) !== 'video/webm') return null;
+  for (const segment of ebmlChildren(bytes, 0, bytes.length, EBML_SEGMENT)) {
+    for (const tracks of ebmlChildren(bytes, segment.start, segment.end, EBML_TRACKS)) {
+      for (const entry of ebmlChildren(bytes, tracks.start, tracks.end, EBML_TRACK_ENTRY)) {
+        for (const video of ebmlChildren(bytes, entry.start, entry.end, EBML_VIDEO)) {
+          const width = ebmlUint(bytes, ebmlChildren(bytes, video.start, video.end, EBML_PIXEL_WIDTH)[0]);
+          const height = ebmlUint(bytes, ebmlChildren(bytes, video.start, video.end, EBML_PIXEL_HEIGHT)[0]);
+          if (width !== null && height !== null && width > 0 && height > 0) return { width, height };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /** Validate a capture's bytes: non-empty, within the cap, a supported type by
  * magic bytes, and (for images) structurally decodable. */
 export function validateMediaBytes(bytes: Buffer): MediaType {

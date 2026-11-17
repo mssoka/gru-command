@@ -46,7 +46,8 @@ minion captures it itself    ──▶ POST /api/media (fallback)       ──�
 3. **Fallback: submit and bind.** When the repository declares no
    `[capture] serve`, or the output is not a web page, the minion captures
    it itself from its committed head (any screenshot or recording tool; the
-   rule suggests `agent-browser screenshot` and `agent-browser record`). Each
+   rule gives the `agent-browser` commands for a still and for a
+   [clip at the same viewport](#clips)). Each
    capture goes to `POST /api/media`, with the body
    sent from a file (`curl --data-binary @file`). The service accepts it only
    while the job's one live lane sits at exactly the named head, with no
@@ -146,7 +147,8 @@ workflow notes of every GC-built job). It is never committed.
   characters); it becomes the caption, with the viewport when a shot has
   more than one, and `before (merge base)` for a before shot.
 - **`kind`**: `screenshot` (PNG) or `clip` (WebM, recorded from the first
-  page through a moment past the last step).
+  page through a moment past the last step). Both are filmed at the shot's
+  viewport, by the same steps ([Clips](#clips)).
 - **`viewports`**: 1–3 of `desktop` (1280×800), `tablet` (768×1024), `mobile`
   (390×844), or `{"width": W, "height": H}` (320–3840 × 320–2160).
 - **`steps`**: 1–20, the first an `open`. `open` takes a path on the app
@@ -225,7 +227,8 @@ committed head and the job's shot list, then:
   the step's (`step_failed`); a command that never finishes is the tool's.
   agent-browser must be installed on the GC host (`npm install -g
   agent-browser && agent-browser install`); without it the run fails
-  `tool_missing`.
+  `tool_missing`. A list with a clip also needs `ffmpeg` on the host
+  ([Clips](#clips)).
 - **Storing.** A run stores all its files together, each a `media.captured`
   event with `captured_by: "gc"` and its `shot` (`run_id`, `shot_id`,
   `viewport`, `files`). A run counts only once all its files are stored. At a
@@ -262,6 +265,42 @@ committed head and the job's shot list, then:
   before the verification scheduler is disposed, and no run starts once it
   has begun. A run stopped while the service runs on (its job was parked)
   cleans up its folder itself.
+
+
+### Clips
+
+A clip is a screenshot's shot with `"kind": "clip"`: the same list, the same
+steps, the same viewports, the same isolated browser session, the same checks
+on the file, the same store. Only the last command differs. A still ends in
+`screenshot <file>`; a clip is recorded around the steps.
+
+- **Viewport.** `agent-browser record start` opens a fresh browser context
+  at the tool's own size (1280×634 on agent-browser 0.25.3), whatever
+  viewport was set before, and a recording keeps the frame size it starts
+  with. So the camera runs `record start <scratch file> <first page>`, then
+  `set viewport <w> <h>` on that page, then `record restart <the clip>`: the
+  restart takes the viewport as its frame and keeps the page as it is. The
+  scratch file is the run's own and is removed.
+- **The check.** A filmed clip must be a WebM whose frame is the shot's
+  viewport (an odd side is rounded up to the next even number by the
+  encoder: 391×845 is filmed as 392×846). GC reads the size from the file's
+  first video track. A clip at another size, a still where a clip was asked
+  for (or the reverse), and a WebM that names no frame size fail the run as
+  `tool_missing`: the tool did it, not the shot list, so a desktop recording
+  never reaches the card under a phone caption.
+- **ffmpeg.** agent-browser encodes a recording through the host's `ffmpeg`
+  and finds out it is missing only when the recording stops. GC asks first:
+  a list with a clip is refused before anything is served, with
+  `a clip needs ffmpeg on the Gru Command host … install it, for example
+  brew install ffmpeg or apt install ffmpeg`, as `tool_missing`. A list of
+  stills never asks, and needs none.
+- **Size.** A clip counts as one of the head's 8 captures and holds at most
+  10,000,000 bytes. A larger one fails the run as `capture_invalid`: shorten
+  the flow, or split it into two shots.
+- **Without GC's camera.** A minion that films its own clip
+  ([the fallback](#the-flow)) uses the same three commands. GC cannot
+  check that clip's size: a submission says nothing of the viewport it
+  claims.
 
 ## When media is owed
 

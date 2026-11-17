@@ -20,7 +20,7 @@ import {
 } from '../worktrees/manifest.js';
 import { removeTree } from '../worktrees/reclaim.js';
 import type { PlannedCapture } from './shot-list.js';
-import { MediaError, mediaRoot, validateMediaBytes } from './store.js';
+import { MediaError, mediaRoot, validateMediaBytes, webmFrameSize, type MediaType } from './store.js';
 import { CaptureToolError, ShotStepError, stripAnsi, type WebCaptureDriver } from './web-adapter.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -317,12 +317,14 @@ async function serveAndFilm(input: CameraRunInput, lease: VerificationLease, cwd
       } catch (error) {
         throw new CameraFailure('capture_invalid', `shot "${plan.shotId}" at ${plan.viewport.name} wrote no file: ${oneLine(error)}`);
       }
+      let mediaType: MediaType;
       try {
-        validateMediaBytes(bytes);
+        mediaType = validateMediaBytes(bytes);
       } catch (error) {
         if (error instanceof MediaError) throw new CameraFailure('capture_invalid', `shot "${plan.shotId}" at ${plan.viewport.name}: ${error.message}`);
         throw error;
       }
+      assertFilmedAsPlanned(plan, mediaType, bytes);
       if (app.exitedNow) throw new CameraFailure('serve_failed', `[capture] serve exited while shot "${plan.shotId}" was filmed: ${outputTail(app.output()) || 'no output'}`);
       filmed.push({ plan, bytes });
     }
@@ -330,6 +332,29 @@ async function serveAndFilm(input: CameraRunInput, lease: VerificationLease, cwd
   } finally {
     await stopApp(app, log);
   }
+}
+
+/** A filmed file is what its shot asked for: a still for a screenshot, a
+ * WebM for a clip, and a clip's frame is the shot's viewport (its encoder
+ * rounds an odd side up to the next even number). Anything else is the
+ * capture tool's doing, never the shot list's: a clip the tool recorded at
+ * its own default size would show a desktop page under a phone caption. */
+function assertFilmedAsPlanned(plan: PlannedCapture, mediaType: MediaType, bytes: Buffer): void {
+  const where = `shot "${plan.shotId}" at ${plan.viewport.name}`;
+  if (plan.kind === 'screenshot') {
+    if (mediaType.startsWith('image/')) return;
+    throw new CameraFailure('tool_missing', `${where}: the capture tool wrote ${mediaType} for a screenshot`);
+  }
+  if (mediaType !== 'video/webm') throw new CameraFailure('tool_missing', `${where}: the capture tool wrote ${mediaType} for a clip, not a WebM recording`);
+  const frame = webmFrameSize(bytes);
+  if (frame === null) throw new CameraFailure('tool_missing', `${where}: the clip names no frame size, so GC cannot tell it was filmed at the shot's viewport`);
+  const even = (side: number): number => side + (side % 2);
+  const { width, height } = plan.viewport;
+  if (frame.width === even(width) && frame.height === even(height)) return;
+  throw new CameraFailure(
+    'tool_missing',
+    `${where}: the clip was recorded at ${frame.width}x${frame.height}, not the shot's ${width}x${height} — the capture tool did not apply the viewport to the recording`,
+  );
 }
 
 /** A throwaway checkout of `sha`, set up by its own manifest (or
@@ -382,7 +407,7 @@ export async function filmShotList(input: CameraRunInput): Promise<CameraRunResu
   // Cheap refusals first: no budget slot is waited for to learn them.
   let problem: string | null;
   try {
-    problem = await abortable(input.driver.probe(input.signal), input.signal);
+    problem = await abortable(input.driver.probe(input.signal, input.plans), input.signal);
   } catch (error) {
     return { kind: 'failed', code: error instanceof CameraFailure ? error.code : 'tool_missing', detail: oneLine(error) };
   }

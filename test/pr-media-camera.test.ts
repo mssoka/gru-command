@@ -17,7 +17,7 @@ import {
 import type { VerificationLease, VerificationRunSpec } from '../src/verify/scheduler.js';
 import type { VerificationBudget } from '../src/verify/server.js';
 import { parseWorktreeManifest, type ManifestCapture } from '../src/worktrees/manifest.js';
-import { minimalPng } from './helpers/images.js';
+import { minimalPng, minimalWebm } from './helpers/images.js';
 
 /**
  * GC's camera (PR media PR 2): one run films a shot list at the lane's exact
@@ -137,17 +137,24 @@ interface Shot {
 }
 
 /** A browser stand-in: reads the page the app serves and writes a PNG. */
-function driver(opts: { probe?: string; fail?: unknown; bytes?: Buffer; during?: () => void } = {}): WebCaptureDriver & { readonly shots: Shot[] } {
+function driver(
+  opts: { probe?: string; fail?: unknown; bytes?: Buffer; bytesFor?: (request: WebShotRequest) => Buffer; during?: () => void } = {},
+): WebCaptureDriver & { readonly shots: Shot[]; readonly probed: (readonly PlannedCapture[])[] } {
   const shots: Shot[] = [];
+  const probed: (readonly PlannedCapture[])[] = [];
   return {
     shots,
-    probe: async () => opts.probe ?? null,
+    probed,
+    probe: async (_signal, asked) => {
+      probed.push(asked);
+      return opts.probe ?? null;
+    },
     shoot: async (request) => {
       const page = await (await fetch(`${request.baseUrl}${request.plan.steps[0]!.action === 'open' ? (request.plan.steps[0] as { path: string }).path : '/'}`)).text();
       shots.push({ request, page });
       opts.during?.();
       if (opts.fail !== undefined) throw opts.fail;
-      writeFileSync(request.outFile, opts.bytes ?? minimalPng());
+      writeFileSync(request.outFile, opts.bytesFor?.(request) ?? opts.bytes ?? minimalPng());
     },
   };
 }
@@ -389,6 +396,46 @@ describe('filmShotList', () => {
     expect(await filmShotList(run)).toMatchObject({ kind: 'failed', code: 'stopped' });
     expect(run.budgetFake.released).toHaveLength(1);
   });
+
+  it('stores a clip only at its shot\'s viewport: another size, another file type or an unreadable head is the tool\'s failure, never the shot list\'s', async () => {
+    const at = lane();
+    const clips = planCaptures(parseShotList(JSON.stringify({
+      version: 1,
+      shots: [{ id: 'flow', proves: 'AC2: the flow', kind: 'clip', viewports: ['mobile', { width: 391, height: 845 }], steps: [{ open: '/' }] }],
+    })));
+    // The encoder rounds an odd side up to the next even number.
+    const even = (side: number): number => side + (side % 2);
+    const asAsked = driver({ bytesFor: (request) => minimalWebm(even(request.plan.viewport.width), even(request.plan.viewport.height)) });
+    const filmed = await filmShotList(input(at, { driver: asAsked, plans: clips }));
+    expect(filmed.kind).toBe('filmed');
+    if (filmed.kind !== 'filmed') return;
+    expect(filmed.files.map((file) => [file.plan.viewport.name, file.bytes.equals(minimalWebm(even(file.plan.viewport.width), even(file.plan.viewport.height)))]))
+      .toEqual([['mobile', true], ['391x845', true]]);
+    // The host is asked about exactly what the run will film.
+    expect(asAsked.probed).toEqual([clips]);
+
+    // The tool's default frame under a phone caption: refused, by name.
+    expect(await filmShotList(input(at, { driver: driver({ bytes: minimalWebm(1280, 634) }), plans: clips }))).toEqual({
+      kind: 'failed',
+      code: 'tool_missing',
+      detail: 'shot "flow" at mobile: the clip was recorded at 1280x634, not the shot\'s 390x844 — the capture tool did not apply the viewport to the recording',
+    });
+    // One side right is not the viewport.
+    expect(await filmShotList(input(at, { driver: driver({ bytes: minimalWebm(390, 634) }), plans: clips })))
+      .toMatchObject({ kind: 'failed', code: 'tool_missing', detail: expect.stringContaining('recorded at 390x634, not the shot\'s 390x844') });
+    // A still where a clip was asked for, and a clip where a still was.
+    expect(await filmShotList(input(at, { driver: driver(), plans: clips }))).toEqual({
+      kind: 'failed', code: 'tool_missing', detail: 'shot "flow" at mobile: the capture tool wrote image/png for a clip, not a WebM recording',
+    });
+    expect(await filmShotList(input(at, { driver: driver({ bytes: minimalWebm(1280, 800) }) }))).toEqual({
+      kind: 'failed', code: 'tool_missing', detail: 'shot "home" at desktop: the capture tool wrote video/webm for a screenshot',
+    });
+    // A WebM that names no frame size cannot be vouched for.
+    const headless = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x82, 0x84]), Buffer.from('webm'), Buffer.alloc(32)]);
+    expect(await filmShotList(input(at, { driver: driver({ bytes: headless }), plans: clips }))).toEqual({
+      kind: 'failed', code: 'tool_missing', detail: 'shot "flow" at mobile: the clip names no frame size, so GC cannot tell it was filmed at the shot\'s viewport',
+    });
+  });
 });
 
 describe('endOrphanedCameraApps', () => {
@@ -483,13 +530,26 @@ describe('the agent-browser adapter', () => {
     expect(stepArgs({ action: 'open', path: '/x' }, 'http://[::1]:9')).toEqual(['open', 'http://[::1]:9/x']);
   });
 
-  it('records a clip from the first page, rolls a moment past the last step, and stops the recording', async () => {
+  it('records a clip at the shot\'s viewport: a first take opens the page, the viewport is set on it, and the restart films the flow into the real file', async () => {
     const workDir = tmp('gru-camera-adapter-');
-    const { run, calls } = recorder();
-    await new AgentBrowserDriver(run, () => ({})).shoot({ baseUrl: 'http://localhost:4321', plan: plan('clip'), outFile: join(workDir, 'c.webm'), workDir, signal: new AbortController().signal });
+    // The tool writes a take's file when the take ends.
+    const takes: string[] = [];
+    const { run, calls } = recorder((argv) => {
+      const tail = argv.slice(7);
+      if (tail[0] === 'record' && (tail[1] === 'start' || tail[1] === 'restart')) {
+        if (tail[1] === 'restart') writeFileSync(takes.at(-1)!, 'first take');
+        takes.push(tail[2]!);
+      }
+      return { code: 0 };
+    });
+    const outFile = join(workDir, 'c.webm');
+    await new AgentBrowserDriver(run, () => ({})).shoot({ baseUrl: 'http://localhost:4321', plan: plan('clip'), outFile, workDir, signal: new AbortController().signal });
     expect(calls.map((call) => call.argv.slice(7))).toEqual([
+      // A recording opens in a fresh context at the tool's own size, so a
+      // viewport set before it would be lost: none is.
+      ['record', 'start', expect.stringMatching(/warm-up-[0-9a-f-]{36}\.webm$/u), 'http://localhost:4321/board?tab=1'],
       ['set', 'viewport', '640', '480'],
-      ['record', 'start', join(workDir, 'c.webm'), 'http://localhost:4321/board?tab=1'],
+      ['record', 'restart', outFile],
       ['click', '#go'],
       ['fill', '#q', 'mock text'],
       ['wait', '--text', 'Done'],
@@ -498,6 +558,48 @@ describe('the agent-browser adapter', () => {
       ['close'],
     ]);
     expect(calls[0]!.argv.slice(5, 7)).toEqual(['--allowed-domains', 'localhost']);
+    // The first take is the run's own scratch: in its folder, never the
+    // capture, and gone once the shot is over.
+    expect(takes).toHaveLength(2);
+    expect(takes[0]!.startsWith(`${workDir}/`)).toBe(true);
+    expect(takes[0]).not.toBe(outFile);
+    expect(existsSync(takes[0]!)).toBe(false);
+    // The page that does not open is the shot's first step, as for a still.
+    const refused = recorder((argv) => (argv.includes('start') ? { code: 1, stdout: 'net::ERR_CONNECTION_REFUSED' } : { code: 0 }));
+    await expect(new AgentBrowserDriver(refused.run, () => ({})).shoot({ baseUrl: 'http://localhost:4321', plan: plan('clip'), outFile, workDir, signal: new AbortController().signal }))
+      .rejects.toThrow('shot "flow" step 1 (open "/board?tab=1") failed at 640x480: net::ERR_CONNECTION_REFUSED');
+    // A restart that fails is the tool's, never a step of the list.
+    const stuck = recorder((argv) => (argv.includes('restart') ? { code: 1, stdout: 'ffmpeg failed: exit 1' } : { code: 0 }));
+    const failed = new AgentBrowserDriver(stuck.run, () => ({})).shoot({ baseUrl: 'http://localhost:4321', plan: plan('clip'), outFile, workDir, signal: new AbortController().signal });
+    await expect(failed).rejects.toThrow(CaptureToolError);
+    await expect(failed).rejects.toThrow('agent-browser record restart failed: ffmpeg failed: exit 1');
+    expect(stuck.calls.at(-1)!.argv.slice(7)).toEqual(['close']);
+  });
+
+  it('asks the host for ffmpeg only when a clip is planned, and says what to install before anything is served', async () => {
+    const signal = new AbortController().signal;
+    const host = (ffmpeg: { code: number | null; stdout?: string; error?: string | null }) =>
+      recorder((argv) => (argv[0] === 'ffmpeg' ? ffmpeg : { code: 0, stdout: 'agent-browser 0.25.3' }));
+    // Stills only: the encoder is never asked for.
+    const stills = host({ code: null, error: 'ENOENT' });
+    expect(await new AgentBrowserDriver(stills.run, () => ({})).probe(signal, [plan('screenshot')])).toBeNull();
+    expect(stills.calls.map((call) => call.argv)).toEqual([['agent-browser', '--version']]);
+    // A clip on a host without ffmpeg: named, with the fix.
+    const bare = host({ code: null, error: 'ENOENT' });
+    expect(await new AgentBrowserDriver(bare.run, () => ({ PATH: '/usr/bin', AGENT_BROWSER_PROFILE: 'Default' })).probe(signal, [plan('screenshot'), plan('clip')]))
+      .toBe('a clip needs ffmpeg on the Gru Command host (agent-browser records through it): install it, for example `brew install ffmpeg` or `apt install ffmpeg`. Screenshots need none');
+    expect(bare.calls.map((call) => call.argv)).toEqual([['agent-browser', '--version'], ['ffmpeg', '-version']]);
+    // The same environment agent-browser will look it up in.
+    expect(bare.calls[1]!.env['PATH']).toBe('/usr/bin');
+    expect(bare.calls[1]!.env['AGENT_BROWSER_PROFILE']).toBeUndefined();
+    const broken = host({ code: 1, stdout: 'dyld: Library not loaded' });
+    expect(await new AgentBrowserDriver(broken.run, () => ({})).probe(signal, [plan('clip')]))
+      .toBe('ffmpeg -version failed, and a clip is recorded through it: dyld: Library not loaded');
+    expect(await new AgentBrowserDriver(host({ code: 0, stdout: 'ffmpeg version 8.0' }).run, () => ({})).probe(signal, [plan('clip')])).toBeNull();
+    // A missing agent-browser is named first: nothing else is asked.
+    const none = recorder(() => ({ code: null, error: 'ENOENT' }));
+    expect(await new AgentBrowserDriver(none.run, () => ({})).probe(signal, [plan('clip')])).toMatch(/agent-browser is not installed/u);
+    expect(none.calls).toHaveLength(1);
   });
 
   it('names the failing step, tells a missing tool from a failed step, and closes the session under a live signal', async () => {
@@ -516,8 +618,8 @@ describe('the agent-browser adapter', () => {
     const missing = recorder(() => ({ code: null, error: 'ENOENT' }));
     await expect(new AgentBrowserDriver(missing.run, () => ({})).shoot({ baseUrl: 'http://127.0.0.1:1', plan: plan('screenshot'), outFile: join(workDir, 'b.png'), workDir, signal: abort.signal }))
       .rejects.toThrow(CaptureToolError);
-    expect(await new AgentBrowserDriver(missing.run, () => ({})).probe(abort.signal)).toMatch(/agent-browser is not installed on the Gru Command host: run `npm install -g agent-browser/u);
-    expect(await new AgentBrowserDriver(recorder(() => ({ code: 0, stdout: 'agent-browser 0.25.3' })).run, () => ({})).probe(abort.signal)).toBeNull();
+    expect(await new AgentBrowserDriver(missing.run, () => ({})).probe(abort.signal, [])).toMatch(/agent-browser is not installed on the Gru Command host: run `npm install -g agent-browser/u);
+    expect(await new AgentBrowserDriver(recorder(() => ({ code: 0, stdout: 'agent-browser 0.25.3' })).run, () => ({})).probe(abort.signal, [])).toBeNull();
     // A stopped run still closes its browser: the close runs under its own signal.
     abort.abort();
     const stopped = recorder();

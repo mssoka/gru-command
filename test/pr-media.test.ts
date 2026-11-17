@@ -22,8 +22,9 @@ import {
   storeMedia,
   validateCaption,
   validateMediaBytes,
+  webmFrameSize,
 } from '../src/media/store.js';
-import { minimalGif, minimalJpeg, minimalPng, minimalWebp } from './helpers/images.js';
+import { minimalGif, minimalJpeg, minimalPng, minimalWebm, minimalWebp } from './helpers/images.js';
 
 /**
  * PR media store (owner rulings 2026-11-15, PR 1): captures are validated by
@@ -52,6 +53,19 @@ function ledgerWithJob(): { ledger: LedgerApi; dataDir: string } {
 const HEAD = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
 
+/** The first 331 bytes of a clip agent-browser 0.25.3 recorded at 390x844
+ * (ffmpeg's libavformat 62 wrote it): through the video track's frame size. */
+const RECORDED_WEBM_HEAD = Buffer.from(
+  '1a45dfa39f4286810142f7810142f2810442f381084282847765626d4287810242858102185380670100000000008f0f114d9b74ba4dbb' +
+  '8b53ab841549a96653ac81a14dbb8b53ab841654ae6b53ac81d64dbb8c53ab841254c36753ac8201294dbb8c53ab841c53bb6b53ac828e' +
+  'f9ec0100000000000059000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000' +
+  '00000000000000000000000000000000000000000000000000000000000000000000000000000000000000001549a966b02ad7b1830f42' +
+  '404d808c4c61766636322e332e31303057418c4c61766636322e332e3130304489884095e000000000001654ae6bceae01000000000000' +
+  '45d7810173c588c8e11c6bc49c7fb69c810022b59c83756e648881008685565f56503883810123e3838405f5e100e096b0820186ba8203' +
+  '4c',
+  'hex',
+);
+
 function webm(): Buffer {
   return Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x82, 0x84]), Buffer.from('webm'), Buffer.alloc(32)]);
 }
@@ -79,6 +93,26 @@ describe('PR media store', () => {
     // An EBML header that is not the webm doctype (Matroska) is refused.
     expect(sniffMediaType(Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('matroska'), Buffer.alloc(32)]))).toBeNull();
     expect(sniffMediaType(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'))).toBeNull();
+  });
+
+  it('reads a clip\'s frame size from its first video track, and names none for a file it cannot read whole', () => {
+    // A real recording's head, and the same structure built by hand.
+    expect(webmFrameSize(RECORDED_WEBM_HEAD)).toEqual({ width: 390, height: 844 });
+    expect(webmFrameSize(minimalWebm(1280, 800))).toEqual({ width: 1280, height: 800 });
+    expect(webmFrameSize(minimalWebm(3840, 2160))).toEqual({ width: 3840, height: 2160 });
+    // Cut one byte short, the height is half a number: no size, never a wrong one.
+    expect(webmFrameSize(RECORDED_WEBM_HEAD.subarray(0, RECORDED_WEBM_HEAD.length - 1))).toBeNull();
+    expect(webmFrameSize(RECORDED_WEBM_HEAD.subarray(0, 120))).toBeNull();
+    // An audio track, a WebM with no tracks, another type, nothing at all.
+    const audioOnly = minimalWebm(640, 480);
+    audioOnly[audioOnly.indexOf(0xe0, 30)] = 0xe1;
+    expect(webmFrameSize(audioOnly)).toBeNull();
+    expect(webmFrameSize(webm())).toBeNull();
+    expect(webmFrameSize(minimalPng())).toBeNull();
+    expect(webmFrameSize(Buffer.alloc(0))).toBeNull();
+    // A hand-built head is still a WebM by its magic bytes.
+    expect(sniffMediaType(minimalWebm())).toBe('video/webm');
+    expect(validateMediaBytes(minimalWebm(390, 844))).toBe('video/webm');
   });
 
   it('refuses empty, oversized, unsupported and truncated captures with named codes', () => {
