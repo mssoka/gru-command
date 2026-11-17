@@ -42,15 +42,17 @@ export class WorktreeHandoffUnresolvedError extends Error {
   }
 }
 
-/** A release removed a lane's checkout, and a resource of the lane's OWN still
- * stands: its checkout path (re-created or never gone), its administration
- * folder under the repository's `worktrees`, or a folder that names the
- * checkout. Resources of other lanes and other tools never raise it. The
- * lane's row stays as it was, so a later release can finish the job once the
+/** A release has removed a lane's checkout, and a resource of the lane's OWN
+ * still stands: its checkout path (re-created), its administration folder under
+ * the repository's `worktrees`, or a folder that names the checkout. Raised only
+ * by the proof AFTER the removal has run (the endpoint answers 409). A refusal
+ * before any removal is a {@link WorktreeHandoffUnresolvedError} (400) and
+ * touches nothing. Resources of other lanes and other tools never raise either.
+ * The lane's row is not flipped, so a later release can finish the job once the
  * residue is cleared. */
 export class LaneResidueError extends Error {
   constructor(readonly path: string, readonly residue: readonly string[]) {
-    super(`release refused to finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again; its row stays active`);
+    super(`release could not finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again`);
     this.name = 'LaneResidueError';
   }
 }
@@ -895,24 +897,49 @@ export function laneAdministrationOf(lane: WorktreeLane): string | null {
   try { return adminFor(lane.path); } catch { return null; }
 }
 
-/** What of `lane`'s own stands: its checkout path, `admin` (the folder its
- * checkout named, when known), and any inventory folder that is its
- * administration. Never judges anything else in the repository. */
-export function laneResidue(lane: WorktreeLane, admin: string | null): { readonly residue: readonly string[]; readonly unscanned: string | null } {
+/** The administration folder this service recorded for `lane` when it issued
+ * its handoff (the ledger keeps it), or null when none is on record. It names
+ * the lane's own folder whatever state the folder or the rest of the
+ * inventory is in. */
+function recordedAdministration(lane: WorktreeLane): string | null {
+  const association = knownLanes.get(lane.path);
+  if (association === undefined) return null;
+  try {
+    for (const event of completionFacts(association.ledger)) if (event.payload.id === lane.id) return event.payload.admin;
+  } catch { return null; }
+  return null;
+}
+
+/** What of `lane`'s own stands: its checkout path, its administration folder
+ * (`admin`: the one its checkout named, read before a removal; else the one
+ * the ledger recorded), and any inventory folder that is its administration.
+ * Never judges anything else in the repository. `identified` says whether the
+ * lane's own folder is known by name, which an unreadable inventory cannot
+ * then hide; `unscanned` says why the inventory could not be read. */
+export function laneResidue(lane: WorktreeLane, admin: string | null): { readonly residue: readonly string[]; readonly unscanned: string | null; readonly identified: boolean } {
   const standing = (path: string): boolean => {
     try { lstatSync(path); return true; } catch (error) { return errnoOf(error) !== 'ENOENT' && errnoOf(error) !== 'ENOTDIR'; }
   };
+  const known = admin ?? recordedAdministration(lane);
   const { own, unscanned } = laneAdministrations(lane);
-  const residue = [...(standing(lane.path) ? [lane.path] : []), ...(admin !== null && standing(admin) ? [admin] : []), ...own];
-  return { residue: residue.filter((path, index) => residue.indexOf(path) === index), unscanned };
+  const residue = [...(standing(lane.path) ? [lane.path] : []), ...(known !== null && standing(known) ? [known] : []), ...own];
+  return { residue: residue.filter((path, index) => residue.indexOf(path) === index), unscanned, identified: known !== null };
 }
 
 /** Cleanup's old missing-tree reconciliation is NOT writer readiness. Only
  * affirmative absence of BOTH checkout and associated administration permits
- * it: a resource of the lane's own that stands raises {@link LaneResidueError}. */
+ * it, so a resource of the lane's own that stands refuses, as does an inventory
+ * that cannot be read when no administration of the lane is on record. This is
+ * the proof BEFORE a removal (and for a lane whose checkout is already gone):
+ * it touches nothing and raises {@link WorktreeHandoffUnresolvedError}. The
+ * proof after a removal is the manager's, and raises {@link LaneResidueError}. */
 export function assertLaneResourcesAbsent(lane: WorktreeLane, admin: string | null = null): void {
-  const { residue } = laneResidue(lane, admin);
-  if (residue.length > 0) throw new LaneResidueError(lane.path, residue);
+  const { residue, unscanned, identified } = laneResidue(lane, admin);
+  try {
+    if (residue.includes(lane.path)) throw new Error('checkout is present or replaced');
+    if (residue.length > 0) throw new Error(`associated administration retained — custody unresolved (${residue.join(', ')})`);
+    if (unscanned !== null && !identified) throw new Error(`${unscanned}, and no administration of the lane is on record: its absence cannot be proven`);
+  } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
 }
 
 /** Before a removal: a second folder that names the lane's checkout beside the

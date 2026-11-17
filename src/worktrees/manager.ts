@@ -4564,7 +4564,7 @@ export class WorktreeManager {
         // the lane's branch is retained (lossless) for a later release or
         // the autopilot to dispose of.
         freshHead = attempt.budget.freshHead;
-        this.assertRemovalSettled(row, admin);
+        this.assertRemovalSettled(row, admin, { preserved, snapshot });
         branchOutcome = this.budgetBranch(row);
       } else {
         // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins
@@ -4576,7 +4576,7 @@ export class WorktreeManager {
         // branch is retained.)
         const base = this.resolveBase(row.repoPath);
         freshHead = base.sha;
-        this.assertRemovalSettled(row, admin);
+        this.assertRemovalSettled(row, admin, { preserved, snapshot });
         // Containment-verified branch delete — job and writer-child lanes;
         // a branch is deleted only when its tip is provably contained in a
         // durable local ref or the freshly verified remote default;
@@ -4597,7 +4597,7 @@ export class WorktreeManager {
       });
       this.tailFailure = String(error);
     }
-    this.assertRemovalSettled(row, admin);
+    this.assertRemovalSettled(row, admin, { preserved, snapshot });
     // FLIP FIRST (Perkins lane-B r2 a/b): the registry must reflect the
     // removed tree even if the EVENT writes then fail — and the flip
     // itself is guarded (a DB-down window reconciles on retry via the
@@ -5222,31 +5222,87 @@ export class WorktreeManager {
   }
 
   /** The proof that a release's removal settled: of the lane's OWN resources
-   * (its checkout path, the administration folder its checkout named, and any
-   * folder that names the checkout) none stands. Other lanes' and other tools'
-   * folders in the repository are not judged here: once the removal has run,
-   * they never turn a finished release into a refusal. A resource that stands
-   * is the residue: the row is NOT flipped, `worktree.sweep-tail-failed { id,
-   * stage: 'verify', error, residue }` names it (once per residue: a retry that
-   * finds the same residue adds no second record), and the release refuses
+   * (its checkout path, the administration folder its checkout named or the
+   * ledger recorded, and any folder that names the checkout) none stands.
+   * Other lanes' and other tools' folders in the repository are not judged
+   * here: once the removal has run, they never turn a finished release into a
+   * refusal. A resource that stands is the residue: the row is NOT flipped,
+   * `worktree.sweep-tail-failed { id, stage: 'verify', error, residue }` names
+   * it (with `preserved` and `snapshot` when the release had saved work, which
+   * only a completed release would otherwise carry), and the release refuses
    * with {@link LaneResidueError}, which the endpoint answers 409. A later
-   * release finishes the job once the residue is cleared. The write is
-   * best-effort: a ledger hiccup never replaces the refusal. */
-  private assertRemovalSettled(row: WorktreeRecord, admin: string | null): void {
+   * release finishes the job once the residue is cleared. A tail failure noted
+   * on the way is written first, so it never reaches another lane's record.
+   * The writes are best-effort: a ledger hiccup never replaces the refusal. */
+  private assertRemovalSettled(
+    row: WorktreeRecord,
+    admin: string | null,
+    saved: { readonly preserved: SweepPreservation | null; readonly snapshot: SweepSnapshot | null } = { preserved: null, snapshot: null },
+  ): void {
     const { residue, unscanned } = laneResidue(row, admin);
     if (unscanned !== null) this.log('warn', 'the worktrees inventory could not be read after a removal; the lane\'s own resources are judged without it', { id: row.id, detail: unscanned });
     if (residue.length === 0) return;
     const refusal = new LaneResidueError(row.path, residue);
-    this.log('error', 'a lane\'s own resources stand after its removal; the row stays active', { id: row.id, residue });
+    this.log('error', 'a lane\'s own resources stand after its removal; the row is not flipped', { id: row.id, residue });
+    this.recordTailFailure(row);
     try {
-      const last = this.opts.ledger.latestEventByPayloadField('worktree.sweep-tail-failed', 'id', row.id)?.payload as { readonly stage?: unknown; readonly residue?: unknown } | undefined;
-      if (last?.stage !== 'verify' || JSON.stringify(last.residue) !== JSON.stringify(residue)) {
-        this.opts.ledger.appendCustomEvent({ kind: 'worktree.sweep-tail-failed', jobId: row.jobId, roundId: row.roundId, payload: { id: row.id, stage: 'verify', error: refusal.message, residue } });
-      }
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.sweep-tail-failed',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: {
+          id: row.id,
+          stage: 'verify',
+          error: refusal.message,
+          residue,
+          ...(saved.preserved === null ? {} : { preserved: { destination: saved.preserved.destination, files: saved.preserved.count } }),
+          ...(saved.snapshot === null ? {} : { snapshot: { ref: saved.snapshot.ref, sha: saved.snapshot.sha, files: saved.snapshot.files } }),
+        },
+      });
     } catch (eventError) {
       this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
     }
     throw refusal;
+  }
+
+  /** What the lane's last residue refusal recorded as saved before it refused
+   * (see {@link assertRemovalSettled}): a release that refused after its removal
+   * never told the owner, so the release that finishes the lane does. Null when
+   * the last record of a tail failure is not one, or saved nothing. */
+  private savedBeforeResidue(row: WorktreeRecord): { readonly snapshot: SweepSnapshot | null; readonly preserved: SweepPreservation | null } | null {
+    let payload: { readonly stage?: unknown; readonly preserved?: unknown; readonly snapshot?: unknown } | undefined;
+    try {
+      payload = this.opts.ledger.latestEventByPayloadField('worktree.sweep-tail-failed', 'id', row.id)?.payload as typeof payload;
+    } catch (error) {
+      this.log('warn', 'the lane\'s last tail failure could not be read; what it saved is not announced', { id: row.id, error: String(error) });
+      return null;
+    }
+    if (payload?.stage !== 'verify') return null;
+    const preserved = payload.preserved as { readonly destination?: unknown; readonly files?: unknown } | null | undefined;
+    const snapshot = payload.snapshot as { readonly ref?: unknown; readonly sha?: unknown; readonly files?: unknown } | null | undefined;
+    const kept = {
+      preserved: typeof preserved?.destination === 'string' && typeof preserved.files === 'number' ? { destination: preserved.destination, count: preserved.files } : null,
+      snapshot: typeof snapshot?.ref === 'string' && typeof snapshot.sha === 'string' ? { ref: snapshot.ref, sha: snapshot.sha, files: typeof snapshot.files === 'number' ? snapshot.files : 0 } : null,
+    };
+    return kept.preserved === null && kept.snapshot === null ? null : kept;
+  }
+
+  /** Write the failure the release's tail noted (a base or branch step that
+   * failed after the removal) as `worktree.sweep-tail-failed { id, error }`,
+   * and forget it: the field belongs to one release at a time. Best-effort. */
+  private recordTailFailure(row: WorktreeRecord): void {
+    if (this.tailFailure === null) return;
+    try {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.sweep-tail-failed',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: { id: row.id, error: this.tailFailure },
+      });
+    } catch (eventError) {
+      this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
+    }
+    this.tailFailure = null;
   }
 
   /** Copy what a part-way removal left of a lane into the preserve root
@@ -5413,6 +5469,14 @@ export class WorktreeManager {
     } catch (error) {
       this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
     }
+    const saved = this.savedBeforeResidue(row);
+    if (saved !== null) {
+      try {
+        this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved });
+      } catch (error) {
+        this.log('warn', 'saved-work notice failed; what was saved is on the lane\'s records', { id: row.id, error: String(error) });
+      }
+    }
     return { branch: branchOutcome, freshHead };
   }
 
@@ -5491,19 +5555,7 @@ export class WorktreeManager {
     freshHead: string,
     snapshot: SweepSnapshot | null,
   ): void {
-    if (this.tailFailure !== null) {
-      try {
-        this.opts.ledger.appendCustomEvent({
-          kind: 'worktree.sweep-tail-failed',
-          jobId: row.jobId,
-          roundId: row.roundId,
-          payload: { id: row.id, error: this.tailFailure },
-        });
-      } catch (eventError) {
-        this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
-      }
-      this.tailFailure = null;
-    }
+    this.recordTailFailure(row);
     try {
       this.opts.ledger.appendCustomEvent({
         kind: 'worktree.swept',

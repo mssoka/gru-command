@@ -395,7 +395,7 @@ describe('worktree lane release endpoint (r4)', () => {
       expect(answered.json).toMatchObject({ error: 'lane_residue', residue: [residue.path] });
       expect(field<string>(answered.json, 'detail')).toContain(residue.path);
       expect(h.ledger.getWorktree(residue.id)?.status).toBe('active');
-      const refusedResidue = h.logs.find((entry) => entry.msg === 'worktree release refused' && entry.fields['worktree_id'] === residue.id);
+      const refusedResidue = h.logs.find((entry) => entry.msg === 'worktree release handler failed' && entry.fields['worktree_id'] === residue.id);
       expect(refusedResidue?.fields).toMatchObject({ check: 'LaneResidueError', residue: [residue.path] });
 
       // A custody conflict before any removal is still the 400 it was, and the lane is untouched.
@@ -405,7 +405,7 @@ describe('worktree lane release endpoint (r4)', () => {
       expect(refused.status).toBe(400);
       expect(refused.json).toMatchObject({ error: 'bad_request' });
       expect(existsSync(custody.path)).toBe(true);
-      const refusedCustody = h.logs.find((entry) => entry.msg === 'worktree release refused' && entry.fields['worktree_id'] === custody.id);
+      const refusedCustody = h.logs.find((entry) => entry.msg === 'worktree release handler failed' && entry.fields['worktree_id'] === custody.id);
       expect(refusedCustody?.fields).toMatchObject({ check: 'WorktreeHandoffUnresolvedError' });
       expect((refusedCustody?.fields['reasons'] as readonly string[]).join(' <- ')).toContain('completed handoff proof is missing or changed');
     } finally {

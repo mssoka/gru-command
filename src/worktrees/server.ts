@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import { LaneSubmoduleWorkError, type SweepResult, type WorktreeManager } from './manager.js';
+import { LaneSubmoduleWorkError, type WorktreeManager } from './manager.js';
 import { LaneResidueError } from './handoff.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -117,7 +117,7 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     });
   }
 
-  async function handleRelease(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function handleRelease(req: IncomingMessage, res: ServerResponse, releasing: { worktreeId: string | null }): Promise<void> {
     if (!authed(req, res)) return;
     const body = await readBody(req);
     const confirmKill = body['confirm_kill'] === true;
@@ -243,25 +243,13 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         return;
       }
     }
-    let result: SweepResult;
-    try {
-      result = await manager.release({
-        worktreeId,
-        ...(confirmKill ? { confirmKill: true } : {}),
-        ...(discardSubmoduleWork !== undefined ? { discardSubmoduleWork } : {}),
-        ...(baseBranch !== undefined ? { baseBranch } : {}),
-      });
-    } catch (error) {
-      // Which lane, which check: the answer's message alone named neither (the
-      // outer message of a custody refusal is generic; the check is in its causes).
-      log('error', 'worktree release refused', {
-        worktree_id: worktreeId,
-        check: error instanceof Error ? error.name : 'unknown',
-        reasons: reasonsOf(error),
-        ...(error instanceof LaneResidueError ? { residue: error.residue } : {}),
-      });
-      throw error;
-    }
+    releasing.worktreeId = worktreeId;
+    const result = await manager.release({
+      worktreeId,
+      ...(confirmKill ? { confirmKill: true } : {}),
+      ...(discardSubmoduleWork !== undefined ? { discardSubmoduleWork } : {}),
+      ...(baseBranch !== undefined ? { baseBranch } : {}),
+    });
     if (silasRelease && options.ledger !== undefined) {
       // The sweep-ack receipt lands on the JOB only after the release
       // actually succeeded — a refused release (a live child worker, a
@@ -291,10 +279,21 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     requestHook(req, res, path): boolean {
       if (!(req.method === 'POST' && path === '/api/dispatch/release')) return false;
       const startedAt = Date.now();
-      handleRelease(req, res)
+      // The lane being released, once it is resolved: a failure's log line names
+      // it, and the check that fired (the outer message of a custody refusal is
+      // generic; the check is in its causes).
+      const releasing: { worktreeId: string | null } = { worktreeId: null };
+      handleRelease(req, res, releasing)
         .catch((error: unknown) => {
           const message = String(error instanceof Error ? error.message : error);
-          log('error', 'worktree release handler failed', { path, error: message });
+          log('error', 'worktree release handler failed', {
+            path,
+            error: message,
+            worktree_id: releasing.worktreeId,
+            check: error instanceof Error ? error.name : 'unknown',
+            reasons: reasonsOf(error),
+            ...(error instanceof LaneResidueError ? { residue: error.residue } : {}),
+          });
           // A submodule refusal carries the digest a discard must name (#427).
           const submodules = error instanceof LaneSubmoduleWorkError ? { digest: error.digest, submodules: error.submodules } : {};
           // The removal ran and a resource of the lane's own still stands: not a
