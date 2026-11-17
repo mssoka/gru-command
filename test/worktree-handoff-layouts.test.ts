@@ -800,7 +800,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
     expect(eventsOf(f.h, 'worktree.swept').map((event) => (event.payload as { id: string }).id)).toEqual([f.lane.id]);
     expect(eventsOf(f.h, 'worktree.sweep-tail-failed')).toEqual([]);
-    expect(git(f.repo.path, ['worktree', 'list', '--porcelain'])).not.toContain(realpathSync(dirname(f.lane.path)) + '/' + basename(f.lane.path));
+    expect(git(f.repo.path, ['worktree', 'list', '--porcelain']).split('\n')).not.toContain(`worktree ${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path))}`);
     // Nothing of the others' is touched.
     for (const sibling of siblings) {
       expect(existsSync(sibling.path)).toBe(true);
