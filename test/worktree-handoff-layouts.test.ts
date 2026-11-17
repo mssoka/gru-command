@@ -867,7 +867,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
         if (resource === f.lane.path) mkdirSync(resource, { recursive: true });
         else {
           // With a backlink the inventory names it; with none, and no receipt, only the lane's own folder, found by its name, can.
-          const files = label === 'its administration folder is still there'
+          const files: Record<string, string> = label === 'its administration folder is still there'
             ? { gitdir: `${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path), '.git')}\n` }
             : { HEAD: 'ref: refs/heads/main\n' };
           folder(dirname(resource), basename(resource), files);
