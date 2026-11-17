@@ -2,7 +2,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import { LaneSubmoduleWorkError, type WorktreeManager } from './manager.js';
+import { LaneSubmoduleWorkError, type SweepResult, type WorktreeManager } from './manager.js';
+import { LaneResidueError } from './handoff.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseSilasActionRuleId } from '../dispatch/silas-rules.js';
@@ -38,6 +39,15 @@ export interface WorktreeServer {
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
+}
+
+/** The messages along an error's cause chain, outermost first (bounded): the
+ * outer message of a custody refusal is generic, and the check that fired is in
+ * its causes. */
+function reasonsOf(error: unknown): readonly string[] {
+  const reasons: string[] = [];
+  for (let current: unknown = error; current instanceof Error && reasons.length < 6; current = current.cause) reasons.push(current.message);
+  return reasons.length > 0 ? reasons : [String(error)];
 }
 
 function strField(body: Record<string, unknown>, field: string): string {
@@ -233,12 +243,25 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         return;
       }
     }
-    const result = await manager.release({
-      worktreeId,
-      ...(confirmKill ? { confirmKill: true } : {}),
-      ...(discardSubmoduleWork !== undefined ? { discardSubmoduleWork } : {}),
-      ...(baseBranch !== undefined ? { baseBranch } : {}),
-    });
+    let result: SweepResult;
+    try {
+      result = await manager.release({
+        worktreeId,
+        ...(confirmKill ? { confirmKill: true } : {}),
+        ...(discardSubmoduleWork !== undefined ? { discardSubmoduleWork } : {}),
+        ...(baseBranch !== undefined ? { baseBranch } : {}),
+      });
+    } catch (error) {
+      // Which lane, which check: the answer's message alone named neither (the
+      // outer message of a custody refusal is generic; the check is in its causes).
+      log('error', 'worktree release refused', {
+        worktree_id: worktreeId,
+        check: error instanceof Error ? error.name : 'unknown',
+        reasons: reasonsOf(error),
+        ...(error instanceof LaneResidueError ? { residue: error.residue } : {}),
+      });
+      throw error;
+    }
     if (silasRelease && options.ledger !== undefined) {
       // The sweep-ack receipt lands on the JOB only after the release
       // actually succeeded — a refused release (a live child worker, a
@@ -274,6 +297,12 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
           log('error', 'worktree release handler failed', { path, error: message });
           // A submodule refusal carries the digest a discard must name (#427).
           const submodules = error instanceof LaneSubmoduleWorkError ? { digest: error.digest, submodules: error.submodules } : {};
+          // The removal ran and a resource of the lane's own still stands: not a
+          // bad request. Its row stays active, and a later release finishes it.
+          if (!res.headersSent && error instanceof LaneResidueError) {
+            json(res, 409, { error: 'lane_residue', detail: message, residue: error.residue });
+            return;
+          }
           if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message, ...submodules });
         })
         .finally(() => {

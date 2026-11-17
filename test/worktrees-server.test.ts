@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -9,7 +9,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig } from '../src/config.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { WorktreeManager, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
 import { createWorktreeServer } from '../src/worktrees/server.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -33,10 +33,12 @@ interface LaneHarness {
   port: number;
   ledger: LedgerApi;
   manager: WorktreeManager;
+  /** What the endpoint logged. */
+  logs: { level: string; msg: string; fields: Record<string, unknown> }[];
   close: () => Promise<void>;
 }
 
-async function bootLane(): Promise<LaneHarness> {
+async function bootLane(extra: Partial<WorktreeManagerOptions> = {}): Promise<LaneHarness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-wtserver-'));
   cleanupDirs.push(dir);
   writeFileSync(
@@ -55,8 +57,10 @@ async function bootLane(): Promise<LaneHarness> {
     preserveRoot: join(dir, 'wtpreserve'),
     setupTimeoutMs: 30_000,
     killGraceMs: 25,
+    ...extra,
   });
-  const server = createWorktreeServer({ config: cfg, manager, ledger });
+  const logs: LaneHarness['logs'] = [];
+  const server = createWorktreeServer({ config: cfg, manager, ledger, log: (level, msg, fields) => logs.push({ level, msg, fields: fields ?? {} }) });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
     res.writeHead(404);
@@ -68,6 +72,7 @@ async function bootLane(): Promise<LaneHarness> {
     port,
     ledger,
     manager,
+    logs,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       db.close();
@@ -359,6 +364,50 @@ describe('worktree lane release endpoint (r4)', () => {
       expect(field<string>(refused.json, 'detail')).toContain('job lane');
       // The lane was NOT released: the rule-hit must be recordable first.
       expect(h.manager.getWorktree(roundLane.id)?.status).toBe('active');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a release whose removal left its own resources answers 409 naming them, a custody refusal answers 400, and each logs the lane and the check that fired', async () => {
+    let race: string | null = null;
+    const h = await bootLane({
+      // The release's tail resolves the base once the checkout is gone: the path re-created then is residue.
+      log: (_level, message) => {
+        if (race !== null && message.startsWith('base resolution degraded') && !existsSync(race)) {
+          const path = race;
+          race = null;
+          mkdirSync(path, { recursive: true });
+        }
+      },
+    });
+    const repo = makeFixtureRepo('fixture-release-refusals');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-residue', repo: 'fixture-release-refusals', title: 'residue' });
+      h.ledger.addJob({ id: 'job-custody', repo: 'fixture-release-refusals', title: 'custody' });
+      const residue = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-residue' });
+      const custody = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-custody' });
+
+      race = residue.path;
+      const answered = await call(h.port, '/api/dispatch/release', { worktree_id: residue.id }, TOKEN);
+      expect(answered.status).toBe(409);
+      expect(answered.json).toMatchObject({ error: 'lane_residue', residue: [residue.path] });
+      expect(field<string>(answered.json, 'detail')).toContain(residue.path);
+      expect(h.ledger.getWorktree(residue.id)?.status).toBe('active');
+      const refusedResidue = h.logs.find((entry) => entry.msg === 'worktree release refused' && entry.fields['worktree_id'] === residue.id);
+      expect(refusedResidue?.fields).toMatchObject({ check: 'LaneResidueError', residue: [residue.path] });
+
+      // A custody conflict before any removal is still the 400 it was, and the lane is untouched.
+      const receipt = join(execFileSync('git', ['-C', custody.path, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf-8' }).trim(), 'gru-creation-handoff.json');
+      writeFileSync(receipt, JSON.stringify({ ...(JSON.parse(readFileSync(receipt, 'utf-8')) as Record<string, unknown>), state: 'pending', createdAt: null }));
+      const refused = await call(h.port, '/api/dispatch/release', { worktree_id: custody.id }, TOKEN);
+      expect(refused.status).toBe(400);
+      expect(refused.json).toMatchObject({ error: 'bad_request' });
+      expect(existsSync(custody.path)).toBe(true);
+      const refusedCustody = h.logs.find((entry) => entry.msg === 'worktree release refused' && entry.fields['worktree_id'] === custody.id);
+      expect(refusedCustody?.fields).toMatchObject({ check: 'WorktreeHandoffUnresolvedError' });
+      expect((refusedCustody?.fields['reasons'] as readonly string[]).join(' <- ')).toContain('completed handoff proof is missing or changed');
     } finally {
       await h.close();
     }
