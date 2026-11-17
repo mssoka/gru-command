@@ -4590,7 +4590,7 @@ export class WorktreeManager {
         }
       }
     } catch (error) {
-      if (error instanceof WorktreeHandoffUnresolvedError || error instanceof LaneResidueError) throw error;
+      if (error instanceof LaneResidueError) throw error;
       this.log('error', 'sweep tail failed after removal — row still flips swept', {
         id: row.id,
         error: String(error),

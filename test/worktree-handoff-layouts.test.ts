@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -857,7 +857,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
   });
 
   it('records the verify stage and refuses with the residue when its own resources stand after the removal, and a later release finishes', async () => {
-    for (const label of ['its checkout path is re-created', 'its administration folder is still there'] as const) {
+    for (const label of ['its checkout path is re-created', 'its administration folder is still there', 'its administration folder is back with nothing but a HEAD file'] as const) {
       const hook = afterRemoval();
       const f = await laneFixture(`release-residue-${label.replace(/\W+/gu, '-')}`, { log: hook.log });
       const admin = adminOf(f.lane);
@@ -865,7 +865,13 @@ describe('lane release in a repository whose worktree inventory holds other lane
       const resource = residue[0]!;
       hook.arm(f.lane.path, () => {
         if (resource === f.lane.path) mkdirSync(resource, { recursive: true });
-        else folder(dirname(resource), basename(resource), { gitdir: `${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path), '.git')}\n` });
+        else {
+          // With a backlink the inventory names it; with none, and no receipt, only the lane's own folder, found by its name, can.
+          const files = label === 'its administration folder is still there'
+            ? { gitdir: `${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path), '.git')}\n` }
+            : { HEAD: 'ref: refs/heads/main\n' };
+          folder(dirname(resource), basename(resource), files);
+        }
       });
       const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
       expect(outcome.error, label).toMatchObject({ name: 'LaneResidueError', residue });
@@ -934,6 +940,21 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const homeless = { ...unrecorded, repoPath: join(directory(), 'gone-repository') };
     const missing = (() => { try { handoffProof.assertLaneResourcesAbsent(homeless); return null; } catch (error) { return error; } })();
     expect(missing).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('does not reconcile a row whose own administration stands in an inventory that cannot be read', async () => {
+    const f = await laneFixture('release-unreadable-inventory');
+    const admin = adminOf(f.lane);
+    rmSync(f.lane.path, { recursive: true });
+    chmodSync(f.container, 0o000);
+    try {
+      const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+      expect(outcome.error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+      expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
+      expect(kindsOf(f.h).filter((kind) => /^worktree\.(?:swept|preserved|reconciled|release-aborted|sweep-tail-failed)$/u.test(kind))).toEqual([]);
+    } finally { chmodSync(f.container, 0o755); }
+    expect(existsSync(admin)).toBe(true);
+    expect(git(f.repo.path, ['branch', '--list', f.lane.branch ?? ''])).not.toBe('');
   });
 
   it('keeps the record of saved work when residue refuses the release, and the release that finishes the lane tells the owner', async () => {
