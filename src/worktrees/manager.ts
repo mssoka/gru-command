@@ -3126,7 +3126,7 @@ export class WorktreeManager {
           }
         }
         const freshHead = input.diskBudget === true ? '' : this.safeFreshHead(row.repoPath);
-        assertLaneResourcesAbsent(row);
+        this.assertRemovalSettled(row, { branch: branchOutcome, preserved: null, snapshot: null });
         return { status: 'swept', preserved: null, branch: branchOutcome, freshHead } as const;
       });
     }
@@ -4561,7 +4561,7 @@ export class WorktreeManager {
         // the lane's branch is retained (lossless) for a later release or
         // the autopilot to dispose of.
         freshHead = attempt.budget.freshHead;
-        assertLaneResourcesAbsent(row);
+        this.assertRemovalSettled(row, { branch: branchOutcome, preserved, snapshot });
         branchOutcome = this.budgetBranch(row);
       } else {
         // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins
@@ -4573,7 +4573,7 @@ export class WorktreeManager {
         // branch is retained.)
         const base = this.resolveBase(row.repoPath);
         freshHead = base.sha;
-        assertLaneResourcesAbsent(row);
+        this.assertRemovalSettled(row, { branch: branchOutcome, preserved, snapshot });
         // Containment-verified branch delete — job and writer-child lanes;
         // a branch is deleted only when its tip is provably contained in a
         // durable local ref or the freshly verified remote default;
@@ -4594,7 +4594,7 @@ export class WorktreeManager {
       });
       this.tailFailure = String(error);
     }
-    assertLaneResourcesAbsent(row);
+    this.assertRemovalSettled(row, { branch: branchOutcome, preserved, snapshot });
     // FLIP FIRST (Perkins lane-B r2 a/b): the registry must reflect the
     // removed tree even if the EVENT writes then fail — and the flip
     // itself is guarded (a DB-down window reconciles on retry via the
@@ -5218,6 +5218,51 @@ export class WorktreeManager {
     }
   }
 
+  /** The proof that a release's removal settled: neither the lane's checkout
+   * nor its administration remains. It runs after the release removed
+   * something (the checkout, or the lane's branch), so a refusal is recorded
+   * before it is thrown: `worktree.sweep-tail-failed { id, stage: 'custody',
+   * path, checkoutRemoved, branch, preserved, snapshot, error }` names what
+   * is gone (`branch` is what the release did to it so far, `none` while it
+   * touched it not at all) and what was saved. A release never removes
+   * anything and then refuses unrecorded. The row stays as it was; a retry
+   * reconciles over the missing tree once the proof holds. The write is
+   * best-effort: a ledger hiccup never replaces the refusal. */
+  private assertRemovalSettled(
+    row: WorktreeRecord,
+    done: { readonly branch: 'deleted' | 'retained' | 'none'; readonly preserved: SweepPreservation | null; readonly snapshot: SweepSnapshot | null },
+  ): void {
+    try {
+      assertLaneResourcesAbsent(row);
+    } catch (refusal) {
+      const reasons: string[] = [];
+      for (let current: unknown = refusal; current instanceof Error && reasons.length < 4; current = current.cause) reasons.push(current.message);
+      const error = oneLineErrorText(reasons.join(' <- '), 600);
+      const checkoutRemoved = !existsSync(row.path);
+      this.log('error', 'release removed part of the lane and its custody proof then refused; the row stays and a retry reconciles', { id: row.id, path: row.path, checkoutRemoved, branch: done.branch, error });
+      try {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'worktree.sweep-tail-failed',
+          jobId: row.jobId,
+          roundId: row.roundId,
+          payload: {
+            id: row.id,
+            stage: 'custody',
+            path: row.path,
+            checkoutRemoved,
+            branch: done.branch,
+            preserved: done.preserved === null ? null : { destination: done.preserved.destination, files: done.preserved.count },
+            snapshot: done.snapshot === null ? null : { ref: done.snapshot.ref, sha: done.snapshot.sha, files: done.snapshot.files },
+            error,
+          },
+        });
+      } catch (eventError) {
+        this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
+      }
+      throw refusal;
+    }
+  }
+
   /** Copy what a part-way removal left of a lane into the preserve root
    * (#427), off the event loop: no record says what was saved before that
    * removal began. Only what {@link remainsToCopy} keeps is copied. Recorded
@@ -5362,7 +5407,7 @@ export class WorktreeManager {
       branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
       freshHead = this.safeFreshHead(row.repoPath);
     }
-    assertLaneResourcesAbsent(row);
+    this.assertRemovalSettled(row, { branch: branchOutcome, preserved: null, snapshot: null });
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
       this.opts.ledger.appendCustomEvent({
