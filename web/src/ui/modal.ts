@@ -40,6 +40,13 @@ export interface ModalOptions {
   readonly initialFocus?: HTMLElement;
   /** Fired exactly once when the dialog closes, whatever the gesture. */
   readonly onClose?: () => void;
+  /** Extra class on the card, for a caller that needs its own size or
+   * layout (the capture viewer is far wider than a confirmation). */
+  readonly cardClass?: string;
+  /** Keys the dialog does not use itself (everything but Escape and Tab),
+   * delivered only while this dialog is the topmost one. A handler that
+   * acts on a key calls `preventDefault()`. */
+  readonly onKeydown?: (event: KeyboardEvent) => void;
 }
 
 export interface ConfirmOptions {
@@ -92,6 +99,7 @@ class GruModal implements ModalHandle {
 
     this.host = el('div', 'gru-modal');
     this.card = el('div', 'gru-modal__card pp-card');
+    if (options.cardClass !== undefined) this.card.classList.add(options.cardClass);
     this.card.setAttribute('role', 'dialog');
     this.card.setAttribute('aria-modal', 'true');
     this.card.setAttribute('aria-labelledby', titleId);
@@ -173,7 +181,11 @@ class GruModal implements ModalHandle {
       this.close();
       return;
     }
-    if (event.key === 'Tab') this.trapTab(event);
+    if (event.key === 'Tab') {
+      this.trapTab(event);
+      return;
+    }
+    this.options.onKeydown?.(event);
   };
 
   private trapTab(event: KeyboardEvent): void {

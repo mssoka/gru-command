@@ -487,7 +487,7 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
     expect(wrong.status(), `${route} wrong token`).toBe(401);
   }
 
-  // The board-mode control validates its body: only the two known modes
+  // The board-mode control validates its body: only the known modes
   // pass, and a valid mode returns 200 without touching frame state.
   for (const body of [{}, { mode: 'nope' }, { mode: 7 }]) {
     const bad = await page.request.post('http://localhost:8788/__board-mode', {

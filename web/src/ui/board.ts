@@ -126,6 +126,7 @@ import { BoardApiError, type BoardClient, type BoardConnectionState, type BoardS
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
+import { captureLabel, openCaptureViewer, type CaptureViewerHandle } from './media-viewer.js';
 import { RepoOverviewPanel } from './repo-overview.js';
 
 const ROLE_EMOJI: Readonly<Record<string, string>> = {
@@ -216,6 +217,9 @@ export function coverageLines(coverage: OwnerPrMediaCoverageView | null): readon
 /** How long a capture's preview outlives the last card that showed it. */
 export const MEDIA_PREVIEW_GRACE_MS = 10 * 60_000;
 
+/** The open capture viewer's line once its card shows different captures. */
+export const CAPTURE_VIEWER_STALE_NOTICE = '📸 this card changed while you were looking — close the viewer to see its captures as they stand';
+
 export class BoardView {
   private readonly mount: HTMLElement;
   private readonly ownerMount: HTMLElement;
@@ -271,6 +275,15 @@ export class BoardView {
   /** When each capture was last on a card (ms): previews outlive a card that
    * blinks out for a snapshot. */
   private readonly mediaSeen = new Map<string, number>();
+  /** The open capture viewer and the card state it was opened on: its
+   * previews stay loaded while it is open, and it is told when that card
+   * has changed underneath it. */
+  private captureViewer: {
+    readonly handle: CaptureViewerHandle;
+    readonly prId: string;
+    readonly headSha: string;
+    readonly ids: readonly string[];
+  } | null = null;
   /** Lesson proposal rows' UI state by notification id, shared by the band
    * and the bell and kept across snapshot re-renders (review disclosure,
    * fetched review, in-flight decision, last refusal). Pruned when the
@@ -1189,7 +1202,7 @@ export class BoardView {
   }
 
   /** The ready card's media block: the captures bound to its exact head
-   * (stills open full size, clips play in place), then one line saying
+   * (stills open the capture viewer, clips play in place), then one line saying
    * where they stand on the PR/MR. Captures of older heads are counted as
    * superseded and never shown as current. */
   private ownerPrMedia(media: OwnerPrMediaView, provider: 'github' | 'gitlab' | undefined, surface: 'band' | 'bell'): HTMLElement {
@@ -1238,7 +1251,7 @@ export class BoardView {
     this.mediaSeen.set(item.id, Date.now());
     const cached = this.mediaNodes.get(key);
     if (cached !== undefined) return cached;
-    const label = item.role === 'before' ? 'before' : item.kind === 'video' ? 'clip' : 'after';
+    const label = captureLabel(item);
     const figure = el('figure', `board-owner__shot board-owner__shot--${item.kind}`);
     figure.dataset.mediaId = item.id;
     const frame = el('div', 'board-owner__shot-frame', 'loading…');
@@ -1258,22 +1271,72 @@ export class BoardView {
         video.muted = true;
         video.playsInline = true;
         video.setAttribute('aria-label', item.caption);
-        frame.append(video);
+        // The player owns every click on a clip, so its way into the viewer
+        // is a button of its own.
+        const expand = el('button', 'board-owner__shot-expand', '🖼️');
+        expand.type = 'button';
+        expand.title = 'Open in the capture viewer';
+        expand.setAttribute('aria-label', `Open in the capture viewer: ${item.caption}`);
+        expand.addEventListener('click', () => this.openCaptures(item.id));
+        frame.append(video, expand);
         return;
       }
-      const link = el('a', 'board-owner__shot-link');
-      link.href = loaded.url;
-      link.target = '_blank';
-      link.rel = 'noreferrer';
-      link.title = 'Open full size';
+      // The still is the button: it opens the viewer on this capture, inside
+      // the board, with the card's other captures one arrow key away.
+      const open = el('button', 'board-owner__shot-link');
+      open.type = 'button';
+      open.title = 'Open in the capture viewer';
+      open.addEventListener('click', () => this.openCaptures(item.id));
       const image = document.createElement('img');
       image.src = loaded.url;
       image.alt = item.caption;
       image.loading = 'lazy';
-      link.append(image);
-      frame.append(link);
+      open.append(image);
+      frame.append(open);
     });
     return figure;
+  }
+
+  /** Open the capture viewer on one capture of a ready card. The card is
+   * read from the current snapshot at the click, since a preview node
+   * outlives the render that built it and its neighbours may have changed. */
+  private openCaptures(id: string): void {
+    const pr = (this.snapshot?.ownerPrs ?? []).find((row) => row.media?.items.some((item) => item.id === id) === true);
+    const media = pr?.media;
+    // A preview on screen always has its card in the snapshot; a click that
+    // races the card's removal opens nothing.
+    if (pr === undefined || media === undefined || media === null) return;
+    this.captureViewer?.handle.close();
+    // One clip plays at a time: the card's players stop behind the viewer.
+    for (const video of document.querySelectorAll<HTMLVideoElement>('.board-owner__shot video')) video.pause();
+    const handle = openCaptureViewer({
+      title: pr.jobTitle,
+      headSha: media.headSha,
+      items: media.items,
+      startId: id,
+      load: (itemId) => this.mediaUrl(itemId),
+      onClose: () => {
+        if (this.captureViewer?.handle === handle) this.captureViewer = null;
+      },
+    });
+    this.captureViewer = { handle, prId: pr.id, headSha: media.headSha, ids: media.items.map((item) => item.id) };
+  }
+
+  /** Tell the open viewer when its card no longer shows the captures it was
+   * opened on (a new head, or a capture added or removed). A card that is
+   * merely missing from one snapshot says nothing about its captures. */
+  private syncCaptureViewer(snapshot: BoardSnapshot): void {
+    const viewer = this.captureViewer;
+    if (viewer === null) return;
+    const row = (snapshot.ownerPrs ?? []).find((pr) => pr.id === viewer.prId);
+    const media = row?.media ?? null;
+    const changed =
+      row !== undefined &&
+      (media === null ||
+        media.headSha !== viewer.headSha ||
+        media.items.length !== viewer.ids.length ||
+        media.items.some((item, at) => item.id !== viewer.ids[at]));
+    viewer.handle.setNotice(changed ? CAPTURE_VIEWER_STALE_NOTICE : null);
   }
 
   /** A capture's object URL, fetched once per pairing. A refused fetch keeps
@@ -1309,6 +1372,9 @@ export class BoardView {
     // Every capture on a card in THIS snapshot is current, however long the
     // board was quiet before it arrived.
     for (const pr of snapshot.ownerPrs ?? []) for (const item of pr.media?.items ?? []) this.mediaSeen.set(item.id, now);
+    // So is every capture in the open viewer, even after its card has left.
+    for (const id of this.captureViewer?.ids ?? []) this.mediaSeen.set(id, now);
+    this.syncCaptureViewer(snapshot);
     const cutoff = now - MEDIA_PREVIEW_GRACE_MS;
     for (const [id, seen] of this.mediaSeen) {
       if (seen >= cutoff) continue;
@@ -1322,6 +1388,8 @@ export class BoardView {
   }
 
   private resetMedia(): void {
+    // The viewer shows these object URLs: it closes before they are revoked.
+    this.captureViewer?.handle.close();
     for (const url of this.mediaObjectUrls.values()) URL.revokeObjectURL(url);
     this.mediaObjectUrls.clear();
     this.mediaUrls.clear();

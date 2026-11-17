@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { assertSafeTestServicePort } from '../../test/helpers/real-service.mjs';
 import { DEFAULT_MOCK_TOKEN, resolveMockExposure } from './safety.js';
+import { mockCaptureBytes, mockCaptures } from './captures.js';
 import {
   parseClientFrame,
   type AttachmentChip,
@@ -219,10 +220,13 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
  */
 const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations'] as const;
 
-/** Board fixture mode (tests only): the default sample board, or a variant
+/** Board fixture mode (tests only): the default sample board; a variant
  * with no live machine rows and no needs-you job causes so the empty
- * NEEDS GRU clear state is assertable in both themes. /__reset restores. */
-type BoardMode = 'default' | 'clear-needs-you';
+ * NEEDS GRU clear state is assertable in both themes; or the default board
+ * with PR captures on its ready card (mock/captures.ts), served from
+ * GET /api/media/<id>, for the capture viewer. /__reset restores. */
+const BOARD_MODES = ['default', 'clear-needs-you', 'captures'] as const;
+type BoardMode = (typeof BOARD_MODES)[number];
 let boardMode: BoardMode = 'default';
 
 /** A stamp 20 minutes ago, clamped to stay inside the current LOCAL day:
@@ -241,7 +245,11 @@ function mergedReceiptStamp(): string {
 
 function sampleSnapshot(): unknown {
   const snapshot = defaultSampleSnapshot() as BoardSnapshot;
-  const source = (boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot) as BoardSnapshot;
+  const source = (
+    boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot)
+      : boardMode === 'captures' ? capturesVariant(snapshot)
+        : snapshot
+  ) as BoardSnapshot;
   const jobs = source.repos.flatMap((repo) => repo.jobs);
   const descriptors = boardMode === 'clear-needs-you' ? [] : [
     { id: 'demo-api-payment-fix', labels: ['lens failed', 'action-required'] },
@@ -270,6 +278,22 @@ function sampleSnapshot(): unknown {
  * causes of the two remaining fixture jobs (a failed lens and a conflicting
  * PR), and zero the queue count — the board then renders the calm green
  * "nothing needs Gru" state. Everything else is unchanged. */
+/** The default board with the sample captures bound to its ready PR's head. */
+function capturesVariant(snapshot: BoardSnapshot): BoardSnapshot {
+  return {
+    ...snapshot,
+    ownerPrs: (snapshot.ownerPrs ?? []).map((pr) => ({
+      ...pr,
+      media: {
+        headSha: pr.sha,
+        items: mockCaptures(),
+        superseded: 2,
+        publication: { state: 'published' as const, at: new Date(Date.now() - 30_000).toISOString(), detail: null },
+      },
+    })),
+  };
+}
+
 function clearNeedsYouVariant(snapshot: unknown): unknown {
   const snap = snapshot as {
     repos: Array<{ jobs: Array<Record<string, unknown>> }>;
@@ -770,6 +794,22 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end(JSON.stringify(sampleSnapshot()) + '\n');
     return;
   }
+  if (req.method === 'GET' && url.pathname.startsWith('/api/media/')) {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    const png = mockCaptureBytes(decodeURIComponent(url.pathname.slice('/api/media/'.length)));
+    if (png === null) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":"media_not_found"}\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(png.length) });
+    res.end(png);
+    return;
+  }
   if (
     (req.method === 'GET' && url.pathname === '/api/decisions/status') ||
     (req.method === 'POST' && url.pathname === '/api/decisions/recheck')
@@ -1009,14 +1049,15 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     });
     req.on('end', () => {
       try {
-        const parsed = JSON.parse(body) as { mode?: string };
-        if (parsed.mode !== 'default' && parsed.mode !== 'clear-needs-you') throw new Error('bad mode');
-        boardMode = parsed.mode;
+        const parsed = JSON.parse(body) as { mode?: unknown };
+        const mode = BOARD_MODES.find((known) => known === parsed.mode);
+        if (mode === undefined) throw new Error('bad mode');
+        boardMode = mode;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('{"ok":true}\n');
       } catch {
         res.writeHead(400, { 'content-type': 'application/json' });
-        res.end('{"error":"mode must be default|clear-needs-you"}\n');
+        res.end(`{"error":"mode must be ${BOARD_MODES.join('|')}"}\n`);
       }
     });
     return;

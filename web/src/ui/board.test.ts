@@ -19,7 +19,7 @@ import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis, collectJobs } from '../lib/board-kpi.js';
 import { snapshotSections } from '../lib/board-sections.js';
 import { ConsoleShell } from './console.js';
-import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
+import { BoardView, CAPTURE_VIEWER_STALE_NOTICE, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
 import { BoardApiError, BoardClient } from '../lib/board-client.js';
 import { startBoardServerHarness } from '../test-support/board-server-harness.js';
 
@@ -4222,7 +4222,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(badRow.textContent).toContain('PR link unavailable');
   });
 
-  it('ready PR row shows the head-bound captures: stills open full size, clips play in place, one fetch per capture', async () => {
+  it('ready PR row shows the head-bound captures: stills open the capture viewer, clips play in place, one fetch per capture', async () => {
     const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
     const still = { id: 'm-11111111-1111-1111-1111-111111111111', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'New FOR YOU card', bytes: 10 };
     const clip = { id: 'm-22222222-2222-2222-2222-222222222222', kind: 'video' as const, mediaType: 'video/webm', role: 'after' as const, caption: 'Approve flow', bytes: 20 };
@@ -4243,9 +4243,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       view.render(snapshot({ ownerPrs: [withMedia] }));
       await vi.waitFor(() => expect(document.querySelector('.board-owner__shot--video video')).not.toBeNull());
       const row = document.getElementById('board-owner')!.querySelector('.board-owner__row--pr')!;
-      const link = row.querySelector<HTMLAnchorElement>('.board-owner__shot--image a')!;
-      expect(link.href).toBe('blob:test-1');
-      expect(link.target).toBe('_blank');
+      // A still is a button into the capture viewer, never a new-tab link.
+      const open = row.querySelector<HTMLElement>('.board-owner__shot--image .board-owner__shot-link')!;
+      expect(open.tagName).toBe('BUTTON');
+      expect(open.title).toBe('Open in the capture viewer');
+      expect(row.querySelector('.board-owner__media-strip a')).toBeNull();
+      expect(row.querySelector<HTMLImageElement>('.board-owner__shot--image img')!.src).toBe('blob:test-1');
       expect(row.querySelector<HTMLImageElement>('.board-owner__shot--image img')!.alt).toBe('New FOR YOU card');
       const video = row.querySelector<HTMLVideoElement>('.board-owner__shot--video video')!;
       expect(video.controls).toBe(true);
@@ -4286,6 +4289,161 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(document.querySelector('.board-owner__media-strip')).toBeNull();
       expect(note()).toBe('📸 2 captures from an older head — superseded, not shown');
     } finally {
+      createSpy.mockRestore();
+      revokeSpy.mockRestore();
+    }
+  });
+
+  it('a capture opens the viewer inside the board: the card\'s captures flip in place, with no new tab and no new fetch', async () => {
+    const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+    const before = { id: 'm-11111111-1111-1111-1111-111111111111', kind: 'image' as const, mediaType: 'image/png', role: 'before' as const, caption: 'Card, before', bytes: 10 };
+    const after = { id: 'm-22222222-2222-2222-2222-222222222222', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'Card, after', bytes: 10 };
+    const clip = { id: 'm-33333333-3333-3333-3333-333333333333', kind: 'video' as const, mediaType: 'video/webm', role: 'after' as const, caption: 'Approve flow', bytes: 20 };
+    const fetchMedia = vi.fn((id: string) => Promise.resolve(new Blob([id])));
+    let made = 0;
+    const createSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:test-${(made += 1)}`);
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const press = (key: string): void => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    };
+    const count = (): string | null | undefined => document.querySelector('.media-viewer__count')?.textContent;
+    try {
+      const view = new BoardView(() => {});
+      view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia } as unknown as import('../lib/board-client.js').BoardClient);
+      const card = ownerPr('job-shots', { sha, media: { headSha: sha, items: [before, after, clip], superseded: 0, publication: { state: 'published', at: null, detail: null } } });
+      view.render(snapshot({ ownerPrs: [card] }));
+      const band = document.getElementById('board-owner')!;
+      await vi.waitFor(() => expect(band.querySelector('.board-owner__shot--video video')).not.toBeNull());
+      await vi.waitFor(() => expect(band.querySelectorAll('.board-owner__shot-link')).toHaveLength(2));
+      expect(fetchMedia).toHaveBeenCalledTimes(3);
+      const cardClip = band.querySelector<HTMLVideoElement>('.board-owner__shot--video video')!;
+      const cardClipPause = vi.spyOn(cardClip, 'pause');
+
+      // The second still opens the viewer on itself, titled by its heist.
+      const stills = [...band.querySelectorAll<HTMLButtonElement>('.board-owner__shot-link')];
+      stills[1]!.focus();
+      stills[1]!.click();
+      expect(document.querySelectorAll('.gru-modal__card.media-viewer-card')).toHaveLength(1);
+      expect(document.querySelector('.gru-modal__title')?.textContent).toBe('Heist job-shots');
+      expect(count()).toBe('2 of 3 · aaaa1111');
+      expect(document.querySelector('.media-viewer__caption')?.textContent).toBe('Card, after');
+      await vi.waitFor(() =>
+        expect(document.querySelector<HTMLImageElement>('.media-viewer__stage img')?.src)
+          .toBe(band.querySelectorAll<HTMLImageElement>('.board-owner__shot--image img')[1]!.src));
+      // One clip at a time: the card's player stops behind the viewer.
+      expect(cardClipPause).toHaveBeenCalledTimes(1);
+
+      // Every capture of the card is one key away, clips included.
+      press('ArrowLeft');
+      expect(count()).toBe('1 of 3 · aaaa1111');
+      expect(document.querySelector('.media-viewer__label')?.textContent).toBe('before');
+      press('End');
+      expect(count()).toBe('3 of 3 · aaaa1111');
+      await vi.waitFor(() => expect(document.querySelector('.media-viewer__stage video')).not.toBeNull());
+      // The viewer shows the previews the card already holds.
+      expect(fetchMedia).toHaveBeenCalledTimes(3);
+      expect(openSpy).not.toHaveBeenCalled();
+
+      // Escape puts the owner back on the capture they opened.
+      press('Escape');
+      expect(document.querySelector('.gru-modal')).toBeNull();
+      expect(document.activeElement).toBe(stills[1]);
+
+      // A clip's own button opens the viewer on the clip.
+      const expand = band.querySelector<HTMLButtonElement>('.board-owner__shot--video .board-owner__shot-expand')!;
+      expect(expand.getAttribute('aria-label')).toBe('Open in the capture viewer: Approve flow');
+      expand.click();
+      expect(count()).toBe('3 of 3 · aaaa1111');
+      expect(document.querySelector('.media-viewer__label')?.textContent).toBe('clip');
+
+      // Opening from another capture replaces the viewer, never stacks one.
+      stills[0]!.click();
+      expect(document.querySelectorAll('.gru-modal')).toHaveLength(1);
+      expect(count()).toBe('1 of 3 · aaaa1111');
+
+      // The bell's copy of the card opens the same viewer.
+      press('Escape');
+      const bellStill = document.querySelector<HTMLButtonElement>('#notification-list .board-owner__shot-link');
+      if (bellStill === null) throw new Error('the bell did not render the card\'s captures');
+      bellStill.click();
+      expect(count()).toBe('1 of 3 · aaaa1111');
+      expect(fetchMedia).toHaveBeenCalledTimes(3);
+    } finally {
+      for (const close of [...document.querySelectorAll<HTMLButtonElement>('.gru-modal__close')]) close.click();
+      createSpy.mockRestore();
+      revokeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it('an open capture viewer keeps its previews, says when its card has changed, and closes on a re-pair', async () => {
+    const sha = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+    const nextSha = 'bbbb2222cccc3333dddd4444eeee5555ffff6666';
+    const one = { id: 'm-11111111-1111-1111-1111-111111111111', kind: 'image' as const, mediaType: 'image/png', role: 'before' as const, caption: 'Card, before', bytes: 10 };
+    const two = { id: 'm-22222222-2222-2222-2222-222222222222', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'Card, after', bytes: 10 };
+    const newer = { id: 'm-44444444-4444-4444-4444-444444444444', kind: 'image' as const, mediaType: 'image/png', role: 'after' as const, caption: 'Card, newer head', bytes: 10 };
+    const revoked: string[] = [];
+    let made = 0;
+    const createSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:test-${(made += 1)}`);
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url: string) => { revoked.push(url); });
+    const published = { state: 'published' as const, at: null, detail: null };
+    const client = () =>
+      ({ ackNotification: vi.fn(), markNotificationShown: vi.fn(), fetchMedia: vi.fn((id: string) => Promise.resolve(new Blob([id]))) }) as unknown as import('../lib/board-client.js').BoardClient;
+    const notice = (): HTMLElement => document.querySelector<HTMLElement>('.media-viewer__notice')!;
+    try {
+      const view = new BoardView(() => {});
+      view.bindClient(client());
+      const card = ownerPr('job-shots', { sha, media: { headSha: sha, items: [one, two], superseded: 0, publication: published } });
+      view.render(snapshot({ ownerPrs: [card] }));
+      const band = document.getElementById('board-owner')!;
+      await vi.waitFor(() => expect(band.querySelectorAll('.board-owner__shot-link')).toHaveLength(2));
+      band.querySelector<HTMLButtonElement>('.board-owner__shot-link')!.click();
+      expect(notice().hidden).toBe(true);
+
+      // The same card, snapshot after snapshot: nothing to say.
+      view.render(snapshot({ ownerPrs: [card] }));
+      expect(notice().hidden).toBe(true);
+      // A new head replaced the captures the viewer is showing.
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha: nextSha, media: { headSha: nextSha, items: [newer], superseded: 2, publication: published } })] }));
+      expect(notice().hidden).toBe(false);
+      expect(notice().textContent).toBe(CAPTURE_VIEWER_STALE_NOTICE);
+      expect(document.querySelector('.media-viewer__count')?.textContent).toBe('1 of 2 · aaaa1111');
+      await vi.waitFor(() => expect(band.querySelector<HTMLImageElement>('.board-owner__shot img[alt="Card, newer head"]')?.src).toBe('blob:test-3'));
+      // The card shows the viewer's captures again: the line goes.
+      view.render(snapshot({ ownerPrs: [card] }));
+      expect(notice().hidden).toBe(true);
+      // A capture added at the same head changes the card too.
+      view.render(snapshot({ ownerPrs: [ownerPr('job-shots', { sha, media: { headSha: sha, items: [one, two, newer], superseded: 0, publication: published } })] }));
+      expect(notice().hidden).toBe(false);
+      // A card that blinks out of one snapshot says nothing about its captures.
+      view.render(snapshot({ ownerPrs: [] }));
+      expect(notice().hidden).toBe(true);
+
+      // Long after the card left, the open viewer still holds its previews…
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60 * 60_000);
+      try {
+        view.render(snapshot({ ownerPrs: [] }));
+        expect(revoked).toEqual(['blob:test-3']); // only the newer head's, which no viewer shows
+        expect(document.querySelector('.gru-modal')).not.toBeNull();
+        // …and lets them go once it is closed.
+        document.querySelector<HTMLButtonElement>('.gru-modal__close')!.click();
+        clock.mockReturnValue(Date.now() + 60 * 60_000);
+        view.render(snapshot({ ownerPrs: [] }));
+        expect([...revoked].sort()).toEqual(['blob:test-1', 'blob:test-2', 'blob:test-3']);
+      } finally {
+        clock.mockRestore();
+      }
+
+      // A re-pair revokes every preview, so the viewer showing them closes first.
+      view.render(snapshot({ ownerPrs: [card] }));
+      await vi.waitFor(() => expect(band.querySelectorAll('.board-owner__shot-link')).toHaveLength(2));
+      band.querySelector<HTMLButtonElement>('.board-owner__shot-link')!.click();
+      expect(document.querySelector('.gru-modal')).not.toBeNull();
+      view.bindClient(client());
+      expect(document.querySelector('.gru-modal')).toBeNull();
+    } finally {
+      for (const close of [...document.querySelectorAll<HTMLButtonElement>('.gru-modal__close')]) close.click();
       createSpy.mockRestore();
       revokeSpy.mockRestore();
     }

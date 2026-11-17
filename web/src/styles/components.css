@@ -4395,7 +4395,7 @@ html.gru-modal-open {
 }
 
 /* PR media (docs/PR-MEDIA.md): the ready card's captures, bound to its
-   exact head. Stills open full size; clips play in place. */
+   exact head. Stills open the capture viewer; clips play in place. */
 .board-owner__media {
   grid-column: 1 / -1;
   display: grid;
@@ -4421,6 +4421,7 @@ html.gru-modal-open {
 }
 
 .board-owner__shot-frame {
+  position: relative;
   aspect-ratio: 16 / 10;
   display: grid;
   place-items: center;
@@ -4447,6 +4448,39 @@ html.gru-modal-open {
   background: #000;
 }
 
+/* A still is a button into the capture viewer. */
+.board-owner__shot-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+}
+
+.board-owner__shot-link:focus-visible,
+.board-owner__shot-expand:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: -3px;
+}
+
+/* A clip's own way into the viewer: the player keeps every other click. */
+.board-owner__shot-expand {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 2px solid var(--line);
+  border-radius: 50%;
+  background: var(--card);
+  box-shadow: var(--shadow-btn-pressed);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
 .board-owner__shot-caption {
   font-size: 11px;
   line-height: 1.35;
@@ -4464,4 +4498,297 @@ html.gru-modal-open {
 /* Media owed, or a camera failure: the owner should act before merging. */
 .board-owner__media-note--owed {
   color: var(--danger);
+}
+
+/* ── Capture viewer (web/src/ui/media-viewer.ts) ──────────────────────
+   One ready card's captures in a single dialog. The card keeps one size
+   while the owner flips, so a phone shot and a desktop shot land on the
+   same stage and the arrows never move under the pointer. */
+.gru-modal__card.media-viewer-card {
+  width: min(1180px, 100%);
+  height: min(880px, calc(100vh - 40px));
+  height: min(880px, calc(100dvh - 40px));
+}
+
+.media-viewer-card .gru-modal__title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The body is a scroll container (the fallback for a very short window),
+   so it clips: the gutter leaves room for the arrows' focus rings and
+   toy-box shadows, and the negative margin keeps the layout aligned. */
+.media-viewer-card .gru-modal__body {
+  flex: 1;
+  display: flex;
+  margin: 0 -7px -7px;
+  padding: 0 7px 7px;
+}
+
+.media-viewer {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.media-viewer__notice {
+  padding: 8px 12px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.media-viewer__main {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: 'previous stage next';
+  align-items: center;
+  gap: 12px;
+}
+
+.media-viewer__main--single {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: 'stage';
+}
+
+.media-viewer__stage {
+  grid-area: stage;
+  align-self: stretch;
+  position: relative;
+  min-width: 0;
+  min-height: 140px;
+  overflow: hidden;
+  border: var(--outline-thin);
+  border-radius: var(--radius-md);
+  background: var(--soft);
+}
+
+.media-viewer__status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* The still fills the stage and is drawn no larger than its own pixels
+   (scale-down), so a small capture stays sharp. */
+.media-viewer__zoom {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 12px;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+}
+
+.media-viewer__zoom:disabled {
+  cursor: default;
+}
+
+.media-viewer__zoom:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: -5px;
+  border-radius: var(--radius-md);
+}
+
+.media-viewer__zoom img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: scale-down;
+}
+
+/* Actual size: the stage scrolls and the still keeps its own pixels,
+   centered while it is smaller than the stage on an axis. */
+.media-viewer__stage--actual {
+  display: grid;
+  overflow: auto;
+}
+
+.media-viewer__stage--actual .media-viewer__zoom {
+  position: static;
+  width: max-content;
+  height: max-content;
+  margin: auto;
+  cursor: zoom-out;
+}
+
+.media-viewer__stage--actual .media-viewer__zoom img {
+  width: auto;
+  height: auto;
+}
+
+.media-viewer__stage > video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.media-viewer__nav {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--work);
+  color: var(--on-state);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.media-viewer__nav--previous { grid-area: previous; }
+.media-viewer__nav--next { grid-area: next; }
+
+.media-viewer__nav:focus-visible,
+.media-viewer__thumb:focus-visible,
+.media-viewer__full:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 3px;
+}
+
+.media-viewer__meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  min-width: 0;
+}
+
+.media-viewer__label {
+  flex: none;
+}
+
+/* Two lines are held even for a short caption, so the stage keeps its
+   height from one capture to the next. */
+.media-viewer__caption {
+  flex: 1;
+  min-width: 12ch;
+  min-height: 2.7em;
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.media-viewer__count {
+  flex: none;
+  white-space: nowrap;
+}
+
+.media-viewer__full {
+  flex: none;
+  padding: 5px 12px;
+  border: 2px solid var(--ink);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.media-viewer__full:hover {
+  background: var(--soft);
+}
+
+.media-viewer__strip {
+  display: flex;
+  justify-content: safe center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px;
+  overflow-x: auto;
+}
+
+/* One definite track, so a tall phone shot is fitted to the thumb's
+   height (a percentage against an auto track would not resolve). */
+.media-viewer__thumb {
+  flex: none;
+  display: grid;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+  place-items: center;
+  width: 76px;
+  height: 52px;
+  padding: 3px;
+  border: var(--outline-thin);
+  border-radius: 12px;
+  background: var(--soft);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  overflow: hidden;
+  transition: transform 0.12s var(--ease-pop);
+}
+
+.media-viewer__thumb:hover {
+  transform: translateY(-2px);
+}
+
+.media-viewer__thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+}
+
+/* Where the owner is: a minion-yellow ring, readable in both themes. */
+.media-viewer__thumb[aria-current='true'] {
+  background: var(--card);
+  box-shadow: 0 0 0 3px var(--work);
+}
+
+/* Narrow screens: the stage takes the full width and the arrows sit
+   under it as two thumb-sized bars. */
+@media (max-width: 640px) {
+  .media-viewer__main {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'stage stage'
+      'previous next';
+    gap: 10px;
+  }
+
+  .media-viewer__main--single {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-areas: 'stage';
+  }
+
+  .media-viewer__nav {
+    width: 100%;
+    height: 42px;
+    border-radius: var(--radius-sm);
+  }
+
+  .media-viewer__thumb {
+    width: 60px;
+    height: 42px;
+  }
 }

@@ -464,8 +464,9 @@ and its outcome is repaired by the next attempt.
 A ready-PR row (Perkins approved at the head, CI green at the head,
 mergeable) shows:
 
-- the captures bound to that head, as a strip: stills link to the full-size
-  image, and clips play inline (muted, with controls);
+- the captures bound to that head, as a strip: a still opens the
+  [capture viewer](#the-capture-viewer), and clips play inline (muted, with
+  controls) and carry a 🖼️ button that opens the viewer on the clip;
 - a line such as
   `📸 2 captures at aaaa1111 · 1 older superseded · posted to the PR ✓`
   (MR for GitLab). The publication part reads:
@@ -492,6 +493,38 @@ Previews are fetched once per pairing.
   keeps its previews for 10 minutes.
 - **Refused fetch:** it reads `preview unavailable: <reason>` (for example
   `media_altered`) until the next pairing.
+
+### The capture viewer
+
+A click on a still opens every capture of that card in one dialog on the
+board. No tab opens.
+
+- **Flip:** `←` and `→`, the two arrow buttons, or a thumb in the filmstrip.
+  The ends wrap, and `Home` and `End` jump to the first and last capture.
+- **What it shows:** the heist's title, the capture's label (`before`,
+  `after` or `clip`) and caption, and a line such as `3 of 8 · aaaa1111`
+  (the position and the head).
+- **Zoom:** a still drawn smaller than its own pixels zooms to its actual
+  size on a click, and back on the next; the stage scrolls. `full size ↗`
+  opens the still in a new tab for anyone who wants one.
+- **Clips:** they play in the viewer with their own controls. While a clip
+  has focus the arrow keys seek it, and the arrow buttons still flip. A clip
+  stops when the owner flips away or closes, and the card's players stop
+  when the viewer opens.
+- **Close:** `Escape`, the ✕, or a click outside the dialog. Focus returns
+  to the capture that was opened.
+- **No new requests:** the viewer shows the previews the card already
+  fetched.
+- **Card changes while it is open:** the viewer keeps the captures it was
+  opened on, still named by their head, and says
+  `📸 this card changed while you were looking — close the viewer to see its captures as they stand`.
+  The line goes if the card shows those captures again. A card that is
+  missing from one snapshot changes nothing.
+- **Previews:** they stay loaded for as long as the viewer is open, past the
+  10 minutes a card's previews are otherwise kept.
+- **Re-pair:** the viewer closes, since a new pairing fetches every preview
+  afresh.
+- **Narrow screens:** the arrows sit under the stage as two bars.
 
 ## Configuration
 
@@ -546,6 +579,10 @@ the GitHub/GitLab polls run.
   `ownerPrs` rows.
 - `src/dispatch/silas-driver.ts`: the publisher's tick and in-flight guard.
 - `web/src/ui/board.ts`: the preview strip.
+- `web/src/ui/media-viewer.ts`: the capture viewer, on the shared dialog
+  (`web/src/ui/modal.ts`).
+- `web/mock/captures.ts`: sample captures for the dev mock's `captures`
+  board mode.
 - Tests:
   - `test/pr-media.test.ts`, `test/pr-media-server.test.ts` and
     `test/pr-media-publisher.test.ts`;
@@ -555,4 +592,5 @@ the GitHub/GitLab polls run.
     and `test/pr-media-director.test.ts` (coverage, scheduling, re-shoots,
     retries, the FOR YOU block and the PR notes);
   - the engine, driver and web validator, client and render tests;
-  - a real-service route check in `web/e2e/real-server.spec.ts`.
+  - a real-service route check in `web/e2e/real-server.spec.ts`;
+  - the capture viewer in a real browser, `web/e2e/capture-viewer.spec.ts`.
