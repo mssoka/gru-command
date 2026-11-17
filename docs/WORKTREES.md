@@ -618,8 +618,8 @@ carries it, and so does everything that session starts
      the ledger recorded at its handoff, or one that names its checkout) still
      stands, and one that cannot read the repository's `worktrees` inventory
      with no administration of the lane on record: absence must be proven.
-     Once the removal has run, the release never answers 400. It completes
-     (the row swept, `worktree.swept`, the receipt), whatever else the
+     Once `git worktree remove` has succeeded, the release never answers 400.
+     It completes (the row swept, `worktree.swept`, the receipt), whatever else the
      inventory holds: sibling lanes, a desktop tool's worktree folder with no
      `gitdir`, a worktree whose checkout is gone, a folder whose backlink or
      receipt cannot be read. Git reads a worktree only through a folder's
@@ -628,7 +628,12 @@ carries it, and so does everything that session starts
      no usable backlink, when its service handoff receipt names the lane. A lane
      whose checkout is already gone and whose row is still `active` (an
      earlier release that stopped) is reconciled by the next release
-     (`worktree.reconciled`), with or without such folders around.
+     (`worktree.reconciled`), with or without such folders around. A removal
+     that fails part way and whose remains GC cannot delete is the
+     `worktree.release-aborted` refusal described above, and stays one; GC
+     finishes a half-removed checkout only when no folder of the lane's own
+     stands (the ledger's record of its administration, a backlink, or a
+     receipt naming the lane), and otherwise refuses before touching it.
    - **Residue.** What the proof after the removal looks for is the lane's own
      resources: its checkout path (re-created), the git folder its checkout
      named, and any folder that names the checkout. If one still stands, the

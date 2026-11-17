@@ -875,10 +875,15 @@ function administersLane(admin: string, expected: string, lane: WorktreeLane): b
  * are `lane`'s (see {@link administersLane}), and why the inventory could not
  * be read, when it could not (the lane's own resources are then judged by what
  * is known of them alone: the inventory is other tools' and lanes' business). */
-function laneAdministrations(lane: WorktreeLane): { readonly own: readonly string[]; readonly unscanned: string | null } {
+/** The `.git` path of `lane`'s checkout as a backlink resolves to it. */
+function expectedGitFile(lane: WorktreeLane): string {
   let parent: string;
   try { parent = realpathSync(dirname(lane.path)); } catch { parent = dirname(lane.path); }
-  const expected = join(parent, basename(lane.path), '.git');
+  return join(parent, basename(lane.path), '.git');
+}
+
+function laneAdministrations(lane: WorktreeLane): { readonly own: readonly string[]; readonly unscanned: string | null } {
+  const expected = expectedGitFile(lane);
   let container: string;
   let entries: readonly { readonly name: string; isDirectory(): boolean }[];
   try {
@@ -912,18 +917,41 @@ function recordedAdministration(lane: WorktreeLane): string | null {
 
 /** What of `lane`'s own stands: its checkout path, its administration folder
  * (`admin`: the one its checkout named, read before a removal; else the one
- * the ledger recorded), and any inventory folder that is its administration.
+ * the ledger recorded) unless it provably names another checkout (git reuses a
+ * freed folder name), and any inventory folder that is its administration.
  * Never judges anything else in the repository. `identified` says whether the
- * lane's own folder is known by name, which an unreadable inventory cannot
- * then hide; `unscanned` says why the inventory could not be read. */
+ * lane's own folder is known by name AND the place it would stand in can be
+ * seen: an unreadable inventory cannot then hide it, but a repository that
+ * cannot be reached at all can (a missing path proves nothing there).
+ * `unscanned` says why the inventory could not be read. */
 export function laneResidue(lane: WorktreeLane, admin: string | null): { readonly residue: readonly string[]; readonly unscanned: string | null; readonly identified: boolean } {
   const standing = (path: string): boolean => {
     try { lstatSync(path); return true; } catch (error) { return errnoOf(error) !== 'ENOENT' && errnoOf(error) !== 'ENOTDIR'; }
   };
+  const seen = (path: string): boolean => {
+    try { lstatSync(path); return true; } catch { return false; }
+  };
   const known = admin ?? recordedAdministration(lane);
+  const expected = expectedGitFile(lane);
   const { own, unscanned } = laneAdministrations(lane);
-  const residue = [...(standing(lane.path) ? [lane.path] : []), ...(known !== null && standing(known) ? [known] : []), ...own];
-  return { residue: residue.filter((path, index) => residue.indexOf(path) === index), unscanned, identified: known !== null };
+  const ownFolder = (path: string): boolean => {
+    const named = backlinkedGitFile(path);
+    return named === null || named === expected;
+  };
+  const knownFolder = known !== null && standing(known) && ownFolder(known) ? [known] : [];
+  const residue = [...(standing(lane.path) ? [lane.path] : []), ...knownFolder, ...own];
+  return {
+    residue: residue.filter((path, index) => residue.indexOf(path) === index),
+    unscanned,
+    identified: known !== null && (unscanned === null || seen(dirname(known))),
+  };
+}
+
+/** The administration folders of the lane's own that stand (see
+ * {@link laneResidue}), not counting its checkout path. A folder of the lane's
+ * own standing means git did not delete the lane's git folder. */
+export function laneAdministrationsStanding(lane: WorktreeLane): readonly string[] {
+  return laneResidue(lane, null).residue.filter((path) => path !== lane.path);
 }
 
 /** Cleanup's old missing-tree reconciliation is NOT writer readiness. Only

@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, pendingLaneHandoffPublished, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, laneAdministrationOf, laneResidue, LaneResidueError, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
+import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, pendingLaneHandoffPublished, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, laneAdministrationOf, laneAdministrationsStanding, laneResidue, LaneResidueError, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
 import { CreationIntentError, RetainedCreationFailedError, RetainedCreationRefusalError, clearCreationIntent, readCreationIntent, redactCreationTokens, writeCreationIntent, type CreationIntent, type CreationIntentLane, type RetainedReceiptExpectation } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -5172,6 +5172,12 @@ export class WorktreeManager {
     } catch {
       // missing or not a plain file: the repository's records decide
     }
+    // A folder of the lane's own that stands (the one the ledger recorded at its
+    // handoff, or one whose receipt names the lane) is a git folder git did not
+    // delete: finishing a part-way removal here would delete the tree, and the
+    // custody proof would then refuse, which a release must not do after it
+    // removed anything.
+    if (laneAdministrationsStanding(row).length > 0) return false;
     const container = join(repositoryCommonDirectory(row.repoPath), 'worktrees');
     if (!existsSync(container)) return true;
     const tree = new Set([join(row.path, '.git'), join(realpathSync(dirname(row.path)), basename(row.path), '.git')]);
@@ -5265,26 +5271,32 @@ export class WorktreeManager {
     throw refusal;
   }
 
-  /** What the lane's last residue refusal recorded as saved before it refused
-   * (see {@link assertRemovalSettled}): a release that refused after its removal
-   * never told the owner, so the release that finishes the lane does. Null when
-   * the last record of a tail failure is not one, or saved nothing. */
+  /** What the lane's last residue refusal that had saved work recorded (see
+   * {@link assertRemovalSettled}): a release that refused after its removal
+   * never told the owner, so the release that finishes the lane does. Rows of
+   * the same kind written since (a part-way removal finished, a branch that
+   * could not be deleted) do not hide it. Null when no refusal saved anything. */
   private savedBeforeResidue(row: WorktreeRecord): { readonly snapshot: SweepSnapshot | null; readonly preserved: SweepPreservation | null } | null {
-    let payload: { readonly stage?: unknown; readonly preserved?: unknown; readonly snapshot?: unknown } | undefined;
+    let events: readonly { readonly payload: unknown }[];
     try {
-      payload = this.opts.ledger.latestEventByPayloadField('worktree.sweep-tail-failed', 'id', row.id)?.payload as typeof payload;
+      const last = row.jobId === null ? this.opts.ledger.latestEventByPayloadField('worktree.sweep-tail-failed', 'id', row.id) : null;
+      events = row.jobId !== null ? this.opts.ledger.listJobEventsByKinds(row.jobId, ['worktree.sweep-tail-failed']) : last === null ? [] : [last];
     } catch (error) {
-      this.log('warn', 'the lane\'s last tail failure could not be read; what it saved is not announced', { id: row.id, error: String(error) });
+      this.log('warn', 'the lane\'s tail failures could not be read; what a refused release saved is not announced', { id: row.id, error: String(error) });
       return null;
     }
-    if (payload?.stage !== 'verify') return null;
-    const preserved = payload.preserved as { readonly destination?: unknown; readonly files?: unknown } | null | undefined;
-    const snapshot = payload.snapshot as { readonly ref?: unknown; readonly sha?: unknown; readonly files?: unknown } | null | undefined;
-    const kept = {
-      preserved: typeof preserved?.destination === 'string' && typeof preserved.files === 'number' ? { destination: preserved.destination, count: preserved.files } : null,
-      snapshot: typeof snapshot?.ref === 'string' && typeof snapshot.sha === 'string' ? { ref: snapshot.ref, sha: snapshot.sha, files: typeof snapshot.files === 'number' ? snapshot.files : 0 } : null,
-    };
-    return kept.preserved === null && kept.snapshot === null ? null : kept;
+    for (const event of events) {
+      const payload = event.payload as { readonly id?: unknown; readonly stage?: unknown; readonly preserved?: unknown; readonly snapshot?: unknown };
+      if (payload.id !== row.id || payload.stage !== 'verify') continue;
+      const preserved = payload.preserved as { readonly destination?: unknown; readonly files?: unknown } | null | undefined;
+      const snapshot = payload.snapshot as { readonly ref?: unknown; readonly sha?: unknown; readonly files?: unknown } | null | undefined;
+      const kept = {
+        preserved: typeof preserved?.destination === 'string' && typeof preserved.files === 'number' ? { destination: preserved.destination, count: preserved.files } : null,
+        snapshot: typeof snapshot?.ref === 'string' && typeof snapshot.sha === 'string' ? { ref: snapshot.ref, sha: snapshot.sha, files: typeof snapshot.files === 'number' ? snapshot.files : 0 } : null,
+      };
+      if (kept.preserved !== null || kept.snapshot !== null) return kept;
+    }
+    return null;
   }
 
   /** Write the failure the release's tail noted (a base or branch step that
