@@ -606,6 +606,29 @@ carries it, and so does everything that session starts
      part way); a removal the owner ran by hand, outside GC, took no
      snapshot, and such a file is not copied.
 
+   - **A release completes, or refuses before it removes anything.** The
+     proof that a lane's checkout and administration are both gone reads the
+     repository's `worktrees` inventory (`<git common dir>/worktrees`), one
+     folder per linked worktree, and so does the check before the removal.
+     Git reads a worktree only through a folder's `gitdir` backlink, so a
+     folder with none (a desktop tool's worktree, say) names no tree and is
+     skipped, as is a backlink whose checkout stood under a folder that is
+     gone. Such a folder is skipped unless it carries a handoff receipt of
+     this service that names the lane (a removal that stopped part way left
+     it). A folder that cannot be told apart from the lane's (a backlink that
+     is unreadable, empty or no checkout path, a receipt that cannot be
+     read, an entry that is no folder), and a second folder that names the
+     lane's checkout, refuse the release by name BEFORE the checkout is
+     removed: the checkout, its git folder, the branch and the row stay as
+     they were, and nothing is recorded. If the proof refuses after the
+     removal (a folder appeared meanwhile), GC records `worktree.sweep-tail-failed
+     { id, stage: "custody", path, checkoutRemoved, branch, preserved,
+     snapshot, error }` before it refuses, naming what is gone (`branch` is
+     what the release did to the lane's branch so far, `none` until it
+     touched it) and what was saved. The row stays as it was, and a release
+     once the folder is cleared reconciles it over the missing tree
+     (`worktree.reconciled`).
+
    `<lane>` is the lane id when git accepts it as one ref-name component
    (letters, digits, `.`, `_` and `-`, not starting with `.` or `-`, no
    `..`, not ending in `.` or `.lock`), which every job lane's id is,
