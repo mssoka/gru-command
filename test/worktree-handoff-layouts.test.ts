@@ -803,6 +803,7 @@ describe('lane release in a repository whose worktree inventory holds folders GC
       // The release's own tail resolves the base once the checkout is gone: a
       // foreign tool registering a folder at that moment is the race.
       log: (_level, message) => {
+        console.error('DIAG-LOG', message, armed !== null, planted, armed === null ? null : existsSync(armed.lane));
         if (armed !== null && planted === null && message.startsWith('base resolution degraded') && !existsSync(armed.lane)) {
           planted = folder(armed.container, 'raced-registration', { gitdir: 'not-a-checkout\n' });
         }
