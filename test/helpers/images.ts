@@ -57,3 +57,25 @@ export function minimalWebp(): Buffer {
   riff.writeUInt32LE(body.length, 0);
   return Buffer.concat([Buffer.from('RIFF', 'ascii'), riff, body]);
 }
+
+function ebmlElement(id: readonly number[], data: Buffer): Buffer {
+  if (data.length > 126) throw new Error('ebmlElement: one-byte sizes only');
+  return Buffer.concat([Buffer.from(id), Buffer.from([0x80 | data.length]), data]);
+}
+
+function ebmlUint16(value: number): Buffer {
+  const bytes = Buffer.alloc(2);
+  bytes.writeUInt16BE(value, 0);
+  return bytes;
+}
+
+/** The head of a WebM recording and nothing else: the EBML header naming the
+ * `webm` doctype, then a segment of unknown size (as a streamed recording
+ * has) whose one video track names its frame size. No frames. */
+export function minimalWebm(width = 2, height = 2): Buffer {
+  const header = ebmlElement([0x1a, 0x45, 0xdf, 0xa3], ebmlElement([0x42, 0x82], Buffer.from('webm', 'ascii')));
+  const video = ebmlElement([0xe0], Buffer.concat([ebmlElement([0xb0], ebmlUint16(width)), ebmlElement([0xba], ebmlUint16(height))]));
+  const entry = ebmlElement([0xae], Buffer.concat([ebmlElement([0xd7], Buffer.from([1])), video]));
+  const tracks = ebmlElement([0x16, 0x54, 0xae, 0x6b], entry);
+  return Buffer.concat([header, Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), tracks]);
+}

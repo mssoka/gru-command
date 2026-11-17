@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { redactCredentials } from '../redaction.js';
 import type { PlannedCapture, ShotStep } from './shot-list.js';
@@ -57,8 +57,10 @@ export class CaptureToolError extends Error {
 }
 
 export interface WebCaptureDriver {
-  /** Null when the tool is ready; otherwise what to install or fix. */
-  probe(signal: AbortSignal): Promise<string | null>;
+  /** Null when the host can film `plans`; otherwise what to install or fix.
+   * A clip needs more of the host than a still does, so the plans say which
+   * tools the run will use. */
+  probe(signal: AbortSignal, plans: readonly PlannedCapture[]): Promise<string | null>;
   /** Film one capture into `outFile`. Throws {@link ShotStepError} or
    * {@link CaptureToolError}. */
   shoot(request: WebShotRequest): Promise<void>;
@@ -79,6 +81,9 @@ export type CliRunner = (
 ) => Promise<CliResult>;
 
 export const AGENT_BROWSER_BIN = 'agent-browser';
+/** agent-browser encodes a recording through the host's ffmpeg; a still
+ * needs none. */
+export const FFMPEG_BIN = 'ffmpeg';
 /** One action's wait (the tool's own default timeout). */
 export const WEB_STEP_TIMEOUT_MS = 15_000;
 /** Slack the process gets past its action timeout before it is killed. */
@@ -179,15 +184,22 @@ export class AgentBrowserDriver implements WebCaptureDriver {
     private readonly baseEnv: () => NodeJS.ProcessEnv = () => process.env,
   ) {}
 
-  async probe(signal: AbortSignal): Promise<string | null> {
-    const result = await this.run([AGENT_BROWSER_BIN, '--version'], {
-      cwd: process.cwd(), env: cameraBrowserEnv(this.baseEnv()), timeoutMs: 30_000, signal,
-    });
-    if (result.code === 0 && /agent-browser/iu.test(result.stdout)) return null;
+  async probe(signal: AbortSignal, plans: readonly PlannedCapture[]): Promise<string | null> {
+    const options = { cwd: process.cwd(), env: cameraBrowserEnv(this.baseEnv()), timeoutMs: 30_000, signal };
+    const result = await this.run([AGENT_BROWSER_BIN, '--version'], options);
     if (result.error === 'ENOENT') {
       return 'agent-browser is not installed on the Gru Command host: run `npm install -g agent-browser && agent-browser install`';
     }
-    return `agent-browser --version failed: ${detail(result)}`;
+    if (result.code !== 0 || !/agent-browser/iu.test(result.stdout)) return `agent-browser --version failed: ${detail(result)}`;
+    // Learned here, before anything is served: without ffmpeg a recording
+    // runs every step and fails only when it is stopped.
+    if (!plans.some((plan) => plan.kind === 'clip')) return null;
+    const encoder = await this.run([FFMPEG_BIN, '-version'], options);
+    if (encoder.code === 0) return null;
+    if (encoder.error === 'ENOENT') {
+      return 'a clip needs ffmpeg on the Gru Command host (agent-browser records through it): install it, for example `brew install ffmpeg` or `apt install ffmpeg`. Screenshots need none';
+    }
+    return `ffmpeg -version failed, and a clip is recorded through it: ${detail(encoder)}`;
   }
 
   async shoot(request: WebShotRequest): Promise<void> {
@@ -211,22 +223,34 @@ export class AgentBrowserDriver implements WebCaptureDriver {
       if (step === null) throw new CaptureToolError(`agent-browser ${what} failed: ${detail(result)}`);
       throw new ShotStepError(plan.shotId, step, `shot "${plan.shotId}" step ${step + 1} (${what}) failed at ${plan.viewport.name}: ${detail(result)}`);
     };
+    const viewport = ['set', 'viewport', String(plan.viewport.width), String(plan.viewport.height)];
+    // A clip's first take: see below. In the run's folder, never a capture.
+    const warmUp = join(request.workDir, `warm-up-${randomUUID()}.webm`);
     try {
-      await must(['set', 'viewport', String(plan.viewport.width), String(plan.viewport.height)], 'set viewport', null);
       const [first, ...rest] = plan.steps;
       if (first === undefined || first.action !== 'open') throw new ShotStepError(plan.shotId, 0, `shot "${plan.shotId}" must start with an open step`);
       if (plan.kind === 'clip') {
-        // The recording starts on the first page, so the clip shows the
-        // whole flow; it rolls a moment past the last step.
-        await must(['record', 'start', request.outFile, `${request.baseUrl}${first.path}`], describeStep(first), 0);
+        // A clip is filmed at the shot's viewport, as a still is. The tool
+        // opens a recording in a fresh context at its own default size,
+        // whatever viewport was set before, and fixes the frame size when a
+        // recording starts. So the first take only opens the page; the
+        // viewport is set on that page; and the recording is restarted into
+        // the real file, which takes the viewport as its frame and keeps the
+        // page as it is. The clip shows the flow from the first page and
+        // rolls a moment past the last step.
+        await must(['record', 'start', warmUp, `${request.baseUrl}${first.path}`], describeStep(first), 0);
+        await must(viewport, 'set viewport', null);
+        await must(['record', 'restart', request.outFile], 'record restart', null);
         for (const [index, step] of rest.entries()) await must(stepArgs(step, request.baseUrl), describeStep(step), index + 1);
         await must(['wait', String(CLIP_TAIL_MS)], 'clip tail', null);
         await must(['record', 'stop'], 'record stop', null);
       } else {
+        await must(viewport, 'set viewport', null);
         for (const [index, step] of plan.steps.entries()) await must(stepArgs(step, request.baseUrl), describeStep(step), index);
         await must(['screenshot', request.outFile], 'screenshot', null);
       }
     } finally {
+      rmSync(warmUp, { force: true });
       // Best effort, and never under the run's signal (a stopped run still
       // closes its browser): a session left open ends with the tool's daemon.
       await this.run([...base, 'close'], {
