@@ -903,11 +903,17 @@ export function assertLaneResourcesAbsent(lane: WorktreeLane): void {
 }
 
 /** The inventory {@link assertLaneResourcesAbsent} reads after a removal, read
- * BEFORE it: a folder that cannot be told apart from the lane's refuses the
- * release while nothing is removed yet, instead of after the checkout is gone.
- * The lane's own administration is expected here, and is not judged. */
+ * BEFORE it: a folder that cannot be told apart from the lane's, or a second
+ * one that names the lane's checkout, refuses the release while nothing is
+ * removed yet, instead of after the checkout is gone. The administration the
+ * checkout's own `.git` file names is the lane's and is expected here. */
 export function assertLaneAdministrationsResolvable(lane: WorktreeLane): void {
-  try { laneAdministrations(lane); } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
+  try {
+    const own = adminFor(lane.path);
+    for (const admin of laneAdministrations(lane)) {
+      if (realpathSync(admin) !== own) throw new Error(`worktree administration ${admin} also names the checkout — custody unresolved`);
+    }
+  } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
 }
 
 export function captureCleanupHandoff(lane: WorktreeLane): () => void {

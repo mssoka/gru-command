@@ -716,10 +716,11 @@ describe('lane release in a repository whose worktree inventory holds folders GC
     return { repo, h, lane, container, receipt: readFileSync(join(adminOf(lane), 'gru-creation-handoff.json'), 'utf8') };
   }
 
-  /** One folder of the inventory, holding exactly `files`. */
+  /** One folder of the inventory, holding exactly `files`. Git prunes the
+   * inventory itself once its last worktree is removed, so it is made again. */
   function folder(container: string, name: string, files: Readonly<Record<string, string>>): string {
     const path = join(container, name);
-    mkdirSync(path);
+    mkdirSync(path, { recursive: true });
     for (const [file, text] of Object.entries(files)) writeFileSync(join(path, file), text);
     return path;
   }
@@ -803,7 +804,6 @@ describe('lane release in a repository whose worktree inventory holds folders GC
       // The release's own tail resolves the base once the checkout is gone: a
       // foreign tool registering a folder at that moment is the race.
       log: (_level, message) => {
-        console.error('DIAG-LOG', message, armed !== null, planted, armed === null ? null : existsSync(armed.lane));
         if (armed !== null && planted === null && message.startsWith('base resolution degraded') && !existsSync(armed.lane)) {
           planted = folder(armed.container, 'raced-registration', { gitdir: 'not-a-checkout\n' });
         }
