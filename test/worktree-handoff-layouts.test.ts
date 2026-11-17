@@ -1085,7 +1085,10 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const told: { readonly snapshot: { readonly ref: string } | null }[] = [];
     const repo = fixture('release-jobless-saved-work');
     const h = manager({ log: hook.log, onWorkSaved: (saved) => { told.push(saved); } });
-    const lane = await h.worktrees.createReviewWorktree({ repoPath: repo.path, roundId: 'jobless-review', ref: 'HEAD' });
+    h.ledger.addJob({ id: 'release-jobless-owner', repo: 'assigned', title: 'owner of the round' });
+    h.ledger.addRound({ jobId: 'release-jobless-owner', targetRef: 'HEAD' });
+    // The lane is made without a job id, as a round's review lane is.
+    const lane = await h.worktrees.createReviewWorktree({ repoPath: repo.path, roundId: 'release-jobless-owner-r1', ref: 'HEAD' });
     expect(h.ledger.getWorktree(lane.id)?.jobId).toBeNull();
     writeFileSync(join(lane.path, 'README.md'), 'an uncommitted edit\n');
     hook.arm(lane.path, () => mkdirSync(lane.path, { recursive: true }));
