@@ -28,6 +28,15 @@ its port via `GRU_MOCK_PORT`, and its bind via `GRU_MOCK_HOST`. A
 non-loopback mock bind is refused unless `GRU_MOCK_TOKEN` is explicitly
 set to at least 16 characters.
 
+The mock's ready card carries no PR captures by default. To see them, and
+the capture viewer ([PR-MEDIA.md](./PR-MEDIA.md#the-capture-viewer)), switch
+its board mode and reload:
+
+```bash
+curl -X POST localhost:8787/__board-mode -H 'authorization: Bearer dev-token' \
+  -H 'content-type: application/json' -d '{"mode":"captures"}'
+```
+
 > **Real socket (E5c, converged):** the UI now ships against the REAL
 > `/ws` — see the [real-socket section](#real-socket-e5c) below. The mock
 > remains the dev-only socket for `npm run dev:web` and the mock half of

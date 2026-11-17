@@ -233,6 +233,44 @@ describe('openModal', () => {
     expect(document.activeElement).toBe(opener);
   });
 
+  it('a caller\'s card class lands on the card, and its key handler hears the topmost dialog\'s other keys', () => {
+    const below = vi.fn();
+    const above = vi.fn();
+    const press = (key: string): void => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    };
+    const first = openModal({ title: 'Viewer', content: document.createElement('div'), cardClass: 'media-viewer-card', onKeydown: below });
+    const [card] = dialogCards();
+    expect(card?.classList.contains('gru-modal__card')).toBe(true);
+    expect(card?.classList.contains('media-viewer-card')).toBe(true);
+
+    press('ArrowRight');
+    expect(below).toHaveBeenCalledTimes(1);
+    expect((below.mock.calls[0]![0] as KeyboardEvent).key).toBe('ArrowRight');
+    // Tab is the trap's; it never reaches the caller.
+    press('Tab');
+    expect(below).toHaveBeenCalledTimes(1);
+
+    // A dialog opened on top takes the keys; the one below hears nothing.
+    const second = openModal({ title: 'Confirm', content: document.createElement('div'), onKeydown: above });
+    expect(dialogCards()[1]?.classList.contains('media-viewer-card')).toBe(false);
+    press('ArrowLeft');
+    expect(above).toHaveBeenCalledTimes(1);
+    expect(below).toHaveBeenCalledTimes(1);
+    // Escape is the dialog's own: it closes the top one and reaches neither.
+    press('Escape');
+    expect(above).toHaveBeenCalledTimes(1);
+    expect(below).toHaveBeenCalledTimes(1);
+    expect(dialogCards()).toHaveLength(1);
+    press('ArrowLeft');
+    expect(below).toHaveBeenCalledTimes(2);
+
+    second.close();
+    first.close();
+    press('ArrowLeft');
+    expect(below).toHaveBeenCalledTimes(2);
+  });
+
   it('focus-less content falls back to the ✕ button', () => {
     const dialog = openModal({ title: 'No controls', content: document.createElement('div') });
     expect(document.activeElement).toBe(document.querySelector('.gru-modal__close'));

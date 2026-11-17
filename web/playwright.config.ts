@@ -58,7 +58,7 @@ export default defineConfig({
   projects: [
     {
       name: 'mock',
-      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts'],
+      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts', 'capture-viewer.spec.ts'],
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
