@@ -42,7 +42,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import * as handoffProof from '../src/worktrees/handoff.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { WorktreeManager, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
@@ -92,12 +92,12 @@ function reasonsOf(error: unknown): string {
   return messages.join(' <- ');
 }
 
-function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string } {
+function manager(extra: Partial<WorktreeManagerOptions> = {}): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string } {
   const db = new LedgerDb(directory());
   dbs.push(db);
   const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
   const root = directory();
-  return { ledger, root, worktrees: new WorktreeManager({ ledger, root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] }) };
+  return { ledger, root, worktrees: new WorktreeManager({ ledger, root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [], ...extra }) };
 }
 
 /** Convert a fixture to the layout `git init --separate-git-dir` produces:
@@ -698,5 +698,131 @@ describe('child lane parent custody, called directly (#373)', () => {
     expect(reasonsOf(error)).toMatch(/handoff unresolved .*writer handoff attachment changed/u);
     f.childLeftNothing();
     expect(f.h.ledger.getWorktree(f.parent.id)?.status).toBe('active');
+  });
+});
+
+describe('lane release in a repository whose worktree inventory holds folders GC did not create', () => {
+  type Harness = ReturnType<typeof manager>;
+  const retiredKinds = /^worktree\.(?:swept|removed|preserved|reconciled|release-aborted|sweep-tail-failed)$/u;
+  const kindsOf = (h: Harness): readonly string[] => h.ledger.listEvents({ limit: 1000 }).map((event) => event.kind);
+  const adminOf = (lane: { readonly path: string }): string => git(lane.path, ['rev-parse', '--absolute-git-dir']);
+
+  async function laneFixture(name: string, extra: Partial<WorktreeManagerOptions> = {}) {
+    const repo = fixture(name);
+    const h = manager(extra);
+    const job = h.ledger.addJob({ id: name, repo: 'assigned', title: 'release custody' });
+    const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    const container = join(handoffProof.repositoryCommonDirectory(repo.path), 'worktrees');
+    return { repo, h, lane, container, receipt: readFileSync(join(adminOf(lane), 'gru-creation-handoff.json'), 'utf8') };
+  }
+
+  /** One folder of the inventory, holding exactly `files`. */
+  function folder(container: string, name: string, files: Readonly<Record<string, string>>): string {
+    const path = join(container, name);
+    mkdirSync(path);
+    for (const [file, text] of Object.entries(files)) writeFileSync(join(path, file), text);
+    return path;
+  }
+
+  /** A release that refused before touching anything: checkout, administration,
+   * branch and row as they were, and nothing recorded. */
+  function expectUntouched(f: Awaited<ReturnType<typeof laneFixture>>): void {
+    expect(existsSync(f.lane.path)).toBe(true);
+    expect(git(f.repo.path, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${realpathSync(f.lane.path)}`);
+    expect(existsSync(join(adminOf(f.lane), 'gru-creation-handoff.json'))).toBe(true);
+    expect(git(f.repo.path, ['branch', '--list', f.lane.branch ?? ''])).not.toBe('');
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
+    expect(kindsOf(f.h).filter((kind) => retiredKinds.test(kind))).toEqual([]);
+  }
+
+  it('completes the release, with its usual record, when folders name no tree', async () => {
+    const f = await laneFixture('release-names-no-tree');
+    // A desktop tool's worktree whose administration folder never held a
+    // gitdir (git reads no worktree from it), and a worktree whose checkout
+    // lives under a folder that is gone.
+    const noBacklink = folder(f.container, 'desktop-lane', { HEAD: 'ref: refs/heads/main\n', 'desktop-worktree-marker': '' });
+    const goneParent = folder(f.container, 'gone-parent', { HEAD: 'ref: refs/heads/main\n', gitdir: `${join(directory(), 'missing', 'checkout', '.git')}\n` });
+    const result = await f.h.worktrees.release({ worktreeId: f.lane.id });
+    expect(result.status).toBe('swept');
+    expect(existsSync(f.lane.path)).toBe(false);
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
+    expect(kindsOf(f.h)).toContain('worktree.swept');
+    expect(git(f.repo.path, ['worktree', 'list', '--porcelain'])).not.toContain(f.lane.path);
+    // Nothing of the other tools' is touched.
+    expect(readdirSync(noBacklink).sort()).toEqual(['HEAD', 'desktop-worktree-marker']);
+    expect(existsSync(join(goneParent, 'gitdir'))).toBe(true);
+  });
+
+  it('refuses before removing anything when an inventory folder cannot be told apart from the lane itself, and completes once it is cleared', async () => {
+    const cases: readonly (readonly [string, (container: string) => string, string])[] = [
+      ['a backlink that is not a checkout path', (container) => folder(container, 'odd-backlink', { gitdir: 'not-a-checkout\n' }), 'malformed gitdir backlink'],
+      ['an empty backlink', (container) => folder(container, 'empty-backlink', { gitdir: '' }), 'malformed gitdir backlink'],
+      ['a backlink that is a folder', (container) => { const path = folder(container, 'folder-backlink', {}); mkdirSync(join(path, 'gitdir')); return path; }, 'unreadable gitdir backlink'],
+      ['an entry that is not a folder', (container) => { const path = join(container, 'stray-file'); writeFileSync(path, 'x'); return path; }, 'is not a folder'],
+    ];
+    for (const [label, plant, problem] of cases) {
+      const f = await laneFixture(`release-ambiguous-${label.replace(/\W+/gu, '-')}`);
+      const planted = plant(f.container);
+      const error = await f.h.worktrees.release({ worktreeId: f.lane.id }).then(() => null, (cause: unknown) => cause);
+      expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+      expect(reasonsOf(error), label).toContain(problem);
+      expect(reasonsOf(error), label).toContain(planted);
+      expectUntouched(f);
+      rmSync(planted, { recursive: true, force: true });
+      expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status, label).toBe('swept');
+      expect(kindsOf(f.h), label).toContain('worktree.swept');
+    }
+  });
+
+  it('keeps custody: a folder with no backlink that holds a receipt for this lane, or one that cannot be read, still refuses before removal', async () => {
+    const f = await laneFixture('release-receipt-custody');
+    const receipt = JSON.parse(f.receipt) as Record<string, unknown>;
+    const refused: readonly (readonly [string, string])[] = [
+      ['this lane\'s own receipt', f.receipt],
+      ['this lane\'s checkout under another id', JSON.stringify({ ...receipt, id: 'earlier-lane' })],
+      ['a receipt that cannot be read', '{'],
+    ];
+    for (const [label, text] of refused) {
+      const planted = folder(f.container, 'stale-administration', { 'gru-creation-handoff.json': text });
+      const error = await f.h.worktrees.release({ worktreeId: f.lane.id }).then(() => null, (cause: unknown) => cause);
+      expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+      expectUntouched(f);
+      rmSync(planted, { recursive: true, force: true });
+    }
+    // Another lane's receipt names another tree: it is no custody of this one.
+    folder(f.container, 'other-lane-administration', { 'gru-creation-handoff.json': JSON.stringify({ ...receipt, id: 'other-lane', path: `${String(receipt.path)}-other` }) });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    expect(kindsOf(f.h)).toContain('worktree.swept');
+  });
+
+  it('records what a release removed when its proof refuses afterwards, and a retry completes once it is cleared', async () => {
+    let planted: string | null = null;
+    let armed: { readonly lane: string; readonly container: string } | null = null;
+    const f = await laneFixture('release-refuses-after-removal', {
+      // The release's own tail resolves the base once the checkout is gone: a
+      // foreign tool registering a folder at that moment is the race.
+      log: (_level, message) => {
+        if (armed !== null && planted === null && message.startsWith('base resolution degraded') && !existsSync(armed.lane)) {
+          planted = folder(armed.container, 'raced-registration', { gitdir: 'not-a-checkout\n' });
+        }
+      },
+    });
+    armed = { lane: f.lane.path, container: f.container };
+    const error = await f.h.worktrees.release({ worktreeId: f.lane.id }).then(() => null, (cause: unknown) => cause);
+    expect(error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(existsSync(f.lane.path)).toBe(false);
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
+    const recorded = f.h.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind === 'worktree.sweep-tail-failed');
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.payload).toMatchObject({
+      id: f.lane.id, stage: 'custody', path: f.lane.path, checkoutRemoved: true, branch: 'none', preserved: null, snapshot: null,
+      error: expect.stringContaining('malformed gitdir backlink') as unknown,
+    });
+    expect(kindsOf(f.h)).not.toContain('worktree.swept');
+    // The retained row reconciles over the missing tree once the folder is cleared.
+    rmSync(planted!, { recursive: true, force: true });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
+    expect(kindsOf(f.h)).toContain('worktree.reconciled');
   });
 });
