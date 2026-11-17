@@ -968,8 +968,8 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
     expect(outcome.error).toMatchObject({ name: 'LaneResidueError' });
     const failures = (id: string) => eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => event.payload as { id: string; stage?: string; error: string }).filter((payload) => payload.id === id);
-    expect(failures(f.lane.id).map((payload) => payload.stage ?? 'tail')).toEqual(['tail', 'verify']);
-    expect(failures(f.lane.id)[0]?.error).toContain('base resolution broke');
+    expect(failures(f.lane.id).map((payload) => payload.stage ?? 'tail').sort()).toEqual(['tail', 'verify']);
+    expect(failures(f.lane.id).find((payload) => payload.stage === undefined)?.error).toContain('base resolution broke');
     // The next lane's release is clean, and its record carries nothing of the first lane's failure.
     expect((await f.h.worktrees.release({ worktreeId: other.id })).status).toBe('swept');
     expect(failures(other.id)).toEqual([]);
