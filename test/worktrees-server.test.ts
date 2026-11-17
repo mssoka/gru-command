@@ -369,6 +369,36 @@ describe('worktree lane release endpoint (r4)', () => {
     }
   });
 
+  it('a silas sweep-ack release completes beside sibling lanes and folders that are not the lane itself, and records its receipt', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-sweep-ack-beside');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-ack-beside', repo: 'fixture-sweep-ack-beside', title: 'x' });
+      h.ledger.addJob({ id: 'job-ack-sibling', repo: 'fixture-sweep-ack-beside', title: 'y' });
+      for (const id of ['job-ack-beside', 'job-ack-sibling']) h.ledger.setJobStatus(id, 'working');
+      h.ledger.setJobStatus('job-ack-beside', 'in-review');
+      h.ledger.setJobStatus('job-ack-beside', 'merged');
+      await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-ack-beside' });
+      const sibling = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-ack-sibling' });
+      // What the repository holds beside the lane: a desktop tool's worktree folder that never held a gitdir, and a stale one.
+      const inventory = join(repo.path, '.git', 'worktrees');
+      for (const name of ['desktop-folder', 'stale-folder']) mkdirSync(join(inventory, name), { recursive: true });
+      writeFileSync(join(inventory, 'desktop-folder', 'desktop-worktree-marker'), '');
+      writeFileSync(join(inventory, 'stale-folder', 'gitdir'), 'not-a-checkout\n');
+      const released = await call(h.port, '/api/dispatch/release', { job_id: 'job-ack-beside', by: 'silas', rule_id: 'sweep-ack' }, TOKEN);
+      expect(released.status).toBe(200);
+      expect(field<string>(released.json, 'status')).toBe('swept');
+      expect(h.manager.getWorktree('job-ack-beside')?.status).toBe('swept');
+      expect(h.manager.getWorktree(sibling.id)?.status).toBe('active');
+      expect(h.ledger.listJobEvents('job-ack-beside').filter((event) => event.kind === 'silas.lane-released')).toHaveLength(1);
+      expect(h.ledger.listJobEvents('job-ack-beside').filter((event) => event.kind === 'worktree.swept')).toHaveLength(1);
+      expect(existsSync(join(inventory, 'desktop-folder'))).toBe(true);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('a release whose removal left its own resources answers 409 naming them, a custody refusal answers 400, and each logs the lane and the check that fired', async () => {
     let race: string | null = null;
     const h = await bootLane({

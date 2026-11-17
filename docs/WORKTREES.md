@@ -576,7 +576,9 @@ carries it, and so does everything that session starts
      first, a link removed as a link), runs `git worktree prune`, and the
      release completes as usual (the lane swept, the owner told what was
      saved), with `worktree.sweep-tail-failed { id, stage: "remove", error }`
-     naming what happened. When the rest cannot be deleted either, the
+     naming what happened (its stage `verify`, written when the lane's own
+     resources still stand after a removal that did complete, is described
+     below). When the rest cannot be deleted either, the
      release is refused by name with what is left in place. A release of a
      lane found in that state (the git folder gone, part of the tree left)
      takes the same path and then reconciles the lane as removed; unless an

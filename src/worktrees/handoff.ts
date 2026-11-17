@@ -871,10 +871,6 @@ function administersLane(admin: string, expected: string, lane: WorktreeLane): b
   } catch { return false; }
 }
 
-/** The administration folders of the repository's `worktrees` inventory that
- * are `lane`'s (see {@link administersLane}), and why the inventory could not
- * be read, when it could not (the lane's own resources are then judged by what
- * is known of them alone: the inventory is other tools' and lanes' business). */
 /** The `.git` path of `lane`'s checkout as a backlink resolves to it. */
 function expectedGitFile(lane: WorktreeLane): string {
   let parent: string;
@@ -882,6 +878,10 @@ function expectedGitFile(lane: WorktreeLane): string {
   return join(parent, basename(lane.path), '.git');
 }
 
+/** The administration folders of the repository's `worktrees` inventory that
+ * are `lane`'s (see {@link administersLane}), and why the inventory could not
+ * be read, when it could not (the lane's own resources are then judged by what
+ * is known of them alone: the inventory is other tools' and lanes' business). */
 function laneAdministrations(lane: WorktreeLane): { readonly own: readonly string[]; readonly unscanned: string | null } {
   const expected = expectedGitFile(lane);
   let container: string;
@@ -910,7 +910,8 @@ function recordedAdministration(lane: WorktreeLane): string | null {
   const association = knownLanes.get(lane.path);
   if (association === undefined) return null;
   try {
-    for (const event of completionFacts(association.ledger)) if (event.payload.id === lane.id) return event.payload.admin;
+    // The current binding, not the first issuance: a repository move rebinds the lane's folder.
+    for (const event of completionFacts(association.ledger)) if (event.payload.id === lane.id) return issuedBinding(event.payload, lane.id, association.ledger).binding.admin;
   } catch { return null; }
   return null;
 }
@@ -967,6 +968,10 @@ export function assertLaneResourcesAbsent(lane: WorktreeLane, admin: string | nu
     if (residue.includes(lane.path)) throw new Error('checkout is present or replaced');
     if (residue.length > 0) throw new Error(`associated administration retained — custody unresolved (${residue.join(', ')})`);
     if (unscanned !== null && !identified) throw new Error(`${unscanned}, and no administration of the lane is on record: its absence cannot be proven`);
+    // A checkout missing from a folder that itself cannot be reached (an unmounted volume) is not shown gone.
+    try { realpathSync(dirname(lane.path)); } catch (error) {
+      throw new Error(`the folder holding the checkout cannot be reached (${errnoOf(error)}): its absence cannot be proven`, { cause: error });
+    }
   } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
 }
 

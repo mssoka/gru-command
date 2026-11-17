@@ -5279,8 +5279,8 @@ export class WorktreeManager {
   private savedBeforeResidue(row: WorktreeRecord): { readonly snapshot: SweepSnapshot | null; readonly preserved: SweepPreservation | null } | null {
     let events: readonly { readonly payload: unknown }[];
     try {
-      const last = row.jobId === null ? this.opts.ledger.latestEventByPayloadField('worktree.sweep-tail-failed', 'id', row.id) : null;
-      events = row.jobId !== null ? this.opts.ledger.listJobEventsByKinds(row.jobId, ['worktree.sweep-tail-failed']) : last === null ? [] : [last];
+      // Every row of the lane, newest first, whatever its job (a review lane has none).
+      events = this.opts.ledger.listEventsAfter(0, { kinds: ['worktree.sweep-tail-failed'], payload: { key: 'id', equals: row.id }, order: 'desc', limit: 200 });
     } catch (error) {
       this.log('warn', 'the lane\'s tail failures could not be read; what a refused release saved is not announced', { id: row.id, error: String(error) });
       return null;
@@ -5462,8 +5462,10 @@ export class WorktreeManager {
       freshHead = this.safeFreshHead(row.repoPath);
     }
     this.assertRemovalSettled(row, null);
+    let flipped = false;
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
+      flipped = true;
       this.opts.ledger.appendCustomEvent({
         kind: 'worktree.reconciled',
         jobId: row.jobId,
@@ -5481,7 +5483,8 @@ export class WorktreeManager {
     } catch (error) {
       this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
     }
-    const saved = this.savedBeforeResidue(row);
+    // Only once the flip landed: a retry of a failed write must not announce the same work again.
+    const saved = flipped ? this.savedBeforeResidue(row) : null;
     if (saved !== null) {
       try {
         this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved });
