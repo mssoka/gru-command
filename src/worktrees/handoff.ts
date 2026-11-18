@@ -48,20 +48,21 @@ export class WorktreeHandoffUnresolvedError extends Error {
  * answers 409 (`lane_residue`, naming the paths), never the 400 of a bad
  * request. The lane's row is not flipped, so a later release can finish the job
  * once the residue is cleared. It is raised by the manager, never by the proofs
- * of this file, in two places:
- * - the proof after a release's own `git worktree remove` (it writes the
- *   `worktree.sweep-tail-failed { stage: 'verify' }` record, which marks the
- *   lane);
- * - a retry of a marked lane (a `verify` record with no later `worktree.swept`
- *   or `worktree.reconciled`) while its residue still stands: the same answer
- *   again, found before anything is touched, with no second record.
- * A request that ran no removal never raises it. Its refusal is the
- * {@link WorktreeHandoffUnresolvedError} (400), which touches nothing and
- * writes nothing: the reconcile of a lane whose checkout is already gone, an
- * unmarked lane, and a row that is already swept when its own resources stand
- * at the start. A swept row whose resources turn up only after its branch step
- * answers swept with a warning. Resources of other lanes and other tools never
- * raise either. */
+ * of this file, in two situations:
+ * - a removal ran in the request itself (its own `git worktree remove`, or GC
+ *   finishing one git left part way) and a resource of the lane's own stands
+ *   after it: it writes the `worktree.sweep-tail-failed { stage: 'verify' }`
+ *   record, which marks the lane;
+ * - the retry of a marked lane (a `verify` record with no later
+ *   `worktree.swept` or `worktree.reconciled`) while its residue still stands:
+ *   the same answer again, found before anything is touched, with no second
+ *   record.
+ * Every other request answers a resource of the lane's own that stands with
+ * the {@link WorktreeHandoffUnresolvedError} (400), which writes nothing: the
+ * reconcile of a lane whose checkout was already gone, an unmarked lane, and a
+ * row that is already swept when its own resources stand at the start. A swept
+ * row whose resources turn up only after its branch step answers swept with a
+ * warning. Resources of other lanes and other tools never raise either. */
 export class LaneResidueError extends Error {
   constructor(readonly path: string, readonly residue: readonly string[]) {
     super(`release could not finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again`);
@@ -981,10 +982,12 @@ export function assertLaneResourcesAbsent(lane: WorktreeLane): void {
     if (residue.includes(lane.path)) throw new Error('checkout is present or replaced');
     if (residue.length > 0) throw new Error(`associated administration retained — custody unresolved (${residue.join(', ')})`);
     if (unscanned !== null && !identified) throw new Error(`${unscanned}, and no administration of the lane is on record: its absence cannot be proven`);
-    // A checkout missing from a folder that itself cannot be reached (an unmounted volume) is not shown gone.
-    try { realpathSync(dirname(lane.path)); } catch (error) {
+    // A checkout missing from a folder that itself cannot be reached (an unmounted volume), or that is not a folder, is not shown gone.
+    let parent: string;
+    try { parent = realpathSync(dirname(lane.path)); } catch (error) {
       throw new Error(`the folder holding the checkout cannot be reached (${errnoOf(error)}): its absence cannot be proven`, { cause: error });
     }
+    if (!statSync(parent).isDirectory()) throw new Error(`the folder holding the checkout (${parent}) is not a folder: its absence cannot be proven`);
   } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
 }
 

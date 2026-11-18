@@ -3155,6 +3155,7 @@ export class WorktreeManager {
     // What is left is kept first unless an aborted release of GC's already
     // saved the lane's work before its removal began (and no removal of the
     // lane has completed since: what stands then was never saved).
+    let finishedHere = false;
     if (existsSync(row.path) && this.laneAdminGone(row)) {
       await this.withRepoLock(row.repoPath, async () => {
         if (!existsSync(row.path) || !this.laneAdminGone(row)) return;
@@ -3162,6 +3163,7 @@ export class WorktreeManager {
         const remains = aborted === null ? await this.preserveRemains(row) : null;
         try {
           this.removeLaneRemains(row);
+          finishedHere = true;
         } catch (error) {
           // The copy is on the record: a retry reuses it, never copying again.
           if (remains !== null) this.recordAbortedRelease(row, { preserved: remains, snapshot: null, discarded: null }, error);
@@ -3195,7 +3197,7 @@ export class WorktreeManager {
         // (Perkins lane-B r3): containment-verified delete, or retain +
         // note — and the response reports the TRUE outcome. A disk budget
         // release asks origin nothing here (#427 PR 3): the branch is kept.
-        const reconciled = this.reconcileMissingTree(row, input.baseBranch, input.diskBudget === true);
+        const reconciled = this.reconcileMissingTree(row, input.baseBranch, input.diskBudget === true, finishedHere);
         return { status: 'swept', preserved: null, ...reconciled } as const;
       }
       // (0.9) AUTOMATIC RELEASE PROOFS (issue #243 F-H1): an unattended sweep
@@ -5274,8 +5276,9 @@ export class WorktreeManager {
     }
   }
 
-  /** The proof, after a release's OWN `git worktree remove` has run (the
-   * only place a request writes a `verify` record), that its removal settled:
+  /** The proof, after a removal ran in the same request (its own
+   * `git worktree remove`, or GC finishing one git left part way: the only
+   * places a request writes a `verify` record), that the removal settled:
    * of the lane's OWN resources
    * (its checkout path, the administration folder its checkout named or the
    * ledger recorded, and any folder that names the checkout) none stands.
@@ -5545,13 +5548,23 @@ export class WorktreeManager {
    * behind a swept row that early-returns forever. Returns the true
    * branch outcome for the release response. A disk budget release (#427
    * PR 3) asks origin nothing: the branch is retained, and no head is
-   * resolved. */
+   * resolved. `finishedHere` says this request itself deleted what git left of
+   * the lane's checkout (the part-way removal above): a removal ran in it, so
+   * the lane's own resources that stand are residue (the 409 and the `verify`
+   * record, never a 400). Otherwise the checkout was already gone when the
+   * request began, no removal ran in it, and they are the refusal before
+   * removal (400, nothing recorded) wherever the checks meet them. */
   private reconcileMissingTree(
     row: WorktreeRecord,
     baseBranch: string | undefined,
     diskBudget: boolean,
+    finishedHere: boolean,
   ): { readonly branch: 'deleted' | 'retained' | 'none'; readonly freshHead: string } {
-    assertLaneResourcesAbsent(row);
+    const settled = (): void => {
+      if (finishedHere) this.assertRemovalSettled(row, null);
+      else assertLaneResourcesAbsent(row);
+    };
+    settled();
     this.log('warn', 'worktree tree missing under a non-swept row — reconciling swept', {
       id: row.id,
       path: row.path,
@@ -5568,17 +5581,16 @@ export class WorktreeManager {
       // The disposal resolves FRESH remote state first (Perkins r8): a
       // retry must never delete on the witness of stale tracking refs.
       const remote = this.safeFreshRemoteBranch(row.repoPath);
-      assertLaneResourcesAbsent(row);
+      settled();
       branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
       freshHead = this.safeFreshHead(row.repoPath);
     }
-    // This release ran no removal: the lane's checkout was gone when it began.
-    // Resources of the lane's own that stand now (they turned up while the
-    // branch step asked origin) are the refusal the checks above give, the
-    // same answer whenever they turned up. Never the residue of a removal:
-    // that would write a record, and mark the lane, for a request that
-    // removed nothing.
-    assertLaneResourcesAbsent(row);
+    // The same answer as the checks above, whenever the lane's own resources
+    // turned up (here: while the branch step asked origin). A request that ran
+    // no removal records nothing and marks no lane; the branch step it ran is
+    // idempotent, and its deletion needed proven containment, so a retry loses
+    // nothing.
+    settled();
     let flipped = false;
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');

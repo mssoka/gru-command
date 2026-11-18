@@ -958,6 +958,12 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const unmounted = (() => { try { handoffProof.assertLaneResourcesAbsent({ ...h2.lane, path: join(directory(), 'missing-folder', 'checkout') }); return null; } catch (error) { return error; } })();
     expect(unmounted).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
     expect(reasonsOf(unmounted)).toContain('cannot be reached');
+    // Nor is one whose holding folder is a plain file: nothing can stand under it, and nothing shows the lane was ever removed.
+    const plain = join(directory(), 'plain-file');
+    writeFileSync(plain, 'not a folder');
+    const underFile = (() => { try { handoffProof.assertLaneResourcesAbsent({ ...h2.lane, path: join(plain, 'checkout') }); return null; } catch (error) { return error; } })();
+    expect(underFile).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(reasonsOf(underFile)).toContain('is not a folder');
   }, 120_000);
 
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('does not reconcile a row whose own administration stands in an inventory that cannot be read', async () => {
@@ -1371,6 +1377,40 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect(kindsOf(f.h).filter((kind) => /^worktree\.(?:swept|preserved|reconciled|release-aborted|sweep-tail-failed)$/u.test(kind))).toEqual([]);
     // It stays the refusal before removal while the folder stands, and the release finishes once it is cleared.
     expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    rmSync(admin, { recursive: true, force: true });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    expect(kindsOf(f.h)).toContain('worktree.reconciled');
+  }, 120_000);
+
+  it('answers the residue of a request that finished a half-removed checkout with the residue refusal, never a 400, and marks the lane', async () => {
+    let armed: { readonly repo: string; readonly branch: string; readonly act: () => void } | null = null;
+    const f = await laneFixture('release-finisher-late-residue', {
+      log: (_level, message) => {
+        // After the branch step (the branch is gone) the fresh head is resolved; the lane's own git folder is back by then.
+        if (armed !== null && message.startsWith('base resolution degraded') && git(armed.repo, ['branch', '--list', armed.branch]) === '') {
+          const { act } = armed;
+          armed = null;
+          act();
+        }
+      },
+    });
+    const admin = adminOf(f.lane);
+    writeFileSync(join(f.lane.path, 'notes.txt'), 'an untracked deliverable\n');
+    // What a removal that failed part way leaves: git deleted its folder for the lane, the checkout's files are still there.
+    rmSync(admin, { recursive: true, force: true });
+    armed = { repo: f.repo.path, branch: f.lane.branch ?? '', act: () => { folder(dirname(admin), basename(admin), { gitdir: `${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path), '.git')}\n` }); } };
+    // This request deleted the rest of the checkout itself: a removal ran in it, so what stands afterwards is residue.
+    const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+    expect(outcome.error).toMatchObject({ name: 'LaneResidueError', residue: [admin] });
+    expect(existsSync(f.lane.path)).toBe(false);
+    expect(git(f.repo.path, ['branch', '--list', f.lane.branch ?? ''])).toBe('');
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
+    expect(eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => (event.payload as { stage?: string }).stage).sort()).toEqual(['remove', 'verify']);
+    expect(kindsOf(f.h)).not.toContain('worktree.reconciled');
+    // The lane is marked: the retry answers the same residue refusal, touching nothing and recording nothing.
+    const recorded = f.h.ledger.listEvents({ limit: 1000 });
+    expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toMatchObject({ name: 'LaneResidueError', residue: [admin] });
+    expect(f.h.ledger.listEvents({ limit: 1000 })).toEqual(recorded);
     rmSync(admin, { recursive: true, force: true });
     expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
     expect(kindsOf(f.h)).toContain('worktree.reconciled');
