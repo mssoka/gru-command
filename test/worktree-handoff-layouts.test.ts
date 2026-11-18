@@ -1600,6 +1600,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
   }, 120_000);
 
   it('answers a checkout path that stands again right after a half-removal finish with the residue refusal, not a git failure', async () => {
+    const told: SavedWork[] = [];
     let arm: (() => void) | null = null;
     const f = await laneFixture('release-finisher-path-again', {
       log: (_level, message) => {
@@ -1609,6 +1610,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
           act();
         }
       },
+      onWorkSaved: (saved) => { told.push(saved); },
     });
     writeFileSync(join(f.lane.path, 'notes.txt'), 'an untracked deliverable\n');
     rmSync(adminOf(f.lane), { recursive: true, force: true });
@@ -1617,12 +1619,49 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
     expect(outcome.error).toMatchObject({ name: 'LaneResidueError', residue: [f.lane.path] });
     expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
-    expect(eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => (event.payload as { stage?: string }).stage).sort()).toEqual(['remove', 'verify']);
-    // The lane is marked: the retry is the same refusal, and the folder is not deleted a second time.
+    const rows = eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => event.payload as { stage?: string; preserved?: { files: number } });
+    expect(rows.map((row) => row.stage).sort()).toEqual(['remove', 'verify']);
+    // The residue record carries the copy, and nothing is told "released" while the lane stands.
+    const copied = rows.find((row) => row.stage === 'verify')?.preserved?.files ?? 0;
+    expect(copied).toBeGreaterThan(0);
+    expect(told).toEqual([]);
+    // The lane is marked: the retry is the same refusal, the folder is not deleted a second time, and nothing is recorded.
+    const recorded = f.h.ledger.listEvents({ limit: 1000 });
     expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toMatchObject({ name: 'LaneResidueError', residue: [f.lane.path] });
     expect(existsSync(f.lane.path)).toBe(true);
+    expect(f.h.ledger.listEvents({ limit: 1000 })).toEqual(recorded);
     rmSync(f.lane.path, { recursive: true, force: true });
     expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    expect(told).toHaveLength(1);
+    expect(told[0]?.preserved?.count).toBe(copied);
+  }, 120_000);
+
+  it('completes a request that finished a half-removed checkout even when the folder holding the checkout is missing or is not a folder afterwards', async () => {
+    for (const shape of ['missing', 'a plain file'] as const) {
+      let arm: (() => void) | null = null;
+      const f = await laneFixture(`release-finisher-parent-${shape.replace(/\W+/gu, '-')}`, {
+        log: (_level, message) => {
+          if (arm !== null && message.startsWith('lane removal finished by GC after git stopped part way')) {
+            const act = arm;
+            arm = null;
+            act();
+          }
+        },
+      });
+      rmSync(adminOf(f.lane), { recursive: true, force: true });
+      // After GC finished the removal, the folder that held the checkout is gone, or a plain file stands in its place.
+      arm = () => {
+        rmSync(dirname(f.lane.path), { recursive: true, force: true });
+        if (shape === 'a plain file') writeFileSync(dirname(f.lane.path), 'not a folder');
+      };
+      const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+      expect(outcome.error, shape).toBeNull();
+      expect(outcome.result?.status, shape).toBe('swept');
+      expect(f.h.ledger.getWorktree(f.lane.id)?.status, shape).toBe('swept');
+      expect(kindsOf(f.h), shape).toContain('worktree.reconciled');
+      // The injection ran.
+      expect(existsSync(dirname(f.lane.path)), shape).toBe(shape === 'a plain file');
+    }
   }, 120_000);
 
   it('carries the snapshot an aborted release saved through a half-removal finish on the removal\'s record, and tells it once after the flip', async () => {

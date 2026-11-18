@@ -534,6 +534,43 @@ describe('worktree lane release endpoint (r4)', () => {
     }
   });
 
+  it('a request that finished a half-removed checkout answers 409 lane_residue, never 400, when its own git folder turns up straight after', async () => {
+    let admin: string | null = null;
+    let backlink = '';
+    const h = await bootLane({
+      // Straight after GC finished the removal, before the proof of what stands.
+      log: (_level, message) => {
+        if (admin !== null && message.startsWith('lane removal finished by GC after git stopped part way')) {
+          mkdirSync(admin, { recursive: true });
+          writeFileSync(join(admin, 'gitdir'), backlink);
+          admin = null;
+        }
+      },
+    });
+    const repo = makeFixtureRepo('fixture-finisher-residue');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-finisher-residue', repo: 'fixture-finisher-residue', title: 'finisher residue' });
+      const lane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-finisher-residue' });
+      const own = execFileSync('git', ['-C', lane.path, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf-8' }).trim();
+      // git's half-removal: its folder for the lane is gone, the checkout is not.
+      rmSync(own, { recursive: true, force: true });
+      backlink = `${join(realpathSync(dirname(lane.path)), basename(lane.path), '.git')}\n`;
+      admin = own;
+      const answered = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(answered.status).toBe(409);
+      expect(answered.json).toMatchObject({ error: 'lane_residue', residue: [own] });
+      expect(h.ledger.getWorktree(lane.id)?.status).toBe('active');
+      expect(h.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind === 'worktree.sweep-tail-failed').map((event) => (event.payload as { stage?: string }).stage).sort()).toEqual(['remove', 'verify']);
+      rmSync(own, { recursive: true, force: true });
+      const finished = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(finished.status).toBe(200);
+      expect(field<string>(finished.json, 'status')).toBe('swept');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('names the lane in the log of a release that fails before the manager is asked to release it', async () => {
     const h = await bootLane();
     const repo = makeFixtureRepo('fixture-release-log-lane');
