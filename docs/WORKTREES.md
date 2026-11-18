@@ -639,7 +639,10 @@ carries it, and so does everything that session starts
      `worktree.release-aborted` refusal described above, and stays one; GC
      finishes a half-removed checkout only when no folder of the lane's own
      stands (the ledger's record of its administration, a backlink, or a
-     receipt naming the lane), and otherwise refuses before touching it.
+     receipt naming the lane), and otherwise refuses before touching it. A
+     lane whose checkout is a half-removed one has no usable git to ask, so that
+     refusal comes from the git call that fails first; the folders that stand
+     are named only when the custody proof is reached.
    - **Residue.** What the proof after the removal looks for is the lane's own
      resources: its checkout path (re-created), the git folder its checkout
      named, and any folder that names the checkout. If one still stands, the
@@ -702,13 +705,17 @@ carries it, and so does everything that session starts
      reaches the network), the release answers 200 with the row still swept and
      logs a warning naming the residue paths; it writes no `verify` record and
      raises no 409.
-   - **Where the 409 comes from.** The proof after a release's own
-     `git worktree remove`, and the retry of a marked lane above. A request that
-     ran no removal never raises it: the reconcile of a lane whose checkout is
-     already gone answers the refusal before removal (400, nothing recorded) when
-     the lane's own resources stand at the start or turn up after its branch
-     step, so it never marks a lane; an unmarked lane and a swept row answer as
-     described above. The
+   - **Where the 409 comes from.** The proof after a removal that ran in the
+     request itself (its own `git worktree remove`, or GC deleting what git left
+     of a checkout it removed part way, whose reconcile then meets residue), and
+     the retry of a marked lane above. No other request raises it. The reconcile
+     of a lane whose checkout was already gone when the request began ran no
+     removal: if the lane's own resources stand at the start or turn up while it
+     asks origin, it answers the refusal before removal (400) and records
+     nothing, so it marks no lane. The branch step it has run by then is
+     idempotent, and a branch is deleted only when its tip is contained, so the
+     retry loses nothing. An unmarked lane and a swept row answer as described
+     above. The
      endpoint's `worktree release handler failed` log line names
      `worktree_id`, `check` (the error's name) and `reasons` (the cause
      chain, which names the check that fired), and `residue` for a 409.
@@ -1582,12 +1589,13 @@ the `detail`, the `digest` and the `submodules` it found;
 exactly that work (audited), and any other value (`true` included) is
 refused. A Silas release carrying it is refused. A refusal before the lane's
 checkout is removed (a custody or handoff conflict, a lane whose own git folder
-stands while its checkout is gone, a swept row whose own resources stand) is a
-400 `bad_request` with the `detail`, and nothing is touched. A release whose
-removal ran, or the retry of a lane whose earlier release did, and whose own
-resources still stand answers `409 { error: "lane_residue", detail, residue:
-[paths] }` (see [§3](#3-preserve-first-ordered-sweep-18c), the marker and the residue rules);
-the row stays active. The handler's log line names `worktree_id`, `check` and
+stands while its checkout is gone and which is not marked, a swept row whose own
+resources stand) is a 400 `bad_request` with the `detail`, and nothing is
+touched. A release whose removal ran, or the retry of a marked lane (one whose
+earlier release ran the removal and found residue), and whose own resources
+still stand answers `409 { error: "lane_residue", detail, residue: [paths] }`
+(see [§3](#3-preserve-first-ordered-sweep-18c), the marker and the residue
+rules); the row stays active. The handler's log line names `worktree_id`, `check` and
 `reasons`. Authenticated like every product surface.
 
 ## Configuration
