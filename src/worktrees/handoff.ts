@@ -42,14 +42,24 @@ export class WorktreeHandoffUnresolvedError extends Error {
   }
 }
 
-/** A release has removed a lane's checkout, and a resource of the lane's OWN
- * still stands: its checkout path (re-created), its administration folder under
- * the repository's `worktrees`, or a folder that names the checkout. Raised only
- * by the proof AFTER the removal has run (the endpoint answers 409). A refusal
- * before any removal is a {@link WorktreeHandoffUnresolvedError} (400) and
- * touches nothing. Resources of other lanes and other tools never raise either.
- * The lane's row is not flipped, so a later release can finish the job once the
- * residue is cleared. */
+/** A resource of a lane's OWN still stands where a removal of its checkout has
+ * run: its checkout path (re-created), its administration folder under the
+ * repository's `worktrees`, or a folder that names the checkout. The endpoint
+ * answers 409 (`lane_residue`, naming the paths), never the 400 of a bad
+ * request. The lane's row is not flipped, so a later release can finish the job
+ * once the residue is cleared. It is raised by the manager, never by the proofs
+ * of this file, in three places:
+ * - the proof after a release's own `git worktree remove` (it writes the
+ *   `worktree.sweep-tail-failed { stage: 'verify' }` record);
+ * - the reconcile of a lane whose checkout is already gone, in its last check,
+ *   after it disposed of the lane's branch (also written as a `verify` record);
+ * - a retry of a lane that has such a record, while its residue still stands:
+ *   the same answer again, found before anything is touched, with no second
+ *   record.
+ * A refusal before any removal of the lane's is a
+ * {@link WorktreeHandoffUnresolvedError} (400) and touches nothing, and so is
+ * every refusal for a row that is already swept. Resources of other lanes and
+ * other tools never raise either. */
 export class LaneResidueError extends Error {
   constructor(readonly path: string, readonly residue: readonly string[]) {
     super(`release could not finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again`);
@@ -959,11 +969,12 @@ export function laneAdministrationsStanding(lane: WorktreeLane): readonly string
  * affirmative absence of BOTH checkout and associated administration permits
  * it, so a resource of the lane's own that stands refuses, as does an inventory
  * that cannot be read when no administration of the lane is on record. This is
- * the proof BEFORE a removal (and for a lane whose checkout is already gone):
- * it touches nothing and raises {@link WorktreeHandoffUnresolvedError}. The
- * proof after a removal is the manager's, and raises {@link LaneResidueError}. */
-export function assertLaneResourcesAbsent(lane: WorktreeLane, admin: string | null = null): void {
-  const { residue, unscanned, identified } = laneResidue(lane, admin);
+ * the proof BEFORE a removal (and for a lane whose checkout is already gone, or
+ * whose row is swept): it touches nothing and raises
+ * {@link WorktreeHandoffUnresolvedError}. The manager turns what it finds into
+ * a {@link LaneResidueError} where a removal of the lane's has run. */
+export function assertLaneResourcesAbsent(lane: WorktreeLane): void {
+  const { residue, unscanned, identified } = laneResidue(lane, null);
   try {
     if (residue.includes(lane.path)) throw new Error('checkout is present or replaced');
     if (residue.length > 0) throw new Error(`associated administration retained — custody unresolved (${residue.join(', ')})`);

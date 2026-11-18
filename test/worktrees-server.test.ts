@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
@@ -438,6 +438,51 @@ describe('worktree lane release endpoint (r4)', () => {
       const refusedCustody = h.logs.find((entry) => entry.msg === 'worktree release handler failed' && entry.fields['worktree_id'] === custody.id);
       expect(refusedCustody?.fields).toMatchObject({ check: 'WorktreeHandoffUnresolvedError' });
       expect((refusedCustody?.fields['reasons'] as readonly string[]).join(' <- ')).toContain('completed handoff proof is missing or changed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a retry while the residue of an earlier release still stands answers the same 409 naming it, and the release finishes once it is cleared', async () => {
+    let race: { readonly path: string; readonly admin: string } | null = null;
+    const h = await bootLane({
+      // The release's tail resolves the base once the checkout is gone: a folder that names the checkout, back then, is residue.
+      log: (_level, message) => {
+        if (race !== null && message.startsWith('base resolution degraded') && !existsSync(race.path)) {
+          const { path, admin } = race;
+          race = null;
+          mkdirSync(admin, { recursive: true });
+          writeFileSync(join(admin, 'gitdir'), `${join(realpathSync(dirname(path)), basename(path), '.git')}\n`);
+        }
+      },
+    });
+    const repo = makeFixtureRepo('fixture-release-retry-residue');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-retry-residue', repo: 'fixture-release-retry-residue', title: 'residue retry' });
+      const lane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-retry-residue' });
+      const admin = execFileSync('git', ['-C', lane.path, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf-8' }).trim();
+      race = { path: lane.path, admin };
+      const first = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(first.status).toBe(409);
+      expect(first.json).toMatchObject({ error: 'lane_residue', residue: [admin] });
+      // The same request while the residue stands: the same answer, not a bad request without the paths.
+      const retry = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(retry.status).toBe(409);
+      expect(retry.json).toMatchObject({ error: 'lane_residue', residue: [admin] });
+      expect(field<string>(retry.json, 'detail')).toContain(admin);
+      expect(h.ledger.getWorktree(lane.id)?.status).toBe('active');
+      expect(existsSync(admin)).toBe(true);
+      const refusals = h.logs.filter((entry) => entry.msg === 'worktree release handler failed' && entry.fields['worktree_id'] === lane.id);
+      expect(refusals).toHaveLength(2);
+      for (const refusal of refusals) expect(refusal.fields).toMatchObject({ check: 'LaneResidueError', residue: [admin] });
+      // One record of the refusal: the retry touched nothing and wrote nothing.
+      expect(h.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind === 'worktree.sweep-tail-failed')).toHaveLength(1);
+      rmSync(admin, { recursive: true, force: true });
+      const finished = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(finished.status).toBe(200);
+      expect(field<string>(finished.json, 'status')).toBe('swept');
+      expect(h.ledger.getWorktree(lane.id)?.status).toBe('swept');
     } finally {
       await h.close();
     }

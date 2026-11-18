@@ -433,7 +433,7 @@ const PINS: Record<string, number> = {
   'worktree-manager.test.ts': 103,
   'worktree-manifest.test.ts': 16,
   'worktree-port.test.ts': 4,
-  'worktrees-server.test.ts': 11,
+  'worktrees-server.test.ts': 12,
   'yield-report.test.ts': 55,
   'assert-for-you-plain-language-baseline.test.ts': 7,
   'assert-formal-verdicts-baseline.test.ts': 5,
