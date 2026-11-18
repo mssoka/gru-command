@@ -661,9 +661,11 @@ carries it, and so does everything that session starts
      flip has landed, so a restart or a refusal in between loses nothing and
      nothing says "released" about a lane that is not. If that record cannot be
      written, the request that finishes the lane tells it itself. In such a
-     request the custody proof's refusal, when a resource of the lane's own
-     stands, is the residue answer too (the 409, a `verify` record), never a
-     400: a removal ran in it. When that record cannot be written, nothing on the
+     request the proof of what stands afterwards is the post-removal proof, the
+     lane's own resources only, so it never answers 400 (a removal ran in it):
+     residue, a re-created checkout path included, is the 409 and a `verify`
+     record, and an inventory or a parent folder that cannot be read afterwards
+     does not refuse it. When that record cannot be written, nothing on the
      lane's records would name the saved work, so the refusal tells the owner
      itself, at once (the later release then has nothing on record to tell
      again). That notice says the lane's checkout was removed by a release that
@@ -725,10 +727,11 @@ carries it, and so does everything that session starts
      the retry of a marked lane above. No other request raises it. The reconcile
      of a lane whose checkout was already gone when the request began ran no
      removal: if the lane's own resources stand at the start or turn up while it
-     asks origin, it answers the refusal before removal (400) and records
-     nothing, so it marks no lane. The branch step it has run by then is
-     idempotent, and a branch is deleted only when its tip is contained, so the
-     retry loses nothing. An unmarked lane and a swept row answer as described
+     asks origin, it answers the refusal before removal (400) and writes no
+     `verify` record, so it marks no lane (a branch step that fails can still
+     write its own stage-less tail-failure record, which marks nothing). The
+     branch step it has run by then is idempotent, and a branch is deleted only
+     when its tip is contained, so the retry loses nothing. An unmarked lane and a swept row answer as described
      above. The
      endpoint's `worktree release handler failed` log line names
      `worktree_id`, `check` (the error's name) and `reasons` (the cause
