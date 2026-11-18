@@ -182,6 +182,8 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     // selector the caller used (job_id, an explicit job lane, or an
     // explicit child lane). The manager's OS-process enumeration cannot
     // prove an in-process child ceased, so the durable record decides.
+    // From here a failure's log line names the lane.
+    releasing.worktreeId = worktreeId;
     const lane = manager.getWorktree(worktreeId);
     if (lane !== null && options.ledger !== undefined) {
       const outstanding = options.ledger.unfinishedChildWorkersOf(lane);
@@ -243,7 +245,6 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         return;
       }
     }
-    releasing.worktreeId = worktreeId;
     const result = await manager.release({
       worktreeId,
       ...(confirmKill ? { confirmKill: true } : {}),

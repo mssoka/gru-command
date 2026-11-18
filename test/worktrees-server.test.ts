@@ -488,6 +488,71 @@ describe('worktree lane release endpoint (r4)', () => {
     }
   });
 
+  it('a swept lane answers 400 when its own resources stand at the start and 200, still swept, when they turn up after its branch step', async () => {
+    let armed: { readonly repo: string; readonly branch: string; readonly path: string } | null = null;
+    const warnings: { readonly message: string; readonly fields: unknown }[] = [];
+    const branchesOf = (repo: string, branch: string): string => execFileSync('git', ['-C', repo, 'branch', '--list', branch], { encoding: 'utf-8' }).trim();
+    const h = await bootLane({
+      log: (level, message, fields) => {
+        if (level === 'warn') warnings.push({ message, fields });
+        // The fresh head is resolved after the branch step; the lane's path comes back then.
+        if (armed !== null && message.startsWith('base resolution degraded') && branchesOf(armed.repo, armed.branch) === '' && !existsSync(armed.path)) {
+          const { path } = armed;
+          armed = null;
+          mkdirSync(path, { recursive: true });
+        }
+      },
+    });
+    const repo = makeFixtureRepo('fixture-swept-answers');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-swept-answers', repo: 'fixture-swept-answers', title: 'swept' });
+      const lane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-swept-answers' });
+      const branch = lane.branch ?? '';
+      expect((await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN)).status).toBe(200);
+      // A swept row with a surviving branch, and the lane's path back at the start: the refusal before removal. Nothing is deleted.
+      execFileSync('git', ['-C', repo.path, 'branch', branch, 'HEAD']);
+      mkdirSync(lane.path, { recursive: true });
+      const entry = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(entry.status).toBe(400);
+      expect(entry.json).toMatchObject({ error: 'bad_request' });
+      expect(branchesOf(repo.path, branch)).not.toBe('');
+      rmSync(lane.path, { recursive: true, force: true });
+      // The path comes back only after the branch step: the row stays swept and the answer is the swept one, with a warning naming it.
+      armed = { repo: repo.path, branch, path: lane.path };
+      warnings.length = 0;
+      const late = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      expect(late.status).toBe(200);
+      expect(field<string>(late.json, 'status')).toBe('swept');
+      expect(existsSync(lane.path)).toBe(true);
+      expect(branchesOf(repo.path, branch)).toBe('');
+      expect(h.ledger.getWorktree(lane.id)?.status).toBe('swept');
+      expect(warnings.some((warning) => JSON.stringify(warning.fields).includes(lane.path))).toBe(true);
+      expect(h.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind === 'worktree.sweep-tail-failed')).toEqual([]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('names the lane in the log of a release that fails before the manager is asked to release it', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-release-log-lane');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-log-lane', repo: 'fixture-release-log-lane', title: 'log lane' });
+      const lane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-log-lane' });
+      const failing = vi.spyOn(h.ledger, 'unfinishedChildWorkersOf').mockImplementationOnce(() => { throw new Error('the ledger is down'); });
+      const answered = await call(h.port, '/api/dispatch/release', { worktree_id: lane.id }, TOKEN);
+      failing.mockRestore();
+      expect(answered.status).toBe(400);
+      const logged = h.logs.find((entry) => entry.msg === 'worktree release handler failed');
+      expect(logged?.fields).toMatchObject({ worktree_id: lane.id, check: 'Error' });
+      expect(h.ledger.getWorktree(lane.id)?.status).toBe('active');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('ROUND ARM: the paused payload carries the pid list and the ask — pinned', async () => {
     const h = await bootLane();
     const repo = makeFixtureRepo('fixture-round-arm');

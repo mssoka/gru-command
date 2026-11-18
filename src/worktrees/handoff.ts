@@ -48,20 +48,20 @@ export class WorktreeHandoffUnresolvedError extends Error {
  * answers 409 (`lane_residue`, naming the paths), never the 400 of a bad
  * request. The lane's row is not flipped, so a later release can finish the job
  * once the residue is cleared. It is raised by the manager, never by the proofs
- * of this file, in three places:
+ * of this file, in two places:
  * - the proof after a release's own `git worktree remove` (it writes the
- *   `worktree.sweep-tail-failed { stage: 'verify' }` record);
- * - the reconcile of a lane whose checkout is already gone, in its last check,
- *   after it disposed of the lane's branch (also written as a `verify` record);
+ *   `worktree.sweep-tail-failed { stage: 'verify' }` record, which marks the
+ *   lane);
  * - a retry of a marked lane (a `verify` record with no later `worktree.swept`
  *   or `worktree.reconciled`) while its residue still stands: the same answer
  *   again, found before anything is touched, with no second record.
- * A refusal before any removal of the lane's is a
- * {@link WorktreeHandoffUnresolvedError} (400) and touches nothing, as is the
- * refusal of a row that is already swept when its own resources stand at the
- * start. A swept row whose resources turn up only later, after its branch
- * step, answers swept with a warning, never this error. Resources of other
- * lanes and other tools never raise either. */
+ * A request that ran no removal never raises it. Its refusal is the
+ * {@link WorktreeHandoffUnresolvedError} (400), which touches nothing and
+ * writes nothing: the reconcile of a lane whose checkout is already gone, an
+ * unmarked lane, and a row that is already swept when its own resources stand
+ * at the start. A swept row whose resources turn up only after its branch step
+ * answers swept with a warning. Resources of other lanes and other tools never
+ * raise either. */
 export class LaneResidueError extends Error {
   constructor(readonly path: string, readonly residue: readonly string[]) {
     super(`release could not finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again`);

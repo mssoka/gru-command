@@ -42,7 +42,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import * as handoffProof from '../src/worktrees/handoff.js';
-import { WorktreeManager, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
+import { sweepWorkNotice, WorktreeManager, type SavedWork, type WorktreeManagerOptions } from '../src/worktrees/manager.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
@@ -958,7 +958,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const unmounted = (() => { try { handoffProof.assertLaneResourcesAbsent({ ...h2.lane, path: join(directory(), 'missing-folder', 'checkout') }); return null; } catch (error) { return error; } })();
     expect(unmounted).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
     expect(reasonsOf(unmounted)).toContain('cannot be reached');
-  });
+  }, 120_000);
 
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('does not reconcile a row whose own administration stands in an inventory that cannot be read', async () => {
     const f = await laneFixture('release-unreadable-inventory');
@@ -1146,7 +1146,7 @@ describe('lane release in a repository whose worktree inventory holds other lane
 
   it('tells the owner what a refused release saved even when the record of its refusal cannot be written', async () => {
     const hook = afterRemoval();
-    const told: { readonly snapshot: { readonly ref: string } | null; readonly preserved: { readonly count: number } | null }[] = [];
+    const told: SavedWork[] = [];
     const f = await laneFixture('release-residue-saved-unrecorded', { log: hook.log, onWorkSaved: (saved) => { told.push(saved); } });
     writeFileSync(join(f.lane.path, 'README.md'), 'an uncommitted edit\n');
     writeFileSync(join(f.lane.path, 'notes.txt'), 'an untracked deliverable\n');
@@ -1164,6 +1164,12 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect(told).toHaveLength(1);
     expect(told[0]?.snapshot?.ref).toMatch(/^refs\/gru\/preserved\//u);
     expect(told[0]?.preserved?.count).toBe(1);
+    // The lane is not released yet (its row is active and the answer was a refusal): the notice does not say it was.
+    expect(told[0]?.unfinished).toBe(true);
+    const notice = sweepWorkNotice(told[0]!).detail;
+    expect(notice).toContain('could not finish');
+    expect(notice).toContain(told[0]!.snapshot!.ref);
+    expect(notice).not.toContain('was released');
     down.mockRestore();
     // The release that finishes the lane has nothing on record to tell again.
     rmSync(f.lane.path, { recursive: true, force: true });
@@ -1321,5 +1327,82 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
     expect(f.h.ledger.listEvents({ limit: 1000 })).toEqual(recorded);
     expect(warnings.filter((warning) => JSON.stringify(warning.fields).includes(f.lane.path)).length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('answers a swept row whose own resources turn up while it asks origin about its branch with the refusal before removal, keeping the branch', async () => {
+    const hook = afterRemoval();
+    const f = await laneFixture('release-swept-residue-before-branch', { log: hook.log });
+    const branch = f.lane.branch ?? '';
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    git(f.repo.path, ['branch', branch, 'HEAD']);
+    const recorded = f.h.ledger.listEvents({ limit: 1000 });
+    // The first fresh-base resolution of the heal asks origin whether the surviving branch may go; the path is back by then.
+    hook.arm(f.lane.path, () => mkdirSync(f.lane.path, { recursive: true }));
+    const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+    expect(outcome.error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(existsSync(f.lane.path)).toBe(true);
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
+    expect(f.h.ledger.listEvents({ limit: 1000 })).toEqual(recorded);
+    expect(git(f.repo.path, ['branch', '--list', branch])).not.toBe('');
+  }, 120_000);
+
+  it('answers a lane whose checkout is already gone with the refusal before removal when its own resources turn up after its branch step, recording nothing', async () => {
+    let armed: { readonly repo: string; readonly branch: string; readonly path: string; readonly act: () => void } | null = null;
+    const f = await laneFixture('release-reconcile-late-residue', {
+      log: (_level, message) => {
+        // After the branch step (the branch is gone) the fresh head is resolved; the lane's own git folder is back by then.
+        if (armed !== null && message.startsWith('base resolution degraded') && git(armed.repo, ['branch', '--list', armed.branch]) === '') {
+          const { act } = armed;
+          armed = null;
+          act();
+        }
+      },
+    });
+    const admin = adminOf(f.lane);
+    // What an interrupted release left behind: the checkout and its git folder gone, the row active, the branch still there.
+    git(f.repo.path, ['worktree', 'remove', '--force', f.lane.path]);
+    armed = { repo: f.repo.path, branch: f.lane.branch ?? '', path: f.lane.path, act: () => { folder(dirname(admin), basename(admin), { gitdir: `${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path), '.git')}\n` }); } };
+    // No removal ran in this request: the same refusal as at the start, and no record that would mark the lane.
+    const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+    expect(outcome.error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(existsSync(admin)).toBe(true);
+    expect(git(f.repo.path, ['branch', '--list', f.lane.branch ?? ''])).toBe('');
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
+    expect(kindsOf(f.h).filter((kind) => /^worktree\.(?:swept|preserved|reconciled|release-aborted|sweep-tail-failed)$/u.test(kind))).toEqual([]);
+    // It stays the refusal before removal while the folder stands, and the release finishes once it is cleared.
+    expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    rmSync(admin, { recursive: true, force: true });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    expect(kindsOf(f.h)).toContain('worktree.reconciled');
+  }, 120_000);
+
+  it('finds the marker of a refused release after a restart: a new manager over the same ledger file answers the same residue refusal', async () => {
+    const hook = afterRemoval();
+    const repo = fixture('release-marker-restart');
+    const dir = directory();
+    const root = directory();
+    const preserveRoot = directory();
+    const start = (db: LedgerDb) => {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      return { ledger, worktrees: new WorktreeManager({ ledger, root, preserveRoot, setupTimeoutMs: 30_000, enumerateProcesses: () => [], log: hook.log }) };
+    };
+    const first = new LedgerDb(dir);
+    const before = start(first);
+    const job = before.ledger.addJob({ id: 'release-marker-restart', repo: 'assigned', title: 'release custody' });
+    const lane = await before.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    const admin = adminOf(lane);
+    hook.arm(lane.path, () => { folder(dirname(admin), basename(admin), { gitdir: `${join(realpathSync(dirname(lane.path)), basename(lane.path), '.git')}\n` }); });
+    expect((await outcomeOf(before.worktrees.release({ worktreeId: lane.id }))).error).toMatchObject({ name: 'LaneResidueError', residue: [admin] });
+    first.close();
+    // A restart: the ledger file is opened again, by a manager that has seen none of this.
+    const second = new LedgerDb(dir);
+    dbs.push(second);
+    const after = start(second);
+    const retry = await outcomeOf(after.worktrees.release({ worktreeId: lane.id }));
+    expect(retry.error).toMatchObject({ name: 'LaneResidueError', residue: [admin] });
+    expect(after.ledger.getWorktree(lane.id)?.status).toBe('active');
+    expect(existsSync(admin)).toBe(true);
+    rmSync(admin, { recursive: true, force: true });
+    expect((await after.worktrees.release({ worktreeId: lane.id })).status).toBe('swept');
   }, 120_000);
 });

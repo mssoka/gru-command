@@ -791,6 +791,10 @@ export interface SavedWork {
   readonly worktree: WorktreeRecord;
   readonly snapshot: SweepSnapshot | null;
   readonly preserved: SweepPreservation | null;
+  /** The release that saved it removed the lane's checkout and could not
+   * finish (a resource of the lane's own stands, and its refusal could not be
+   * recorded): the lane is not released yet, and the notice says so. */
+  readonly unfinished?: boolean;
 }
 
 /** A repository's identity (#427 PR 2b): its root commits and its
@@ -5270,7 +5274,9 @@ export class WorktreeManager {
     }
   }
 
-  /** The proof that a release's removal settled: of the lane's OWN resources
+  /** The proof, after a release's OWN `git worktree remove` has run (the
+   * only place a request writes a `verify` record), that its removal settled:
+   * of the lane's OWN resources
    * (its checkout path, the administration folder its checkout named or the
    * ledger recorded, and any folder that names the checkout) none stands.
    * Other lanes' and other tools' folders in the repository are not judged
@@ -5319,7 +5325,7 @@ export class WorktreeManager {
     }
     if (!recorded && (saved.snapshot !== null || saved.preserved !== null)) {
       try {
-        this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved });
+        this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved, unfinished: true });
       } catch (error) {
         this.log('warn', 'saved-work notice failed; what was saved is on disk and the lane\'s other records', { id: row.id, ref: saved.snapshot?.ref ?? null, error: String(error) });
       }
@@ -5330,9 +5336,11 @@ export class WorktreeManager {
   /** The lane's `worktree.sweep-tail-failed { stage: 'verify' }` records,
    * newest first: each says a release ran the lane's removal and found a
    * resource of the lane's own standing (see {@link assertRemovalSettled}).
-   * Every row of the lane is read, whatever its job (a review lane has none).
-   * Empty when the records cannot be read (logged): what they would have said
-   * is then not acted on, and nothing is touched on their account. */
+   * The lane's rows are read whatever its job (a review lane has none), the
+   * newest 200 of the kind (a lane has a handful: one per release that found
+   * something to say). Empty when the records cannot be read (logged): what
+   * they would have said is then not acted on, and nothing is touched on their
+   * account. */
   private residueRefusals(row: WorktreeRecord): readonly EventRecord[] {
     try {
       return this.opts.ledger
@@ -5373,7 +5381,8 @@ export class WorktreeManager {
    * residue is gone the release completes as usual. A lane with no marker (a
    * checkout the owner deleted by hand, or a `verify` record that could not be
    * written) keeps the refusal before removal it always had. Read here, before
-   * the absence proof, which stays free of the ledger. */
+   * the absence proof, which never reads the marker (it reads only the
+   * ledger's record of where the lane's own git folder was). */
   private assertMarkedResidueCleared(row: WorktreeRecord): void {
     if (this.residueMarker(row) === null) return;
     const { residue } = laneResidue(row, null);
@@ -5563,7 +5572,13 @@ export class WorktreeManager {
       branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
       freshHead = this.safeFreshHead(row.repoPath);
     }
-    this.assertRemovalSettled(row, null);
+    // This release ran no removal: the lane's checkout was gone when it began.
+    // Resources of the lane's own that stand now (they turned up while the
+    // branch step asked origin) are the refusal the checks above give, the
+    // same answer whenever they turned up. Never the residue of a removal:
+    // that would write a record, and mark the lane, for a request that
+    // removed nothing.
+    assertLaneResourcesAbsent(row);
     let flipped = false;
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
@@ -6219,12 +6234,18 @@ export function sweepWorkNotice(input: SavedWork): {
   readonly title: string;
   readonly detail: string;
 } {
-  const { worktree, snapshot, preserved } = input;
+  const { worktree, snapshot, preserved, unfinished = false } = input;
   const lane = `Lane ${worktree.id} (job ${worktree.jobId ?? 'none'})`;
+  // A refusal that could not be recorded tells the owner now: the lane's
+  // checkout is gone, but the release did not finish, so it is not "released".
   const parts = snapshot === null
-    ? [`${lane} was released with ${String(preserved?.count ?? 0)} untracked file(s), copied to ${preserved?.destination ?? '(nowhere)'}.`]
+    ? [unfinished
+      ? `${lane} had its checkout removed by a release that could not finish (resources of its own still stand). ${String(preserved?.count ?? 0)} untracked file(s) were copied to ${preserved?.destination ?? '(nowhere)'}.`
+      : `${lane} was released with ${String(preserved?.count ?? 0)} untracked file(s), copied to ${preserved?.destination ?? '(nowhere)'}.`]
     : [
-      `${lane} was released with ${String(snapshot.files)} tracked file(s) changed and not committed. They are saved at ${snapshot.ref} (commit ${snapshot.sha}).`,
+      unfinished
+        ? `${lane} had its checkout removed by a release that could not finish (resources of its own still stand). ${String(snapshot.files)} tracked file(s) changed and not committed are saved at ${snapshot.ref} (commit ${snapshot.sha}).`
+        : `${lane} was released with ${String(snapshot.files)} tracked file(s) changed and not committed. They are saved at ${snapshot.ref} (commit ${snapshot.sha}).`,
       ...(preserved === null ? [] : [`Its ${String(preserved.count)} untracked file(s) were copied to ${preserved.destination}.`]),
       `To apply the tracked changes to a checkout: git -C ${shellWord(worktree.repoPath)} cherry-pick --no-commit ${shellWord(snapshot.ref)}`,
     ];
