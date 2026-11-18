@@ -1452,11 +1452,13 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect(told).toEqual([]);
     // What the finish saved is on the record of the removal it finished.
     const removal = eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => event.payload as { stage?: string; preserved?: { files: number } }).find((payload) => payload.stage === 'remove');
-    expect(removal?.preserved?.files).toBeGreaterThan(0);
+    expect(removal).toHaveProperty('preserved');
+    const copied = removal?.preserved?.files ?? 0;
+    expect(copied).toBeGreaterThan(0);
     // The next release finds the checkout gone, sweeps the lane, and tells it, once and in the usual words.
     expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
     expect(told).toHaveLength(1);
-    expect(told[0]?.preserved?.count).toBe(removal?.preserved?.files);
+    expect(told[0]?.preserved?.count).toBe(copied);
     expect(told[0]?.unfinished).toBeUndefined();
   }, 120_000);
 
@@ -1595,6 +1597,62 @@ describe('lane release in a repository whose worktree inventory holds other lane
     const copies = eventsOf(f.h, 'worktree.preserved').map((event) => event.payload as { readonly destination: string; readonly remains?: boolean }).filter((payload) => payload.remains === true);
     expect(copies).toHaveLength(1);
     expect(readFileSync(join(copies[0]!.destination, 'recreated.txt'), 'utf8')).toBe('someone else\'s file\n');
+  }, 120_000);
+
+  it('does not tell the same saved work twice when the finish recorded it and only the residue record could not be written', async () => {
+    const told: SavedWork[] = [];
+    let arm: (() => void) | null = null;
+    const f = await laneFixture('release-finisher-verify-unrecorded', {
+      log: (_level, message) => {
+        if (arm !== null && message.startsWith('lane removal finished by GC after git stopped part way')) {
+          const act = arm;
+          arm = null;
+          act();
+        }
+      },
+      onWorkSaved: (saved) => { told.push(saved); },
+    });
+    const admin = adminOf(f.lane);
+    writeFileSync(join(f.lane.path, 'notes.txt'), 'an untracked deliverable\n');
+    rmSync(admin, { recursive: true, force: true });
+    arm = () => { folder(dirname(admin), basename(admin), { gitdir: `${join(realpathSync(dirname(f.lane.path)), basename(f.lane.path), '.git')}\n` }); };
+    const append = f.h.ledger.appendCustomEvent.bind(f.h.ledger);
+    const down = vi.spyOn(f.h.ledger, 'appendCustomEvent').mockImplementation((fields) => {
+      if (fields.kind === 'worktree.sweep-tail-failed' && (fields.payload as { stage?: string }).stage === 'verify') throw new Error('the ledger is down');
+      return append(fields);
+    });
+    expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toMatchObject({ name: 'LaneResidueError', residue: [admin] });
+    down.mockRestore();
+    // The work is on the removal's record, which the release that sweeps the lane reads: nothing is told while the lane stands.
+    expect(told).toEqual([]);
+    rmSync(admin, { recursive: true, force: true });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    expect(told).toHaveLength(1);
+    expect(told[0]?.unfinished).toBeUndefined();
+  }, 120_000);
+
+  it('completes a request that finished a half-removed checkout even when the inventory cannot be read afterwards', async () => {
+    let arm: (() => void) | null = null;
+    const f = await laneFixture('release-finisher-inventory-unreadable', {
+      log: (_level, message) => {
+        if (arm !== null && message.startsWith('lane removal finished by GC after git stopped part way')) {
+          const act = arm;
+          arm = null;
+          act();
+        }
+      },
+    });
+    rmSync(adminOf(f.lane), { recursive: true, force: true });
+    // After GC finished the removal, a plain file stands where the repository's inventory was.
+    arm = () => { rmSync(f.container, { recursive: true, force: true }); writeFileSync(f.container, 'not a folder'); };
+    const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+    expect(outcome.error).toBeNull();
+    expect(outcome.result?.status).toBe('swept');
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('swept');
+    expect(kindsOf(f.h)).toContain('worktree.reconciled');
+    // The injection ran, and the removal's own record is the only tail record.
+    expect(lstatSync(f.container).isFile()).toBe(true);
+    expect(eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => (event.payload as { stage?: string }).stage)).toEqual(['remove']);
   }, 120_000);
 
   it('finds the marker of a refused release after a restart: a new manager over the same ledger file answers the same residue refusal', async () => {

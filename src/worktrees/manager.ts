@@ -793,6 +793,11 @@ interface SavedWorkParts {
   readonly preserved: SweepPreservation | null;
 }
 
+/** Whether two records name the same saved work (the same snapshot ref, the same preserve folder). */
+function sameWork(left: SavedWorkParts, right: SavedWorkParts): boolean {
+  return (left.snapshot?.ref ?? '') === (right.snapshot?.ref ?? '') && (left.preserved?.destination ?? '') === (right.preserved?.destination ?? '');
+}
+
 /** What a completed release saved (#427), for the owner's notice. */
 export interface SavedWork {
   readonly worktree: WorktreeRecord;
@@ -3194,11 +3199,17 @@ export class WorktreeManager {
     // before the custody proof, which a rebase's or bisect's detached HEAD
     // would fail unnamed.
     if (existsSync(row.path)) this.assertNoOperationInProgress(row);
-    // A request that finished what git left ran a removal: if its custody proof
-    // refuses while a resource of the lane's own stands, that is residue (the
-    // 409, recorded with what the request saved), never a 400.
-    const proof = this.residueAfterRemoval(row, finishedHere.saved, () => captureCleanupHandoff(rememberManagedLane(row, this.opts.ledger)));
-    const assertCleanup = (): void => this.residueAfterRemoval(row, finishedHere.saved, proof);
+    // A request that finished what git left ran a removal. Its proof of what
+    // stands afterwards is the one every removal gets: the lane's own resources
+    // only (the 409 and the `verify` record, which carries what it saved, never a
+    // 400), however the inventory or the parent folder look. A checkout path
+    // that stands again is the lane's own residue. Any other request proves
+    // custody before it touches anything.
+    const finished = finishedHere.saved;
+    rememberManagedLane(row, this.opts.ledger);
+    const assertCleanup: () => void = finished !== null
+      ? (): void => this.assertRemovalSettled(row, null, finished)
+      : captureCleanupHandoff(row);
     return this.withRepoLock(row.repoPath, async () => {
       assertCleanup();
       // (0) Crash-window reconciliation (Perkins lane-B r2 c): the tree is
@@ -5355,7 +5366,8 @@ export class WorktreeManager {
     } catch (eventError) {
       this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
     }
-    if (!recorded) this.tellSavedWork(row, saved, true);
+    // Unless the removal's own record already carries this work: the release that sweeps the lane tells it from there.
+    if (!recorded && !this.savedOnRecord(row).some((kept) => sameWork(kept, saved))) this.tellSavedWork(row, saved, true);
     throw refusal;
   }
 
@@ -5367,21 +5379,6 @@ export class WorktreeManager {
       this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved, ...(unfinished ? { unfinished: true } : {}) });
     } catch (error) {
       this.log('warn', 'saved-work notice failed; what was saved is on the lane\'s records', { id: row.id, ref: saved.snapshot?.ref ?? null, error: String(error) });
-    }
-  }
-
-  /** A refusal of the custody proof in a request that already ran a removal
-   * (`saved` is set: it finished what git left of the checkout) is the residue
-   * answer when the lane's own resources stand: the post-removal proof writes
-   * the `verify` record, carrying what the request saved, and throws the 409.
-   * When none stands, the refusal is what it was. A request that ran no removal
-   * (`saved` null) is untouched. */
-  private residueAfterRemoval<T>(row: WorktreeRecord, saved: SavedWorkParts | null, run: () => T): T {
-    try {
-      return run();
-    } catch (error) {
-      if (saved !== null && error instanceof WorktreeHandoffUnresolvedError) this.assertRemovalSettled(row, null, saved);
-      throw error;
     }
   }
 
