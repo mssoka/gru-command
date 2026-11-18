@@ -3128,14 +3128,23 @@ export class WorktreeManager {
           }
         }
         const freshHead = input.diskBudget === true ? '' : this.safeFreshHead(row.repoPath);
-        // This release removes nothing and its row is done: a resource of the
-        // lane's own that stands is the refusal the check above gives, whenever
-        // it turned up. It is never the residue of a removal, which would write
-        // a record for a row that no release has left to finish.
-        assertLaneResourcesAbsent(row);
+        // The row is done and this release removed nothing of the lane's. A
+        // resource of the lane's own that stands at the start is refused by the
+        // check above, before anything is touched. One that turns up only now,
+        // after the branch step (the fresh head above reaches the network), is
+        // not a refusal any more: the branch may be gone, and no release has
+        // anything left to finish. The row stays swept, the answer is the
+        // swept one, and the warning names what stands. Nothing is recorded.
+        const { residue } = laneResidue(row, null);
+        if (residue.length > 0) this.log('warn', 'a swept lane\'s own resources stand after its branch step; the row stays swept and nothing is recorded', { id: row.id, residue });
         return { status: 'swept', preserved: null, branch: branchOutcome, freshHead } as const;
       });
     }
+    // A retry while the residue of an earlier release still stands (the lane's
+    // marker): the residue answer again, before anything is touched. What
+    // stands is not a part-way removal git left: the removal ran and
+    // succeeded, and this is what turned up after it.
+    this.assertMarkedResidueCleared(row);
     // A removal git left part way (#427): git deleted the lane's git folder
     // and part of its tree, so no git command runs in what is left. The
     // release deletes the rest and reconciles the lane as removed below.
@@ -3164,9 +3173,6 @@ export class WorktreeManager {
         }
       });
     }
-    // A retry while the residue of an earlier release still stands: its
-    // answer again, before the custody proof reads it as a bad request.
-    this.assertEarlierResidueCleared(row);
     // An unfinished merge, rebase, cherry-pick, revert or bisect refuses
     // every release by name before anything is touched (#427): a snapshot
     // of the uncommitted work could not say what the lane meant. Checked
@@ -5338,17 +5344,38 @@ export class WorktreeManager {
     }
   }
 
-  /** A retry of a release that already answered residue, while that residue
-   * still stands: the same {@link LaneResidueError} again, naming what stands
-   * now, found before anything is touched and with no second record. The
-   * lane's `verify` record says a release ran its removal, so what stands of
-   * its own is that release's residue, not a custody conflict to refuse as a
-   * bad request. A lane with no such record (a checkout the owner deleted by
-   * hand) keeps the refusal before removal it always had. A re-created
-   * checkout path that holds no folder of the lane's own is not refused here:
-   * the part-way removal path above finishes it. */
-  private assertEarlierResidueCleared(row: WorktreeRecord): void {
-    if (this.residueRefusals(row).length === 0) return;
+  /** The lane's marker: the newest `worktree.sweep-tail-failed { stage:
+   * 'verify' }` record, which says a release ran the lane's removal and found a
+   * resource of the lane's own standing, unless a `worktree.swept` or
+   * `worktree.reconciled` record of the lane follows it (the removal is then on
+   * the record as completed). Null when there is none, or when the lane's
+   * records cannot be read (logged): with no marker nothing is known to have
+   * been removed, so the refusal before removal is the answer. It lives in the
+   * ledger, so it survives a restart. */
+  private residueMarker(row: WorktreeRecord): EventRecord | null {
+    const [newest] = this.residueRefusals(row);
+    if (newest === undefined) return null;
+    try {
+      const later = this.opts.ledger.listEventsAfter(newest.seq, { kinds: ['worktree.swept', 'worktree.reconciled'], payload: { key: 'id', equals: row.id }, limit: 1 });
+      return later.length === 0 ? newest : null;
+    } catch (error) {
+      this.log('warn', 'the lane\'s records after its residue could not be read; it is treated as unmarked', { id: row.id, error: String(error) });
+      return null;
+    }
+  }
+
+  /** A retry of a lane whose marker says a release already ran its removal and
+   * found residue ({@link residueMarker}), while that residue still stands: the
+   * same {@link LaneResidueError} again, naming what stands now. This request
+   * ran no removal, so it touches nothing (a re-created folder is neither
+   * copied nor deleted: it is not a part-way removal of git's, and the ignored
+   * files in it would not be copied) and writes no second record. Once the
+   * residue is gone the release completes as usual. A lane with no marker (a
+   * checkout the owner deleted by hand, or a `verify` record that could not be
+   * written) keeps the refusal before removal it always had. Read here, before
+   * the absence proof, which stays free of the ledger. */
+  private assertMarkedResidueCleared(row: WorktreeRecord): void {
+    if (this.residueMarker(row) === null) return;
     const { residue } = laneResidue(row, null);
     if (residue.length === 0) return;
     this.log('error', 'a lane\'s own resources from an earlier release still stand; nothing is touched', { id: row.id, residue });

@@ -53,13 +53,15 @@ export class WorktreeHandoffUnresolvedError extends Error {
  *   `worktree.sweep-tail-failed { stage: 'verify' }` record);
  * - the reconcile of a lane whose checkout is already gone, in its last check,
  *   after it disposed of the lane's branch (also written as a `verify` record);
- * - a retry of a lane that has such a record, while its residue still stands:
- *   the same answer again, found before anything is touched, with no second
- *   record.
+ * - a retry of a marked lane (a `verify` record with no later `worktree.swept`
+ *   or `worktree.reconciled`) while its residue still stands: the same answer
+ *   again, found before anything is touched, with no second record.
  * A refusal before any removal of the lane's is a
- * {@link WorktreeHandoffUnresolvedError} (400) and touches nothing, and so is
- * every refusal for a row that is already swept. Resources of other lanes and
- * other tools never raise either. */
+ * {@link WorktreeHandoffUnresolvedError} (400) and touches nothing, as is the
+ * refusal of a row that is already swept when its own resources stand at the
+ * start. A swept row whose resources turn up only later, after its branch
+ * step, answers swept with a warning, never this error. Resources of other
+ * lanes and other tools never raise either. */
 export class LaneResidueError extends Error {
   constructor(readonly path: string, readonly residue: readonly string[]) {
     super(`release could not finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again`);
