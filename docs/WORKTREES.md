@@ -654,9 +654,16 @@ carries it, and so does everything that session starts
      of untracked files, `{ ref, sha, files }` for the ref of the uncommitted
      tracked work: the shapes of `worktree.release-aborted`) when the release had
      saved work, and the release that finishes the lane tells the owner where it
-     went. A request that itself finished a half-removed checkout tells what it
-     saved the same way: once the lane is swept, or on the residue record if its
-     reconcile still refuses. When that record cannot be written, nothing on the
+     went. A request that itself finished a half-removed checkout records what it
+     saved on the `worktree.sweep-tail-failed { stage: "remove" }` record it
+     writes for that removal (the same shapes), and the release that sweeps the
+     lane tells it from the lane's records, each work once and only after the
+     flip has landed, so a restart or a refusal in between loses nothing and
+     nothing says "released" about a lane that is not. If that record cannot be
+     written, the request that finishes the lane tells it itself. In such a
+     request the custody proof's refusal, when a resource of the lane's own
+     stands, is the residue answer too (the 409, a `verify` record), never a
+     400: a removal ran in it. When that record cannot be written, nothing on the
      lane's records would name the saved work, so the refusal tells the owner
      itself, at once (the later release then has nothing on record to tell
      again). That notice says the lane's checkout was removed by a release that
