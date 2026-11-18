@@ -3,6 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { LaneSubmoduleWorkError, type WorktreeManager } from './manager.js';
+import { LaneResidueError } from './handoff.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseSilasActionRuleId } from '../dispatch/silas-rules.js';
@@ -38,6 +39,15 @@ export interface WorktreeServer {
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
+}
+
+/** The messages along an error's cause chain, outermost first (bounded): the
+ * outer message of a custody refusal is generic, and the check that fired is in
+ * its causes. */
+function reasonsOf(error: unknown): readonly string[] {
+  const reasons: string[] = [];
+  for (let current: unknown = error; current instanceof Error && reasons.length < 6; current = current.cause) reasons.push(current.message);
+  return reasons.length > 0 ? reasons : [String(error)];
 }
 
 function strField(body: Record<string, unknown>, field: string): string {
@@ -107,7 +117,7 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     });
   }
 
-  async function handleRelease(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function handleRelease(req: IncomingMessage, res: ServerResponse, releasing: { worktreeId: string | null }): Promise<void> {
     if (!authed(req, res)) return;
     const body = await readBody(req);
     const confirmKill = body['confirm_kill'] === true;
@@ -172,6 +182,8 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     // selector the caller used (job_id, an explicit job lane, or an
     // explicit child lane). The manager's OS-process enumeration cannot
     // prove an in-process child ceased, so the durable record decides.
+    // From here a failure's log line names the lane.
+    releasing.worktreeId = worktreeId;
     const lane = manager.getWorktree(worktreeId);
     if (lane !== null && options.ledger !== undefined) {
       const outstanding = options.ledger.unfinishedChildWorkersOf(lane);
@@ -268,12 +280,29 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     requestHook(req, res, path): boolean {
       if (!(req.method === 'POST' && path === '/api/dispatch/release')) return false;
       const startedAt = Date.now();
-      handleRelease(req, res)
+      // The lane being released, once it is resolved: a failure's log line names
+      // it, and the check that fired (the outer message of a custody refusal is
+      // generic; the check is in its causes).
+      const releasing: { worktreeId: string | null } = { worktreeId: null };
+      handleRelease(req, res, releasing)
         .catch((error: unknown) => {
           const message = String(error instanceof Error ? error.message : error);
-          log('error', 'worktree release handler failed', { path, error: message });
+          log('error', 'worktree release handler failed', {
+            path,
+            error: message,
+            worktree_id: releasing.worktreeId,
+            check: error instanceof Error ? error.name : 'unknown',
+            reasons: reasonsOf(error),
+            ...(error instanceof LaneResidueError ? { residue: error.residue } : {}),
+          });
           // A submodule refusal carries the digest a discard must name (#427).
           const submodules = error instanceof LaneSubmoduleWorkError ? { digest: error.digest, submodules: error.submodules } : {};
+          // The removal ran and a resource of the lane's own still stands: not a
+          // bad request. Its row stays active, and a later release finishes it.
+          if (!res.headersSent && error instanceof LaneResidueError) {
+            json(res, 409, { error: 'lane_residue', detail: message, residue: error.residue });
+            return;
+          }
           if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message, ...submodules });
         })
         .finally(() => {
