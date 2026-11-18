@@ -650,10 +650,13 @@ carries it, and so does everything that session starts
      `worktree.sweep-tail-failed { id, stage: "verify", error, residue:
      [paths] }`, then answers `409 { error: "lane_residue", detail, residue }`
      naming what stands, not the 400 of a bad request. The record also
-     carries `preserved` and `snapshot` (the copy of untracked files and the
-     ref of the uncommitted tracked work, as on `worktree.swept`) when the
-     release had saved work, and the release that finishes the lane tells the
-     owner where it went. When that record cannot be written, nothing on the
+     carries `preserved` and `snapshot` (`{ destination, files }` for the copy
+     of untracked files, `{ ref, sha, files }` for the ref of the uncommitted
+     tracked work: the shapes of `worktree.release-aborted`) when the release had
+     saved work, and the release that finishes the lane tells the owner where it
+     went. A request that itself finished a half-removed checkout tells what it
+     saved the same way: once the lane is swept, or on the residue record if its
+     reconcile still refuses. When that record cannot be written, nothing on the
      lane's records would name the saved work, so the refusal tells the owner
      itself, at once (the later release then has nothing on record to tell
      again). That notice says the lane's checkout was removed by a release that
@@ -678,14 +681,18 @@ carries it, and so does everything that session starts
      (it is not a part-way removal of git's, and the ignored files in it would
      not be copied), the row, branch and folders stay, and no second `verify`
      record is written. Once the residue is gone, a release of a marked lane
-     completes as usual (`worktree.reconciled`). A lane with **no marker** is a
-     pre-removal refusal: the 400, touching nothing, as for a checkout the owner
-     deleted by hand while the lane's own git folder stands. That includes a lane
-     whose `verify` record could not be written (the refusal that failed to be
+     completes as usual (`worktree.reconciled`). A lane with **no marker** whose
+     own git folder stands is a pre-removal refusal: the 400, touching nothing,
+     as for a checkout the owner deleted by hand. That includes a lane whose
+     `verify` record could not be written (the refusal that failed to be
      recorded had already told the owner what it saved), and one whose removal
      is on the record as completed since (the flip of its row failed after its
      `worktree.swept` was written). The folders that stand are named in that
-     400's log line (`reasons`), not in the response.
+     400's log line (`reasons`), not in the response. A re-created checkout path
+     with no git folder of the lane's own beside it is not an absence-proof case:
+     for an unmarked lane the half-removed-checkout rule above applies (GC copies
+     what git would keep, deletes the folder and finishes, so ignored files in it
+     are not copied), where a marked lane is refused with the 409.
    - **A stale aborted release does not cover what is re-created.** A
      `worktree.release-aborted` row stands for the work its release saved
      before its removal began, so a half-removed checkout of that release needs
