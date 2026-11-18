@@ -1625,6 +1625,35 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
   }, 120_000);
 
+  it('carries the snapshot an aborted release saved through a half-removal finish on the removal\'s record, and tells it once after the flip', async () => {
+    const told: SavedWork[] = [];
+    let lock: string | null = null;
+    const f = await laneFixture('release-finisher-aborted-snapshot', {
+      log: (_level, message) => {
+        if (lock !== null && message === 'uncommitted work saved before the sweep') {
+          writeFileSync(lock, 'foreign custody');
+          lock = null;
+        }
+      },
+      onWorkSaved: (saved) => { told.push(saved); },
+    });
+    writeFileSync(join(f.lane.path, 'README.md'), 'an uncommitted edit\n');
+    const admin = adminOf(f.lane);
+    lock = join(admin, 'locked');
+    expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toBeInstanceOf(Error);
+    expect(eventsOf(f.h, 'worktree.release-aborted')).toHaveLength(1);
+    // Git then deleted its folder for the lane and left the checkout: the aborted release's snapshot covers what stands.
+    rmSync(join(admin, 'locked'));
+    rmSync(admin, { recursive: true, force: true });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+    const removal = eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => event.payload as { stage?: string; snapshot?: { ref: string; sha: string; files: number } }).find((payload) => payload.stage === 'remove');
+    expect(removal?.snapshot).toMatchObject({ files: 1 });
+    expect(removal?.snapshot?.ref).toMatch(/^refs\/gru\/preserved\//u);
+    expect(told).toHaveLength(1);
+    expect(told[0]?.snapshot?.ref).toBe(removal?.snapshot?.ref);
+    expect(told[0]?.unfinished).toBeUndefined();
+  }, 120_000);
+
   it('does not tell the same saved work twice when the finish recorded it and only the residue record could not be written', async () => {
     const told: SavedWork[] = [];
     let arm: (() => void) | null = null;
