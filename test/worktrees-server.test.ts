@@ -527,7 +527,7 @@ describe('worktree lane release endpoint (r4)', () => {
       expect(existsSync(lane.path)).toBe(true);
       expect(branchesOf(repo.path, branch)).toBe('');
       expect(h.ledger.getWorktree(lane.id)?.status).toBe('swept');
-      expect(warnings.some((warning) => JSON.stringify(warning.fields).includes(lane.path))).toBe(true);
+      expect(warnings.some((warning) => warning.message.includes('a swept lane\'s own resources stand after its branch step') && JSON.stringify(warning.fields).includes(lane.path))).toBe(true);
       expect(h.ledger.listEvents({ limit: 1000 }).filter((event) => event.kind === 'worktree.sweep-tail-failed')).toEqual([]);
     } finally {
       await h.close();
