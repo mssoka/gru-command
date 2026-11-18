@@ -664,8 +664,8 @@ carries it, and so does everything that session starts
      request the proof of what stands afterwards is the post-removal proof, the
      lane's own resources only, so it never answers 400 (a removal ran in it):
      residue, a re-created checkout path included, is the 409 and a `verify`
-     record, and an inventory or a parent folder that cannot be read afterwards
-     does not refuse it. When that record cannot be written, nothing on the
+     record, and an inventory that cannot be read afterwards, or a parent folder
+     that is missing or is not a folder, does not refuse it. When that record cannot be written, nothing on the
      lane's records would name the saved work, so the refusal tells the owner
      itself, at once (the later release then has nothing on record to tell
      again). That notice says the lane's checkout was removed by a release that
