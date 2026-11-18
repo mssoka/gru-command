@@ -576,7 +576,9 @@ carries it, and so does everything that session starts
      first, a link removed as a link), runs `git worktree prune`, and the
      release completes as usual (the lane swept, the owner told what was
      saved), with `worktree.sweep-tail-failed { id, stage: "remove", error }`
-     naming what happened. When the rest cannot be deleted either, the
+     naming what happened (its stage `verify`, written when the lane's own
+     resources still stand after a removal that did complete, is described
+     below). When the rest cannot be deleted either, the
      release is refused by name with what is left in place. A release of a
      lane found in that state (the git folder gone, part of the tree left)
      takes the same path and then reconciles the lane as removed; unless an
@@ -605,6 +607,51 @@ carries it, and so does everything that session starts
      when GC took one before the removal (a release of GC's that stopped
      part way); a removal the owner ran by hand, outside GC, took no
      snapshot, and such a file is not copied.
+
+   - **Before the removal, a release refuses; after it, it completes.** Every
+     check that can refuse runs before `git worktree remove`: the custody and
+     handoff proofs, and a second folder under the repository's
+     `.git/worktrees` that names the lane's checkout beside the one its own
+     `.git` file names (a half-done removal's residue). A refusal there is the
+     400 it always was (`worktree handoff unresolved`), and nothing is touched:
+     the checkout, its git folder, the branch and the row stay. That holds
+     for any release that has not run the removal, including one for a lane
+     whose checkout is already gone but whose own administration (the folder
+     the ledger recorded at its handoff, or one that names its checkout) still
+     stands, and one that cannot read the repository's `worktrees` inventory
+     with no administration of the lane on record: absence must be proven.
+     Once `git worktree remove` has succeeded, the release never answers 400.
+     It completes (the row swept, `worktree.swept`, the receipt), whatever else the
+     inventory holds: sibling lanes, a desktop tool's worktree folder with no
+     `gitdir`, a worktree whose checkout is gone, a folder whose backlink or
+     receipt cannot be read. Git reads a worktree only through a folder's
+     `gitdir` backlink, so such a folder is not the lane's to judge. A folder
+     is the lane's when its backlink resolves to the lane's checkout, or, with
+     no usable backlink, when its service handoff receipt names the lane. A lane
+     whose checkout is already gone and whose row is still `active` (an
+     earlier release that stopped) is reconciled by the next release
+     (`worktree.reconciled`), with or without such folders around. A removal
+     that fails part way and whose remains GC cannot delete is the
+     `worktree.release-aborted` refusal described above, and stays one; GC
+     finishes a half-removed checkout only when no folder of the lane's own
+     stands (the ledger's record of its administration, a backlink, or a
+     receipt naming the lane), and otherwise refuses before touching it.
+   - **Residue.** What the proof after the removal looks for is the lane's own
+     resources: its checkout path (re-created), the git folder its checkout
+     named, and any folder that names the checkout. If one still stands, the
+     row is not flipped to swept and the release writes
+     `worktree.sweep-tail-failed { id, stage: "verify", error, residue:
+     [paths] }`, then answers `409 { error: "lane_residue", detail, residue }`
+     naming what stands, not the 400 of a bad request. The record also
+     carries `preserved` and `snapshot` (the copy of untracked files and the
+     ref of the uncommitted tracked work, as on `worktree.swept`) when the
+     release had saved work, and the release that finishes the lane tells the
+     owner where it went. A failure the release's tail noted on the way is
+     written first, as its own `worktree.sweep-tail-failed { id, error }`. The
+     branch is kept. A release of the same row after the residue is cleared
+     reconciles it. The endpoint's `worktree release handler failed` log line
+     names `worktree_id`, `check` (the error's name) and `reasons` (the cause
+     chain, which names the check that fired), and `residue` for a 409.
 
    `<lane>` is the lane id when git accepts it as one ref-name component
    (letters, digits, `.`, `_` and `-`, not starting with `.` or `-`, no

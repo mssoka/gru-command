@@ -42,6 +42,21 @@ export class WorktreeHandoffUnresolvedError extends Error {
   }
 }
 
+/** A release has removed a lane's checkout, and a resource of the lane's OWN
+ * still stands: its checkout path (re-created), its administration folder under
+ * the repository's `worktrees`, or a folder that names the checkout. Raised only
+ * by the proof AFTER the removal has run (the endpoint answers 409). A refusal
+ * before any removal is a {@link WorktreeHandoffUnresolvedError} (400) and
+ * touches nothing. Resources of other lanes and other tools never raise either.
+ * The lane's row is not flipped, so a later release can finish the job once the
+ * residue is cleared. */
+export class LaneResidueError extends Error {
+  constructor(readonly path: string, readonly residue: readonly string[]) {
+    super(`release could not finish the lane at ${path}: its own resources still stand after the removal (${residue.join(', ')}) — clear them, then release the lane again`);
+    this.name = 'LaneResidueError';
+  }
+}
+
 /** A lane's creation handoff receipt, as its administration holds it and
  * the ledger's completion (and any rebinding) records it. */
 export interface Receipt {
@@ -826,26 +841,148 @@ function absent(path: string): boolean {
   }
 }
 
-/** Cleanup's old missing-tree reconciliation is NOT writer readiness. Only
- * affirmative absence of BOTH checkout and associated administration permits it. */
-export function assertLaneResourcesAbsent(lane: WorktreeLane): void {
+/** The checkout `admin`'s `gitdir` backlink names, as the `.git` path it
+ * resolves to; null when the folder has no usable backlink (missing,
+ * unreadable, empty, not a checkout path, or a checkout under a folder that
+ * is gone). */
+function backlinkedGitFile(admin: string): string | null {
   try {
-    if (!absent(lane.path)) throw new Error('checkout is present or replaced');
-    const expected = join(realpathSync(dirname(lane.path)), basename(lane.path), '.git');
-    const common = repositoryCommonDirectory(lane.repoPath);
-    const container = join(common, 'worktrees');
-    if (absent(container)) return;
-    if (!lstatSync(container).isDirectory()) throw new Error('worktree inventory is not canonical');
-    for (const entry of readdirSync(container, { withFileTypes: true })) {
-      if (!entry.isDirectory()) throw new Error('ambiguous worktree administration inventory');
-      const admin = join(container, entry.name);
-      const text = readWorktreeMetadata(join(admin, 'gitdir')).trim();
-      if (text === '' || !text.endsWith('/.git')) throw new Error('malformed worktree backlink');
-      const backlink = resolve(admin, text);
-      const canonical = join(realpathSync(dirname(dirname(backlink))), basename(dirname(backlink)), '.git');
-      if (canonical === expected) throw new Error('associated administration retained — custody unresolved');
+    const text = readWorktreeMetadata(join(admin, 'gitdir')).trim();
+    if (text === '' || !text.endsWith('/.git')) return null;
+    const checkout = dirname(resolve(admin, text));
+    return join(realpathSync(dirname(checkout)), basename(checkout), '.git');
+  } catch { return null; }
+}
+
+/** Whether the folder `admin` of the repository's `worktrees` inventory is
+ * administration of `lane`'s checkout: its backlink resolves to the checkout
+ * (`expected`) or, with no usable backlink, its service handoff receipt names
+ * the lane (a removal that stopped part way left it). A folder not shown to be
+ * the lane's is not the lane's to judge, and never throws: other tools leave
+ * folders in a repository, a sibling lane's names another tree, and a stale
+ * one names none (git reads a worktree only through `gitdir`: `git worktree
+ * list` skips a folder without one and `git worktree prune` removes it). */
+function administersLane(admin: string, expected: string, lane: WorktreeLane): boolean {
+  const named = backlinkedGitFile(admin);
+  if (named !== null) return named === expected;
+  try {
+    const receipt = parseReceipt(readWorktreeMetadata(join(admin, receiptName)));
+    return receipt.id === lane.id || receipt.path === lane.path || receipt.path === dirname(expected);
+  } catch { return false; }
+}
+
+/** The `.git` path of `lane`'s checkout as a backlink resolves to it. */
+function expectedGitFile(lane: WorktreeLane): string {
+  let parent: string;
+  try { parent = realpathSync(dirname(lane.path)); } catch { parent = dirname(lane.path); }
+  return join(parent, basename(lane.path), '.git');
+}
+
+/** The administration folders of the repository's `worktrees` inventory that
+ * are `lane`'s (see {@link administersLane}), and why the inventory could not
+ * be read, when it could not (the lane's own resources are then judged by what
+ * is known of them alone: the inventory is other tools' and lanes' business). */
+function laneAdministrations(lane: WorktreeLane): { readonly own: readonly string[]; readonly unscanned: string | null } {
+  const expected = expectedGitFile(lane);
+  let container: string;
+  let entries: readonly { readonly name: string; isDirectory(): boolean }[];
+  try {
+    container = join(repositoryCommonDirectory(lane.repoPath), 'worktrees');
+    entries = readdirSync(container, { withFileTypes: true });
+  } catch (error) {
+    return { own: [], unscanned: errnoOf(error) === 'ENOENT' ? null : `the worktrees inventory of ${lane.repoPath} could not be read (${errnoOf(error)})` };
+  }
+  return { own: entries.filter((entry) => entry.isDirectory()).map((entry) => join(container, entry.name)).filter((admin) => administersLane(admin, expected, lane)), unscanned: null };
+}
+
+/** The administration folder `lane`'s checkout names, read BEFORE its removal
+ * (null when it cannot be resolved), so the proof after it can name the one
+ * folder git must have deleted. */
+export function laneAdministrationOf(lane: WorktreeLane): string | null {
+  try { return adminFor(lane.path); } catch { return null; }
+}
+
+/** The administration folder this service recorded for `lane` when it issued
+ * its handoff (the ledger keeps it), or null when none is on record. It names
+ * the lane's own folder whatever state the folder or the rest of the
+ * inventory is in. */
+function recordedAdministration(lane: WorktreeLane): string | null {
+  const association = knownLanes.get(lane.path);
+  if (association === undefined) return null;
+  try {
+    // The current binding, not the first issuance: a repository move rebinds the lane's folder.
+    for (const event of completionFacts(association.ledger)) if (event.payload.id === lane.id) return issuedBinding(event.payload, lane.id, association.ledger).binding.admin;
+  } catch { return null; }
+  return null;
+}
+
+/** What of `lane`'s own stands: its checkout path, its administration folder
+ * (`admin`: the one its checkout named, read before a removal; else the one
+ * the ledger recorded) unless it provably names another checkout (git reuses a
+ * freed folder name), and any inventory folder that is its administration.
+ * Never judges anything else in the repository. `identified` says whether the
+ * lane's own folder is known by name AND the place it would stand in can be
+ * seen: an unreadable inventory cannot then hide it, but a repository that
+ * cannot be reached at all can (a missing path proves nothing there).
+ * `unscanned` says why the inventory could not be read. */
+export function laneResidue(lane: WorktreeLane, admin: string | null): { readonly residue: readonly string[]; readonly unscanned: string | null; readonly identified: boolean } {
+  const standing = (path: string): boolean => {
+    try { lstatSync(path); return true; } catch (error) { return errnoOf(error) !== 'ENOENT' && errnoOf(error) !== 'ENOTDIR'; }
+  };
+  const seen = (path: string): boolean => {
+    try { lstatSync(path); return true; } catch { return false; }
+  };
+  const known = admin ?? recordedAdministration(lane);
+  const expected = expectedGitFile(lane);
+  const { own, unscanned } = laneAdministrations(lane);
+  const ownFolder = (path: string): boolean => {
+    const named = backlinkedGitFile(path);
+    return named === null || named === expected;
+  };
+  const knownFolder = known !== null && standing(known) && ownFolder(known) ? [known] : [];
+  const residue = [...(standing(lane.path) ? [lane.path] : []), ...knownFolder, ...own];
+  return {
+    residue: residue.filter((path, index) => residue.indexOf(path) === index),
+    unscanned,
+    identified: known !== null && (unscanned === null || seen(dirname(known))),
+  };
+}
+
+/** The administration folders of the lane's own that stand (see
+ * {@link laneResidue}), not counting its checkout path. A folder of the lane's
+ * own standing means git did not delete the lane's git folder. */
+export function laneAdministrationsStanding(lane: WorktreeLane): readonly string[] {
+  return laneResidue(lane, null).residue.filter((path) => path !== lane.path);
+}
+
+/** Cleanup's old missing-tree reconciliation is NOT writer readiness. Only
+ * affirmative absence of BOTH checkout and associated administration permits
+ * it, so a resource of the lane's own that stands refuses, as does an inventory
+ * that cannot be read when no administration of the lane is on record. This is
+ * the proof BEFORE a removal (and for a lane whose checkout is already gone):
+ * it touches nothing and raises {@link WorktreeHandoffUnresolvedError}. The
+ * proof after a removal is the manager's, and raises {@link LaneResidueError}. */
+export function assertLaneResourcesAbsent(lane: WorktreeLane, admin: string | null = null): void {
+  const { residue, unscanned, identified } = laneResidue(lane, admin);
+  try {
+    if (residue.includes(lane.path)) throw new Error('checkout is present or replaced');
+    if (residue.length > 0) throw new Error(`associated administration retained — custody unresolved (${residue.join(', ')})`);
+    if (unscanned !== null && !identified) throw new Error(`${unscanned}, and no administration of the lane is on record: its absence cannot be proven`);
+    // A checkout missing from a folder that itself cannot be reached (an unmounted volume) is not shown gone.
+    try { realpathSync(dirname(lane.path)); } catch (error) {
+      throw new Error(`the folder holding the checkout cannot be reached (${errnoOf(error)}): its absence cannot be proven`, { cause: error });
     }
-    if (!absent(lane.path)) throw new Error('checkout appeared during absence inspection');
+  } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
+}
+
+/** Before a removal: a second folder that names the lane's checkout beside the
+ * one its `.git` file names is custody the removal would leave half done, so
+ * it refuses while nothing is removed yet. Other folders are not judged. */
+export function assertNoSecondAdministration(lane: WorktreeLane): void {
+  try {
+    const own = adminFor(lane.path);
+    const second = laneAdministrations(lane).own.filter((admin) => realpathSync(admin) !== own);
+    if (second.length > 0) throw new Error(`worktree administration ${second.join(', ')} also names the checkout — custody unresolved`);
   } catch (error) { throw new WorktreeHandoffUnresolvedError(lane.path, error); }
 }
 
@@ -854,7 +991,7 @@ export function captureCleanupHandoff(lane: WorktreeLane): () => void {
     const check = captureLaneHandoff(lane);
     return () => {
       if (absent(lane.path)) assertLaneResourcesAbsent(lane);
-      else check();
+      else { check(); assertNoSecondAdministration(lane); }
     };
   }
   assertLaneResourcesAbsent(lane);
