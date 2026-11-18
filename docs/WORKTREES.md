@@ -583,7 +583,8 @@ carries it, and so does everything that session starts
      lane found in that state (the git folder gone, part of the tree left)
      takes the same path and then reconciles the lane as removed; unless an
      aborted release of GC's saved the lane's work before its removal began
-     (and no removal of the lane has completed since: see **Residue** below),
+     (and no removal of the lane has completed since: see **A stale aborted
+     release** below),
      it first copies what is left into the preserve root, off the event loop
      (`worktree.preserved`, with `remains: true`). Only what git would keep
      is copied: `git ls-files --cached --others --exclude-standard` over the
@@ -619,9 +620,11 @@ carries it, and so does everything that session starts
      for any release that has not run the removal, including one for a lane
      whose checkout is already gone but whose own administration (the folder
      the ledger recorded at its handoff, or one that names its checkout) still
-     stands, and one that cannot read the repository's `worktrees` inventory
-     with no administration of the lane on record: absence must be proven.
-     Once `git worktree remove` has succeeded, the release never answers 400.
+     stands, **unless the lane is marked** (see **A retry while the residue
+     still stands** below), and one that cannot read the repository's
+     `worktrees` inventory with no administration of the lane on record:
+     absence must be proven. Once `git worktree remove` has succeeded in a
+     release, that same release never answers 400.
      It completes (the row swept, `worktree.swept`, the receipt), whatever else the
      inventory holds: sibling lanes, a desktop tool's worktree folder with no
      `gitdir`, a worktree whose checkout is gone, a folder whose backlink or
@@ -653,21 +656,27 @@ carries it, and so does everything that session starts
      again). A failure the release's tail noted on the way is written first,
      as its own `worktree.sweep-tail-failed { id, error }`. The branch is kept.
      A release of the same row after the residue is cleared reconciles it.
-   - **A retry while the residue still stands** answers the same
-     `409 lane_residue` with the paths that stand now, not a 400 without them.
-     The lane's `verify` record is what says a release ran the removal, so what
-     stands of the lane's own (its git folder, a folder naming its checkout,
-     and a re-created checkout beside one of those) is that release's residue.
-     The retry is found before anything is touched and writes nothing more: no
-     second `verify` record, the row, branch and folders as they were. A
-     re-created checkout path with no folder of the lane's own beside it is not
-     refused: it is the half-removed checkout above, and the release copies
-     what is there into the preserve root, deletes it and finishes. A lane
-     with no `verify` record (a checkout the owner deleted by hand, whose own
-     git folder stands) keeps the refusal before removal, the 400 it always
-     was. If the `verify` record itself could not be written, the retry has
-     nothing to recognise, and answers that 400; the folders that stand are
-     named in its log line's `reasons`, not in the response.
+   - **A retry while the residue still stands.** A lane is **marked** when the
+     ledger holds a `worktree.sweep-tail-failed` record with `stage: "verify"`
+     for it and no later `worktree.swept` or `worktree.reconciled` record of it:
+     a release ran its removal, and found residue. The marker is on the ledger,
+     so it survives a restart, and the manager reads it before the absence
+     proof, which itself reads no ledger. A release of a marked lane whose own
+     resources still stand (its git folder, a folder naming its checkout, a
+     re-created checkout path) answers the same `409 lane_residue`, listing the
+     paths that stand now, not a 400 without them. This request ran no removal,
+     so it touches nothing: a re-created folder is neither copied nor deleted
+     (it is not a part-way removal of git's, and the ignored files in it would
+     not be copied), the row, branch and folders stay, and no second `verify`
+     record is written. Once the residue is gone, a release of a marked lane
+     completes as usual (`worktree.reconciled`). A lane with **no marker** is a
+     pre-removal refusal: the 400, touching nothing, as for a checkout the owner
+     deleted by hand while the lane's own git folder stands. That includes a lane
+     whose `verify` record could not be written (the refusal that failed to be
+     recorded had already told the owner what it saved), and one whose removal
+     is on the record as completed since (the flip of its row failed after its
+     `worktree.swept` was written). The folders that stand are named in that
+     400's log line (`reasons`), not in the response.
    - **A stale aborted release does not cover what is re-created.** A
      `worktree.release-aborted` row stands for the work its release saved
      before its removal began, so a half-removed checkout of that release needs
@@ -676,14 +685,20 @@ carries it, and so does everything that session starts
      of the lane, the `verify` residue included), what stands at the lane's
      path was never saved, so the release copies it before deleting it. The
      snapshot the aborted release saved is told to the owner once, by the
-     release that finishes the lane.
-   - **A swept row is not a residue case.** A release of a row that is already
-     swept removes nothing. A resource of the lane's own that stands, whether
-     it was there at the start or turned up while the release ran, is the same
-     refusal before removal (400, nothing recorded), never a `verify` record.
+     release that completed the removal, not again by the one that finishes the
+     lane.
+   - **A swept row answers by when its resources stand.** A release of a row
+     that is already swept removes nothing of the lane's. If a resource of the
+     lane's own stands when the release starts, it answers the refusal before
+     removal (400), writes nothing to the ledger and deletes no branch. If one
+     turns up only after the branch step (the fresh head it resolves afterwards
+     reaches the network), the release answers 200 with the row still swept and
+     logs a warning naming the residue paths; it writes no `verify` record and
+     raises no 409.
    - **Where the 409 comes from.** The proof after `git worktree remove`; the
      reconcile of a lane whose checkout is already gone, in its last check
-     after it disposed of the lane's branch; and the retry above. The
+     after it disposed of the lane's branch (it writes a `verify` record too);
+     and the retry of a marked lane above. A swept row never raises it. The
      endpoint's `worktree release handler failed` log line names
      `worktree_id`, `check` (the error's name) and `reasons` (the cause
      chain, which names the check that fired), and `residue` for a 409.
