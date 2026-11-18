@@ -3155,7 +3155,11 @@ export class WorktreeManager {
     // What is left is kept first unless an aborted release of GC's already
     // saved the lane's work before its removal began (and no removal of the
     // lane has completed since: what stands then was never saved).
-    let finishedHere = false;
+    // Set once this request has deleted what git left: a removal ran in it, and
+    // what it saved (the remains' copy, or what an aborted release saved) is
+    // told once the lane is swept, or carried by the residue record if the
+    // reconcile below still refuses. Telling it here would say "released" first.
+    const finishedHere: { saved: { readonly snapshot: SweepSnapshot | null; readonly preserved: SweepPreservation | null } | null } = { saved: null };
     if (existsSync(row.path) && this.laneAdminGone(row)) {
       await this.withRepoLock(row.repoPath, async () => {
         if (!existsSync(row.path) || !this.laneAdminGone(row)) return;
@@ -3163,20 +3167,13 @@ export class WorktreeManager {
         const remains = aborted === null ? await this.preserveRemains(row) : null;
         try {
           this.removeLaneRemains(row);
-          finishedHere = true;
         } catch (error) {
           // The copy is on the record: a retry reuses it, never copying again.
           if (remains !== null) this.recordAbortedRelease(row, { preserved: remains, snapshot: null, discarded: null }, error);
           throw error;
         }
         this.recordRemovalFinished(row, 'a git worktree remove failed part way, after git had deleted the lane\'s git folder');
-        const saved = aborted ?? { snapshot: null, preserved: remains };
-        if (saved.snapshot === null && saved.preserved === null) return;
-        try {
-          this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved });
-        } catch (error) {
-          this.log('warn', 'saved-work notice failed; what was saved is on the lane\'s records', { id: row.id, error: String(error) });
-        }
+        finishedHere.saved = aborted === null ? { snapshot: null, preserved: remains } : { snapshot: aborted.snapshot, preserved: aborted.preserved };
       });
     }
     // An unfinished merge, rebase, cherry-pick, revert or bisect refuses
@@ -3197,7 +3194,7 @@ export class WorktreeManager {
         // (Perkins lane-B r3): containment-verified delete, or retain +
         // note — and the response reports the TRUE outcome. A disk budget
         // release asks origin nothing here (#427 PR 3): the branch is kept.
-        const reconciled = this.reconcileMissingTree(row, input.baseBranch, input.diskBudget === true, finishedHere);
+        const reconciled = this.reconcileMissingTree(row, input.baseBranch, input.diskBudget === true, finishedHere.saved);
         return { status: 'swept', preserved: null, ...reconciled } as const;
       }
       // (0.9) AUTOMATIC RELEASE PROOFS (issue #243 F-H1): an unattended sweep
@@ -5548,20 +5545,22 @@ export class WorktreeManager {
    * behind a swept row that early-returns forever. Returns the true
    * branch outcome for the release response. A disk budget release (#427
    * PR 3) asks origin nothing: the branch is retained, and no head is
-   * resolved. `finishedHere` says this request itself deleted what git left of
-   * the lane's checkout (the part-way removal above): a removal ran in it, so
-   * the lane's own resources that stand are residue (the 409 and the `verify`
-   * record, never a 400). Otherwise the checkout was already gone when the
-   * request began, no removal ran in it, and they are the refusal before
-   * removal (400, nothing recorded) wherever the checks meet them. */
+   * resolved. `finished` is set when this request itself deleted what git left
+   * of the lane's checkout (the part-way removal above), with what that saved:
+   * a removal ran in it, so the lane's own resources that stand are residue
+   * (the 409 and the `verify` record, which then carries what was saved, never
+   * a 400), and what it saved is told only once none stands. Otherwise the
+   * checkout was already gone when the request began, no removal ran in it, and
+   * they are the refusal before removal (400, nothing recorded) wherever the
+   * checks meet them. */
   private reconcileMissingTree(
     row: WorktreeRecord,
     baseBranch: string | undefined,
     diskBudget: boolean,
-    finishedHere: boolean,
+    finished: { readonly snapshot: SweepSnapshot | null; readonly preserved: SweepPreservation | null } | null,
   ): { readonly branch: 'deleted' | 'retained' | 'none'; readonly freshHead: string } {
     const settled = (): void => {
-      if (finishedHere) this.assertRemovalSettled(row, null);
+      if (finished !== null) this.assertRemovalSettled(row, null, finished);
       else assertLaneResourcesAbsent(row);
     };
     settled();
@@ -5611,6 +5610,15 @@ export class WorktreeManager {
       this.opts.onSwept?.({ worktree: row });
     } catch (error) {
       this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+    }
+    // What this request saved itself, now that no resource of the lane's own stands. Whether or not the flip landed:
+    // the part-way removal does not run again, so a retry could never tell it.
+    if (finished !== null && (finished.snapshot !== null || finished.preserved !== null)) {
+      try {
+        this.opts.onWorkSaved?.({ worktree: row, snapshot: finished.snapshot, preserved: finished.preserved });
+      } catch (error) {
+        this.log('warn', 'saved-work notice failed; what was saved is on the lane\'s records', { id: row.id, error: String(error) });
+      }
     }
     // Only once the flip landed: a retry of a failed write must not announce the same work again.
     const saved = flipped ? this.savedBeforeResidue(row) : null;
