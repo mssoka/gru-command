@@ -3198,7 +3198,9 @@ export class WorktreeManager {
     // of the uncommitted work could not say what the lane meant. Checked
     // before the custody proof, which a rebase's or bisect's detached HEAD
     // would fail unnamed.
-    if (existsSync(row.path)) this.assertNoOperationInProgress(row);
+    // (A request that finished what git left asks git nothing about a checkout
+    // path that stands again: that is its residue, judged below.)
+    if (finishedHere.saved === null && existsSync(row.path)) this.assertNoOperationInProgress(row);
     // A request that finished what git left ran a removal. Its proof of what
     // stands afterwards is the one every removal gets: the lane's own resources
     // only (the 409 and the `verify` record, which carries what it saved, never a

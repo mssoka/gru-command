@@ -1599,6 +1599,32 @@ describe('lane release in a repository whose worktree inventory holds other lane
     expect(readFileSync(join(copies[0]!.destination, 'recreated.txt'), 'utf8')).toBe('someone else\'s file\n');
   }, 120_000);
 
+  it('answers a checkout path that stands again right after a half-removal finish with the residue refusal, not a git failure', async () => {
+    let arm: (() => void) | null = null;
+    const f = await laneFixture('release-finisher-path-again', {
+      log: (_level, message) => {
+        if (arm !== null && message.startsWith('lane removal finished by GC after git stopped part way')) {
+          const act = arm;
+          arm = null;
+          act();
+        }
+      },
+    });
+    writeFileSync(join(f.lane.path, 'notes.txt'), 'an untracked deliverable\n');
+    rmSync(adminOf(f.lane), { recursive: true, force: true });
+    // A process of the lane is still running: it puts the checkout path back as soon as GC has deleted it.
+    arm = () => mkdirSync(f.lane.path, { recursive: true });
+    const outcome = await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }));
+    expect(outcome.error).toMatchObject({ name: 'LaneResidueError', residue: [f.lane.path] });
+    expect(f.h.ledger.getWorktree(f.lane.id)?.status).toBe('active');
+    expect(eventsOf(f.h, 'worktree.sweep-tail-failed').map((event) => (event.payload as { stage?: string }).stage).sort()).toEqual(['remove', 'verify']);
+    // The lane is marked: the retry is the same refusal, and the folder is not deleted a second time.
+    expect((await outcomeOf(f.h.worktrees.release({ worktreeId: f.lane.id }))).error).toMatchObject({ name: 'LaneResidueError', residue: [f.lane.path] });
+    expect(existsSync(f.lane.path)).toBe(true);
+    rmSync(f.lane.path, { recursive: true, force: true });
+    expect((await f.h.worktrees.release({ worktreeId: f.lane.id })).status).toBe('swept');
+  }, 120_000);
+
   it('does not tell the same saved work twice when the finish recorded it and only the residue record could not be written', async () => {
     const told: SavedWork[] = [];
     let arm: (() => void) | null = null;
