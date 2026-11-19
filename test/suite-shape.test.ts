@@ -348,7 +348,7 @@ const PINS: Record<string, number> = {
   'restart-recovery-progress.test.ts': 310,
   'restart-recovery-schema.test.ts': 4,
   'rebrief-recovery.test.ts': 100,
-  'repo-overview.test.ts': 101,
+  'repo-overview.test.ts': 102,
   'repo-overview-gitlab.test.ts': 29,
   'repo-overview-glab-runner.test.ts': 1,
   'rehearsal.test.ts': 4,
@@ -454,6 +454,8 @@ const PINS: Record<string, number> = {
   'perkins-github-app.test.ts': 177,
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 10,
+  'thread-capture.test.ts': 3,
+  'thread-capture-real.test.ts': 1,
   'tool-call-policy.test.ts': 12,
   'verification-capture.test.ts': 53,
 

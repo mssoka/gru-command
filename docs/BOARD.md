@@ -354,6 +354,21 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `null` beside a small `threadPoolMs` points at that filesystem),
   `probeLimitMs`, and `activeResources` (`process.getActiveResourcesInfo()`
   counted by type). The row and its reason are unchanged.
+  **A health look that gets no answer captures the threads.** When
+  `threadPoolMs` or `workspaceStatMs` is `null`, the service takes its own
+  thread stacks once per jam and logs `repo overview: the health look got
+  no answer — thread stacks captured` with `file` (the full capture,
+  `<data_dir>/logs/thread-capture-<time>.txt`; the newest five are kept),
+  `tool`, and `workers`: one entry per libuv pool thread saying where it
+  was. On macOS (`sample`, three seconds) an entry lists the thread's
+  innermost frames by share of the samples, so `__open 100%` is a thread
+  that never left `open`. On Linux (`/proc/<pid>/task`) it is the thread's
+  state, the kernel function it waits in and its system call number, and
+  the file also lists the open file descriptors. A capture that fails logs
+  at error level and is tried again at the next deadline, three times per
+  jam; a jam ends when a health look answers or a validation returns in
+  time. The capture runs one child process and synchronous file calls
+  only, so it works while the pool is jammed.
   **Default-branch CI alert (#446):** the one runs call reads the 20
   newest default-branch runs; the chip shows the newest of them that tested
   the branch itself — `pull_request*` and fork runs that merely share its

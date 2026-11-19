@@ -23,6 +23,7 @@ import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
 import { bindSupervisorNotificationDisposition } from './supervision/notification-disposition.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { startLoopStallWatchdog } from './supervision/loop-stall-watchdog.js';
+import { captureThreadStacks } from './supervision/thread-capture.js';
 import { TranscriptService } from './transcripts/service.js';
 import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
@@ -543,6 +544,8 @@ async function main(): Promise<number> {
     gitlabApi: new GitLabRepoOverviewApi(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
     onDefaultBranchRuns: (observation) => defaultBranchCi.observe(observation),
+    // A jammed thread pool says what its threads are blocked in, beside service.log.
+    captureThreads: () => captureThreadStacks({ dir: join(config.dataDir, 'logs') }),
   });
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
