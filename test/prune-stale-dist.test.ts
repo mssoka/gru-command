@@ -111,9 +111,11 @@ describe('prune-stale-dist', () => {
     // the capture globs, the shot list, the runner, its director and the
     // agent-browser adapter (dist/media/{capture-paths,shot-list,camera,
     // director,web-adapter}.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5318);
+    // The thread capture a jammed libuv pool triggers
+    // (dist/supervision/thread-capture.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5319);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('5235591c5c70dd7db4f5eb18c0b783f5c84989940b25ad2616014ede6b8f6714');
+      .toBe('6afb64ff8af32f1dabd53ff4f66e31095ee603c55f3d7ffc965b7c82eb02f98b');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

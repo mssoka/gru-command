@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import type { LogLevel } from '../logger.js';
+import type { ThreadCapture } from '../supervision/thread-capture.js';
 import {
   GhApiError,
   GhBudgetExceededError,
@@ -1082,6 +1083,8 @@ class RootValidationTrace {
 
 /** How long each health probe may take before its answer is "none". */
 export const ROOT_VALIDATION_PROBE_LIMIT_MS = 1_000;
+/** Thread captures tried per jam before giving up on that jam. */
+export const THREAD_CAPTURE_MAX_TRIES = 3;
 
 /** A cheap look at the process the moment a root validation timed out. */
 export interface RootValidationHealth {
@@ -1154,6 +1157,10 @@ export interface ManagedRepoOverviewOptions {
   /** The process-health look taken when a root validation times out;
    * default {@link probeRootValidationHealth}. */
   readonly probeRootHealth?: (workspaceRoot: string) => Promise<RootValidationHealth>;
+  /** Takes this process's thread stacks when that health look got no
+   * answer, so the log says what the pool threads are blocked in.
+   * Production wires `captureThreadStacks`; absent = no capture. */
+  readonly captureThreads?: () => Promise<ThreadCapture>;
   readonly resolveRemote?: RemoteResolver;
   /** Refresh cadence; default {@link REPO_OVERVIEW_REFRESH_MS}. */
   readonly intervalMs?: number;
@@ -1232,6 +1239,10 @@ export class ManagedRepoOverviewTracker {
   private started = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight: Promise<RepoOverviewView | null> | null = null;
+  /** Thread captures tried since the health look last answered, and
+   * whether one of them was taken: one capture per jam, not one per pass. */
+  private captureTries = 0;
+  private captureTaken = false;
 
   constructor(opts: ManagedRepoOverviewOptions) {
     this.opts = opts;
@@ -1318,6 +1329,37 @@ export class ManagedRepoOverviewTracker {
     } catch (error) {
       return { healthProbeError: messageOf(error).slice(0, 300) };
     }
+  }
+
+  /** The health look got no answer (no pool thread came free, or the
+   * workspace `stat` did not return): capture the threads once per jam.
+   * A failed capture is retried on the next deadline, up to
+   * {@link THREAD_CAPTURE_MAX_TRIES}; an answering look ends the jam. */
+  private async captureUnansweredHealth(health: Record<string, unknown>): Promise<void> {
+    if (!('threadPoolMs' in health)) return;
+    if (health['threadPoolMs'] !== null && health['workspaceStatMs'] !== null) {
+      this.healthAnswered();
+      return;
+    }
+    const captureThreads = this.opts.captureThreads;
+    if (captureThreads === undefined || this.captureTaken || this.captureTries >= THREAD_CAPTURE_MAX_TRIES) return;
+    this.captureTries += 1;
+    try {
+      const capture = await captureThreads();
+      this.captureTaken = true;
+      this.log('warn', 'repo overview: the health look got no answer — thread stacks captured', { ...capture });
+    } catch (error) {
+      this.log('error', 'repo overview: the health look got no answer and the thread stacks could not be captured', {
+        error: messageOf(error).slice(0, 300),
+        attempt: this.captureTries,
+        of: THREAD_CAPTURE_MAX_TRIES,
+      });
+    }
+  }
+
+  private healthAnswered(): void {
+    this.captureTries = 0;
+    this.captureTaken = false;
   }
 
   /** Re-scan the registry and observe provider state (coalesced). */
@@ -1446,9 +1488,12 @@ export class ManagedRepoOverviewTracker {
             timerLateMs: pendingPath.timedOut ? pendingPath.timerLateMs : null,
             ...health,
           });
+          await this.captureUnansweredHealth(health);
           unreadable(true, detail);
           continue;
         }
+        // The resolver's own filesystem steps went through the pool in time.
+        this.healthAnswered();
         selectedPath = pendingPath.value;
       } catch (error) {
         attemptedResolutions += 1;

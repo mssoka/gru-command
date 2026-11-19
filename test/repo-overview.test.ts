@@ -40,6 +40,7 @@ import {
   REPO_OVERVIEW_RUNS_PER_FETCH,
   REPO_OVERVIEW_STALE_AFTER_MS,
   ROOT_VALIDATION_PROBE_LIMIT_MS,
+  THREAD_CAPTURE_MAX_TRIES,
   classifyGhError,
   classifyRemote,
   freshnessOf,
@@ -54,6 +55,7 @@ import {
   type RepoOverviewMeta,
   type RepoOverviewRunRaw,
   type RepoOverviewRowView,
+  type RootValidationHealth,
   defaultRemoteResolver,
   probeRootValidationHealth,
 } from '../src/repos/overview.js';
@@ -2139,6 +2141,110 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       expect(deadlineFields()).toHaveLength(4);
       expect(deadlineFields()[3]).toMatchObject({ resolver: 'still pending', healthProbeError: 'probe exploded' });
       expect(deadlineFields()[3]).not.toHaveProperty('threadPoolMs');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('captures the thread stacks once per jam when the health look gets no answer', async () => {
+    vi.useFakeTimers();
+    const clock = { ms: T0 };
+    const logs: { level: string; msg: string; fields: Record<string, unknown> }[] = [];
+    const captureLines = () => logs.filter((line) => line.msg.startsWith('repo overview: the health look got no answer'));
+    const jammed: RootValidationHealth = { threadPoolMs: null, workspaceStatMs: null, probeLimitMs: 1_000, activeResources: { FSReqPromise: 3 } };
+    const answering: RootValidationHealth = { threadPoolMs: 2, workspaceStatMs: 3, probeLimitMs: 1_000, activeResources: { PipeWrap: 2 } };
+    const capture = { file: '/data/logs/thread-capture-1.txt', tool: 'sample' as const, workers: ['__open 100%'], pruneError: null };
+    let health: RootValidationHealth | 'probe fails' = jammed;
+    let hangs = true;
+    let captureFails = true;
+    let captures = 0;
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
+      api: new FakeApi(),
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => (hangs ? new Promise(() => {}) : { kind: 'available', path: `/ws/${name}` }),
+      probeRootHealth: async () => {
+        if (health === 'probe fails') throw new Error('probe exploded');
+        return health;
+      },
+      captureThreads: async () => {
+        captures += 1;
+        if (captureFails) throw new Error('/usr/bin/sample 4242 3 did not finish');
+        return capture;
+      },
+      resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
+      log: (level, msg, fields) => logs.push({ level, msg, fields: fields ?? {} }),
+    });
+    const pass = async (): Promise<void> => {
+      const refreshed = tracker.refresh();
+      await vi.advanceTimersByTimeAsync(0);
+      clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS;
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS);
+      await refreshed;
+    };
+    try {
+      // A capture that fails is said so, and tried again at the next deadline.
+      await pass();
+      expect(captures).toBe(1);
+      expect(captureLines()).toEqual([
+        {
+          level: 'error',
+          msg: 'repo overview: the health look got no answer and the thread stacks could not be captured',
+          fields: { error: '/usr/bin/sample 4242 3 did not finish', attempt: 1, of: THREAD_CAPTURE_MAX_TRIES },
+        },
+      ]);
+      captureFails = false;
+      await pass();
+      expect(captures).toBe(2);
+      expect(captureLines()[1]).toEqual({
+        level: 'warn',
+        msg: 'repo overview: the health look got no answer — thread stacks captured',
+        fields: capture,
+      });
+      // The same jam, pass after pass: the deadline line repeats, the capture does not.
+      await pass();
+      await pass();
+      expect(captures).toBe(2);
+      expect(logs.filter((line) => line.msg.startsWith('repo overview: root validation exceeded its deadline'))).toHaveLength(4);
+
+      // A deadline missed with the pool answering (a slow git, not a jam)
+      // takes no capture, and ends the jam: the next one is captured again.
+      health = answering;
+      await pass();
+      expect(captures).toBe(2);
+      health = jammed;
+      await pass();
+      expect(captures).toBe(3);
+      // A health look that itself failed says nothing about the pool.
+      health = 'probe fails';
+      await pass();
+      expect(captures).toBe(3);
+      // So does a validation that returns in time.
+      hangs = false;
+      await pass();
+      hangs = true;
+      health = jammed;
+      await pass();
+      expect(captures).toBe(4);
+
+      // Only the workspace stat unanswered (that filesystem, not the pool) is captured too.
+      health = answering;
+      await pass();
+      health = { ...jammed, threadPoolMs: 1 };
+      await pass();
+      expect(captures).toBe(5);
+
+      // A capture that keeps failing is given up after THREAD_CAPTURE_MAX_TRIES for that jam.
+      health = answering;
+      await pass();
+      health = jammed;
+      captureFails = true;
+      for (let deadline = 0; deadline < THREAD_CAPTURE_MAX_TRIES + 2; deadline += 1) await pass();
+      expect(captures).toBe(5 + THREAD_CAPTURE_MAX_TRIES);
+      expect(captureLines().at(-1)?.fields).toMatchObject({ attempt: THREAD_CAPTURE_MAX_TRIES, of: THREAD_CAPTURE_MAX_TRIES });
     } finally {
       vi.useRealTimers();
     }
