@@ -496,6 +496,46 @@ body {
   .cockpit-kpis__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+/* Even rows, never an empty corner (owner pick 2026-11-20). auto-fit packs
+   as many 180px tracks as fit, so seven cards on a board narrower than
+   1320px wrapped 5 + 2 (or 6 + 1) and left a hole. The number of cards a
+   row CAN hold is unchanged — one per 190px of strip, so no card is ever
+   narrower than before — but when they cannot share one row they split
+   into rows that each fill the width:
+     seven: 4 + 3, then 3 + 2 + 2, then pairs with the last one full-width;
+     six:   3 + 3 (pairs below that, as auto-fit already gives);
+     five:  3 + 2, then pairs with the last one full-width.
+   The count comes from `data-count`; any other count keeps auto-fit. The
+   thresholds are where auto-fit's own track count changes (190k - 10). */
+@container kpis (min-width: 750px) and (max-width: 1319px) {
+  .cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  .cockpit-kpis__grid[data-count='7'] > .cockpit-card { grid-column: span 3; }
+  .cockpit-kpis__grid[data-count='7'] > .cockpit-card:nth-child(n + 5) { grid-column: span 4; }
+}
+
+@container kpis (min-width: 560px) and (max-width: 749px) {
+  .cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .cockpit-kpis__grid[data-count='7'] > .cockpit-card { grid-column: span 2; }
+  .cockpit-kpis__grid[data-count='7'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }
+}
+
+@container kpis (min-width: 560px) and (max-width: 1129px) {
+  .cockpit-kpis__grid[data-count='6'] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@container kpis (min-width: 560px) and (max-width: 939px) {
+  .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .cockpit-kpis__grid[data-count='5'] > .cockpit-card { grid-column: span 2; }
+  .cockpit-kpis__grid[data-count='5'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }
+}
+
+@container kpis (max-width: 559px) {
+  .cockpit-kpis__grid[data-count='7'],
+  .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cockpit-kpis__grid[data-count='7'] > .cockpit-card:last-child,
+  .cockpit-kpis__grid[data-count='5'] > .cockpit-card:last-child { grid-column: span 2; }
+}
+
 /* Each card takes TWO tracks of the strip's own grid: its head and its
    body. The head track is shared by every card in the row (subgrid), so a
    row where one card's label or aside wraps to a second line gives every
@@ -669,6 +709,13 @@ body {
 .cockpit-fact--zero .cockpit-fact__num {
   color: var(--faint);
   font-weight: 600;
+}
+
+/* A card whose own headline is zero steps back (owner pick 2026-11-20).
+   Colour only: the zero lines keep their reserved places, so nothing
+   moves when a count leaves zero. */
+.cockpit-card--quiet .cockpit-card__big {
+  color: var(--muted);
 }
 
 .cockpit-fact--alert,
@@ -2667,6 +2714,9 @@ body {
    No card box until expanded — hairline dividers only, zebra-free. */
 .board-job {
   display: grid;
+  /* One shrinkable track: an implicit `auto` track cannot go below its
+     content's minimum, so one unbreakable branch name widened the row. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 3px;
   padding: 7px 6px 8px;
   background: transparent;
@@ -2726,10 +2776,18 @@ body {
   border-radius: 999px;
 }
 
+/* The row's open/close arrow: a small outlined box, so it reads as a
+   control and is easy to find (it was a bare 12px glyph). */
 .board-job__chevron {
   flex: none;
-  width: 1em;
-  font-size: 12px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--line);
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1;
   color: var(--muted);
 }
 
@@ -2781,29 +2839,48 @@ body {
 }
 
 /* Line 2: small, muted, monospace data readout. */
+/* The line under a heist's title reads as a sentence (owner pick
+   2026-11-20): ordinary case at 12px in the body font. It was 10.5px
+   uppercase monospace, with the branch name taking most of the line. */
 .board-job__meta {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px 8px;
   flex-wrap: wrap;
-  padding-left: 42px;
+  padding-left: 50px;
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10.5px;
-  letter-spacing: 0.02em;
+  font-family: var(--font-body);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
-/* Each row credits its repo — grouping rides the rows, not wrappers. */
+/* Each row credits its repo — grouping rides the rows, not wrappers. The
+   repo is a small tag: the one word a reader looks for first. */
 .board-job__repo {
+  padding: 0 8px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 11px;
   font-weight: 800;
-  color: var(--muted);
 }
 
+/* The branch is evidence, not the headline: last on the line, small and
+   in the code font (visual order only — the DOM order is unchanged). */
 .board-job__branch {
+  order: 1;
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 32ch;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 500;
 }
 
 .board-job__age {
@@ -2817,6 +2894,8 @@ body {
 }
 
 .board-job__pr {
+  /* After the branch (order 1); the family chip follows it. */
+  order: 2;
   margin-left: auto;
   font-family: var(--font-body);
   font-size: 11px;
@@ -2835,9 +2914,17 @@ body {
   color: var(--ink);
 }
 
+.board-job__family-chip {
+  order: 3;
+}
+
 .board-job__family {
   display: grid;
-  margin: 2px 0 0 42px;
+  /* One shrinkable track: a nested row's unbreakable branch name must
+     ellipsize inside the column, never push the board wider than a phone. */
+  grid-template-columns: minmax(0, 1fr);
+  /* Hangs off the parent's meta line (its padding-left). */
+  margin: 2px 0 0 50px;
   border-left: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
   cursor: auto;
 }
@@ -2871,7 +2958,7 @@ body {
 }
 
 .board-job--child .board-job__meta {
-  padding-left: 30px;
+  padding-left: 38px;
 }
 
 /* The expanded row: the v3 detail in one box — the only card allowed. */

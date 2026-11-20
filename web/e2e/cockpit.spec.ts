@@ -542,6 +542,9 @@ interface CockpitFit {
   readonly containerWidth: number;
   /** The grid's USED column count (the resolved track list). */
   readonly columns: number;
+  /** The grid's right edge, and each row's right-most card edge by row top. */
+  readonly gridRight: number;
+  readonly rowRights: ReadonlyArray<readonly [number, number]>;
   readonly cards: readonly CardFit[];
   readonly bodyOverflow: boolean;
 }
@@ -568,6 +571,17 @@ async function cockpitFit(page: Page): Promise<CockpitFit> {
       // track; a track the row has no card for is COLLAPSED to 0px, so the
       // columns the owner sees are the positive ones (Rule 2's `n`).
       columns: getComputedStyle(grid).gridTemplateColumns.split(' ').filter((track) => parseFloat(track) > 0).length,
+      gridRight: grid.getBoundingClientRect().right,
+      rowRights: [
+        ...[...kpis.querySelectorAll<HTMLElement>('.cockpit-card')]
+          .reduce((rights, card) => {
+            const box = card.getBoundingClientRect();
+            const top = Math.round(box.top);
+            rights.set(top, Math.max(rights.get(top) ?? -Infinity, box.right));
+            return rights;
+          }, new Map<number, number>())
+          .entries(),
+      ],
       cards: [...kpis.querySelectorAll<HTMLElement>('.cockpit-card')].map((card) => {
         const unit = card.querySelector<HTMLElement>('.cockpit-card__unit');
         if (unit === null) throw new Error('missing .cockpit-card__unit');
@@ -597,6 +611,33 @@ async function cockpitFit(page: Page): Promise<CockpitFit> {
  * floored at two (a phone keeps two columns). */
 function expectedColumns(width: number, cards: number): number {
   return Math.min(7, cards, Math.max(2, Math.floor((width + 10) / 190)));
+}
+
+/** Rule 2, as rows (owner pick 2026-11-20: even rows, never an empty
+ * corner). The number of cards a row CAN hold is `expectedColumns`. Five,
+ * six and seven cards that cannot share one row split into rows that each
+ * fill the width — 4 + 3, 3 + 3, 3 + 2, then pairs — instead of packing
+ * the first row and leaving a short last one (5 + 2 at the owner's own
+ * geometry). Any other count keeps the packed rows auto-fit gives. */
+function expectedRows(width: number, cards: number): readonly number[] {
+  const perRow = expectedColumns(width, cards);
+  const rows: number[] = [];
+  if (cards < 5 || cards > 7) {
+    for (let left = cards; left > 0; left -= perRow) rows.push(Math.min(perRow, left));
+    return rows;
+  }
+  // In two columns the odd last card takes the whole row.
+  if (perRow === 2) {
+    for (let left = cards; left > 0; left -= 2) rows.push(Math.min(2, left));
+    return rows;
+  }
+  let left = cards;
+  for (let remaining = Math.ceil(cards / perRow); remaining > 0; remaining -= 1) {
+    const size = Math.ceil(left / remaining);
+    rows.push(size);
+    left -= size;
+  }
+  return rows;
 }
 
 /** Every text surface of one card, named as the owner reads it; the
@@ -646,7 +687,15 @@ function expectCockpitFits(fit: CockpitFit, where: string): void {
       `head heights equal in the row at y=${top} (${heights.join(', ')}) at ${where}`,
     ).toBeLessThanOrEqual(1);
   }
-  expect(fit.columns, `grid columns vs Rule 2 at ${where}`).toBe(expectedColumns(fit.containerWidth, fit.cards.length));
+  // Cards per row, top to bottom (the grid's own track count no longer says
+  // it: an even split uses spans over a finer grid).
+  const perRow = [...rows.values()].map((heights) => heights.length);
+  expect(perRow, `cards per row vs Rule 2 at ${where}`).toEqual(expectedRows(fit.containerWidth, fit.cards.length));
+  // Every row fills the strip: the last card of each row ends at the grid's
+  // right edge, so there is never an empty corner.
+  for (const [top, right] of fit.rowRights) {
+    expect(Math.abs(right - fit.gridRight), `the row at y=${top} fills the strip at ${where}`).toBeLessThanOrEqual(1);
+  }
 }
 
 /** familyA's fact counts (the headline numbers ride their own line). */

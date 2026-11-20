@@ -1848,8 +1848,11 @@ export function jobStatusTone(status: string): JobTone {
   switch (status) {
     case 'working':
     case 'dispatched':
-    case 'delivered':
       return 'work';
+    // Yellow means IN MOTION only (owner pick 2026-11-20): delivered work is
+    // out of the worker's hands, like work in review, so it shares the
+    // review blue and never reads as still running.
+    case 'delivered':
     case 'in-review':
       return 'rev';
     case 'merged':

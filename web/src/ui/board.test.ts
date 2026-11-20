@@ -706,6 +706,20 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     // A zero steps back; a real count keeps full ink.
     expect(document.querySelector<HTMLElement>('[data-kpi="jobs.done"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--zero')).toBe(true);
     expect(document.querySelector<HTMLElement>('[data-kpi="jobs.working"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--zero')).toBe(false);
+    // A card whose own headline is zero steps back, unless it carries an
+    // alert; a card with a count keeps full strength (owner pick 2026-11-20).
+    // The zero lines stay rendered in their places: nothing moves when a
+    // count leaves zero.
+    for (const card of document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')) {
+      const headline = card.querySelector('.cockpit-card__big')?.textContent;
+      const off = card.classList.contains('cockpit-card--off');
+      const alert = card.querySelector('.cockpit-fact--alert') !== null;
+      expect(card.classList.contains('cockpit-card--quiet'), `${card.dataset.card} (headline ${headline})`).toBe(
+        headline === '0' && !off && !alert,
+      );
+    }
+    expect(document.querySelector<HTMLElement>('.cockpit-card--heists')?.classList.contains('cockpit-card--quiet')).toBe(false);
+    expect(document.querySelectorAll('#board-kpis .cockpit-fact--zero').length).toBeGreaterThan(0);
 
     // v6.1 ruling 5 survives the re-face: every rendered number carries its
     // visible label — adjacency in the DOM, not a tooltip promise.
@@ -2476,15 +2490,24 @@ describe('board agent rail — truthful runtime status (#171)', () => {
 describe('board v6 — job status tones', () => {
   beforeEach(mountBoardDom);
 
-  it('renders the delivered chip in the work color family and its dot in the same tone', () => {
+  it('yellow means in motion only: a delivered heist wears the review blue, chip and dot alike', () => {
+    // Owner pick 2026-11-20 (it was yellow since 2026-09-22): delivered work
+    // is out of the worker's hands, so it must not look like it is running.
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ status: 'delivered' })] }));
     const row = document.querySelector('#board-jobs .board-job');
     const chip = row?.querySelector('.board-job__status');
     expect(chip?.textContent).toBe('delivered');
-    expect(chip?.className).toContain('pp-chip--work');
-    expect(chip?.className).not.toContain('pp-chip--rev');
-    expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--work');
+    expect(chip?.className).toContain('pp-chip--rev');
+    expect(chip?.className).not.toContain('pp-chip--work');
+    expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--rev');
+    // Work that IS in motion keeps the yellow.
+    for (const status of ['working', 'dispatched']) {
+      view.render(snapshot({ jobs: [baseJob({ status })] }));
+      const moving = document.querySelector('#board-jobs .board-job');
+      expect(moving?.querySelector('.board-job__status')?.className, status).toContain('pp-chip--work');
+      expect(moving?.querySelector('.board-job__dot')?.className, status).toContain('board-job__dot--work');
+    }
   });
 });
 

@@ -1501,7 +1501,14 @@ export class BoardView {
     // A labelled group, not a heading or region landmark (#401): the cards
     // render on every page, and six headings ahead of FOR YOU would pad
     // screen-reader navigation. The visible label is its accessible name.
-    const node = el('article', `cockpit-card cockpit-card--${card.id}${card.off ? ' cockpit-card--off' : ''}`);
+    // A card whose own headline is zero steps back (owner pick 2026-11-20):
+    // colour only, so nothing moves when the count leaves zero. An alert on
+    // the card keeps it at full strength.
+    const quiet = !card.off && card.headline.value === '0' && !card.facts.some((fact) => fact.alert);
+    const node = el(
+      'article',
+      `cockpit-card cockpit-card--${card.id}${card.off ? ' cockpit-card--off' : ''}${quiet ? ' cockpit-card--quiet' : ''}`,
+    );
     node.dataset.card = card.id;
     node.setAttribute('role', 'group');
     node.setAttribute('aria-label', card.label);

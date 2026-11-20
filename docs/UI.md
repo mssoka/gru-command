@@ -57,9 +57,9 @@ key `gru-theme`).
 | `--ink` | `#22304a` | `#e8ecf4` | primary text |
 | `--line` | `#22304a` | `#313c58` | chunky outlines |
 | `--muted` / `--faint` | `#5b6a84` / `#6d6a5d` | `#93a0b8` / `#8b96ac` | secondary text (AA-pinned in `web/src/lib/palette-contrast.test.ts`) |
-| `--work` | `#ffd54a` | `#ffd54a` | minion yellow: working/delivered, Gru bubbles |
+| `--work` | `#ffd54a` | `#ffd54a` | minion yellow: work in motion (working/dispatched), Gru bubbles |
 | `--done` | `#7ee08a` | `#6fd68a` | merged/done states |
-| `--rev` | `#9ad7f5` | `#7cc4ef` | review states |
+| `--rev` | `#9ad7f5` | `#7cc4ef` | review states, and delivered work (out of the worker's hands) |
 | `--park` | `#e8e3d8` | `#2a3350` | parked/vaulted |
 | `--alert` | `#ffb3ba` | `#ff8f9c` | blocked/errors |
 | `--perkins` | `#c9b8ff` | `#b7a3ff` | Perkins rounds |
