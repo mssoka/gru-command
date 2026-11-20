@@ -85,11 +85,13 @@ import {
 } from '../lib/board-signals.js';
 import {
   decidedOptionLabel,
+  isAnsweredNotification,
   isDestructiveAsk,
   isNoRecommendation,
   kindOfAsk,
   ownerAttention,
   ownerCounts,
+  ownerHiddenLabel,
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
@@ -779,7 +781,12 @@ export class BoardView {
           ),
         );
       }
-      summary.append(gruLine('lbl board-owner__gru'));
+      // "nothing needs Gru either" would contradict the line before it while
+      // Gru is carrying out an answer: the quiet line steps aside then. A
+      // last-known board keeps it (it carries the last-known marker), and a
+      // busy machine queue is always named.
+      const gruQuiet = snapshot.unackedActionRequired === 0 && !this.lastKnown();
+      if (!(counts.answered > 0 && gruQuiet)) summary.append(gruLine('lbl board-owner__gru'));
       mount.append(summary);
     }
     mount.hidden = false;
@@ -813,7 +820,7 @@ export class BoardView {
       }
       mount.append(list);
       if (window.hidden > 0) {
-        const more = el('button', 'board-band__more', `+${window.hidden} older pending`);
+        const more = el('button', 'board-band__more', ownerHiddenLabel(rows.slice(window.rows.length)));
         more.type = 'button';
         more.setAttribute('aria-expanded', String(this.ownerExpanded));
         more.addEventListener('click', () => {
@@ -3441,8 +3448,11 @@ export class BoardView {
       // Only needs-owner rings the shoulder; machine/fyi rows live in the
       // panel bands and reach Gru through the wake path instead.
       if (notification.routing !== 'needs-owner') continue;
-      // History and already-handled rows (acked on ANY device) never toast.
+      // History and already-handled rows (acked on ANY device) never toast,
+      // and neither does a decision that arrives already answered (the owner
+      // answered it on another device): nothing is asked of them here.
       if (firstRender || notification.ackedAt !== null || notification.resolvedAt !== null) continue;
+      if (isAnsweredNotification(notification)) continue;
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }
@@ -3470,7 +3480,8 @@ export class BoardView {
   /** Badge = unacked needs-owner items not yet seen here, at ANY severity
    * (panel-open marks seen; an ack from ANY device clears it via ackedAt).
    * Machine (action-required) and FYI rows never count — they are not the
-   * owner's shoulder. */
+   * owner's shoulder — and neither does a decision the owner has already
+   * answered. */
   private updateBadge(
     notifications: readonly {
       id: string;
@@ -3478,17 +3489,19 @@ export class BoardView {
       severity: string;
       ackedAt: string | null;
       resolvedAt: string | null;
+      decision?: unknown;
       decidedAt?: string | null;
     }[],
   ): void {
     // An answered decision is Gru's work now: it never rings as unread on a
-    // browser that has not shown it (owner pick 2026-11-20).
+    // browser that has not shown it (owner pick 2026-11-20). The same rule
+    // as the band's count (isAnsweredNotification).
     const unseen = notifications.filter(
       (n) =>
         n.routing === 'needs-owner' &&
         n.ackedAt === null &&
         n.resolvedAt === null &&
-        (n.decidedAt === null || n.decidedAt === undefined) &&
+        !isAnsweredNotification(n) &&
         !this.seenOwnerIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);

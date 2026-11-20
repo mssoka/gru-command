@@ -2210,6 +2210,12 @@ body {
   color: var(--muted);
 }
 
+/* Gru's share and Gru's own queue read as one muted line beside the
+   headline: a dot between them, never two bare sentences side by side. */
+.board-owner__answered + .board-owner__gru::before {
+  content: '· ';
+}
+
 #board-owner[data-empty='true'] {
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;

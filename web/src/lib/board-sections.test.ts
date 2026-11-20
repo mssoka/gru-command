@@ -216,3 +216,37 @@ describe('board sections — bounded reversible previews', () => {
     expect(pipelineStateTone({ state: 'waiting' })).toBe('pp-chip--park');
   });
 });
+
+describe('FOR YOU count on the shortcut strip', () => {
+  it('counts what the owner still owes: an answered decision is left out', () => {
+    const base = withMailboxFixture({
+      repos: [],
+      agents: [],
+      notifications: [],
+      decisions: { enabled: false, status: 'disabled', reason: 'disabled', model: 'm', endpoint: 'https://example.invalid', credentialPresent: false, credentialSource: 'none', checkedAt: null, incarnation: 'strip', generation: 0 },
+      unackedActionRequired: 0,
+      unackedNeedsOwner: 2,
+      wakes: { count: 0, lastAt: null },
+    } as BoardSnapshot);
+    const decision = {
+      question: 'Approve?',
+      context: 'Context.',
+      recommendation: 'Approve.',
+      reservedClass: 'scope-design',
+      whyNotDelegable: 'Owner call.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'It starts.' }],
+      discussion: false,
+    };
+    const row = (id: string, decidedAt: string | null) => ({
+      id, ts: '2026-11-20T10:00:00.000Z', kind: 'gru.owner-escalation', routing: 'needs-owner' as const, severity: 'error' as const,
+      title: id, detail: null, agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null, decision,
+      decidedAt, decidedBy: decidedAt === null ? null : 'web', decidedOption: decidedAt === null ? null : 'approve',
+    });
+    const both = { ...base, notifications: [row('open', null), row('answered', '2026-11-20T10:05:00.000Z')] } as BoardSnapshot;
+    expect(boardSections(both).counts['for-you']).toBe(1);
+    expect(sectionNav(boardSections(both).counts).find((entry) => entry.id === 'for-you')?.count).toBe(1);
+    const onlyAnswered = { ...base, notifications: [row('answered', '2026-11-20T10:05:00.000Z')] } as BoardSnapshot;
+    expect(boardSections(onlyAnswered).counts['for-you']).toBe(0);
+  });
+});
+

@@ -348,6 +348,55 @@ describe('owner look — the ready row and the FOR YOU pill', () => {
     expect(band().querySelector('.board-owner__answered')).toBeNull();
   });
 
+  it('a decision that arrives already answered never taps the shoulder; an open one does', () => {
+    const view = new BoardView(() => {});
+    const toasted: string[] = [];
+    view.setToastHandler((item) => toasted.push(item.id));
+    // History present at the first render never toasts.
+    view.render(snapshot([]));
+    // Two new arrivals: one the owner answered on another device while this
+    // browser was away, one still open.
+    view.render(
+      snapshot([
+        notification({ id: 'answered-elsewhere', decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'finish' }),
+        notification({ id: 'still-open' }),
+      ]),
+    );
+    expect(toasted).toEqual(['still-open']);
+  });
+
+  it('with only answers in hand the band never says "nothing needs Gru either"', () => {
+    const view = new BoardView(() => {});
+    const answered = notification({ id: 'answered', decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'finish' });
+    // Gru's own queue is empty, but Gru is carrying out an answer: the quiet
+    // line would contradict the one before it.
+    view.render(snapshot([answered]));
+    const summary = band().querySelector('.board-owner__summary')!;
+    expect([...summary.children].map((node) => node.textContent)).toEqual(['Nothing needs you', 'Gru is carrying out 1 answer']);
+    // A busy machine queue is still named, after Gru's share.
+    view.render({ ...snapshot([answered]), unackedActionRequired: 2 });
+    expect([...band().querySelector('.board-owner__summary')!.children].map((node) => node.className.split(' ').at(-1))).toEqual([
+      'board-owner__headline',
+      'board-owner__answered',
+      'board-owner__gru',
+    ]);
+    // With something still owed and no answers, the quiet line stays.
+    view.render(snapshot([notification({ id: 'open' })]));
+    expect(band().querySelector('.board-owner__gru')?.textContent).toContain('nothing needs Gru either');
+  });
+
+  it('an open question shows ahead of newer answered cards, and the expander names what it hides', () => {
+    const view = new BoardView(() => {});
+    const answered = [1, 2, 3, 4, 5, 6].map((n) =>
+      notification({ id: `answered-${n}`, ts: `2026-11-20T18:0${n}:00.000Z`, decidedAt: '2026-11-20T18:30:00.000Z', decidedOption: 'finish' }),
+    );
+    view.render(snapshot([...answered, notification({ id: 'open', ts: '2026-11-20T09:00:00.000Z' })]));
+    const cards = [...band().querySelectorAll<HTMLElement>('[data-notification-id]')].map((card) => card.dataset.notificationId);
+    expect(cards[0]).toBe('open');
+    expect(band().querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band().querySelector('.board-band__more')?.textContent).toBe('+1 answered');
+  });
+
   it('an answered decision never rings the bell badge as unread', () => {
     // The badge counts owner rows the bell has not shown, so the panel
     // stays closed here (an open panel marks its rows seen).

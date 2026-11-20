@@ -144,14 +144,18 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   keeps its row until that follow-through, but it is Gru's work, not the
   owner's (owner pick 2026-11-20): it leaves `N pending`, the
   `N things need you` headline, the section strip's FOR YOU count and the
-  bell's unread badge, and the band names it on its own line (`Gru is
-  carrying out 1 answer`). With only answered rows the headline reads
-  `Nothing needs you` and the rows stay visible. Rows are
-  deterministic (newest first, stable `owner-decision:{id}` /
+  bell's unread badge, and it never toasts or chimes when it arrives
+  already answered. The band names it beside the headline (`Gru is
+  carrying out 1 answer`); with only answered rows the headline reads
+  `Nothing needs you`, the rows stay visible, and the quiet "nothing needs
+  Gru either" line steps aside (it would contradict the line before it).
+  Rows are deterministic: what still needs the owner first, then answered
+  rows, newest first within each (stable `owner-decision:{id}` /
   `owner-notice:{id}` / `owner-proposal:{id}` / `owner-pr:{jobId}` action
-  keys), focus survives snapshot re-renders, and the older tail hides
-  behind a `+N older pending`
-  expander — the engine already merges EVERY unacked needs-owner row
+  keys), so an open question never sits behind answered cards. Focus
+  survives snapshot re-renders, and the tail hides behind an expander
+  that says what it holds (`+N older pending`, `+N answered`, or both)
+  — the engine already merges EVERY unacked needs-owner row
   into the snapshot, so no pending obligation is lost to the bounded
   feed. The row's action is **OPEN PR** for a GitHub pull and **OPEN
   MR** for a GitLab merge request (external https link only) — a link
@@ -441,7 +445,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   is the alert/history surface: it shares the SAME authoritative owner
   projection as the board's permanent FOR YOU band, so the two surfaces
   never disagree about what the owner owes (the badge and toasts still
-  count needs-owner notifications only); opening it never completes an
+  count needs-owner notifications only, and neither counts a decision the
+  owner has already answered); opening it never completes an
   obligation. There is no timed escalation: machine alerts never promote
   to owner attention by age alone (docs/FLOW.md forbids promotion by age);
   a machine row leaves the queue when its producer resolves

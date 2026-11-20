@@ -16,7 +16,9 @@
  *   - PR rows: the server-computed, evidence-bound `ownerPrs` projection
  *     (the browser never re-derives merge readiness).
  *
- * Ordering is deterministic (newest first, action id tiebreak) and row
+ * Ordering is deterministic (what still needs the owner first, then
+ * answers awaiting follow-through; newest first and action id tiebreak
+ * within each) and row
  * ids are stable across renders so focus, aria and tests address the same
  * control before and after a snapshot push. No text-based dedupe, no
  * grouping, no bulk actions, and never an action derived from prose.
@@ -152,14 +154,46 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
   for (const pr of snapshot.ownerPrs ?? []) {
     rows.push({ kind: 'pr', actionId: pr.id, ts: pr.checkedAt, pr });
   }
-  return rows.sort((left, right) => right.ts.localeCompare(left.ts) || left.actionId.localeCompare(right.actionId));
+  // What still needs the owner comes first, newest first; answers Gru is
+  // carrying out follow, newest first. The band shows a window of the first
+  // rows, so an open question can never sit behind answered cards while the
+  // header says it is waiting.
+  const answeredLast = (row: OwnerRow): number => (isAnsweredRow(row) ? 1 : 0);
+  return rows.sort(
+    (left, right) =>
+      answeredLast(left) - answeredLast(right) || right.ts.localeCompare(left.ts) || left.actionId.localeCompare(right.actionId),
+  );
 }
 
 /** True for a decision the owner has ANSWERED: its row stays on the band
  * until the producer resolves it (follow-through stays distinct from the
  * choice), but the ball is with Gru — it no longer needs the owner. */
 export function isAnsweredRow(row: OwnerRow): boolean {
-  return row.kind === 'decision' && row.notification.decidedAt !== null && row.notification.decidedAt !== undefined;
+  return row.kind === 'decision' && isAnsweredNotification(row.notification);
+}
+
+/** The same rule on a bare notification, for the surfaces that never build
+ * rows (the bell badge, toasts): a typed decision with a recorded choice.
+ * A row with no decision cannot be answered, whatever else it carries. */
+export function isAnsweredNotification(notification: {
+  readonly decision?: unknown;
+  readonly decidedAt?: string | null;
+}): boolean {
+  return (
+    notification.decision !== null &&
+    notification.decision !== undefined &&
+    notification.decidedAt !== null &&
+    notification.decidedAt !== undefined
+  );
+}
+
+/** The expander's words for the rows behind the window: what is still owed
+ * and what is already answered are never lumped together as "pending". */
+export function ownerHiddenLabel(hidden: readonly OwnerRow[]): string {
+  const answered = hidden.filter(isAnsweredRow).length;
+  const owed = hidden.length - answered;
+  if (owed > 0 && answered > 0) return `+${owed} older pending · +${answered} answered`;
+  return owed > 0 ? `+${owed} older pending` : `+${answered} answered`;
 }
 
 export interface OwnerCounts {
