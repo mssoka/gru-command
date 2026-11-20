@@ -303,6 +303,16 @@ describe('palette contrast (v5)', () => {
     }
   });
 
+  it('a long Gru reply reads dark ink on the butter bubble in both themes', () => {
+    expect(declarationIn(COMPONENTS_CSS, '.msg--gru.msg--long', 'background')).toBe('var(--gru-soft)');
+    expect(colorTokenIn(COMPONENTS_CSS, '.msg--gru.msg--long')).toBe('on-state');
+    // Short replies keep the bright minion yellow.
+    expect(declarationIn(COMPONENTS_CSS, '.msg--gru', 'background')).toBe('var(--work)');
+    for (const selector of [':root', '.dark']) {
+      expect(contrast(themeVars(selector), 'on-state', 'gru-soft'), selector).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
   it('the pair list itself is non-trivial (guards an accidentally emptied table)', () => {
     expect(TEXT_PAIRS.length).toBeGreaterThan(12);
   });

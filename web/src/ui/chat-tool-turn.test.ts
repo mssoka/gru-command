@@ -219,3 +219,68 @@ describe('text turns keep the streaming lifecycle', () => {
     expect(bubbles()[0]?.textContent).toContain('late text');
   });
 });
+
+describe('a reply interrupted by tool work reads as separate paragraphs (owner pick 2026-11-20)', () => {
+  const paragraphs = (): string[] => [...bubbles()[0]!.querySelectorAll('p')].map((node) => node.textContent ?? '');
+
+  it('text that resumes after a tool call starts its own paragraph, live and on replay', () => {
+    for (const live of [true, false]) {
+      seq = 0;
+      installChatDom();
+      const view = new ChatView(() => true);
+      view.reset();
+      view.addFrame(turn('start'), live);
+      view.addFrame(delta('Let me look before suggesting '), live);
+      view.addFrame(delta('anything.'), live);
+      view.addFrame(tool('start'), live);
+      view.addFrame(tool('end'), live);
+      view.addFrame(delta('My local copy '), live);
+      view.addFrame(delta('is behind.'), live);
+      view.addFrame(tool('start', 'fetch'), live);
+      view.addFrame(tool('end', 'fetch'), live);
+      view.addFrame(delta('Yes, this is doable.'), live);
+      view.addFrame(turn('end'), live);
+      // One bubble for the turn, in three paragraphs. Before, the three
+      // parts were one paragraph reading "…anything.My local copy…".
+      expect(bubbles(), `live=${String(live)}`).toHaveLength(1);
+      expect(paragraphs(), `live=${String(live)}`).toEqual([
+        'Let me look before suggesting anything.',
+        'My local copy is behind.',
+        'Yes, this is doable.',
+      ]);
+    }
+  });
+
+  it('deltas with no tool work between them still join as written, and a break the text carries is not doubled', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('One sen'), true);
+    view.addFrame(delta('tence.\n\n'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta('Next part.'), true);
+    view.addFrame(turn('end'), true);
+    expect(paragraphs()).toEqual(['One sentence.', 'Next part.']);
+  });
+
+  it('a long reply wears the calm bubble; a short one keeps the bright one', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('Yes. Let me look at how it is built first.'), true);
+    expect(bubbles()[0]?.classList.contains('msg--long')).toBe(false);
+    // It grows past about six lines while streaming: the bubble calms down.
+    view.addFrame(delta(` ${'More detail follows here. '.repeat(20)}`), true);
+    expect(bubbles()[0]?.classList.contains('msg--long')).toBe(true);
+    view.addFrame(turn('end'), true);
+    expect(bubbles()[0]?.classList.contains('msg--long')).toBe(true);
+    // The next short reply is bright again.
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('Done.'), true);
+    view.addFrame(turn('end'), true);
+    expect(bubbles()).toHaveLength(2);
+    expect(bubbles()[1]?.classList.contains('msg--long')).toBe(false);
+  });
+});
+

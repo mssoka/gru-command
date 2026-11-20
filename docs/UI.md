@@ -407,6 +407,35 @@ read:
   that stays still under reduced motion; calm otherwise. The count beside
   it still carries the fact.
 
+**The rest of the board** (owner picks 2026-11-20, the same readability
+pass):
+
+- **Heist rows.** The line under a title reads as a sentence: ordinary
+  case at 12px in the body font, the repo as a small tag, the branch last
+  among the left-hand items in small code type (visual order only), and a
+  boxed arrow to open the row. Yellow means work in motion only
+  (`working`, `dispatched`); a `delivered` heist is out of the worker's
+  hands and wears the review blue.
+- **Number cards.** Even rows, never an empty corner: cards that cannot
+  share one row split into rows that each fill the width (seven as 4 + 3,
+  six as 3 + 3, five as 3 + 2, then pairs with a full-width last card). A
+  row never holds more cards than before, so no card gets narrower. A card
+  whose headline is zero steps back by colour; zero lines keep their faint
+  ink and their reserved places, so nothing moves when a count changes.
+- **Health pill.** Readings that need no look fold behind `details`; a
+  reading that needs a look always shows. The choice is remembered per
+  browser (`gru-command.health-details`). A phone always folds them and
+  shows no control.
+- **Crew rail.** The line under a name is ordinary case at 11px and wraps
+  rather than cutting the role; the name gets the room before the ID code;
+  a rail too long for its height ends on a pinned `Show all N` control.
+- **FOR GRU.** Its counts use real singular and plural forms.
+- **Chat replies.** Text that resumes after tool work starts its own
+  paragraph (the parts of a reply used to run together), and a reply
+  longer than about six lines reads on the pale butter bubble
+  (`--gru-soft`) while short replies keep the bright yellow. The composer
+  is unchanged.
+
 It reads as the attention
 card
 (cockpit rework): under

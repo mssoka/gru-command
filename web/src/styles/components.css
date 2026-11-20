@@ -1282,6 +1282,15 @@ body {
   border-bottom-right-radius: 6px;
 }
 
+/* A long reply reads on the calm bubble (owner pick 2026-11-20, option
+   6b): short replies keep the bright minion yellow; a reply longer than
+   about six lines is pale butter yellow with the same dark ink, in both
+   themes, instead of a tall block of bright colour. */
+.msg--gru.msg--long {
+  background: var(--gru-soft);
+  color: var(--on-state);
+}
+
 .msg--queued {
   opacity: 0.6;
   border-style: dashed;
