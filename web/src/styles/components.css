@@ -2323,6 +2323,13 @@ body {
   overflow-wrap: anywhere;
 }
 
+.board-owner__checked {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--on-state);
+  overflow-wrap: anywhere;
+}
+
 .board-owner__facts {
   flex: 1 1 280px;
   display: grid;
@@ -4129,6 +4136,12 @@ a.repo-row__name:hover {
   color: var(--danger);
 }
 
+/* A card with no body (a notice whose kind has no guidance): the first
+   line under the strip keeps a gap from it. */
+.board-notification--owner > .board-notification__head + .board-notification__details {
+  margin-top: 10px;
+}
+
 /* Answered: the recorded choice leads, with a green tick. */
 .board-notification--owner > .board-notification__decided {
   margin-top: 12px;
@@ -4197,8 +4210,11 @@ a.repo-row__name:hover {
   animation: conn-pulse 1.6s ease-in-out infinite;
 }
 
+/* Same selectors as the animated rule above: a shorter one would lose to
+   it and the dot would keep pulsing. */
 @media (prefers-reduced-motion: reduce) {
-  #board-owner .board-band__label::before {
+  #board-owner[data-attention='question'] .board-band__label::before,
+  #board-owner[data-attention='ready'] .board-band__label::before {
     animation: none;
   }
 }

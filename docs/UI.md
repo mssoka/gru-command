@@ -383,17 +383,21 @@ read:
   nothing" notes under it; the call is the question, Gru's advice in a
   butter speech bubble (`--gru-soft`, dark ink in both themes), and one
   tile per choice: the button, then what happens.
-- Severity no longer floods an owner card. Machine rows, feed rows and
-  closed receipts keep the compact card, where an error row still paints
-  the alert surface with on-state ink on every line.
+- Severity no longer floods an owner card. Machine rows, feed rows
+  (an acked or resolved owner row included) and closed receipts keep the
+  compact card, where an error row still paints the alert surface with
+  on-state ink on every line.
 - An answered card leads with the recorded choice and folds the ask under
   a "What you were asked" recap; its open state survives snapshot pushes
   like Details.
 - The ready row states its three facts in plain words (Reviewed and
-  approved, Checks are green, Can be merged) above the exact evidence line.
+  approved, Checks are green, Can be merged) above the exact evidence
+  line, and its strip says when that evidence was last observed
+  (`checked 3h ago`): the facts are as of that observation.
 - The FOR YOU pill follows what is waiting (`data-attention` on the band):
-  coral with a pulse for a question, green for good news only, calm
-  otherwise. The count beside it still carries the fact.
+  coral for a question, green for good news only, each with a pulsing dot
+  that stays still under reduced motion; calm otherwise. The count beside
+  it still carries the fact.
 
 It reads as the attention
 card

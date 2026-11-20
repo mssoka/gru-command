@@ -211,6 +211,7 @@ describe('palette contrast (v5)', () => {
       expect(colorTokenIn(COMPONENTS_CSS, `${owner} .board-notification__meta`)).toBe('on-state');
       expect(declarationIn(COMPONENTS_CSS, '.board-owner__strip', 'background')).toBe('var(--done)');
       expect(colorTokenIn(COMPONENTS_CSS, '.board-owner__strip')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-owner__checked')).toBe('on-state');
       // The body is calm whatever the severity: the card no longer floods,
       // and every line names its own ink instead of inheriting the alert
       // surface's.
@@ -253,6 +254,33 @@ describe('palette contrast (v5)', () => {
       expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
     });
   }
+
+  it('the owner look\'s ink rules follow the error-surface override they tie with', () => {
+    // `.board-notification--owner .x` and `.board-notification--error .x`
+    // have the same specificity, so an error-severity owner card reads its
+    // calm inks only because the owner block comes LATER in the file. The
+    // token pins above cannot see order; this does.
+    const errorList = COMPONENTS_CSS.indexOf('.board-notification--error .board-notification__context');
+    const ownerInks = COMPONENTS_CSS.indexOf('.board-notification--owner .board-notification__context');
+    const ownerHead = COMPONENTS_CSS.indexOf('.board-notification--owner .board-notification__head');
+    const errorMeta = COMPONENTS_CSS.indexOf('.board-notification--error .board-notification__meta');
+    expect(errorList).toBeGreaterThan(-1);
+    expect(errorMeta).toBeGreaterThan(-1);
+    expect(ownerInks).toBeGreaterThan(errorList);
+    expect(ownerHead).toBeGreaterThan(errorMeta);
+    expect(COMPONENTS_CSS.lastIndexOf('.board-notification--error .board-notification__')).toBeLessThan(ownerHead);
+  });
+
+  it('the FOR YOU pill stops pulsing under reduced motion', () => {
+    // The still rule must match the animated rule's selectors exactly: a
+    // shorter selector loses to it and the dot keeps pulsing.
+    const source = COMPONENTS_CSS.replace(/\/\*[\s\S]*?\*\//gu, '');
+    const animated = /#board-owner\[data-attention='question'\] \.board-band__label::before,\s*#board-owner\[data-attention='ready'\] \.board-band__label::before\s*\{[^}]*animation:\s*conn-pulse[^}]*\}/u;
+    const still = /@media \(prefers-reduced-motion: reduce\)\s*\{\s*#board-owner\[data-attention='question'\] \.board-band__label::before,\s*#board-owner\[data-attention='ready'\] \.board-band__label::before\s*\{\s*animation:\s*none;\s*\}\s*\}/u;
+    expect(source).toMatch(animated);
+    expect(source).toMatch(still);
+    expect(source.search(still)).toBeGreaterThan(source.search(animated));
+  });
 
   it('the pair list itself is non-trivial (guards an accidentally emptied table)', () => {
     expect(TEXT_PAIRS.length).toBeGreaterThan(12);

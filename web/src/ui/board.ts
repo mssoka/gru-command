@@ -1183,6 +1183,9 @@ export class BoardView {
     strip.append(
       el('div', 'board-owner__title', `🔀 ${pr.jobTitle}`),
       el('span', 'pp-chip board-owner__ready', 'ready for you'),
+      // The facts below held when the evidence was last observed; the strip
+      // says how long ago that was, in the same breath as "ready".
+      el('span', 'lbl board-owner__checked', `checked ${formatAge(pr.checkedAt)} ago`),
     );
     // The three facts the evidence line proves, in plain words; the exact
     // evidence (repo, head, observation age) stays on the line below them.
@@ -2938,7 +2941,9 @@ export class BoardView {
     // the owner's answer or its follow-through — wears the headline strip
     // and the split body. Machine rows, feed rows and closed receipts keep
     // the compact card.
-    const ownerFace = item.routing === 'needs-owner' && !receipt && item.resolvedAt === null;
+    // An acked row is a feed row, not an open ask (the band no longer
+    // lists it), so it keeps the compact card as well.
+    const ownerFace = item.routing === 'needs-owner' && !receipt && item.resolvedAt === null && item.ackedAt === null;
     const destructive = ownerFace && decision !== null && isDestructiveAsk(decision.reservedClass);
     const card = el(
       'article',
@@ -3696,13 +3701,14 @@ interface DecisionSubmission {
  * contain ':' (e.g. `lessons-proposal-withdrawn:<uuid>`), so a fixed
  * split(':')[1] parses the wrong segment and drops focus to <body>. */
 function notificationIdFromFocusKey(key: string): string | null {
-  // The key suffix is known (`:details`, `:seen`, `:option:<id>`); parse it
+  // The key suffix is known (`:details`, `:recap`, `:seen`, `:option:<id>`); parse it
   // from the RIGHT so an id containing ':' survives intact.
   if (key.startsWith('notif:')) {
     const rest = key.slice('notif:'.length);
     const optionAt = rest.lastIndexOf(':option:');
     if (optionAt !== -1) return rest.slice(0, optionAt) || null;
     if (rest.endsWith(':details')) return rest.slice(0, -':details'.length) || null;
+    if (rest.endsWith(':recap')) return rest.slice(0, -':recap'.length) || null;
     if (rest.endsWith(':seen')) return rest.slice(0, -':seen'.length) || null;
     if (rest.endsWith(':card')) return rest.slice(0, -':card'.length) || null;
     if (rest.endsWith(':discuss')) return rest.slice(0, -':discuss'.length) || null;

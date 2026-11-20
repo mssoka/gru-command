@@ -300,6 +300,8 @@ describe('owner look — the ready row and the FOR YOU pill', () => {
     const strip = row.querySelector<HTMLElement>(':scope > .board-owner__strip')!;
     expect(strip.querySelector('.board-owner__title')?.textContent).toBe('🔀 Root and specialist context compaction');
     expect(strip.querySelector('.board-owner__ready')?.textContent).toBe('ready for you');
+    // "Ready" is as of the last observation, and the strip says when.
+    expect(strip.querySelector('.board-owner__checked')?.textContent).toMatch(/^checked \S+ ago$/u);
     const facts = row.querySelector<HTMLElement>(':scope > .board-owner__facts')!;
     expect([...facts.querySelectorAll('.board-owner__tick')].map((tick) => tick.textContent)).toEqual([
       'Reviewed and approved',
@@ -324,5 +326,63 @@ describe('owner look — the ready row and the FOR YOU pill', () => {
     expect(band().dataset.attention).toBe('ready');
     view.render(snapshot([answered]));
     expect(band().dataset.attention).toBe('answered');
+  });
+});
+
+describe('owner look — rows that are not open asks, and focus', () => {
+  beforeEach(mountBoardDom);
+
+  it('an acked owner row is a feed row: it keeps the compact card, with no strip and no live control', () => {
+    // The band drops an acked row (it is no longer owed), and the bell lists
+    // it under FEED. It must not come back there dressed as an open question.
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot([
+        notification({ id: 'acked-ask', ackedAt: '2026-11-20T17:20:00.000Z' }),
+        notification({ id: 'acked-notice', kind: 'port-squat', decision: null, ackedAt: '2026-11-20T17:21:00.000Z' }),
+      ]),
+    );
+    expect(band().querySelector('[data-notification-id]')).toBeNull();
+    expect(band().dataset.attention).toBe('clear');
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    for (const id of ['acked-ask', 'acked-notice']) {
+      const card = cardOf(id, panel);
+      expect(card.classList.contains('board-notification--owner'), id).toBe(false);
+      expect(card.querySelector('.board-notification__body'), id).toBeNull();
+      expect(card.querySelector(':scope > .board-notification__meta'), id).not.toBeNull();
+      expect(card.querySelector('.board-notification__state')?.textContent, id).toBe('seen');
+      expect(card.querySelector('.board-notification__option-button'), id).toBeNull();
+    }
+  });
+
+  it('focus on the recap lands on the card when the follow-through resolves the row', () => {
+    const view = new BoardView(() => {});
+    const answered = notification({ decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'finish' });
+    view.render(snapshot([answered]));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    const summary = cardOf('ask-1', panel).querySelector<HTMLElement>('.board-notification__recap > summary')!;
+    expect(summary.dataset.focusKey).toBe('notif:ask-1:recap');
+    summary.tabIndex = 0;
+    summary.focus();
+    expect(document.activeElement).toBe(summary);
+    // Resolved: the row becomes a compact feed card with no recap. Focus
+    // stays on that card, never on <body>.
+    view.render(snapshot([{ ...answered, resolvedAt: '2026-11-20T17:30:00.000Z', resolvedBy: 'gru' }]));
+    const card = cardOf('ask-1', panel);
+    expect(card.querySelector('.board-notification__recap')).toBeNull();
+    expect(document.activeElement).toBe(card);
+  });
+
+  it('a notice whose kind has no guidance wears the strip with Details straight under it', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot([notification({ id: 'bare', kind: 'test.unregistered-owner-kind', decision: null })]));
+    const card = cardOf('bare');
+    expect(card.classList.contains('board-notification--owner')).toBe(true);
+    expect([...card.children].map((child) => child.className.split(' ')[0])).toEqual([
+      'board-notification__head',
+      'board-notification__details',
+    ]);
   });
 });
