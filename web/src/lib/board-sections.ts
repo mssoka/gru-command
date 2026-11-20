@@ -215,6 +215,18 @@ export function settledJobs(jobs: readonly BandedJob[]): readonly BandedJob[] {
   );
 }
 
+/** The FOR GRU band's count line, with real singular and plural forms
+ * ("0 threads · 1 incident · 1 notification"): the fixed plural read
+ * "1 incidents · 1 notifications". */
+export function mailboxCountText(counts: { readonly threads: number; readonly incidents: number; readonly notifications: number }): string {
+  const noun = (count: number, one: string, many: string): string => `${count} ${count === 1 ? one : many}`;
+  return [
+    noun(counts.threads, 'thread', 'threads'),
+    noun(counts.incidents, 'incident', 'incidents'),
+    noun(counts.notifications, 'notification', 'notifications'),
+  ].join(' · ');
+}
+
 /** Human label + tone for one pipeline entry state (one mapping for the
  * row chip and the tests). */
 export function pipelineStateLabel(entry: Pick<PipelineEntryView, 'state'>): string {

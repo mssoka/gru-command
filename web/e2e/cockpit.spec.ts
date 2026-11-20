@@ -541,7 +541,9 @@ interface CockpitFit {
   /** The KPI wrapper's width — the size container the tracks follow. */
   readonly containerWidth: number;
   /** The grid's USED column count (the resolved track list). */
-  readonly columns: number;
+  /** The grid's right edge, and each row's right-most card edge by row top. */
+  readonly gridRight: number;
+  readonly rowRights: ReadonlyArray<readonly [number, number]>;
   readonly cards: readonly CardFit[];
   readonly bodyOverflow: boolean;
 }
@@ -564,10 +566,17 @@ async function cockpitFit(page: Page): Promise<CockpitFit> {
       el === null ? null : { cw: el.clientWidth, sw: el.scrollWidth, whiteSpace: getComputedStyle(el).whiteSpace };
     return {
       containerWidth: kpis.clientWidth,
-      // The computed value resolves `repeat(auto-fit, …)` to one entry per
-      // track; a track the row has no card for is COLLAPSED to 0px, so the
-      // columns the owner sees are the positive ones (Rule 2's `n`).
-      columns: getComputedStyle(grid).gridTemplateColumns.split(' ').filter((track) => parseFloat(track) > 0).length,
+      gridRight: grid.getBoundingClientRect().right,
+      rowRights: [
+        ...[...kpis.querySelectorAll<HTMLElement>('.cockpit-card')]
+          .reduce((rights, card) => {
+            const box = card.getBoundingClientRect();
+            const top = Math.round(box.top);
+            rights.set(top, Math.max(rights.get(top) ?? -Infinity, box.right));
+            return rights;
+          }, new Map<number, number>())
+          .entries(),
+      ],
       cards: [...kpis.querySelectorAll<HTMLElement>('.cockpit-card')].map((card) => {
         const unit = card.querySelector<HTMLElement>('.cockpit-card__unit');
         if (unit === null) throw new Error('missing .cockpit-card__unit');
@@ -597,6 +606,33 @@ async function cockpitFit(page: Page): Promise<CockpitFit> {
  * floored at two (a phone keeps two columns). */
 function expectedColumns(width: number, cards: number): number {
   return Math.min(7, cards, Math.max(2, Math.floor((width + 10) / 190)));
+}
+
+/** Rule 2, as rows (owner pick 2026-11-20: even rows, never an empty
+ * corner). The number of cards a row CAN hold is `expectedColumns`. Five,
+ * six and seven cards that cannot share one row split into rows that each
+ * fill the width — 4 + 3, 3 + 3, 3 + 2, then pairs — instead of packing
+ * the first row and leaving a short last one (5 + 2 at the owner's own
+ * geometry). Any other count keeps the packed rows auto-fit gives. */
+function expectedRows(width: number, cards: number): readonly number[] {
+  const perRow = expectedColumns(width, cards);
+  const rows: number[] = [];
+  if (cards < 5 || cards > 7) {
+    for (let left = cards; left > 0; left -= perRow) rows.push(Math.min(perRow, left));
+    return rows;
+  }
+  // In two columns the odd last card takes the whole row.
+  if (perRow === 2) {
+    for (let left = cards; left > 0; left -= 2) rows.push(Math.min(2, left));
+    return rows;
+  }
+  let left = cards;
+  for (let remaining = Math.ceil(cards / perRow); remaining > 0; remaining -= 1) {
+    const size = Math.ceil(left / remaining);
+    rows.push(size);
+    left -= size;
+  }
+  return rows;
 }
 
 /** Every text surface of one card, named as the owner reads it; the
@@ -646,7 +682,19 @@ function expectCockpitFits(fit: CockpitFit, where: string): void {
       `head heights equal in the row at y=${top} (${heights.join(', ')}) at ${where}`,
     ).toBeLessThanOrEqual(1);
   }
-  expect(fit.columns, `grid columns vs Rule 2 at ${where}`).toBe(expectedColumns(fit.containerWidth, fit.cards.length));
+  // Cards per row, top to bottom (the grid's own track count no longer says
+  // it: an even split uses spans over a finer grid).
+  const perRow = [...rows.values()].map((heights) => heights.length);
+  expect(perRow, `cards per row vs Rule 2 at ${where}`).toEqual(expectedRows(fit.containerWidth, fit.cards.length));
+  // Every row fills the strip: the last card of each row ends at the grid's
+  // right edge, so there is never an empty corner.
+  // (Five to seven cards — the even-rows rule. Any other count keeps
+  // auto-fit's packed rows, whose last row may be short by design.)
+  if (fit.cards.length >= 5 && fit.cards.length <= 7) {
+    for (const [top, right] of fit.rowRights) {
+      expect(Math.abs(right - fit.gridRight), `the row at y=${top} fills the strip at ${where}`).toBeLessThanOrEqual(1);
+    }
+  }
 }
 
 /** familyA's fact counts (the headline numbers ride their own line). */
@@ -1234,6 +1282,116 @@ test('on a phone the bar stays one sticky row of brand and buttons above the hea
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
+
+test('the health pill folds its calm readings behind "details", shows a problem by name, remembers the choice, and a phone has no control', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const send = await harness(page, makeSnapshot(familyA(0)));
+  const pill = page.locator('#command-health');
+  const toggle = pill.locator('.command-health__more');
+  const calm = pill.locator('.command-health__part[data-problem="false"]');
+  const problems = pill.locator('.command-health__part[data-problem="true"]');
+  await expect(page.locator('#command-health-summary')).toHaveText('All healthy');
+  // Healthy: one line. The readings are rendered but not painted, and the
+  // list gives up its room.
+  expect(await calm.count()).toBeGreaterThan(0);
+  for (const part of await calm.all()) await expect(part).toBeHidden();
+  await expect(page.locator('#command-health-parts')).toBeHidden();
+  await expect(toggle).toHaveText('details');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  const closedWidth = (await pill.boundingBox())!.width;
+  await toggle.click();
+  await expect(toggle).toHaveText('hide details');
+  for (const part of await calm.all()) await expect(part).toBeVisible();
+  expect((await pill.boundingBox())!.width).toBeGreaterThan(closedWidth);
+  // A snapshot push keeps the choice.
+  await send(makeSnapshot(familyA(0)));
+  await expect(toggle).toHaveText('hide details');
+  await toggle.click();
+  await expect(toggle).toHaveText('details');
+  // Something needs a look: those readings show by name while the calm
+  // ones stay folded.
+  await send(makeSnapshot(familyA(2)));
+  await expect(page.locator('#command-health-summary')).toHaveText('3 need a look');
+  expect(await problems.count()).toBe(3);
+  for (const part of await problems.all()) await expect(part).toBeVisible();
+  for (const part of await calm.all()) await expect(part).toBeHidden();
+  // The choice is remembered across a reload on this browser.
+  await send(makeSnapshot(familyA(0)));
+  await toggle.click();
+  expect(await page.evaluate(() => localStorage.getItem('gru-command.health-details'))).toBe('open');
+  await toggle.click();
+  expect(await page.evaluate(() => localStorage.getItem('gru-command.health-details'))).toBe('closed');
+  // A phone always folds the calm readings and shows no control for them.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await settleTransitions(page);
+  await expect(toggle).toBeHidden();
+  for (const part of await calm.all()) await expect(part).toBeHidden();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+for (const [width, height] of [[1000, 700], [1500, 700]] as const) {
+  test(`a push never moves the reader while the crew list is shown in full (${width}×${height})`, async ({ page }) => {
+    await page.setViewportSize({ width, height });
+    const crew = (count: number): Record<string, unknown>[] =>
+      Array.from({ length: count }, (_, index) => ({
+        ...agent(`crew-${String(index).padStart(2, '0')}`, index % 3 === 0 ? 'streaming' : 'idle'),
+        // One row carries the longest chip the rail renders.
+        ...(index === 1 ? { childCounts: { active: 3, queued: 2, finished: 7, lifetimeCreations: 12 } } : {}),
+      }));
+    const board = (count: number): BoardSnapshot => ({ ...makeSnapshot(familyA(0)), agents: crew(count) }) as unknown as BoardSnapshot;
+    const send = await harness(page, board(40));
+    const rail = page.locator('#board-agents');
+    const toggle = rail.locator('[data-section="crew-all"]');
+    await expect(rail.locator('.board-agent')).toHaveCount(40);
+    await toggle.click();
+    await expect(toggle).toHaveText('Show fewer');
+    // Scroll whatever scrolls the rail out of view: the window, or the pane
+    // that holds the rail, depending on the layout at this width.
+    const before = await page.evaluate(() => {
+      const railNode = document.getElementById('board-agents')!;
+      let scroller: Element = document.scrollingElement!;
+      for (let node = railNode.parentElement; node !== null; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight - node.clientHeight > 200) {
+          scroller = node;
+          break;
+        }
+      }
+      scroller.setAttribute('data-test-scroller', 'true');
+      scroller.scrollTop = 600;
+      return scroller.scrollTop;
+    });
+    expect(before, 'the full crew list makes something scroll').toBeGreaterThan(300);
+    // A push rebuilds the rail while the control still holds focus.
+    await expect(toggle).toBeFocused();
+    await send(board(41));
+    await expect(rail.locator('.board-agent')).toHaveCount(41);
+    const after = await page.evaluate(() => document.querySelector('[data-test-scroller="true"]')!.scrollTop);
+    expect(Math.abs(after - before), `scroll moved from ${before} to ${after}`).toBeLessThanOrEqual(2);
+    await expect(toggle).toBeFocused();
+    await expect(toggle).toHaveText('Show fewer');
+
+    // Nothing on a row is wider than the rail, the longest chip included,
+    // and a minion's four-character ID code is shown whole.
+    const fit = await rail.evaluate((node) => {
+      const limit = node.getBoundingClientRect().right;
+      const outside = [...node.querySelectorAll<HTMLElement>('.board-agent *')]
+        .filter((child) => {
+          const box = child.getBoundingClientRect();
+          return box.width > 0 && box.right > limit + 1;
+        })
+        .map((child) => child.className);
+      const clippedIds = [...node.querySelectorAll<HTMLElement>('.board-agent__hash')]
+        .filter((hash) => (hash.textContent ?? '').length <= 4 && hash.scrollWidth > hash.clientWidth + 1)
+        .map((hash) => hash.textContent);
+      return { outside, clippedIds, sideways: node.scrollWidth - node.clientWidth };
+    });
+    expect(fit.outside, 'elements past the rail edge').toEqual([]);
+    expect(fit.clippedIds, 'four-character ID codes cut short').toEqual([]);
+    expect(fit.sideways).toBeLessThanOrEqual(1);
+    await expect(rail.locator('.board-agent__child-counts')).toHaveText('↳ 12 children (3 active, 2 queued, 7 finished)');
+  });
+}
 
 test('the health pill dot and ink say the state: muted when nothing reads ok or the board is last-known, ▲ only when something needs a look', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });

@@ -60,6 +60,7 @@ import {
   pipelineStateLabel,
   pipelineStateTone,
   pipelineWindow,
+  mailboxCountText,
   sectionNav,
   settledJobs,
   settledPreview,
@@ -69,7 +70,7 @@ import {
   SETTLED_PREVIEW_SIZE,
   type SectionId,
 } from '../lib/board-sections.js';
-import { cockpitCards, gruQueueLine, healthPill, type CockpitCard } from '../lib/cockpit.js';
+import { cockpitCards, gruQueueLine, healthPill, isQuietCard, type CockpitCard } from '../lib/cockpit.js';
 import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
 import { familyStatusBreakdown, isLiveMegaminion, subMinionTree } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
@@ -326,6 +327,10 @@ export class BoardView {
   private extraReceipts: NotificationView[] = [];
   /** Unique ids for "Gru's pick" tags (see pickTag). */
   private pickTagSeq = 0;
+  /** Whether the crew rail shows every row instead of scrolling. */
+  private crewExpanded = false;
+  /** Whether the health pill shows its calm readings (remembered per browser). */
+  private healthDetailsOpen = readHealthDetailsPref();
   /** Open Details disclosures, keyed by notification id — a snapshot push
    * never collapses what the operator opened. */
   private readonly openNotificationDetails = new Set<string>();
@@ -1468,6 +1473,10 @@ export class BoardView {
     this.healthMount.dataset.lastKnown = String(pill.lastKnown);
     this.healthMount.title = pill.title;
     this.healthSummary.textContent = pill.summary;
+    // One calm line (owner pick 2026-11-20): the readings that need no look
+    // fold behind "details"; a reading that needs a look always shows, by
+    // name. The choice is the operator's and is remembered on this browser.
+    this.syncHealthDetails(pill.parts.filter((part) => !part.problem).length);
     this.healthParts.replaceChildren();
     for (const part of pill.parts) {
       const node = el('span', `command-health__part command-health__part--${part.tone}`);
@@ -1481,6 +1490,44 @@ export class BoardView {
       this.healthParts.append(node);
     }
     this.renderTrackerChips(snapshot);
+  }
+
+  /** The health pill's "details" control: created once beside the summary,
+   * shown only while there are calm readings to fold, and kept in step with
+   * the remembered choice. */
+  private syncHealthDetails(calm: number): void {
+    let toggle = this.healthMount.querySelector<HTMLButtonElement>('.command-health__more');
+    if (toggle === null) {
+      toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'command-health__more';
+      toggle.setAttribute('aria-controls', this.healthParts.id);
+      toggle.addEventListener('click', () => {
+        this.healthDetailsOpen = !this.healthDetailsOpen;
+        writeHealthDetailsPref(this.healthDetailsOpen);
+        this.applyHealthDetails();
+      });
+      this.healthSummary.after(toggle);
+    }
+    toggle.hidden = calm === 0;
+    toggle.dataset.calm = String(calm);
+    this.applyHealthDetails();
+  }
+
+  private applyHealthDetails(): void {
+    const toggle = this.healthMount.querySelector<HTMLButtonElement>('.command-health__more');
+    this.healthMount.dataset.details = this.healthDetailsOpen ? 'open' : 'closed';
+    if (toggle === null) return;
+    const calm = Number(toggle.dataset.calm ?? '0');
+    toggle.textContent = this.healthDetailsOpen ? 'hide details' : 'details';
+    toggle.setAttribute('aria-expanded', String(this.healthDetailsOpen));
+    // The name starts with the visible text (a voice user says "details").
+    toggle.setAttribute(
+      'aria-label',
+      this.healthDetailsOpen
+        ? 'hide details: the system health readings that need no look'
+        : `details: show ${calm} system health ${calm === 1 ? 'reading' : 'readings'} that ${calm === 1 ? 'needs' : 'need'} no look`,
+    );
   }
 
   /** Six KPI cards (five when the server sends no raids block): a headline
@@ -1500,7 +1547,14 @@ export class BoardView {
     // A labelled group, not a heading or region landmark (#401): the cards
     // render on every page, and six headings ahead of FOR YOU would pad
     // screen-reader navigation. The visible label is its accessible name.
-    const node = el('article', `cockpit-card cockpit-card--${card.id}${card.off ? ' cockpit-card--off' : ''}`);
+    // A card whose own headline is zero steps back (owner pick 2026-11-20):
+    // colour only, so nothing moves when the count leaves zero. An alert on
+    // the card keeps it at full strength.
+    const quiet = isQuietCard(card);
+    const node = el(
+      'article',
+      `cockpit-card cockpit-card--${card.id}${card.off ? ' cockpit-card--off' : ''}${quiet ? ' cockpit-card--quiet' : ''}`,
+    );
     node.dataset.card = card.id;
     node.setAttribute('role', 'group');
     node.setAttribute('aria-label', card.label);
@@ -1946,7 +2000,7 @@ export class BoardView {
       'for-gru',
       'needs-you',
       BAND_LABELS['needs-you'],
-      snapshot.mailbox === undefined || snapshot.mailbox === null ? 'unavailable' : `${this.unavailableReason === null ? '' : 'last-known · '}${snapshot.mailbox.counts.threads} threads · ${snapshot.mailbox.counts.incidents} incidents · ${snapshot.mailbox.counts.notifications} notifications`,
+      snapshot.mailbox === undefined || snapshot.mailbox === null ? 'unavailable' : `${this.unavailableReason === null ? '' : 'last-known · '}${mailboxCountText(snapshot.mailbox.counts)}`,
     );
     if (this.unavailableReason !== null) {
       section.dataset.mailboxStatus = 'last-known';
@@ -2469,7 +2523,20 @@ export class BoardView {
   private renderAgents(agents: readonly AgentView[]): void {
     this.lastAgents = agents;
     const rail = mustGet('board-agents');
+    // A snapshot push rebuilds the rail: a focused "show all" control keeps
+    // its place.
+    const crewToggleFocused = document.activeElement instanceof HTMLElement && document.activeElement.dataset.section === 'crew-all';
+    // Rebuilding the rail empties it for a moment. Shown in full it holds up
+    // the page's height, so the page (or the pane that scrolls it) was
+    // clamped to the top and the reader lost their place on every push.
+    // Whatever scrolls around the rail is put back where it was.
+    const restoreScroll = keepScrollAround(rail);
+    // The focused control is about to be removed. Let go of focus while the
+    // rail is still whole: a browser that settles focus on removal does its
+    // layout work now, not while the rail is empty.
+    if (crewToggleFocused && document.activeElement instanceof HTMLElement) document.activeElement.blur();
     rail.replaceChildren();
+    rail.classList.toggle('board-agents--all', this.crewExpanded);
     this.ensureAgeTicker();
     // Issue #171 truthful agent status: liveness is RUNTIME OWNERSHIP,
     // not the raw stored state. The live crew = current members plus
@@ -2498,6 +2565,7 @@ export class BoardView {
     );
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no crew yet'));
+      restoreScroll();
       return;
     }
     // Membership-first order arrives from the server; disposed rows collapse
@@ -2577,6 +2645,41 @@ export class BoardView {
         for (const { agent, depth } of subMinionTree(disposed)) rail.append(this.agentRow(agent, 'disposed', false, false, labelById, jobs, suffixes, depth));
       }
     }
+    this.appendCrewToggle(rail, agents, crewToggleFocused);
+    restoreScroll();
+  }
+
+  /** The rail scrolls inside a fixed height, so a long crew ended on half a
+   * row with no sign of more (owner pick 2026-11-20). When the rows do not
+   * fit, one control pinned to the list's bottom edge shows them all, and
+   * folds them again. It appears only when there is something to show or
+   * fold; a rail that is not on screen measures nothing and gets none
+   * until the next push finds it visible. */
+  private appendCrewToggle(rail: HTMLElement, agents: readonly AgentView[], refocus: boolean): void {
+    const overflowing = rail.scrollHeight > rail.clientHeight + 4;
+    if (!this.crewExpanded && !overflowing) return;
+    const rows = rail.querySelectorAll('.board-agent').length;
+    const toggle = el('button', 'board-agent-toggle board-agents__all', this.crewExpanded ? 'Show fewer' : `Show all ${rows}`);
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', String(this.crewExpanded));
+    toggle.setAttribute('data-section', 'crew-all');
+    toggle.addEventListener('click', () => {
+      this.crewExpanded = !this.crewExpanded;
+      this.renderAgents(agents);
+      // Focus follows the control. When folding leaves a list that fits,
+      // the control is gone: focus lands on the rail itself, never <body>.
+      const next = rail.querySelector<HTMLElement>('[data-section="crew-all"]');
+      if (next !== null) next.focus({ preventScroll: true });
+      else {
+        rail.tabIndex = -1;
+        rail.focus({ preventScroll: true });
+      }
+    });
+    rail.append(toggle);
+    // Restoring focus after a snapshot push must never scroll: a reader who
+    // left the control focused and scrolled away would be yanked back to
+    // the rail on every push.
+    if (refocus) toggle.focus({ preventScroll: true });
   }
 
   /** One dense agent row: status dot, name + short hash, role·state
@@ -3770,6 +3873,46 @@ interface DecisionSubmission {
   phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
   message: string | null;
   reconcileAfterSnapshotRevision: number | null;
+}
+
+/** Remember where the window, `node` and every scrolling ancestor of it are
+ * scrolled, and return a function that puts back any that moved. */
+function keepScrollAround(node: HTMLElement): () => void {
+  const view = node.ownerDocument.defaultView;
+  const windowAt = view === null ? null : { x: view.scrollX, y: view.scrollY };
+  const scrolled: { readonly el: HTMLElement; readonly top: number; readonly left: number }[] = [];
+  for (let parent: HTMLElement | null = node; parent !== null; parent = parent.parentElement) {
+    if (parent.scrollTop !== 0 || parent.scrollLeft !== 0) scrolled.push({ el: parent, top: parent.scrollTop, left: parent.scrollLeft });
+  }
+  return () => {
+    for (const { el: parent, top, left } of scrolled) {
+      if (parent.scrollTop !== top) parent.scrollTop = top;
+      if (parent.scrollLeft !== left) parent.scrollLeft = left;
+    }
+    if (view !== null && windowAt !== null && (view.scrollX !== windowAt.x || view.scrollY !== windowAt.y)) {
+      view.scrollTo(windowAt.x, windowAt.y);
+    }
+  };
+}
+
+const HEALTH_DETAILS_KEY = 'gru-command.health-details';
+
+/** The remembered "show the calm health readings" choice. Storage that is
+ * unavailable (private mode, a test DOM without it) reads as closed. */
+function readHealthDetailsPref(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(HEALTH_DETAILS_KEY) === 'open';
+  } catch {
+    return false;
+  }
+}
+
+function writeHealthDetailsPref(open: boolean): void {
+  try {
+    globalThis.localStorage?.setItem(HEALTH_DETAILS_KEY, open ? 'open' : 'closed');
+  } catch {
+    // The choice still holds for this page; it is just not remembered.
+  }
 }
 
 /** Owner-surface focus (FOR YOU band + bell): stable keys survive the

@@ -28,6 +28,7 @@ import type {
 import { imageKindFor, type BrowseResult, type UploadedFile } from '../lib/attach-client.js';
 import { COCKPIT_MIN_WIDTH } from '../lib/console-layout.js';
 import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
+import { isLongReply, resumeReplyText } from '../lib/chat-reply.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { WORKING_FLAVOR_INTERVAL_MS, WorkingFlavorDeck } from '../lib/working-flavor.js';
 import { el, mustGet } from './dom.js';
@@ -70,6 +71,8 @@ interface PendingResetView {
   readonly streamingBubble: HTMLElement | null;
   readonly streamingBody: HTMLElement | null;
   readonly streamText: string;
+  readonly streamSeamBefore: string | null;
+  readonly streamSeamAfter: string;
   readonly streamOpen: boolean;
   readonly activeTool: HTMLElement | null;
   readonly activeToolBand: ServiceBand | null;
@@ -114,6 +117,11 @@ export class ChatView {
   private streamingBubble: HTMLElement | null = null;
   private streamingBody: HTMLElement | null = null;
   private streamText = '';
+  /** Tool work arrived after this stream's text: the reply as it stood then
+   * (null while no tool work has interrupted the text), and everything that
+   * has resumed since. `streamText` is their join (see chat-reply.ts). */
+  private streamSeamBefore: string | null = null;
+  private streamSeamAfter = '';
   /** True between turn:start (or the first bare delta of a partial replay)
    * and closeStream/markStreamIncomplete. The bubble's DOM is created
    * lazily on the first text delta, so tool-only turns leave no stub. */
@@ -406,6 +414,8 @@ export class ChatView {
       streamingBubble: this.streamingBubble,
       streamingBody: this.streamingBody,
       streamText: this.streamText,
+      streamSeamBefore: this.streamSeamBefore,
+      streamSeamAfter: this.streamSeamAfter,
       streamOpen: this.streamOpen,
       activeTool: this.activeTool,
       activeToolBand: this.activeToolBand,
@@ -419,6 +429,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
     this.streamOpen = false;
     this.activeTool = null;
     this.activeToolBand = null;
@@ -442,6 +454,8 @@ export class ChatView {
     this.streamingBubble = prior.streamingBubble;
     this.streamingBody = prior.streamingBody;
     this.streamText = prior.streamText;
+    this.streamSeamBefore = prior.streamSeamBefore;
+    this.streamSeamAfter = prior.streamSeamAfter;
     this.streamOpen = prior.streamOpen;
     this.activeTool = prior.activeTool;
     this.activeToolBand = prior.activeToolBand;
@@ -933,6 +947,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
     this.streamOpen = false;
     this.activeTool = null;
     this.activeToolBand = null;
@@ -1014,16 +1030,35 @@ export class ChatView {
         // never leaves an empty stub.
         this.closeServiceBand();
         if (!this.streamOpen) this.openStream();
-        this.streamText += frame.text;
+        // Text that resumes after tool work is joined to the reply so it
+        // neither runs into the sentence written before the tool call nor
+        // corrupts a markdown block (owner pick 2026-11-20).
+        // The join is re-made from ALL the resumed text as it arrives: live
+        // text comes a token at a time, and the first token alone ("-",
+        // "1", a single backtick) does not yet say what the text is.
+        if (this.streamSeamBefore !== null) {
+          this.streamSeamAfter += frame.text;
+          this.streamText = resumeReplyText(this.streamSeamBefore, this.streamSeamAfter);
+        } else {
+          this.streamText += frame.text;
+        }
         if (frame.text !== '') {
           const body = this.streamingBody ?? this.mountStreamBubble();
           renderMarkdown(this.streamText, body, { streaming: true });
+          // A long reply reads on the calm bubble (see chat-reply.ts).
+          this.streamingBubble?.classList.toggle('msg--long', isLongReply(this.streamText));
         }
         if (live) this.bumpUnread();
         this.followContent(live);
         break;
       }
       case 'tool': {
+        // Tool work inside a reply that already has text: the next text is
+        // a new part of it.
+        if (this.streamOpen && this.streamText.trim() !== '') {
+          this.streamSeamBefore = this.streamText;
+          this.streamSeamAfter = '';
+        }
         if (frame.state === 'start') {
           this.activeTool?.remove();
           if (this.activeToolBand !== null) {
@@ -1153,6 +1188,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
   }
 
   /** Lazily create the Gru bubble for the first text delta of a stream. */
@@ -1180,6 +1217,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
   }
 
   /** A dropped socket mid-turn leaves the bubble marked incomplete. */

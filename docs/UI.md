@@ -57,9 +57,9 @@ key `gru-theme`).
 | `--ink` | `#22304a` | `#e8ecf4` | primary text |
 | `--line` | `#22304a` | `#313c58` | chunky outlines |
 | `--muted` / `--faint` | `#5b6a84` / `#6d6a5d` | `#93a0b8` / `#8b96ac` | secondary text (AA-pinned in `web/src/lib/palette-contrast.test.ts`) |
-| `--work` | `#ffd54a` | `#ffd54a` | minion yellow: working/delivered, Gru bubbles |
+| `--work` | `#ffd54a` | `#ffd54a` | minion yellow: work in motion (working/dispatched), Gru bubbles |
 | `--done` | `#7ee08a` | `#6fd68a` | merged/done states |
-| `--rev` | `#9ad7f5` | `#7cc4ef` | review states |
+| `--rev` | `#9ad7f5` | `#7cc4ef` | review states, and delivered work (out of the worker's hands) |
 | `--park` | `#e8e3d8` | `#2a3350` | parked/vaulted |
 | `--alert` | `#ffb3ba` | `#ff8f9c` | blocked/errors |
 | `--perkins` | `#c9b8ff` | `#b7a3ff` | Perkins rounds |
@@ -300,9 +300,11 @@ board socket is lost (stale, reconnecting, offline) until it reopens — an
 HTTP catch-up meanwhile is still last-known — or while the board is
 unavailable, the summary is prefixed `last-known ·` and the dot is muted
 unless something needs a look. A check whose source is
-not wired (`n/a`) stays out of the text and in the tooltip. On a phone the
-calm checks fold away and the ones that need a look keep a line of their
-own inside the pill.
+not wired (`n/a`) stays out of the text and in the tooltip. The calm
+checks fold behind a `details` control beside the summary (the choice is
+remembered per browser); a check that needs a look always shows. On a
+phone the calm checks always fold, with no control, and the ones that need
+a look keep a line of their own inside the pill.
 
 The **KPI cards** sit at the top of the board column: **HEISTS** (the total
 on the board, a stage bar working → in review → merged → done, and every
@@ -319,8 +321,10 @@ raids awaiting you, queued, fixes awaiting you, break-ins, and the busiest
 repository's use of its cap over the last 24 hours — `1/2 in 24h`, every
 repository in the tooltip; a dashed `— unavailable` card when the server
 could not read the raids; no card at all from a server that sends no
-raids block). Two columns on a phone, three from 520px, six from 1000px of
-board column (five when there is no raids card). Every count is a
+raids block). A row holds one card per 190px of board column, never
+fewer than two; cards that cannot share one row split into rows that each
+fill the width (seven as 4 + 3, six as 3 + 3, five as 3 + 2, then pairs
+with a full-width last card), so there is never an empty corner. Every count is a
 `data-kpi` span tied to the derivation the v4 strip used, and carries its
 label beside it; the context lines (a raid's attack, `across 2 heists`)
 and the card asides are text. Zeros fade; a count that needs attention
@@ -423,6 +427,44 @@ GRU keeps its full card with its warning). Its empty state is the calm clear sta
 list is healthy); its rows are keyboard-focusable and a snapshot
 re-render preserves focus (stable action ids) and never toasts or rings
 a chime.
+
+**The rest of the board** (owner picks 2026-11-20, the same readability
+pass):
+
+- **Heist rows.** The line under a title reads as a sentence: ordinary
+  case at 12px in the body font, the repo as a small tag, the branch last
+  among the left-hand items in small code type (visual order only), and a
+  boxed arrow to open the row. Yellow means work in motion only
+  (`working`, `dispatched`); a `delivered` heist is out of the worker's
+  hands and wears the review blue.
+- **Number cards.** Even rows, never an empty corner: cards that cannot
+  share one row split into rows that each fill the width (seven as 4 + 3,
+  six as 3 + 3, five as 3 + 2, then pairs with a full-width last card). A
+  row never holds more cards than before, so no card gets narrower. A card
+  whose headline is zero steps back by colour; zero lines keep their faint
+  ink and their reserved places, so nothing moves when a count changes.
+- **Health pill.** Readings that need no look fold behind `details`; a
+  reading that needs a look always shows. The choice is remembered per
+  browser (`gru-command.health-details`). A phone always folds them and
+  shows no control.
+- **Crew rail.** The line under a name is ordinary case at 11px and wraps
+  rather than cutting the role, and no chip on it is wider than the rail;
+  the name gets the room before the ID code, which keeps four characters;
+  a rail too long for its height ends on a pinned `Show all N` control
+  that lifts the height limit.
+- **FOR GRU.** Its counts use real singular and plural forms.
+- **Chat replies.** The parts of a reply used to run together across tool
+  calls. Text that resumes after tool work is now joined by a rule
+  (`web/src/lib/chat-reply.ts`), re-applied as the resumed text arrives: a
+  new paragraph after a finished sentence, after a closed code block, a
+  heading, a table or a list, and before text that opens one; the next
+  line of the same list or table when it carries on; and exactly as
+  written when the text plainly continues (it opens with white space or
+  closing punctuation), inside a code block that is still open, or when
+  the tool work interrupted a sentence mid-way. A reply
+  longer than about six lines reads on the pale butter bubble
+  (`--gru-soft`) while short replies keep the bright yellow. The composer
+  is unchanged.
 
 Jobs bucket NEEDS GRU → IN FLIGHT → SETTLED → COLD (recency inside each
 band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width

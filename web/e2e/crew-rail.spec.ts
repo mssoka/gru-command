@@ -121,3 +121,43 @@ test('crew rail names: short authored, long/Unicode, full identity, no overflow'
     await page.setViewportSize({ width: 1280, height: 900 });
   }
 });
+
+test('crew rail: a list too long for its height ends on "Show all", which really grows the list and folds it back', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await pair(page);
+  const rail = page.locator('#board-agents');
+  const toggle = rail.locator('[data-section="crew-all"]');
+  const size = (): Promise<{ client: number; scroll: number; scrollWidth: number; clientWidth: number }> =>
+    rail.evaluate((node) => ({ client: node.clientHeight, scroll: node.scrollHeight, scrollWidth: node.scrollWidth, clientWidth: node.clientWidth }));
+  // The mock crew does not fit the rail's fixed height.
+  await expect(toggle).toBeVisible();
+  await expect(toggle).toHaveText(/^Show all \d+$/u);
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  const folded = await size();
+  expect(folded.client).toBeLessThanOrEqual(420);
+  expect(folded.scroll).toBeGreaterThan(folded.client);
+  // The control is pinned to the list's bottom edge: it is on screen
+  // without scrolling the list, and it is the list's last child.
+  const railBox = (await rail.boundingBox())!;
+  const toggleBox = (await toggle.boundingBox())!;
+  expect(toggleBox.y + toggleBox.height).toBeLessThanOrEqual(railBox.y + railBox.height + 1);
+  expect(await rail.evaluate((node) => node.lastElementChild?.getAttribute('data-section'))).toBe('crew-all');
+  // No chip on any row is wider than the rail.
+  expect(folded.scrollWidth).toBeLessThanOrEqual(folded.clientWidth + 1);
+
+  await toggle.click();
+  await expect(toggle).toHaveText('Show fewer');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(toggle).toBeFocused();
+  // The list actually grew: nothing is left to scroll inside it.
+  const shown = await size();
+  expect(shown.client).toBeGreaterThan(folded.client);
+  expect(shown.scroll).toBeLessThanOrEqual(shown.client + 1);
+
+  await toggle.click();
+  await expect(toggle).toHaveText(/^Show all \d+$/u);
+  await expect(toggle).toBeFocused();
+  expect((await size()).client).toBeLessThanOrEqual(420);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+

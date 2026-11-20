@@ -356,6 +356,14 @@ function raidsCard(snapshot: BoardSnapshot): CockpitCard | null {
   };
 }
 
+/** A card whose own headline is zero steps back (owner pick 2026-11-20):
+ * colour only, so nothing moves when the count leaves zero. An off card
+ * has its own dashed face, and a card that carries an alert keeps full
+ * strength however quiet its headline is. */
+export function isQuietCard(card: Pick<CockpitCard, 'off' | 'headline' | 'facts'>): boolean {
+  return !card.off && card.headline.value === '0' && !card.facts.some((fact) => fact.alert);
+}
+
 /** The attention card's line about Gru's own queue: the live machine rows
  * awaiting a Gru disposition (NEEDS GRU, the count the strip's ALERTS pair
  * used to carry), with that pair's long explanation as its title. It is

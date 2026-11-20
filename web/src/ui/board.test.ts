@@ -658,6 +658,51 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect([...pill.querySelectorAll<HTMLElement>('.command-health__part')].map((part) => [part.textContent, part.dataset.problem])).toEqual([['verify lock free', 'false']]);
   });
 
+  it('the health pill folds its calm readings behind "details", keeps problems in view, and remembers the choice', () => {
+    localStorage.removeItem('gru-command.health-details');
+    const view = new BoardView(() => {});
+    const calmVerify = { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 };
+    const busyVerify = { lockInUse: true, activeRuns: 1, queuedRuns: 2, workerBudget: 8, workersPerRun: 4 };
+    view.render(snapshot({ verify: calmVerify }));
+    const pill = document.getElementById('command-health')!;
+    const toggle = pill.querySelector<HTMLButtonElement>('.command-health__more')!;
+    // Healthy: one line, with the calm reading one click away.
+    expect(pill.dataset.details).toBe('closed');
+    expect(toggle.hidden).toBe(false);
+    expect(toggle.textContent).toBe('details');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-controls')).toBe('command-health-parts');
+    // The accessible name starts with the visible text.
+    expect(toggle.getAttribute('aria-label')).toBe('details: show 1 system health reading that needs no look');
+    // The reading itself is still rendered (the stylesheet folds it).
+    expect(pill.querySelector('.command-health__part[data-check="verify"]')?.getAttribute('data-problem')).toBe('false');
+    // The control sits right after the summary and is created once.
+    expect(document.getElementById('command-health-summary')?.nextElementSibling).toBe(toggle);
+    toggle.click();
+    expect(pill.dataset.details).toBe('open');
+    expect(toggle.textContent).toBe('hide details');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')?.startsWith('hide details')).toBe(true);
+    expect(localStorage.getItem('gru-command.health-details')).toBe('open');
+    // A snapshot push keeps the choice and the same control.
+    view.render(snapshot({ verify: calmVerify }));
+    expect(pill.dataset.details).toBe('open');
+    expect(pill.querySelectorAll('.command-health__more')).toHaveLength(1);
+    // Only problems: nothing calm to fold, so the control steps aside and
+    // the problem is marked to stay in view.
+    view.render(snapshot({ verify: busyVerify }));
+    expect(toggle.hidden).toBe(true);
+    expect(pill.querySelector('.command-health__part[data-check="verify"]')?.getAttribute('data-problem')).toBe('true');
+    // A fresh board on the same browser opens the way the operator left it.
+    mountBoardDom();
+    const again = new BoardView(() => {});
+    again.render(snapshot({ verify: calmVerify }));
+    expect(document.getElementById('command-health')!.dataset.details).toBe('open');
+    document.getElementById('command-health')!.querySelector<HTMLButtonElement>('.command-health__more')!.click();
+    expect(localStorage.getItem('gru-command.health-details')).toBe('closed');
+    localStorage.removeItem('gru-command.health-details');
+  });
+
   it('renders every KPI as a data-kpi number matching boardKpis, each beside its visible label', () => {
     const jobs = [
       baseJob({ id: 'w1', status: 'working' }),
@@ -706,6 +751,20 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     // A zero steps back; a real count keeps full ink.
     expect(document.querySelector<HTMLElement>('[data-kpi="jobs.done"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--zero')).toBe(true);
     expect(document.querySelector<HTMLElement>('[data-kpi="jobs.working"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--zero')).toBe(false);
+    // A card whose own headline is zero steps back, unless it carries an
+    // alert; a card with a count keeps full strength (owner pick 2026-11-20).
+    // The zero lines stay rendered in their places: nothing moves when a
+    // count leaves zero.
+    for (const card of document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')) {
+      const headline = card.querySelector('.cockpit-card__big')?.textContent;
+      const off = card.classList.contains('cockpit-card--off');
+      const alert = card.querySelector('.cockpit-fact--alert') !== null;
+      expect(card.classList.contains('cockpit-card--quiet'), `${card.dataset.card} (headline ${headline})`).toBe(
+        headline === '0' && !off && !alert,
+      );
+    }
+    expect(document.querySelector<HTMLElement>('.cockpit-card--heists')?.classList.contains('cockpit-card--quiet')).toBe(false);
+    expect(document.querySelectorAll('#board-kpis .cockpit-fact--zero').length).toBeGreaterThan(0);
 
     // v6.1 ruling 5 survives the re-face: every rendered number carries its
     // visible label — adjacency in the DOM, not a tooltip promise.
@@ -2476,15 +2535,24 @@ describe('board agent rail — truthful runtime status (#171)', () => {
 describe('board v6 — job status tones', () => {
   beforeEach(mountBoardDom);
 
-  it('renders the delivered chip in the work color family and its dot in the same tone', () => {
+  it('yellow means in motion only: a delivered heist wears the review blue, chip and dot alike', () => {
+    // Owner pick 2026-11-20 (it was yellow since 2026-09-22): delivered work
+    // is out of the worker's hands, so it must not look like it is running.
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ status: 'delivered' })] }));
     const row = document.querySelector('#board-jobs .board-job');
     const chip = row?.querySelector('.board-job__status');
     expect(chip?.textContent).toBe('delivered');
-    expect(chip?.className).toContain('pp-chip--work');
-    expect(chip?.className).not.toContain('pp-chip--rev');
-    expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--work');
+    expect(chip?.className).toContain('pp-chip--rev');
+    expect(chip?.className).not.toContain('pp-chip--work');
+    expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--rev');
+    // Work that IS in motion keeps the yellow.
+    for (const status of ['working', 'dispatched']) {
+      view.render(snapshot({ jobs: [baseJob({ status })] }));
+      const moving = document.querySelector('#board-jobs .board-job');
+      expect(moving?.querySelector('.board-job__status')?.className, status).toContain('pp-chip--work');
+      expect(moving?.querySelector('.board-job__dot')?.className, status).toContain('board-job__dot--work');
+    }
   });
 });
 
@@ -5354,7 +5422,7 @@ describe('board — megaminions nest under their heist', () => {
     );
     expandForGru();
     const forGru = document.querySelector<HTMLElement>('#board-section-for-gru');
-    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 threads · 0 incidents · 0 notifications');
+    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 thread · 0 incidents · 0 notifications');
     const stuck = rowOf('rev-stuck');
     expect(forGru?.contains(stuck)).toBe(true);
     const link = stuck.querySelector<HTMLButtonElement>('button.board-job__parent');
@@ -5958,7 +6026,7 @@ describe('GH-305 rendered mailbox lifecycle', () => {
     view.render({ ...base, mailbox: { items: [item], counts: { threads: 0, incidents: 1, notifications: 1, needsGru: 0 } } });
     expandForGru();
     const section = document.querySelector('#board-section-for-gru')!;
-    expect(section.querySelector('.board-band__count')?.textContent).toBe('0 threads · 1 incidents · 1 notifications');
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('0 threads · 1 incident · 1 notification');
     expect(section.querySelector('.mailbox-incident')?.textContent).toContain('waiting · owner: producer');
     expect(section.textContent).toContain('successful Book dream');
     expect(section.textContent).toContain('decision:hold');
@@ -5989,3 +6057,104 @@ describe('GH-305 rendered mailbox lifecycle', () => {
     expect(document.querySelector('[data-nav="for-gru"] .board-nav__count')?.textContent).toBe('—');
   });
 });
+
+describe('crew rail — show all (owner pick 2026-11-20)', () => {
+  beforeEach(mountBoardDom);
+
+  /** The rail scrolls inside a fixed height; a test DOM lays nothing out,
+   * so the two heights the control reads are supplied here. */
+  function sizeRail(scrollHeight: number, clientHeight: number): HTMLElement {
+    const rail = document.getElementById('board-agents')!;
+    Object.defineProperty(rail, 'scrollHeight', { configurable: true, get: () => scrollHeight });
+    Object.defineProperty(rail, 'clientHeight', { configurable: true, get: () => clientHeight });
+    return rail;
+  }
+
+  const crew = [1, 2, 3].map((n) => agent(`crew-${n}`, { role: 'minion', label: `worker ${n}`, jobId: null }));
+
+  it('a list that fits ends on its last row, with no control', () => {
+    const rail = sizeRail(300, 420);
+    new BoardView(() => {}).render(snapshot({ jobs: [], agents: crew }));
+    expect(rail.querySelector('[data-section="crew-all"]')).toBeNull();
+    expect(rail.classList.contains('board-agents--all')).toBe(false);
+  });
+
+  it('a list that does not fit ends on "Show all N", which lifts the height limit and folds back', () => {
+    const rail = sizeRail(900, 420);
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: crew }));
+    let toggle = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(toggle.textContent).toBe('Show all 3');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    // It is the list's last child: the list ends on the control.
+    expect(rail.lastElementChild).toBe(toggle);
+    toggle.click();
+    toggle = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(rail.classList.contains('board-agents--all')).toBe(true);
+    expect(toggle.textContent).toBe('Show fewer');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(toggle);
+    // Expanded, the list no longer overflows — the control stays so it can
+    // be folded again, and a snapshot push keeps both the state and focus.
+    sizeRail(900, 900);
+    view.render(snapshot({ jobs: [], agents: crew }));
+    toggle = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(toggle.textContent).toBe('Show fewer');
+    expect(document.activeElement).toBe(toggle);
+    toggle.click();
+    expect(rail.classList.contains('board-agents--all')).toBe(false);
+    // Folded and fitting again: the control is gone, and focus lands on
+    // the rail itself, never on <body>.
+    expect(rail.querySelector('[data-section="crew-all"]')).toBeNull();
+    expect(document.activeElement).toBe(rail);
+  });
+
+  it('restoring focus to the control after a push never scrolls the page', () => {
+    const rail = sizeRail(900, 420);
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: crew }));
+    rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.focus();
+    // Every focus() the rail makes from here on must opt out of scrolling:
+    // a reader who scrolled away would otherwise be yanked back on each push.
+    const calls: (FocusOptions | undefined)[] = [];
+    const original = HTMLElement.prototype.focus;
+    HTMLElement.prototype.focus = function focus(this: HTMLElement, options?: FocusOptions): void {
+      if (this.dataset.section === 'crew-all' || this.id === 'board-agents') calls.push(options);
+      original.call(this, options);
+    };
+    try {
+      view.render(snapshot({ jobs: [], agents: crew }));
+      // Show all, then fold a list that now fits: the control leaves and
+      // focus goes to the rail itself, by the same rule.
+      rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.click();
+      sizeRail(300, 420);
+      rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.click();
+    } finally {
+      HTMLElement.prototype.focus = original;
+    }
+    expect(document.activeElement).toBe(rail);
+    expect(calls.length).toBeGreaterThanOrEqual(3);
+    for (const options of calls) expect(options).toEqual({ preventScroll: true });
+  });
+
+  it('a push lets go of the focused control before emptying the rail, then takes focus back', () => {
+    // A browser that settles focus when the focused element is removed does
+    // layout at that moment; with the rail empty, the page it holds up
+    // collapses and the reader is thrown to the top.
+    const rail = sizeRail(900, 420);
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: crew }));
+    const first = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    first.focus();
+    let rowsWhenBlurred = -1;
+    first.addEventListener('blur', () => {
+      rowsWhenBlurred = rail.querySelectorAll('.board-agent').length;
+    });
+    view.render(snapshot({ jobs: [], agents: crew }));
+    expect(rowsWhenBlurred).toBe(crew.length);
+    const next = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(next).not.toBe(first);
+    expect(document.activeElement).toBe(next);
+  });
+});
+

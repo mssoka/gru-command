@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { BoardSnapshot, JobView, PipelineEntryView } from './board-protocol.js';
 import {
   boardSections,
+  mailboxCountText,
   pipelineStateLabel,
   pipelineStateTone,
   pipelineWindow,
@@ -250,3 +251,10 @@ describe('FOR YOU count on the shortcut strip', () => {
   });
 });
 
+describe('FOR GRU count line', () => {
+  it('uses the singular for exactly one and the plural for zero and many', () => {
+    expect(mailboxCountText({ threads: 0, incidents: 1, notifications: 1 })).toBe('0 threads · 1 incident · 1 notification');
+    expect(mailboxCountText({ threads: 1, incidents: 0, notifications: 2 })).toBe('1 thread · 0 incidents · 2 notifications');
+    expect(mailboxCountText({ threads: 9, incidents: 3, notifications: 0 })).toBe('9 threads · 3 incidents · 0 notifications');
+  });
+});
