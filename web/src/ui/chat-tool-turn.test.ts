@@ -264,6 +264,18 @@ describe('a reply interrupted by tool work reads as separate paragraphs (owner p
     expect(paragraphs()).toEqual(['One sentence.', 'Next part.']);
   });
 
+  it('a sentence that tool work interrupts mid-way stays one sentence', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('I checked the file'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta(' and it is fine.'), true);
+    view.addFrame(turn('end'), true);
+    expect(paragraphs()).toEqual(['I checked the file and it is fine.']);
+  });
+
   it('a long reply wears the calm bubble; a short one keeps the bright one', () => {
     const view = new ChatView(() => true);
     view.reset();

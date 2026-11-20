@@ -10,6 +10,18 @@ describe('a reply that resumes after tool work', () => {
     expect(resumeReplyText('First part. ', 'Second part.')).toBe('First part. \n\nSecond part.');
   });
 
+  it('a sentence the tool work interrupted mid-way is joined exactly as written', () => {
+    expect(resumeReplyText('Mock Gru ', 'here, boss!')).toBe('Mock Gru here, boss!');
+    expect(resumeReplyText('I checked the file', ' and it is fine.')).toBe('I checked the file and it is fine.');
+    expect(resumeReplyText('The count is 3', ', as expected.')).toBe('The count is 3, as expected.');
+  });
+
+  it('a finished sentence may close with quotes, brackets or emphasis and still gets its break', () => {
+    for (const end of ['Done.', 'Done!', 'Really?', 'Here is what I found:', 'He said "done."', '(It works.)', '**Done.**', 'Wait…']) {
+      expect(resumeReplyText(end, 'Next part.'), end).toBe(`${end}\n\nNext part.`);
+    }
+  });
+
   it('leaves a break that either side already carries, and an empty side, alone', () => {
     expect(resumeReplyText('First part.\n', 'Second part.')).toBe('First part.\nSecond part.');
     expect(resumeReplyText('First part.\n\n', 'Second part.')).toBe('First part.\n\nSecond part.');

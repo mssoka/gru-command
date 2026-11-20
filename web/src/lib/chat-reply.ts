@@ -5,19 +5,27 @@
  * stretches of it. The bubble accumulates every delta of the turn, so a
  * sentence written before a tool call and the one written after it used
  * to run together ("…anything.My local copy…"). Text that resumes after
- * tool work is a new part of the reply and starts its own paragraph.
+ * tool work, when the sentence before it was finished, is a new part of
+ * the reply and starts its own paragraph.
  *
  * A long reply also gets a calmer bubble: short replies keep the bright
  * minion yellow, and a reply longer than about six lines reads on the
  * pale butter yellow instead of a tall block of bright colour.
  */
 
+/** The text so far ends a sentence: closing punctuation, optionally inside
+ * closing quotes, brackets or emphasis marks. */
+const ENDS_SENTENCE = /[.!?…:][)\]"'”’*_`]*\s*$/u;
+
 /** Join the reply so far with text that resumes after tool work. The break
- * is added only between two parts that would otherwise touch: an empty
- * side, or a break either side already carries, is left alone. */
+ * is added only where a FINISHED sentence would otherwise touch the next
+ * part. An empty side, a break either side already carries, and a sentence
+ * the tool work interrupted mid-way ("I checked the file" … " and it is
+ * fine.") are joined exactly as written. */
 export function resumeReplyText(soFar: string, next: string): string {
   if (next === '' || soFar.trim() === '') return soFar + next;
   if (/\n[^\S\n]*$/u.test(soFar) || /^[^\S\n]*\n/u.test(next)) return soFar + next;
+  if (!ENDS_SENTENCE.test(soFar)) return soFar + next;
   return `${soFar}\n\n${next}`;
 }
 
