@@ -4090,6 +4090,29 @@ a.repo-row__name:hover {
   box-shadow: var(--shadow-btn-pressed);
 }
 
+/* Gru's pick: the recommended choice wears a tag, a yellow ring and the
+   filled button; the others stay outlined. */
+.board-notification__pick {
+  justify-self: start;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--work);
+  color: var(--on-state);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+/* A yellow ring OUTSIDE the tile's own ink border: a yellow border alone
+   is about 1.4:1 on the light theme's white tile and all but disappears. */
+.board-notification--owner .board-notification__option--pick {
+  box-shadow: 0 0 0 3px var(--work);
+}
+
+.board-notification--owner .board-notification__option--pick .board-notification__option-button {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
 .board-notification--owner .board-notification__option-label {
   color: var(--ink);
   font-size: 14px;

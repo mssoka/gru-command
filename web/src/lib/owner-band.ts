@@ -65,6 +65,14 @@ export function kindOfAsk(reservedClass: string): KindOfAsk | null {
   return Object.hasOwn(KIND_OF_ASK, reservedClass) ? (KIND_OF_ASK[reservedClass] ?? null) : null;
 }
 
+/** The option the producer marked as Gru's pick, or null. Only an id that
+ * is one of the decision's own options counts — an id that matches nothing
+ * (a decision whose options were replaced) marks no choice. */
+export function recommendedOptionId(decision: NotificationDecisionView): string | null {
+  const id = decision.recommendedOption ?? null;
+  return id !== null && decision.options.some((option) => option.id === id) ? id : null;
+}
+
 /** A destructive or irreversible ask: the one kind whose card carries the
  * red edge as well as the badge. */
 export function isDestructiveAsk(reservedClass: string): boolean {

@@ -622,6 +622,7 @@ function defaultSampleSnapshot(): unknown {
           question: 'Approve the payment retry fix and re-arm the lane?',
           context: 'The retry loop fix is ready but touches a shared payment path.',
           recommendation: 'Approve it; keep the unrelated ledger work separate.',
+          recommendedOption: 'approve',
           reservedClass: 'scope-design',
           whyNotDelegable: 'It changes a shared, owner-visible payment behavior.',
           options: [

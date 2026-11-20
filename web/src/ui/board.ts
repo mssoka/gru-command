@@ -95,6 +95,7 @@ import {
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
+  recommendedOptionId,
   safePrUrl,
   type OwnerDecisionRow,
   type OwnerNoticeRow,
@@ -323,6 +324,8 @@ export class BoardView {
   } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
+  /** Unique ids for "Gru's pick" tags (see pickTag). */
+  private pickTagSeq = 0;
   /** Open Details disclosures, keyed by notification id — a snapshot push
    * never collapses what the operator opened. */
   private readonly openNotificationDetails = new Set<string>();
@@ -3213,6 +3216,11 @@ export class BoardView {
     }
     // On the owner face the why/if-nothing notes sit with the story.
     if (!split) block.append(this.decisionWhy(decision));
+    // Gru's pick (owner pick 2026-11-20): the option the producer marked as
+    // recommended wears a tag on the owner face, so "choose the first
+    // option" never has to be mapped onto a button. The compact card keeps
+    // its plain list.
+    const pick = split ? recommendedOptionId(decision) : null;
     const decided = item.decidedAt !== null && item.decidedAt !== undefined;
     // Options are live only on an open OWNER row: machine queue rows and
     // closed receipts render their options read-only (no fake control).
@@ -3243,7 +3251,15 @@ export class BoardView {
       const options = el('div', 'board-notification__options');
       for (const option of decision.options) {
         const optionNode = el('div', 'board-notification__option');
+        const pickTag = option.id === pick ? this.pickTag() : null;
+        if (pickTag !== null) {
+          optionNode.classList.add('board-notification__option--pick');
+          optionNode.append(pickTag);
+        }
         const button = document.createElement('button');
+        // The tag describes the button without renaming it: a screen reader
+        // hears the choice, then "Gru's pick".
+        if (pickTag !== null) button.setAttribute('aria-describedby', pickTag.id);
         button.type = 'button';
         button.className = 'board-notification__option-button';
         button.textContent = option.label;
@@ -3277,6 +3293,10 @@ export class BoardView {
       const options = el('div', 'board-notification__options board-notification__options--readonly');
       for (const option of decision.options) {
         const optionNode = el('div', 'board-notification__option');
+        if (option.id === pick) {
+          optionNode.classList.add('board-notification__option--pick');
+          optionNode.append(this.pickTag());
+        }
         optionNode.append(
           el('div', 'board-notification__option-label', option.label),
           el('div', 'board-notification__option-consequence', option.consequence),
@@ -3290,6 +3310,19 @@ export class BoardView {
       if (ifNothing !== null) block.append(ifNothing);
     }
     return block;
+  }
+
+  /** The "Gru's pick" tag: the star is decoration, the words are the
+   * content, and each tag has its own id (the same card renders on the band
+   * and in the bell) so the choice it marks can point at it. */
+  private pickTag(): HTMLElement {
+    const tag = el('span', 'board-notification__pick');
+    this.pickTagSeq += 1;
+    tag.id = `gru-pick-${this.pickTagSeq}`;
+    const star = el('span', 'board-notification__pick-star', '★ ');
+    star.setAttribute('aria-hidden', 'true');
+    tag.append(star, document.createTextNode('Gru’s pick'));
+    return tag;
   }
 
   /** Why the decision reached the owner and cannot be delegated. */

@@ -752,6 +752,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // owner's eventual choice records through the typed path. The
             // ledger refuses every other row shape (not_discussion,
             // decision_recorded, not_open, no_decision, not_owner_decision).
+            // The attach path carries no mark of its own. A body that sends
+            // one is refused, never silently ignored: the caller would
+            // believe the card marks a choice it does not.
+            if (Object.prototype.hasOwnProperty.call(body, 'recommendedOption')) {
+              json(res, 400, {
+                error: 'bad_request',
+                detail:
+                  'decision-options takes no recommendedOption: a mark stays only on an option attached unchanged — say which one you recommend in the chat',
+              });
+              return;
+            }
             const options = parseDecisionOptions((body as Record<string, unknown>)['options']);
             const by = optStrField(body, 'by') ?? 'gru';
             try {

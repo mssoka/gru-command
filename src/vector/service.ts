@@ -420,6 +420,7 @@ export class VectorService {
         'An attack changes nothing in your repository, and finding nothing never means the code is safe.',
       ].join('\n'),
       recommendation: 'Attacking it now. An attack changes nothing in your repository, and finding nothing never means the code is safe.',
+      recommendedOption: 'accept',
       reservedClass: 'authority-cost',
       whyNotDelegable: 'An attack spends quota, so the app starts one only when you accept.',
       options: [
@@ -553,6 +554,7 @@ export class VectorService {
         'Details hold the exact guarantee, the replay and its receipts.',
       ].join('\n'),
       recommendation: 'Fixing it now. A fresh replay confirmed the failure on the default branch, so it is a real break rather than a flaky test.',
+      recommendedOption: 'accept',
       reservedClass: 'authority-cost',
       whyNotDelegable: 'A fix spends quota, so the app starts one only when you accept.',
       options: [

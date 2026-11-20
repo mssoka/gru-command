@@ -1486,6 +1486,8 @@ describe('owner approval — the card the owner answers', () => {
     // the caller's prose must never be able to make the card unpostable.
     expect(card.decision?.context).toBe('Gru cannot tell whether this directive finished what it started. Gru’s reason is in Details.');
     expect(card.decision?.options.map((option) => option.id)).toEqual(['approve', 'deny']);
+    // An approval card states no preference, so it marks no option.
+    expect(card.decision?.recommendedOption).toBeUndefined();
     expect(card.decision?.options[0]).toEqual({ id: 'approve', label: 'Approve',
       consequence: 'Closes the request as never-proved. Nothing is re-run and no completion is recorded. ' +
         "The job keeps its status, and its workspace stays held until the job is closed or new approved work is admitted there." });

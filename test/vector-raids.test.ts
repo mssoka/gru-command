@@ -317,7 +317,7 @@ describe('planning and picks (#351 §2)', () => {
     expect(raid).toMatchObject({ state: 'proposed', notificationId: `vector-raid:${raid!.id}` });
     expect(service.pick({ picks: [pickRefunds('again')], digest: null, requestedBy: 'gru' }).raids).toEqual([raid]);
     const [card] = h.rows(RAID_PROPOSAL_KIND);
-    expect(card).toMatchObject({ routing: 'needs-owner', decision: { reservedClass: 'authority-cost', options: [{ id: 'accept' }, { id: 'decline' }] } });
+    expect(card).toMatchObject({ routing: 'needs-owner', decision: { reservedClass: 'authority-cost', recommendedOption: 'accept', options: [{ id: 'accept' }, { id: 'decline' }] } });
     expect(h.rows(RAID_PROPOSAL_KIND)).toHaveLength(1);
     h.notifications.decide(card!.id, 'accept', 'web', card!.decision!);
     expect(service.raids()[0]).toMatchObject({ state: 'queued', launchedBy: 'owner-accept' });
@@ -634,6 +634,8 @@ describe('the board view: the cockpit raids card (#351)', () => {
     expect(on(service.boardView())).toMatchObject({ breakIns: 1, fixesAwaitingOwner: 0 });
     await service.onBreakIn('bi-1');
     const [first] = h.rows(FIX_PROPOSAL_KIND);
+    // The fix proposal recommends sending the fix, and marks that choice.
+    expect(first?.decision?.recommendedOption).toBe('accept');
     expect(on(service.boardView()).fixesAwaitingOwner).toBe(1);
     h.notifications.decide(first!.id, 'decline', 'web', first!.decision!);
     await service.followFixDecision(first!.id);

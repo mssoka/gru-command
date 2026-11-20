@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isValidLessonProposal } from './board-protocol.js';
+import { isNotificationDecisionView, isValidLessonProposal } from './board-protocol.js';
 import {
   agentStateTone,
   isValidSnapshot,
@@ -1031,5 +1031,26 @@ describe('lesson proposal review validator', () => {
     });
     expect(isValidLessonProposal(review({ slug: 'ops', before: null, after: null }))).toBe(false);
     expect(isValidLessonProposal(review({ slug: 'ops', before: null, after: { summary: 'S.', tags: [] } }))).toBe(true);
+  });
+});
+
+describe('owner decision view: the recommended option', () => {
+  const decision = {
+    question: 'Approve the slim contract?',
+    context: 'The agreed scope would change.',
+    recommendation: 'Approve it.',
+    reservedClass: 'scope-design',
+    whyNotDelegable: 'It changes the agreed scope.',
+    options: [{ id: 'approve', label: 'Approve', consequence: 'Gru starts the slim plan.' }],
+    discussion: false,
+  };
+
+  it('accepts a marked option, an explicit null and a row with no such field; refuses anything else', () => {
+    expect(isNotificationDecisionView(decision)).toBe(true);
+    expect(isNotificationDecisionView({ ...decision, recommendedOption: 'approve' })).toBe(true);
+    expect(isNotificationDecisionView({ ...decision, recommendedOption: null })).toBe(true);
+    for (const bad of [7, true, ['approve'], { id: 'approve' }]) {
+      expect(isNotificationDecisionView({ ...decision, recommendedOption: bad }), JSON.stringify(bad)).toBe(false);
+    }
   });
 });

@@ -49,6 +49,13 @@ export interface NotificationDecision {
    * Required by the write boundary; null only survives on a row written by
    * an older build. */
   readonly recommendation: string | null;
+  /** The option the recommendation picks, by id (owner pick 2026-11-20): the
+   * card marks that choice, so the owner never has to map "choose the first
+   * option" onto a button. Optional: a recommendation that is not one of the
+   * options, the no-preference form, a discussion-only decision and a row
+   * written by an older build have none. It is stated by the producer and
+   * never inferred from the recommendation's prose. */
+  readonly recommendedOption?: string;
   /** What happens if the owner does nothing (issue #570). Required by the
    * write boundary — there is no automatic default, so a producer states the
    * real consequence (OWNER_NOTHING_DEFAULT when nothing changes) — and
@@ -188,10 +195,25 @@ export function parseNotificationDecision(value: unknown): NotificationDecision 
     throw new Error('decision.options requires at least one option unless decision.discussion is true');
   }
   const options = parseDecisionOptions(optionsRaw);
+  // The recommended option names one of THIS decision's options, and only
+  // beside a recommendation: an id that matches nothing would mark no
+  // choice, and a pick with no stated reason is not advice.
+  const recommendedOption = boundedOptionalString(raw['recommendedOption'], 'decision.recommendedOption', 64);
+  if (recommendedOption !== null) {
+    if (!options.some((option) => option.id === recommendedOption)) {
+      throw new Error(
+        `decision.recommendedOption "${recommendedOption}" is not one of this decision's option ids (${options.map((option) => option.id).join(', ') || 'it has none'})`,
+      );
+    }
+    if (recommendation === null) {
+      throw new Error('decision.recommendedOption needs decision.recommendation: a marked choice states its reason');
+    }
+  }
   return {
     question,
     context,
     recommendation,
+    ...(recommendedOption !== null ? { recommendedOption } : {}),
     ...(ifNothing !== null ? { ifNothing } : {}),
     reservedClass: reservedClass as OwnerReservedClass,
     whyNotDelegable,
@@ -206,10 +228,34 @@ export function parseNotificationDecision(value: unknown): NotificationDecision 
 export function parseStoredNotificationDecision(json: string | null): NotificationDecision | null {
   if (json === null || json.trim() === '') return null;
   try {
-    return parseNotificationDecision(JSON.parse(json));
+    return parseNotificationDecision(withoutDanglingMark(JSON.parse(json)));
   } catch {
     return null;
   }
+}
+
+/** Read side only. A stored mark the write boundary would refuse — one that
+ * is not text, names none of the stored options, or has no recommendation
+ * beside it — marks nothing, and must not cost the owner the whole
+ * question: the strict parser would refuse it, and a refused stored
+ * decision reads as "no typed decision" (no options, no way to answer).
+ * The write boundary still refuses such a mark loudly; this keeps a row
+ * readable if one is ever stored anyway. */
+function withoutDanglingMark(raw: unknown): unknown {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return raw;
+  const record = raw as Record<string, unknown>;
+  const mark = record['recommendedOption'];
+  if (mark === undefined || mark === null) return raw;
+  const options: readonly unknown[] = Array.isArray(record['options']) ? record['options'] : [];
+  const named =
+    typeof mark === 'string' &&
+    options.some((option) => typeof option === 'object' && option !== null && (option as Record<string, unknown>)['id'] === mark.trim());
+  const recommendation = record['recommendation'];
+  const reasoned = typeof recommendation === 'string' && recommendation.trim() !== '';
+  if (named && reasoned) return raw;
+  const { recommendedOption: _refusedMark, ...rest } = record;
+  void _refusedMark;
+  return rest;
 }
 
 export function serializeNotificationDecision(decision: NotificationDecision): string {

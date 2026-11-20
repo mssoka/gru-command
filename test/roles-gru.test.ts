@@ -36,6 +36,13 @@ describe('gru role definition', () => {
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
+    // Gru names the option it recommends (the card marks it), as an
+    // optional field, and knows the two cases where it must not.
+    expect(prompt).toContain('"recommendedOption": "<optional: the id of the option you recommend>"');
+    expect(prompt).toContain('name it in `recommendedOption` by its `id`');
+    expect(prompt).toContain('refuses a no-preference card that marks one');
+    expect(prompt).toContain('Options you attach later to a discussion card carry no mark of');
+    expect(prompt).toContain('the route refuses a `recommendedOption` there');
     expect(prompt).toContain('"reservedClass"');
     expect(prompt).toContain('"whyNotDelegable"');
     expect(prompt).toContain('POST /api/notifications/:id/decision');

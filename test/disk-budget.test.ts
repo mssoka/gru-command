@@ -1242,6 +1242,8 @@ describe('disk budget, proposed (#427 PR 3)', () => {
     expect(card.routing).toBe('needs-owner');
     expect(card.decision?.reservedClass).toBe('authority-cost');
     expect(card.decision?.options.map((option) => option.id)).toEqual(['accept', 'decline']);
+    // The recommendation is to accept, and the card marks that choice.
+    expect(card.decision?.recommendedOption).toBe('accept');
     expect(card.detail).toContain(`GC uses 32.5 GB under ${h.dataDir}, over its 30.0 GB budget`);
     expect(card.detail).toContain('1. Release lane job-done (job lane of job job-done, done, in disk-app): about 1.0 GB.');
     expect(card.detail).toContain(`2. Delete the 1 review folder of job job-done (done): ${round}: about 512.0 MB. The ledger keeps the verdicts and findings, the PR the published review, and each round folder its consolidated.json.`);

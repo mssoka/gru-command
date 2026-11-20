@@ -6749,7 +6749,19 @@ export class LedgerApi {
           `notification "${id}" is not a discussion decision — its producer-authored options are not replaced`,
         );
       }
-      const next: NotificationDecision = { ...current.decision, options: [...validated] };
+      // A mark survives only on the option it was written about: the same
+      // id attached with the same label and consequence. Otherwise it would
+      // name an id that is gone (the row would then read back as "no typed
+      // decision"), or an id reused for a choice the recommendation never
+      // assessed. Re-attaching the identical options changes nothing, so an
+      // owner's click in flight and an idempotent replay still match.
+      const { recommendedOption: marked, ...unmarked } = current.decision;
+      const before = current.decision.options.find((option) => option.id === marked);
+      const markStands =
+        marked !== undefined &&
+        before !== undefined &&
+        validated.some((option) => option.id === marked && option.label === before.label && option.consequence === before.consequence);
+      const next: NotificationDecision = { ...(markStands ? current.decision : unmarked), options: [...validated] };
       this.db
         .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?')
         .run(serializeNotificationDecision(next), id);

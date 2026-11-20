@@ -604,6 +604,7 @@ export class OnboardingService {
         'The pull request changes no other file. Normal review applies, and merging it stays your call.',
       ].join('\n'),
       recommendation: `Setting it up now. Until ${shown(repo)} has that settings file, its jobs get no setup and verification has no command.`,
+      recommendedOption: 'accept',
       reservedClass: 'authority-cost',
       whyNotDelegable: 'Setting a repository up spends quota and opens a pull request on your repository, so the app does it only when you accept.',
       options: [

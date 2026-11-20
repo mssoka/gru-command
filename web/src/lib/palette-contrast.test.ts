@@ -282,6 +282,27 @@ describe('palette contrast (v5)', () => {
     expect(source.search(still)).toBeGreaterThan(source.search(animated));
   });
 
+  it('Gru\'s pick is marked by a ring outside the tile\'s ink border, not by a yellow border', () => {
+    const pick = '.board-notification--owner .board-notification__option--pick';
+    // Yellow on the light theme's white tile is about 1.4:1: as a border
+    // it would be weaker than the ink border it replaced.
+    expect(declarationIn(COMPONENTS_CSS, pick, 'border-color')).toBeNull();
+    expect(declarationIn(COMPONENTS_CSS, pick, 'box-shadow')).toBe('0 0 0 3px var(--work)');
+    expect(contrast(themeVars(':root'), 'work', 'card')).toBeLessThan(3);
+    // The ring itself sits on the card body (--soft), where yellow is as
+    // weak: it reads by its edge against the tile's ink border.
+    expect(contrast(themeVars(':root'), 'work', 'soft')).toBeLessThan(3);
+    expect(declarationIn(COMPONENTS_CSS, '.board-notification--owner .board-notification__option', 'border')).toBe('var(--outline-thin)');
+    // The tag and the filled button carry readable pairs in both themes.
+    expect(colorTokenIn(COMPONENTS_CSS, '.board-notification__pick')).toBe('on-state');
+    expect(declarationIn(COMPONENTS_CSS, '.board-notification__pick', 'background')).toBe('var(--work)');
+    expect(colorTokenIn(COMPONENTS_CSS, `${pick} .board-notification__option-button`)).toBe('accent-text');
+    for (const selector of [':root', '.dark']) {
+      expect(contrast(themeVars(selector), 'on-state', 'work'), selector).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(themeVars(selector), 'accent-text', 'accent'), selector).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
   it('the pair list itself is non-trivial (guards an accidentally emptied table)', () => {
     expect(TEXT_PAIRS.length).toBeGreaterThan(12);
   });

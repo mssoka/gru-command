@@ -30,6 +30,7 @@ Every question card states:
 | `question` | One line, plain words, about the owner's choice — not the machinery. |
 | `context` | One or two sentences on what happened and why it matters. |
 | `recommendation` | Required. Either what Gru recommends, or the explicit no-preference form (below). |
+| `recommendedOption` | Optional. The `id` of the option the recommendation picks; the card marks that choice "Gru's pick". |
 | `ifNothing` | Required. What happens if the owner does nothing. |
 | `whyNotDelegable` | Why Silas/Gru cannot decide it. |
 | `options[]` | Concrete choices; every `consequence` says what happens or does not happen. |
@@ -53,6 +54,32 @@ one).
 
 `ifNothing` is **required on write and optional on read**: a row written
 before this standard renders its choices with no invented do-nothing line.
+
+**The pick is stated, never inferred.** A recommendation such as "choose
+the first option" makes the owner count buttons, so a producer whose
+recommendation is one of the options names that option in
+`recommendedOption`, and the card marks it (a tag, a yellow ring and the
+filled button, and names it to a screen reader as the description of
+that choice). The boundary keeps the mark honest:
+
+- it must be the `id` of one of the decision's own options;
+- it needs a `recommendation` beside it (a marked choice states its reason);
+- the no-preference form marks no option ("either choice is fine" and a
+  marked choice contradict each other in front of the owner).
+
+It is optional: a recommendation that is not one of the options, a
+discussion-only card and a row written before the field existed mark
+nothing, and the browser never guesses a pick from the recommendation's
+words. Options attached later to a discussion card
+(`POST /api/notifications/:id/decision-options`) carry no mark of their
+own, and the route refuses a body that sends one. A mark the card already
+carried stays only on the option it was written about, attached unchanged
+(same id, label and consequence); otherwise it is cleared, because the
+stored recommendation was not written about the new choice. A stored mark
+the boundary would refuse is dropped when the row is read, never the whole
+question. The mark is part of the decision the browser echoes back with a
+choice, so a card whose mark changed is `decision_changed` like any other
+edit. The owner is free to choose any option, marked or not.
 
 ## Where the owner's text ends and evidence begins
 

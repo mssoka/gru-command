@@ -382,7 +382,10 @@ read:
   (the typed context) with the "Why this needs you" and "If you do
   nothing" notes under it; the call is the question, Gru's advice in a
   butter speech bubble (`--gru-soft`, dark ink in both themes), and one
-  tile per choice: the button, then what happens.
+  tile per choice: the button, then what happens. The option the producer
+  named in `recommendedOption` wears "★ Gru's pick", a yellow ring and
+  the filled button; an unmarked decision marks none (never the first
+  option by default). See [FOR-YOU.md](./FOR-YOU.md).
 - Severity no longer floods an owner card. Machine rows, feed rows
   (an acked or resolved owner row included) and closed receipts keep the
   compact card, where an error row still paints the alert surface with

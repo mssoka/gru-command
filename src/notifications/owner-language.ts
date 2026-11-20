@@ -127,6 +127,20 @@ function assertRecommendation(recommendation: string | null): void {
   }
 }
 
+/** The marked-choice rule: the no-preference form names no option. A card
+ * that says "either choice is fine" and marks one of them contradicts
+ * itself in front of the owner. */
+function assertRecommendedOption(decision: NotificationDecision): void {
+  if (decision.recommendedOption === undefined) return;
+  if (decision.recommendation !== null && decision.recommendation.startsWith(OWNER_NO_RECOMMENDATION_PREFIX)) {
+    throw new Error(
+      `decision.recommendedOption: a "${OWNER_NO_RECOMMENDATION_PREFIX}" decision marks no option ` +
+        `(it names "${decision.recommendedOption}") — recommend that option in words, or leave it unmarked ` +
+        '(see docs/FOR-YOU.md)',
+    );
+  }
+}
+
 /** The "if you do nothing" rule: required at the write boundary, optional
  * when reading a pre-upgrade row (a legacy row renders no line rather than
  * an invented fact). */
@@ -149,6 +163,7 @@ export function assertOwnerDecisionLanguage(decision: NotificationDecision): voi
   assertOwnerFacingText('decision.context', decision.context);
   assertRecommendation(decision.recommendation);
   assertOwnerFacingText('decision.recommendation', decision.recommendation ?? '');
+  assertRecommendedOption(decision);
   assertOwnerFacingText('decision.whyNotDelegable', decision.whyNotDelegable);
   assertIfNothing(decision.ifNothing);
   assertOwnerFacingText('decision.ifNothing', decision.ifNothing ?? '');

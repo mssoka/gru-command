@@ -167,6 +167,9 @@ export interface NotificationDecisionView {
   readonly question: string;
   readonly context: string;
   readonly recommendation: string | null;
+  /** The option the recommendation picks, by id (absent when the producer
+   * marked none): the card marks that choice. Never derived from prose. */
+  readonly recommendedOption?: string | null;
   /** What happens if the owner does nothing (absent on pre-upgrade rows; a
    * card with no line invents none). */
   readonly ifNothing?: string | null;
@@ -182,6 +185,7 @@ export function isNotificationDecisionView(value: unknown): value is Notificatio
     typeof value.question === 'string' &&
     typeof value.context === 'string' &&
     (value.recommendation === null || typeof value.recommendation === 'string') &&
+    (value.recommendedOption === undefined || value.recommendedOption === null || typeof value.recommendedOption === 'string') &&
     (value.ifNothing === undefined || value.ifNothing === null || typeof value.ifNothing === 'string') &&
     typeof value.reservedClass === 'string' &&
     typeof value.whyNotDelegable === 'string' &&
