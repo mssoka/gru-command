@@ -6055,3 +6055,54 @@ describe('GH-305 rendered mailbox lifecycle', () => {
     expect(document.querySelector('[data-nav="for-gru"] .board-nav__count')?.textContent).toBe('—');
   });
 });
+
+describe('crew rail — show all (owner pick 2026-11-20)', () => {
+  beforeEach(mountBoardDom);
+
+  /** The rail scrolls inside a fixed height; a test DOM lays nothing out,
+   * so the two heights the control reads are supplied here. */
+  function sizeRail(scrollHeight: number, clientHeight: number): HTMLElement {
+    const rail = document.getElementById('board-agents')!;
+    Object.defineProperty(rail, 'scrollHeight', { configurable: true, get: () => scrollHeight });
+    Object.defineProperty(rail, 'clientHeight', { configurable: true, get: () => clientHeight });
+    return rail;
+  }
+
+  const crew = [1, 2, 3].map((n) => agent(`crew-${n}`, { role: 'minion', label: `worker ${n}`, jobId: null }));
+
+  it('a list that fits ends on its last row, with no control', () => {
+    const rail = sizeRail(300, 420);
+    new BoardView(() => {}).render(snapshot({ jobs: [], agents: crew }));
+    expect(rail.querySelector('[data-section="crew-all"]')).toBeNull();
+    expect(rail.classList.contains('board-agents--all')).toBe(false);
+  });
+
+  it('a list that does not fit ends on "Show all N", which lifts the height limit and folds back', () => {
+    const rail = sizeRail(900, 420);
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: crew }));
+    let toggle = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(toggle.textContent).toBe('Show all 3');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    // It is the list's last child: the list ends on the control.
+    expect(rail.lastElementChild).toBe(toggle);
+    toggle.click();
+    toggle = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(rail.classList.contains('board-agents--all')).toBe(true);
+    expect(toggle.textContent).toBe('Show fewer');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(toggle);
+    // Expanded, the list no longer overflows — the control stays so it can
+    // be folded again, and a snapshot push keeps both the state and focus.
+    sizeRail(900, 900);
+    view.render(snapshot({ jobs: [], agents: crew }));
+    toggle = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(toggle.textContent).toBe('Show fewer');
+    expect(document.activeElement).toBe(toggle);
+    toggle.click();
+    expect(rail.classList.contains('board-agents--all')).toBe(false);
+    // Folded and fitting again: the control is gone.
+    expect(rail.querySelector('[data-section="crew-all"]')).toBeNull();
+  });
+});
+

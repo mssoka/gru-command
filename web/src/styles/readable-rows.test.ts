@@ -123,3 +123,29 @@ describe('health pill: one calm line', () => {
   });
 });
 
+describe('crew rail: a readable role line', () => {
+  it('the line under a crew name is ordinary case at 11px and wraps instead of cutting the role', () => {
+    expect(declared('.board-agent__sub', 'text-transform')).toBe('none');
+    expect(declared('.board-agent__sub', 'letter-spacing')).toBe('0');
+    expect(declared('.board-agent__sub', 'flex-wrap')).toBe('wrap');
+    expect(Number.parseFloat(declared('.board-agent__sub', 'font-size') ?? '0')).toBeGreaterThanOrEqual(11);
+    // It used to ellipsize on one line, which cut the role to "M..".
+    expect(declared('.board-agent__sub', 'white-space')).toBeNull();
+    expect(declared('.board-agent__sub', 'overflow')).toBeNull();
+    expect(declared('.board-agent__role', 'flex')).toBe('none');
+    expect(declared('.board-agent__role', 'text-overflow')).toBeNull();
+    // The chips on the line follow its case and size.
+    expect(declared('.board-agent__sub .lbl', 'text-transform')).toBe('none');
+    expect(declared('.board-agent__sub .lbl', 'font-size')).toBe('inherit');
+  });
+
+  it('the name gets the room before the ID code, and "show all" is pinned to the list\'s bottom edge', () => {
+    expect(declared('.board-agent__hash', 'flex')).toBe('0 100 auto');
+    expect(declared('.board-agent__hash', 'text-overflow')).toBe('ellipsis');
+    expect(declared('.board-agent-toggle.board-agents__all', 'position')).toBe('sticky');
+    expect(declared('.board-agent-toggle.board-agents__all', 'bottom')).toBe('0');
+    expect(declared('.board-agent-toggle.board-agents__all', 'background')).toBe('var(--card)');
+    expect(declared('.board-agents--all', 'max-height')).toBe('none');
+  });
+});
+

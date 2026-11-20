@@ -3189,6 +3189,22 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* "Show all N": pinned to the bottom edge of the scrolling list, so the
+   list ends on a control, never on half a row. Showing all lifts the
+   height limit. */
+.board-agents--all {
+  max-height: none;
+}
+
+.board-agent-toggle.board-agents__all {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  border-style: solid;
+  background: var(--card);
+  color: var(--ink);
+}
+
 .board-agents {
   display: grid;
   gap: 4px;
@@ -3286,8 +3302,14 @@ body {
   white-space: nowrap;
 }
 
+/* The ID code tells same-named crew apart, so it stays, but the NAME gets
+   the room: the code gives way first. */
 .board-agent__hash {
-  flex: none;
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 9px;
   letter-spacing: 0.04em;
@@ -3297,22 +3319,35 @@ body {
 .board-agent__sub {
   display: flex;
   align-items: center;
-  gap: 4px;
-  font-size: 9px;
-  /* The .lbl default (0.18em) is tuned for big headings; in an 240px rail
-     it squeezes the role·state out of the line. */
-  letter-spacing: 0.05em;
+  /* A readable line (owner pick 2026-11-20): ordinary case at 11px that
+     WRAPS. It was 9px capitals on one line, so a narrow rail cut the role
+     down to "M.." to make room for the chips beside it. */
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--muted);
-  overflow: hidden;
-  white-space: nowrap;
   min-width: 0;
 }
 
+/* Everything on the line reads in the same ordinary case and size: the
+   chips that carry their own `.lbl` (the quiet age, a waiting note) no
+   longer shout in 9px capitals beside it. */
+.board-agent__sub .lbl {
+  font-size: inherit;
+  font-weight: inherit;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* The role is the line's point: it is never cut. The chips after it wrap
+   to the next line when the rail is narrow. */
 .board-agent__role {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
+  flex: none;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .board-agent__supervision {

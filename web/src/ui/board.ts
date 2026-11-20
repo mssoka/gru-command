@@ -327,6 +327,8 @@ export class BoardView {
   private extraReceipts: NotificationView[] = [];
   /** Unique ids for "Gru's pick" tags (see pickTag). */
   private pickTagSeq = 0;
+  /** Whether the crew rail shows every row instead of scrolling. */
+  private crewExpanded = false;
   /** Whether the health pill shows its calm readings (remembered per browser). */
   private healthDetailsOpen = readHealthDetailsPref();
   /** Open Details disclosures, keyed by notification id — a snapshot push
@@ -2520,7 +2522,11 @@ export class BoardView {
   private renderAgents(agents: readonly AgentView[]): void {
     this.lastAgents = agents;
     const rail = mustGet('board-agents');
+    // A snapshot push rebuilds the rail: a focused "show all" control keeps
+    // its place.
+    const crewToggleFocused = document.activeElement instanceof HTMLElement && document.activeElement.dataset.section === 'crew-all';
     rail.replaceChildren();
+    rail.classList.toggle('board-agents--all', this.crewExpanded);
     this.ensureAgeTicker();
     // Issue #171 truthful agent status: liveness is RUNTIME OWNERSHIP,
     // not the raw stored state. The live crew = current members plus
@@ -2628,6 +2634,30 @@ export class BoardView {
         for (const { agent, depth } of subMinionTree(disposed)) rail.append(this.agentRow(agent, 'disposed', false, false, labelById, jobs, suffixes, depth));
       }
     }
+    this.appendCrewToggle(rail, agents, crewToggleFocused);
+  }
+
+  /** The rail scrolls inside a fixed height, so a long crew ended on half a
+   * row with no sign of more (owner pick 2026-11-20). When the rows do not
+   * fit, one control pinned to the list's bottom edge shows them all, and
+   * folds them again. It appears only when there is something to show or
+   * fold; a rail that is not on screen measures nothing and gets none
+   * until the next push finds it visible. */
+  private appendCrewToggle(rail: HTMLElement, agents: readonly AgentView[], refocus: boolean): void {
+    const overflowing = rail.scrollHeight > rail.clientHeight + 4;
+    if (!this.crewExpanded && !overflowing) return;
+    const rows = rail.querySelectorAll('.board-agent').length;
+    const toggle = el('button', 'board-agent-toggle board-agents__all', this.crewExpanded ? 'Show fewer' : `Show all ${rows}`);
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', String(this.crewExpanded));
+    toggle.setAttribute('data-section', 'crew-all');
+    toggle.addEventListener('click', () => {
+      this.crewExpanded = !this.crewExpanded;
+      this.renderAgents(agents);
+      rail.querySelector<HTMLElement>('[data-section="crew-all"]')?.focus();
+    });
+    rail.append(toggle);
+    if (refocus) toggle.focus();
   }
 
   /** One dense agent row: status dot, name + short hash, role·state
