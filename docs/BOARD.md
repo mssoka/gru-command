@@ -140,7 +140,13 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   Ack), lesson proposals, and the server-projected, evidence-bound
   **ready PRs** (see below). Viewing completes nothing: the header count
   is owed actions, not unseen rows; a row settles only on recorded
-  follow-through or confirmed merged/closed state. Rows are
+  follow-through or confirmed merged/closed state. An ANSWERED decision
+  keeps its row until that follow-through, but it is Gru's work, not the
+  owner's (owner pick 2026-11-20): it leaves `N pending`, the
+  `N things need you` headline, the section strip's FOR YOU count and the
+  bell's unread badge, and the band names it on its own line (`Gru is
+  carrying out 1 answer`). With only answered rows the headline reads
+  `Nothing needs you` and the rows stay visible. Rows are
   deterministic (newest first, stable `owner-decision:{id}` /
   `owner-notice:{id}` / `owner-proposal:{id}` / `owner-pr:{jobId}` action
   keys), focus survives snapshot re-renders, and the older tail hides

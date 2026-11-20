@@ -155,12 +155,34 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
   return rows.sort((left, right) => right.ts.localeCompare(left.ts) || left.actionId.localeCompare(right.actionId));
 }
 
-/** The pending count shown in the band header — owed actions, not unseen
- * rows. Opening the board or the bell never changes it. A recorded
- * decision keeps its row visible (awaiting follow-through) until the
- * producer resolves it, exactly like an unanswered one. */
+/** True for a decision the owner has ANSWERED: its row stays on the band
+ * until the producer resolves it (follow-through stays distinct from the
+ * choice), but the ball is with Gru — it no longer needs the owner. */
+export function isAnsweredRow(row: OwnerRow): boolean {
+  return row.kind === 'decision' && row.notification.decidedAt !== null && row.notification.decidedAt !== undefined;
+}
+
+export interface OwnerCounts {
+  /** Rows that still need the owner: open decisions, notices, proposals
+   * and ready PRs/MRs. */
+  readonly needsYou: number;
+  /** Answered decisions Gru is carrying out. */
+  readonly answered: number;
+}
+
+/** What the band header counts (owner pick 2026-11-20): an answered
+ * decision keeps its row visible until its follow-through resolves, but it
+ * is counted as Gru's work, never as something the owner still owes. */
+export function ownerCounts(rows: readonly OwnerRow[]): OwnerCounts {
+  const answered = rows.filter(isAnsweredRow).length;
+  return { needsYou: rows.length - answered, answered };
+}
+
+/** The pending count shown in the band header and the section strip —
+ * owed actions, not unseen rows, and not answers awaiting follow-through.
+ * Opening the board or the bell never changes it. */
 export function ownerPendingCount(snapshot: BoardSnapshot): number {
-  return ownerRows(snapshot).length;
+  return ownerCounts(ownerRows(snapshot)).needsYou;
 }
 
 /** What the FOR YOU pill says is waiting (owner look 2026-11-20):
@@ -174,9 +196,7 @@ export type OwnerAttention = 'question' | 'ready' | 'answered' | 'clear';
 
 export function ownerAttention(rows: readonly OwnerRow[]): OwnerAttention {
   if (rows.length === 0) return 'clear';
-  const answered = (row: OwnerRow): boolean =>
-    row.kind === 'decision' && row.notification.decidedAt !== null && row.notification.decidedAt !== undefined;
-  if (rows.some((row) => row.kind !== 'pr' && !answered(row))) return 'question';
+  if (rows.some((row) => row.kind !== 'pr' && !isAnsweredRow(row))) return 'question';
   return rows.some((row) => row.kind === 'pr') ? 'ready' : 'answered';
 }
 

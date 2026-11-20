@@ -315,6 +315,59 @@ describe('owner look — the ready row and the FOR YOU pill', () => {
     expect(row.querySelector<HTMLAnchorElement>(':scope > .board-owner__open')?.textContent).toBe('OPEN PR ↗');
   });
 
+  it('an answered card leaves the count and the headline and is named as Gru\'s work', () => {
+    const view = new BoardView(() => {});
+    const answered = notification({ id: 'answered', decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'finish' });
+    const second = notification({ id: 'answered-2', decidedAt: '2026-11-20T17:10:00.000Z', decidedOption: 'leave' });
+    const count = (): string | null | undefined => band().querySelector('.board-band__count')?.textContent;
+    const headline = (): string | null | undefined => band().querySelector('.board-owner__headline')?.textContent;
+    const answeredLine = (): string | null | undefined => band().querySelector('.board-owner__answered')?.textContent;
+
+    // One open question, one answer in hand, one ready PR: two things need
+    // the owner; the answer is Gru's.
+    view.render(snapshot([notification({ id: 'open' }), answered], [readyPr()]));
+    expect(count()).toBe('2 pending');
+    expect(headline()).toBe('2 things need you');
+    expect(answeredLine()).toBe('Gru is carrying out 1 answer');
+    // The answered card is still on the band — the record stays visible.
+    expect(band().querySelector('[data-notification-id="answered"]')).not.toBeNull();
+
+    // Only answers in hand: nothing needs the owner, and the band is not
+    // the empty state (the rows are still there).
+    view.render(snapshot([answered, second]));
+    expect(count()).toBe('0 pending');
+    expect(headline()).toBe('Nothing needs you');
+    expect(answeredLine()).toBe('Gru is carrying out 2 answers');
+    expect(band().dataset.empty).toBe('false');
+    expect(band().querySelectorAll('.board-notification--decided')).toHaveLength(2);
+
+    // No answers in hand: no such line at all.
+    view.render(snapshot([notification({ id: 'open' })]));
+    expect(count()).toBe('1 pending');
+    expect(headline()).toBe('1 thing needs you');
+    expect(band().querySelector('.board-owner__answered')).toBeNull();
+  });
+
+  it('an answered decision never rings the bell badge as unread', () => {
+    // The badge counts owner rows the bell has not shown, so the panel
+    // stays closed here (an open panel marks its rows seen).
+    const closePanel = (): void => {
+      document.getElementById('notification-panel')!.hidden = true;
+    };
+    const badge = (): string | null => document.getElementById('notification-badge')!.textContent;
+    closePanel();
+    const view = new BoardView(() => {});
+    view.render(snapshot([notification({ id: 'open' })]));
+    expect(badge()).toBe('1');
+    // A browser that never showed the row gets it already answered (the
+    // owner answered elsewhere): nothing to ring for.
+    mountBoardDom();
+    closePanel();
+    const fresh = new BoardView(() => {});
+    fresh.render(snapshot([notification({ id: 'answered', decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'finish' })]));
+    expect(badge()).toBe('0');
+  });
+
   it('the pill says what is waiting: a question, good news only, an answer in hand, or nothing', () => {
     const view = new BoardView(() => {});
     const answered = notification({ decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'finish' });

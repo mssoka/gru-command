@@ -3093,7 +3093,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
     expect(document.getElementById('board-owner')!.textContent).toContain('awaiting follow-through');
     expect(document.getElementById('board-owner')!.querySelector('[data-action-id="notif:decide-me:option:approve"]')).toBeNull();
-    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    // Answered: the row stays (follow-through is distinct from the choice),
+    // but it is Gru's work now and leaves the owner's count.
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    expect(document.getElementById('board-owner')!.querySelector('.board-owner__headline')?.textContent).toBe('Nothing needs you');
+    expect(document.getElementById('board-owner')!.querySelector('.board-owner__answered')?.textContent).toBe('Gru is carrying out 1 answer');
   });
 
   it('a decided row reloaded from the snapshot renders decided with no controls, and Details survives re-renders', () => {
@@ -3116,7 +3120,10 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const band = document.getElementById('board-owner')!;
     expect(band.textContent).toContain('Decision recorded: “Approve the slim contract” — awaiting follow-through.');
     expect(band.querySelector('[data-action-id^="notif:decided-row:option:"]')).toBeNull();
-    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    // The answered row is still on the band, counted as Gru's work.
+    expect(band.querySelector('[data-notification-id="decided-row"]')).not.toBeNull();
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    expect(band.querySelector('.board-owner__answered')?.textContent).toBe('Gru is carrying out 1 answer');
     expect(client.decideNotification).not.toHaveBeenCalled();
     // Reload (fresh render of the same authoritative row): still decided.
     view.render(snapshot({ notifications: [stop] }));

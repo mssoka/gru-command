@@ -89,6 +89,7 @@ import {
   isNoRecommendation,
   kindOfAsk,
   ownerAttention,
+  ownerCounts,
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
@@ -740,8 +741,12 @@ export class BoardView {
     head.id = 'board-owner-head';
     // The pending number rides its own reserved tabular slot (9→10 moves
     // no label), the same contract as the cockpit's counts.
+    // An answered decision keeps its row until its follow-through resolves,
+    // but it is Gru's work now: it leaves the pending count and the headline
+    // (owner pick 2026-11-20) and is named on its own line.
+    const counts = ownerCounts(rows);
     const count = el('span', 'board-band__count lbl');
-    count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
+    count.append(el('span', 'num board-band__count-num', String(counts.needsYou)), document.createTextNode(' pending'));
     head.append(el('span', 'board-band__label', 'FOR YOU'), count);
     // The attention card (cockpit rework): what needs you, then one line
     // about Gru's own queue (NEEDS GRU — the live machine count the strip's
@@ -757,9 +762,24 @@ export class BoardView {
     if (rows.length > 0) {
       const summary = el('div', 'board-owner__summary');
       summary.append(
-        el('span', 'board-owner__headline', `${rows.length} ${rows.length === 1 ? 'thing needs' : 'things need'} you`),
-        gruLine('lbl board-owner__gru'),
+        el(
+          'span',
+          'board-owner__headline',
+          counts.needsYou === 0
+            ? 'Nothing needs you'
+            : `${counts.needsYou} ${counts.needsYou === 1 ? 'thing needs' : 'things need'} you`,
+        ),
       );
+      if (counts.answered > 0) {
+        summary.append(
+          el(
+            'span',
+            'lbl board-owner__answered',
+            `Gru is carrying out ${counts.answered} ${counts.answered === 1 ? 'answer' : 'answers'}`,
+          ),
+        );
+      }
+      summary.append(gruLine('lbl board-owner__gru'));
       mount.append(summary);
     }
     mount.hidden = false;
@@ -3451,12 +3471,24 @@ export class BoardView {
    * (panel-open marks seen; an ack from ANY device clears it via ackedAt).
    * Machine (action-required) and FYI rows never count — they are not the
    * owner's shoulder. */
-  private updateBadge(notifications: readonly { id: string; routing: string; severity: string; ackedAt: string | null; resolvedAt: string | null }[]): void {
+  private updateBadge(
+    notifications: readonly {
+      id: string;
+      routing: string;
+      severity: string;
+      ackedAt: string | null;
+      resolvedAt: string | null;
+      decidedAt?: string | null;
+    }[],
+  ): void {
+    // An answered decision is Gru's work now: it never rings as unread on a
+    // browser that has not shown it (owner pick 2026-11-20).
     const unseen = notifications.filter(
       (n) =>
         n.routing === 'needs-owner' &&
         n.ackedAt === null &&
         n.resolvedAt === null &&
+        (n.decidedAt === null || n.decidedAt === undefined) &&
         !this.seenOwnerIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);

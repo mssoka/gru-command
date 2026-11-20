@@ -2202,7 +2202,8 @@ body {
   color: var(--ink);
 }
 
-.board-owner__gru {
+.board-owner__gru,
+.board-owner__answered {
   letter-spacing: 0.02em;
   text-transform: none;
   font-weight: 700;

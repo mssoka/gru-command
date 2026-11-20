@@ -389,7 +389,10 @@ read:
   on-state ink on every line.
 - An answered card leads with the recorded choice and folds the ask under
   a "What you were asked" recap; its open state survives snapshot pushes
-  like Details.
+  like Details. It stays on the band until its follow-through resolves,
+  but it no longer counts as something the owner owes: `N pending` and
+  the headline count only what still needs the owner, and a separate line
+  names Gru's share (`Gru is carrying out 1 answer`).
 - The ready row states its three facts in plain words (Reviewed and
   approved, Checks are green, Can be merged) above the exact evidence
   line, and its strip says when that evidence was last observed

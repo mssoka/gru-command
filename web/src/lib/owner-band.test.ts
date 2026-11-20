@@ -6,7 +6,9 @@ import {
   decidedOptionLabel,
   isDestructiveAsk,
   kindOfAsk,
+  isAnsweredRow,
   ownerAttention,
+  ownerCounts,
   ownerNoticeGuidance,
   ownerPendingCount,
   ownerRows,
@@ -335,5 +337,26 @@ describe('owner look — kind of ask and what the pill says', () => {
     expect(ownerAttention(ownerRows(snapshot({ notifications: [answered], ownerPrs: [pr('job-1')] })))).toBe('ready');
     // Only answers awaiting follow-through: the ball is with Gru.
     expect(ownerAttention(ownerRows(snapshot({ notifications: [answered] })))).toBe('answered');
+  });
+
+  it('an answered decision counts as Gru\'s work: it leaves the pending count but keeps its row', () => {
+    const open = notification('n01', { routing: 'needs-owner', decision });
+    const answered = notification('n02', { routing: 'needs-owner', decision, decidedAt: '2026-09-28T00:06:00.000Z', decidedOption: 'delete' });
+    const notice = notification('n03', { routing: 'needs-owner', kind: 'port-squat' });
+    const board = snapshot({ notifications: [open, answered, notice], ownerPrs: [pr('job-1')] });
+    const rows = ownerRows(board);
+    // Every row is still rendered: follow-through stays visible.
+    expect(rows).toHaveLength(4);
+    expect(rows.filter(isAnsweredRow).map((row) => row.actionId)).toEqual(['owner-decision:n02']);
+    expect(ownerCounts(rows)).toEqual({ needsYou: 3, answered: 1 });
+    expect(ownerPendingCount(board)).toBe(3);
+    // Only answers in hand: nothing is owed.
+    const onlyAnswered = snapshot({ notifications: [answered] });
+    expect(ownerCounts(ownerRows(onlyAnswered))).toEqual({ needsYou: 0, answered: 1 });
+    expect(ownerPendingCount(onlyAnswered)).toBe(0);
+    expect(ownerCounts([])).toEqual({ needsYou: 0, answered: 0 });
+    // A notice has no decision to answer; a stray decidedAt never hides it.
+    const oddNotice = notification('n04', { routing: 'needs-owner', kind: 'port-squat', decidedAt: '2026-09-28T00:07:00.000Z' });
+    expect(ownerCounts(ownerRows(snapshot({ notifications: [oddNotice] })))).toEqual({ needsYou: 1, answered: 0 });
   });
 });
