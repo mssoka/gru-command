@@ -389,7 +389,12 @@ read:
   on-state ink on every line.
 - An answered card leads with the recorded choice and folds the ask under
   a "What you were asked" recap; its open state survives snapshot pushes
-  like Details.
+  like Details. It stays on the band until its follow-through resolves,
+  but it no longer counts as something the owner owes: `N pending` and
+  the headline count only what still needs the owner, and a muted line
+  beside the headline names Gru's share (`Gru is carrying out 1 answer`).
+  Answered cards sort after everything still owed, and the expander names
+  what it hides (`+N older pending`, `+N answered`).
 - The ready row states its three facts in plain words (Reviewed and
   approved, Checks are green, Can be merged) above the exact evidence
   line, and its strip says when that evidence was last observed
@@ -402,10 +407,13 @@ read:
 It reads as the attention
 card
 (cockpit rework): under
-its `FOR YOU · N pending` heading, `2 things need you`, then one line about
+its `FOR YOU · N pending` heading, `2 things need you` (`Nothing needs you`
+when the only rows are answered ones), Gru's share of answered decisions
+when there is one, then one line about
 Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
 is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing
-needs Gru either · the crew is on it`; prefixed `last-known ·` while the
+needs Gru either · the crew is on it`, which is left out while Gru is
+carrying out an answer; prefixed `last-known ·` while the
 board socket is lost or the board is unavailable — an empty FOR GRU folded
 while the socket is lost carries the same prefix, and an unavailable FOR
 GRU keeps its full card with its warning). Its empty state is the calm clear state (an empty owner

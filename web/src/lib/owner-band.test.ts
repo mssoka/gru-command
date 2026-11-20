@@ -6,7 +6,11 @@ import {
   decidedOptionLabel,
   isDestructiveAsk,
   kindOfAsk,
+  isAnsweredNotification,
+  isAnsweredRow,
   ownerAttention,
+  ownerCounts,
+  ownerHiddenLabel,
   ownerNoticeGuidance,
   ownerPendingCount,
   ownerRows,
@@ -115,12 +119,13 @@ describe('owner-band row model', () => {
         ],
       }),
     );
+    // What still needs the owner comes first; the answered row follows.
     expect(rows.map((row) => `${row.kind}:${row.actionId}`)).toEqual([
       'decision:owner-decision:dec',
-      'decision:owner-decision:decided',
       'notice:owner-notice:legacy',
+      'decision:owner-decision:decided',
     ]);
-    const decided = rows[1]!;
+    const decided = rows[2]!;
     expect(decided.kind === 'decision' ? decided.notification.decidedOption : null).toBe('approve');
     expect(decidedOptionLabel(decision, 'approve')).toBe('Approve the slim contract');
     expect(decidedOptionLabel(decision, null)).toBe('decision recorded');
@@ -335,5 +340,69 @@ describe('owner look — kind of ask and what the pill says', () => {
     expect(ownerAttention(ownerRows(snapshot({ notifications: [answered], ownerPrs: [pr('job-1')] })))).toBe('ready');
     // Only answers awaiting follow-through: the ball is with Gru.
     expect(ownerAttention(ownerRows(snapshot({ notifications: [answered] })))).toBe('answered');
+  });
+
+  it('an answered decision counts as Gru\'s work: it leaves the pending count but keeps its row', () => {
+    const open = notification('n01', { routing: 'needs-owner', decision });
+    const answered = notification('n02', { routing: 'needs-owner', decision, decidedAt: '2026-09-28T00:06:00.000Z', decidedOption: 'delete' });
+    const notice = notification('n03', { routing: 'needs-owner', kind: 'port-squat' });
+    const board = snapshot({ notifications: [open, answered, notice], ownerPrs: [pr('job-1')] });
+    const rows = ownerRows(board);
+    // Every row is still rendered: follow-through stays visible.
+    expect(rows).toHaveLength(4);
+    expect(rows.filter(isAnsweredRow).map((row) => row.actionId)).toEqual(['owner-decision:n02']);
+    expect(ownerCounts(rows)).toEqual({ needsYou: 3, answered: 1 });
+    expect(ownerPendingCount(board)).toBe(3);
+    // Only answers in hand: nothing is owed.
+    const onlyAnswered = snapshot({ notifications: [answered] });
+    expect(ownerCounts(ownerRows(onlyAnswered))).toEqual({ needsYou: 0, answered: 1 });
+    expect(ownerPendingCount(onlyAnswered)).toBe(0);
+    expect(ownerCounts([])).toEqual({ needsYou: 0, answered: 0 });
+    // A notice has no decision to answer; a stray decidedAt never hides it.
+    const oddNotice = notification('n04', { routing: 'needs-owner', kind: 'port-squat', decidedAt: '2026-09-28T00:07:00.000Z' });
+    expect(ownerCounts(ownerRows(snapshot({ notifications: [oddNotice] })))).toEqual({ needsYou: 1, answered: 0 });
+  });
+
+  it('what still needs the owner sorts ahead of answered rows, so the window never hides an open question behind them', () => {
+    const answered = (n: number) =>
+      notification(`a${String(n).padStart(2, '0')}`, {
+        routing: 'needs-owner',
+        decision,
+        decidedAt: '2026-09-28T00:09:00.000Z',
+        decidedOption: 'delete',
+        // Newer than the open question below.
+        ts: `2026-09-28T01:00:${String(10 + n)}.000Z`,
+      });
+    const open = notification('n01', { routing: 'needs-owner', decision, ts: '2026-09-28T00:00:01.000Z' });
+    const rows = ownerRows(snapshot({ notifications: [...[1, 2, 3, 4, 5, 6].map(answered), open] }));
+    // Seven rows, one of them owed: it leads although it is the oldest.
+    expect(rows[0]?.actionId).toBe('owner-decision:n01');
+    expect(rows.slice(1).every(isAnsweredRow)).toBe(true);
+    // Within the answered rows the order is still newest first.
+    expect(rows.slice(1).map((row) => row.actionId)).toEqual([6, 5, 4, 3, 2, 1].map((n) => `owner-decision:a0${n}`));
+    const window = ownerWindow(rows, false);
+    expect(window.rows.map((row) => row.actionId)).toContain('owner-decision:n01');
+    // The expander says what it hides: here, only an answered row.
+    expect(ownerHiddenLabel(rows.slice(window.rows.length))).toBe('+1 answered');
+  });
+
+  it('the expander never lumps owed and answered rows together as "pending"', () => {
+    const open = notification('n01', { routing: 'needs-owner', decision });
+    const done = notification('n02', { routing: 'needs-owner', decision, decidedAt: '2026-09-28T00:06:00.000Z', decidedOption: 'delete' });
+    const [openRow] = ownerRows(snapshot({ notifications: [open] }));
+    const [doneRow] = ownerRows(snapshot({ notifications: [done] }));
+    expect(ownerHiddenLabel([openRow!, openRow!])).toBe('+2 older pending');
+    expect(ownerHiddenLabel([doneRow!])).toBe('+1 answered');
+    expect(ownerHiddenLabel([openRow!, doneRow!, doneRow!])).toBe('+1 older pending · +2 answered');
+  });
+
+  it('only a typed decision with a recorded choice is answered, on a row or on a bare notification', () => {
+    expect(isAnsweredNotification({ decision, decidedAt: '2026-09-28T00:06:00.000Z' })).toBe(true);
+    expect(isAnsweredNotification({ decision, decidedAt: null })).toBe(false);
+    expect(isAnsweredNotification({ decision })).toBe(false);
+    // No decision to answer: a stray decidedAt changes nothing, for the
+    // count and for the badge alike.
+    expect(isAnsweredNotification({ decision: null, decidedAt: '2026-09-28T00:06:00.000Z' })).toBe(false);
+    expect(isAnsweredNotification({ decidedAt: '2026-09-28T00:06:00.000Z' })).toBe(false);
   });
 });

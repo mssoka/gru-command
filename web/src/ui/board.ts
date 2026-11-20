@@ -85,10 +85,13 @@ import {
 } from '../lib/board-signals.js';
 import {
   decidedOptionLabel,
+  isAnsweredNotification,
   isDestructiveAsk,
   isNoRecommendation,
   kindOfAsk,
   ownerAttention,
+  ownerCounts,
+  ownerHiddenLabel,
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
@@ -740,8 +743,12 @@ export class BoardView {
     head.id = 'board-owner-head';
     // The pending number rides its own reserved tabular slot (9→10 moves
     // no label), the same contract as the cockpit's counts.
+    // An answered decision keeps its row until its follow-through resolves,
+    // but it is Gru's work now: it leaves the pending count and the headline
+    // (owner pick 2026-11-20) and is named on its own line.
+    const counts = ownerCounts(rows);
     const count = el('span', 'board-band__count lbl');
-    count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
+    count.append(el('span', 'num board-band__count-num', String(counts.needsYou)), document.createTextNode(' pending'));
     head.append(el('span', 'board-band__label', 'FOR YOU'), count);
     // The attention card (cockpit rework): what needs you, then one line
     // about Gru's own queue (NEEDS GRU — the live machine count the strip's
@@ -757,9 +764,29 @@ export class BoardView {
     if (rows.length > 0) {
       const summary = el('div', 'board-owner__summary');
       summary.append(
-        el('span', 'board-owner__headline', `${rows.length} ${rows.length === 1 ? 'thing needs' : 'things need'} you`),
-        gruLine('lbl board-owner__gru'),
+        el(
+          'span',
+          'board-owner__headline',
+          counts.needsYou === 0
+            ? 'Nothing needs you'
+            : `${counts.needsYou} ${counts.needsYou === 1 ? 'thing needs' : 'things need'} you`,
+        ),
       );
+      if (counts.answered > 0) {
+        summary.append(
+          el(
+            'span',
+            'lbl board-owner__answered',
+            `Gru is carrying out ${counts.answered} ${counts.answered === 1 ? 'answer' : 'answers'}`,
+          ),
+        );
+      }
+      // "nothing needs Gru either" would contradict the line before it while
+      // Gru is carrying out an answer: the quiet line steps aside then. A
+      // last-known board keeps it (it carries the last-known marker), and a
+      // busy machine queue is always named.
+      const gruQuiet = snapshot.unackedActionRequired === 0 && !this.lastKnown();
+      if (!(counts.answered > 0 && gruQuiet)) summary.append(gruLine('lbl board-owner__gru'));
       mount.append(summary);
     }
     mount.hidden = false;
@@ -793,7 +820,7 @@ export class BoardView {
       }
       mount.append(list);
       if (window.hidden > 0) {
-        const more = el('button', 'board-band__more', `+${window.hidden} older pending`);
+        const more = el('button', 'board-band__more', ownerHiddenLabel(rows.slice(window.rows.length)));
         more.type = 'button';
         more.setAttribute('aria-expanded', String(this.ownerExpanded));
         more.addEventListener('click', () => {
@@ -3421,8 +3448,11 @@ export class BoardView {
       // Only needs-owner rings the shoulder; machine/fyi rows live in the
       // panel bands and reach Gru through the wake path instead.
       if (notification.routing !== 'needs-owner') continue;
-      // History and already-handled rows (acked on ANY device) never toast.
+      // History and already-handled rows (acked on ANY device) never toast,
+      // and neither does a decision that arrives already answered (the owner
+      // answered it on another device): nothing is asked of them here.
       if (firstRender || notification.ackedAt !== null || notification.resolvedAt !== null) continue;
+      if (isAnsweredNotification(notification)) continue;
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }
@@ -3450,13 +3480,28 @@ export class BoardView {
   /** Badge = unacked needs-owner items not yet seen here, at ANY severity
    * (panel-open marks seen; an ack from ANY device clears it via ackedAt).
    * Machine (action-required) and FYI rows never count — they are not the
-   * owner's shoulder. */
-  private updateBadge(notifications: readonly { id: string; routing: string; severity: string; ackedAt: string | null; resolvedAt: string | null }[]): void {
+   * owner's shoulder — and neither does a decision the owner has already
+   * answered. */
+  private updateBadge(
+    notifications: readonly {
+      id: string;
+      routing: string;
+      severity: string;
+      ackedAt: string | null;
+      resolvedAt: string | null;
+      decision?: unknown;
+      decidedAt?: string | null;
+    }[],
+  ): void {
+    // An answered decision is Gru's work now: it never rings as unread on a
+    // browser that has not shown it (owner pick 2026-11-20). The same rule
+    // as the band's count (isAnsweredNotification).
     const unseen = notifications.filter(
       (n) =>
         n.routing === 'needs-owner' &&
         n.ackedAt === null &&
         n.resolvedAt === null &&
+        !isAnsweredNotification(n) &&
         !this.seenOwnerIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);

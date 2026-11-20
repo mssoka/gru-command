@@ -16,7 +16,9 @@
  *   - PR rows: the server-computed, evidence-bound `ownerPrs` projection
  *     (the browser never re-derives merge readiness).
  *
- * Ordering is deterministic (newest first, action id tiebreak) and row
+ * Ordering is deterministic (what still needs the owner first, then
+ * answers awaiting follow-through; newest first and action id tiebreak
+ * within each) and row
  * ids are stable across renders so focus, aria and tests address the same
  * control before and after a snapshot push. No text-based dedupe, no
  * grouping, no bulk actions, and never an action derived from prose.
@@ -152,15 +154,69 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
   for (const pr of snapshot.ownerPrs ?? []) {
     rows.push({ kind: 'pr', actionId: pr.id, ts: pr.checkedAt, pr });
   }
-  return rows.sort((left, right) => right.ts.localeCompare(left.ts) || left.actionId.localeCompare(right.actionId));
+  // What still needs the owner comes first, newest first; answers Gru is
+  // carrying out follow, newest first. The band shows a window of the first
+  // rows, so an open question can never sit behind answered cards while the
+  // header says it is waiting.
+  const answeredLast = (row: OwnerRow): number => (isAnsweredRow(row) ? 1 : 0);
+  return rows.sort(
+    (left, right) =>
+      answeredLast(left) - answeredLast(right) || right.ts.localeCompare(left.ts) || left.actionId.localeCompare(right.actionId),
+  );
 }
 
-/** The pending count shown in the band header — owed actions, not unseen
- * rows. Opening the board or the bell never changes it. A recorded
- * decision keeps its row visible (awaiting follow-through) until the
- * producer resolves it, exactly like an unanswered one. */
+/** True for a decision the owner has ANSWERED: its row stays on the band
+ * until the producer resolves it (follow-through stays distinct from the
+ * choice), but the ball is with Gru — it no longer needs the owner. */
+export function isAnsweredRow(row: OwnerRow): boolean {
+  return row.kind === 'decision' && isAnsweredNotification(row.notification);
+}
+
+/** The same rule on a bare notification, for the surfaces that never build
+ * rows (the bell badge, toasts): a typed decision with a recorded choice.
+ * A row with no decision cannot be answered, whatever else it carries. */
+export function isAnsweredNotification(notification: {
+  readonly decision?: unknown;
+  readonly decidedAt?: string | null;
+}): boolean {
+  return (
+    notification.decision !== null &&
+    notification.decision !== undefined &&
+    notification.decidedAt !== null &&
+    notification.decidedAt !== undefined
+  );
+}
+
+/** The expander's words for the rows behind the window: what is still owed
+ * and what is already answered are never lumped together as "pending". */
+export function ownerHiddenLabel(hidden: readonly OwnerRow[]): string {
+  const answered = hidden.filter(isAnsweredRow).length;
+  const owed = hidden.length - answered;
+  if (owed > 0 && answered > 0) return `+${owed} older pending · +${answered} answered`;
+  return owed > 0 ? `+${owed} older pending` : `+${answered} answered`;
+}
+
+export interface OwnerCounts {
+  /** Rows that still need the owner: open decisions, notices, proposals
+   * and ready PRs/MRs. */
+  readonly needsYou: number;
+  /** Answered decisions Gru is carrying out. */
+  readonly answered: number;
+}
+
+/** What the band header counts (owner pick 2026-11-20): an answered
+ * decision keeps its row visible until its follow-through resolves, but it
+ * is counted as Gru's work, never as something the owner still owes. */
+export function ownerCounts(rows: readonly OwnerRow[]): OwnerCounts {
+  const answered = rows.filter(isAnsweredRow).length;
+  return { needsYou: rows.length - answered, answered };
+}
+
+/** The pending count shown in the band header and the section strip —
+ * owed actions, not unseen rows, and not answers awaiting follow-through.
+ * Opening the board or the bell never changes it. */
 export function ownerPendingCount(snapshot: BoardSnapshot): number {
-  return ownerRows(snapshot).length;
+  return ownerCounts(ownerRows(snapshot)).needsYou;
 }
 
 /** What the FOR YOU pill says is waiting (owner look 2026-11-20):
@@ -174,9 +230,7 @@ export type OwnerAttention = 'question' | 'ready' | 'answered' | 'clear';
 
 export function ownerAttention(rows: readonly OwnerRow[]): OwnerAttention {
   if (rows.length === 0) return 'clear';
-  const answered = (row: OwnerRow): boolean =>
-    row.kind === 'decision' && row.notification.decidedAt !== null && row.notification.decidedAt !== undefined;
-  if (rows.some((row) => row.kind !== 'pr' && !answered(row))) return 'question';
+  if (rows.some((row) => row.kind !== 'pr' && !isAnsweredRow(row))) return 'question';
   return rows.some((row) => row.kind === 'pr') ? 'ready' : 'answered';
 }
 
