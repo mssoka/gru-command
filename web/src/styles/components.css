@@ -365,6 +365,41 @@ body {
   color: var(--muted);
 }
 
+/* One calm line (owner pick 2026-11-20): readings that need no look fold
+   behind "details"; a reading that needs a look always shows. With nothing
+   to show, the list gives up its reserved room too. */
+.command-health[data-details='closed'] .command-health__part[data-problem='false'] {
+  display: none;
+}
+
+.command-health[data-details='closed'] .command-health__parts:not(:has([data-problem='true'])) {
+  display: none;
+}
+
+.command-health__more {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.command-health__more:hover {
+  color: var(--ink);
+}
+
+.command-health__more:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 .command-health__part + .command-health__part::before {
   content: '·';
   margin: 0 6px;
@@ -432,6 +467,9 @@ body {
   .command-health__parts { order: 1; flex: 1 1 100%; white-space: normal; }
   .command-health:not([data-state='attention']) .command-health__parts,
   .command-health__part[data-problem='false'] { display: none; }
+  /* A phone always folds the calm readings (the rule above), so the
+     "details" control has nothing to show here and would only cost room. */
+  .command-health__more { display: none; }
   .command-health .board-decisions,
   .command-health .board-wakes { white-space: normal; }
 }

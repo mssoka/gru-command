@@ -327,6 +327,8 @@ export class BoardView {
   private extraReceipts: NotificationView[] = [];
   /** Unique ids for "Gru's pick" tags (see pickTag). */
   private pickTagSeq = 0;
+  /** Whether the health pill shows its calm readings (remembered per browser). */
+  private healthDetailsOpen = readHealthDetailsPref();
   /** Open Details disclosures, keyed by notification id — a snapshot push
    * never collapses what the operator opened. */
   private readonly openNotificationDetails = new Set<string>();
@@ -1469,6 +1471,10 @@ export class BoardView {
     this.healthMount.dataset.lastKnown = String(pill.lastKnown);
     this.healthMount.title = pill.title;
     this.healthSummary.textContent = pill.summary;
+    // One calm line (owner pick 2026-11-20): the readings that need no look
+    // fold behind "details"; a reading that needs a look always shows, by
+    // name. The choice is the operator's and is remembered on this browser.
+    this.syncHealthDetails(pill.parts.filter((part) => !part.problem).length);
     this.healthParts.replaceChildren();
     for (const part of pill.parts) {
       const node = el('span', `command-health__part command-health__part--${part.tone}`);
@@ -1482,6 +1488,43 @@ export class BoardView {
       this.healthParts.append(node);
     }
     this.renderTrackerChips(snapshot);
+  }
+
+  /** The health pill's "details" control: created once beside the summary,
+   * shown only while there are calm readings to fold, and kept in step with
+   * the remembered choice. */
+  private syncHealthDetails(calm: number): void {
+    let toggle = this.healthMount.querySelector<HTMLButtonElement>('.command-health__more');
+    if (toggle === null) {
+      toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'command-health__more';
+      toggle.setAttribute('aria-controls', this.healthParts.id);
+      toggle.addEventListener('click', () => {
+        this.healthDetailsOpen = !this.healthDetailsOpen;
+        writeHealthDetailsPref(this.healthDetailsOpen);
+        this.applyHealthDetails();
+      });
+      this.healthSummary.after(toggle);
+    }
+    toggle.hidden = calm === 0;
+    toggle.dataset.calm = String(calm);
+    this.applyHealthDetails();
+  }
+
+  private applyHealthDetails(): void {
+    const toggle = this.healthMount.querySelector<HTMLButtonElement>('.command-health__more');
+    this.healthMount.dataset.details = this.healthDetailsOpen ? 'open' : 'closed';
+    if (toggle === null) return;
+    const calm = Number(toggle.dataset.calm ?? '0');
+    toggle.textContent = this.healthDetailsOpen ? 'hide details' : 'details';
+    toggle.setAttribute('aria-expanded', String(this.healthDetailsOpen));
+    toggle.setAttribute(
+      'aria-label',
+      this.healthDetailsOpen
+        ? 'System health: hide the readings that need no look'
+        : `System health: show ${calm} ${calm === 1 ? 'reading' : 'readings'} that ${calm === 1 ? 'needs' : 'need'} no look`,
+    );
   }
 
   /** Six KPI cards (five when the server sends no raids block): a headline
@@ -3778,6 +3821,26 @@ interface DecisionSubmission {
   phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
   message: string | null;
   reconcileAfterSnapshotRevision: number | null;
+}
+
+const HEALTH_DETAILS_KEY = 'gru-command.health-details';
+
+/** The remembered "show the calm health readings" choice. Storage that is
+ * unavailable (private mode, a test DOM without it) reads as closed. */
+function readHealthDetailsPref(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(HEALTH_DETAILS_KEY) === 'open';
+  } catch {
+    return false;
+  }
+}
+
+function writeHealthDetailsPref(open: boolean): void {
+  try {
+    globalThis.localStorage?.setItem(HEALTH_DETAILS_KEY, open ? 'open' : 'closed');
+  } catch {
+    // The choice still holds for this page; it is just not remembered.
+  }
 }
 
 /** Owner-surface focus (FOR YOU band + bell): stable keys survive the

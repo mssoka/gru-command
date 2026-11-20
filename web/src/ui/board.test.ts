@@ -658,6 +658,49 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect([...pill.querySelectorAll<HTMLElement>('.command-health__part')].map((part) => [part.textContent, part.dataset.problem])).toEqual([['verify lock free', 'false']]);
   });
 
+  it('the health pill folds its calm readings behind "details", keeps problems in view, and remembers the choice', () => {
+    localStorage.removeItem('gru-command.health-details');
+    const view = new BoardView(() => {});
+    const calmVerify = { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 };
+    const busyVerify = { lockInUse: true, activeRuns: 1, queuedRuns: 2, workerBudget: 8, workersPerRun: 4 };
+    view.render(snapshot({ verify: calmVerify }));
+    const pill = document.getElementById('command-health')!;
+    const toggle = pill.querySelector<HTMLButtonElement>('.command-health__more')!;
+    // Healthy: one line, with the calm reading one click away.
+    expect(pill.dataset.details).toBe('closed');
+    expect(toggle.hidden).toBe(false);
+    expect(toggle.textContent).toBe('details');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-controls')).toBe('command-health-parts');
+    expect(toggle.getAttribute('aria-label')).toBe('System health: show 1 reading that needs no look');
+    // The reading itself is still rendered (the stylesheet folds it).
+    expect(pill.querySelector('.command-health__part[data-check="verify"]')?.getAttribute('data-problem')).toBe('false');
+    // The control sits right after the summary and is created once.
+    expect(document.getElementById('command-health-summary')?.nextElementSibling).toBe(toggle);
+    toggle.click();
+    expect(pill.dataset.details).toBe('open');
+    expect(toggle.textContent).toBe('hide details');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(localStorage.getItem('gru-command.health-details')).toBe('open');
+    // A snapshot push keeps the choice and the same control.
+    view.render(snapshot({ verify: calmVerify }));
+    expect(pill.dataset.details).toBe('open');
+    expect(pill.querySelectorAll('.command-health__more')).toHaveLength(1);
+    // Only problems: nothing calm to fold, so the control steps aside and
+    // the problem is marked to stay in view.
+    view.render(snapshot({ verify: busyVerify }));
+    expect(toggle.hidden).toBe(true);
+    expect(pill.querySelector('.command-health__part[data-check="verify"]')?.getAttribute('data-problem')).toBe('true');
+    // A fresh board on the same browser opens the way the operator left it.
+    mountBoardDom();
+    const again = new BoardView(() => {});
+    again.render(snapshot({ verify: calmVerify }));
+    expect(document.getElementById('command-health')!.dataset.details).toBe('open');
+    document.getElementById('command-health')!.querySelector<HTMLButtonElement>('.command-health__more')!.click();
+    expect(localStorage.getItem('gru-command.health-details')).toBe('closed');
+    localStorage.removeItem('gru-command.health-details');
+  });
+
   it('renders every KPI as a data-kpi number matching boardKpis, each beside its visible label', () => {
     const jobs = [
       baseJob({ id: 'w1', status: 'working' }),

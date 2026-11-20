@@ -106,3 +106,20 @@ describe('number cards: even rows', () => {
     expect(declared('.cockpit-card--quiet .cockpit-card__big', 'color')).toBe('var(--muted)');
   });
 });
+
+describe('health pill: one calm line', () => {
+  it('folds only the readings that need no look, and gives up the list\'s room when none shows', () => {
+    expect(declared(".command-health[data-details='closed'] .command-health__part[data-problem='false']", 'display')).toBe('none');
+    expect(
+      declared(".command-health[data-details='closed'] .command-health__parts:not(:has([data-problem='true']))", 'display'),
+    ).toBe('none');
+    // A phone folds the calm readings unconditionally, so the control that
+    // could not show them is hidden there too.
+    expect(COMPONENTS_CSS).toMatch(
+      /@media \(max-width: 640px\) \{[\s\S]*?\.command-health__part\[data-problem='false'\] \{ display: none; \}[\s\S]*?\.command-health__more \{ display: none; \}/u,
+    );
+    // No rule hides a reading that needs a look.
+    expect(COMPONENTS_CSS).not.toMatch(/\.command-health__part\[data-problem='true'\]\s*\{[^}]*display:\s*none/u);
+  });
+});
+
