@@ -125,6 +125,8 @@ const TEXT_PAIRS: readonly (readonly [string, string])[] = [
   ['ink', 'danger-soft'], // error toast (v6.1 themed fill)
   ['muted', 'paper-soft'], // notice line (v6.1 themed fill)
   ['danger', 'card'], // notification option-submit error line
+  ['danger', 'soft'], // the same line on the owner face's calm body
+  ['on-state', 'gru-soft'], // Gru's advice bubble (owner look)
 ];
 
 describe('palette contrast (v5)', () => {
@@ -177,6 +179,73 @@ describe('palette contrast (v5)', () => {
         ['on-state', 'alert'],
         ['ink', 'accent-soft'],
         ['danger', 'card'],
+      ];
+      const failures = pairs
+        .map(([foreground, background]) => ({ pair: `${foreground} on ${background}`, ratio: contrast(vars, foreground, background) }))
+        .filter(({ ratio }) => ratio < 4.5);
+      expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+    });
+  }
+
+  it('the "if you do nothing" line keeps readable ink on an error card (it was pale on pink)', () => {
+    // #570 added the line after the error-surface override was written, so
+    // it kept the muted secondary ink on the alert fill: about 1.2:1 in the
+    // dark theme. It must resolve to the same on-state ink as its siblings.
+    expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__if-nothing')).toBe('on-state');
+  });
+
+  for (const [theme, selector] of [
+    ['light', ':root'],
+    ['dark', '.dark'],
+  ] as const) {
+    it(`the owner look paints explicit AA pairs in the ${theme} theme`, () => {
+      const vars = themeVars(selector);
+      const owner = '.board-notification--owner';
+      // The headline strip: dark ink on coral (a question), on yellow
+      // (answered) and — the ready PR/MR row — on green.
+      expect(declarationIn(COMPONENTS_CSS, `${owner} .board-notification__head`, 'background')).toBe('var(--alert)');
+      expect(colorTokenIn(COMPONENTS_CSS, `${owner} .board-notification__head`)).toBe('on-state');
+      expect(
+        declarationIn(COMPONENTS_CSS, `${owner}.board-notification--decided .board-notification__head`, 'background'),
+      ).toBe('var(--work)');
+      expect(colorTokenIn(COMPONENTS_CSS, `${owner} .board-notification__meta`)).toBe('on-state');
+      expect(declarationIn(COMPONENTS_CSS, '.board-owner__strip', 'background')).toBe('var(--done)');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-owner__strip')).toBe('on-state');
+      // The body is calm whatever the severity: the card no longer floods,
+      // and every line names its own ink instead of inheriting the alert
+      // surface's.
+      expect(declarationIn(COMPONENTS_CSS, owner, 'background')).toBe('var(--soft)');
+      expect(colorTokenIn(COMPONENTS_CSS, owner)).toBe('ink');
+      for (const [child, token] of [
+        ['context', 'ink'],
+        ['question', 'ink'],
+        ['option-label', 'ink'],
+        ['detail-text', 'ink'],
+        ['guidance', 'ink'],
+        ['discuss-text', 'ink'],
+        ['submission', 'ink'],
+        ['why', 'muted'],
+        ['if-nothing', 'muted'],
+        ['option-consequence', 'muted'],
+        ['detail-kind', 'muted'],
+        ['option-error', 'danger'],
+      ] as const) {
+        expect(colorTokenIn(COMPONENTS_CSS, `${owner} .board-notification__${child}`), child).toBe(token);
+      }
+      // Gru's advice: dark ink on the butter bubble in both themes.
+      expect(declarationIn(COMPONENTS_CSS, '.board-notification__gru-bubble', 'background')).toBe('var(--gru-soft)');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification__gru-bubble')).toBe('on-state');
+      const pairs: readonly (readonly [string, string])[] = [
+        ['on-state', 'alert'],
+        ['on-state', 'work'],
+        ['on-state', 'done'],
+        ['ink', 'soft'],
+        ['muted', 'soft'],
+        ['danger', 'soft'],
+        ['ink', 'card'],
+        ['muted', 'card'],
+        ['ink', 'paper'],
+        ['on-state', 'gru-soft'],
       ];
       const failures = pairs
         .map(([foreground, background]) => ({ pair: `${foreground} on ${background}`, ratio: contrast(vars, foreground, background) }))

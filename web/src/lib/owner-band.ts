@@ -41,6 +41,34 @@ export function isNoRecommendation(recommendation: string): boolean {
   return recommendation.startsWith(OWNER_NO_RECOMMENDATION_PREFIX);
 }
 
+export interface KindOfAsk {
+  readonly icon: string;
+  readonly label: string;
+}
+
+/** Plain words for the reserved owner boundary a decision falls under
+ * (`reservedClass`, validated at the server write boundary): the badge on
+ * an owner card says what KIND of ask it is before the owner reads it. */
+const KIND_OF_ASK: Readonly<Record<string, KindOfAsk>> = {
+  merge: { icon: '🔀', label: 'Merge' },
+  'authority-cost': { icon: '🔑', label: 'Access or cost' },
+  destructive: { icon: '⚠️', label: 'Can’t be undone' },
+  'scope-design': { icon: '🧭', label: 'Scope or design' },
+  lessons: { icon: '📖', label: 'Lesson' },
+};
+
+/** The badge for a decision's reserved class; a class this build does not
+ * know gets NO badge (never a guessed label). */
+export function kindOfAsk(reservedClass: string): KindOfAsk | null {
+  return Object.hasOwn(KIND_OF_ASK, reservedClass) ? (KIND_OF_ASK[reservedClass] ?? null) : null;
+}
+
+/** A destructive or irreversible ask: the one kind whose card carries the
+ * red edge as well as the badge. */
+export function isDestructiveAsk(reservedClass: string): boolean {
+  return reservedClass === 'destructive';
+}
+
 export interface OwnerDecisionRow {
   readonly kind: 'decision';
   readonly actionId: string;
@@ -133,6 +161,23 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
  * producer resolves it, exactly like an unanswered one. */
 export function ownerPendingCount(snapshot: BoardSnapshot): number {
   return ownerRows(snapshot).length;
+}
+
+/** What the FOR YOU pill says is waiting (owner look 2026-11-20):
+ *   - `question`: something only the owner can answer or do — an open
+ *     decision, an owner notice, or a lesson proposal;
+ *   - `ready`: only good news is waiting — ready PRs/MRs (and, at most,
+ *     answers Gru is already carrying out);
+ *   - `answered`: only answers awaiting Gru's follow-through;
+ *   - `clear`: nothing. */
+export type OwnerAttention = 'question' | 'ready' | 'answered' | 'clear';
+
+export function ownerAttention(rows: readonly OwnerRow[]): OwnerAttention {
+  if (rows.length === 0) return 'clear';
+  const answered = (row: OwnerRow): boolean =>
+    row.kind === 'decision' && row.notification.decidedAt !== null && row.notification.decidedAt !== undefined;
+  if (rows.some((row) => row.kind !== 'pr' && !answered(row))) return 'question';
+  return rows.some((row) => row.kind === 'pr') ? 'ready' : 'answered';
 }
 
 /** How many rows render before the "+N older" expander. Nothing is ever

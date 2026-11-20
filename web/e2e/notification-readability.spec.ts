@@ -984,7 +984,8 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         expect(await computedFontSize(page, panelMachineDetailSelector)).toBeCloseTo(beforeFonts.panelDetail * 2, 1);
         expect(await computedFontSize(page, relativeProbeSelector)).toBeCloseTo(beforeFonts.relative * 2, 1);
         expect(await computedFontSize(page, metaSelector)).toBe(22);
-        expect(await computedFontSize(page, optionSelector)).toBe(24);
+        // The owner look's choice button reads at 14px (it was a 12px pill).
+        expect(await computedFontSize(page, optionSelector)).toBe(28);
         const after = await page.evaluate(() => {
           const composer = document.querySelector<HTMLElement>('#chat-input');
           const panel = document.getElementById('notification-panel');
@@ -1019,7 +1020,12 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         // needs more vertical space and never more than its container.
         const titleAfter = await page.locator(titleSelector).boundingBox();
         expect(titleAfter!.height).toBeGreaterThan(titleBefore!.height);
-        expect(titleAfter!.width).toBeLessThanOrEqual(titleBefore!.width + 1);
+        // On the owner look the title shares the headline strip with the
+        // kind badge and the time label; once those wrap under it the title
+        // may take the whole strip row — but never more than the strip.
+        const stripAfter = await card.locator('.board-notification__head').boundingBox();
+        expect(titleAfter!.x).toBeGreaterThanOrEqual(stripAfter!.x - 1);
+        expect(titleAfter!.x + titleAfter!.width).toBeLessThanOrEqual(stripAfter!.x + stripAfter!.width + 1);
 
         // Full expanded content: geometry, non-overlap, reachability.
         const detailBox = await detail.boundingBox();
