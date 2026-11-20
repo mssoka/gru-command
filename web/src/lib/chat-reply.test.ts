@@ -48,9 +48,57 @@ describe('a reply that resumes after tool work', () => {
     expect(resumeReplyText('~~~\ncode\n```', 'more')).toBe('~~~\ncode\n```more');
   });
 
-  it('a finished-looking abbreviation followed by a continuation is not split', () => {
+  it('text that plainly carries on is joined as written, even after a full stop or on a block line cut mid-way', () => {
+    // White space, a comma, a semicolon or a closing bracket cannot begin a
+    // new part of the reply.
     expect(resumeReplyText('Check the config, e.g.', ' the port.')).toBe('Check the config, e.g. the port.');
-    expect(resumeReplyText('It works on v2.', 'x and later.')).toBe('It works on v2.x and later.');
+    expect(resumeReplyText('The count is 3', ', as expected.')).toBe('The count is 3, as expected.');
+    expect(resumeReplyText('It passed', '; nothing else changed.')).toBe('It passed; nothing else changed.');
+    expect(resumeReplyText('(see the log', ') for details.')).toBe('(see the log) for details.');
+    // A list item, a heading and a table row that the tool work cut mid-way
+    // keep their tail on the same line.
+    expect(resumeReplyText('1. First I checked the', ' config file.')).toBe('1. First I checked the config file.');
+    expect(resumeReplyText('## Summary of the', ' findings')).toBe('## Summary of the findings');
+    expect(resumeReplyText('| 1 |', ' 2 |')).toBe('| 1 | 2 |');
+  });
+
+  it('after a finished sentence, a word with no space before it begins a new paragraph', () => {
+    // Text resumes at the start of a new block: "npm" is a new sentence, and
+    // gluing it gave "Done.npm test passes now."
+    expect(resumeReplyText('Done.', 'npm test passes now.')).toBe('Done.\n\nnpm test passes now.');
+    expect(resumeReplyText('Done.', '3 files changed.')).toBe('Done.\n\n3 files changed.');
+  });
+
+  it('a list or a table that carries on stays one list, one table', () => {
+    expect(resumeReplyText('- read the file', '- ran the tests')).toBe('- read the file\n- ran the tests');
+    expect(resumeReplyText('1. read the file', '2. ran the tests')).toBe('1. read the file\n2. ran the tests');
+    expect(resumeReplyText('| lint | ok |', '| types | ok |')).toBe('| lint | ok |\n| types | ok |');
+  });
+
+  it('a closing fence and a rule line always end their line; a longer or labelled fence is not closed by a shorter one', () => {
+    const closed = 'Fix:\n```ts\nconst a = 1;\n```';
+    // Even text that opens with a space cannot share the fence's line.
+    expect(resumeReplyText(closed, ' The tests pass.')).toBe(`${closed}\n\n The tests pass.`);
+    expect(resumeReplyText('Done.\n\n---', 'Next part.')).toBe('Done.\n\n---\n\nNext part.');
+    // Four backticks are closed only by four or more: three inside are code.
+    const longOpen = '````\ncode\n```';
+    expect(resumeReplyText(longOpen, 'still code')).toBe(`${longOpen}still code`);
+    const longClosed = `${longOpen}\n${'`'.repeat(4)}`;
+    expect(resumeReplyText(longClosed, 'After the block.')).toBe(`${longClosed}\n\nAfter the block.`);
+    // A fence line with an info string opens a block; it never closes one.
+    const labelled = '```sh\nnpm test\n```ts';
+    expect(resumeReplyText(labelled, 'more code')).toBe(`${labelled}more code`);
+  });
+
+  it('is re-joined as resumed text arrives: one token alone does not decide', () => {
+    // Live text comes a token at a time. "-" is not yet a list item…
+    expect(resumeReplyText('What I found', '-')).toBe('What I found-');
+    // …and the same seam, joined again once more has arrived, is.
+    expect(resumeReplyText('What I found', '- the port is taken')).toBe('What I found\n\n- the port is taken');
+    expect(resumeReplyText('Done', '##')).toBe('Done##');
+    expect(resumeReplyText('Done', '## Next')).toBe('Done\n\n## Next');
+    expect(resumeReplyText('Steps so far', '1')).toBe('Steps so far1');
+    expect(resumeReplyText('Steps so far', '1. read the file')).toBe('Steps so far\n\n1. read the file');
   });
 
   it('leaves a break that either side already carries, and an empty side, alone', () => {

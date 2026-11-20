@@ -71,7 +71,8 @@ interface PendingResetView {
   readonly streamingBubble: HTMLElement | null;
   readonly streamingBody: HTMLElement | null;
   readonly streamText: string;
-  readonly streamResumesAfterTool: boolean;
+  readonly streamSeamBefore: string | null;
+  readonly streamSeamAfter: string;
   readonly streamOpen: boolean;
   readonly activeTool: HTMLElement | null;
   readonly activeToolBand: ServiceBand | null;
@@ -116,9 +117,11 @@ export class ChatView {
   private streamingBubble: HTMLElement | null = null;
   private streamingBody: HTMLElement | null = null;
   private streamText = '';
-  /** Tool work arrived after this stream's text: the next text delta starts
-   * a new paragraph (see chat-reply.ts). */
-  private streamResumesAfterTool = false;
+  /** Tool work arrived after this stream's text: the reply as it stood then
+   * (null while no tool work has interrupted the text), and everything that
+   * has resumed since. `streamText` is their join (see chat-reply.ts). */
+  private streamSeamBefore: string | null = null;
+  private streamSeamAfter = '';
   /** True between turn:start (or the first bare delta of a partial replay)
    * and closeStream/markStreamIncomplete. The bubble's DOM is created
    * lazily on the first text delta, so tool-only turns leave no stub. */
@@ -411,7 +414,8 @@ export class ChatView {
       streamingBubble: this.streamingBubble,
       streamingBody: this.streamingBody,
       streamText: this.streamText,
-      streamResumesAfterTool: this.streamResumesAfterTool,
+      streamSeamBefore: this.streamSeamBefore,
+      streamSeamAfter: this.streamSeamAfter,
       streamOpen: this.streamOpen,
       activeTool: this.activeTool,
       activeToolBand: this.activeToolBand,
@@ -425,7 +429,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
-    this.streamResumesAfterTool = false;
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
     this.streamOpen = false;
     this.activeTool = null;
     this.activeToolBand = null;
@@ -449,7 +454,8 @@ export class ChatView {
     this.streamingBubble = prior.streamingBubble;
     this.streamingBody = prior.streamingBody;
     this.streamText = prior.streamText;
-    this.streamResumesAfterTool = prior.streamResumesAfterTool;
+    this.streamSeamBefore = prior.streamSeamBefore;
+    this.streamSeamAfter = prior.streamSeamAfter;
     this.streamOpen = prior.streamOpen;
     this.activeTool = prior.activeTool;
     this.activeToolBand = prior.activeToolBand;
@@ -941,7 +947,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
-    this.streamResumesAfterTool = false;
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
     this.streamOpen = false;
     this.activeTool = null;
     this.activeToolBand = null;
@@ -1023,12 +1030,15 @@ export class ChatView {
         // never leaves an empty stub.
         this.closeServiceBand();
         if (!this.streamOpen) this.openStream();
-        // Text that resumes after tool work is a new part of the reply: it
-        // starts its own paragraph instead of running into the sentence
-        // written before the tool call (owner pick 2026-11-20).
-        if (this.streamResumesAfterTool && frame.text !== '') {
-          this.streamText = resumeReplyText(this.streamText, frame.text);
-          this.streamResumesAfterTool = false;
+        // Text that resumes after tool work is joined to the reply so it
+        // neither runs into the sentence written before the tool call nor
+        // corrupts a markdown block (owner pick 2026-11-20).
+        // The join is re-made from ALL the resumed text as it arrives: live
+        // text comes a token at a time, and the first token alone ("-",
+        // "1", a single backtick) does not yet say what the text is.
+        if (this.streamSeamBefore !== null) {
+          this.streamSeamAfter += frame.text;
+          this.streamText = resumeReplyText(this.streamSeamBefore, this.streamSeamAfter);
         } else {
           this.streamText += frame.text;
         }
@@ -1045,7 +1055,10 @@ export class ChatView {
       case 'tool': {
         // Tool work inside a reply that already has text: the next text is
         // a new part of it.
-        if (this.streamOpen && this.streamText.trim() !== '') this.streamResumesAfterTool = true;
+        if (this.streamOpen && this.streamText.trim() !== '') {
+          this.streamSeamBefore = this.streamText;
+          this.streamSeamAfter = '';
+        }
         if (frame.state === 'start') {
           this.activeTool?.remove();
           if (this.activeToolBand !== null) {
@@ -1175,7 +1188,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
-    this.streamResumesAfterTool = false;
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
   }
 
   /** Lazily create the Gru bubble for the first text delta of a stream. */
@@ -1203,7 +1217,8 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
-    this.streamResumesAfterTool = false;
+    this.streamSeamBefore = null;
+    this.streamSeamAfter = '';
   }
 
   /** A dropped socket mid-turn leaves the bubble marked incomplete. */

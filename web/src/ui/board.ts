@@ -2526,6 +2526,15 @@ export class BoardView {
     // A snapshot push rebuilds the rail: a focused "show all" control keeps
     // its place.
     const crewToggleFocused = document.activeElement instanceof HTMLElement && document.activeElement.dataset.section === 'crew-all';
+    // Rebuilding the rail empties it for a moment. Shown in full it holds up
+    // the page's height, so the page (or the pane that scrolls it) was
+    // clamped to the top and the reader lost their place on every push.
+    // Whatever scrolls around the rail is put back where it was.
+    const restoreScroll = keepScrollAround(rail);
+    // The focused control is about to be removed. Let go of focus while the
+    // rail is still whole: a browser that settles focus on removal does its
+    // layout work now, not while the rail is empty.
+    if (crewToggleFocused && document.activeElement instanceof HTMLElement) document.activeElement.blur();
     rail.replaceChildren();
     rail.classList.toggle('board-agents--all', this.crewExpanded);
     this.ensureAgeTicker();
@@ -2556,6 +2565,7 @@ export class BoardView {
     );
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no crew yet'));
+      restoreScroll();
       return;
     }
     // Membership-first order arrives from the server; disposed rows collapse
@@ -2636,6 +2646,7 @@ export class BoardView {
       }
     }
     this.appendCrewToggle(rail, agents, crewToggleFocused);
+    restoreScroll();
   }
 
   /** The rail scrolls inside a fixed height, so a long crew ended on half a
@@ -3862,6 +3873,26 @@ interface DecisionSubmission {
   phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
   message: string | null;
   reconcileAfterSnapshotRevision: number | null;
+}
+
+/** Remember where the window, `node` and every scrolling ancestor of it are
+ * scrolled, and return a function that puts back any that moved. */
+function keepScrollAround(node: HTMLElement): () => void {
+  const view = node.ownerDocument.defaultView;
+  const windowAt = view === null ? null : { x: view.scrollX, y: view.scrollY };
+  const scrolled: { readonly el: HTMLElement; readonly top: number; readonly left: number }[] = [];
+  for (let parent: HTMLElement | null = node; parent !== null; parent = parent.parentElement) {
+    if (parent.scrollTop !== 0 || parent.scrollLeft !== 0) scrolled.push({ el: parent, top: parent.scrollTop, left: parent.scrollLeft });
+  }
+  return () => {
+    for (const { el: parent, top, left } of scrolled) {
+      if (parent.scrollTop !== top) parent.scrollTop = top;
+      if (parent.scrollLeft !== left) parent.scrollLeft = left;
+    }
+    if (view !== null && windowAt !== null && (view.scrollX !== windowAt.x || view.scrollY !== windowAt.y)) {
+      view.scrollTo(windowAt.x, windowAt.y);
+    }
+  };
 }
 
 const HEALTH_DETAILS_KEY = 'gru-command.health-details';

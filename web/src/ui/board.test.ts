@@ -6124,12 +6124,37 @@ describe('crew rail — show all (owner pick 2026-11-20)', () => {
     };
     try {
       view.render(snapshot({ jobs: [], agents: crew }));
+      // Show all, then fold a list that now fits: the control leaves and
+      // focus goes to the rail itself, by the same rule.
+      rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.click();
+      sizeRail(300, 420);
       rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.click();
     } finally {
       HTMLElement.prototype.focus = original;
     }
-    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(document.activeElement).toBe(rail);
+    expect(calls.length).toBeGreaterThanOrEqual(3);
     for (const options of calls) expect(options).toEqual({ preventScroll: true });
+  });
+
+  it('a push lets go of the focused control before emptying the rail, then takes focus back', () => {
+    // A browser that settles focus when the focused element is removed does
+    // layout at that moment; with the rail empty, the page it holds up
+    // collapses and the reader is thrown to the top.
+    const rail = sizeRail(900, 420);
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: crew }));
+    const first = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    first.focus();
+    let rowsWhenBlurred = -1;
+    first.addEventListener('blur', () => {
+      rowsWhenBlurred = rail.querySelectorAll('.board-agent').length;
+    });
+    view.render(snapshot({ jobs: [], agents: crew }));
+    expect(rowsWhenBlurred).toBe(crew.length);
+    const next = rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!;
+    expect(next).not.toBe(first);
+    expect(document.activeElement).toBe(next);
   });
 });
 

@@ -302,6 +302,44 @@ describe('a reply interrupted by tool work reads as separate paragraphs (owner p
     expect(paragraphs()).toEqual(['Here is the fix:', 'The tests pass.', 'Both rows match.']);
   });
 
+  it('resumed text that arrives a token at a time is still recognised: a list is a list, a heading a heading', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('What I found'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    // The marker and its text arrive as separate deltas, as they do live.
+    view.addFrame(delta('-'), true);
+    view.addFrame(delta(' the port'), true);
+    view.addFrame(delta(' is taken'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta('##'), true);
+    view.addFrame(delta(' Next'), true);
+    view.addFrame(turn('end'), true);
+    const bubble = bubbles()[0]!;
+    expect(paragraphs()[0]).toBe('What I found');
+    expect([...bubble.querySelectorAll('li')].map((item) => item.textContent?.trim())).toEqual(['the port is taken']);
+    expect(bubble.querySelector('h2')?.textContent).toBe('Next');
+    expect(bubble.textContent).not.toContain('found-');
+    expect(bubble.textContent).not.toContain('##');
+  });
+
+  it('two list items either side of tool work render as one list', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('Steps:\n- read the file'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta('- ran the tests'), true);
+    view.addFrame(turn('end'), true);
+    const bubble = bubbles()[0]!;
+    expect(bubble.querySelectorAll('ul')).toHaveLength(1);
+    expect([...bubble.querySelectorAll('li')].map((item) => item.textContent?.trim())).toEqual(['read the file', 'ran the tests']);
+  });
+
   it('a long reply wears the calm bubble; a short one keeps the bright one', () => {
     const view = new ChatView(() => true);
     view.reset();

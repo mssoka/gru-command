@@ -454,10 +454,14 @@ pass):
   that lifts the height limit.
 - **FOR GRU.** Its counts use real singular and plural forms.
 - **Chat replies.** The parts of a reply used to run together across tool
-  calls. Text that resumes after tool work now starts its own paragraph
-  after a finished sentence and around a markdown block (a code block, a
-  table, a heading, a list); a sentence the tool work interrupted mid-way
-  is joined as written (`web/src/lib/chat-reply.ts`). A reply
+  calls. Text that resumes after tool work is now joined by a rule
+  (`web/src/lib/chat-reply.ts`), re-applied as the resumed text arrives: a
+  new paragraph after a finished sentence, after a closed code block, a
+  heading, a table or a list, and before text that opens one; the next
+  line of the same list or table when it carries on; and exactly as
+  written when the text plainly continues (it opens with white space or
+  closing punctuation), inside a code block that is still open, or when
+  the tool work interrupted a sentence mid-way. A reply
   longer than about six lines reads on the pale butter bubble
   (`--gru-soft`) while short replies keep the bright yellow. The composer
   is unchanged.

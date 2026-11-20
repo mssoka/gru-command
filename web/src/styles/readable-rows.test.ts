@@ -93,6 +93,14 @@ describe('number cards: even rows', () => {
     const narrow = rule(`(width < ${from(3)}px)`);
     expect(narrow).toContain(".cockpit-kpis__grid[data-count='7'] > .cockpit-card:last-child");
     expect(narrow).toContain('grid-column: span 2;');
+    // Two neighbouring ranges can both match at a fractional width in
+    // Chromium (559.98px). The narrow rule is last and resets the spans the
+    // wider rules set, so it wins outright instead of mixing with them.
+    expect(narrow).toContain(".cockpit-kpis__grid[data-count='7'] > .cockpit-card,");
+    expect(narrow).toContain(".cockpit-kpis__grid[data-count='5'] > .cockpit-card { grid-column: auto; }");
+    expect(narrow.indexOf('grid-column: auto;')).toBeLessThan(narrow.indexOf('grid-column: span 2;'));
+    const lastKpiQuery = [...COMPONENTS_CSS.matchAll(/@container kpis \(([^)]*)\)/gu)].map((match) => match[1]!).at(-1);
+    expect(lastKpiQuery).toBe(`width < ${from(3)}px`);
   });
 
   it('six cards split 3 + 3 and five split 3 + 2, each up to the width that fits them in one row', () => {
@@ -108,9 +116,12 @@ describe('number cards: even rows', () => {
     // `(min-width: 750px) and (max-width: 1319px)` left 749.5px and 1319.5px
     // to auto-fit, which packs 6 + 1 or 3 + 3 + 1.
     const queries = [...COMPONENTS_CSS.matchAll(/@container kpis \(([^)]*)\)/gu)].map((match) => match[1]!);
+    // EVERY strip query is a range, the two-column floor included: none
+    // keeps an integer min-/max-width bound a fractional width can miss.
+    expect(queries.length).toBeGreaterThanOrEqual(6);
+    expect(queries.filter((query) => /min-width|max-width/u.test(query))).toEqual([]);
+    expect(queries).toContain('width < 370px');
     const evenRows = queries.filter((query) => query.includes('width <'));
-    expect(evenRows.length).toBeGreaterThanOrEqual(5);
-    for (const query of evenRows) expect(query, query).not.toMatch(/min-width|max-width/u);
     // Seven cards: the three ranges meet exactly at the widths where a row
     // gains a card, from zero up to the one-row width.
     expect(evenRows).toContain(`width < ${from(3)}px`);
@@ -149,6 +160,9 @@ describe('crew rail: a readable role line', () => {
     expect(declared('.board-agent__sub', 'white-space')).toBeNull();
     expect(declared('.board-agent__sub', 'overflow')).toBeNull();
     expect(declared('.board-agent__role', 'flex')).toBe('none');
+    // A long role wraps its own words beside its emoji: it is never wider
+    // than the line less the emoji, so it cannot drop below it.
+    expect(declared('.board-agent__role', 'max-width')).toBe('calc(100% - 2em)');
     expect(declared('.board-agent__role', 'text-overflow')).toBeNull();
     // Nothing on the line is wider than the line: a long chip wraps inside
     // the rail instead of printing over the state chip.
@@ -162,8 +176,11 @@ describe('crew rail: a readable role line', () => {
 
   it('the name gets the room before the ID code, and "show all" is pinned to the list\'s bottom edge', () => {
     expect(declared('.board-agent__hash', 'flex')).toBe('0 100 auto');
-    // …but never to nothing: the code is what tells same-named crew apart.
-    expect(declared('.board-agent__hash', 'min-width')).toBe('4ch');
+    // …but never below four characters: the code is what tells same-named
+    // crew apart. `4ch` alone held two (it leaves out the letter spacing
+    // after each character), so the floor adds it.
+    expect(declared('.board-agent__hash', 'letter-spacing')).toBe('0.04em');
+    expect(declared('.board-agent__hash', 'min-width')).toBe('calc(4ch + 4 * 0.04em + 1px)');
     expect(declared('.board-agent__hash', 'text-overflow')).toBe('ellipsis');
     expect(declared('.board-agent-toggle.board-agents__all', 'position')).toBe('sticky');
     expect(declared('.board-agent-toggle.board-agents__all', 'bottom')).toBe('0');

@@ -1329,6 +1329,70 @@ test('the health pill folds its calm readings behind "details", shows a problem 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
+for (const [width, height] of [[1000, 700], [1500, 700]] as const) {
+  test(`a push never moves the reader while the crew list is shown in full (${width}×${height})`, async ({ page }) => {
+    await page.setViewportSize({ width, height });
+    const crew = (count: number): Record<string, unknown>[] =>
+      Array.from({ length: count }, (_, index) => ({
+        ...agent(`crew-${String(index).padStart(2, '0')}`, index % 3 === 0 ? 'streaming' : 'idle'),
+        // One row carries the longest chip the rail renders.
+        ...(index === 1 ? { childCounts: { active: 3, queued: 2, finished: 7, lifetimeCreations: 12 } } : {}),
+      }));
+    const board = (count: number): BoardSnapshot => ({ ...makeSnapshot(familyA(0)), agents: crew(count) }) as unknown as BoardSnapshot;
+    const send = await harness(page, board(40));
+    const rail = page.locator('#board-agents');
+    const toggle = rail.locator('[data-section="crew-all"]');
+    await expect(rail.locator('.board-agent')).toHaveCount(40);
+    await toggle.click();
+    await expect(toggle).toHaveText('Show fewer');
+    // Scroll whatever scrolls the rail out of view: the window, or the pane
+    // that holds the rail, depending on the layout at this width.
+    const before = await page.evaluate(() => {
+      const railNode = document.getElementById('board-agents')!;
+      let scroller: Element = document.scrollingElement!;
+      for (let node = railNode.parentElement; node !== null; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight - node.clientHeight > 200) {
+          scroller = node;
+          break;
+        }
+      }
+      scroller.setAttribute('data-test-scroller', 'true');
+      scroller.scrollTop = 600;
+      return scroller.scrollTop;
+    });
+    expect(before, 'the full crew list makes something scroll').toBeGreaterThan(300);
+    // A push rebuilds the rail while the control still holds focus.
+    await expect(toggle).toBeFocused();
+    await send(board(41));
+    await expect(rail.locator('.board-agent')).toHaveCount(41);
+    const after = await page.evaluate(() => document.querySelector('[data-test-scroller="true"]')!.scrollTop);
+    expect(Math.abs(after - before), `scroll moved from ${before} to ${after}`).toBeLessThanOrEqual(2);
+    await expect(toggle).toBeFocused();
+    await expect(toggle).toHaveText('Show fewer');
+
+    // Nothing on a row is wider than the rail, the longest chip included,
+    // and a minion's four-character ID code is shown whole.
+    const fit = await rail.evaluate((node) => {
+      const limit = node.getBoundingClientRect().right;
+      const outside = [...node.querySelectorAll<HTMLElement>('.board-agent *')]
+        .filter((child) => {
+          const box = child.getBoundingClientRect();
+          return box.width > 0 && box.right > limit + 1;
+        })
+        .map((child) => child.className);
+      const clippedIds = [...node.querySelectorAll<HTMLElement>('.board-agent__hash')]
+        .filter((hash) => (hash.textContent ?? '').length <= 4 && hash.scrollWidth > hash.clientWidth + 1)
+        .map((hash) => hash.textContent);
+      return { outside, clippedIds, sideways: node.scrollWidth - node.clientWidth };
+    });
+    expect(fit.outside, 'elements past the rail edge').toEqual([]);
+    expect(fit.clippedIds, 'four-character ID codes cut short').toEqual([]);
+    expect(fit.sideways).toBeLessThanOrEqual(1);
+    await expect(rail.locator('.board-agent__child-counts')).toHaveText('↳ 12 children (3 active, 2 queued, 7 finished)');
+  });
+}
+
 test('the health pill dot and ink say the state: muted when nothing reads ok or the board is last-known, ▲ only when something needs a look', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const send = await harness(page, makeSnapshot(familyA(0)));

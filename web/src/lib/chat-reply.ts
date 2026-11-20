@@ -18,17 +18,24 @@
  * closing quotes, brackets or emphasis marks. */
 const ENDS_SENTENCE = /[.!?…:][)\]"'”’*_`]*\s*$/u;
 
-/** A line that is a markdown block of its own: a code fence, a table row, a
- * heading, a list item or a quote. Text that follows one of these on the
- * same line (or the very next) is swallowed by it or changes it. */
-const BLOCK_LINE = /^\s{0,3}(?:`{3,}|~{3,}|\|.*\|\s*$|#{1,6}\s|[-*+]\s|\d+[.)]\s|>)/u;
+/** Lines that are markdown blocks of their own. */
+const FENCE_LINE = /^\s{0,3}(`{3,}|~{3,})/u;
+const RULE_LINE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/u;
+const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s/u;
+const TABLE_ROW = /^\s{0,3}\|.*\|\s*$/u;
+const HEADING = /^\s{0,3}#{1,6}\s/u;
+const QUOTE = /^\s{0,3}>/u;
 
 /** The next text opens with a markdown block marker. */
 const STARTS_BLOCK = /^\s{0,3}(?:`{3,}|~{3,}|\||#{1,6}\s|[-*+]\s|\d+[.)]\s|>)/u;
+const STARTS_TABLE_ROW = /^\s{0,3}\|/u;
 
-/** The next text carries on the sentence before it: it opens with white
- * space or a lowercase letter ("e.g." … " the port."). */
-const CONTINUES = /^[\s\p{Ll},;]/u;
+/** The next text plainly carries on the line before it: it opens with white
+ * space or with punctuation that cannot begin a new part ("e.g." … " the
+ * port."; "the count is 3" … ", as expected."). A reply resumes after tool
+ * work at the start of a new block of text, so anything else — a capital, a
+ * lowercase word, a digit — begins something new. */
+const CONTINUES = /^[\s,;)\]]/u;
 
 function lastWrittenLine(text: string): string {
   const lines = text.split('\n').filter((line) => line.trim() !== '');
@@ -36,42 +43,56 @@ function lastWrittenLine(text: string): string {
 }
 
 /** True while a fenced code block is still open at the end of the text:
- * what follows is more code, and a blank line there is content. */
+ * what follows is more code, and a blank line there is content. A fence is
+ * closed only by a line of the same character, at least as long, with
+ * nothing after it (CommonMark). */
 function insideOpenFence(text: string): boolean {
-  let open: string | null = null;
+  let open: { readonly char: string; readonly length: number } | null = null;
   for (const line of text.split('\n')) {
-    const fence = /^\s{0,3}(`{3,}|~{3,})/u.exec(line)?.[1] ?? null;
-    if (fence === null) continue;
-    if (open === null) open = fence[0]!;
-    else if (fence[0] === open) open = null;
+    const match = /^\s{0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (match === null) continue;
+    const fence = match[1]!;
+    if (open === null) open = { char: fence[0]!, length: fence.length };
+    else if (fence[0] === open.char && fence.length >= open.length && match[2]!.trim() === '') open = null;
   }
   return open !== null;
 }
 
-/** Join the reply so far with text that resumes after tool work.
+/** Join the reply so far with ALL the text that has resumed after tool
+ * work (the caller re-joins as more of it arrives: live text comes a token
+ * at a time, and "-" is not yet a list item).
  *
- * A paragraph break is added where the two parts would otherwise run
- * together or corrupt each other:
- *   - after a line that is a block of its own (a closing code fence, a
- *     table row, a heading, a list item, a quote) — glued text would be
- *     rendered inside the code block, dropped as an extra table cell or
- *     folded into the heading;
- *   - before text that opens a block of its own;
- *   - after a finished sentence, unless the next text plainly carries the
- *     sentence on (it opens with white space or a lowercase letter).
- *
- * Everything else is joined exactly as written: an empty side, a break
- * either side already carries, text inside a code fence that is still
- * open, and a sentence the tool work interrupted mid-way ("I checked the
- * file" … " and it is fine."). */
+ * The join is chosen so the two parts neither run together nor corrupt
+ * each other:
+ *   - inside a code fence that is still open: as written (a blank line
+ *     there is content);
+ *   - after a closing code fence or a rule line: a new paragraph, always
+ *     (text on that line would reopen or swallow the block);
+ *   - a list item followed by a list item, a table row followed by a table
+ *     row: the next line of the same block;
+ *   - before text that opens a block of its own: a new paragraph;
+ *   - text that plainly carries on (it opens with white space or closing
+ *     punctuation): as written, even on a heading, a list item or a table
+ *     row cut mid-way;
+ *   - after a heading, a list item, a table row or a quote, and after a
+ *     finished sentence: a new paragraph;
+ *   - otherwise (a sentence the tool work interrupted mid-way): as
+ *     written.
+ * An empty side, or a break either side already carries, is left alone. */
 export function resumeReplyText(soFar: string, next: string): string {
-  if (next === '' || soFar.trim() === '') return soFar + next;
-  if (/\n[^\S\n]*$/u.test(soFar) || /^[^\S\n]*\n/u.test(next)) return soFar + next;
-  if (insideOpenFence(soFar)) return soFar + next;
-  const broken = `${soFar}\n\n${next}`;
-  if (BLOCK_LINE.test(lastWrittenLine(soFar)) || STARTS_BLOCK.test(next)) return broken;
-  if (CONTINUES.test(next)) return soFar + next;
-  return ENDS_SENTENCE.test(soFar) ? broken : soFar + next;
+  const written = soFar + next;
+  if (next === '' || soFar.trim() === '') return written;
+  if (/\n[^\S\n]*$/u.test(soFar) || /^[^\S\n]*\n/u.test(next)) return written;
+  if (insideOpenFence(soFar)) return written;
+  const paragraph = `${soFar}\n\n${next}`;
+  const line = lastWrittenLine(soFar);
+  if (FENCE_LINE.test(line) || RULE_LINE.test(line)) return paragraph;
+  if (LIST_ITEM.test(line) && LIST_ITEM.test(next)) return `${soFar}\n${next}`;
+  if (TABLE_ROW.test(line) && STARTS_TABLE_ROW.test(next)) return `${soFar}\n${next}`;
+  if (STARTS_BLOCK.test(next)) return paragraph;
+  if (CONTINUES.test(next)) return written;
+  if (LIST_ITEM.test(line) || TABLE_ROW.test(line) || HEADING.test(line) || QUOTE.test(line)) return paragraph;
+  return ENDS_SENTENCE.test(soFar) ? paragraph : written;
 }
 
 /** About six lines of chat text at the bubble's width. */

@@ -530,7 +530,7 @@ body {
 
 /* Two columns is the strip's floor (a phone): below 370px auto-fit would
    drop to a single track, and one 180px card per row is not a dashboard. */
-@container kpis (max-width: 369px) {
+@container kpis (width < 370px) {
   .cockpit-kpis__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
@@ -569,9 +569,14 @@ body {
   .cockpit-kpis__grid[data-count='5'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }
 }
 
+/* Last, and complete: at a fractional width Chromium can match this range
+   and the one above it at once (559.98px), so this block resets the spans
+   the wider rules set instead of inheriting them into a two-column grid. */
 @container kpis (width < 560px) {
   .cockpit-kpis__grid[data-count='7'],
   .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cockpit-kpis__grid[data-count='7'] > .cockpit-card,
+  .cockpit-kpis__grid[data-count='5'] > .cockpit-card { grid-column: auto; }
   .cockpit-kpis__grid[data-count='7'] > .cockpit-card:last-child,
   .cockpit-kpis__grid[data-count='5'] > .cockpit-card:last-child { grid-column: span 2; }
 }
@@ -3322,8 +3327,10 @@ body {
 .board-agent__hash {
   flex: 0 100 auto;
   /* A floor: four characters always show, so two workers on one long-named
-     heist can still be told apart. */
-  min-width: 4ch;
+     heist can still be told apart. `ch` is the glyph alone: the letter
+     spacing after each of the four is added, or the box holds only two
+     characters and an ellipsis. */
+  min-width: calc(4ch + 4 * 0.04em + 1px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3363,7 +3370,6 @@ body {
    (3 active, 2 queued, 7 finished)") wraps inside the rail instead of
    printing over the state chip or scrolling the rail sideways. */
 .board-agent__sub > * {
-  flex-shrink: 1;
   min-width: 0;
   max-width: 100%;
   overflow-wrap: anywhere;
@@ -3381,7 +3387,10 @@ body {
    to the next line when the rail is narrow. */
 .board-agent__role {
   flex: none;
-  max-width: 100%;
+  /* Never wider than the line LESS the emoji before it: a long role
+     ("megaminion · streaming") then wraps its own words beside the emoji
+     instead of dropping to the next line and leaving the emoji alone. */
+  max-width: calc(100% - 2em);
   overflow-wrap: anywhere;
 }
 
