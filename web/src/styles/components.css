@@ -4090,8 +4090,8 @@ a.repo-row__name:hover {
   box-shadow: var(--shadow-btn-pressed);
 }
 
-/* Gru's pick: the recommended choice wears a tag, a yellow outline and
-   the filled button; the others stay outlined. */
+/* Gru's pick: the recommended choice wears a tag, a yellow ring and the
+   filled button; the others stay outlined. */
 .board-notification__pick {
   justify-self: start;
   padding: 2px 9px;
@@ -4102,9 +4102,10 @@ a.repo-row__name:hover {
   font-weight: 800;
 }
 
+/* A yellow ring OUTSIDE the tile's own ink border: a yellow border alone
+   is about 1.4:1 on the light theme's white tile and all but disappears. */
 .board-notification--owner .board-notification__option--pick {
-  border-color: var(--work);
-  box-shadow: 3px 4px 0 color-mix(in srgb, var(--work) 45%, transparent);
+  box-shadow: 0 0 0 3px var(--work);
 }
 
 .board-notification--owner .board-notification__option--pick .board-notification__option-button {

@@ -763,6 +763,55 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     expect(rig.api.resolveOwnerDecision(id, 'executed', INTERNAL)?.resolvedAt).not.toBeNull();
   });
 
+  it('attached options are unmarked: a marked discussion card keeps its typed decision when its options are replaced', () => {
+    // A discussion card may carry starter options and a marked one. The
+    // stored recommendation was written about the discussion, so a mark
+    // carried over to the agreed options would name an id that is gone
+    // (the row then read back as "no typed decision": no options, no way
+    // to answer) or an id reused for a choice it never assessed.
+    for (const agreed of [
+      [
+        { id: 'slim', label: 'The slim plan', consequence: 'Gru starts the slim plan.' },
+        { id: 'full', label: 'The full plan', consequence: 'Gru starts the full plan.' },
+      ],
+      // The same id, reused for a different choice.
+      [{ id: 'approve', label: 'Approve the other plan', consequence: 'Gru starts the other plan.' }],
+    ]) {
+      const rig = boot();
+      const id = rig.center.post({
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Which shape?',
+        detail: 'Talk it through with Gru first',
+        decision: decision({ discussion: true, recommendedOption: 'approve' }),
+      }).id;
+      expect(rig.api.getNotification(id)?.decision?.recommendedOption).toBe('approve');
+      const attached = rig.api.updateNotificationDecisionOptions(id, agreed, 'gru');
+      const ids = agreed.map((option) => option.id);
+      // Still a typed decision, with the agreed options and no mark.
+      expect(attached?.decision?.options.map((option) => option.id), ids.join()).toEqual(ids);
+      expect(attached?.decision !== null && attached?.decision !== undefined && 'recommendedOption' in attached.decision, ids.join()).toBe(false);
+      expect(rig.api.getNotification(id)?.decision?.recommendation, ids.join()).toBe('Approve the slim contract.');
+      // And the owner can answer it.
+      expect(rig.center.decide(id, ids[0]!, 'owner')?.decidedOption, ids.join()).toBe(ids[0]);
+    }
+  });
+
+  it('a stored mark that names no stored option is dropped on read, never the whole question', () => {
+    const stored = JSON.stringify({ ...decision(), recommendedOption: 'gone' });
+    // The write boundary still refuses it loudly.
+    expect(() => parseNotificationDecision(JSON.parse(stored))).toThrow(/is not one of this decision's option ids/);
+    // Read back, the card keeps its question and options, unmarked.
+    const read = parseStoredNotificationDecision(stored);
+    expect(read).toEqual(parseNotificationDecision(decision()));
+    expect(read !== null && 'recommendedOption' in read).toBe(false);
+    // A mark that does name an option is kept; other corruption still
+    // reads as no decision.
+    expect(parseStoredNotificationDecision(JSON.stringify({ ...decision(), recommendedOption: 'keep' }))?.recommendedOption).toBe('keep');
+    expect(parseStoredNotificationDecision(JSON.stringify({ ...decision(), recommendedOption: 'gone', question: '' }))).toBeNull();
+  });
+
   it('refuses every other row shape with typed codes and an empty option list', () => {
     const rig = boot();
     const codeOf = (fn: () => unknown): string => {

@@ -223,7 +223,7 @@ use this role and the owner's direct messages for authority:
   `{ "title": "...", "detail": "the evidence behind the ask",
   "idempotencyKey": "<optional>", "decision": {
   "question": "...", "context": "...", "recommendation": "...",
-  "recommendedOption": "approve",
+  "recommendedOption": "<optional: the id of the option you recommend>",
   "ifNothing": "what happens if the owner does nothing",
   "reservedClass": "scope-design" | "authority-cost" | "destructive" |
   "merge" | "lessons", "whyNotDelegable": "...", "discussion": false,
@@ -241,8 +241,10 @@ use this role and the owner's direct messages for authority:
   the options, name it in `recommendedOption` by its `id`: the card marks
   that choice "Gru's pick", so never write "choose the first option" and
   leave the owner to count buttons. Leave it out when you recommend
-  something that is not an option or have no preference (the server
-  refuses a no-preference card that marks one). `docs/FOR-YOU.md` is the standard
+  something that is not an option, have no preference (the server
+  refuses a no-preference card that marks one), or the card has no options
+  yet. Options you attach later to a discussion card are always unmarked:
+  say which one you recommend in the chat instead. `docs/FOR-YOU.md` is the standard
   and the server refuses (`400`) a card that breaks it. A discussion-only row is settled
   by talking with the owner in chat and then attaching the agreed options
   with `POST /api/notifications/:id/decision-options` `{ "options": [...],

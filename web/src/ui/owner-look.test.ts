@@ -210,6 +210,17 @@ describe('owner look — the headline strip and the split body', () => {
       'board-notification__option-consequence',
     ]);
     expect(picked.querySelector('button')?.textContent).toBe('Leave staging paused for now');
+    // The tag describes its button (the name stays the choice itself), the
+    // star is decoration, and the id is not shared with the bell's copy.
+    const tag = picked.querySelector<HTMLElement>('.board-notification__pick')!;
+    expect(picked.querySelector('button')?.getAttribute('aria-describedby')).toBe(tag.id);
+    expect(tag.id).toMatch(/^gru-pick-\d+$/u);
+    expect(tag.querySelector('[aria-hidden="true"]')?.textContent).toBe('★ ');
+    expect(tiles('marked')[0]!.querySelector('button')?.hasAttribute('aria-describedby')).toBe(false);
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bellTag = cardOf('marked', document.getElementById('notification-list')!).querySelector<HTMLElement>('.board-notification__pick')!;
+    expect(bellTag.id).not.toBe(tag.id);
+    expect(document.querySelectorAll(`#${tag.id}`)).toHaveLength(1);
     expect(cardOf('marked').querySelectorAll('button.board-notification__option-button')).toHaveLength(2);
     // No mark from the producer, or a mark naming no option: nothing is marked.
     for (const id of ['unmarked', 'dangling']) {

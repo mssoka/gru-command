@@ -2378,6 +2378,61 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     }
   });
 
+  it('a marked card travels end to end: posted with Gru\'s pick, shown on the board with it, and answered against the echo', async () => {
+    const { port, api, close } = await boot('board-test-token');
+    try {
+      const decision = {
+        question: 'Send the payment retry fix?',
+        context: 'The fix is ready and changes how failed payments are retried.',
+        recommendation: 'Send it; the retry loop loses payments today.',
+        recommendedOption: 'send',
+        ifNothing: 'If you do nothing, failed payments keep being retried the old way.',
+        reservedClass: 'scope-design',
+        whyNotDelegable: 'It changes agreed payment behavior.',
+        options: [
+          { id: 'send', label: 'Send the fix', consequence: 'Gru starts it and reports back.' },
+          { id: 'hold', label: 'Hold it', consequence: 'Nothing changes.' },
+        ],
+        discussion: false,
+      };
+      const path = '/api/notifications/needs-owner';
+      const body = { title: 'The payment retry fix is ready', detail: 'evidence: retry-loop trace', decision };
+      // A mark that names no option, and a mark on the no-preference form,
+      // are refused at the route with nothing stored.
+      for (const bad of [
+        { ...decision, recommendedOption: 'first' },
+        { ...decision, recommendation: 'No recommendation — either choice is fine, because both are safe.' },
+      ]) {
+        expect((await postJson(port, path, 'board-test-token', { ...body, decision: bad })).status).toBe(400);
+      }
+      expect(api.listNotifications({ limit: 10 })).toHaveLength(0);
+      const created = await postJson(port, path, 'board-test-token', body);
+      expect(created.status).toBe(201);
+      const row = created.body as { id: string; decision: { recommendedOption?: string } };
+      expect(row.decision.recommendedOption).toBe('send');
+      // The board snapshot — what the browser renders — carries the mark.
+      const board = await getJson(port, '/api/board', 'board-test-token');
+      const shown = (board.body as { notifications: { id: string; decision: Record<string, unknown> | null }[] }).notifications.find(
+        (entry) => entry.id === row.id,
+      );
+      expect(shown?.decision?.['recommendedOption']).toBe('send');
+      // An echo that lost the mark is not the decision that was displayed.
+      const { recommendedOption: _lost, ...unmarked } = shown!.decision!;
+      void _lost;
+      expect(
+        await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'hold', by: 'web', expectedDecision: unmarked }),
+      ).toMatchObject({ status: 409, body: { code: 'decision_changed' } });
+      // The echo the browser actually sends (the displayed decision, whole)
+      // records the choice — and the owner may choose against the pick.
+      const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+        optionId: 'hold', by: 'web', expectedDecision: shown!.decision,
+      });
+      expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'hold' } });
+    } finally {
+      await close();
+    }
+  });
+
   it('the discussion bridge attaches agreed options, records nothing, and the typed path then settles', async () => {
     const { port, api, close } = await boot('board-test-token');
     try {

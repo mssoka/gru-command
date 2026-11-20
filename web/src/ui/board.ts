@@ -326,6 +326,8 @@ export class BoardView {
   private extraReceipts: NotificationView[] = [];
   /** Open Details disclosures, keyed by notification id — a snapshot push
    * never collapses what the operator opened. */
+  /** Unique ids for "Gru's pick" tags (see pickTag). */
+  private pickTagSeq = 0;
   private readonly openNotificationDetails = new Set<string>();
   /** Answered owner cards whose "What you were asked" recap is open. */
   private readonly openNotificationRecaps = new Set<string>();
@@ -3249,11 +3251,15 @@ export class BoardView {
       const options = el('div', 'board-notification__options');
       for (const option of decision.options) {
         const optionNode = el('div', 'board-notification__option');
-        if (option.id === pick) {
+        const pickTag = option.id === pick ? this.pickTag() : null;
+        if (pickTag !== null) {
           optionNode.classList.add('board-notification__option--pick');
-          optionNode.append(el('span', 'board-notification__pick', '★ Gru’s pick'));
+          optionNode.append(pickTag);
         }
         const button = document.createElement('button');
+        // The tag describes the button without renaming it: a screen reader
+        // hears the choice, then "Gru's pick".
+        if (pickTag !== null) button.setAttribute('aria-describedby', pickTag.id);
         button.type = 'button';
         button.className = 'board-notification__option-button';
         button.textContent = option.label;
@@ -3289,7 +3295,7 @@ export class BoardView {
         const optionNode = el('div', 'board-notification__option');
         if (option.id === pick) {
           optionNode.classList.add('board-notification__option--pick');
-          optionNode.append(el('span', 'board-notification__pick', '★ Gru’s pick'));
+          optionNode.append(this.pickTag());
         }
         optionNode.append(
           el('div', 'board-notification__option-label', option.label),
@@ -3304,6 +3310,19 @@ export class BoardView {
       if (ifNothing !== null) block.append(ifNothing);
     }
     return block;
+  }
+
+  /** The "Gru's pick" tag: the star is decoration, the words are the
+   * content, and each tag has its own id (the same card renders on the band
+   * and in the bell) so the choice it marks can point at it. */
+  private pickTag(): HTMLElement {
+    const tag = el('span', 'board-notification__pick');
+    this.pickTagSeq += 1;
+    tag.id = `gru-pick-${this.pickTagSeq}`;
+    const star = el('span', 'board-notification__pick-star', '★ ');
+    star.setAttribute('aria-hidden', 'true');
+    tag.append(star, document.createTextNode('Gru’s pick'));
+    return tag;
   }
 
   /** Why the decision reached the owner and cannot be delegated. */

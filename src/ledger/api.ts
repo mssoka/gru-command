@@ -6749,7 +6749,14 @@ export class LedgerApi {
           `notification "${id}" is not a discussion decision — its producer-authored options are not replaced`,
         );
       }
-      const next: NotificationDecision = { ...current.decision, options: [...validated] };
+      // The stored recommendation was written about the discussion, not
+      // about these options: a mark carried over would name an id that is
+      // gone (the row would then read back as "no typed decision"), or an
+      // id reused for a choice the recommendation never assessed. Attached
+      // options are unmarked.
+      const { recommendedOption: _markOnReplacedOptions, ...kept } = current.decision;
+      void _markOnReplacedOptions;
+      const next: NotificationDecision = { ...kept, options: [...validated] };
       this.db
         .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?')
         .run(serializeNotificationDecision(next), id);
