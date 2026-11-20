@@ -60,6 +60,7 @@ import {
   pipelineStateLabel,
   pipelineStateTone,
   pipelineWindow,
+  mailboxCountText,
   sectionNav,
   settledJobs,
   settledPreview,
@@ -1946,7 +1947,7 @@ export class BoardView {
       'for-gru',
       'needs-you',
       BAND_LABELS['needs-you'],
-      snapshot.mailbox === undefined || snapshot.mailbox === null ? 'unavailable' : `${this.unavailableReason === null ? '' : 'last-known · '}${snapshot.mailbox.counts.threads} threads · ${snapshot.mailbox.counts.incidents} incidents · ${snapshot.mailbox.counts.notifications} notifications`,
+      snapshot.mailbox === undefined || snapshot.mailbox === null ? 'unavailable' : `${this.unavailableReason === null ? '' : 'last-known · '}${mailboxCountText(snapshot.mailbox.counts)}`,
     );
     if (this.unavailableReason !== null) {
       section.dataset.mailboxStatus = 'last-known';

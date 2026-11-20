@@ -5354,7 +5354,7 @@ describe('board — megaminions nest under their heist', () => {
     );
     expandForGru();
     const forGru = document.querySelector<HTMLElement>('#board-section-for-gru');
-    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 threads · 0 incidents · 0 notifications');
+    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 thread · 0 incidents · 0 notifications');
     const stuck = rowOf('rev-stuck');
     expect(forGru?.contains(stuck)).toBe(true);
     const link = stuck.querySelector<HTMLButtonElement>('button.board-job__parent');
@@ -5958,7 +5958,7 @@ describe('GH-305 rendered mailbox lifecycle', () => {
     view.render({ ...base, mailbox: { items: [item], counts: { threads: 0, incidents: 1, notifications: 1, needsGru: 0 } } });
     expandForGru();
     const section = document.querySelector('#board-section-for-gru')!;
-    expect(section.querySelector('.board-band__count')?.textContent).toBe('0 threads · 1 incidents · 1 notifications');
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('0 threads · 1 incident · 1 notification');
     expect(section.querySelector('.mailbox-incident')?.textContent).toContain('waiting · owner: producer');
     expect(section.textContent).toContain('successful Book dream');
     expect(section.textContent).toContain('decision:hold');
