@@ -1936,6 +1936,7 @@ export class DiskService {
         question: `Free about ${diskSize(total)} of disk space in the ${String(steps.length)} lossless step${steps.length === 1 ? '' : 's'} listed?`,
         context: this.ownerConditionText(usage, reads),
         recommendation: 'Freeing the space in lossless steps. Work that is still needed is saved first, review verdicts stay in the history, and a slimmed workspace restores before its next turn.',
+        recommendedOption: 'accept',
         reservedClass: 'authority-cost',
         whyNotDelegable: 'Freeing space happens only when you accept: the disk budget is set to ask you first.',
         options: [

@@ -185,6 +185,57 @@ describe('owner look — the headline strip and the split body', () => {
     expect(bubble.querySelector('.board-notification__gru-label')).toBeNull();
   });
 
+  it('Gru\'s pick is marked on the recommended tile only, and an unmarked decision marks none', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot([
+        notification({ id: 'marked', decision: decision({ recommendedOption: 'leave' }) }),
+        notification({ id: 'unmarked' }),
+        notification({ id: 'dangling', decision: decision({ recommendedOption: 'first' }) }),
+      ]),
+    );
+    const tiles = (id: string): HTMLElement[] => [...cardOf(id).querySelectorAll<HTMLElement>('.board-notification__option')];
+    // The mark follows the producer's option id — here the SECOND choice.
+    expect(tiles('marked').map((tile) => tile.classList.contains('board-notification__option--pick'))).toEqual([false, true]);
+    expect(tiles('marked').map((tile) => tile.querySelector('.board-notification__pick')?.textContent ?? null)).toEqual([
+      null,
+      '★ Gru’s pick',
+    ]);
+    // The tag sits above the button; the button's own name is unchanged and
+    // every choice stays a live control.
+    const picked = tiles('marked')[1]!;
+    expect([...picked.children].map((child) => child.className.split(' ')[0])).toEqual([
+      'board-notification__pick',
+      'board-notification__option-button',
+      'board-notification__option-consequence',
+    ]);
+    expect(picked.querySelector('button')?.textContent).toBe('Leave staging paused for now');
+    expect(cardOf('marked').querySelectorAll('button.board-notification__option-button')).toHaveLength(2);
+    // No mark from the producer, or a mark naming no option: nothing is marked.
+    for (const id of ['unmarked', 'dangling']) {
+      expect(cardOf(id).querySelector('.board-notification__option--pick'), id).toBeNull();
+      expect(cardOf(id).querySelector('.board-notification__pick'), id).toBeNull();
+    }
+  });
+
+  it('the recap of an answered card keeps Gru\'s pick; the compact card never shows one', () => {
+    const view = new BoardView(() => {});
+    const marked = decision({ recommendedOption: 'finish' });
+    view.render(
+      snapshot([
+        notification({ id: 'answered', decision: marked, decidedAt: '2026-11-20T17:09:00.000Z', decidedOption: 'leave' }),
+        notification({ id: 'machine', routing: 'action-required', decision: marked }),
+      ]),
+    );
+    const recapTiles = [...cardOf('answered').querySelectorAll<HTMLElement>('.board-notification__recap .board-notification__option')];
+    expect(recapTiles.map((tile) => tile.querySelector('.board-notification__pick')?.textContent ?? null)).toEqual(['★ Gru’s pick', null]);
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const machine = cardOf('machine', document.getElementById('notification-list')!);
+    expect(machine.querySelectorAll('.board-notification__option')).toHaveLength(2);
+    expect(machine.querySelector('.board-notification__pick')).toBeNull();
+    expect(machine.querySelector('.board-notification__option--pick')).toBeNull();
+  });
+
   it('a destructive ask carries the red edge and its badge; an unknown reserved class gets no badge', () => {
     const view = new BoardView(() => {});
     view.render(

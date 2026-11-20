@@ -95,6 +95,7 @@ import {
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
+  recommendedOptionId,
   safePrUrl,
   type OwnerDecisionRow,
   type OwnerNoticeRow,
@@ -3213,6 +3214,11 @@ export class BoardView {
     }
     // On the owner face the why/if-nothing notes sit with the story.
     if (!split) block.append(this.decisionWhy(decision));
+    // Gru's pick (owner pick 2026-11-20): the option the producer marked as
+    // recommended wears a tag on the owner face, so "choose the first
+    // option" never has to be mapped onto a button. The compact card keeps
+    // its plain list.
+    const pick = split ? recommendedOptionId(decision) : null;
     const decided = item.decidedAt !== null && item.decidedAt !== undefined;
     // Options are live only on an open OWNER row: machine queue rows and
     // closed receipts render their options read-only (no fake control).
@@ -3243,6 +3249,10 @@ export class BoardView {
       const options = el('div', 'board-notification__options');
       for (const option of decision.options) {
         const optionNode = el('div', 'board-notification__option');
+        if (option.id === pick) {
+          optionNode.classList.add('board-notification__option--pick');
+          optionNode.append(el('span', 'board-notification__pick', '★ Gru’s pick'));
+        }
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'board-notification__option-button';
@@ -3277,6 +3287,10 @@ export class BoardView {
       const options = el('div', 'board-notification__options board-notification__options--readonly');
       for (const option of decision.options) {
         const optionNode = el('div', 'board-notification__option');
+        if (option.id === pick) {
+          optionNode.classList.add('board-notification__option--pick');
+          optionNode.append(el('span', 'board-notification__pick', '★ Gru’s pick'));
+        }
         optionNode.append(
           el('div', 'board-notification__option-label', option.label),
           el('div', 'board-notification__option-consequence', option.consequence),

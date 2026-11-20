@@ -16,6 +16,7 @@ export interface BoardServerHarness {
         readonly question: string;
         readonly context: string;
         readonly recommendation: string;
+        readonly recommendedOption?: string;
         readonly ifNothing?: string;
         readonly reservedClass: string;
         readonly whyNotDelegable: string;

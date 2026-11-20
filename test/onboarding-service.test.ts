@@ -177,6 +177,8 @@ describe('onboarding scan and cards (#427)', () => {
     expect(card).toMatchObject({ title: 'Set up swift-app for Gru Command', routing: 'needs-owner', resolvedAt: null });
     expect(card.detail).toContain('origin/main');
     expect(card.decision?.options.map((option) => option.id)).toEqual(['accept', 'decline']);
+    // The recommendation is to accept, and the card marks that choice.
+    expect(card.decision?.recommendedOption).toBe('accept');
     expect(card.decision?.reservedClass).toBe('authority-cost');
     expect(h.dispatched).toEqual([]);
 

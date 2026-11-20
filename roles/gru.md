@@ -223,11 +223,13 @@ use this role and the owner's direct messages for authority:
   `{ "title": "...", "detail": "the evidence behind the ask",
   "idempotencyKey": "<optional>", "decision": {
   "question": "...", "context": "...", "recommendation": "...",
+  "recommendedOption": "approve",
   "ifNothing": "what happens if the owner does nothing",
   "reservedClass": "scope-design" | "authority-cost" | "destructive" |
   "merge" | "lessons", "whyNotDelegable": "...", "discussion": false,
   "options": [{ "id": "approve", "label": "Approve …", "consequence": "what
-  happens / does not happen" }] } }`. Every field is required (options may
+  happens / does not happen" }] } }`. Every field is required except
+  `recommendedOption` (options may
   be empty only when `discussion` is true), and the card is written for a
   non-technical owner: plain words in the title, the question, the context,
   the recommendation, `ifNothing` and every option; `detail` is the ONE slot
@@ -235,7 +237,12 @@ use this role and the owner's direct messages for authority:
   never on the face. If you have no preference, say so explicitly
   (`"recommendation": "No recommendation — either choice is fine, because
   …"`) instead of leaving the owner to guess; state the real do-nothing
-  consequence rather than a generic one. `docs/FOR-YOU.md` is the standard
+  consequence rather than a generic one. When your recommendation IS one of
+  the options, name it in `recommendedOption` by its `id`: the card marks
+  that choice "Gru's pick", so never write "choose the first option" and
+  leave the owner to count buttons. Leave it out when you recommend
+  something that is not an option or have no preference (the server
+  refuses a no-preference card that marks one). `docs/FOR-YOU.md` is the standard
   and the server refuses (`400`) a card that breaks it. A discussion-only row is settled
   by talking with the owner in chat and then attaching the agreed options
   with `POST /api/notifications/:id/decision-options` `{ "options": [...],

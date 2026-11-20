@@ -15,6 +15,7 @@ import {
   ownerPendingCount,
   ownerRows,
   ownerWindow,
+  recommendedOptionId,
   safePrUrl,
 } from './owner-band.js';
 
@@ -404,5 +405,22 @@ describe('owner look — kind of ask and what the pill says', () => {
     // count and for the badge alike.
     expect(isAnsweredNotification({ decision: null, decidedAt: '2026-09-28T00:06:00.000Z' })).toBe(false);
     expect(isAnsweredNotification({ decidedAt: '2026-09-28T00:06:00.000Z' })).toBe(false);
+  });
+
+  it('Gru\'s pick is the producer\'s marked option, and only when it is one of the decision\'s own options', () => {
+    const two = {
+      ...decision,
+      options: [
+        { id: 'delete', label: 'Delete them', consequence: 'The folders are removed.' },
+        { id: 'keep', label: 'Keep them', consequence: 'Nothing is deleted.' },
+      ],
+    };
+    expect(recommendedOptionId({ ...two, recommendedOption: 'keep' })).toBe('keep');
+    // Unmarked rows (absent or null) have no pick — never the first option.
+    expect(recommendedOptionId(two)).toBeNull();
+    expect(recommendedOptionId({ ...two, recommendedOption: null })).toBeNull();
+    // A mark that names none of the options marks nothing.
+    expect(recommendedOptionId({ ...two, recommendedOption: 'first' })).toBeNull();
+    expect(recommendedOptionId({ ...two, options: [], discussion: true, recommendedOption: 'keep' })).toBeNull();
   });
 });
