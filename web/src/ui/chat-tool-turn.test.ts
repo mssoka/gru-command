@@ -276,6 +276,32 @@ describe('a reply interrupted by tool work reads as separate paragraphs (owner p
     expect(paragraphs()).toEqual(['I checked the file and it is fine.']);
   });
 
+  it('text after a code block or a table renders after it, never inside it', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('Here is the fix:\n```ts\nconst port = 7665;\n```'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta('The tests pass.'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta('| check | result |\n| --- | --- |\n| lint | ok |'), true);
+    view.addFrame(tool('start'), true);
+    view.addFrame(tool('end'), true);
+    view.addFrame(delta('Both rows match.'), true);
+    view.addFrame(turn('end'), true);
+    const bubble = bubbles()[0]!;
+    // The code block holds only the code.
+    expect(bubble.querySelectorAll('pre')).toHaveLength(1);
+    expect(bubble.querySelector('pre')?.textContent).toContain('const port = 7665;');
+    expect(bubble.querySelector('pre')?.textContent).not.toContain('The tests pass');
+    expect(bubble.querySelector('pre')?.textContent).not.toContain('check');
+    // The table keeps its one body row, and the sentence after it survives.
+    expect(bubble.querySelectorAll('tbody tr')).toHaveLength(1);
+    expect(paragraphs()).toEqual(['Here is the fix:', 'The tests pass.', 'Both rows match.']);
+  });
+
   it('a long reply wears the calm bubble; a short one keeps the bright one', () => {
     const view = new ChatView(() => true);
     view.reset();

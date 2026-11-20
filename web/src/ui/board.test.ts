@@ -672,7 +672,8 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(toggle.textContent).toBe('details');
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.getAttribute('aria-controls')).toBe('command-health-parts');
-    expect(toggle.getAttribute('aria-label')).toBe('System health: show 1 reading that needs no look');
+    // The accessible name starts with the visible text.
+    expect(toggle.getAttribute('aria-label')).toBe('details: show 1 system health reading that needs no look');
     // The reading itself is still rendered (the stylesheet folds it).
     expect(pill.querySelector('.command-health__part[data-check="verify"]')?.getAttribute('data-problem')).toBe('false');
     // The control sits right after the summary and is created once.
@@ -681,6 +682,7 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(pill.dataset.details).toBe('open');
     expect(toggle.textContent).toBe('hide details');
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')?.startsWith('hide details')).toBe(true);
     expect(localStorage.getItem('gru-command.health-details')).toBe('open');
     // A snapshot push keeps the choice and the same control.
     view.render(snapshot({ verify: calmVerify }));
@@ -6101,8 +6103,33 @@ describe('crew rail — show all (owner pick 2026-11-20)', () => {
     expect(document.activeElement).toBe(toggle);
     toggle.click();
     expect(rail.classList.contains('board-agents--all')).toBe(false);
-    // Folded and fitting again: the control is gone.
+    // Folded and fitting again: the control is gone, and focus lands on
+    // the rail itself, never on <body>.
     expect(rail.querySelector('[data-section="crew-all"]')).toBeNull();
+    expect(document.activeElement).toBe(rail);
+  });
+
+  it('restoring focus to the control after a push never scrolls the page', () => {
+    const rail = sizeRail(900, 420);
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: crew }));
+    rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.focus();
+    // Every focus() the rail makes from here on must opt out of scrolling:
+    // a reader who scrolled away would otherwise be yanked back on each push.
+    const calls: (FocusOptions | undefined)[] = [];
+    const original = HTMLElement.prototype.focus;
+    HTMLElement.prototype.focus = function focus(this: HTMLElement, options?: FocusOptions): void {
+      if (this.dataset.section === 'crew-all' || this.id === 'board-agents') calls.push(options);
+      original.call(this, options);
+    };
+    try {
+      view.render(snapshot({ jobs: [], agents: crew }));
+      rail.querySelector<HTMLButtonElement>('[data-section="crew-all"]')!.click();
+    } finally {
+      HTMLElement.prototype.focus = original;
+    }
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const options of calls) expect(options).toEqual({ preventScroll: true });
   });
 });
 

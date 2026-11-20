@@ -22,6 +22,37 @@ describe('a reply that resumes after tool work', () => {
     }
   });
 
+  it('never glues text onto a markdown block: a closed code fence, a table row, a heading, a list item, a quote', () => {
+    const fence = 'Here is the fix:\n```ts\nconst port = 7665;\n```';
+    expect(resumeReplyText(fence, 'The tests pass.')).toBe(`${fence}\n\nThe tests pass.`);
+    const table = '| check | result |\n| --- | --- |\n| lint | ok |';
+    expect(resumeReplyText(table, 'Both rows match.')).toBe(`${table}\n\nBoth rows match.`);
+    expect(resumeReplyText('## Plan', 'First I read the file.')).toBe('## Plan\n\nFirst I read the file.');
+    expect(resumeReplyText('Steps:\n- read the file', 'Then I ran it.')).toBe('Steps:\n- read the file\n\nThen I ran it.');
+    expect(resumeReplyText('1. read the file', 'then I ran it')).toBe('1. read the file\n\nthen I ran it');
+    expect(resumeReplyText('> quoted line', 'My reply.')).toBe('> quoted line\n\nMy reply.');
+  });
+
+  it('starts a paragraph before text that opens a block of its own, even mid-sentence', () => {
+    expect(resumeReplyText('The result', '| check | result |\n| --- | --- |')).toBe('The result\n\n| check | result |\n| --- | --- |');
+    expect(resumeReplyText('What I found', '- the port is taken')).toBe('What I found\n\n- the port is taken');
+    expect(resumeReplyText('The fix', '```ts\nconst a = 1;\n```')).toBe('The fix\n\n```ts\nconst a = 1;\n```');
+    expect(resumeReplyText('Done', '## Next')).toBe('Done\n\n## Next');
+  });
+
+  it('text inside a code fence that is still open is joined as written: a blank line there is content', () => {
+    const open = 'Running:\n```sh\nnpm test';
+    expect(resumeReplyText(open, ' -- --watch')).toBe(`${open} -- --watch`);
+    expect(resumeReplyText(`${open}.`, 'Then more.')).toBe(`${open}.Then more.`);
+    // A tilde fence is closed only by a tilde fence.
+    expect(resumeReplyText('~~~\ncode\n```', 'more')).toBe('~~~\ncode\n```more');
+  });
+
+  it('a finished-looking abbreviation followed by a continuation is not split', () => {
+    expect(resumeReplyText('Check the config, e.g.', ' the port.')).toBe('Check the config, e.g. the port.');
+    expect(resumeReplyText('It works on v2.', 'x and later.')).toBe('It works on v2.x and later.');
+  });
+
   it('leaves a break that either side already carries, and an empty side, alone', () => {
     expect(resumeReplyText('First part.\n', 'Second part.')).toBe('First part.\nSecond part.');
     expect(resumeReplyText('First part.\n\n', 'Second part.')).toBe('First part.\n\nSecond part.');

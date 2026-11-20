@@ -544,30 +544,32 @@ body {
      six:   3 + 3 (pairs below that, as auto-fit already gives);
      five:  3 + 2, then pairs with the last one full-width.
    The count comes from `data-count`; any other count keeps auto-fit. The
-   thresholds are where auto-fit's own track count changes (190k - 10). */
-@container kpis (min-width: 750px) and (max-width: 1319px) {
+   thresholds are where auto-fit's own track count changes (190k - 10),
+   written as ranges so a fractional width (zoom, a dragged splitter) never
+   falls between two rules. */
+@container kpis (750px <= width < 1320px) {
   .cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(12, minmax(0, 1fr)); }
   .cockpit-kpis__grid[data-count='7'] > .cockpit-card { grid-column: span 3; }
   .cockpit-kpis__grid[data-count='7'] > .cockpit-card:nth-child(n + 5) { grid-column: span 4; }
 }
 
-@container kpis (min-width: 560px) and (max-width: 749px) {
+@container kpis (560px <= width < 750px) {
   .cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .cockpit-kpis__grid[data-count='7'] > .cockpit-card { grid-column: span 2; }
   .cockpit-kpis__grid[data-count='7'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }
 }
 
-@container kpis (min-width: 560px) and (max-width: 1129px) {
+@container kpis (560px <= width < 1130px) {
   .cockpit-kpis__grid[data-count='6'] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
-@container kpis (min-width: 560px) and (max-width: 939px) {
+@container kpis (560px <= width < 940px) {
   .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .cockpit-kpis__grid[data-count='5'] > .cockpit-card { grid-column: span 2; }
   .cockpit-kpis__grid[data-count='5'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }
 }
 
-@container kpis (max-width: 559px) {
+@container kpis (width < 560px) {
   .cockpit-kpis__grid[data-count='7'],
   .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cockpit-kpis__grid[data-count='7'] > .cockpit-card:last-child,
@@ -3199,12 +3201,7 @@ body {
 }
 
 /* "Show all N": pinned to the bottom edge of the scrolling list, so the
-   list ends on a control, never on half a row. Showing all lifts the
-   height limit. */
-.board-agents--all {
-  max-height: none;
-}
-
+   list ends on a control, never on half a row. */
 .board-agent-toggle.board-agents__all {
   position: sticky;
   bottom: 0;
@@ -3223,6 +3220,15 @@ body {
   max-height: 420px;
   overflow-y: auto;
   padding-right: 2px;
+  /* A row scrolled into view lands above the pinned control, not under it. */
+  scroll-padding-bottom: 40px;
+}
+
+/* Showing all lifts the height limit. Two classes, placed AFTER the base
+   rule: with one class and an earlier position it lost to the base rule's
+   max-height and the list never grew. */
+.board-agents.board-agents--all {
+  max-height: none;
 }
 
 /* A sub-minion sits indented under the minion that created it (owner pick,
@@ -3315,7 +3321,9 @@ body {
    the room: the code gives way first. */
 .board-agent__hash {
   flex: 0 100 auto;
-  min-width: 0;
+  /* A floor: four characters always show, so two workers on one long-named
+     heist can still be told apart. */
+  min-width: 4ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3349,6 +3357,24 @@ body {
   font-weight: inherit;
   letter-spacing: 0;
   text-transform: none;
+}
+
+/* Nothing on the line is wider than the line: a long chip ("↳ 12 children
+   (3 active, 2 queued, 7 finished)") wraps inside the rail instead of
+   printing over the state chip or scrolling the rail sideways. */
+.board-agent__sub > * {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.board-agent__sub .board-agent__child-counts,
+.board-agent__sub .board-agent__parent-link,
+.board-agent__sub .board-agent__age,
+.board-agent__sub .board-agent__runtime {
+  white-space: normal;
+  text-align: left;
 }
 
 /* The role is the line's point: it is never cut. The chips after it wrap

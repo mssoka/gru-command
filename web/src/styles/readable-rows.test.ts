@@ -76,30 +76,46 @@ describe('number cards: even rows', () => {
     throw new Error(`unterminated @container kpis ${query} block`);
   };
 
+  /** One row holds k cards from 190k - 10 px of strip (a 180px card and a
+   * 10px gap each): the widths at which auto-fit itself gains a column. */
+  const from = (cards: number): number => 190 * cards - 10;
+  const between = (low: number, high: number): string => `(${from(low)}px <= width < ${from(high)}px)`;
+
   it('seven cards that cannot share a row split 4 + 3, then 3 + 2 + 2, then pairs with a full-width last card', () => {
-    const wide = rule('(min-width: 750px) and (max-width: 1319px)');
+    // 4 + 3 from the width that fits four up to the width that fits seven.
+    const wide = rule(between(4, 7));
     expect(wide).toContain(".cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(12, minmax(0, 1fr)); }");
     expect(wide).toContain(".cockpit-kpis__grid[data-count='7'] > .cockpit-card { grid-column: span 3; }");
     expect(wide).toContain(".cockpit-kpis__grid[data-count='7'] > .cockpit-card:nth-child(n + 5) { grid-column: span 4; }");
-    const middle = rule('(min-width: 560px) and (max-width: 749px)');
+    const middle = rule(between(3, 4));
     expect(middle).toContain(".cockpit-kpis__grid[data-count='7'] { grid-template-columns: repeat(6, minmax(0, 1fr)); }");
     expect(middle).toContain(".cockpit-kpis__grid[data-count='7'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }");
-    const narrow = rule('(max-width: 559px)');
+    const narrow = rule(`(width < ${from(3)}px)`);
     expect(narrow).toContain(".cockpit-kpis__grid[data-count='7'] > .cockpit-card:last-child");
     expect(narrow).toContain('grid-column: span 2;');
   });
 
-  it('six cards split 3 + 3 and five split 3 + 2; the thresholds are where a row gains a card (190k - 10)', () => {
-    expect(rule('(min-width: 560px) and (max-width: 1129px)')).toContain(
+  it('six cards split 3 + 3 and five split 3 + 2, each up to the width that fits them in one row', () => {
+    expect(rule(between(3, 6))).toContain(
       ".cockpit-kpis__grid[data-count='6'] { grid-template-columns: repeat(3, minmax(0, 1fr)); }",
     );
-    const five = rule('(min-width: 560px) and (max-width: 939px)');
+    const five = rule(between(3, 5));
     expect(five).toContain(".cockpit-kpis__grid[data-count='5'] > .cockpit-card { grid-column: span 2; }");
     expect(five).toContain(".cockpit-kpis__grid[data-count='5'] > .cockpit-card:nth-child(n + 4) { grid-column: span 3; }");
-    // One row holds k cards from 190k - 10 px: 7 at 1320, 6 at 1130, 5 at 940, 4 at 750, 3 at 560.
-    for (const [cards, width] of [[7, 1320], [6, 1130], [5, 940], [4, 750], [3, 560]] as const) {
-      expect(190 * cards - 10, `${cards} cards`).toBe(width);
-    }
+  });
+
+  it('the even-rows rules are ranges with no gap between them: a fractional width always matches one', () => {
+    // `(min-width: 750px) and (max-width: 1319px)` left 749.5px and 1319.5px
+    // to auto-fit, which packs 6 + 1 or 3 + 3 + 1.
+    const queries = [...COMPONENTS_CSS.matchAll(/@container kpis \(([^)]*)\)/gu)].map((match) => match[1]!);
+    const evenRows = queries.filter((query) => query.includes('width <'));
+    expect(evenRows.length).toBeGreaterThanOrEqual(5);
+    for (const query of evenRows) expect(query, query).not.toMatch(/min-width|max-width/u);
+    // Seven cards: the three ranges meet exactly at the widths where a row
+    // gains a card, from zero up to the one-row width.
+    expect(evenRows).toContain(`width < ${from(3)}px`);
+    expect(evenRows).toContain(`${from(3)}px <= width < ${from(4)}px`);
+    expect(evenRows).toContain(`${from(4)}px <= width < ${from(7)}px`);
   });
 
   it('a card whose headline is zero steps back by colour only', () => {
@@ -134,6 +150,11 @@ describe('crew rail: a readable role line', () => {
     expect(declared('.board-agent__sub', 'overflow')).toBeNull();
     expect(declared('.board-agent__role', 'flex')).toBe('none');
     expect(declared('.board-agent__role', 'text-overflow')).toBeNull();
+    // Nothing on the line is wider than the line: a long chip wraps inside
+    // the rail instead of printing over the state chip.
+    expect(declared('.board-agent__sub > *', 'max-width')).toBe('100%');
+    expect(declared('.board-agent__sub > *', 'min-width')).toBe('0');
+    expect(declared('.board-agent__sub .board-agent__child-counts', 'white-space')).toBe('normal');
     // The chips on the line follow its case and size.
     expect(declared('.board-agent__sub .lbl', 'text-transform')).toBe('none');
     expect(declared('.board-agent__sub .lbl', 'font-size')).toBe('inherit');
@@ -141,11 +162,21 @@ describe('crew rail: a readable role line', () => {
 
   it('the name gets the room before the ID code, and "show all" is pinned to the list\'s bottom edge', () => {
     expect(declared('.board-agent__hash', 'flex')).toBe('0 100 auto');
+    // …but never to nothing: the code is what tells same-named crew apart.
+    expect(declared('.board-agent__hash', 'min-width')).toBe('4ch');
     expect(declared('.board-agent__hash', 'text-overflow')).toBe('ellipsis');
     expect(declared('.board-agent-toggle.board-agents__all', 'position')).toBe('sticky');
     expect(declared('.board-agent-toggle.board-agents__all', 'bottom')).toBe('0');
     expect(declared('.board-agent-toggle.board-agents__all', 'background')).toBe('var(--card)');
-    expect(declared('.board-agents--all', 'max-height')).toBe('none');
+    // "Show all" lifts the height limit. The rule must BEAT the base rule's
+    // max-height: with one class and an earlier position it lost, the label
+    // changed and the list never grew. Two classes, and placed after it.
+    expect(declared('.board-agents.board-agents--all', 'max-height')).toBe('none');
+    expect(declared('.board-agents--all', 'max-height')).toBeNull();
+    expect(declared('.board-agents', 'max-height')).toBe('420px');
+    expect(COMPONENTS_CSS.indexOf('.board-agents.board-agents--all {')).toBeGreaterThan(COMPONENTS_CSS.indexOf('.board-agents {'));
+    // A row scrolled into view lands above the pinned control.
+    expect(Number.parseFloat(declared('.board-agents', 'scroll-padding-bottom') ?? '0')).toBeGreaterThanOrEqual(36);
   });
 });
 

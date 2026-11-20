@@ -300,9 +300,11 @@ board socket is lost (stale, reconnecting, offline) until it reopens — an
 HTTP catch-up meanwhile is still last-known — or while the board is
 unavailable, the summary is prefixed `last-known ·` and the dot is muted
 unless something needs a look. A check whose source is
-not wired (`n/a`) stays out of the text and in the tooltip. On a phone the
-calm checks fold away and the ones that need a look keep a line of their
-own inside the pill.
+not wired (`n/a`) stays out of the text and in the tooltip. The calm
+checks fold behind a `details` control beside the summary (the choice is
+remembered per browser); a check that needs a look always shows. On a
+phone the calm checks always fold, with no control, and the ones that need
+a look keep a line of their own inside the pill.
 
 The **KPI cards** sit at the top of the board column: **HEISTS** (the total
 on the board, a stage bar working → in review → merged → done, and every
@@ -319,8 +321,10 @@ raids awaiting you, queued, fixes awaiting you, break-ins, and the busiest
 repository's use of its cap over the last 24 hours — `1/2 in 24h`, every
 repository in the tooltip; a dashed `— unavailable` card when the server
 could not read the raids; no card at all from a server that sends no
-raids block). Two columns on a phone, three from 520px, six from 1000px of
-board column (five when there is no raids card). Every count is a
+raids block). A row holds one card per 190px of board column, never
+fewer than two; cards that cannot share one row split into rows that each
+fill the width (seven as 4 + 3, six as 3 + 3, five as 3 + 2, then pairs
+with a full-width last card), so there is never an empty corner. Every count is a
 `data-kpi` span tied to the derivation the v4 strip used, and carries its
 label beside it; the context lines (a raid's attack, `across 2 heists`)
 and the card asides are text. Zeros fade; a count that needs attention
@@ -407,6 +411,23 @@ read:
   that stays still under reduced motion; calm otherwise. The count beside
   it still carries the fact.
 
+It reads as the attention
+card
+(cockpit rework): under
+its `FOR YOU · N pending` heading, `2 things need you` (`Nothing needs you`
+when the only rows are answered ones), Gru's share of answered decisions
+when there is one, then one line about
+Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
+is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing
+needs Gru either · the crew is on it`, which is left out while Gru is
+carrying out an answer; prefixed `last-known ·` while the
+board socket is lost or the board is unavailable — an empty FOR GRU folded
+while the socket is lost carries the same prefix, and an unavailable FOR
+GRU keeps its full card with its warning). Its empty state is the calm clear state (an empty owner
+list is healthy); its rows are keyboard-focusable and a snapshot
+re-render preserves focus (stable action ids) and never toasts or rings
+a chime.
+
 **The rest of the board** (owner picks 2026-11-20, the same readability
 pass):
 
@@ -427,31 +448,19 @@ pass):
   browser (`gru-command.health-details`). A phone always folds them and
   shows no control.
 - **Crew rail.** The line under a name is ordinary case at 11px and wraps
-  rather than cutting the role; the name gets the room before the ID code;
-  a rail too long for its height ends on a pinned `Show all N` control.
+  rather than cutting the role, and no chip on it is wider than the rail;
+  the name gets the room before the ID code, which keeps four characters;
+  a rail too long for its height ends on a pinned `Show all N` control
+  that lifts the height limit.
 - **FOR GRU.** Its counts use real singular and plural forms.
-- **Chat replies.** Text that resumes after tool work starts its own
-  paragraph (the parts of a reply used to run together), and a reply
+- **Chat replies.** The parts of a reply used to run together across tool
+  calls. Text that resumes after tool work now starts its own paragraph
+  after a finished sentence and around a markdown block (a code block, a
+  table, a heading, a list); a sentence the tool work interrupted mid-way
+  is joined as written (`web/src/lib/chat-reply.ts`). A reply
   longer than about six lines reads on the pale butter bubble
   (`--gru-soft`) while short replies keep the bright yellow. The composer
   is unchanged.
-
-It reads as the attention
-card
-(cockpit rework): under
-its `FOR YOU · N pending` heading, `2 things need you` (`Nothing needs you`
-when the only rows are answered ones), Gru's share of answered decisions
-when there is one, then one line about
-Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
-is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing
-needs Gru either · the crew is on it`, which is left out while Gru is
-carrying out an answer; prefixed `last-known ·` while the
-board socket is lost or the board is unavailable — an empty FOR GRU folded
-while the socket is lost carries the same prefix, and an unavailable FOR
-GRU keeps its full card with its warning). Its empty state is the calm clear state (an empty owner
-list is healthy); its rows are keyboard-focusable and a snapshot
-re-render preserves focus (stable action ids) and never toasts or rings
-a chime.
 
 Jobs bucket NEEDS GRU → IN FLIGHT → SETTLED → COLD (recency inside each
 band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width

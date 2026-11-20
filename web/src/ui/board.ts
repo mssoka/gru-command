@@ -70,7 +70,7 @@ import {
   SETTLED_PREVIEW_SIZE,
   type SectionId,
 } from '../lib/board-sections.js';
-import { cockpitCards, gruQueueLine, healthPill, type CockpitCard } from '../lib/cockpit.js';
+import { cockpitCards, gruQueueLine, healthPill, isQuietCard, type CockpitCard } from '../lib/cockpit.js';
 import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
 import { familyStatusBreakdown, isLiveMegaminion, subMinionTree } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
@@ -1521,11 +1521,12 @@ export class BoardView {
     const calm = Number(toggle.dataset.calm ?? '0');
     toggle.textContent = this.healthDetailsOpen ? 'hide details' : 'details';
     toggle.setAttribute('aria-expanded', String(this.healthDetailsOpen));
+    // The name starts with the visible text (a voice user says "details").
     toggle.setAttribute(
       'aria-label',
       this.healthDetailsOpen
-        ? 'System health: hide the readings that need no look'
-        : `System health: show ${calm} ${calm === 1 ? 'reading' : 'readings'} that ${calm === 1 ? 'needs' : 'need'} no look`,
+        ? 'hide details: the system health readings that need no look'
+        : `details: show ${calm} system health ${calm === 1 ? 'reading' : 'readings'} that ${calm === 1 ? 'needs' : 'need'} no look`,
     );
   }
 
@@ -1549,7 +1550,7 @@ export class BoardView {
     // A card whose own headline is zero steps back (owner pick 2026-11-20):
     // colour only, so nothing moves when the count leaves zero. An alert on
     // the card keeps it at full strength.
-    const quiet = !card.off && card.headline.value === '0' && !card.facts.some((fact) => fact.alert);
+    const quiet = isQuietCard(card);
     const node = el(
       'article',
       `cockpit-card cockpit-card--${card.id}${card.off ? ' cockpit-card--off' : ''}${quiet ? ' cockpit-card--quiet' : ''}`,
@@ -2654,10 +2655,20 @@ export class BoardView {
     toggle.addEventListener('click', () => {
       this.crewExpanded = !this.crewExpanded;
       this.renderAgents(agents);
-      rail.querySelector<HTMLElement>('[data-section="crew-all"]')?.focus();
+      // Focus follows the control. When folding leaves a list that fits,
+      // the control is gone: focus lands on the rail itself, never <body>.
+      const next = rail.querySelector<HTMLElement>('[data-section="crew-all"]');
+      if (next !== null) next.focus({ preventScroll: true });
+      else {
+        rail.tabIndex = -1;
+        rail.focus({ preventScroll: true });
+      }
     });
     rail.append(toggle);
-    if (refocus) toggle.focus();
+    // Restoring focus after a snapshot push must never scroll: a reader who
+    // left the control focused and scrolled away would be yanked back to
+    // the rail on every push.
+    if (refocus) toggle.focus({ preventScroll: true });
   }
 
   /** One dense agent row: status dot, name + short hash, role·state

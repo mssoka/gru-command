@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { boardKpis, collectJobs } from './board-kpi.js';
 import type { AgentView, BoardSnapshot, BriefingReviewView, BuildView, ChildWorkerCounts, DiskView, JobView, SilasView, VectorOnView, VectorView } from './board-protocol.js';
-import { cockpitCards, gruQueueLine, healthPill, type CockpitCard } from './cockpit.js';
+import { cockpitCards, gruQueueLine, healthPill, type CockpitCard, isQuietCard } from './cockpit.js';
 
 /**
  * The cockpit (owner-approved rework 2026-10-17): the health pill and the
@@ -466,3 +466,26 @@ describe('cockpit Gru line', () => {
     expect(gruQueueLine(2, true).text).toBe('last-known · Gru is handling 2 live alerts');
   });
 });
+
+describe('a card whose headline is zero steps back', () => {
+  const fact = (value: number, alert = false) => ({ kpi: 'x', value, label: 'x', title: 'x', alert });
+  const card = (headline: string, facts: ReturnType<typeof fact>[], off = false) => ({
+    off,
+    headline: { value: headline, unit: 'open', kpi: null, title: 'x' },
+    facts,
+  });
+
+  it('is quiet at zero, at full strength with a count, an alert, or the off face', () => {
+    expect(isQuietCard(card('0', [fact(0), fact(3)]))).toBe(true);
+    expect(isQuietCard(card('0', []))).toBe(true);
+    // A count in the headline.
+    expect(isQuietCard(card('4', [fact(0)]))).toBe(false);
+    // Zero in the headline but an alert on the card: it must not step back.
+    expect(isQuietCard(card('0', [fact(1, true)]))).toBe(false);
+    // An off card has its own dashed face; an unknown headline is not zero.
+    expect(isQuietCard(card('0', [], true))).toBe(false);
+    expect(isQuietCard(card('—', []))).toBe(false);
+    expect(isQuietCard(card('off', []))).toBe(false);
+  });
+});
+
