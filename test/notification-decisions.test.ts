@@ -48,7 +48,7 @@ function tmpDir(): string {
   return dir;
 }
 
-function boot(): { api: LedgerApi; bus: EventBus; center: NotificationCenter; needsOwner: string[]; actionRequired: string[] } {
+function boot(): { api: LedgerApi; db: LedgerDb; bus: EventBus; center: NotificationCenter; needsOwner: string[]; actionRequired: string[] } {
   const db = new LedgerDb(tmpDir());
   const bus = new EventBus();
   const api = new LedgerApi(db.handle, { bus });
@@ -60,7 +60,7 @@ function boot(): { api: LedgerApi; bus: EventBus; center: NotificationCenter; ne
     onNeedsOwner: (row) => needsOwner.push(row.id),
     onActionRequired: (row) => actionRequired.push(row.id),
   });
-  return { api, bus, center, needsOwner, actionRequired };
+  return { api, db, bus, center, needsOwner, actionRequired };
 }
 
 const decision = ownerDecisionFixture;
@@ -792,10 +792,58 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
       // Still a typed decision, with the agreed options and no mark.
       expect(attached?.decision?.options.map((option) => option.id), ids.join()).toEqual(ids);
       expect(attached?.decision !== null && attached?.decision !== undefined && 'recommendedOption' in attached.decision, ids.join()).toBe(false);
+      // The mark is gone from the STORED row, not merely hidden by the
+      // tolerant read: what is stored is what a strict parse accepts.
+      const stored = (rig.db.handle.prepare('SELECT decision_json FROM notifications WHERE id = ?').get(id) as { decision_json: string }).decision_json;
+      expect(stored, ids.join()).not.toContain('recommendedOption');
+      expect(() => parseNotificationDecision(JSON.parse(stored)), ids.join()).not.toThrow();
       expect(rig.api.getNotification(id)?.decision?.recommendation, ids.join()).toBe('Approve the slim contract.');
       // And the owner can answer it.
       expect(rig.center.decide(id, ids[0]!, 'owner')?.decidedOption, ids.join()).toBe(ids[0]);
     }
+  });
+
+  it('re-attaching the marked option unchanged keeps the mark, so nothing in flight is invalidated', () => {
+    const rig = boot();
+    const starter = decision({ discussion: true, recommendedOption: 'approve' });
+    const id = rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Which shape?',
+      detail: 'Talk it through with Gru first',
+      decision: starter,
+    }).id;
+    const displayed = rig.api.getNotification(id)!.decision!;
+    // The same options again (order aside): the decision is byte-identical,
+    // so a click the owner already made against it still matches.
+    const again = rig.api.updateNotificationDecisionOptions(id, [...starter.options], 'gru');
+    expect(again?.decision?.recommendedOption).toBe('approve');
+    expect(serializeNotificationDecision(again!.decision!)).toBe(serializeNotificationDecision(displayed));
+    expect(rig.api.recordNotificationDecision(id, 'approve', 'web', displayed)?.decidedOption).toBe('approve');
+
+    // The marked option kept among others, unchanged: the mark stands.
+    const rig2 = boot();
+    const id2 = rig2.center.post({
+      kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Which shape?', detail: 'evidence', decision: starter,
+    }).id;
+    const widened = rig2.api.updateNotificationDecisionOptions(
+      id2,
+      [...starter.options, { id: 'later', label: 'Decide later', consequence: 'Nothing changes for now.' }],
+      'gru',
+    );
+    expect(widened?.decision?.recommendedOption).toBe('approve');
+    // The same id with a different consequence is a different choice.
+    const rig3 = boot();
+    const id3 = rig3.center.post({
+      kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Which shape?', detail: 'evidence', decision: starter,
+    }).id;
+    const reworded = rig3.api.updateNotificationDecisionOptions(
+      id3,
+      starter.options.map((option) => (option.id === 'approve' ? { ...option, consequence: 'Gru starts a different plan.' } : option)),
+      'gru',
+    );
+    expect(reworded?.decision !== null && reworded?.decision !== undefined && 'recommendedOption' in reworded.decision).toBe(false);
   });
 
   it('a stored mark that names no stored option is dropped on read, never the whole question', () => {
@@ -806,6 +854,22 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     const read = parseStoredNotificationDecision(stored);
     expect(read).toEqual(parseNotificationDecision(decision()));
     expect(read !== null && 'recommendedOption' in read).toBe(false);
+    // Every mark the write boundary refuses is dropped the same way: one
+    // that is not text, and one with no recommendation beside it.
+    for (const refused of [
+      { ...decision(), recommendedOption: 7 },
+      { ...decision(), recommendedOption: ['approve'] },
+      { ...decision(), recommendedOption: { id: 'approve' } },
+      { ...decision(), recommendedOption: true },
+    ]) {
+      expect(() => parseNotificationDecision(refused), JSON.stringify(refused.recommendedOption)).toThrow(/recommendedOption/);
+      expect(parseStoredNotificationDecision(JSON.stringify(refused)), JSON.stringify(refused.recommendedOption)).toEqual(
+        parseNotificationDecision(decision()),
+      );
+    }
+    const unreasoned = { ...decision(), recommendation: null, recommendedOption: 'approve' };
+    expect(() => parseNotificationDecision(unreasoned)).toThrow(/needs decision\.recommendation/);
+    expect(parseStoredNotificationDecision(JSON.stringify(unreasoned))).toEqual(parseNotificationDecision({ ...decision(), recommendation: null }));
     // A mark that does name an option is kept; other corruption still
     // reads as no decision.
     expect(parseStoredNotificationDecision(JSON.stringify({ ...decision(), recommendedOption: 'keep' }))?.recommendedOption).toBe('keep');

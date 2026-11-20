@@ -243,8 +243,9 @@ use this role and the owner's direct messages for authority:
   leave the owner to count buttons. Leave it out when you recommend
   something that is not an option, have no preference (the server
   refuses a no-preference card that marks one), or the card has no options
-  yet. Options you attach later to a discussion card are always unmarked:
-  say which one you recommend in the chat instead. `docs/FOR-YOU.md` is the standard
+  yet. Options you attach later to a discussion card carry no mark of
+  their own (the route refuses a `recommendedOption` there): say which one
+  you recommend in the chat instead. `docs/FOR-YOU.md` is the standard
   and the server refuses (`400`) a card that breaks it. A discussion-only row is settled
   by talking with the owner in chat and then attaching the agreed options
   with `POST /api/notifications/:id/decision-options` `{ "options": [...],

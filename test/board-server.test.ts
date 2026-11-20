@@ -2458,6 +2458,16 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
           optionId: 'go', expectedDecision: row.decision,
         })).status,
       ).toBe(400);
+      // The attach path carries no mark of its own: a body that sends one is
+      // refused loudly, never silently ignored, and nothing is attached.
+      const marked = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
+        options: [{ id: 'go', label: 'Go with shape A', consequence: 'Gru commissions shape A.' }],
+        recommendedOption: 'go',
+        by: 'gru',
+      });
+      expect(marked).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+      expect((marked.body as { detail: string }).detail).toContain('decision-options takes no recommendedOption');
+      expect(api.getNotification(row.id)?.decision?.options).toEqual([]);
       const attached = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
         options: [
           { id: 'go', label: 'Go with shape A', consequence: 'Gru commissions shape A.' },

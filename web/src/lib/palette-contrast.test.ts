@@ -289,6 +289,10 @@ describe('palette contrast (v5)', () => {
     expect(declarationIn(COMPONENTS_CSS, pick, 'border-color')).toBeNull();
     expect(declarationIn(COMPONENTS_CSS, pick, 'box-shadow')).toBe('0 0 0 3px var(--work)');
     expect(contrast(themeVars(':root'), 'work', 'card')).toBeLessThan(3);
+    // The ring itself sits on the card body (--soft), where yellow is as
+    // weak: it reads by its edge against the tile's ink border.
+    expect(contrast(themeVars(':root'), 'work', 'soft')).toBeLessThan(3);
+    expect(declarationIn(COMPONENTS_CSS, '.board-notification--owner .board-notification__option', 'border')).toBe('var(--outline-thin)');
     // The tag and the filled button carry readable pairs in both themes.
     expect(colorTokenIn(COMPONENTS_CSS, '.board-notification__pick')).toBe('on-state');
     expect(declarationIn(COMPONENTS_CSS, '.board-notification__pick', 'background')).toBe('var(--work)');

@@ -58,7 +58,7 @@ before this standard renders its choices with no invented do-nothing line.
 **The pick is stated, never inferred.** A recommendation such as "choose
 the first option" makes the owner count buttons, so a producer whose
 recommendation is one of the options names that option in
-`recommendedOption`, and the card marks it (a tag, a yellow outline and the
+`recommendedOption`, and the card marks it (a tag, a yellow ring and the
 filled button, and names it to a screen reader as the description of
 that choice). The boundary keeps the mark honest:
 
@@ -71,11 +71,13 @@ It is optional: a recommendation that is not one of the options, a
 discussion-only card and a row written before the field existed mark
 nothing, and the browser never guesses a pick from the recommendation's
 words. Options attached later to a discussion card
-(`POST /api/notifications/:id/decision-options`) are always unmarked, and
-any mark the card carried is cleared: the stored recommendation was
-written about the discussion, not about those options. A stored mark that
-names none of the stored options is dropped when the row is read, never
-the whole question. The mark is part of the decision the browser echoes back with a
+(`POST /api/notifications/:id/decision-options`) carry no mark of their
+own, and the route refuses a body that sends one. A mark the card already
+carried stays only on the option it was written about, attached unchanged
+(same id, label and consequence); otherwise it is cleared, because the
+stored recommendation was not written about the new choice. A stored mark
+the boundary would refuse is dropped when the row is read, never the whole
+question. The mark is part of the decision the browser echoes back with a
 choice, so a card whose mark changed is `decision_changed` like any other
 edit. The owner is free to choose any option, marked or not.
 

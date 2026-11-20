@@ -41,7 +41,8 @@ describe('gru role definition', () => {
     expect(prompt).toContain('"recommendedOption": "<optional: the id of the option you recommend>"');
     expect(prompt).toContain('name it in `recommendedOption` by its `id`');
     expect(prompt).toContain('refuses a no-preference card that marks one');
-    expect(prompt).toContain('Options you attach later to a discussion card are always unmarked');
+    expect(prompt).toContain('Options you attach later to a discussion card carry no mark of');
+    expect(prompt).toContain('the route refuses a `recommendedOption` there');
     expect(prompt).toContain('"reservedClass"');
     expect(prompt).toContain('"whyNotDelegable"');
     expect(prompt).toContain('POST /api/notifications/:id/decision');

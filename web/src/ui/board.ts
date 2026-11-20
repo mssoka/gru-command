@@ -324,10 +324,10 @@ export class BoardView {
   } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
-  /** Open Details disclosures, keyed by notification id — a snapshot push
-   * never collapses what the operator opened. */
   /** Unique ids for "Gru's pick" tags (see pickTag). */
   private pickTagSeq = 0;
+  /** Open Details disclosures, keyed by notification id — a snapshot push
+   * never collapses what the operator opened. */
   private readonly openNotificationDetails = new Set<string>();
   /** Answered owner cards whose "What you were asked" recap is open. */
   private readonly openNotificationRecaps = new Set<string>();

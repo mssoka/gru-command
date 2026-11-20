@@ -234,24 +234,27 @@ export function parseStoredNotificationDecision(json: string | null): Notificati
   }
 }
 
-/** Read side only. A stored mark that names none of the stored options
- * marks nothing — and must not cost the owner the whole question: the
- * strict parser would refuse it, and a refused stored decision reads as
- * "no typed decision" (no options, no way to answer). The write boundary
- * still refuses such a mark loudly; this keeps a row readable if one is
- * ever stored anyway. */
+/** Read side only. A stored mark the write boundary would refuse — one that
+ * is not text, names none of the stored options, or has no recommendation
+ * beside it — marks nothing, and must not cost the owner the whole
+ * question: the strict parser would refuse it, and a refused stored
+ * decision reads as "no typed decision" (no options, no way to answer).
+ * The write boundary still refuses such a mark loudly; this keeps a row
+ * readable if one is ever stored anyway. */
 function withoutDanglingMark(raw: unknown): unknown {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return raw;
   const record = raw as Record<string, unknown>;
   const mark = record['recommendedOption'];
-  if (typeof mark !== 'string') return raw;
+  if (mark === undefined || mark === null) return raw;
   const options: readonly unknown[] = Array.isArray(record['options']) ? record['options'] : [];
-  const named = options.some(
-    (option) => typeof option === 'object' && option !== null && (option as Record<string, unknown>)['id'] === mark.trim(),
-  );
-  if (named) return raw;
-  const { recommendedOption: _danglingMark, ...rest } = record;
-  void _danglingMark;
+  const named =
+    typeof mark === 'string' &&
+    options.some((option) => typeof option === 'object' && option !== null && (option as Record<string, unknown>)['id'] === mark.trim());
+  const recommendation = record['recommendation'];
+  const reasoned = typeof recommendation === 'string' && recommendation.trim() !== '';
+  if (named && reasoned) return raw;
+  const { recommendedOption: _refusedMark, ...rest } = record;
+  void _refusedMark;
   return rest;
 }
 
