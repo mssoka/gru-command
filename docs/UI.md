@@ -356,10 +356,50 @@ readiness rule. Owner-facing copy follows [FOR-YOU.md](./FOR-YOU.md): the
 question card's face is guidance and choices only — never the short
 `detail` — it carries the typed context, Gru's recommendation ("Gru
 recommends: …", or the explicit no-recommendation form rendered without
-that prefix) and the producer's full "If you do nothing, …" sentence after
-the options (rendered bare, never doubled with a label), and a notice
+that prefix) and the producer's full "If you do nothing, …" sentence
+(rendered bare, never doubled with a label), and a notice
 renders "why you're seeing this / if you do nothing / what to do" from the
-central per-kind guidance (no generic sentence). It reads as the attention
+central per-kind guidance (no generic sentence).
+
+**The owner look** (owner picks 2026-11-20). An OPEN owner row — awaiting
+the owner's answer or Gru's follow-through — wears a headline strip over a
+calm body, and the strip's colour says how things stand before a word is
+read:
+
+| Strip | Meaning | Where |
+| --- | --- | --- |
+| coral | a question only the owner can answer | an open decision or owner notice |
+| yellow | answered, Gru is on it | a decided card awaiting follow-through |
+| green | good news, one step from the owner | the ready PR/MR row |
+
+- The strip carries the title, the kind-of-ask badge (`reservedClass` in
+  plain words: Merge, Access or cost, Can't be undone, Scope or design,
+  Lesson; an unknown class gets no badge) and the short `time · FOR YOU`
+  label. A destructive ask also carries a red left edge
+  (`--band-destructive`).
+- The body puts the story beside the owner's call and stacks them on a
+  narrow surface (a phone, the bell panel). The story is "What happened"
+  (the typed context) with the "Why this needs you" and "If you do
+  nothing" notes under it; the call is the question, Gru's advice in a
+  butter speech bubble (`--gru-soft`, dark ink in both themes), and one
+  tile per choice: the button, then what happens.
+- Severity no longer floods an owner card. Machine rows, feed rows
+  (an acked or resolved owner row included) and closed receipts keep the
+  compact card, where an error row still paints the alert surface with
+  on-state ink on every line.
+- An answered card leads with the recorded choice and folds the ask under
+  a "What you were asked" recap; its open state survives snapshot pushes
+  like Details.
+- The ready row states its three facts in plain words (Reviewed and
+  approved, Checks are green, Can be merged) above the exact evidence
+  line, and its strip says when that evidence was last observed
+  (`checked 3h ago`): the facts are as of that observation.
+- The FOR YOU pill follows what is waiting (`data-attention` on the band):
+  coral for a question, green for good news only, each with a pulsing dot
+  that stays still under reduced motion; calm otherwise. The count beside
+  it still carries the fact.
+
+It reads as the attention
 card
 (cockpit rework): under
 its `FOR YOU · N pending` heading, `2 things need you`, then one line about

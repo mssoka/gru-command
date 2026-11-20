@@ -4,6 +4,9 @@ import {
   LESSONS_PROPOSAL_CONSEQUENCE,
   OWNER_WINDOW_SIZE,
   decidedOptionLabel,
+  isDestructiveAsk,
+  kindOfAsk,
+  ownerAttention,
   ownerNoticeGuidance,
   ownerPendingCount,
   ownerRows,
@@ -285,5 +288,52 @@ describe('safePrUrl', () => {
     expect(safePrUrl('http://gitlab.example.test/acme/app/-/merge_requests/3')).toBeNull();
     expect(safePrUrl('')).toBeNull();
     expect(safePrUrl('github.com/x/y/pull/1')).toBeNull();
+  });
+});
+
+describe('owner look — kind of ask and what the pill says', () => {
+  const decision = {
+    question: 'Delete the 14 old worktrees?',
+    context: 'They are merged and unused.',
+    recommendation: null,
+    reservedClass: 'destructive',
+    whyNotDelegable: 'Deleting them cannot be undone.',
+    options: [{ id: 'delete', label: 'Delete them', consequence: 'The folders are removed.' }],
+    discussion: false,
+  };
+
+  it('names every reserved class in plain words and gives an unknown class no badge', () => {
+    expect(kindOfAsk('merge')).toEqual({ icon: '🔀', label: 'Merge' });
+    expect(kindOfAsk('authority-cost')).toEqual({ icon: '🔑', label: 'Access or cost' });
+    expect(kindOfAsk('destructive')).toEqual({ icon: '⚠️', label: 'Can’t be undone' });
+    expect(kindOfAsk('scope-design')).toEqual({ icon: '🧭', label: 'Scope or design' });
+    expect(kindOfAsk('lessons')).toEqual({ icon: '📖', label: 'Lesson' });
+    // Never a guessed label — and never an inherited object key.
+    expect(kindOfAsk('something-new')).toBeNull();
+    expect(kindOfAsk('toString')).toBeNull();
+    expect(kindOfAsk('')).toBeNull();
+  });
+
+  it('only a destructive ask carries the red edge', () => {
+    expect(isDestructiveAsk('destructive')).toBe(true);
+    for (const other of ['merge', 'authority-cost', 'scope-design', 'lessons', 'something-new']) {
+      expect(isDestructiveAsk(other), other).toBe(false);
+    }
+  });
+
+  it('the pill is clear with no rows, a question while anything needs the owner, and ready for good news only', () => {
+    expect(ownerAttention(ownerRows(snapshot()))).toBe('clear');
+    const open = notification('n01', { routing: 'needs-owner', decision });
+    const answered = notification('n02', { routing: 'needs-owner', decision, decidedAt: '2026-09-28T00:06:00.000Z', decidedOption: 'delete' });
+    const notice = notification('n03', { routing: 'needs-owner', kind: 'port-squat' });
+    expect(ownerAttention(ownerRows(snapshot({ notifications: [open] })))).toBe('question');
+    expect(ownerAttention(ownerRows(snapshot({ notifications: [notice] })))).toBe('question');
+    // A question outranks good news and answered rows beside it.
+    expect(ownerAttention(ownerRows(snapshot({ notifications: [open, answered], ownerPrs: [pr('job-1')] })))).toBe('question');
+    // Only ready PRs (with or without answers Gru is carrying out): good news.
+    expect(ownerAttention(ownerRows(snapshot({ ownerPrs: [pr('job-1')] })))).toBe('ready');
+    expect(ownerAttention(ownerRows(snapshot({ notifications: [answered], ownerPrs: [pr('job-1')] })))).toBe('ready');
+    // Only answers awaiting follow-through: the ball is with Gru.
+    expect(ownerAttention(ownerRows(snapshot({ notifications: [answered] })))).toBe('answered');
   });
 });

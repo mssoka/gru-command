@@ -984,7 +984,8 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         expect(await computedFontSize(page, panelMachineDetailSelector)).toBeCloseTo(beforeFonts.panelDetail * 2, 1);
         expect(await computedFontSize(page, relativeProbeSelector)).toBeCloseTo(beforeFonts.relative * 2, 1);
         expect(await computedFontSize(page, metaSelector)).toBe(22);
-        expect(await computedFontSize(page, optionSelector)).toBe(24);
+        // The owner look's choice button reads at 14px (it was a 12px pill).
+        expect(await computedFontSize(page, optionSelector)).toBe(28);
         const after = await page.evaluate(() => {
           const composer = document.querySelector<HTMLElement>('#chat-input');
           const panel = document.getElementById('notification-panel');
@@ -1019,7 +1020,12 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         // needs more vertical space and never more than its container.
         const titleAfter = await page.locator(titleSelector).boundingBox();
         expect(titleAfter!.height).toBeGreaterThan(titleBefore!.height);
-        expect(titleAfter!.width).toBeLessThanOrEqual(titleBefore!.width + 1);
+        // On the owner look the title shares the headline strip with the
+        // kind badge and the time label; once those wrap under it the title
+        // may take the whole strip row — but never more than the strip.
+        const stripAfter = await card.locator('.board-notification__head').boundingBox();
+        expect(titleAfter!.x).toBeGreaterThanOrEqual(stripAfter!.x - 1);
+        expect(titleAfter!.x + titleAfter!.width).toBeLessThanOrEqual(stripAfter!.x + stripAfter!.width + 1);
 
         // Full expanded content: geometry, non-overlap, reachability.
         const detailBox = await detail.boundingBox();
@@ -1743,6 +1749,128 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         await captureViewport(page, `${theme}-contrast-panel`, `${theme}: panel used for measured contrast`);
       } finally {
         await page.close();
+      }
+    }
+  });
+
+  test('owner look: an error-severity question, an answered card and the ready row meet WCAG AA and keep every line inside the card', async ({ browser }) => {
+    // The fixed fixture's decision is info-severity with no ready row, so on
+    // its own it never measures the cases the owner look changes most: an
+    // ERROR owner card (which used to flood the alert surface), the yellow
+    // answered strip with its recap, and the green ready row.
+    const base = decisionNotification();
+    const errorAsk: NotificationView = {
+      ...base,
+      id: 'error-ask',
+      severity: 'error',
+      decision: {
+        ...base.decision!,
+        reservedClass: 'destructive',
+        ifNothing: 'If you do nothing, the lane stays parked and nothing is re-armed.',
+      },
+    };
+    const answeredAsk: NotificationView = {
+      ...base,
+      id: 'answered-ask',
+      severity: 'error',
+      decidedAt: '2026-10-11T00:03:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    };
+    const ready = {
+      id: 'owner-pr:job-ready',
+      jobId: 'job-ready',
+      jobTitle: 'Fix the payment retry loop: a long heist title that has to wrap inside the green strip without pushing it wider',
+      repo: 'demo-api',
+      prUrl: 'https://example.invalid/pr/41',
+      sha: LONG_SHA,
+      checkedAt: T0,
+    };
+    const errorCard = '#board-owner [data-notification-id="error-ask"]';
+    const answeredCard = '#board-owner [data-notification-id="answered-ask"]';
+    const readyRow = '#board-owner .board-owner__row--pr';
+    for (const theme of ['light', 'dark'] as const) {
+      for (const width of [1280, 390] as const) {
+        const page = await browser.newPage({ viewport: { width, height: 900 } });
+        try {
+          const seed = await seedBoard(page, fixtureSnapshot({ notifications: [errorAsk, answeredAsk], ownerPrs: [ready], unackedNeedsOwner: 2 }));
+          await pairAndOpenBoard(page);
+          if (theme === 'dark') {
+            await page.locator('#theme-toggle').click();
+            await expect(page.locator('html')).toHaveClass(/dark/);
+          }
+          await expect(page.locator(errorCard)).toHaveClass(/board-notification--owner/);
+          await expect(page.locator(errorCard)).toHaveClass(/board-notification--destructive/);
+          await page.locator(`${answeredCard} .board-notification__recap > summary`).click();
+          await settled(page);
+          expect(seed.pageErrors).toEqual([]);
+
+          const pairs: readonly (readonly [string, string])[] = [
+            [`${errorCard} .board-notification__title`, 'error question: title on the coral strip'],
+            [`${errorCard} .board-notification__meta`, 'error question: time label on the strip'],
+            [`${errorCard} .board-notification__kind`, 'error question: kind badge'],
+            [`${errorCard} .board-notification__kicker`, 'error question: kicker'],
+            [`${errorCard} .board-notification__context`, 'error question: context'],
+            [`${errorCard} .board-notification__why`, 'error question: why this needs you'],
+            [`${errorCard} .board-notification__if-nothing`, 'error question: if you do nothing'],
+            [`${errorCard} .board-notification__question`, 'error question: question'],
+            [`${errorCard} .board-notification__gru-bubble`, 'error question: Gru bubble'],
+            [`${errorCard} .board-notification__option-button`, 'error question: choice button'],
+            [`${errorCard} .board-notification__option-consequence`, 'error question: consequence'],
+            [`${errorCard} .board-notification__details > summary`, 'error question: Details'],
+            [`${answeredCard} .board-notification__title`, 'answered: title on the yellow strip'],
+            [`${answeredCard} .board-notification__state`, 'answered: state chip'],
+            [`${answeredCard} .board-notification__decided`, 'answered: recorded choice'],
+            [`${answeredCard} .board-notification__recap > summary`, 'answered: recap summary'],
+            [`${answeredCard} .board-notification__recap .board-notification__question`, 'answered: recap question'],
+            [`${answeredCard} .board-notification__recap .board-notification__option-label`, 'answered: recap option'],
+            [`${readyRow} .board-owner__title`, 'ready row: title on the green strip'],
+            [`${readyRow} .board-owner__ready`, 'ready row: ready chip'],
+            [`${readyRow} .board-owner__checked`, 'ready row: checked label'],
+            [`${readyRow} .board-owner__tick`, 'ready row: plain fact'],
+            [`${readyRow} .board-owner__meta`, 'ready row: evidence line'],
+            [`${readyRow} .board-owner__open`, 'ready row: open link'],
+          ];
+          const failures: { pair: string; ratio: number }[] = [];
+          for (const [selector, label] of pairs) {
+            const ratio = await contrastOf(page, selector);
+            if (ratio < 4.5) failures.push({ pair: `${label} (${theme} @${width})`, ratio });
+          }
+          expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+
+          // The strips really are the colours that carry the meaning.
+          const background = (selector: string): Promise<string> =>
+            page.locator(selector).evaluate((element) => getComputedStyle(element).backgroundColor);
+          const strips = [
+            await background(`${errorCard} .board-notification__head`),
+            await background(`${answeredCard} .board-notification__head`),
+            await background(`${readyRow} .board-owner__strip`),
+          ];
+          expect(new Set(strips).size, `three distinct strip colours (${theme})`).toBe(3);
+
+          // The cards clip (rounded strip), so a clipped line would still
+          // report no scroll overflow: every painted descendant must END
+          // inside its card.
+          for (const card of [errorCard, answeredCard, readyRow]) {
+            const overflow = await overflows(page, card);
+            expect(overflow.scrollWidth, `${card} ${theme} @${width}`).toBeLessThanOrEqual(overflow.clientWidth + 1);
+            const outside = await page.locator(card).evaluate((root) => {
+              const limit = root.getBoundingClientRect();
+              return [...root.querySelectorAll<HTMLElement>('*')]
+                .filter((node) => {
+                  const rect = node.getBoundingClientRect();
+                  if (rect.width === 0 || rect.height === 0) return false;
+                  return rect.right > limit.right + 1 || rect.left < limit.left - 1;
+                })
+                .map((node) => node.className || node.tagName);
+            });
+            expect(outside, `${card} ${theme} @${width}: lines outside the card`).toEqual([]);
+          }
+          expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
+          await captureViewport(page, `${theme}-${width}-owner-look`, `${theme} @${width}: error question, answered card and ready row`);
+        } finally {
+          await page.close();
+        }
       }
     }
   });

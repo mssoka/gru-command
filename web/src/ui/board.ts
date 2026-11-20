@@ -85,7 +85,10 @@ import {
 } from '../lib/board-signals.js';
 import {
   decidedOptionLabel,
+  isDestructiveAsk,
   isNoRecommendation,
+  kindOfAsk,
+  ownerAttention,
   ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
@@ -320,6 +323,8 @@ export class BoardView {
   /** Open Details disclosures, keyed by notification id — a snapshot push
    * never collapses what the operator opened. */
   private readonly openNotificationDetails = new Set<string>();
+  /** Answered owner cards whose "What you were asked" recap is open. */
+  private readonly openNotificationRecaps = new Set<string>();
   /** Authoritative rows returned by a decision submission, applied until
    * the next snapshot carries the same state. */
   private readonly decisionOverrides = new Map<string, NotificationView>();
@@ -759,6 +764,9 @@ export class BoardView {
     }
     mount.hidden = false;
     mount.dataset.empty = String(rows.length === 0);
+    // The pill's colour says what is waiting (a question, good news only,
+    // or nothing) — the count beside it still carries the fact.
+    mount.dataset.attention = ownerAttention(rows);
     if (rows.length === 0) {
       // An empty owner list is healthy, not absence — the calm clear
       // state NEEDS GRU uses (never hidden, never a false alarm).
@@ -1168,19 +1176,35 @@ export class BoardView {
     const pr = row.pr;
     const gitlab = pr.provider === 'gitlab';
     const node = el('article', 'board-owner__row board-owner__row--pr');
-    node.append(
+    // Good news that needs one step from the owner wears a GREEN headline
+    // strip (owner look 2026-11-20): the colour says "ready, all fine"
+    // before a word is read.
+    const strip = el('div', 'board-owner__strip');
+    strip.append(
       el('div', 'board-owner__title', `🔀 ${pr.jobTitle}`),
-      el(
-        'span',
-        'pp-chip pp-chip--done board-owner__ready',
-        'ready for you',
-      ),
+      el('span', 'pp-chip board-owner__ready', 'ready for you'),
+      // The facts below held when the evidence was last observed; the strip
+      // says how long ago that was, in the same breath as "ready".
+      el('span', 'lbl board-owner__checked', `checked ${formatAge(pr.checkedAt)} ago`),
+    );
+    // The three facts the evidence line proves, in plain words; the exact
+    // evidence (repo, head, observation age) stays on the line below them.
+    const ticks = el('div', 'board-owner__ticks');
+    ticks.append(
+      el('span', 'board-owner__tick', 'Reviewed and approved'),
+      el('span', 'board-owner__tick', 'Checks are green'),
+      el('span', 'board-owner__tick', 'Can be merged'),
+    );
+    const facts = el('div', 'board-owner__facts');
+    facts.append(
+      ticks,
       el(
         'div',
         'board-owner__meta lbl',
         `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable · observed ${formatAge(pr.checkedAt)} ago`,
       ),
     );
+    node.append(strip, facts);
     const href = safePrUrl(pr.prUrl);
     if (href !== null) {
       const open = el('a', 'board-owner__open', gitlab ? 'OPEN MR ↗' : 'OPEN PR ↗');
@@ -2912,9 +2936,18 @@ export class BoardView {
   private notificationCard(item: NotificationView, closedReceipt = false, bandVisible = false): HTMLElement {
     const receipt = closedReceipt;
     const decided = item.decidedAt !== null && item.decidedAt !== undefined;
+    const decision = item.decision ?? null;
+    // The owner face (owner look 2026-11-20): an OPEN owner row — awaiting
+    // the owner's answer or its follow-through — wears the headline strip
+    // and the split body. Machine rows, feed rows and closed receipts keep
+    // the compact card.
+    // An acked row is a feed row, not an open ask (the band no longer
+    // lists it), so it keeps the compact card as well.
+    const ownerFace = item.routing === 'needs-owner' && !receipt && item.resolvedAt === null && item.ackedAt === null;
+    const destructive = ownerFace && decision !== null && isDestructiveAsk(decision.reservedClass);
     const card = el(
       'article',
-      `board-notification board-notification--${item.severity}${receipt ? ' board-notification--receipt' : ''}${decided ? ' board-notification--decided' : ''}`,
+      `board-notification board-notification--${item.severity}${receipt ? ' board-notification--receipt' : ''}${decided ? ' board-notification--decided' : ''}${ownerFace ? ' board-notification--owner' : ''}${destructive ? ' board-notification--destructive' : ''}`,
     );
     card.dataset.notificationId = item.id;
     card.dataset.focusTarget = 'card';
@@ -2940,62 +2973,111 @@ export class BoardView {
           : item.ackedAt !== null
             ? 'seen'
             : null;
+    // What KIND of ask this is, in plain words, before the owner reads it.
+    const kind = ownerFace && decision !== null ? kindOfAsk(decision.reservedClass) : null;
+    if (kind !== null) head.append(el('span', 'pp-chip board-notification__kind', `${kind.icon} ${kind.label}`));
     if (state !== null) head.append(el('span', 'pp-chip board-notification__state', state));
-    card.append(head);
     // Metadata stays a SHORT label line: timestamp + attention channel —
-    // never prose, never the long detail.
-    card.append(el('div', 'board-notification__meta lbl', `${formatTs(item.ts)} · ${ROUTING_LABEL[item.routing]}`));
+    // never prose, never the long detail. On the owner face it rides the
+    // headline strip; the compact card keeps it on its own line.
+    const meta = el('div', 'board-notification__meta lbl', `${formatTs(item.ts)} · ${ROUTING_LABEL[item.routing]}`);
+    if (ownerFace) head.append(meta);
+    card.append(head);
+    if (!ownerFace) card.append(meta);
     const detail = item.detail === null || item.detail === '' ? null : item.detail;
-    const decision = item.decision ?? null;
     const shortDetail = detail !== null && detail.length <= DETAIL_FACE_LIMIT && !detail.includes('\n');
     // The face is guidance and choices only (issue #570): an owner row never
     // promotes its short detail to the face, because that slot belongs to the
     // typed context and evidence stays behind Details — a one-line log line
     // with an id is exactly what the standard keeps off the face.
     const detailOnFace = decision === null && shortDetail && item.routing !== 'needs-owner';
-    if (decision !== null) card.append(el('div', 'board-notification__context', decision.context));
-    else if (detailOnFace && detail !== null) card.append(el('div', 'board-notification__context', detail));
     const submission = this.decisionSubmissions.get(item.id) ?? null;
-    if (decision !== null) {
-      card.append(this.decisionBlock(item, decision, submission, bandVisible, !receipt && item.routing === 'needs-owner'));
-      if (submission !== null && !decided && item.resolvedAt === null) {
-        // The submission state lives in BoardView, not in the DOM: a live
-        // push mid-submit re-renders the SAME phase on both surfaces.
-        const status = el(
-          'div',
-          `board-notification__submission board-notification__submission--${submission.phase}`,
-          submission.phase === 'submitting'
-            ? `Recording “${submission.label}”…`
-            : (submission.message ?? 'The outcome is unconfirmed — the board will show the recorded state.'),
+    const submissionStatus = (): HTMLElement | null => {
+      if (submission === null || decided || item.resolvedAt !== null) return null;
+      // The submission state lives in BoardView, not in the DOM: a live
+      // push mid-submit re-renders the SAME phase on both surfaces.
+      const status = el(
+        'div',
+        `board-notification__submission board-notification__submission--${submission.phase}`,
+        submission.phase === 'submitting'
+          ? `Recording “${submission.label}”…`
+          : (submission.message ?? 'The outcome is unconfirmed — the board will show the recorded state.'),
+      );
+      status.setAttribute('role', submission.phase === 'submitting' || submission.phase === 'reconciling' ? 'status' : 'alert');
+      return status;
+    };
+    const decidedLine = (shown: NotificationDecisionView): HTMLElement =>
+      el(
+        'div',
+        'board-notification__decided',
+        item.resolvedAt === null
+          ? `Decision recorded: “${decidedOptionLabel(shown, item.decidedOption)}” — awaiting follow-through.`
+          : `Decision recorded: “${decidedOptionLabel(shown, item.decidedOption)}” — follow-through resolved.`,
+      );
+    if (ownerFace) {
+      const body = el('div', 'board-notification__body');
+      if (decision !== null) {
+        // The story on one side, the owner's call on the other (they stack
+        // on a narrow surface): what happened, why it reached the owner and
+        // what waiting costs — then the question, Gru's advice, the choices.
+        const story = el('div', 'board-notification__story');
+        story.append(
+          el('div', 'board-notification__kicker lbl', 'What happened'),
+          el('div', 'board-notification__context', decision.context),
         );
-        status.setAttribute('role', submission.phase === 'submitting' || submission.phase === 'reconciling' ? 'status' : 'alert');
-        card.append(status);
+        const notes = el('div', 'board-notification__notes');
+        notes.append(this.decisionWhy(decision));
+        const ifNothing = this.decisionIfNothing(decision);
+        if (ifNothing !== null) notes.append(ifNothing);
+        story.append(notes);
+        body.append(story, this.decisionBlock(item, decision, submission, bandVisible, true, true));
+        if (decided) {
+          // Answered: the recorded choice leads, and the ask itself folds
+          // under a recap — the ball is with Gru now, the record stays.
+          card.append(decidedLine(decision));
+          const recap = document.createElement('details');
+          recap.className = 'board-notification__recap';
+          recap.open = this.openNotificationRecaps.has(item.id);
+          const summary = document.createElement('summary');
+          summary.textContent = 'What you were asked';
+          summary.dataset.focusKey = `notif:${item.id}:recap`;
+          if (bandVisible) summary.dataset.ownerFocusKey = `notif:${item.id}:recap`;
+          recap.append(summary, body);
+          recap.addEventListener('toggle', () => {
+            if (recap.open) this.openNotificationRecaps.add(item.id);
+            else this.openNotificationRecaps.delete(item.id);
+          });
+          card.append(recap);
+        } else {
+          card.append(body);
+          const status = submissionStatus();
+          if (status !== null) card.append(status);
+        }
+      } else {
+        // Owner-only notice: why it is here, what happens if the owner does
+        // nothing, and the manual step — structured, and no fake control.
+        const guidance = ownerNoticeGuidance(item.kind);
+        if (guidance !== null) {
+          const box = el('div', 'board-notification__guidance');
+          box.append(
+            el('div', 'board-notification__guidance-why', `Why you’re seeing this: ${guidance.whyAsked}`),
+            // The stored line already opens with "If you do nothing, …"; the
+            // static label would say it twice on every notice (#570).
+            el('div', 'board-notification__guidance-nothing', guidance.ifNothing),
+            el('div', 'board-notification__guidance-how', `What to do: ${guidance.howTo}`),
+          );
+          body.append(box);
+          card.append(body);
+        }
       }
-      if (decided) {
-        card.append(
-          el(
-            'div',
-            'board-notification__decided',
-            item.resolvedAt === null
-              ? `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — awaiting follow-through.`
-              : `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — follow-through resolved.`,
-          ),
-        );
-      }
-    } else if (item.routing === 'needs-owner' && !receipt && item.resolvedAt === null) {
-      // Owner-only notice: why it is here, what happens if the owner does
-      // nothing, and the manual step — structured, and no fake control.
-      const guidance = ownerNoticeGuidance(item.kind);
-      if (guidance !== null) {
-        const box = el('div', 'board-notification__guidance');
-        box.append(
-          el('div', 'board-notification__guidance-why', `Why you’re seeing this: ${guidance.whyAsked}`),
-          // The stored line already opens with "If you do nothing, …"; the
-          // static label would say it twice on every notice (#570).
-          el('div', 'board-notification__guidance-nothing', guidance.ifNothing),
-          el('div', 'board-notification__guidance-how', `What to do: ${guidance.howTo}`),
-        );
-        card.append(box);
+    } else {
+      if (decision !== null) card.append(el('div', 'board-notification__context', decision.context));
+      else if (detailOnFace && detail !== null) card.append(el('div', 'board-notification__context', detail));
+      if (decision !== null) {
+        card.append(this.decisionBlock(item, decision, submission, bandVisible, !receipt && item.routing === 'needs-owner', false));
+        const status = submissionStatus();
+        if (status !== null) card.append(status);
+        if (decided) card.append(decidedLine(decision));
       }
     }
     // What the card was closed with (#523): the follow-through's result, or a
@@ -3067,23 +3149,43 @@ export class BoardView {
     submission: DecisionSubmission | null,
     bandVisible: boolean,
     allowOptions: boolean,
+    split: boolean,
   ): HTMLElement {
     const block = el('section', 'board-notification__decision');
+    if (split) block.append(el('div', 'board-notification__kicker lbl', 'Your call'));
     block.append(el('div', 'board-notification__question', decision.question));
     if (decision.recommendation !== null) {
       // A producer with no preference states that form explicitly; it is not
       // dressed up as a recommendation (#570).
-      block.append(
-        el(
-          'div',
-          'board-notification__recommendation',
-          isNoRecommendation(decision.recommendation)
-            ? decision.recommendation
-            : `Gru recommends: ${decision.recommendation}`,
-        ),
-      );
+      const plain = isNoRecommendation(decision.recommendation);
+      if (split) {
+        // The owner face: Gru's advice reads as Gru talking — the brain coin
+        // and a speech bubble — and still says the same words in order.
+        const line = el('div', 'board-notification__recommendation');
+        const coin = el('span', 'board-notification__gru-coin', '🧠');
+        coin.setAttribute('aria-hidden', 'true');
+        const bubble = el('div', 'board-notification__gru-bubble');
+        if (plain) bubble.textContent = decision.recommendation;
+        else {
+          bubble.append(
+            el('span', 'board-notification__gru-label', 'Gru recommends:'),
+            document.createTextNode(` ${decision.recommendation}`),
+          );
+        }
+        line.append(coin, bubble);
+        block.append(line);
+      } else {
+        block.append(
+          el(
+            'div',
+            'board-notification__recommendation',
+            plain ? decision.recommendation : `Gru recommends: ${decision.recommendation}`,
+          ),
+        );
+      }
     }
-    block.append(el('div', 'board-notification__why', `Why this needs you: ${decision.whyNotDelegable}`));
+    // On the owner face the why/if-nothing notes sit with the story.
+    if (!split) block.append(this.decisionWhy(decision));
     const decided = item.decidedAt !== null && item.decidedAt !== undefined;
     // Options are live only on an open OWNER row: machine queue rows and
     // closed receipts render their options read-only (no fake control).
@@ -3156,14 +3258,24 @@ export class BoardView {
       }
       block.append(options);
     }
-    // What happens if the owner does nothing (#570). A pre-upgrade row has no
-    // line and gets none invented.
-    const ifNothing = decision.ifNothing ?? null;
-    if (ifNothing !== null && ifNothing !== '') {
-      // Rendered bare: every producer line already reads "If you do nothing, …".
-      block.append(el('div', 'board-notification__if-nothing', ifNothing));
+    if (!split) {
+      const ifNothing = this.decisionIfNothing(decision);
+      if (ifNothing !== null) block.append(ifNothing);
     }
     return block;
+  }
+
+  /** Why the decision reached the owner and cannot be delegated. */
+  private decisionWhy(decision: NotificationDecisionView): HTMLElement {
+    return el('div', 'board-notification__why', `Why this needs you: ${decision.whyNotDelegable}`);
+  }
+
+  /** What happens if the owner does nothing (#570). A pre-upgrade row has no
+   * line and gets none invented. Rendered bare: every producer line already
+   * reads "If you do nothing, …". */
+  private decisionIfNothing(decision: NotificationDecisionView): HTMLElement | null {
+    const ifNothing = decision.ifNothing ?? null;
+    return ifNothing !== null && ifNothing !== '' ? el('div', 'board-notification__if-nothing', ifNothing) : null;
   }
 
   /** Submit an owner decision through the SHARED submission state
@@ -3274,6 +3386,13 @@ export class BoardView {
       if (id === undefined) continue;
       if (details.open) this.openNotificationDetails.add(id);
       else this.openNotificationDetails.delete(id);
+    }
+    // The answered card's recap keeps its open state the same way.
+    for (const recap of root.querySelectorAll<HTMLDetailsElement>('.board-notification__recap')) {
+      const id = recap.closest<HTMLElement>('[data-notification-id]')?.dataset.notificationId;
+      if (id === undefined) continue;
+      if (recap.open) this.openNotificationRecaps.add(id);
+      else this.openNotificationRecaps.delete(id);
     }
   }
 
@@ -3582,13 +3701,14 @@ interface DecisionSubmission {
  * contain ':' (e.g. `lessons-proposal-withdrawn:<uuid>`), so a fixed
  * split(':')[1] parses the wrong segment and drops focus to <body>. */
 function notificationIdFromFocusKey(key: string): string | null {
-  // The key suffix is known (`:details`, `:seen`, `:option:<id>`); parse it
+  // The key suffix is known (`:details`, `:recap`, `:seen`, `:option:<id>`); parse it
   // from the RIGHT so an id containing ':' survives intact.
   if (key.startsWith('notif:')) {
     const rest = key.slice('notif:'.length);
     const optionAt = rest.lastIndexOf(':option:');
     if (optionAt !== -1) return rest.slice(0, optionAt) || null;
     if (rest.endsWith(':details')) return rest.slice(0, -':details'.length) || null;
+    if (rest.endsWith(':recap')) return rest.slice(0, -':recap'.length) || null;
     if (rest.endsWith(':seen')) return rest.slice(0, -':seen'.length) || null;
     if (rest.endsWith(':card')) return rest.slice(0, -':card'.length) || null;
     if (rest.endsWith(':discuss')) return rest.slice(0, -':discuss'.length) || null;

@@ -34,12 +34,18 @@
   --paper-soft: #fdf3e4;    /* notice fill */
   --border: #ccc;           /* attach chip/picker hairline */
   --danger: #c0392b;        /* remove-hover / picker error ink */
+  /* Owner look (2026-11-20): Gru's advice bubble is a pale butter yellow
+     with dark ink in BOTH themes (the dark --accent-soft read as brown). */
+  --gru-soft: #ffe9a8;
 
   /* Attention-band accents (v5): one accent per band, edge + pill only.
      The INK pair is the accent's readable text tone on paper surfaces
      (the edge/pill tones themselves are decorative). */
   --band-needs-you: #f2868f;
   --band-needs-you-ink: #b03e4a;
+  /* The red edge of a destructive ("can't be undone") owner ask: an edge
+     only, never text. Dark needs its own red — there --danger IS coral. */
+  --band-destructive: #c0392b;
   --band-in-flight: var(--work);
   --band-settled: var(--done);
   --band-cold: var(--park);
@@ -94,9 +100,11 @@
   --paper-soft: #262b1e;
   --border: var(--line);
   --danger: var(--alert);
+  --gru-soft: #ffe9a8;
 
   --band-needs-you: #ff8f9c;
   --band-needs-you-ink: #ff9fae;
+  --band-destructive: #e5354b;
   --band-in-flight: var(--work);
   --band-settled: var(--done);
   --band-cold: var(--park);

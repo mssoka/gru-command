@@ -2271,19 +2271,125 @@ body {
   padding-left: 12px;
 }
 
+/* The ready PR/MR row (owner look 2026-11-20): good news that needs one
+   step from the owner wears a GREEN headline strip — the colour says
+   "ready, all fine" before a word is read. A wrapping flex card, so the
+   control drops under the facts on a narrow surface with no extra rule. */
 .board-owner__row--pr {
-  padding-left: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  margin: 6px 0;
+  padding: 0 0 12px;
+  overflow: hidden;
+  border: var(--outline-thin);
+  border-radius: var(--radius-md);
+  background: var(--soft);
 }
 
-.board-owner__row--pr::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 6px;
-  bottom: 6px;
-  width: 4px;
-  border-radius: 999px;
+.board-owner__row--pr:last-child {
+  border-bottom: var(--outline-thin);
+}
+
+.board-owner__strip {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+  padding: 10px 14px;
   background: var(--done);
+  color: var(--on-state);
+}
+
+.board-owner__row--pr .board-owner__title {
+  flex: 1 1 240px;
+  font-size: 16px;
+  line-height: 1.3;
+  color: var(--on-state);
+}
+
+/* Chips on a strip are neutral (paper + ink): they read on any strip
+   colour and never inherit the strip's dark ink onto a dark chip. */
+.board-owner__strip .board-owner__ready {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.board-owner__checked {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--on-state);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__facts {
+  flex: 1 1 280px;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 14px;
+}
+
+/* The evidence line under the plain facts: mixed case at reading size
+   (the band's uppercase label treatment made a long line hard to read),
+   and its own grid cell — never the base row's named `meta` area. */
+.board-owner__facts .board-owner__meta {
+  grid-area: auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 1.45;
+  text-transform: none;
+}
+
+.board-owner__ticks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.board-owner__tick::before {
+  content: '✓';
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--done);
+  color: var(--on-state);
+  font-size: 11px;
+}
+
+.board-owner__row--pr .board-owner__open,
+.board-owner__row--pr .board-owner__nolink {
+  margin: 0 14px;
+}
+
+.board-owner__row--pr .board-owner__open {
+  font-size: 13px;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  border: var(--outline);
+  box-shadow: var(--shadow-btn);
+}
+
+.board-owner__row--pr .board-owner__media {
+  flex: 1 1 100%;
+  margin: 0;
+  padding: 0 14px;
 }
 
 .board-owner__title {
@@ -3545,6 +3651,7 @@ a.repo-row__name:hover {
 .board-notification--error .board-notification__question,
 .board-notification--error .board-notification__recommendation,
 .board-notification--error .board-notification__why,
+.board-notification--error .board-notification__if-nothing,
 .board-notification--error .board-notification__decided,
 .board-notification--error .board-notification__result,
 .board-notification--error .board-notification__guidance,
@@ -3772,9 +3879,344 @@ a.repo-row__name:hover {
   border-bottom: 0;
 }
 
+/* The headline strip carries the attention now: the wrapper's left accent
+   bar would say it twice. */
 .board-owner__row--decision.board-owner__row--error,
 .board-owner__row--notice.board-owner__row--error {
-  padding-left: 12px;
+  padding-left: 0;
+}
+
+.board-owner__row--decision::before,
+.board-owner__row--notice::before {
+  content: none;
+}
+
+/* ── Owner look (owner picks 2026-11-20) ───────────────────────────────
+ * An OPEN owner row wears a headline strip over a calm body. The strip's
+ * colour says how things stand before a word is read:
+ *   coral  — a question only the owner can answer;
+ *   yellow — answered, Gru is on it;
+ *   green  — good news, one step from the owner (the ready PR/MR row).
+ * Severity no longer floods the card; a destructive ask carries a red
+ * edge as well. Every rule below restores an explicit AA pair, so an
+ * error-severity owner row never inherits the alert surface's ink. */
+.board-notification--owner {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--soft);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.board-notification--destructive {
+  border-left: 8px solid var(--band-destructive);
+}
+
+.board-notification--owner .board-notification__head {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 10px 14px;
+  background: var(--alert);
+  color: var(--on-state);
+}
+
+.board-notification--owner.board-notification--decided .board-notification__head {
+  background: var(--work);
+}
+
+.board-notification--owner .board-notification__title {
+  flex: 1 1 260px;
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+/* Chips and the time label may shrink and wrap: at 200% text in a 320px
+   panel an unshrinkable strip item pushed the card past its container. */
+.board-notification--owner .board-notification__kind,
+.board-notification--owner .board-notification__state {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  margin-left: 0;
+  background: var(--paper);
+  color: var(--ink);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.board-notification--owner .board-notification__meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--on-state);
+  opacity: 1;
+}
+
+/* The story beside the owner's call; they stack when the surface is
+   narrow (a phone, the bell panel). */
+.board-notification__body {
+  display: grid;
+  /* Two columns at most (each at least 40% wide), one when the surface
+     cannot give each 340px. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(340px, 40%)), 1fr));
+  gap: 16px 28px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.board-notification__body > * {
+  min-width: 0;
+}
+
+.board-notification__story {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.board-notification--owner .board-notification__context {
+  max-width: 68ch;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.board-notification__notes {
+  display: grid;
+  gap: 6px;
+  max-width: 68ch;
+  margin-top: 8px;
+  padding-top: 10px;
+  border-top: 2px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+}
+
+.board-notification--owner .board-notification__why,
+.board-notification--owner .board-notification__if-nothing {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.board-notification--owner .board-notification__decision {
+  gap: 10px;
+  align-content: start;
+  margin-top: 0;
+}
+
+.board-notification--owner .board-notification__question {
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+/* Gru's advice reads as Gru talking: the brain coin and a butter bubble. */
+.board-notification--owner .board-notification__recommendation {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--on-state);
+  font-size: 14px;
+}
+
+.board-notification__gru-coin {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: var(--outline-thin);
+  border-radius: 50%;
+  background: var(--work);
+  font-size: 16px;
+}
+
+.board-notification__gru-bubble {
+  min-width: 0;
+  padding: 8px 12px;
+  border: 2px solid var(--line);
+  border-radius: 4px 16px 16px 16px;
+  background: var(--gru-soft);
+  color: var(--on-state);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__gru-label {
+  font-weight: 800;
+}
+
+/* Each choice is its own tile: the button, then what happens. */
+.board-notification--owner .board-notification__options {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.board-notification--owner .board-notification__option {
+  gap: 8px;
+  align-content: start;
+  padding: 12px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+
+.board-notification--owner .board-notification__option-button {
+  padding: 8px 14px;
+  border: var(--outline);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: var(--shadow-btn);
+  font-size: 14px;
+  transition: transform 0.12s var(--ease-pop), box-shadow 0.12s ease;
+}
+
+.board-notification--owner .board-notification__option-button:hover:not(:disabled):not([aria-disabled='true']) {
+  transform: translate(-1px, -1px);
+}
+
+.board-notification--owner .board-notification__option-button:active:not(:disabled):not([aria-disabled='true']) {
+  transform: translate(2px, 2px);
+  box-shadow: var(--shadow-btn-pressed);
+}
+
+.board-notification--owner .board-notification__option-label {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.board-notification--owner .board-notification__option-consequence {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.board-notification--owner .board-notification__option-error {
+  color: var(--danger);
+}
+
+.board-notification--owner .board-notification__discuss,
+.board-notification--owner .board-notification__discuss-text {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.board-notification--owner .board-notification__guidance {
+  /* A notice has no "your call" column: its guidance takes the full row. */
+  grid-column: 1 / -1;
+  gap: 6px;
+  max-width: 80ch;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* The lines under the body keep the strip's gutter. */
+.board-notification--owner > .board-notification__submission,
+.board-notification--owner > .board-notification__decided,
+.board-notification--owner > .board-notification__result,
+.board-notification--owner > .board-notification__recap,
+.board-notification--owner > .board-notification__details {
+  margin: 0 14px 10px;
+}
+
+.board-notification--owner .board-notification__submission {
+  color: var(--ink);
+}
+
+.board-notification--owner .board-notification__submission--submitting {
+  color: var(--muted);
+}
+
+.board-notification--owner .board-notification__submission--refused,
+.board-notification--owner .board-notification__submission--unconfirmed {
+  color: var(--danger);
+}
+
+/* A card with no body (a notice whose kind has no guidance): the first
+   line under the strip keeps a gap from it. */
+.board-notification--owner > .board-notification__head + .board-notification__details {
+  margin-top: 10px;
+}
+
+/* Answered: the recorded choice leads, with a green tick. */
+.board-notification--owner > .board-notification__decided {
+  margin-top: 12px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.board-notification--owner > .board-notification__decided::before {
+  content: '✓';
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: var(--done);
+  color: var(--on-state);
+  font-size: 12px;
+}
+
+.board-notification__recap {
+  min-width: 0;
+}
+
+.board-notification__recap > summary,
+.board-notification--owner .board-notification__details > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.board-notification__recap > .board-notification__body {
+  padding: 10px 0 0;
+}
+
+.board-notification--owner .board-notification__detail-text {
+  color: var(--ink);
+}
+
+.board-notification--owner .board-notification__detail-kind {
+  color: var(--muted);
+}
+
+/* The FOR YOU pill says what is waiting: coral with a pulse for a
+   question, green for good news only; it stays calm otherwise. */
+#board-owner[data-attention='question'] .board-band__label {
+  background: var(--band-needs-you);
+}
+
+#board-owner[data-attention='ready'] .board-band__label {
+  background: var(--done);
+}
+
+#board-owner[data-attention='question'] .board-band__label::before,
+#board-owner[data-attention='ready'] .board-band__label::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--on-state);
+  vertical-align: 1px;
+  animation: conn-pulse 1.6s ease-in-out infinite;
+}
+
+/* Same selectors as the animated rule above: a shorter one would lose to
+   it and the dot would keep pulsing. */
+@media (prefers-reduced-motion: reduce) {
+  #board-owner[data-attention='question'] .board-band__label::before,
+  #board-owner[data-attention='ready'] .board-band__label::before {
+    animation: none;
+  }
 }
 
 /* ── Transcript drawer (E6) ─────────────────────────────── */
