@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -69,6 +69,93 @@ describe('GruSessionPointer', () => {
     });
     expect(new GruSessionPointer(dir).current()).toMatchObject({ epoch: 1, replayFloorSeq: 41 });
     expect(pointer.resumeCandidate()).toBe(freshFile);
+  });
+
+  it('a pointer recorded under another runtime is not resumed — it warns and spawns fresh', () => {
+    const dir = fixture();
+    const file = join(dir, 'claude-code.jsonl');
+    writeFileSync(file, '{}\n');
+    new GruSessionPointer(dir, () => {}, () => 'claude-code').record(file);
+
+    const warnings: string[] = [];
+    const asPi = new GruSessionPointer(
+      dir,
+      (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+      () => 'pi',
+    );
+    expect(asPi.resumeCandidate()).toBeNull();
+    expect(warnings.some((msg) => msg.includes('another runtime'))).toBe(true);
+    // The runtime that wrote it still owns the resume.
+    expect(new GruSessionPointer(dir, () => {}, () => 'claude-code').resumeCandidate()).toBe(file);
+  });
+
+  it('a legacy pointer (no runtime) resumes once, and the next record stamps the runtime', () => {
+    const dir = fixture();
+    const file = join(dir, 'legacy.jsonl');
+    writeFileSync(file, '{}\n');
+    writeFileSync(
+      join(dir, SESSION_STATE_NAME),
+      `${JSON.stringify({ sessionFile: file, spawnedAt: 'x', epoch: 2, replayFloorSeq: 7 })}\n`,
+    );
+    const pointer = new GruSessionPointer(dir, () => {}, () => 'pi');
+    // Absent is the legacy shape: resumable, never guessed at.
+    expect(pointer.current()?.runtime).toBeNull();
+    expect(pointer.resumeCandidate()).toBe(file);
+    expect(pointer.record(file)).toMatchObject({ runtime: 'pi', epoch: 2, replayFloorSeq: 7 });
+    expect(
+      JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8')).runtime,
+    ).toBe('pi');
+  });
+
+  it('an unknown current runtime never blocks a resume (the check never guesses)', () => {
+    const dir = fixture();
+    const file = join(dir, 'known.jsonl');
+    writeFileSync(file, '{}\n');
+    new GruSessionPointer(dir, () => {}, () => 'pi').record(file);
+    // Default resolver: no runtime notion (a caller with no adapter).
+    expect(new GruSessionPointer(dir).resumeCandidate()).toBe(file);
+  });
+
+  it('a write with no runtime resolver keeps the recorded label', () => {
+    const dir = fixture();
+    const file = join(dir, 'labelled.jsonl');
+    writeFileSync(file, '{}\n');
+    new GruSessionPointer(dir, () => {}, () => 'pi').record(file);
+    expect(JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8')).runtime).toBe('pi');
+    // A caller with no runtime notion must not erase a label already on
+    // record: an absent runtime resumes unguarded.
+    expect(new GruSessionPointer(dir).advance(file, 3).runtime).toBe('pi');
+    expect(JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8')).runtime).toBe('pi');
+  });
+
+  it('an unknown runtime is written as an absent field, never as null', () => {
+    const dir = fixture();
+    const file = join(dir, 'anonymous.jsonl');
+    writeFileSync(file, '{}\n');
+    new GruSessionPointer(dir).record(file);
+    const raw = JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8'));
+    expect('runtime' in raw).toBe(false);
+    expect(new GruSessionPointer(dir).current()?.runtime).toBeNull();
+  });
+
+  it('an explicit null runtime fails loud instead of resuming unguarded', () => {
+    const dir = fixture();
+    writeFileSync(
+      join(dir, SESSION_STATE_NAME),
+      `${JSON.stringify({ sessionFile: join(dir, 'x.jsonl'), epoch: 1, replayFloorSeq: 0, runtime: null })}\n`,
+    );
+    expect(() => new GruSessionPointer(dir).current()).toThrowError(/invalid runtime/);
+  });
+
+  it('a pointer whose runtime is not a string fails loud', () => {
+    const dir = fixture();
+    writeFileSync(
+      join(dir, SESSION_STATE_NAME),
+      `${JSON.stringify({ sessionFile: join(dir, 'x.jsonl'), runtime: 42 })}\n`,
+    );
+    expect(() => new GruSessionPointer(dir).current()).toThrowError(/invalid runtime/);
   });
 
   it('two successive resets advance safely and a later record preserves the boundary', () => {

@@ -20,6 +20,7 @@ import { ChatFrameLog } from '../src/chat/frame-log.js';
 import { createChatServer, type ChatServer } from '../src/chat/server.js';
 import { AWARENESS_WAKE_INSTRUCTION, type AwarenessInjection, type GruAwarenessPort } from '../src/chat/awareness.js';
 import { GruSessionPointer, SESSION_STATE_NAME } from '../src/chat/session-state.js';
+import { CorruptSessionTreeError } from '../src/runtime/session-tree.js';
 import { configPathFor, loadConfig, type GruCommandConfig } from '../src/config.js';
 import { ClaudeCodeRuntime } from '../src/runtime/claude-adapter.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
@@ -317,6 +318,9 @@ async function makeHarness(options: {
   readonly spawnBackoffMaxMs?: number;
   /** Gru on a real runtime instead of the stub (the stub stays `h.handle`). */
   readonly spawnGru?: (resumeFile: string | null) => Promise<AgentHandle>;
+  /** The runtime the harness's pointer believes it would spawn (null keeps the
+   * legacy no-runtime pointer, which resumes unconditionally). */
+  readonly pointerRuntime?: string | null;
 } = {}): Promise<Harness> {
   const dir = options.reuseDir ?? mkdtempSync(join(tmpdir(), 'gru-command-e4-'));
   cleanupDirs.push(dir);
@@ -338,7 +342,11 @@ async function makeHarness(options: {
   mkdirSync(uploadsDir, { recursive: true });
 
   const frameLog = ChatFrameLog.load(chatDir);
-  const pointer = new GruSessionPointer(chatDir);
+  const pointer = new GruSessionPointer(
+    chatDir,
+    () => {},
+    options.pointerRuntime === undefined ? undefined : () => options.pointerRuntime!,
+  );
   if (options.failFirstPointerAdvance !== undefined) {
     const advance = pointer.advance.bind(pointer);
     let failure: Error | null = options.failFirstPointerAdvance;
@@ -1309,6 +1317,181 @@ describe('chat server (real sockets, stub Gru)', () => {
     ).toBe(true);
     await retry.close();
     await harness.close();
+  });
+
+  it('an unusable resume boundary mints one fresh session instead of backing off (D2)', async () => {
+    const first = await makeHarness();
+    const client = await authedClient(first.port);
+    client.send('record the boundary', 'boundary-1');
+    await pollUntil(() => first.handle.calls.length === 1, 'first delivery');
+    await client.close();
+    await first.close();
+    const prior = new GruSessionPointer(first.chatDir).current()!;
+    expect(prior.sessionFile).toBe(first.handle.sessionFile);
+
+    const freshFile = join(first.dir, 'sessions', 'fresh-after-unusable.jsonl');
+    writeFileSync(freshFile, '');
+    const fresh = new StubGruHandle(freshFile, 'stub-fresh-after-unusable');
+    const second = await makeHarness({
+      reuseDir: first.dir,
+      spawnGru: (resumeFile) =>
+        resumeFile === null
+          ? Promise.resolve(fresh)
+          : Promise.reject(new CorruptSessionTreeError(resumeFile, 'aa000001', 'duplicate-id')),
+    });
+    try {
+      const retry = await authedClient(second.port);
+      retry.send('carry on', 'after-unusable');
+      // The repair advances the boundary, so the in-flight word has no ack:
+      // the socket closes and the persisted outbox replays under the new
+      // epoch — the same contract the vanished-session repair already pins.
+      await retry.waitFor(
+        (frame) => frame.type === 'error' && /could not be reconciled/.test(frame.message),
+        'boundary change rejects the in-flight word',
+      );
+      expect(await retry.closed).toBe(1011);
+      await retry.close();
+
+      // Exactly one resume attempt, then exactly one fresh mint.
+      expect(second.spawnCalls).toEqual([prior.sessionFile, null]);
+      const state = new GruSessionPointer(second.chatDir).current()!;
+      expect(state.sessionFile).toBe(freshFile);
+      // The replacement boundary is durable: epoch advanced, floor lifted.
+      expect(state.epoch).toBe(prior.epoch + 1);
+      expect(state.replayFloorSeq).toBeGreaterThan(prior.replayFloorSeq);
+      // ONE durable surface naming the cause, and no retry-gate failure.
+      const adopting = second.frameLog.history.filter(
+        (frame) => frame.type === 'notice' && /could not adopt/.test(frame.text),
+      );
+      expect(adopting).toHaveLength(1);
+      // The notice must live ABOVE the floor the repair lifted: a client that
+      // reconnects replays it beside the fresh session, never a bare chat.
+      const notice = adopting[0]!;
+      const noticeSeq = (notice as { readonly seq?: number }).seq;
+      expect(noticeSeq).toBeGreaterThan(state.replayFloorSeq);
+      expect(
+        second.frameLog.history.some(
+          (frame) => frame.type === 'error' && /could not start|temporarily unavailable/.test(frame.message),
+        ),
+      ).toBe(false);
+
+      // The replay lands on the fresh session, and no backoff window stands
+      // between the operator's next word and the brain that is already live.
+      const resumedClient = await authedClient(second.port);
+      // The replayed history carries the cause, not just the fresh session.
+      await resumedClient.waitFor(
+        (frame) => frame.type === 'notice' && /could not adopt/.test(frame.text),
+        'the repair notice survives replay',
+      );
+      resumedClient.send('carry on', 'after-unusable');
+      await pollUntil(
+        () => fresh.calls.some((call) => call.text === 'carry on'),
+        'delivery to the fresh session',
+      );
+      resumedClient.send('and again', 'after-unusable-2');
+      await pollUntil(
+        () => fresh.calls.some((call) => call.text === 'and again'),
+        'second delivery without backoff',
+      );
+      expect(second.spawnCalls).toEqual([prior.sessionFile, null]);
+      await resumedClient.close();
+    } finally {
+      await second.close();
+    }
+  });
+
+  it('a failed fresh retry never re-projects the refused transcript, and the notice lands when it can (D2)', async () => {
+    const first = await makeHarness();
+    const client = await authedClient(first.port);
+    client.send('record the boundary', 'boundary-retry-1');
+    await pollUntil(() => first.handle.calls.length === 1, 'first delivery');
+    await client.close();
+    await first.close();
+    const prior = new GruSessionPointer(first.chatDir).current()!;
+
+    const freshFile = join(first.dir, 'sessions', 'fresh-after-failed-retry.jsonl');
+    writeFileSync(freshFile, '');
+    const fresh = new StubGruHandle(freshFile, 'stub-fresh-after-failed-retry');
+    let freshAttempts = 0;
+    const second = await makeHarness({
+      reuseDir: first.dir,
+      spawnGru: (resumeFile) => {
+        if (resumeFile !== null) {
+          return Promise.reject(new CorruptSessionTreeError(resumeFile, 'aa000001', 'duplicate-id'));
+        }
+        freshAttempts += 1;
+        if (freshAttempts === 1) return Promise.reject(new Error('fresh spawn unavailable'));
+        return Promise.resolve(fresh);
+      },
+    });
+    try {
+      const firstTry = await authedClient(second.port);
+      firstTry.send('carry on', 'after-failed-retry-1');
+      await firstTry.waitFor(
+        (frame) => frame.type === 'error' && /Gru could not start/.test(frame.message),
+        'the failed repair surfaces as a spawn failure',
+      );
+      await firstTry.close();
+      // No notice is claimed for a repair that never happened.
+      expect(
+        second.frameLog.history.some(
+          (frame) => frame.type === 'notice' && /could not adopt/.test(frame.text),
+        ),
+      ).toBe(false);
+
+      // The refused transcript is remembered: the next attempt goes STRAIGHT
+      // to the fresh mint instead of re-opening (and re-parsing) it.
+      const secondTry = await authedClient(second.port);
+      secondTry.send('carry on now', 'after-failed-retry-2');
+      await pollUntil(
+        () => fresh.calls.some((call) => call.text === 'carry on now'),
+        'delivery after the recovered retry',
+      );
+      expect(second.spawnCalls).toEqual([prior.sessionFile, null, null]);
+      const state = new GruSessionPointer(second.chatDir).current()!;
+      expect(state.sessionFile).toBe(freshFile);
+      expect(state.epoch).toBe(prior.epoch + 1);
+      // The deferred notice is published once the replacement is real, above
+      // its floor so a reconnect still learns why the chat restarted.
+      const adopting = second.frameLog.history.filter(
+        (frame) => frame.type === 'notice' && /could not adopt/.test(frame.text),
+      );
+      expect(adopting).toHaveLength(1);
+      expect((adopting[0] as { readonly seq?: number }).seq).toBeGreaterThan(state.replayFloorSeq);
+      await secondTry.close();
+    } finally {
+      await second.close();
+    }
+  });
+
+  it('a pointer recorded under another runtime replaces the boundary with a notice (D1-C)', async () => {
+    const first = await makeHarness({ pointerRuntime: 'claude-code' });
+    const client = await authedClient(first.port);
+    client.send('record the boundary', 'boundary-mismatch-1');
+    await pollUntil(() => first.handle.calls.length === 1, 'first delivery');
+    await client.close();
+    await first.close();
+    const prior = new GruSessionPointer(first.chatDir).current()!;
+    expect(prior.runtime).toBe('claude-code');
+
+    // Same install, runtime switched: the pointer must refuse its own file
+    // before the spawner ever sees the path, and the chat must say so.
+    const second = await makeHarness({ reuseDir: first.dir, pointerRuntime: 'pi' });
+    try {
+      const retry = await authedClient(second.port);
+      retry.send('carry on', 'after-runtime-switch');
+      await retry.waitFor(
+        (frame) => frame.type === 'notice' && /different runtime/.test(frame.text),
+        'the runtime switch is explained in chat',
+      );
+      expect(second.spawnCalls).toEqual([null]);
+      const state = new GruSessionPointer(second.chatDir).current()!;
+      expect(state.epoch).toBe(prior.epoch + 1);
+      expect(state.runtime).toBe('pi');
+      await retry.close();
+    } finally {
+      await second.close();
+    }
   });
 
   it('dispose closes clients with 1001 and refuses later upgrades (no zombies)', async () => {

@@ -14,6 +14,13 @@ New installs and generated configs (`config-generate`, the setup wizard) write
 adopts the existing runtime unless one is chosen explicitly. Switch an existing
 install by editing `[runtimes] default`.
 
+A switch does not carry a conversation across: the Gru resume pointer records
+the runtime that wrote its session, and a pointer recorded under the other
+runtime spawns a fresh session (one warn in the log, one chat notice, the old
+transcript untouched on disk). A pi session is never projected as claude-code
+or the reverse — the formats differ, and the pi adapter refuses a transcript
+whose header names another runtime by name.
+
 [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) holds the parity matrix between the
 two runtimes, its guard, the declared gaps and the rollout notes for changing
 the default. Both runtimes take Silas directives and re-briefs with exact

@@ -3936,7 +3936,9 @@ describe('Perkins r1 regressions', () => {
     // Claude Code's own first records (an init frame, then a user turn).
     writeFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: '11111111-1111-1111-1111-111111111111' })}\n${JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } })}\n`, 'utf-8');
     const before = readFileSync(file, 'utf-8');
-    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/is not a valid pi session/);
+    // Refused by the pre-open gate, not the SDK's header check: the message
+    // names the file and why it cannot be adopted.
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/is not a pi transcript/);
     expect(existsSync(`${file}.lock`)).toBe(false);
     expect(readFileSync(file, 'utf-8')).toBe(before);
   });
@@ -3946,6 +3948,79 @@ describe('Perkins r1 regressions', () => {
     expect(() => new StubScript([{ deltas: [], toolCall: call, toolCalls: [call] }])).toThrow(/must not supply both toolCall and toolCalls/);
     const responder = new StubScript(() => ({ deltas: [], toolCall: call, toolCalls: [call] }));
     expect(() => responder.next('prompt')).toThrow(/must not supply both toolCall and toolCalls/);
+  });
+
+  it('refuses a migrated transcript whose header still names another runtime #contract:foreign-transcript-refused:pi', async () => {
+    const fx = await fixture([{ deltas: ['x'] }]);
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-11-23T00-00-00-000Z_33333333-3333-3333-3333-333333333333.jsonl');
+    // The 2026-11-23 shape: a claude-code transcript that pi's own v1→v2
+    // migration already rewrote, so it IS a structurally valid pi file — the
+    // SDK's header-shape check passes and only the runtime label remains.
+    writeFileSync(file, `${JSON.stringify({ type: 'session', version: 3, id: '33333333-3333-3333-3333-333333333333', timestamp: '2026-11-23T00:00:00.000Z', cwd: fx.workspace, runtime: 'claude-code' })}\n${JSON.stringify({ type: 'message', id: 'aa000001', parentId: null, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } })}\n`, 'utf-8');
+    const before = readFileSync(file, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/written by runtime claude-code/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    // Refused BEFORE any projection: the guard runs on the opened session, so
+    // nothing downstream may rewrite the file either.
+    expect(readFileSync(file, 'utf-8')).toBe(before);
+    expect(fx.runtime.health().state).toBe('ok');
+  });
+
+  it('refuses a claude-code transcript BEFORE pi can migrate it in place #contract:foreign-transcript-refused:pi', async () => {
+    const fx = await fixture([{ deltas: ['x'] }]);
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-11-23T00-00-03-000Z_66666666-6666-6666-6666-666666666666.jsonl');
+    // A v1 claude-code transcript: pi's open() would migrate it (v1→v2 mints
+    // ids through a collision set it never fills) and rewrite the file. The
+    // pre-open gate must refuse it while every byte is still the writer's.
+    writeFileSync(file, `${JSON.stringify({ type: 'session', version: 1, id: '66666666-6666-6666-6666-666666666666', timestamp: '2026-11-23T00:00:00.000Z', cwd: fx.workspace, runtime: 'claude-code' })}\n${JSON.stringify({ type: 'user', session_id: '66666666-6666-6666-6666-666666666666', message: { role: 'user', content: 'hello' } })}\n`, 'utf-8');
+    const before = readFileSync(file, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/written by runtime claude-code/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(readFileSync(file, 'utf-8')).toBe(before);
+    expect(fx.runtime.health().state).toBe('ok');
+  });
+
+  it('refuses a resume file that does not start with a pi session header', async () => {
+    const fx = await fixture([{ deltas: ['x'] }]);
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-11-23T00-00-04-000Z_77777777-7777-7777-7777-777777777777.jsonl');
+    // Claude Code frames (no header line): the SDK would synthesise its own
+    // header and mint a NEW session file, which the chat layer reports as a
+    // retryable identity change — the incident's symptom by another road.
+    writeFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: '77777777-7777-7777-7777-777777777777' })}\n${JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } })}\n`, 'utf-8');
+    const before = readFileSync(file, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/is not a pi transcript/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(readFileSync(file, 'utf-8')).toBe(before);
+  });
+
+  it('refuses an entry tree that revisits an id instead of spinning into RangeError', async () => {
+    const fx = await fixture([{ deltas: ['x'] }]);
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const header = (id: string) => JSON.stringify({ type: 'session', version: 3, id, timestamp: '2026-11-23T00:00:00.000Z', cwd: fx.workspace });
+    const message = (id: string, parentId: string | null, text: string) => JSON.stringify({ type: 'message', id, parentId, message: { role: 'user', content: [{ type: 'text', text }] } });
+
+    // pi's v1→v2 migration mints ids through a collision set it never fills,
+    // so a large transcript lands duplicates. Here the duplicate closes a loop:
+    // the last entry's parent resolves, through the id index, back to itself.
+    const duplicated = join(dir, '2026-11-23T00-00-01-000Z_44444444-4444-4444-4444-444444444444.jsonl');
+    writeFileSync(duplicated, `${header('44444444-4444-4444-4444-444444444444')}\n${message('aa000001', null, 'one')}\n${message('aa000002', 'aa000001', 'two')}\n${message('aa000001', 'aa000002', 'three')}\n`, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: duplicated })).rejects.toThrow(/duplicate-id at entry id aa000001/);
+    expect(existsSync(`${duplicated}.lock`)).toBe(false);
+
+    // A cycle without duplicate ids: two entries that are each other's parent.
+    const cyclic = join(dir, '2026-11-23T00-00-02-000Z_55555555-5555-5555-5555-555555555555.jsonl');
+    writeFileSync(cyclic, `${header('55555555-5555-5555-5555-555555555555')}\n${message('bb000001', 'bb000002', 'one')}\n${message('bb000002', 'bb000001', 'two')}\n`, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: cyclic })).rejects.toThrow(/cycle at entry id bb000001/);
+    expect(existsSync(`${cyclic}.lock`)).toBe(false);
+    // A data problem, never adapter health: the next spawn still tries.
+    expect(fx.runtime.health().state).toBe('ok');
   });
 
   it('N24: resumeFile outside the session store is refused #contract:resume-outside-store-refused:pi', async () => {

@@ -26,6 +26,7 @@ import { resolveSpawnCwd } from './cwd.js';
 import { carriesLaneEnv, laneProvenanceEnv, withoutLaneEnv } from '../worktrees/lane-provenance.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths.js';
+import { assertPiResumeHeader, assertResumableTree, isUnusableBoundaryError } from './session-tree.js';
 
 // E3 extracted the shared session-path helpers; re-export so existing
 // consumers of the pi adapter's surface keep working.
@@ -895,6 +896,13 @@ export class PiRuntime implements AgentRuntime {
         );
       }
     }
+    if (resumeFile !== undefined) {
+      // BEFORE the lock and before `SessionManager.open`: pi's open migrates a
+      // v1 transcript in place (`_loadEntries` → `_rewriteFile`), and that is
+      // the very migration whose id minting corrupts a claude-code file. A
+      // foreign transcript must never reach it.
+      assertPiResumeHeader(resumeFile);
+    }
     // Resume: lock BEFORE touching the file — a second writer must never
     // even open a session another process holds (single-writer, ruling 1).
     // A concurrent twin spawn may already hold it for THIS process (its
@@ -930,6 +938,13 @@ export class PiRuntime implements AgentRuntime {
         if (file === undefined || header === null) throw new DirectiveCheckpointError('Pi fresh session has no durable native identity');
         writeFileSync(file, `${JSON.stringify(header)}\n`, { flag: 'wx', mode: 0o600 });
         sessionManager = SessionManager.open(file, dirname(file), cwd);
+      }
+      if (resumeFile !== undefined) {
+        // A foreign or corrupt transcript must fail HERE, by name and before
+        // any projection: pi projects the parent chain with no cycle guard, so
+        // a duplicate entry id surfaces ~5s later as
+        // `RangeError: Invalid array length` from inside the SDK.
+        assertResumableTree(sessionManager, resumeFile, 'pi');
       }
       if (deferToSession) {
         const context = sessionManager.buildSessionContext();
@@ -1125,11 +1140,13 @@ export class PiRuntime implements AgentRuntime {
       // Infrastructure failure (store, loader, session create) marks the
       // adapter down; the NEXT spawn attempt re-clears it. Caller-facing
       // errors — bad model/thinking references (rejected above), a foreign
-      // lock holder (LockBusyError), or losing a double-resume race
-      // (SessionAlreadyActiveError) — are state conflicts, never health.
+      // lock holder (LockBusyError), losing a double-resume race
+      // (SessionAlreadyActiveError), or a transcript this runtime must not
+      // adopt (session-tree.ts) — are state conflicts, never health.
       if (
         !(error instanceof SessionAlreadyActiveError) &&
         !(error instanceof LockBusyError) &&
+        !isUnusableBoundaryError(error) &&
         !modelRejected
       ) {
         this.down = String(error);
