@@ -34,7 +34,7 @@ export interface GruSessionState {
  * mid-write never leaves a torn pointer.
  */
 export class GruSessionPointer {
-  private readonly file: string;
+  readonly file: string;
   private readonly log: Log;
   /** One warn per refused file: resumeCandidate() is consulted more than
    * once per boot (constructor, then the spawn itself). */

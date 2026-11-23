@@ -2646,6 +2646,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/runtime/review-mcp-server.mjs",
   "dist/runtime/review-model-identity.js",
   "dist/runtime/session-paths.js",
+  "dist/runtime/session-tree.js",
   "dist/runtime/spawn-registration.js",
   "dist/runtime/disposal-observation.js",
   "dist/runtime/stream-json.js",
