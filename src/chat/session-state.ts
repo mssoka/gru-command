@@ -34,8 +34,11 @@ export interface GruSessionState {
  * mid-write never leaves a torn pointer.
  */
 export class GruSessionPointer {
-  readonly file: string;
+  private readonly file: string;
   private readonly log: Log;
+  /** One warn per refused file: resumeCandidate() is consulted more than
+   * once per boot (constructor, then the spawn itself). */
+  private warnedRefusal: string | null = null;
 
   constructor(
     readonly dir: string,
@@ -58,10 +61,11 @@ export class GruSessionPointer {
     const state = this.current();
     if (state === null) return null;
     if (!existsSync(state.sessionFile)) {
-      this.log('warn', 'gru session pointer names a vanished session file — spawning fresh', {
-        pointer: this.file,
-        sessionFile: state.sessionFile,
-      });
+      this.warnOnce(state.sessionFile, 'vanished',
+        'gru session pointer names a vanished session file — spawning fresh', {
+          pointer: this.file,
+          sessionFile: state.sessionFile,
+        });
       return null;
     }
     // The session format belongs to the runtime that wrote it. Handing a
@@ -70,15 +74,23 @@ export class GruSessionPointer {
     // ever sees the path.
     const runtime = this.currentRuntime();
     if (state.runtime !== null && runtime !== null && state.runtime !== runtime) {
-      this.log('warn', 'gru session was written by another runtime — spawning fresh', {
-        pointer: this.file,
-        sessionFile: state.sessionFile,
-        session_runtime: state.runtime,
-        runtime,
-      });
+      this.warnOnce(state.sessionFile, `runtime:${state.runtime}`,
+        'gru session was written by another runtime — spawning fresh', {
+          pointer: this.file,
+          sessionFile: state.sessionFile,
+          session_runtime: state.runtime,
+          runtime,
+        });
       return null;
     }
     return state.sessionFile;
+  }
+
+  private warnOnce(file: string, reason: string, message: string, fields: Record<string, unknown>): void {
+    const key = `${reason}\u0000${file}`;
+    if (this.warnedRefusal === key) return;
+    this.warnedRefusal = key;
+    this.log('warn', message, fields);
   }
 
   /** Read the durable pointer without applying session-file existence policy. */
@@ -130,7 +142,7 @@ export class GruSessionPointer {
     // non-string value cannot be interpreted, and silently reading it as
     // "unknown" would resume a transcript this runtime may not own.
     const runtime = value['runtime'];
-    if (runtime !== undefined && runtime !== null && (typeof runtime !== 'string' || runtime === '')) {
+    if (runtime !== undefined && (typeof runtime !== 'string' || runtime === '')) {
       throw new Error(
         `gru session pointer ${this.file} has an invalid runtime; ` +
           'refusing to guess — inspect or remove the file',
@@ -153,10 +165,18 @@ export class GruSessionPointer {
       spawnedAt: new Date().toISOString(),
       epoch: prior?.epoch ?? 0,
       replayFloorSeq: prior?.replayFloorSeq ?? 0,
-      runtime: this.currentRuntime(),
+      runtime: this.runtimeForWrite(prior),
     };
     this.write(state);
     return state;
+  }
+
+  /** The runtime to persist. A resolver that does not know it (a caller with no
+   * runtime notion, or a test) must never erase a label that is already on
+   * record: an absent runtime resumes unguarded, and silently disabling the
+   * guard is exactly the failure this field exists to prevent. */
+  private runtimeForWrite(prior: GruSessionState | null): string | null {
+    return this.currentRuntime() ?? prior?.runtime ?? null;
   }
 
   /** Atomically activate a truly fresh native session and replay boundary. */
@@ -172,7 +192,7 @@ export class GruSessionPointer {
       spawnedAt: new Date().toISOString(),
       epoch: priorEpoch + 1,
       replayFloorSeq,
-      runtime: this.currentRuntime(),
+      runtime: this.runtimeForWrite(prior),
     };
     this.write(state);
     return state;
@@ -180,8 +200,18 @@ export class GruSessionPointer {
 
   private write(state: GruSessionState): void {
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
+    // An unknown runtime is written as ABSENT (the legacy shape), never as
+    // `null`: a present-but-null field is uninterpretable, and the reader
+    // refuses it rather than guessing. Field order stays stable.
+    const payload: Record<string, unknown> = {
+      sessionFile: state.sessionFile,
+      spawnedAt: state.spawnedAt,
+      epoch: state.epoch,
+      replayFloorSeq: state.replayFloorSeq,
+    };
+    if (state.runtime !== null) payload['runtime'] = state.runtime;
     try {
-      writeFileSync(staging, `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
+      writeFileSync(staging, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
       renameSync(staging, this.file);
     } catch (error) {
       try {

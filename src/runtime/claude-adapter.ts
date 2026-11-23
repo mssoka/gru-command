@@ -40,6 +40,7 @@ import {
   normalizeSessionPath,
   SessionAlreadyActiveError,
 } from './session-paths.js';
+import { assertClaudeResumeHeader } from './session-tree.js';
 import {
   CLAUDE_NO_CONTENT,
   ClaudeControlTranslator,
@@ -506,6 +507,11 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           );
         }
         const extracted = extractSessionId(head);
+        // A migrated-from-claude pi transcript still carries every frame's
+        // session_id, so without this it would be adopted and appended to as
+        // two formats in one file. A real Claude transcript starts with a
+        // frame, not a session header, and is unaffected.
+        assertClaudeResumeHeader(resumeFile, head);
         resumedHeader = claudeHeaderOf(head);
         if (extracted !== null) {
           sessionId = extracted;

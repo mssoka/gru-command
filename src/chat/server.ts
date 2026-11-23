@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from 'node:fs';
+import { realpathSync, statSync, existsSync } from 'node:fs';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import type { Duplex } from 'node:stream';
@@ -273,6 +273,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   } | null = null;
   let pendingDeliveries = 0;
   let deferredControlFrames = 0;
+  /** A resume file this server already refused (foreign runtime or corrupt
+   * tree): later attempts mint fresh instead of re-parsing it. */
+  let rejectedResumeFile: string | null = null;
   let deferredFrameTail: Promise<void> = Promise.resolve();
   /** Awareness wake coalescing: one request → at most one trailing turn. */
   let wakeRequested = false;
@@ -329,43 +332,17 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
    * would back off while the chat reports a transient failure. Mint ONE fresh
    * session instead, keep the old transcript on disk, and leave the retry
    * gate untouched. Every other error keeps the existing backoff path.
+   *
+   * The notice is NOT written here: `pointer.advance()` sets the replay floor
+   * to the frame high-water, so anything logged before it belongs to the
+   * retired view and no reconnect would ever see it. The caller queues the
+   * text and `flushPendingNotices()` publishes it above the new floor.
    */
-  async function spawnOverUsableBoundary(
-    resumeFile: string | null,
-    source: 'chat' | 'wake',
-  ): Promise<{ readonly handle: AgentHandle; readonly resumedFile: string | null; readonly replaced: boolean }> {
-    try {
-      return {
-        handle: await options.spawnGru(resumeFile, source),
-        resumedFile: resumeFile,
-        replaced: false,
-      };
-    } catch (error) {
-      if (resumeFile === null || !isUnusableBoundaryError(error)) throw error;
-      log('warn', 'gru resume boundary is unusable — spawning a fresh session', {
-        session_file: resumeFile,
-        error: errorMessage(error),
-      });
-      try {
-        // ONE durable surface, same episode rule as the spawn-failure notice:
-        // the operator sees why the chat restarted, and where the old file is.
-        emitLogged({
-          type: 'notice',
-          text:
-            `⚠️ Gru could not adopt the previous session (${errorMessage(error)}). ` +
-            `Starting a fresh chat; the old transcript stays at ${resumeFile} and was not deleted.`,
-        });
-      } catch (surfaceError) {
-        log('warn', 'failed to persist the unusable-boundary notice', {
-          error: errorMessage(surfaceError),
-        });
-      }
-      return {
-        handle: await options.spawnGru(null, source),
-        resumedFile: null,
-        replaced: true,
-      };
-    }
+  function unusableBoundaryNotice(reason: string, sessionFile: string): string {
+    return (
+      `⚠️ Gru could not adopt the previous session (${reason}). ` +
+      `Starting a fresh chat; the old transcript stays at ${sessionFile} and was not deleted.`
+    );
   }
 
   async function spawnGru(source: 'chat' | 'wake'): Promise<AgentHandle> {
@@ -373,22 +350,54 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       // Inside the try (r1 W4): a corrupt resume pointer must surface as
       // a spawn failure and CLEAR the spawn gate — not wedge it forever.
       const priorBoundary = options.pointer.current();
-      const resumeFile = options.pointer.resumeCandidate();
+      const pointed = options.pointer.resumeCandidate();
+      // A pointer refusal over a file that still exists means its recorded
+      // runtime is not the one that would host this spawn. The transcript is
+      // intact; the operator still deserves to know why the chat restarted.
+      const refusedByRuntime =
+        pointed === null && priorBoundary !== null && existsSync(priorBoundary.sessionFile);
+      // Already refused once: go straight to the fresh mint rather than
+      // re-opening (and re-parsing) the same doomed transcript every cycle.
+      const skipped = pointed !== null && pointed === rejectedResumeFile;
+      const resumeFile = skipped ? null : pointed;
       let replacingUnrecoverableBoundary =
-        boundarySessionMissing || (priorBoundary !== null && resumeFile === null);
+        boundarySessionMissing || skipped || refusedByRuntime ||
+        (priorBoundary !== null && resumeFile === null);
       boundarySessionMissing = replacingUnrecoverableBoundary;
+      let resumedFile = resumeFile;
+      let boundaryNotice =
+        refusedByRuntime && priorBoundary !== null
+          ? unusableBoundaryNotice(
+              'it was recorded by a different runtime',
+              priorBoundary.sessionFile,
+            )
+          : skipped && pointed !== null
+            ? unusableBoundaryNotice('it could not be adopted on the previous attempt', pointed)
+            : null;
       log('info', 'spawning the single Gru session', {
         resume: resumeFile !== null,
         replacing_unrecoverable_boundary: replacingUnrecoverableBoundary,
       });
-      const attempt = await spawnOverUsableBoundary(resumeFile, source);
-      const spawned = attempt.handle;
-      if (attempt.replaced) {
-        // The pointed transcript cannot be adopted: the next attempt (and the
-        // pointer write below) must treat the boundary as unrecoverable, so a
-        // failed fresh retry does not go back to projecting the same file.
+      let spawned: AgentHandle;
+      try {
+        spawned = await options.spawnGru(resumeFile, source);
+      } catch (error) {
+        if (resumeFile === null || !isUnusableBoundaryError(error)) throw error;
+        if (disposed) throw error;
+        log('warn', 'gru resume boundary is unusable — spawning a fresh session', {
+          session_file: resumeFile,
+          error: errorMessage(error),
+        });
+        // Promote BEFORE the retry. The replacement boundary is unrecoverable
+        // now: if the fresh spawn also fails, the next attempt must not fall
+        // back to projecting the same file, and the pointer write below must
+        // advance rather than record.
         replacingUnrecoverableBoundary = true;
         boundarySessionMissing = true;
+        rejectedResumeFile = resumeFile;
+        resumedFile = null;
+        boundaryNotice = unusableBoundaryNotice(errorMessage(error), resumeFile);
+        spawned = await options.spawnGru(null, source);
       }
       if (disposed) {
         // The server went down while the spawn was in flight — release the
@@ -401,7 +410,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         if (spawned.sessionFile === null || spawned.sessionFile === '') {
           throw new Error('Gru chat session has no durable session file');
         }
-        if (attempt.resumedFile !== null && !sameSessionFile(spawned.sessionFile, attempt.resumedFile)) {
+        if (resumedFile !== null && !sameSessionFile(spawned.sessionFile, resumedFile)) {
           throw new Error('resumed Gru spawn changed native session identity');
         }
         if (spawned.health().state === 'disposed') {
@@ -421,6 +430,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         handle = spawned;
         unsubscribe = stagedUnsubscribe;
         spawnGate.reset();
+        rejectedResumeFile = null;
+        // Queued, not emitted: the flush after broadcastContext() publishes it
+        // ABOVE the replay floor this advance just lifted, so a reconnect
+        // replays the cause instead of an unexplained empty chat.
+        if (boundaryNotice !== null && pendingNotices.length < MAX_PENDING_NOTICES) {
+          pendingNotices.push({ text: boundaryNotice });
+        }
       } catch (error) {
         try {
           stagedUnsubscribe?.();

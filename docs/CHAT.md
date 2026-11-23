@@ -243,6 +243,16 @@ Compact context and New chat are the row's controls:
   browser outbox and rides the first reconnect after the window; a
   successful spawn resets the gate. A broken model therefore cannot turn
   client reconnects into a per-second spawn loop.
+- **An unusable resume transcript is replaced, not retried.** The resume
+  pointer records the runtime that wrote the session; a runtime switch (or a
+  transcript this runtime must not adopt — another writer's header, a
+  duplicated entry id, a parent cycle) is an unrecoverable boundary, never a
+  transient failure. Gru mints ONE fresh session, advances the epoch and
+  replay floor, and queues ONE durable `notice` naming the cause and the
+  untouched transcript path — published above the new floor, so a reconnect
+  replays it instead of an unexplained empty chat. The spawn-retry gate is
+  not armed, and the refused path is remembered so later attempts do not
+  re-open it. Every other spawn failure keeps the backoff above.
 - Reconnecting clients re-auth with `last_seen_seq`; the server sends
   `auth_ok` (high-water), a fresh `context` snapshot, then every logged
   frame with `seq > max(last_seen_seq, replay_floor_seq)` in order, then

@@ -118,6 +118,37 @@ describe('GruSessionPointer', () => {
     expect(new GruSessionPointer(dir).resumeCandidate()).toBe(file);
   });
 
+  it('a write with no runtime resolver keeps the recorded label', () => {
+    const dir = fixture();
+    const file = join(dir, 'labelled.jsonl');
+    writeFileSync(file, '{}\n');
+    new GruSessionPointer(dir, () => {}, () => 'pi').record(file);
+    expect(JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8')).runtime).toBe('pi');
+    // A caller with no runtime notion must not erase a label already on
+    // record: an absent runtime resumes unguarded.
+    expect(new GruSessionPointer(dir).advance(file, 3).runtime).toBe('pi');
+    expect(JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8')).runtime).toBe('pi');
+  });
+
+  it('an unknown runtime is written as an absent field, never as null', () => {
+    const dir = fixture();
+    const file = join(dir, 'anonymous.jsonl');
+    writeFileSync(file, '{}\n');
+    new GruSessionPointer(dir).record(file);
+    const raw = JSON.parse(readFileSync(join(dir, SESSION_STATE_NAME), 'utf-8'));
+    expect('runtime' in raw).toBe(false);
+    expect(new GruSessionPointer(dir).current()?.runtime).toBeNull();
+  });
+
+  it('an explicit null runtime fails loud instead of resuming unguarded', () => {
+    const dir = fixture();
+    writeFileSync(
+      join(dir, SESSION_STATE_NAME),
+      `${JSON.stringify({ sessionFile: join(dir, 'x.jsonl'), epoch: 1, replayFloorSeq: 0, runtime: null })}\n`,
+    );
+    expect(() => new GruSessionPointer(dir).current()).toThrowError(/invalid runtime/);
+  });
+
   it('a pointer whose runtime is not a string fails loud', () => {
     const dir = fixture();
     writeFileSync(

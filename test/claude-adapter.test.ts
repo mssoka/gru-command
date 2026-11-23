@@ -2572,7 +2572,25 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     // pi's own first records: its session header, then a user message.
     writeFileSync(file, `${JSON.stringify({ type: 'session', version: 3, id: '22222222-2222-2222-2222-222222222222', timestamp: '2026-09-17T00:00:00.000Z', cwd: fx.workspace })}\n${JSON.stringify({ type: 'message', id: 'a1b2c3d4', parentId: null, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } })}\n`, 'utf-8');
     const before = readFileSync(file, 'utf-8');
-    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/has no session id/);
+    // Refused by name at the header, not by the later session-id extraction:
+    // the message tells the operator which runtime wrote the file.
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/written by runtime pi/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(readFileSync(file, 'utf-8')).toBe(before);
+    expect(doubleInvocations(fx)).toEqual([]);
+  });
+
+  it('refuses a migrated-from-claude pi transcript whose frames still carry a session id #contract:foreign-transcript-refused:claude-code', async () => {
+    const fx = fixture();
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09-17T00-00-00-000Z_88888888-8888-8888-8888-888888888888.jsonl');
+    // pi rewrote a claude-code transcript in place (the 2026-11-23 incident):
+    // the head is now pi's header, but every carried frame still names the
+    // claude session id, so extractSessionId() alone would adopt it.
+    writeFileSync(file, `${JSON.stringify({ type: 'session', version: 3, id: '88888888-8888-8888-8888-888888888888', timestamp: '2026-09-17T00:00:00.000Z', cwd: fx.workspace })}\n${JSON.stringify({ type: 'user', session_id: '88888888-8888-8888-8888-888888888888', message: { role: 'user', content: 'hello' } })}\n`, 'utf-8');
+    const before = readFileSync(file, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/written by runtime pi/);
     expect(existsSync(`${file}.lock`)).toBe(false);
     expect(readFileSync(file, 'utf-8')).toBe(before);
     expect(doubleInvocations(fx)).toEqual([]);

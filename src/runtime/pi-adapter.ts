@@ -26,7 +26,7 @@ import { resolveSpawnCwd } from './cwd.js';
 import { carriesLaneEnv, laneProvenanceEnv, withoutLaneEnv } from '../worktrees/lane-provenance.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths.js';
-import { assertResumableTree, isUnusableBoundaryError } from './session-tree.js';
+import { assertPiResumeHeader, assertResumableTree, isUnusableBoundaryError } from './session-tree.js';
 
 // E3 extracted the shared session-path helpers; re-export so existing
 // consumers of the pi adapter's surface keep working.
@@ -895,6 +895,13 @@ export class PiRuntime implements AgentRuntime {
           `resumeFile must live under the session store (${this.store.sessionsDir}), got: ${resumeFile}`,
         );
       }
+    }
+    if (resumeFile !== undefined) {
+      // BEFORE the lock and before `SessionManager.open`: pi's open migrates a
+      // v1 transcript in place (`_loadEntries` → `_rewriteFile`), and that is
+      // the very migration whose id minting corrupts a claude-code file. A
+      // foreign transcript must never reach it.
+      assertPiResumeHeader(resumeFile);
     }
     // Resume: lock BEFORE touching the file — a second writer must never
     // even open a session another process holds (single-writer, ruling 1).
