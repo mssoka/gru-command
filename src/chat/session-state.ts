@@ -16,6 +16,12 @@ export interface GruSessionState {
   readonly epoch: number;
   /** Frames at or below this seq belong to an earlier active chat view. */
   readonly replayFloorSeq: number;
+  /** The runtime that wrote the active session. NULL on pointers written
+   * before this field existed: those resume once, then get backfilled. A
+   * pointer naming runtime A must never hand its transcript to runtime B —
+   * the formats are different, and pi's projection of a claude-code
+   * transcript throws deep inside the SDK (see session-tree.ts). */
+  readonly runtime: string | null;
 }
 
 /**
@@ -34,6 +40,10 @@ export class GruSessionPointer {
   constructor(
     readonly dir: string,
     log: Log = () => {},
+    /** The runtime that WOULD host the next spawn. Null means unknown (a
+     * pointer test, or a caller with no runtime notion): the mismatch check
+     * is skipped rather than guessed. */
+    private readonly currentRuntime: () => string | null = () => null,
   ) {
     this.file = join(dir, SESSION_STATE_NAME);
     this.log = log;
@@ -51,6 +61,20 @@ export class GruSessionPointer {
       this.log('warn', 'gru session pointer names a vanished session file — spawning fresh', {
         pointer: this.file,
         sessionFile: state.sessionFile,
+      });
+      return null;
+    }
+    // The session format belongs to the runtime that wrote it. Handing a
+    // claude-code transcript to pi projects a foreign tree (and pi's first
+    // open rewrites the header on the way), so refuse before the spawner
+    // ever sees the path.
+    const runtime = this.currentRuntime();
+    if (state.runtime !== null && runtime !== null && state.runtime !== runtime) {
+      this.log('warn', 'gru session was written by another runtime — spawning fresh', {
+        pointer: this.file,
+        sessionFile: state.sessionFile,
+        session_runtime: state.runtime,
+        runtime,
       });
       return null;
     }
@@ -102,11 +126,22 @@ export class GruSessionPointer {
           'refusing to guess — inspect or remove the file',
       );
     }
+    // Absent is the legacy shape (resume once, then backfill). A present but
+    // non-string value cannot be interpreted, and silently reading it as
+    // "unknown" would resume a transcript this runtime may not own.
+    const runtime = value['runtime'];
+    if (runtime !== undefined && runtime !== null && (typeof runtime !== 'string' || runtime === '')) {
+      throw new Error(
+        `gru session pointer ${this.file} has an invalid runtime; ` +
+          'refusing to guess — inspect or remove the file',
+      );
+    }
     return {
       sessionFile,
       spawnedAt: typeof value['spawnedAt'] === 'string' ? value['spawnedAt'] : '',
       epoch,
       replayFloorSeq,
+      runtime: typeof runtime === 'string' ? runtime : null,
     };
   }
 
@@ -118,6 +153,7 @@ export class GruSessionPointer {
       spawnedAt: new Date().toISOString(),
       epoch: prior?.epoch ?? 0,
       replayFloorSeq: prior?.replayFloorSeq ?? 0,
+      runtime: this.currentRuntime(),
     };
     this.write(state);
     return state;
@@ -136,6 +172,7 @@ export class GruSessionPointer {
       spawnedAt: new Date().toISOString(),
       epoch: priorEpoch + 1,
       replayFloorSeq,
+      runtime: this.currentRuntime(),
     };
     this.write(state);
     return state;

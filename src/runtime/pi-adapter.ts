@@ -26,6 +26,7 @@ import { resolveSpawnCwd } from './cwd.js';
 import { carriesLaneEnv, laneProvenanceEnv, withoutLaneEnv } from '../worktrees/lane-provenance.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths.js';
+import { assertResumableTree, isUnusableBoundaryError } from './session-tree.js';
 
 // E3 extracted the shared session-path helpers; re-export so existing
 // consumers of the pi adapter's surface keep working.
@@ -931,6 +932,13 @@ export class PiRuntime implements AgentRuntime {
         writeFileSync(file, `${JSON.stringify(header)}\n`, { flag: 'wx', mode: 0o600 });
         sessionManager = SessionManager.open(file, dirname(file), cwd);
       }
+      if (resumeFile !== undefined) {
+        // A foreign or corrupt transcript must fail HERE, by name and before
+        // any projection: pi projects the parent chain with no cycle guard, so
+        // a duplicate entry id surfaces ~5s later as
+        // `RangeError: Invalid array length` from inside the SDK.
+        assertResumableTree(sessionManager, resumeFile, 'pi');
+      }
       if (deferToSession) {
         const context = sessionManager.buildSessionContext();
         try {
@@ -1125,11 +1133,13 @@ export class PiRuntime implements AgentRuntime {
       // Infrastructure failure (store, loader, session create) marks the
       // adapter down; the NEXT spawn attempt re-clears it. Caller-facing
       // errors — bad model/thinking references (rejected above), a foreign
-      // lock holder (LockBusyError), or losing a double-resume race
-      // (SessionAlreadyActiveError) — are state conflicts, never health.
+      // lock holder (LockBusyError), losing a double-resume race
+      // (SessionAlreadyActiveError), or a transcript this runtime must not
+      // adopt (session-tree.ts) — are state conflicts, never health.
       if (
         !(error instanceof SessionAlreadyActiveError) &&
         !(error instanceof LockBusyError) &&
+        !isUnusableBoundaryError(error) &&
         !modelRejected
       ) {
         this.down = String(error);

@@ -20,6 +20,7 @@ import { ChatFrameLog } from '../src/chat/frame-log.js';
 import { createChatServer, type ChatServer } from '../src/chat/server.js';
 import { AWARENESS_WAKE_INSTRUCTION, type AwarenessInjection, type GruAwarenessPort } from '../src/chat/awareness.js';
 import { GruSessionPointer, SESSION_STATE_NAME } from '../src/chat/session-state.js';
+import { CorruptSessionTreeError } from '../src/runtime/session-tree.js';
 import { configPathFor, loadConfig, type GruCommandConfig } from '../src/config.js';
 import { ClaudeCodeRuntime } from '../src/runtime/claude-adapter.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
@@ -1309,6 +1310,77 @@ describe('chat server (real sockets, stub Gru)', () => {
     ).toBe(true);
     await retry.close();
     await harness.close();
+  });
+
+  it('an unusable resume boundary mints one fresh session instead of backing off (D2)', async () => {
+    const first = await makeHarness();
+    const client = await authedClient(first.port);
+    client.send('record the boundary', 'boundary-1');
+    await pollUntil(() => first.handle.calls.length === 1, 'first delivery');
+    await client.close();
+    await first.close();
+    const prior = new GruSessionPointer(first.chatDir).current()!;
+    expect(prior.sessionFile).toBe(first.handle.sessionFile);
+
+    const freshFile = join(first.dir, 'sessions', 'fresh-after-unusable.jsonl');
+    writeFileSync(freshFile, '');
+    const fresh = new StubGruHandle(freshFile, 'stub-fresh-after-unusable');
+    const second = await makeHarness({
+      reuseDir: first.dir,
+      spawnGru: (resumeFile) =>
+        resumeFile === null
+          ? Promise.resolve(fresh)
+          : Promise.reject(new CorruptSessionTreeError(resumeFile, 'aa000001', 'duplicate-id')),
+    });
+    try {
+      const retry = await authedClient(second.port);
+      retry.send('carry on', 'after-unusable');
+      // The repair advances the boundary, so the in-flight word has no ack:
+      // the socket closes and the persisted outbox replays under the new
+      // epoch — the same contract the vanished-session repair already pins.
+      await retry.waitFor(
+        (frame) => frame.type === 'error' && /could not be reconciled/.test(frame.message),
+        'boundary change rejects the in-flight word',
+      );
+      expect(await retry.closed).toBe(1011);
+      await retry.close();
+
+      // Exactly one resume attempt, then exactly one fresh mint.
+      expect(second.spawnCalls).toEqual([prior.sessionFile, null]);
+      const state = new GruSessionPointer(second.chatDir).current()!;
+      expect(state.sessionFile).toBe(freshFile);
+      // The replacement boundary is durable: epoch advanced, floor lifted.
+      expect(state.epoch).toBe(prior.epoch + 1);
+      expect(state.replayFloorSeq).toBeGreaterThanOrEqual(prior.replayFloorSeq);
+      // ONE durable surface naming the cause, and no retry-gate failure.
+      const adopting = second.frameLog.history.filter(
+        (frame) => frame.type === 'notice' && /could not adopt/.test(frame.text),
+      );
+      expect(adopting).toHaveLength(1);
+      expect(
+        second.frameLog.history.some(
+          (frame) => frame.type === 'error' && /could not start|temporarily unavailable/.test(frame.message),
+        ),
+      ).toBe(false);
+
+      // The replay lands on the fresh session, and no backoff window stands
+      // between the operator's next word and the brain that is already live.
+      const resumedClient = await authedClient(second.port);
+      resumedClient.send('carry on', 'after-unusable');
+      await pollUntil(
+        () => fresh.calls.some((call) => call.text === 'carry on'),
+        'delivery to the fresh session',
+      );
+      resumedClient.send('and again', 'after-unusable-2');
+      await pollUntil(
+        () => fresh.calls.some((call) => call.text === 'and again'),
+        'second delivery without backoff',
+      );
+      expect(second.spawnCalls).toEqual([prior.sessionFile, null]);
+      await resumedClient.close();
+    } finally {
+      await second.close();
+    }
   });
 
   it('dispose closes clients with 1001 and refuses later upgrades (no zombies)', async () => {

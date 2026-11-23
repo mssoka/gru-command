@@ -27,6 +27,7 @@ import {
   type UserFrame,
 } from './frames.js';
 import type { GruSessionPointer } from './session-state.js';
+import { isUnusableBoundaryError } from '../runtime/session-tree.js';
 import {
   AWARENESS_WAKE_INSTRUCTION,
   type AwarenessInjection,
@@ -321,20 +322,74 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     return spawning;
   }
 
+  /**
+   * Resume-boundary policy (2026-11-23). A transcript this runtime cannot
+   * adopt — another runtime wrote it, or its entry tree is unwalkable — is
+   * UNRECOVERABLE: retrying projects the same file again, and the retry gate
+   * would back off while the chat reports a transient failure. Mint ONE fresh
+   * session instead, keep the old transcript on disk, and leave the retry
+   * gate untouched. Every other error keeps the existing backoff path.
+   */
+  async function spawnOverUsableBoundary(
+    resumeFile: string | null,
+    source: 'chat' | 'wake',
+  ): Promise<{ readonly handle: AgentHandle; readonly resumedFile: string | null; readonly replaced: boolean }> {
+    try {
+      return {
+        handle: await options.spawnGru(resumeFile, source),
+        resumedFile: resumeFile,
+        replaced: false,
+      };
+    } catch (error) {
+      if (resumeFile === null || !isUnusableBoundaryError(error)) throw error;
+      log('warn', 'gru resume boundary is unusable — spawning a fresh session', {
+        session_file: resumeFile,
+        error: errorMessage(error),
+      });
+      try {
+        // ONE durable surface, same episode rule as the spawn-failure notice:
+        // the operator sees why the chat restarted, and where the old file is.
+        emitLogged({
+          type: 'notice',
+          text:
+            `⚠️ Gru could not adopt the previous session (${errorMessage(error)}). ` +
+            `Starting a fresh chat; the old transcript stays at ${resumeFile} and was not deleted.`,
+        });
+      } catch (surfaceError) {
+        log('warn', 'failed to persist the unusable-boundary notice', {
+          error: errorMessage(surfaceError),
+        });
+      }
+      return {
+        handle: await options.spawnGru(null, source),
+        resumedFile: null,
+        replaced: true,
+      };
+    }
+  }
+
   async function spawnGru(source: 'chat' | 'wake'): Promise<AgentHandle> {
     try {
       // Inside the try (r1 W4): a corrupt resume pointer must surface as
       // a spawn failure and CLEAR the spawn gate — not wedge it forever.
       const priorBoundary = options.pointer.current();
       const resumeFile = options.pointer.resumeCandidate();
-      const replacingUnrecoverableBoundary =
+      let replacingUnrecoverableBoundary =
         boundarySessionMissing || (priorBoundary !== null && resumeFile === null);
       boundarySessionMissing = replacingUnrecoverableBoundary;
       log('info', 'spawning the single Gru session', {
         resume: resumeFile !== null,
         replacing_unrecoverable_boundary: replacingUnrecoverableBoundary,
       });
-      const spawned = await options.spawnGru(resumeFile, source);
+      const attempt = await spawnOverUsableBoundary(resumeFile, source);
+      const spawned = attempt.handle;
+      if (attempt.replaced) {
+        // The pointed transcript cannot be adopted: the next attempt (and the
+        // pointer write below) must treat the boundary as unrecoverable, so a
+        // failed fresh retry does not go back to projecting the same file.
+        replacingUnrecoverableBoundary = true;
+        boundarySessionMissing = true;
+      }
       if (disposed) {
         // The server went down while the spawn was in flight — release the
         // session instead of wiring it into a dead server (r1 N9).
@@ -346,7 +401,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         if (spawned.sessionFile === null || spawned.sessionFile === '') {
           throw new Error('Gru chat session has no durable session file');
         }
-        if (resumeFile !== null && !sameSessionFile(spawned.sessionFile, resumeFile)) {
+        if (attempt.resumedFile !== null && !sameSessionFile(spawned.sessionFile, attempt.resumedFile)) {
           throw new Error('resumed Gru spawn changed native session identity');
         }
         if (spawned.health().state === 'disposed') {

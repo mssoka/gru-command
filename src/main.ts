@@ -1124,7 +1124,13 @@ async function main(): Promise<number> {
   const chat = createChatServer({
     config,
     frameLog,
-    pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
+    pointer: new GruSessionPointer(
+      chatDir,
+      (level, msg, fields) => logger.log(level, msg, fields),
+      // Same rule the registry spawns by: a pointer recorded under another
+      // runtime is not resumable (the transcript format belongs to its writer).
+      () => registry.runtimeIdFor('gru'),
+    ),
     spawnGru: (resumeFile, source) => gruSlot.ensure({
       ...(resumeFile !== null ? { resumeFile } : {}),
       intent: source === 'chat' ? 'user' : 'autonomous',
