@@ -4507,8 +4507,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     // On a phone the review sheet takes the whole screen.
     const narrowSheets = [...css.matchAll(/@media \(max-width: 560px\) \{\s*\.board-lessons-sheet\s*\{([^}]*)\}/gu)];
     expect(narrowSheets).toHaveLength(1);
-    expect(compact(narrowSheets[0]![1])).toContain('width: 100vw;');
-    expect(compact(narrowSheets[0]![1])).toContain('height: 100dvh;');
+    expect(compact(narrowSheets[0]![1])).toContain('width: 100%;');
+    expect(compact(narrowSheets[0]![1])).toContain('height: 100%;');
   });
 
   it('the owner context has its OWN grid track, the proposal card never lands in the row cells, and the pointer control is themed', async () => {
