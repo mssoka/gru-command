@@ -34,6 +34,11 @@ import {
   type GruAwarenessPort,
 } from './awareness.js';
 import { SpawnRetryGate } from './spawn-backoff.js';
+import {
+  SupervisedSlotStoppedError,
+  type SupervisedSlot,
+  type SupervisedSlotStop,
+} from '../supervision/supervisor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -126,6 +131,9 @@ export interface ChatServerOptions {
   readonly spawnGru: (resumeFile: string | null, source?: 'chat' | 'wake') => Promise<AgentHandle>;
   /** Supervisor breaker gate: machine turns never re-arm it (Gru dispositions do). */
   readonly canWakeGru?: () => boolean;
+  /** The supervised Gru slot's stop, when it is stopped (#619): chat names
+   * it and its alert instead of reporting a transient spawn failure. */
+  readonly gruStop?: () => SupervisedSlotStop | null;
   /** Mint a native session without resume/transcript context. This is
    * mandatory: reusing spawnGru(null) could return the supervised old handle. */
   readonly spawnFreshGru: () => Promise<AgentHandle>;
@@ -207,6 +215,24 @@ interface Client {
   authDeadline: ReturnType<typeof setTimeout> | null;
   /** One deferred-frame failure poisons the ordered stream for this socket. */
   deferredFailed: boolean;
+}
+
+/** The chat server's view of the supervised Gru slot (#619), as the service
+ * wires it: a chat message is user intent (it re-arms a stopped Gru), a wake
+ * is autonomous (it never does), and the slot's stop is what chat names. */
+export function supervisedGruSlotOptions(
+  slot: Pick<SupervisedSlot, 'ensure' | 'canReplace' | 'stop' | 'adoptReplacement'>,
+): Pick<ChatServerOptions, 'spawnGru' | 'canWakeGru' | 'gruStop' | 'canAdoptFreshGru' | 'adoptFreshGru'> {
+  return {
+    spawnGru: (resumeFile, source) => slot.ensure({
+      ...(resumeFile !== null ? { resumeFile } : {}),
+      intent: source === 'chat' ? 'user' : 'autonomous',
+    }),
+    canWakeGru: () => slot.canReplace(),
+    gruStop: () => slot.stop(),
+    canAdoptFreshGru: () => slot.canReplace(),
+    adoptFreshGru: (handle) => slot.adoptReplacement(handle),
+  };
 }
 
 /**
@@ -458,6 +484,23 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       return spawned;
     } catch (error) {
       const message = errorMessage(error);
+      // #619: a stopped Gru refuses the spawn. That refusal is not a spawn
+      // failure: the retry gate stays open, so the next chat message (which
+      // re-arms Gru) is never turned away by a backoff window. Every other
+      // failure keeps the gate, stopped Gru or not.
+      const stop = error instanceof SupervisedSlotStoppedError
+        ? { agentId: error.agentId, stopReason: error.stopReason, notificationId: error.notificationId }
+        : null;
+      if (stop !== null) {
+        log('warn', 'gru spawn refused — Gru is stopped', {
+          agent_id: stop.agentId,
+          stop_reason: stop.stopReason,
+          notification_id: stop.notificationId,
+          error: message,
+        });
+        noteGruStopped(stop);
+        throw error;
+      }
       const retryInMs = spawnGate.recordFailure();
       const firstFailure = spawnGate.failureCount === 1;
       log('error', 'gru spawn failed', {
@@ -490,6 +533,38 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   // -----------------------------------------------------------------------
   // Runtime events → frames (all logged, all broadcast)
   // -----------------------------------------------------------------------
+
+  function readGruStop(): SupervisedSlotStop | null {
+    try {
+      return options.gruStop?.() ?? null;
+    } catch (error) {
+      log('warn', 'gru stop lookup failed', { error: errorMessage(error) });
+      return null;
+    }
+  }
+
+  /** One durable notice per stop per process (#619): Gru is stopped, why,
+   * which alert, and that a chat message re-arms it. */
+  const notedGruStops = new Set<string>();
+  function noteGruStopped(stop: SupervisedSlotStop): void {
+    const key = [stop.agentId, stop.notificationId ?? '', stop.stopReason ?? ''].join('\u0000');
+    if (notedGruStops.has(key)) return;
+    notedGruStops.add(key);
+    const details = [
+      ...(stop.stopReason === null ? [] : [stop.stopReason.replaceAll('_', ' ')]),
+      ...(stop.notificationId === null ? [] : [`alert ${stop.notificationId}`]),
+    ];
+    try {
+      emitLogged({
+        type: 'notice',
+        text:
+          `Gru is stopped${details.length === 0 ? '' : ` (${details.join('; ')})`} and will not restart on its own. ` +
+          'Send Gru a message to re-arm it.',
+      });
+    } catch (error) {
+      log('warn', 'failed to persist the Gru stop notice', { error: errorMessage(error) });
+    }
+  }
 
   function emitLogged(frame: Parameters<ChatFrameLog['append']>[0]): LoggedFrame {
     const seqed = frameLog.append(frame);
@@ -1898,6 +1973,18 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
     warmup(): void {
       void ensureGru().catch((error: unknown) => {
+        const stop = readGruStop();
+        if (stop !== null) {
+          // #619: a stopped Gru is not a failed boot. Say so in chat once,
+          // naming the alert; the first chat message re-arms it.
+          log('info', 'gru warmup refused — Gru is stopped; a chat message or a disposition on its alert re-arms it', {
+            agent_id: stop.agentId,
+            stop_reason: stop.stopReason,
+            notification_id: stop.notificationId,
+          });
+          noteGruStopped(stop);
+          return;
+        }
         // Logged (r1 W4): a warm boot failure is an ops-visible condition —
         // the first message retries (bounded by the spawn-retry gate), but
         // the boot log must say why.

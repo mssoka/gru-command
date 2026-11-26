@@ -4490,12 +4490,24 @@ export class LedgerApi {
     string,
     {
       readonly role: Role;
+      /** The supervised slot the stopped agent served, from the event that
+       * started the stop; null for a slotless agent or a stop recorded
+       * before slots were persisted (#619). */
+      readonly slotId: string | null;
       readonly reason: string | null;
       readonly restarts: number;
       readonly notificationId: string | null;
       readonly pendingFenceReason: string | null;
     }
   > {
+    // A later re-arm-fenced event keeps the stop but carries no slot, so the
+    // slot is read from the stop that started it.
+    const originOf = this.db.prepare(
+      `SELECT payload FROM events
+        WHERE agent_id = ? AND kind IN ('supervision.escalated', 'supervision.breaker')
+        ORDER BY seq DESC
+        LIMIT 1`,
+    );
     const rows = this.db
       .prepare(
         `SELECT e.agent_id AS agent_id, a.role AS role, e.kind AS kind, e.payload AS payload
@@ -4515,6 +4527,7 @@ export class LedgerApi {
       string,
       {
         role: Role;
+        slotId: string | null;
         reason: string | null;
         restarts: number;
         notificationId: string | null;
@@ -4572,7 +4585,18 @@ export class LedgerApi {
           .get(row.agent_id) as { id: string } | undefined;
         notificationId = openControl?.id ?? null;
       }
-      stops.set(row.agent_id, { role: row.role, reason, restarts, notificationId, pendingFenceReason });
+      let slotId: string | null = null;
+      const origin = originOf.get(row.agent_id) as { payload: string } | undefined;
+      if (origin !== undefined) {
+        try {
+          const originPayload = JSON.parse(origin.payload) as Record<string, unknown>;
+          if (typeof originPayload['slot'] === 'string') slotId = originPayload['slot'];
+        } catch {
+          // A malformed origin names no slot; the first slot to resume the
+          // stopped session binds it instead.
+        }
+      }
+      stops.set(row.agent_id, { role: row.role, slotId, reason, restarts, notificationId, pendingFenceReason });
     }
     return stops;
   }

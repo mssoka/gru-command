@@ -234,7 +234,7 @@ async function reviewPreflightCheck(
   return warning === null ? result : { ...result, warnings: [...(result.warnings ?? []), warning] };
 }
 import { ChatFrameLog } from './chat/frame-log.js';
-import { createChatServer } from './chat/server.js';
+import { createChatServer, supervisedGruSlotOptions } from './chat/server.js';
 import { GruAwareness } from './chat/awareness.js';
 import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
@@ -1131,17 +1131,13 @@ async function main(): Promise<number> {
       // runtime is not resumable (the transcript format belongs to its writer).
       () => registry.runtimeIdFor('gru'),
     ),
-    spawnGru: (resumeFile, source) => gruSlot.ensure({
-      ...(resumeFile !== null ? { resumeFile } : {}),
-      intent: source === 'chat' ? 'user' : 'autonomous',
-    }),
-    canWakeGru: () => gruSlot.canReplace(),
+    // Chat message = user intent, wake = autonomous, and the slot's stop is
+    // what chat names (#619); one helper so a test pins this wiring.
+    ...supervisedGruSlotOptions(gruSlot),
     // New chat deliberately bypasses ensure(): it must mint without resume
     // even while the old supervised slot is healthy. Activation then advances
     // the slot generation so no stale restart can swap the old epoch back in.
     spawnFreshGru: () => registry.spawn('gru', {}),
-    canAdoptFreshGru: () => gruSlot.canReplace(),
-    adoptFreshGru: (handle) => gruSlot.adoptReplacement(handle),
     siblingUpgradePaths: [BOARD_WS_PATH],
     awareness,
     log: (level, msg, fields) => logger.log(level, msg, fields),

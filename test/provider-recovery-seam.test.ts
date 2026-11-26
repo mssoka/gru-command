@@ -580,6 +580,38 @@ describe('supervisor ⇄ sensor seam', () => {
     }
   });
 
+  it('after a restart, a disposition on a restored Silas slot stop still defers to its open provider wait (#619)', async () => {
+    const h = new SeamHarness();
+    const handle = await h.runSilasIntoQuotaWall();
+    await h.settle();
+    if (h.ledger.getAgent(handle.id) === null) h.ledger.registerAgent({ id: handle.id, role: 'silas' });
+    const wait = h.ledger.openProviderWaitForAgent(handle.id);
+    expect(wait).toMatchObject({ waiterKind: 'silas-slot', slotId: 'silas-ops', status: 'waiting' });
+    const incident = h.ledger.listNotifications({ routing: 'action-required', unackedOnly: true })
+      .find((row) => row.kind.startsWith('supervision.provider-wall.'));
+    expect(h.ledger.durableSupervisionStops().get(handle.id)).toMatchObject({ slotId: 'silas-ops' });
+    h.supervisor.dispose();
+    const restarted = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry: h.registry, ledger: h.ledger, notifications: h.notifications,
+      tickMs: 5_000, now: () => Date.parse('2026-09-28T10:00:00Z'),
+    });
+    try {
+      restarted.start();
+      restarted.declareSlot({ id: 'silas-ops', role: 'silas', spawn: (options) => h.registry.spawn('silas', options) });
+      // The restored stop names a declared slot, so the disposition is decided
+      // without an adoption — and the sensor still owns it.
+      const refused = restarted.onNotificationDisposed(incident!.id);
+      expect(refused).toMatchObject({ ok: false });
+      if (!refused.ok) expect(refused.reason).toContain(`open provider recovery ${wait!.id}`);
+      expect(h.ledger.durableSupervisionStops().has(handle.id)).toBe(true);
+      expect(h.ledger.listEventsAfter(0, { kinds: ['supervision.rearmed'] })).toEqual([]);
+    } finally {
+      restarted.dispose();
+      h.sensor.stop();
+    }
+  });
+
   it('a provider switch turned off across a restart hands the stopped lane to Gru with a re-arm control — the hand-back runs before hydration', async () => {
     const h = new SeamHarness();
     const handle = await h.runMinionIntoQuotaWall('job-recovery-off');

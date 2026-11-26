@@ -9,11 +9,13 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import {
   Supervisor,
+  SupervisedSlotStoppedError,
   type AgentSupervisionView,
   type SupervisedSlot,
   type SupervisorRegistry,
 } from '../src/supervision/supervisor.js';
 import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
+import { supervisedGruSlotOptions } from '../src/chat/server.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
 import { publishSpawnRegistration, stageSpawnRegistration } from '../src/runtime/spawn-registration.js';
@@ -3243,6 +3245,9 @@ describe('supervisor — decision-backed failure guidance', () => {
       source: 'deterministic_guard', route: 'fallback', requires_confirm: false,
     });
     expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)).toHaveLength(1);
+    // Only Gru's own stop names the chat-message way out (#619).
+    expect(h.notificationsOfKind(`supervision.provider-wall.${handle.id}.authentication_wall`)[0]!.detail)
+      .not.toContain('Gru is the stopped agent');
     expect(decide).not.toHaveBeenCalled();
     h.dispose();
   });
@@ -5157,6 +5162,416 @@ describe('supervisor — Perkins r1 fixes', () => {
     // breaker (final independent review T1).
     expect(view?.stopReason).toBeNull();
     h.dispose();
+  });
+});
+
+describe('supervisor — a stopped Gru slot across a service restart (#619)', () => {
+  const RESUME = 'gru-wall-session.jsonl';
+  const WALL_ERROR = 'API Error: 401 Invalid authentication credentials';
+
+  /** The next service process: a fresh supervisor and registry over the same
+   * ledger, hydrated at start, with the Gru slot declared again. */
+  function restartOver(h: Harness): { supervisor: Supervisor; registry: FakeRegistry; slot: SupervisedSlot } {
+    const registry = new FakeRegistry();
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+      registry,
+      ledger: h.api,
+      notifications: h.center,
+      tickMs: 5,
+      now: () => h.nowMs,
+    });
+    supervisor.start();
+    const slot = supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => registry.spawn('gru', options) });
+    return { supervisor, registry, slot };
+  }
+
+  it('an authentication wall on gru-main survives a restart: a wake is refused before any spawn, and a chat message re-arms it', async () => {
+    const h = boot();
+    const first = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+    // Resume keeps the session id, as the real adapters do.
+    h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-wall', options?.resumeFile ?? RESUME);
+    h.api.registerAgent({ id: 'gru-wall', role: 'gru' });
+    const original = (await first.ensure({ intent: 'user' })) as FakeHandle;
+    original.emit({ type: 'turn_start' });
+    original.emit({ type: 'error', error: WALL_ERROR, fatal: false });
+    await flushMicrotasks();
+    expect(h.supervisor.viewFor('gru-wall')).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+    const wall = h.notificationsOfKind('supervision.provider-wall.gru-wall.authentication_wall')[0]!;
+    // Gru cannot dispose its own alert: the alert names the way out.
+    expect(wall.detail).toContain('Gru is the stopped agent here: a chat message to Gru re-arms it.');
+    expect(h.api.durableSupervisionStops().get('gru-wall')).toMatchObject({ slotId: 'gru-main', notificationId: wall.id });
+    expect(first.stop()).toEqual({ agentId: 'gru-wall', stopReason: 'authentication_wall', notificationId: wall.id });
+    // A stray resume of the stopped session reaching the tap is disposed,
+    // never attached to the stopped slot record.
+    const stray = new FakeHandle('gru', 'gru-wall', RESUME);
+    h.registry.adopt(stray);
+    await flushMicrotasks();
+    expect(stray.disposed).toBe(true);
+    expect(first.current()).toBeNull();
+    h.supervisor.dispose();
+
+    const next = restartOver(h);
+    try {
+      next.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-wall', options?.resumeFile ?? RESUME);
+      // The restored stop names its slot before any session exists.
+      expect(next.slot.canReplace()).toBe(false);
+      await expect(next.slot.ensure({ resumeFile: RESUME, intent: 'autonomous' })).rejects.toThrow(SupervisedSlotStoppedError);
+      expect(next.registry.spawnCalls).toEqual([]);
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+      // A chat message is human intent: it re-arms the stop and gets a live session.
+      const resumed = (await next.slot.ensure({ resumeFile: RESUME, intent: 'user' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(next.slot.current()).toBe(resumed);
+      expect(next.supervisor.viewFor('gru-wall')).toMatchObject({ state: 'watching', breakerOpen: false, stopReason: null });
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedBy: 'slot-use', ackedAt: null });
+      expect(h.api.durableSupervisionStops().has('gru-wall')).toBe(false);
+      expect(next.slot.canReplace()).toBe(true);
+      await expect(next.slot.ensure({ intent: 'user' })).resolves.toBe(resumed);
+    } finally {
+      next.supervisor.dispose();
+      h.dispose();
+    }
+  });
+
+  it('a stop recorded without its slot: the first wake is refused and binds it, and a chat message re-arms it', async () => {
+    const h = boot();
+    try {
+      // The ledger the issue reported: the stop event predates slot binding.
+      h.api.registerAgent({ id: 'gru-legacy', role: 'gru' });
+      h.api.appendCustomEvent({
+        kind: 'supervision.escalated',
+        agentId: 'gru-legacy',
+        payload: { class: 'authentication_wall', restarts: 0 },
+      });
+      const wall = h.center.postIncident({
+        kind: 'supervision.provider-wall.gru-legacy.authentication_wall',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Agent gru-legacy stopped: authentication wall',
+        detail: 'Blind restart is withheld.',
+        agentId: 'gru-legacy',
+        dedupe: 'unacked',
+      });
+      h.supervisor.start();
+      const slot = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+      const spawned: FakeHandle[] = [];
+      h.registry.spawnImpl = async (role, options) => {
+        const handle = new FakeHandle(role, 'gru-legacy', options?.resumeFile ?? RESUME);
+        spawned.push(handle);
+        return handle;
+      };
+      expect(slot.stop()).toBeNull(); // nothing names this slot yet
+      const announced: string[] = [];
+      h.registry.onAgentEvent((envelope) => {
+        if (envelope.phase === 'spawned') announced.push(envelope.agentId);
+      });
+      const refused = slot.ensure({ resumeFile: RESUME, intent: 'autonomous' });
+      await expect(refused).rejects.toThrow(SupervisedSlotStoppedError);
+      await expect(refused).rejects.toThrow(/gru-legacy.*authentication_wall.*autonomous ensure cannot re-arm/);
+      await expect(refused).rejects.toMatchObject({
+        slotId: 'gru-main',
+        agentId: 'gru-legacy',
+        stopReason: 'authentication_wall',
+        notificationId: wall.id,
+      });
+      // The refused session was never published or handed out: it was
+      // quarantined and disposed.
+      expect(announced).toEqual([]);
+      expect(h.registry.spawnCalls).toHaveLength(1);
+      expect(spawned[0]!.disposed).toBe(true);
+      expect(h.registry.quarantineCalls).toContain(spawned[0]);
+      expect(h.registry.listHandles()).not.toContain(spawned[0]);
+      expect(slot.current()).toBeNull();
+      expect(slot.stop()).toEqual({ agentId: 'gru-legacy', stopReason: 'authentication_wall', notificationId: wall.id });
+      expect(h.api.listEventsAfter(0, { kinds: ['supervision.rearmed'] })).toEqual([]);
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+      // Bound now: the next wake is refused without a spawn.
+      expect(slot.canReplace()).toBe(false);
+      await expect(slot.ensure({ resumeFile: RESUME, intent: 'autonomous' })).rejects.toThrow(SupervisedSlotStoppedError);
+      expect(h.registry.spawnCalls).toHaveLength(1);
+      // A chat message re-arms it and is served by a live session.
+      const resumed = (await slot.ensure({ resumeFile: RESUME, intent: 'user' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(slot.current()).toBe(resumed);
+      expect(h.supervisor.viewFor('gru-legacy')).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedBy: 'slot-use' });
+      expect(h.api.durableSupervisionStops().has('gru-legacy')).toBe(false);
+      expect(slot.stop()).toBeNull();
+    } finally {
+      h.dispose();
+    }
+  });
+
+  /** A stop recorded before slots were persisted, as the issue's ledger had it. */
+  function legacyStop(h: Harness, agentId: string, slot: string | null = null): NotificationRecord {
+    h.api.registerAgent({ id: agentId, role: 'gru' });
+    h.api.appendCustomEvent({
+      kind: 'supervision.escalated',
+      agentId,
+      payload: { class: 'authentication_wall', restarts: 0, ...(slot === null ? {} : { slot }) },
+    });
+    return h.center.postIncident({
+      kind: `supervision.provider-wall.${agentId}.authentication_wall`,
+      routing: 'action-required',
+      severity: 'error',
+      title: `Agent ${agentId} stopped: authentication wall`,
+      detail: 'Blind restart is withheld.',
+      agentId,
+      dedupe: 'unacked',
+    });
+  }
+
+  it('a stop recorded without its slot: the first chat message re-arms it at admission and is served live', async () => {
+    const h = boot();
+    try {
+      const wall = legacyStop(h, 'gru-first-chat');
+      h.supervisor.start();
+      const slot = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+      h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-first-chat', options?.resumeFile ?? RESUME);
+      // No wake ran first, so nothing bound the stop: admission decides it.
+      const resumed = (await slot.ensure({ resumeFile: RESUME, intent: 'user' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(slot.current()).toBe(resumed);
+      expect(h.registry.spawnCalls).toHaveLength(1);
+      expect(h.supervisor.viewFor('gru-first-chat')).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedBy: 'slot-use', ackedAt: null });
+      expect(h.api.durableSupervisionStops().has('gru-first-chat')).toBe(false);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a restored slot stop keeps its slot when another producer resumes the session first, and a chat message re-arms it', async () => {
+    const h = boot();
+    try {
+      const wall = legacyStop(h, 'gru-stray', 'gru-main');
+      h.supervisor.start();
+      const slot = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+      const stray = new FakeHandle('gru', 'gru-stray', RESUME);
+      h.registry.adopt(stray);
+      expect(stray.disposed).toBe(true);
+      // The slotless record must not erase the slot the restored stop names.
+      expect(slot.canReplace()).toBe(false);
+      expect(slot.stop()).toEqual({ agentId: 'gru-stray', stopReason: 'authentication_wall', notificationId: wall.id });
+      await expect(slot.ensure({ resumeFile: RESUME, intent: 'autonomous' })).rejects.toThrow(SupervisedSlotStoppedError);
+      expect(h.registry.spawnCalls).toEqual([]);
+      h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-stray', options?.resumeFile ?? RESUME);
+      const resumed = (await slot.ensure({ resumeFile: RESUME, intent: 'user' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(slot.current()).toBe(resumed);
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedBy: 'slot-use' });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a slot spawn that drops the staged options never hands out a dead session, and the next chat message re-arms', async () => {
+    const h = boot();
+    try {
+      legacyStop(h, 'gru-unstaged');
+      h.supervisor.start();
+      // This spawn rebuilds its options, so the admission hook never runs.
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-main',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options?.resumeFile === undefined ? {} : { resumeFile: options.resumeFile }),
+      });
+      h.registry.spawnImpl = async (role, options) => {
+        const handle = new FakeHandle(role, 'gru-unstaged', options?.resumeFile ?? RESUME);
+        // Like the real adapters, disposal runs once: a second dispose emits
+        // no second `disposed` event that could clear a re-attached handle.
+        const disposeOnce = handle.dispose.bind(handle);
+        let disposal: Promise<void> | null = null;
+        handle.dispose = () => (disposal ??= disposeOnce());
+        return handle;
+      };
+      await expect(slot.ensure({ resumeFile: RESUME, intent: 'user' })).rejects.toThrow(
+        /spawned agent gru-unstaged, but that agent is stopped, so supervision disposed the session/,
+      );
+      expect(slot.current()).toBeNull();
+      // The stopped record holds no dead handle: the next user ensure re-arms
+      // the now slot-bound stop and is served live.
+      const resumed = (await slot.ensure({ resumeFile: RESUME, intent: 'user' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(slot.current()).toBe(resumed);
+      await expect(slot.ensure({ intent: 'user' })).resolves.toBe(resumed);
+      expect(h.supervisor.viewFor('gru-unstaged')).toMatchObject({ state: 'watching', breakerOpen: false });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a crash-loop stop on gru-main keeps its slot across a restart, and a disposition on its alert re-arms it before any spawn', async () => {
+    const h = boot();
+    const first = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+    h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-loop', options?.resumeFile ?? RESUME);
+    h.api.registerAgent({ id: 'gru-loop', role: 'gru' });
+    const original = (await first.ensure({ intent: 'user' })) as FakeHandle;
+    h.registry.spawnImpl = async () => { throw new Error('spawn exploded'); };
+    hang(original);
+    h.advance(60);
+    await sleep(250); // rungs fail fast; the next need trips the breaker
+    const breaker = h.notificationsOfKind('supervision.breaker')[0]!;
+    expect(breaker.detail).toContain('Gru is the stopped agent here: a chat message to Gru re-arms it.');
+    expect(h.api.durableSupervisionStops().get('gru-loop')).toMatchObject({ slotId: 'gru-main', notificationId: breaker.id });
+    h.supervisor.dispose();
+
+    const next = restartOver(h);
+    try {
+      next.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-loop', options?.resumeFile ?? RESUME);
+      expect(next.slot.canReplace()).toBe(false);
+      await expect(next.slot.ensure({ resumeFile: RESUME, intent: 'autonomous' })).rejects.toThrow(SupervisedSlotStoppedError);
+      expect(next.registry.spawnCalls).toEqual([]);
+      // New chat is refused as well, by the same rule canReplace() reads.
+      await expect(next.slot.adoptReplacement(new FakeHandle('gru', 'gru-fresh-chat', null))).rejects.toThrow(/breaker is open/);
+      // Gru's (or the owner's) disposition is the other re-arm control: it
+      // must not wait for an adoption no wake can make any more.
+      expect(next.supervisor.onNotificationDisposed(breaker.id)).toEqual({ ok: true, rearmed: true });
+      expect(h.api.durableSupervisionStops().has('gru-loop')).toBe(false);
+      expect(next.slot.canReplace()).toBe(true);
+      const resumed = (await next.slot.ensure({ resumeFile: RESUME, intent: 'autonomous' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(next.slot.current()).toBe(resumed);
+    } finally {
+      next.supervisor.dispose();
+      h.dispose();
+    }
+  });
+
+  it('an ensure without an intent (a scheduler) leaves a restored slot stop as it was before the restart', async () => {
+    const h = boot();
+    try {
+      const wall = legacyStop(h, 'bob-stopped', 'bob-consolidator');
+      h.supervisor.start();
+      const slot = h.supervisor.declareSlot({ id: 'bob-consolidator', role: 'bob', spawn: (options) => h.registry.spawn('bob', options) });
+      // A fresh session for the slot: the restored stop is not re-armed and
+      // its alert stays open for Gru.
+      const fresh = (await slot.ensure()) as FakeHandle;
+      expect(fresh.disposed).toBe(false);
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(h.api.listEventsAfter(0, { kinds: ['supervision.rearmed'] })).toEqual([]);
+      expect(h.api.durableSupervisionStops().has('bob-stopped')).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a slotless producer resuming a stopped minion keeps its handle (directive checkpoint recovery)', async () => {
+    const h = boot();
+    try {
+      const stopped = new FakeHandle('minion', 'minion-stopped-recovery', null);
+      h.registry.adopt(stopped);
+      stopped.emit({ type: 'turn_start' });
+      stopped.emit({ type: 'error', error: WALL_ERROR, fatal: false });
+      await flushMicrotasks();
+      expect(h.supervisor.viewFor('minion-stopped-recovery')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      // Directive recovery respawns the same agent id with no slot: the
+      // dispose rule for stopped slot agents must not touch it.
+      const recovery = new FakeHandle('minion', 'minion-stopped-recovery', null);
+      h.registry.adopt(recovery);
+      await flushMicrotasks();
+      expect(recovery.disposed).toBe(false);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a disposition on a restored slot stop held by a slotless record restarts Gru through its slot', async () => {
+    const h = boot();
+    try {
+      const wall = legacyStop(h, 'gru-held', 'gru-main');
+      h.supervisor.start();
+      const slot = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+      // Another producer resumed the stopped session: the tap adopts it with
+      // no slot and disposes it.
+      h.registry.adopt(new FakeHandle('gru', 'gru-held', RESUME));
+      h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-held', options?.resumeFile ?? RESUME);
+      expect(h.supervisor.onNotificationDisposed(wall.id)).toEqual({ ok: true, rearmed: true });
+      // The guarded restart runs through gru-main, never outside it.
+      await vi.waitFor(() => expect(slot.current()).not.toBeNull());
+      expect((slot.current() as FakeHandle).disposed).toBe(false);
+      expect(h.registry.spawnCalls).toHaveLength(1);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('the service wiring: a wake is refused, chat reads the stop, and a chat message re-arms Gru', async () => {
+    const h = boot();
+    try {
+      const wall = legacyStop(h, 'gru-wired', 'gru-main');
+      h.supervisor.start();
+      const slot = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+      h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-wired', options?.resumeFile ?? RESUME);
+      // The same helper main.ts spreads into the chat server's options.
+      const wiring = supervisedGruSlotOptions(slot);
+      expect(wiring.canWakeGru?.()).toBe(false);
+      expect(wiring.canAdoptFreshGru?.()).toBe(false);
+      expect(wiring.gruStop?.()).toEqual({ agentId: 'gru-wired', stopReason: 'authentication_wall', notificationId: wall.id });
+      await expect(wiring.spawnGru(RESUME, 'wake')).rejects.toThrow(SupervisedSlotStoppedError);
+      expect(h.registry.spawnCalls).toEqual([]);
+      const live = (await wiring.spawnGru(RESUME, 'chat')) as FakeHandle;
+      expect(live.disposed).toBe(false);
+      expect(h.registry.spawnCalls).toEqual([{ role: 'gru', resumeFile: RESUME }]);
+      expect(wiring.gruStop?.()).toBeNull();
+      expect(wiring.canWakeGru?.()).toBe(true);
+      expect(h.api.getNotification(wall.id)).toMatchObject({ resolvedBy: 'slot-use' });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a restored stop takes its slot from the event that started it', () => {
+    const h = boot();
+    try {
+      h.api.registerAgent({ id: 'fenced-agent', role: 'gru' });
+      h.api.appendCustomEvent({ kind: 'supervision.escalated', agentId: 'fenced-agent', payload: { class: 'authentication_wall', restarts: 0, slot: 'gru-main' } });
+      // A later re-arm-fenced event keeps the stop but carries no slot.
+      h.api.appendCustomEvent({ kind: 'supervision.rearm-fenced', agentId: 'fenced-agent', payload: { reason: 'fixture hold', stop_reason: 'authentication_wall', restarts: 0 } });
+      expect(h.api.durableSupervisionStops().get('fenced-agent')).toMatchObject({ slotId: 'gru-main' });
+
+      h.api.registerAgent({ id: 'restopped-agent', role: 'gru' });
+      h.api.appendCustomEvent({ kind: 'supervision.escalated', agentId: 'restopped-agent', payload: { class: 'authentication_wall', restarts: 0, slot: 'gru-main' } });
+      h.api.appendCustomEvent({ kind: 'supervision.rearmed', agentId: 'restopped-agent', payload: { by: 'slot-use', slot: 'gru-main' } });
+      h.api.appendCustomEvent({ kind: 'supervision.breaker', agentId: 'restopped-agent', payload: { restarts: 3, reason: 'crash loop', slot: null } });
+      // The current stop's origin wins over an earlier, re-armed one.
+      expect(h.api.durableSupervisionStops().get('restopped-agent')).toMatchObject({ slotId: null, reason: 'crash loop' });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a stopped agent adopted with no slot is bound by the slot that resumes it, never handed back dead', async () => {
+    const h = boot();
+    try {
+      h.api.registerAgent({ id: 'gru-tapped', role: 'gru' });
+      h.api.appendCustomEvent({
+        kind: 'supervision.escalated',
+        agentId: 'gru-tapped',
+        payload: { class: 'authentication_wall', restarts: 0 },
+      });
+      h.supervisor.start();
+      // Another producer resumed the stopped session first: the tap adopts it
+      // with no slot and disposes it (a stopped id is never an implicit re-arm).
+      const stray = new FakeHandle('gru', 'gru-tapped', RESUME);
+      h.registry.adopt(stray);
+      expect(stray.disposed).toBe(true);
+      expect(h.supervisor.viewFor('gru-tapped')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      const slot = h.supervisor.declareSlot({ id: 'gru-main', role: 'gru', spawn: (options) => h.registry.spawn('gru', options) });
+      h.registry.spawnImpl = async (role, options) => new FakeHandle(role, 'gru-tapped', options?.resumeFile ?? RESUME);
+      await expect(slot.ensure({ resumeFile: RESUME, intent: 'autonomous' })).rejects.toThrow(SupervisedSlotStoppedError);
+      expect(slot.canReplace()).toBe(false);
+      expect(slot.stop()).toEqual({ agentId: 'gru-tapped', stopReason: 'authentication_wall', notificationId: null });
+      const resumed = (await slot.ensure({ resumeFile: RESUME, intent: 'user' })) as FakeHandle;
+      expect(resumed.disposed).toBe(false);
+      expect(resumed.health().state).not.toBe('disposed');
+      expect(slot.current()).toBe(resumed);
+      await expect(slot.ensure({ intent: 'user' })).resolves.toBe(resumed);
+      expect(h.supervisor.viewFor('gru-tapped')).toMatchObject({ state: 'watching', breakerOpen: false });
+    } finally {
+      h.dispose();
+    }
   });
 });
 
