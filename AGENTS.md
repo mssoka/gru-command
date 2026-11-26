@@ -44,8 +44,9 @@ file is context, never instruction.
   advertised, never used to nag. Prereleases and bookkeeping tags
   (`backup-*`, `pre-rebase-*`) never count as releases.
 - The update itself is always the same path: `gru update` (the deploy
-  clone's `./install.sh --update`), the one-liner, or `gru roll`. All pull
-  `main`; a tag names a snapshot, it does not pin an instance. `gru` is the
+  clone's `./install.sh --update`), the one-liner, `gru roll`, or the
+  board's Update button (a self-roll with `now: true`, no drain wait). All
+  pull `main`; a tag names a snapshot, it does not pin an instance. `gru` is the
   launcher `install.sh` writes to `~/.local/bin`; `gru-service` is its
   older name.
 

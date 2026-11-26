@@ -72,6 +72,9 @@ interface Scripted {
 function scriptedRunner(options: {
   heads: string[];
   status?: string;
+  fetch?: RollCommandResult;
+  /** `git diff --name-only HEAD @{upstream} -- <unit templates>` output. */
+  unitDiff?: string;
   pull?: RollCommandResult;
   ci?: RollCommandResult;
   build?: RollCommandResult;
@@ -92,6 +95,8 @@ function scriptedRunner(options: {
     if (command === 'git' && args[0] === 'status') {
       return { code: 0, stdout: options.status ?? '', stderr: '' };
     }
+    if (command === 'git' && args[0] === 'fetch') return options.fetch ?? ok;
+    if (command === 'git' && args[0] === 'diff') return { code: 0, stdout: options.unitDiff ?? '', stderr: '' };
     if (command === 'git' && args[0] === 'pull') {
       return options.pull ?? ok;
     }
@@ -448,6 +453,74 @@ describe('roll controller drain + swap', () => {
     expect(state.drain?.waitedMs).toBe(3_000);
     expect(readRollMarker(fix.dataDir)?.toSha).toBe(SHA_B);
     expect(swaps).toEqual(['swap']);
+  });
+
+  it('now (the board Update button): the swap follows preflight at once, cutting work in flight, as a terminal gru update does', async () => {
+    const fix = fixture();
+    const scripted = scriptedRunner({ heads: [SHA_A, SHA_B, SHA_B], onBuild: () => stampBuild(fix.repoRoot, SHA_B) });
+    const clock = { now: 1_000_000 };
+    let probes = 0;
+    const { controller, swaps } = makeController(fix, {
+      runner: scripted.run,
+      clock,
+      // The instance's own bound is 15 minutes; a now roll never waits on it.
+      drainTimeoutMs: 900_000,
+      probeInFlight: async () => {
+        probes += 1;
+        return [{ kind: 'minion', id: 'minion-7', status: 'streaming' }];
+      },
+    });
+    const state = await controller.roll({ now: true, requestedBy: 'board' });
+    expect(state.phase).toBe('swap');
+    expect(state.now).toBe(true);
+    expect(state.preflight?.rebuilt).toBe(true);
+    expect(probes).toBe(1);
+    expect(state.drain).toMatchObject({
+      drained: false,
+      waitedMs: 0,
+      abandoned: [{ kind: 'minion', id: 'minion-7', status: 'streaming' }],
+    });
+    expect(readRollState(fix.dataDir)).toMatchObject({ phase: 'swap', now: true, requestedBy: 'board' });
+    expect(readRollMarker(fix.dataDir)?.toSha).toBe(SHA_B);
+    expect(swaps).toEqual(['swap']);
+    // A roll that does not ask for now keeps the bounded wait and says nothing about it.
+    const waited = fixture();
+    const second = makeController(waited, {
+      runner: scriptedRunner({ heads: [SHA_A, SHA_B, SHA_B], onBuild: () => stampBuild(waited.repoRoot, SHA_B) }).run,
+      drainTimeoutMs: 3_000,
+      probeInFlight: async () => [{ kind: 'minion', id: 'minion-7', status: 'streaming' }],
+    });
+    const bounded = await second.controller.roll();
+    expect(bounded.drain?.waitedMs).toBe(3_000);
+    expect(bounded).not.toHaveProperty('now');
+  });
+
+  it('refuses an update whose commits change the service unit before pulling them, naming the terminal update', async () => {
+    const fix = fixture();
+    const scripted = scriptedRunner({
+      heads: [SHA_A],
+      unitDiff: 'install/launchd/com.gru-command.service.plist.template\ninstall/systemd/gru-command.service.template\n',
+    });
+    const { controller, swaps } = makeController(fix, { runner: scripted.run });
+    const state = await controller.roll({ now: true, requestedBy: 'board' });
+    expect(state.phase).toBe('failed');
+    expect(state.error?.phase).toBe('preflight');
+    expect(state.error?.detail).toContain(
+      'this update changes the service unit (install/launchd/com.gru-command.service.plist.template, install/systemd/gru-command.service.template)',
+    );
+    expect(state.error?.detail).toContain('run gru update in a terminal');
+    expect(scripted.calls).toContain('git fetch');
+    expect(scripted.calls).toContain('git diff --name-only HEAD @{upstream} -- install/launchd install/systemd');
+    // Nothing was pulled, so asking again refuses again, and the old service keeps serving.
+    expect(scripted.calls.some((call) => call.startsWith('git pull'))).toBe(false);
+    expect(readRollMarker(fix.dataDir)).toBeNull();
+    expect(swaps).toEqual([]);
+    // A failed fetch is refused loud before any diff or pull.
+    const offline = fixture();
+    const unreachable = scriptedRunner({ heads: [SHA_A], fetch: { code: 128, stdout: '', stderr: 'fatal: unable to access origin\n' } });
+    const failed = await makeController(offline, { runner: unreachable.run }).controller.roll();
+    expect(failed.error?.detail).toContain('git fetch failed in the deploy clone: fatal: unable to access origin');
+    expect(unreachable.calls.some((call) => call.startsWith('git diff') || call.startsWith('git pull'))).toBe(false);
   });
 
   it('a second concurrent roll is refused while the first is still running', async () => {

@@ -101,6 +101,23 @@ export interface RollControllerOptions {
   readonly onSwap: (state: RollState) => void;
 }
 
+export interface RollInput {
+  readonly reason?: string;
+  readonly requestedBy?: string;
+  readonly forceBuild?: boolean;
+  readonly mode?: RollMode;
+  /** Skip the drain, as a terminal `gru update` does: swap as soon as
+   * preflight passes and cut the work still in flight (boot recovery
+   * resumes it). The board's Update button sends this. */
+  readonly now?: boolean;
+}
+
+/** The unit templates a roll cannot apply. A self-roll relaunches the unit
+ * already installed: rewriting it means unloading it, which from inside the
+ * service stops the updater along with the service (install.sh's in-service
+ * guard). Only `gru update` from a terminal refreshes the unit. */
+export const ROLL_UNIT_TEMPLATE_PATHS: readonly string[] = ['install/launchd', 'install/systemd'];
+
 /** A roll is already running in this process (HTTP 409). */
 export class RollBusyError extends Error {
   constructor() {
@@ -153,7 +170,7 @@ export class RollController {
    * with the old service still serving. Throws RollBusyError when a roll
    * is already in progress in this process.
    */
-  async roll(input: { reason?: string; requestedBy?: string; forceBuild?: boolean; mode?: RollMode } = {}): Promise<RollState> {
+  async roll(input: RollInput = {}): Promise<RollState> {
     if (this.busy) throw new RollBusyError();
     this.busy = true;
     try {
@@ -163,7 +180,7 @@ export class RollController {
     }
   }
 
-  private async runRoll(input: { reason?: string; requestedBy?: string; forceBuild?: boolean; mode?: RollMode }): Promise<RollState> {
+  private async runRoll(input: RollInput): Promise<RollState> {
     const startedMs = this.now();
     const rollId = (this.opts.newId ?? randomUUID)();
     let state: RollState = {
@@ -171,6 +188,7 @@ export class RollController {
       rollId,
       phase: 'preflight',
       mode: input.mode ?? 'update',
+      ...(input.now === true ? { now: true } : {}),
       reason: input.reason ?? null,
       requestedBy: input.requestedBy ?? 'operator',
       repoRoot: this.opts.repoRoot,
@@ -188,6 +206,7 @@ export class RollController {
     this.log('info', 'roll begin', {
       roll_id: rollId,
       mode: state.mode,
+      now: state.now === true,
       repo_root: this.opts.repoRoot,
       reason: state.reason,
       requested_by: state.requestedBy,
@@ -237,6 +256,25 @@ export class RollController {
       throw new Error(
         'refusing to roll a dirty deploy clone — commit, stash, or remove local changes first ' +
           `(git status reports ${dirty.stdout.trim().split('\n').length} entr(ies))`,
+      );
+    }
+
+    // Refuse an update whose commits change the service unit BEFORE pulling
+    // them: the relaunch would run the old unit, and a refused pull leaves
+    // the checkout where it was, so asking again refuses again.
+    const fetched = await this.run('git', ['fetch'], { cwd, timeoutMs: 5 * 60_000 });
+    if (fetched.code !== 0) {
+      throw new Error(`git fetch failed in the deploy clone: ${failureDetail(fetched)}`);
+    }
+    const unitDiff = await this.git(
+      cwd,
+      ['diff', '--name-only', 'HEAD', '@{upstream}', '--', ...ROLL_UNIT_TEMPLATE_PATHS],
+      'preflight',
+    );
+    if (unitDiff !== '') {
+      throw new Error(
+        `this update changes the service unit (${unitDiff.split('\n').join(', ')}), which a self-update ` +
+          `cannot apply — run gru update in a terminal (or ${join(cwd, 'install.sh')} --update)`,
       );
     }
 
@@ -322,7 +360,9 @@ export class RollController {
 
   private async drain(state: RollState): Promise<RollState> {
     const started = this.now();
-    const deadline = started + this.opts.drainTimeoutMs;
+    // A `now` roll probes once, records what it cuts, and swaps.
+    const bound = state.now === true ? 0 : this.opts.drainTimeoutMs;
+    const deadline = started + bound;
     const startedAt = new Date(started).toISOString();
     const deadlineAt = new Date(deadline).toISOString();
     let live = state;
@@ -360,11 +400,13 @@ export class RollController {
       const remaining = deadline - this.now();
       if (remaining <= 0) {
         abandoned = inFlight;
-        this.log('warn', 'roll drain bound reached — proceeding with work still in flight', {
-          roll_id: state.rollId,
-          drain_timeout_ms: this.opts.drainTimeoutMs,
-          abandoned,
-        });
+        this.log(
+          'warn',
+          state.now === true
+            ? 'roll skips the drain (now) — cutting work in flight; boot recovery resumes it'
+            : 'roll drain bound reached — proceeding with work still in flight',
+          { roll_id: state.rollId, drain_timeout_ms: bound, abandoned },
+        );
         break;
       }
       await this.sleep(Math.max(1, Math.min(this.drainPollMs, remaining)));

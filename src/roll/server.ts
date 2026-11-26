@@ -12,9 +12,11 @@ export type RollControllerPort = Pick<RollController, 'isBusy' | 'state' | 'roll
  * Roll HTTP surface (graceful self-roll): operator-guarded, same pairing
  * token and constant-time comparison as every other write surface.
  *
- *   POST /api/roll   { reason?, requested_by?, force_build?, mode? } → 202
+ *   POST /api/roll   { reason?, requested_by?, force_build?, mode?, now? } → 202
  *                    { status: 'accepted', roll } — the roll runs in the
  *                    background; 409 while one is already in progress.
+ *                    `now: true` skips the drain, as a terminal `gru
+ *                    update` does (the board's Update button).
  *   GET  /api/roll   → 200 { roll } — the live record (null before the
  *                    first roll; post-restart reads come from disk).
  *
@@ -148,6 +150,7 @@ export function createRollServer(options: {
           const reason = optStr(body, 'reason');
           const requestedBy = optStr(body, 'requested_by');
           const forceBuild = optBool(body, 'force_build');
+          const now = optBool(body, 'now');
           const mode = optMode(body);
           if (mode === 'restart' && forceBuild !== undefined) {
             throw new Error('force_build applies to an update; a restart never builds');
@@ -161,6 +164,7 @@ export function createRollServer(options: {
             ...(requestedBy !== undefined ? { requestedBy } : {}),
             ...(forceBuild !== undefined ? { forceBuild } : {}),
             ...(mode !== undefined ? { mode } : {}),
+            ...(now === true ? { now } : {}),
           });
           // The controller sets the preflight record synchronously before
           // its first await; the 202 carries it so followers start aligned.

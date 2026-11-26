@@ -677,11 +677,11 @@ function defaultSampleSnapshot(): unknown {
     ],
     wakes: { count: 2, lastAt: new Date(Date.now() - 180_000).toISOString() },
     build: {
-      buildRev: 'abc1234def5678abc1234def5678abc1234def56',
+      buildRev: mockRollPhase() === 'done' ? 'def5678abc1234def5678abc1234def5678abc12' : 'abc1234def5678abc1234def5678abc1234def56',
       buildCommittedAt: new Date(Date.now() - 5_400_000).toISOString(),
       originMainRev: 'def5678abc1234def5678abc1234def5678abc12',
       originMainCommittedAt: new Date(Date.now() - 600_000).toISOString(),
-      commitsBehind: 3,
+      commitsBehind: mockRollPhase() === 'done' ? 0 : 3,
       latestTag: null,
       buildTag: null,
       updateAvailable: null,
@@ -782,9 +782,47 @@ function mockBrowse(path: string): unknown {
   return { root: MOCK_BROWSE_ROOT, path, parent, truncated: false, entries };
 }
 
+// The board's Update button (dev-only): a simulated self-update. POST
+// /api/roll starts it; it builds for 4 s, restarts for 2 s, then is done,
+// and from then on the sample build is current.
+let mockRoll: { readonly rollId: string; readonly startedAt: number } | null = null;
+function mockRollPhase(): 'preflight' | 'swap' | 'done' | null {
+  if (mockRoll === null) return null;
+  const elapsed = Date.now() - mockRoll.startedAt;
+  return elapsed < 4_000 ? 'preflight' : elapsed < 6_000 ? 'swap' : 'done';
+}
+function mockRollRecord(): unknown {
+  const phase = mockRollPhase();
+  if (mockRoll === null || phase === null) return null;
+  return {
+    schemaVersion: 1,
+    rollId: mockRoll.rollId,
+    phase,
+    mode: 'update',
+    now: true,
+    requestedBy: 'board',
+    toSha: 'def5678abc1234def5678abc1234def5678abc12',
+    error: null,
+  };
+}
+
 const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   // Board API (dev-only, generic sample data; token matches the chat token).
   const url = new URL(req.url ?? '/', 'http://localhost');
+  if (url.pathname === '/api/roll' && (req.method === 'GET' || req.method === 'POST')) {
+    req.resume();
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    const running = mockRollPhase() === 'preflight' || mockRollPhase() === 'swap';
+    if (req.method === 'POST' && !running) mockRoll = { rollId: `mock-roll-${Date.now()}`, startedAt: Date.now() };
+    const status = req.method === 'GET' ? 200 : running ? 409 : 202;
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ...(status === 409 ? { error: 'roll_in_progress' } : {}), ...(status === 202 ? { status: 'accepted' } : {}), roll: mockRollRecord() }) + '\n');
+    return;
+  }
   if (req.method === 'GET' && url.pathname === '/api/board') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
