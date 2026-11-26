@@ -1520,23 +1520,36 @@ export class BoardView {
       if (part.flag !== null) {
         node.append(el('span', `pp-chip ${part.tone === 'alert' ? 'pp-chip--alert' : 'pp-chip--work'} command-health__flag`, part.flag));
       }
-      if (part.id === 'deploy') this.appendUpdateControl(node, snapshot);
       this.healthParts.append(node);
     }
+    this.renderUpdateControl(snapshot);
     this.renderTrackerChips(snapshot);
   }
 
-  /** The Update button and its progress on the deploy reading (owner
-   * request 2026-11-26): one press runs what a terminal `gru update` runs. */
-  private appendUpdateControl(node: HTMLElement, snapshot: BoardSnapshot): void {
+  /** The Update Now button and its progress (owner request 2026-11-26):
+   * one press runs what a terminal `gru update` runs. It lives in its own
+   * slot before the readings, never inside them: a laptop-width pill cuts
+   * the readings off ("deploy 3 behind…"), and the button went with them. */
+  private renderUpdateControl(snapshot: BoardSnapshot): void {
+    let slot = this.healthMount.querySelector<HTMLElement>('.command-health__update-slot');
+    if (slot === null) {
+      slot = el('span', 'command-health__update-slot');
+      this.healthParts.before(slot);
+    }
     const control = updateControl(this.updateFollow, snapshot.build ?? null);
-    node.dataset.update = this.updateFollow.step;
+    // Offered only on a live board: a last-known snapshot authorizes no
+    // action, and a press could not reach the service anyway. The progress
+    // text stays, since an update's own restart drops the board's socket.
+    const offered = control.offer && this.boardClient !== null && !this.lastKnown();
+    slot.dataset.update = this.updateFollow.step;
+    slot.replaceChildren();
+    slot.hidden = control.status === null && !offered;
     if (control.status !== null) {
       const status = el('span', `command-health__update-status command-health__update-status--${control.tone ?? 'work'}`, control.status);
       status.setAttribute('role', 'status');
-      node.append(status);
+      slot.append(status);
     }
-    if (!control.offer || this.boardClient === null) return;
+    if (!offered) return;
     const button = document.createElement('button');
     button.type = 'button';
     // A pp-btn (filled, shadowed), so it never reads as one of the pills.
@@ -1548,7 +1561,7 @@ export class BoardView {
     button.setAttribute('aria-label', UPDATE_BUTTON_TITLE);
     button.dataset.actionId = 'deploy-update';
     button.addEventListener('click', () => this.startUpdate());
-    node.append(button);
+    slot.append(button);
   }
 
   private setUpdateFollow(next: UpdateFollow): void {

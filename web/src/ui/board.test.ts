@@ -630,7 +630,7 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
       const view = new BoardView(() => {});
       const reloads: string[] = [];
       view.setReloadHandler(() => reloads.push('reload'));
-      view.render(snapshot({
+      const behind = snapshot({
         build: {
           buildRev: 'a'.repeat(40),
           buildCommittedAt: new Date(Date.now() - 6 * 3_600_000).toISOString(),
@@ -643,13 +643,24 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
           checkedAt: new Date().toISOString(),
           checkError: null,
         },
-      }));
-      const deploy = () => document.querySelector<HTMLElement>('.command-health__part[data-check="deploy"]')!;
-      // No client, no button: the press would have nowhere to go.
-      expect(deploy().querySelector('.command-health__update')).toBeNull();
+      });
+      view.render(behind);
+      const slot = () => document.querySelector<HTMLElement>('#command-health .command-health__update-slot')!;
+      // No client, no button: the press would have nowhere to go, and the
+      // empty slot takes no room.
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+      expect(slot().hidden).toBe(true);
+      // Bound, but the snapshot on screen is last-known until the client's
+      // own arrives: a last-known board authorizes no action.
       view.bindClient(client);
-      const button = deploy().querySelector<HTMLButtonElement>('.command-health__update')!;
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+      view.render(behind);
+      const button = slot().querySelector<HTMLButtonElement>('.command-health__update')!;
       expect(button.textContent).toBe('↻Update Now');
+      // Its own slot right after the summary, never inside the readings: a
+      // laptop-width pill cuts the readings off, and the button with them.
+      expect(button.closest('#command-health-parts')).toBeNull();
+      expect(slot().nextElementSibling?.id).toBe('command-health-parts');
       // The accessible name starts with the visible label (voice control).
       expect(button.getAttribute('aria-label')?.startsWith('Update Now:')).toBe(true);
       // A real button (pp-btn: filled, shadowed), not one of the pills beside it.
@@ -662,14 +673,19 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(requests.map(({ method, path }) => `${method} ${path}`)).toEqual(['GET /api/roll', 'POST /api/roll']);
       expect(requests[1]).toMatchObject({ body: { mode: 'update', now: true, requested_by: 'board' }, auth: 'Bearer board-token' });
-      const status = () => deploy().querySelector('.command-health__update-status')?.textContent;
+      const status = () => slot().querySelector('.command-health__update-status')?.textContent;
       expect(status()).toBe('updating: pulling and building…');
-      expect(deploy().querySelector('.command-health__update')).toBeNull();
+      expect(slot().querySelector('.command-health__update')).toBeNull();
 
       await vi.advanceTimersByTimeAsync(2_000);
       expect(status()).toBe('restarting…');
       await vi.advanceTimersByTimeAsync(2_000);
       expect(status()).toBe('restarting — waiting for the service…');
+      // The restart drops the board's socket: the progress stays on the
+      // last-known board, and no button comes back meanwhile.
+      view.markSnapshotStale();
+      expect(status()).toBe('restarting — waiting for the service…');
+      expect(slot().querySelector('.command-health__update')).toBeNull();
       expect(reloads).toEqual([]);
       await vi.advanceTimersByTimeAsync(2_000);
       expect(status()).toBe('updated — reloading…');
@@ -702,7 +718,7 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
       const client = new BoardClient({ token: 'board-token', host: 'gc.test', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} });
       const view = new BoardView(() => {});
       view.setReloadHandler(() => {});
-      view.render(snapshot({
+      const release = snapshot({
         build: {
           buildRev: 'a'.repeat(40),
           buildCommittedAt: null,
@@ -715,30 +731,32 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
           checkedAt: new Date().toISOString(),
           checkError: null,
         },
-      }));
+      });
       view.bindClient(client);
-      const deploy = () => document.querySelector<HTMLElement>('.command-health__part[data-check="deploy"]')!;
-      const status = () => deploy().querySelector('.command-health__update-status')?.textContent;
+      view.render(release);
+      const slot = () => document.querySelector<HTMLElement>('#command-health .command-health__update-slot')!;
+      const status = () => slot().querySelector('.command-health__update-status')?.textContent;
 
-      deploy().querySelector<HTMLButtonElement>('.command-health__update')!.click();
+      slot().querySelector<HTMLButtonElement>('.command-health__update')!.click();
       await vi.advanceTimersByTimeAsync(0);
       expect(status()).toBe('update failed: no pairing token configured');
-      expect(deploy().querySelector('.command-health__update-status--alert')).not.toBeNull();
-      expect(deploy().querySelector('.command-health__update')).not.toBeNull();
+      expect(slot().querySelector('.command-health__update-status--alert')).not.toBeNull();
+      expect(slot().querySelector('.command-health__update')).not.toBeNull();
 
       // A terminal gru update is already running: the page follows it.
       post = () => json(409, { error: 'roll_in_progress', roll: { schemaVersion: 1, rollId: 'roll-cli', phase: 'drain', toSha: null, error: null } });
-      deploy().querySelector<HTMLButtonElement>('.command-health__update')!.click();
+      slot().querySelector<HTMLButtonElement>('.command-health__update')!.click();
       await vi.advanceTimersByTimeAsync(0);
       expect(status()).toBe('restarting…');
-      expect(deploy().querySelector('.command-health__update')).toBeNull();
+      expect(slot().querySelector('.command-health__update')).toBeNull();
 
       // A re-pair drops the follow (it may be another service), so the
       // button comes back; with the service unreachable, nothing is posted.
       view.bindClient(client);
+      view.render(release);
       getDown = true;
       const before = posts.length;
-      deploy().querySelector<HTMLButtonElement>('.command-health__update')!.click();
+      slot().querySelector<HTMLButtonElement>('.command-health__update')!.click();
       await vi.advanceTimersByTimeAsync(0);
       expect(status()).toBe('update failed: the service did not answer, so no update was started');
       expect(posts).toHaveLength(before);
