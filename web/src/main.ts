@@ -198,6 +198,8 @@ new ConsoleShell({
 
 // Pairing replaces the whole app surface (it precedes any authed view).
 function showPairing(): void {
+  // A modal over the board would stay over (and block) the pairing screen.
+  boardView?.closeOverlays();
   mustGet('pairing-view').hidden = false;
   mustGet('console').hidden = true;
   mustGet('chat-view').hidden = true;

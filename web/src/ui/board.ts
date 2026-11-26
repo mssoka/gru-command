@@ -559,7 +559,9 @@ export class BoardView {
     if (!preservePendingDecision) state.pendingDecision = null;
     state.loadFailed = false;
     if (state.recorded === null && !preservePendingDecision) state.message = null;
-    state.open = false;
+    // An open review sheet stays open across a connection blip: it shows
+    // "refreshing" with every choice locked, and the next fresh snapshot
+    // reads the review again. A re-pair drops the row state, which closes it.
   }
 
   private renderSnapshot(snapshot: BoardSnapshot, source: BoardSnapshotSource | 'local' = 'local'): void {
@@ -1261,6 +1263,13 @@ export class BoardView {
     // A failed read is retried by the owner's open.
     if (current.review === null && current.loading === null) current.actions?.load();
     this.renderLessonSheet(id, current);
+  }
+
+  /** Close every modal the board owns (the lesson review sheet) — the app
+   * calls this before it swaps the board for the pairing screen, so no
+   * modal is left over a hidden board. */
+  closeOverlays(): void {
+    this.closeLessonSheet(false);
   }
 
   private closeLessonSheet(restoreFocus = true): void {

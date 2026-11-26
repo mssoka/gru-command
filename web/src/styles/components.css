@@ -2991,6 +2991,10 @@ body {
 .board-lessons-sheet__top {
   display: grid;
   gap: 10px;
+  /* On a short screen the header and the foot scroll themselves, so the
+     changes keep room and Accept all / Reject all stay reachable. */
+  max-height: 40dvh;
+  overflow-y: auto;
   padding: 14px 16px 12px;
   border-bottom: var(--outline-thin);
   background: var(--card);
@@ -3055,6 +3059,8 @@ body {
 }
 
 .board-lessons-sheet__foot {
+  max-height: 45dvh;
+  overflow-y: auto;
   display: flex;
   flex-wrap: wrap;
   align-items: center;

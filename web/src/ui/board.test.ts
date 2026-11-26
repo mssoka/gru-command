@@ -4278,7 +4278,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Not applied — disk I/O error. A fresh proposal will follow.');
   });
 
-  it('the open review keeps its filter, its scroll and the focused control across a snapshot push; Close returns focus to the card', async () => {
+  it('the open review keeps its filter, its scroll and the focused control across a snapshot push and a connection blip; Close returns focus to the card', async () => {
     const view = new BoardView(() => {}, proposalClient(decided));
     view.render(snapshot({ notifications: [proposalNotice] }));
     const sheet = openReview();
@@ -4298,16 +4298,25 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(body.scrollTop).toBe(scrolledTo);
     expect(lessonCards().map(({ name }) => name)).toEqual(['Drain']);
     expect(document.activeElement).toBe(filter('updated'));
-    // A change it shows (a lock) redraws it, keeping filter and focus.
+    // A connection blip keeps the sheet open: refreshing, every choice locked...
     view.markSnapshotStale();
+    expect(sheet.open).toBe(true);
+    expect(sheet.querySelector('.board-lessons-sheet__body')?.textContent).toBe('The board is refreshing.');
+    expect([...sheet.querySelectorAll<HTMLButtonElement>('.board-lessons-sheet__actions button')].every((button) => button.disabled)).toBe(true);
+    // ...and the fresh snapshot reads the review again, filter kept.
     view.render(snapshot({ notifications: [proposalNotice] }));
-    expect(sheet.open).toBe(false); // a stale board dropped the review it read
-    openReview();
     await flush();
+    expect(sheet.open).toBe(true);
     expect(lessonCards().map(({ name }) => name)).toEqual(['Drain']);
     sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__close')!.click();
     expect(sheet.open).toBe(false);
     expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-lessons__see'));
+    // The app swaps the board for the pairing screen: no modal is left over it.
+    openReview();
+    await flush();
+    expect(sheet.open).toBe(true);
+    view.closeOverlays();
+    expect(sheet.open).toBe(false);
   });
 
   it('a re-pair while the review is loading never sends the decision through either client', async () => {
